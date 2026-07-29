@@ -2,7 +2,7 @@
 
 Quanta is designed to be simple and supports multiple modes—interpreter, WASM, JIT, pre‑compiler (e.g., `quanta run`), and native compilation to binary (`qc`).
 
-This document describes the language as implemented in the current work‑in‑progress compiler (`src/qc-0.0.2-wip.quanta`).  Features marked **(WIP)** are present in the tokenizer/parser but not yet fully code‑generated.
+This document describes the language as implemented in the current stable compiler (`src/qc-0.0.4.quanta`).
 
 ---
 
@@ -28,7 +28,7 @@ fn   let   if   else   loop   while   for   break   continue   return
 unsafe   extern   alias   global   // (see below for P6 keywords)
 ```
 
-**P6‑phase keywords** (recognized but not fully implemented):
+**P6‑phase keywords** (recognized; enum and match now implemented):
 ```
 enum   match   type   interface   impl   where   Option   Some   None   Result   Ok   Err   ref   mut   move   String
 ```
@@ -253,8 +253,7 @@ All builtins are emitted inline; they have no call overhead.
 
 ---
 
-## 7. Pattern Matching (`match`)
-
+## 7. Pattern Matching (`match`) (implemented)
 
 ### Patterns
 | Pattern | Meaning |
@@ -303,8 +302,9 @@ fn main() {
 - Constructor can also be positional: `Point(1,2)`.
 - Fields may have a `: Type` annotation; if omitted, the type is inferred from the initializer (if any) or left generic.
 
-### Enums
-```
+### Enums (implemented)
+
+```quanta
 enum Color {
     Red,
     Green,
@@ -324,8 +324,9 @@ fn main() {
 - Discriminant is stored in the first word (0‑based variant index).
 - Payload follows the discriminant, laid out as a tuple.
 
-### Option & Result (built‑in enums)
-```
+### Option & Result (built‑in enums; bare constructors compile but match limited)
+
+```quanta
 enum Option<T> { None, Some(T) }
 enum Result<T, E> { Err(E), Ok(T) }
 ```
@@ -333,10 +334,11 @@ Constructors:
 - `none` → `Option::None`
 - `some(expr)` → `Option::Some(expr)`
 - `err(expr)` → `Result::Err(expr)`
-- `ok(expr)` → `Result::Ok(expr)` (also `ok` alias if desired)
+- `ok(expr)` → `Result::Ok(expr)`
 
-Example (Option):
-```
+**Note**: Bare `Some(val)`, `None`, `Ok(val)`, `Err(val)` expressions compile, but pattern matching on them via `match` requires full match implementation (qc-0.0.4+). Currently they work as expressions but `match` on built-in enum variants is partially implemented.
+
+```quanta
 let some_val = Some(42)
 let none_val = None
 
@@ -344,14 +346,9 @@ match some_val {
     Some(x) => x,
     None => 0,
 }
-```
 
-Example (Result):
-```
-fn divide(a, b) {
-    if b == 0 {
-        return Err("division by zero")
-    }
+fn divide(a, b) -> Result<int, string> {
+    if b == 0 { return Err("division by zero") }
     return Ok(a / b)
 }
 
@@ -364,23 +361,7 @@ fn main() {
 }
 ```
 
-Constructors:
-- `none` → `Option::None`
-- `some(expr)` → `Option::Some(expr)`
-- `err(expr)` → `Result::Err(expr)`
-- `ok(expr)` → `Result::Ok(expr)` (also `ok` alias if desired)
-
-Example (Option):
-
-Example (Result):
-
-Constructors:
-- `none` → `Option::None`
-- `some(expr)` → `Option::Some(expr)`
-- `err(expr)` → `Result::Err(expr)`
-- `ok(expr)` → `Result::Ok(expr)` (also `ok` alias if desired)
-
-### Tuples & Arrays
+---
 ```
 // Tuple literal (a,b) + .N field access. Exercises IR_TALLOC + IR_IDX
 // (qword stride) on both backends.
