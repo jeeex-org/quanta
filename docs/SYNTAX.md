@@ -2,7 +2,7 @@
 
 Quanta is designed to be simple and supports multiple modes—interpreter, WASM, JIT, pre‑compiler (e.g., `quanta run`), and native compilation to binary (`qc`).
 
-This document describes the language as implemented in the current stable compiler (`src/qc-0.0.4.quanta`).
+This document describes the language as implemented in the current stable compiler (`src/qc-0.0.5.quanta`).
 
 ---
 
@@ -324,7 +324,7 @@ fn main() {
 - Discriminant is stored in the first word (0‑based variant index).
 - Payload follows the discriminant, laid out as a tuple.
 
-### Option & Result (built‑in enums; bare constructors compile but match limited)
+### Option & Result (built‑in enums; bare constructors + match working on x86_64, ARM64 backend bug)
 
 ```quanta
 enum Option<T> { None, Some(T) }
@@ -336,7 +336,7 @@ Constructors:
 - `err(expr)` → `Result::Err(expr)`
 - `ok(expr)` → `Result::Ok(expr)`
 
-**Note**: Bare `Some(val)`, `None`, `Ok(val)`, `Err(val)` expressions compile, but pattern matching on them via `match` requires full match implementation (qc-0.0.4+). Currently they work as expressions but `match` on built-in enum variants is partially implemented.
+**Note**: Bare `Some(val)`, `None`, `Ok(val)`, `Err(val)` expressions compile and work correctly on x86_64. Pattern matching on them via `match` is fully implemented on x86_64 (qc-0.0.5). ARM64 cross-compilation works but ARM64 backend has a register emission bug causing bare variant pattern matches to return 0 — fix tracked for qc-0.0.6.
 
 ```quanta
 let some_val = Some(42)
