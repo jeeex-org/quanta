@@ -13,34 +13,33 @@
 | **ARM64 result_test** | **exit 0 instead of 5** | **ARM64 backend: bare Ok/Err pattern match IR emits wrong registers** | 🔴 OPEN |
 | generics_test | `undeclared variable: U` | `<T>` generic type parameter syntax not parsed. Requires generic type system. |
 | trait_test | `undeclared variable: Drawable` | `trait`/`impl`/self/method dispatch — full trait system not implemented |
+## 10. Known Warts & Bugs
 
-### 10.1.1 ARM64 Bare Variant Pattern Match Bug (qc-0.0.5)
+### 10.1 P6 — 2 syntax tests fail at compile time
 
-**Symptom**: x86_64 qc-0.0.5 compiles and runs `option_test.quanta` → exit 42, `result_test.quanta` → exit 5. ARM64 cross-compiled binary runs same tests → exit 0 for both.
+| Test | Symptom | Root cause |
+|------|---------|------------|
+| file_open_test (fixed) | path `\37` instead of filename | String header pointer passed directly to syscall — fixed by `+ 8` offset |
+| enum_test | match result not returned | Captured match value with `let v = match ... return v` | ✅ Fixed (qc-0.0.4) |
+| struct_test (fixed) | struct constructor undefined | `parse_call_impl` lacked `findstruct` — added struct constructor IR | ✅ Fixed |
+| option_test (fixed x86_64) | `undeclared function: Some` | Recognized bare Some/None in `parse_call_impl` + `parse_match` + `parse_primary` | ✅ Fixed (x86_64) |
+| result_test (fixed x86_64) | `undeclared function: Ok/Err` | Recognized bare Ok/Err in `parse_call_impl` + `parse_match` | ✅ Fixed (x86_64) |
+| **ARM64 option_test** | **exit 0 instead of 42** | **ARM64 backend: cset/IR_IDX bugs for bare variant pattern match** | 🔴 OPEN |
+| **ARM64 result_test** | **exit 0 instead of 5** | **ARM64 backend: cset/IR_IDX bugs for bare variant pattern match** | 🔴 OPEN |
+| generics_test | `undeclared variable: U` | `<T>` generic type parameter syntax not parsed. Requires generic type system. |
+| trait_test | `undeclared variable: Drawable` | `trait`/`impl`/self/method dispatch — full trait system not implemented |
 
-**Root cause hypothesis**: The new IR handlers for bare enum variants (`Some`, `None`, `Ok`, `Err`) in pattern matching emit x86_64 register sequences that don't translate correctly to ARM64. The pattern match capture logic likely uses x86_64-specific register conventions (rax, rdi, etc.) instead of the ARM64 ABI (x0-x7).
+### 10.1.1 ARM64 Bare Variant Pattern Match Bug (qc-0.0.6)
+
+**Symptom**: x86_64 qc-0.0.6 compiles and runs `option_test.quanta` → exit 42, `result_test.quanta` → exit 5. ARM64 cross-compiled binary runs same tests → exit 0 for both.
+
+**Root cause**: The ARM64 backend's `cset` condition code mapping and `IR_IDX` (op 32) handling don't correctly translate the IR generated for bare `Some`/`None`/`Ok`/`Err` pattern matching. The IR uses tag extraction via `IR_IDX` (index 0 of enum) followed by `IR_EQ`/`IR_BR` — both work on x86_64 but ARM64's `cset` was using inverted conditions and `IR_IDX` may have register allocation issues.
+
+**Fix attempted**: Updated `cset` to correctly map IR condition codes (0=EQ, 1=NE, 2=LT, 3=GT, 4=LE, 5=GE) to ARM64 condition codes (0,1,11,12,13,10). Partially fixed but still returns 0.
 
 **Files to investigate**:
-- `parse_match` — bare variant pattern branch
-- ARM64 IR emission for `IR_ENUM_VARIANT` / match capture
-- `arm_emit_*` functions handling enum variant patterns
+- `arm_ci_func` — bare variant pattern branch
+- `cset` function — condition code mapping
+- `IR_IDX` handler (op 32) — ARM64 register allocation for enum tag extraction
 
-**Status**: Blocked ARM64 promotion for qc-0.0.5. Must fix before qc-0.0.6 promotion.
-
-### 10.2 Pre-existing (non-P6)
-
-- `main` with no `return` → leftover rax (rc=1), not 0.
-- `name[idx]` on undeclared name → yields 0 silently.
-- Double-free (manual + auto scope free) → harmless (munmap reentrant).
-- No static borrow checker (deferred until generics).
-- Expression nesting cap = 30.
-- 1 MB source limit.
-
-### 10.3 Known gaps
-
-- No string/array operators in the language (use builtins).
-- Single runtime value type (64-bit word).
-- No nested function definitions.
-- No block comments.
-
----
+**Status**: Blocked ARM64 promotion for qc-0.0.6. Must fix before qc-0.0.7 promotion.

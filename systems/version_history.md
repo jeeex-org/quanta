@@ -1,6 +1,8 @@
 ## 9. Version History
+
 | Version | Date | What |
 |---------|------|------|
+| **0.0.6** | **2026-07-30** | **Bare Some/None/Ok/Err support (expressions + match patterns). x86_64 self-host verified (stage2==stage3), 39/39 x86_64 tests pass. ARM64 cross-compile works but ARM64 bare-variant pattern match broken (exit 0) — BLOCKS ARM64 promotion.** |
 | **0.0.5** | **2026-07-30** | **Bare Some/None/Ok/Err support (expressions + match patterns). x86_64 self-host verified (stage2==stage3), 39/39 x86_64 tests pass. ARM64 cross-compile works but ARM64 bare-variant pattern match broken (exit 0) — BLOCKS ARM64 promotion.** |
 | **0.0.4** | **2026-07-30** | **Enum support + self-host verified. Enum declarations, constructors, match expressions working. 37/39 tests pass (trait, generics not implemented; option/result match on built-ins incomplete).** |
 | **0.0.2** | **2026-07-29** | **WIP. option_test + result_test fixed (bare Some/None/Ok/Err). struct_test regression + enum_test match capture + file_open_test string-header all fixed. 38/39 compile, 38/38 runtime pass. 2 remaining: trait, generics.** |

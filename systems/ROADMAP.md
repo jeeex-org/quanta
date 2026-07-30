@@ -7,7 +7,7 @@ compiles to every tier — bare-metal kernel, edge WASM, GPU kernel, cloud servi
 |----------|-------|
 | **Self-hosting** | Compiler in Quanta; byte-identical fixed-point on x86-64 |
 | **Bootstrapping** | `qc-bootstrap-0.0.0` seed binary |
-| **Version** | `qc-0.0.5` (bare Some/None/Ok/Err + enum/match; x86_64 self-host verified; ARM64 bare-variant bug) |
+| **Version** | `qc-0.0.6` (bare Some/None/Ok/Err + enum/match; x86_64 self-host verified; ARM64 bare-variant bug) |
 | **Optimizer** | Tier-1 IR passes (const fold, DCE, tail-call, loop strength), ON by default since 1.0.12 |
 | **Memory model** | Ownership-by-default (compiler-inserted `free` at scope exit), no GC |
 | **Secure by default** | Overflow/shift/bounds traps ON; `unsafe {}` marks opt-out regions |

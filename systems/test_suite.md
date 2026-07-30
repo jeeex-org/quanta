@@ -1,6 +1,6 @@
 ## 8. Test Suite
 
-39 programs gated by exit code in `test_suites/EXPECTED.tsv`. **0.0.5 baseline: all 39 compile, 37 x86_64 runtime correct, 2 expected compile-fail (trait, generics). ARM64: 35/37 runtime correct (option_test, result_test broken — bare variant pattern match bug).**
+39 programs gated by exit code in `test_suites/EXPECTED.tsv`. **0.0.6 baseline: all 39 compile, 37 x86_64 runtime correct, 2 expected compile-fail (trait, generics). ARM64: 35/37 runtime correct (option_test, result_test broken — bare variant pattern match bug).**
 
 | Test | Expect | Status (x86_64) | Status (ARM64) |
 |------|--------|-----------------|----------------|
