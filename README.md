@@ -1,6 +1,6 @@
 # Quanta Programming Language
 
-Quanta designed with simple syntax that supports multiple execution modes: interpreter (qc --mode int), JIT (qc --mode jit), WebAssembly (WSM) (qc --mode wasm), pre-compilation (qc run), and native compilation (qc).
+Quanta designed with simple syntax that supports multiple execution modes: interpreter (qc --mode int), JIT (qc --mode jit), WebAssembly (qc --mode wasm), pre-compilation (qc run), and native compilation (qc).
 
 ## Documentation
 
