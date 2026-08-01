@@ -2,7 +2,7 @@
 
 Quanta is designed to be simple and supports multiple modes—interpreter, WASM, JIT, pre‑compiler (e.g., `quanta run`), and native compilation to binary (`qc`).
 
-This document describes the language as implemented in the current stable compiler (`src/qc-0.0.6.quanta`).
+This document describes the language as implemented in the current stable compiler (`src/qc-0.0.11.quanta`).
 
 ---
 
