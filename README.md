@@ -3,7 +3,7 @@
 Quanta designed with simple syntax that supports multiple execution modes: Native compilation, Pre-compilation, Interpreter, JIT and WebAssembly
 
 ## Status
-- Native compilation (`qc`) — [Active] (qc-0.0.11: Option/Result/Enum match fully working on x86_64 and ARM64; 38/38 tests pass; self-host fixed-point verified)
+- Native compilation (`qc`) — [Active] (qc-0.0.13: P9 traits/impl/vtable dispatch/struct literals fully working on x86_64 and ARM64; 39/39 tests pass; self-host fixed-point verified; P10 generics next)
 - Pre-compilation (`qc run`) — [Planned]
 - Interpreter (`qc --mode int`) — [Planned]
 - JIT (`qc --mode jit`) — [Planned]
