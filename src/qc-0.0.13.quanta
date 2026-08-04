@@ -6055,131 +6055,110 @@ fn arm_ci_func(fi, is_main) {
         }
         else if op==IR_DEREF {  // P6: *p - raw pointer dereference (load)
             aflsuh_all()
-            else if op==IR_DEREF {  // P6: *p - raw pointer dereference (load)
-                        aflsuh_all()
-                        let rd=aphys_a(res)
-                        let rs=aphys_a(a0)
-                        aldr(rd, rs, 0)
-                        asdef(res, rd)
-                    }
-                    else if op==IR_DEREF_MUT {  // P6: *p = v (store through raw pointer)
-                        aflsuh_all()
-                        let rs=aphys_a(a0)   // pointer
-                        let rv=aphys_a(a1)   // value
-                        astr(rv, rs, 0)
-                    }
-                    else if op==IR_PTR_ADD {  // P6: p + n (element-sized)
-                        let r1=aphys_a(a0); let r2=aphys_a(a1); let rd=adistinct_a(res,r1,r2)
-                        if rd!=r1 { amovr(rd, r1) }
-                        // Scale by 8 (element size): lsl r2, r2, 3
-                        if r2!=0 { alsl(r2, r2, 3) }
-                        // add rd, rd, r2
-                        aadd(rd, rd, r2)
-                        asdef(res, rd)
-                    }
-                    else if op==IR_PTR_SUB {  // P6: p - n (element-sized)
-                        let r1=aphys_a(a0); let r2=aphys_a(a1); let rd=adistinct_a(res,r1,r2)
-                        if rd!=r1 { amovr(rd, r1) }
-                        // Scale by 8: lsl r2, r2, 3
-                        if r2!=0 { alsl(r2, r2, 3) }
-                        // sub rd, rd, r2
-                        asub(rd, rd, r2)
-                        asdef(res, rd)
-                    }
-                    else if op==IR_PTR_DIFF {  // P6: p - q (elements)
-                        let r1=aphys_a(a0); let r2=aphys_a(a1); let rd=adistinct_a(res,r1,r2)
-                        if rd!=r1 { amovr(rd, r1) }
-                        // sub rd, r1, r2
-                        asub(rd, r1, r2)
-                        // Divide by 8: asr rd, rd, 3
-                        alsr(rd, rd, 3)
-                        asdef(res, rd)
-                    }
-                    else if op==IR_PTR_CAST {  // P6: &p or cast to raw pointer
-                        // a1: 1 = address-of, 0 = cast (no-op)
-                        let rd=aphys_a(res)
-                        let rs=aphys_a(a0)
-                        if rd!=rs { araw(0xAA0003E0 | (rs << 16) | rd) }
-                        asdef(res, rd)
-                    }
-                    else if op==IR_IS_NULL {  // P6: p == 0
-                        let r1=aphys_a(a0); let rd=aphys_a(res)
-                        // cmp xn, #0
-                        araw(0xF100001F | ((r1 & 31) << 5))
-                        // cset xd, eq (cond=0): 0x9A9F17E0 | rd | (0<<12)
-                        araw(0x9A9F17E0 | (rd & 31))
-                        asdef(res, rd)
-                    }
-                    else if op==IR_VOLATILE_LOAD {  // P6: volatile load
-                        aflsuh_all()
-                        let rd=aphys_a(res)
-                        let rs=aphys_a(a0)
-                        aldr(rd, rs, 0)
-                        asdef(res, rd)
-                    }
-                    else if op==IR_VOLATILE_STORE {  // P6: volatile store
-                        aflsuh_all()
-                        let rs=aphys_a(a0)
-                        let rt=aphys_a(a1)
-                        astr(rt, rs, 0)
-                    }
-                    else if op==IR_FFI_CALL {  // P6: FFI call - AAPCS64
-                        aflsuh_all()
-                        // a0 = function pointer, a1 = num args, a2 = args array
-                        let fn_ptr = aphys_a(a0)
-                        let args_ptr = aphys_a(a2)
-                        
-                        // Load args into X0-X7 (AAPCS64: X0-X7 for first 8 args)
-                        let arg0 = nv(); let arg1 = nv(); let arg2 = nv()
-                        let arg3 = nv(); let arg4 = nv(); let arg5 = nv()
-                        let arg6 = nv(); let arg7 = nv()
-                        
-                        aldr(arg0, aphys_a(a2), 0)
-                        aldr(arg1, aphys_a(a2), 8)
-                        aldr(arg2, aphys_a(a2), 16)
-                        aldr(arg3, aphys_a(a2), 24)
-                        aldr(arg4, aphys_a(a2), 32)
-                        aldr(arg5, aphys_a(a2), 40)
-                        aldr(arg6, aphys_a(a2), 48)
-                        aldr(arg7, aphys_a(a2), 56)
-                        
-                        // Move to AAPCS64 argument registers X0-X7
-                        if arg0 != 0 { araw(0xAA0003E0 | (arg0 << 16) | 0) }  // X0
-                        if arg1 != 0 { araw(0xAA0003E0 | (arg1 << 16) | 1) }  // X1
-                        if arg2 != 0 { araw(0xAA0003E0 | (arg2 << 16) | 2) }  // X2
-                        if arg3 != 0 { araw(0xAA0003E0 | (arg3 << 16) | 3) }  // X3
-                        if arg4 != 0 { araw(0xAA0003E0 | (arg4 << 16) | 4) }  // X4
-                        if arg5 != 0 { araw(0xAA0003E0 | (arg5 << 16) | 5) }  // X5
-                        if arg6 != 0 { araw(0xAA0003E0 | (arg6 << 16) | 6) }  // X6
-                        if arg7 != 0 { araw(0xAA0003E0 | (arg7 << 16) | 7) }  // X7
-                        
-                        // Call function pointer
-                        let fn_ptr = aphys_a(a0)
-                        if fn_ptr != 0 { araw(0xAA0003E0 | (fn_ptr << 16) | 16) }  // X16 = fn_ptr
-                        araw(0xD63F0100)  // blr x16
-                        
-                        // Return value in X0
-                        let rd = aphys_a(res)
-                        if rd != 0 { araw(0xAA0003E0 | (0 << 16) | rd) }  // mov rd, X0
-                        asdef(res, rd)
-                    }
-                    else if op==IR_VEC128 {  // P6: SIMD vec128 (placeholder)
-                        aflsuh_all()
-                        araw(0xD503201F)  // nop
-                        let rd=aphys_a(res)
-                        rxor(rd, rd)
-                        sdef(res, rd)
-                    }
-                    else if op==IR_UNSAFE_BLOCK {  // P6: unsafe block marker (no-op at runtime)
-                        // No-op: unsafe{} is a compile-time construct
-                    }
-                    else if op==IR_ASM {  // P6: inline assembly (placeholder)
-                        aflsuh_all()
-                        araw(0xD503201F)  // nop
-                        let rd=aphys_a(res)
-                        rxor(rd,rd)
-                        sdef(res, rd)
-                    }
+            let rd=aphys_a(res)
+            let rs=aphys_a(a0)
+            aldr(rd, rs, 0)
+            asdef(res, rd)
+        }
+        else if op==IR_DEREF_MUT {  // P6: *p = v (store through raw pointer)
+            aflsuh_all()
+            let rs=aphys_a(a0)   // pointer
+            let rv=aphys_a(a1)   // value
+            astr(rv, rs, 0)
+        }
+        else if op==IR_PTR_ADD {  // P6: p + n (element-sized)
+            let r1=aphys_a(a0); let r2=aphys_a(a1); let rd=adistinct_a(res,r1,r2)
+            if rd!=r1 { amovr(rd, r1) }
+            if r2!=0 { alsl(r2, r2, 3) }
+            aadd(rd, rd, r2)
+            asdef(res, rd)
+        }
+        else if op==IR_PTR_SUB {  // P6: p - n (element-sized)
+            let r1=aphys_a(a0); let r2=aphys_a(a1); let rd=adistinct_a(res,r1,r2)
+            if rd!=r1 { amovr(rd, r1) }
+            if r2!=0 { alsl(r2, r2, 3) }
+            asub(rd, rd, r2)
+            asdef(res, rd)
+        }
+        else if op==IR_PTR_DIFF {  // P6: p - q (elements)
+            let r1=aphys_a(a0); let r2=aphys_a(a1); let rd=adistinct_a(res,r1,r2)
+            if rd!=r1 { amovr(rd, r1) }
+            asub(rd, r1, r2)
+            alsr(rd, rd, 3)
+            asdef(res, rd)
+        }
+        else if op==IR_PTR_CAST {  // P6: &p or cast to raw pointer
+            let rd=aphys_a(res)
+            let rs=aphys_a(a0)
+            if rd!=rs { araw(0xAA0003E0 | (rs << 16) | rd) }
+            asdef(res, rd)
+        }
+        else if op==IR_IS_NULL {  // P6: p == 0
+            let r1=aphys_a(a0); let rd=aphys_a(res)
+            araw(0xF100001F | ((r1 & 31) << 5))
+            araw(0x9A9F17E0 | (rd & 31))
+            asdef(res, rd)
+        }
+        else if op==IR_VOLATILE_LOAD {  // P6: volatile load
+            aflsuh_all()
+            let rd=aphys_a(res)
+            let rs=aphys_a(a0)
+            aldr(rd, rs, 0)
+            asdef(res, rd)
+        }
+        else if op==IR_VOLATILE_STORE {  // P6: volatile store
+            aflsuh_all()
+            let rs=aphys_a(a0)
+            let rt=aphys_a(a1)
+            astr(rt, rs, 0)
+        }
+        else if op==IR_FFI_CALL {  // P6: FFI call - AAPCS64
+            aflsuh_all()
+            let fn_ptr = aphys_a(a0)
+            let args_ptr = aphys_a(a2)
+            let arg0 = nv(); let arg1 = nv(); let arg2 = nv()
+            let arg3 = nv(); let arg4 = nv(); let arg5 = nv()
+            let arg6 = nv(); let arg7 = nv()
+            aldr(arg0, aphys_a(a2), 0)
+            aldr(arg1, aphys_a(a2), 8)
+            aldr(arg2, aphys_a(a2), 16)
+            aldr(arg3, aphys_a(a2), 24)
+            aldr(arg4, aphys_a(a2), 32)
+            aldr(arg5, aphys_a(a2), 40)
+            aldr(arg6, aphys_a(a2), 48)
+            aldr(arg7, aphys_a(a2), 56)
+            if arg0 != 0 { araw(0xAA0003E0 | (arg0 << 16) | 0) }
+            if arg1 != 0 { araw(0xAA0003E0 | (arg1 << 16) | 1) }
+            if arg2 != 0 { araw(0xAA0003E0 | (arg2 << 16) | 2) }
+            if arg3 != 0 { araw(0xAA0003E0 | (arg3 << 16) | 3) }
+            if arg4 != 0 { araw(0xAA0003E0 | (arg4 << 16) | 4) }
+            if arg5 != 0 { araw(0xAA0003E0 | (arg5 << 16) | 5) }
+            if arg6 != 0 { araw(0xAA0003E0 | (arg6 << 16) | 6) }
+            if arg7 != 0 { araw(0xAA0003E0 | (arg7 << 16) | 7) }
+            let fn_ptr2 = aphys_a(a0)
+            if fn_ptr2 != 0 { araw(0xAA0003E0 | (fn_ptr2 << 16) | 16) }
+            araw(0xD63F0100)  // blr x16
+            let rd = aphys_a(res)
+            if rd != 0 { araw(0xAA0003E0 | (0 << 16) | rd) }
+            asdef(res, rd)
+        }
+        else if op==IR_VEC128 {  // P6: SIMD vec128 (placeholder)
+            aflsuh_all()
+            araw(0xD503201F)  // nop
+            let rd=aphys_a(res)
+            rxor(rd, rd)
+            sdef(res, rd)
+        }
+        else if op==IR_UNSAFE_BLOCK {  // P6: unsafe block marker (no-op at runtime)
+        }
+        else if op==IR_ASM {  // P6: inline assembly (placeholder)
+            aflsuh_all()
+            araw(0xD503201F)  // nop
+            let rd=aphys_a(res)
+            rxor(rd,rd)
+            sdef(res, rd)
+        }
+        else if op==IR_STR {
             let sp2=a0+1; let ln=0; let scp=sp2
             while scp<srclen&&r8(src+scp)!=34 { ln=ln+1; if r8(src+scp)==92&&scp+1<srclen { scp=scp+2 } else { scp=scp+1 } }
             let gdata_size=(INTERNAL_GLOBAL_COUNT+gvarc)*8
