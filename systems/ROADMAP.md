@@ -7,7 +7,7 @@ compiles to every tier — bare-metal kernel, edge WASM, GPU kernel, cloud servi
 |----------|-------|
 | **Self-hosting** | Compiler in Quanta; byte-identical fixed-point on x86-64 |
 | **Bootstrapping** | `qc-bootstrap-0.0.0` seed binary |
-| **Version** | `qc-0.0.14-wip` (P10: for-in loops working; generics next). Stable `qc-0.0.13` (P9 traits). See systems/version_history.md. |
+| **Version** | `qc-0.0.14` (P10: for-in loops working; generics next). Stable `qc-0.0.13` (P9 traits). See systems/version_history.md. |
 | **Optimizer** | Tier-1 IR passes (const fold, DCE, tail-call, loop strength), ON by default since 1.0.12 |
 | **Memory model** | Ownership-by-default (compiler-inserted `free` at scope exit), no GC |
 | **Secure by default** | Overflow/shift/bounds traps ON; `unsafe {}` marks opt-out regions |
@@ -463,7 +463,7 @@ All ON by default. Suppressed inside `unsafe {}`. Disable with
 
 ## 8. Test Suite
 
-39 programs gated by exit code in `test_suites/EXPECTED.tsv`. **qc-0.0.14-wip baseline: 39/39 pass, 0 fail, 1 expected compile-fail (generics = P10).** Cross-compiled, all but unported-backend features pass on ARM64 (see systems/test_suite.md §8).
+39 programs gated by exit code in `test_suites/EXPECTED.tsv`. **qc-0.0.14 baseline: 39/39 pass, 0 fail, 1 expected compile-fail (generics = P10).** Cross-compiled, all but unported-backend features pass on ARM64 (see systems/test_suite.md §8).
 
 | Test | Expect | Status |
 |------|--------|--------|
@@ -496,7 +496,7 @@ All ON by default. Suppressed inside `unsafe {}`. Disable with
 
 ## 9. Version History
 
-The authoritative version history is in `systems/version_history.md`. Summary of the 0.0.x line: **0.0.1** bootstrapped self-host → **0.0.2–0.0.3** P6 low-level (raw ptr deref/arith/cast/null, unsafe) → **0.0.4–0.0.5** enums/match + bare Some/None/Ok/Err → **0.0.6** promoted enums → **0.0.7** ARM64 self-host fixed → **0.0.8–0.0.10** P6 batches (FFI, SIMD/asm stubs) → **0.0.11** P7 Option/Result/match both backends → **0.0.12** P8 structs → **0.0.13** P9 traits/impl/vtable/struct-literals (stable) → **0.0.14-wip** P10 for-in (nested, `arr[-1]`) + gsz BSS fix; generics next.
+The authoritative version history is in `systems/version_history.md`. Summary of the 0.0.x line: **0.0.1** bootstrapped self-host → **0.0.2–0.0.3** P6 low-level (raw ptr deref/arith/cast/null, unsafe) → **0.0.4–0.0.5** enums/match + bare Some/None/Ok/Err → **0.0.6** promoted enums → **0.0.7** ARM64 self-host fixed → **0.0.8–0.0.10** P6 batches (FFI, SIMD/asm stubs) → **0.0.11** P7 Option/Result/match both backends → **0.0.12** P8 structs → **0.0.13** P9 traits/impl/vtable/struct-literals (stable) → **0.0.14-wip** P10 for-in DONE. P10 generics NEXT..
 
 Legacy 1.1.x line (2026-07-20 → 1.1.34) is historical/superseded.
 

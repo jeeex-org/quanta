@@ -1,6 +1,6 @@
 ## 8. Test Suite
 
-39 programs gated by exit code in `test_suites/EXPECTED.tsv` (untracked working copy, run via `QC=<compiler> bash test_suites/scripts/run_tests.sh`). **Current baseline (qc-0.0.14-wip, 2026-08-05): 39/39 x86_64 runtime pass, 1 expected compile-fail (generics_test = P10 monomorphization gap).**
+39 programs gated by exit code in `test_suites/EXPECTED.tsv` (untracked working copy, run via `QC=<compiler> bash test_suites/scripts/run_tests.sh`). **Current baseline (qc-0.0.14, 2026-08-05): 39/39 x86_64 runtime pass, 1 expected compile-fail (generics_test = P10 monomorphization gap).**
 
 | Test | Expect | Status (x86_64) | Notes |
 |------|--------|-----------------|-------|
