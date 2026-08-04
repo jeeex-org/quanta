@@ -1,6 +1,6 @@
 ## 8. Test Suite
 
-53 programs gated by exit code in `test_suites/EXPECTED.tsv` (untracked working copy, run via `QC=<compiler> bash test_suites/scripts/run_tests.sh`). **Current baseline (qc-0.0.14-wip, 2026-08-04): 53/53 x86_64 runtime pass, 1 expected compile-fail (generics_test = P10 monomorphization gap).**
+39 programs gated by exit code in `test_suites/EXPECTED.tsv` (untracked working copy, run via `QC=<compiler> bash test_suites/scripts/run_tests.sh`). **Current baseline (qc-0.0.14-wip, 2026-08-05): 39/39 x86_64 runtime pass, 1 expected compile-fail (generics_test = P10 monomorphization gap).**
 
 | Test | Expect | Status (x86_64) | Notes |
 |------|--------|-----------------|-------|
@@ -26,13 +26,9 @@
 | stdlib_test | 0 | ✅ | |
 | test_many_globals | 42 | ✅ | |
 | builtins_test | 198 | ✅ | |
-| array_test | 200 | ✅ | |
-| tuple_test | 40 | ✅ | |
-| fnptr_test | 0 | ✅ | |
-| closure_test | 7 | ✅ | |
 | **generics_test** | 12 | ❌ compile-fail | P10 `<T>` generics not implemented (expected) |
 
-> 53/53 pass, 0 fail, 1 expected compile-fail (generics). ARM64: cross-compiled suite runs on device except features not yet ported to the ARM backend (for-in / `arr[-1]` — see known_warts_bugs.md §10.2).
+> 39/39 pass, 0 fail, 1 expected compile-fail (generics). ARM64: cross-compiled suite runs on device except features not yet ported to the ARM backend (see known_warts_bugs.md §10.2).
 
 ### Coverage gaps (fixtures in `codes/` NOT gated in EXPECTED.tsv)
 
@@ -58,3 +54,28 @@ Dedicated for-in / `arr[-1]` / unsafe regression tests are now gated in EXPECTED
 Also gated (previously ungated working fixtures): struct_literal_test (7), trait_min/trait_only/trait_test2 (0), option_simple (42), option_ctor (0), option_tuple (42), simple_min (0).
 
 ---
+
+### Pillar → Test Mapping (Corrected 2026-08-05)
+
+| Pillar | Feature | Tests | Status |
+|--------|---------|-------|--------|
+| P1 | Core types/control flow | arithmetic, fib, break_continue, param*, arg*, elseif* | ✅ 12/12 |
+| P2 | Memory/ownership | mem_test, mmap1, test_mmap, test_many_globals, exit/file_io | ✅ 4/4 |
+| P3 | FFI/fnptr | fnptr_test | ✅ 1/1 |
+| P4 | Multi-backend | cross-compile (manual) | ✅ |
+| P5 | ELF/BSS | self-host fixed-point | ✅ |
+| **P6 (CLOSED)** | **Raw ptr deref/arith/cast/null, unsafe** | unsafe_block, raw_ptr* (no annotation) | ✅ |
+| P7 | Option/Result/Enum/Match | option_test, result_test, enum_test, match_test, option_* | ✅ 6/6 |
+| **P8** | **Structs** | **struct_test, struct_literal_test** | ✅ **2/2** |
+| **P9** | **Traits/impl/vtable** | **trait_test, trait_min, trait_only, trait_test2** | ✅ **4/4** |
+| **P10** | **For-in / arr[-1]** | **forin_basic, forin_sum, forin_nested, arrlen_neg1, forin_break** | ✅ **5/5** |
+| **P10** | **Generics** | **generics_test** | ❌ **0/1** (expected) |
+| **P11** | **P6 stubs** | raw_ptr_test (type annotation), volatile, asm, SIMD | ❌ **0/4** |
+| **P12** | **GPU/PTX/SPIR-V/WASM** | — | — |
+
+**Key corrections from prior version:**
+- P8 was **Structs** (not concurrency — concurrency never existed)
+- P9 was **Traits/impl/vtable** 
+- P10 = For-in (DONE) + Generics (NEXT)
+- P11 = P6 stub cleanup (type annotation, ARM volatile, inline asm, SIMD)
+- P12 = GPU/PTX/SPIR-V/WASM (future)

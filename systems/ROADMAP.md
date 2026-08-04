@@ -15,7 +15,6 @@ compiles to every tier — bare-metal kernel, edge WASM, GPU kernel, cloud servi
 
 ---
 
-
 ## 2. Language Syntax
 
 ### 2.1 Program structure
@@ -27,7 +26,7 @@ compiles to every tier — bare-metal kernel, edge WASM, GPU kernel, cloud servi
 Execution starts at `fn main()`; return value is the process exit code
 (default `0` if no explicit `return`).
 
-> **P6 status:** `enum`, `match`, `Option/Result` implemented (qc-0.0.4–0.0.7); `trait`/`impl`/vtable dispatch + struct literals implemented (qc-0.0.13); generics `<T>` NOT yet wired (P10 next). The syntax sections below reflect the working language.
+> **P6 status (CLOSED):** Raw pointer deref/arithmetic/cast/null + `unsafe {}` block — IMPLEMENTED on both backends. P6 stubs (type annotation, ARM volatile barrier, inline asm, SIMD) moved to **P11**.
 
 ### 2.2 Functions
 
@@ -62,7 +61,7 @@ fn area(self) { return self.w * self.h }
 let r = (3, 4); return r.area()    // 12
 ```
 
-### 2.4 Structs
+### 2.4 Structs (P8 — DONE, qc-0.0.12)
 
 ```
 struct Name { f0, f1: TypeA, f2: TypeB }
@@ -96,7 +95,7 @@ match c {
 }
 ```
 
-### 2.7 Option / Result (built-in enums, fully implemented qc-0.0.11)
+### 2.7 Option / Result (built-in enums, fully implemented qc-0.0.11, P7)
 
 ```quanta
 let x = Some(42)
@@ -107,6 +106,7 @@ fn divide(a, b) -> Result<int, string> {
     return Ok(a / b)
 }
 ```
+
 - `Option` and `Result` are built-in enum types with compiler support for `Some`/`None` and `Ok`/`Err` constructors.
 - **Note**: Bare `Some(val)`, `None`, `Ok(val)`, `Err(val)` expressions and `match` on them are fully implemented on x86_64 AND ARM64 (P7, qc-0.0.11). Payload access via `.1` (index 1): `let v = Some(42); v.1 == 42`.
 - See `option_test.quanta` (42), `result_test.quanta` (5), `option_simple/option_tuple/option_ctor` (42/42/0).
@@ -122,6 +122,7 @@ fn map<T, U>(arr: [T], f: fn(T) -> U) -> [U] {
     return result
 }
 ```
+
 > `<T>` type parameters are NOT implemented — `fn map<T,U>` fails with
 > "undeclared variable: U". This is the next P10 milestone.
 
@@ -135,6 +136,7 @@ x = x + 1             // assign to existing
 `let` shadows previous bindings (newest wins). Type inferred from RHS.
 
 ### 2.10 Associated Types & Where Clauses
+
 Not yet implemented.
 
 ### 2.11 Control flow
@@ -144,7 +146,7 @@ if cond { ... } else if cond { ... } else { ... }
 loop { ... break continue }
 while cond { ... }
 for i = start; cond; step { ... }      // C-style for
-for x in arr { ... }                   // for-in over array (P10)
+for x in arr { ... }                   // for-in over array (P10 — DONE in wip)
 ```
 
 - `cond` truthy when non-zero.
@@ -164,7 +166,7 @@ for x in arr { ... }                   // for-in over array (P10)
 -  !  ~  not      (unary prefix)
 ```
 
-### 2.13 Unsafe
+### 2.13 Unsafe (P6 — DONE)
 
 ```
 unsafe { ... }
@@ -173,7 +175,7 @@ unsafe { ... }
 Opts OUT of overflow/shift/bounds traps. Counted globally; audit report on
 success when count>0. Malformed (no `{`) → compile error.
 
-### 2.14 Extern FFI
+### 2.14 Extern FFI (P3 — DONE)
 
 ```
 extern "C" fn name(params...) -> type { }
@@ -181,7 +183,7 @@ extern "C" fn name(params...) -> type { }
 
 Declares external C-ABI function. Emits unresolved call (PLT/GOT future).
 
-### 2.15 Include / Module system
+### 2.15 Include / Module system (P9 — MTU NOT IMPLEMENTED)
 
 ```
 include "path/file.q"     // resolved relative to including file's dir
@@ -239,7 +241,6 @@ let p = mem_alloc(n)    // p is OWNED on `mem_alloc()` call
 
 ---
 
-
 ## 3. Types
 
 > All values are 64-bit words at runtime. "Types" are compile-time annotations.
@@ -263,7 +264,6 @@ let p = mem_alloc(n)    // p is OWNED on `mem_alloc()` call
 Float operations via builtins: `fadd`, `fmul`, `fsub`, `fdiv`.
 
 ---
-
 
 ## 4. Built-in Functions
 
@@ -337,7 +337,6 @@ All emit inline (no call overhead). SysV/ABI (rdi, rsi, rdx, rcx, r8, r9).
 
 ---
 
-
 ## 5. Standard Library
 
 ### 5.1 std/string
@@ -363,7 +362,6 @@ search). All integer-only (no float).
 `write_file(path, data)` (O_CREAT|WRONLY|TRUNC), `read_file(path)` (cap 1 MiB).
 
 ---
-
 
 ## 6. Architecture
 
@@ -448,7 +446,6 @@ Default ON since 1.0.12. Verified 286× speedup on arithmetic-progression loop.
 
 ---
 
-
 ## 7. Security (Secure-by-Default)
 
 All ON by default. Suppressed inside `unsafe {}`. Disable with
@@ -463,7 +460,6 @@ All ON by default. Suppressed inside `unsafe {}`. Disable with
 | Emission bounds (F1) | Token/IR/var/fn/alloc overflow → exit(17) | Clean abort |
 
 ---
-
 
 ## 8. Test Suite
 
@@ -498,11 +494,67 @@ All ON by default. Suppressed inside `unsafe {}`. Disable with
 
 ---
 
-
 ## 9. Version History
 
-The authoritative version history is in `systems/version_history.md`. Summary of the 0.0.x line: **0.0.1** bootstrapped self-host → **0.0.2–0.0.3** P6 low-level (pointers/asm/volatile/FFI/SIMD/unsafe) → **0.0.4–0.0.5** enums/match + bare Some/None/Ok/Err → **0.0.6** promoted enums → **0.0.7** ARM64 self-host fixed → **0.0.8–0.0.10** P6 batches (pointers, FFI/asm/SIMD/unsafe) → **0.0.11** P7 Option/Result/match both backends → **0.0.12** P8 structs → **0.0.13** P9 traits/impl/vtable/struct-literals (stable) → **0.0.14-wip** P10 for-in (nested, `arr[-1]`) + gsz BSS fix; generics next.
+The authoritative version history is in `systems/version_history.md`. Summary of the 0.0.x line: **0.0.1** bootstrapped self-host → **0.0.2–0.0.3** P6 low-level (raw ptr deref/arith/cast/null, unsafe) → **0.0.4–0.0.5** enums/match + bare Some/None/Ok/Err → **0.0.6** promoted enums → **0.0.7** ARM64 self-host fixed → **0.0.8–0.0.10** P6 batches (FFI, SIMD/asm stubs) → **0.0.11** P7 Option/Result/match both backends → **0.0.12** P8 structs → **0.0.13** P9 traits/impl/vtable/struct-literals (stable) → **0.0.14-wip** P10 for-in (nested, `arr[-1]`) + gsz BSS fix; generics next.
 
 Legacy 1.1.x line (2026-07-20 → 1.1.34) is historical/superseded.
+
+---
+
+## 10. Pillar Summary (Actual Source State)
+
+| Pillar | Feature | Status | Notes |
+|--------|---------|--------|-------|
+| **P1** | Types, fn, control flow, arrays | ✅ DONE | 12/12 tests pass |
+| **P2** | Memory/ownership (mmap, free, globals) | ✅ DONE | 4/4 tests pass |
+| **P3** | FFI / C ABI / fnptr | ✅ DONE | 1/1 test pass |
+| **P4** | Multi-backend (x86 + ARM64) | ✅ DONE | cross-compile works |
+| **P5** | ELF writer, BSS, static PIE | ✅ DONE | byte-identical fixed-point |
+| **P6** | **Raw ptr deref/arith/cast/null + `unsafe {}`** | ✅ **CLOSED** | Both backends implemented |
+| **P7** | Option/Result/Enum/Match/unwrap | ✅ DONE | 6/6 tests pass |
+| **P8** | Structs (decl, ctor, field access) | ✅ DONE | `struct_test` → 7 |
+| **P9** | Traits/impl/vtable/dyn + struct literals | ✅ DONE | `trait_test` → 0 |
+| **P10** | **For-in + `arr[-1]` + nested** | ✅ **DONE** (wip) | 4/4 tests pass |
+| **P10** | **Generics `<T>` monomorphization** | ❌ **OPEN** | `generics_test` FAIL — next milestone |
+| **P11** | **P6 stubs cleanup** | ❌ **OPEN** | See below |
+| **P12** | GPU/PTX/SPIR-V/WASM/bare-metal | ❌ **NOT STARTED** | No IR/parser/backend |
+
+### P11 — P6 Stubs Cleanup (moved from P6)
+
+| Feature | IR | x86 | ARM64 | Blocker |
+|---------|----|-----|-------|---------|
+| Raw ptr **type annotation** `let p: *u64 = &x` | 54/55 | "No-op" | Not handled | Parser emits nothing → `raw_ptr_test` FAIL 17 |
+| **ARM64 volatile barrier** | 63/64 | `mfence` | ❌ missing `dmb ish` | `IR_VOLATILE_LOAD/STORE` handler |
+| **Inline asm** | 65 | `nop` | `nop` | `TT_ASM`/`TT_AS` tokens exist, parser stub |
+| **SIMD vec128** | 67 | `nop` | `nop` | `IR_VEC128` defined, no codegen |
+
+### P12 — Multi-Target Backends (future)
+
+- PTX (NVIDIA GPU) direct from Quanta-IR
+- SPIR-V (Vulkan/WebGPU) direct from Quanta-IR  
+- WASM (edge/browser)
+- Bare-metal kernel (no stdlib, custom entry)
+
+---
+
+## 11. Known Open Bugs (from known_warts_bugs.md §10.2)
+
+| Test / Issue | Symptom | Root Cause | Status |
+|--------------|---------|------------|--------|
+| `generics_test` | `undeclared variable: U` | `<T>` generic type-parameter syntax not implemented. Requires generic monomorphization. | 🔴 OPEN — P10 next milestone |
+| `let p: *u64 = &x` | "source too many tokens/IR limit" | Raw-pointer **type annotation** (`*T`) in a `let` explodes IR. `&x`/`*p` deref ops alone work. | 🔴 OPEN — P11 type-annotation gap |
+| `mtu_glob_use`, `mtu_helper` | compile-fail | Multi-TU module system not implemented. | 🔴 OPEN — P9 MTU |
+| **ARM64 native self-host (Stage 2)** | `SIGSEGV` rc=139 | OOB read into compiler's own globals on real aarch64 (ai-arm-01). x86 self-host is perfect fixed-point. | 🔴 OPEN — blocks ARM64 true self-host |
+
+---
+
+## 12. Verification Rules
+
+- **Self-host fixed-point mandatory** — every incremental patch must be followed by self-host test (compiler rebuilds its own source). If self-host fails, roll back.
+- **ARM64 verification** — cross-compile alone NOT enough; must dump bytes, disassemble, verify on hardware or qemu. Real Android devices (SSH port 8022) + qemu-aarch64 available.
+- **EDITS FOR ARM64 MUST TARGET `arm_ci_func` / `arm_emit_bltn` (line 5725), NOT x86 `emit_bltn`**.
+- **Bootstrap binary**: `bin/x86_64/qc-0.0.13` (md5 0d41f658, commit 0d0806b) — load-bearing for self-host.
+- **Never create placeholder implementations** unless feature is explicitly in a later pillar OR scope is defined first and full implementation is genuinely blocked.
 
 ---

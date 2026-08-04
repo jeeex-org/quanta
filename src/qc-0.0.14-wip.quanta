@@ -49,7 +49,8 @@ let TT_USIZE = 37
 let TT_PANIC = 38
 // P8: struct keyword
 let TT_STRUCT = 39
-let TT_IN = 41
+// P10: for-in loop keyword
+let TT_IN = 40
 
 // === KEYWORD HASHES ===
 // h = h*31 + byte for each character
@@ -112,6 +113,8 @@ let H_EXPECT = (((((101*31 + 120)*31 + 112)*31 + 101)*31 + 99)*31 + 116)
 let H_PANIC = (((((112*31 + 97)*31 + 110)*31 + 105)*31 + 99))
 // P8: struct keyword
 let H_STRUCT = (((((115*31 + 116)*31 + 114)*31 + 117)*31 + 99)*31 + 116)
+// P10: 'in' keyword for for-in loops
+let H_IN = 43
 
 // === IR OPS ===
 let IR_CONST = 0; let IR_MOV = 1; let IR_ADD = 2; let IR_SUB = 3
@@ -181,8 +184,7 @@ let IR_ASM = 65          // inline assembly
 let IR_FFI_CALL = 66     // FFI call
 let IR_VEC128 = 67       // SIMD vec128
 let IR_UNSAFE_BLOCK = 68 // unsafe block marker (no-op)
-let IR_ARRAY_LEN = 69    # get array length from header [base]
-// let vr_loop_live = mmap(2000000)
+let IR_ARRAY_LEN = 69    // get array length from header [base]
 
 // === GLOBAL BUFFERS ===
 // Source
@@ -871,10 +873,11 @@ fn ktext(sv, ln) {
     if ln==3 && r8(src+sv)==69 && r8(src+sv+1)==114 && r8(src+sv+2)==114 { return 33 } // Err
     if ln==4 && r8(src+sv)==114 && r8(src+sv+1)==101 && r8(src+sv+2)==102 { return 34 } // ref
     if ln==3 && r8(src+sv)==109 && r8(src+sv+1)==117 && r8(src+sv+2)==116 { return 35 } // mut
-    if ln==2 && r8(src+sv)==105 && r8(src+sv+1)==110 { return 36 } // in (P10 for-in)
-    if ln==4 && r8(src+sv)==109 && r8(src+sv+1)==111 && r8(src+sv+2)==118 && r8(src+sv+3)==101 { return 37 } // move
+    if ln==4 && r8(src+sv)==109 && r8(src+sv+1)==111 && r8(src+sv+2)==118 && r8(src+sv+3)==101 { return 36 } // move
     if ln==6 && r8(src+sv)==83 && r8(src+sv+1)==116 && r8(src+sv+2)==114 && r8(src+sv+3)==105 && r8(src+sv+4)==110 && r8(src+sv+5)==103 { return 37 } // String
     if ln==2 && r8(src+sv)==97 && r8(src+sv+1)==115 { return 41 } // as
+    // P10: 'in' keyword for for-in loops
+    if ln==2 && r8(src+sv)==105 && r8(src+sv+1)==110 { return 43 } // in
     if ln==3 && r8(src+sv)==114 && r8(src+sv+1)==97 && r8(src+sv+2)==119 { return 38 } // raw
     if ln==3 && r8(src+sv)==97 && r8(src+sv+1)==115 && r8(src+sv+2)==109 { return 40 } // asm
     if ln==5 && r8(src+sv)==117 && r8(src+sv+1)==115 && r8(src+sv+2)==105 && r8(src+sv+3)==122 && r8(src+sv+4)==101 { return 42 } // usize
@@ -895,11 +898,6 @@ fn ktext(sv, ln) {
 }
 
 fn iremit(op,res,a0,a1,a2) {
-    // IR-level fix: convert arr[-1] (IR_IDX with index -1) to IR_ARRAY_LEN
-    // Array layout: header at [base]=len, elements at [base+8]... 
-    // IR_IDX formula: base + idx*8 + 8. For idx=-1: base + (-1)*8 + 8 = base.
-    // So arr[-1] == arr[base] == length.
-    if op==32 && a1==-1 { op=IR_ARRAY_LEN; a1=0 }
     if irc >= IR_CAP { emit_ovf() }
     let i = irc; irc = i+1
     w64(ir + i*IRS, op); w64(ir + i*IRS + 8, res)
@@ -1383,8 +1381,8 @@ fn tokenize() {
             else if kt==33 { ty=TT_ID }   // Err
             else if kt==34 { ty=TT_REF }
             else if kt==35 { ty=TT_MUT }
-            else if kt==36 { ty=TT_IN }
-            else if kt==37 { ty=TT_KEY }
+            else if kt==36 { ty=TT_MOVE }
+            else if kt==37 { ty=TT_STRING }
             // P9: "for" keyword (ktext=7)
             else if kt==7 { ty=TT_KEY }
             // P6: Low-level keywords
@@ -1397,6 +1395,8 @@ fn tokenize() {
             else if kt==H_PANIC { ty=TT_PANIC }
             // P8: struct keyword
             else if kt==H_STRUCT { ty=TT_STRUCT }
+            // P10: 'in' keyword for for-in loops
+            else if kt==H_IN { ty=TT_IN }
         stok(tokc,ty,sp,l,sc,nl); tokc=tokc+1
         } else if ismop(p) {
             stok(tokc,TT_OP,mopv(p),l,c,2); tokc=tokc+1; p=p+2; c=c+2
@@ -2974,36 +2974,6 @@ fn parse_primary() {
         }
         if peek()==TT_PNCT&&pval()==91 {  // index: a[idx]
             adv(); let idx=parse_expr(); mpnct(93)
-            // Check if idx is a constant -1 (arr[-1] -> array length from header)
-            // Could be direct IR_CONST -1, or IR_NEG of IR_CONST 1
-            let is_neg1 = 0
-            if op_is_const(idx)==1 && op_const_val(idx)==-1 { is_neg1 = 1 }
-            else {
-                // Check for IR_NEG(IR_CONST(1))
-                let k = irc - 1
-                while k>=0 {
-                    if irres(k)==idx && irop(k)==15 {  // IR_NEG=15
-                        let neg_arg = ira0(k)
-                        let k2 = k - 1
-                        while k2>=0 {
-                            if irres(k2)==neg_arg && irop(k2)==IR_CONST && ira0(k2)==1 {
-                                is_neg1 = 1
-                                break
-                            }
-                            k2=k2-1
-                        }
-                        break
-                    }
-                    k=k-1
-                }
-            }
-            if is_neg1==1 {
-                let f=vfind(nm,nl)
-                if f>=0 { let vr=nv(); iremit(IR_ARRAY_LEN,vr,f,0,0); return vr }
-                let g=gfind(nm,nl)
-                if g>=0 { let pg=nv(); iremit(IR_LOADG,pg,g,0,0); let vr=nv(); iremit(IR_ARRAY_LEN,vr,pg,0,0); return vr }
-                compile_error(1, nm, nl)
-            }
             let f=vfind(nm,nl)
             if f>=0 { let vr=nv(); iremit(32,vr,f,idx,0); return vr }
             let g=gfind(nm,nl)
@@ -4049,8 +4019,6 @@ fn constfold(i, op, r0, a0, a1) {
     if ovf_trap==1 {
         if op==IR_ADD || op==IR_SUB || op==IR_MUL { return 0 }
     }
-    // P10: NEVER constant-fold comparison ops (EQ/NE/LT/GT/LE/GE).
-    if op==IR_EQ || op==IR_NE || op==IR_LT || op==IR_GT || op==IR_LE || op==IR_GE { return 0 }
     let c0 = op_is_const(a0); let c1 = op_is_const(a1)
     if c0==1 && c1==1 {
         let v0 = op_const_val(a0); let v1 = op_const_val(a1); let f=0
@@ -4582,36 +4550,6 @@ fn ci_func(fi, is_main) {
             let rd=aphys(res); if rd!=0 { rr(rd,0) }
             sdef(res, rd)
         }
-        else if op==IR_ARRAY_LEN {  // op=69: get array length from header [base]
-            // Array header is at [base]: len at [base], elements start at [base+8]
-            flush_all()
-            let r=aphys(a0)  # get current register for base pointer
-            # Load length from [base] to rax
-            if r == 0 {
-                eb(72); eb(139); eb(0)   # mov rax, [rax]
-            } else {
-                rr(0, r)                  # rax = base
-                eb(72); eb(139); eb(0)   # mov rax, [rax]
-            }
-            # Length now in rax. Result goes to rd (must not be base register r)
-            let rd=aphys(res)
-            if rd == r {
-                # Find different register
-                let k=0
-                while k<14 {
-                    let pr=r64(REGS+k*8)
-                    let used=0; let j=0
-                    while j<allocfc { if r64(alloc+j*16+8)==pr { used=1; break }; j=j+1 }
-                    if used==0 && pr!=r { rd=pr; break }
-                    k=k+1
-                }
-            }
-            if rd != 0 { rr(rd, 0) }
-            # If base was in rax (r==0), the mov rax,[rax] clobbered it; reload
-            # base from its home slot so the next flush keeps it valid.
-            if r == 0 { rbp(0, spill_home(a0)) }
-            sdef(res, rd)
-        }
         else if op==IR_ISTORE {
             // a[idx] = v : header-carrying [base]=len. String base -> byte store.
             flush_all()
@@ -5036,6 +4974,14 @@ fn ci_func(fi, is_main) {
             eb(72); mr(0, rs, rt)   // mov [rs], rt  (64-bit store)
             // Compiler barrier
             eb(0x0F); eb(0xAE); eb(0xF0)  // mfence
+        }
+        // P10: IR_ARRAY_LEN (op 69) — get array length from header [base]
+        else if op==IR_ARRAY_LEN {
+            flush_all()
+            let rs=aphys(a0)
+            let rd=aphys(res)
+            eb(0x48); eb(0x8B); mr(0, rd, rs)  // mov rd, [rs]  (64-bit load from header)
+            sdef(res, rd)
         }
         else if op==IR_STR {
             // a0 = pointer to string in source (including opening quote)
@@ -5876,7 +5822,7 @@ fn arm_ci_func(fi, is_main) {
     araw(0x910003FD)                // mov x29, sp
     let spill_region = 48 + vreg_n * 8
     let frame_size = spill_region + total_str + 80
-    let min_spill = 4096
+    let min_spill = 16384
     if frame_size < min_spill { frame_size = min_spill }
     let rem = frame_size % 16; if rem>0 { frame_size = frame_size + (16-rem) }
     // sub sp, sp, #frame  (encode via movz/movk to x9 then sub)
@@ -6059,8 +6005,8 @@ fn arm_ci_func(fi, is_main) {
             let rd=aphys_a(res); if rd!=0 { araw(0xAA0003E0|(0<<16)|rd) }
             amovz(2, a0); astr(2, 0, 0); asdef(res, rd)
         }
-        else if op==IR_ARRAY_LEN {  // op=69: get array length from header [base]
-            // Array header: length stored at [base] (qword). Result = *(base).
+        // P10: IR_ARRAY_LEN (op 69) — get array length from header [base]
+        else if op==IR_ARRAY_LEN {
             aflsuh_all()
             aldr(0, 31, ahome(a0))   // x0 = base ptr
             araw(0xF9400000)          // ldr x0, [x0]  ; x0 = length header
@@ -6227,131 +6173,110 @@ fn arm_ci_func(fi, is_main) {
         }
         else if op==IR_DEREF {  // P6: *p - raw pointer dereference (load)
             aflsuh_all()
-            else if op==IR_DEREF {  // P6: *p - raw pointer dereference (load)
-                        aflsuh_all()
-                        let rd=aphys_a(res)
-                        let rs=aphys_a(a0)
-                        aldr(rd, rs, 0)
-                        asdef(res, rd)
-                    }
-                    else if op==IR_DEREF_MUT {  // P6: *p = v (store through raw pointer)
-                        aflsuh_all()
-                        let rs=aphys_a(a0)   // pointer
-                        let rv=aphys_a(a1)   // value
-                        astr(rv, rs, 0)
-                    }
-                    else if op==IR_PTR_ADD {  // P6: p + n (element-sized)
-                        let r1=aphys_a(a0); let r2=aphys_a(a1); let rd=adistinct_a(res,r1,r2)
-                        if rd!=r1 { amovr(rd, r1) }
-                        // Scale by 8 (element size): lsl r2, r2, 3
-                        if r2!=0 { alsl(r2, r2, 3) }
-                        // add rd, rd, r2
-                        aadd(rd, rd, r2)
-                        asdef(res, rd)
-                    }
-                    else if op==IR_PTR_SUB {  // P6: p - n (element-sized)
-                        let r1=aphys_a(a0); let r2=aphys_a(a1); let rd=adistinct_a(res,r1,r2)
-                        if rd!=r1 { amovr(rd, r1) }
-                        // Scale by 8: lsl r2, r2, 3
-                        if r2!=0 { alsl(r2, r2, 3) }
-                        // sub rd, rd, r2
-                        asub(rd, rd, r2)
-                        asdef(res, rd)
-                    }
-                    else if op==IR_PTR_DIFF {  // P6: p - q (elements)
-                        let r1=aphys_a(a0); let r2=aphys_a(a1); let rd=adistinct_a(res,r1,r2)
-                        if rd!=r1 { amovr(rd, r1) }
-                        // sub rd, r1, r2
-                        asub(rd, r1, r2)
-                        // Divide by 8: asr rd, rd, 3
-                        alsr(rd, rd, 3)
-                        asdef(res, rd)
-                    }
-                    else if op==IR_PTR_CAST {  // P6: &p or cast to raw pointer
-                        // a1: 1 = address-of, 0 = cast (no-op)
-                        let rd=aphys_a(res)
-                        let rs=aphys_a(a0)
-                        if rd!=rs { araw(0xAA0003E0 | (rs << 16) | rd) }
-                        asdef(res, rd)
-                    }
-                    else if op==IR_IS_NULL {  // P6: p == 0
-                        let r1=aphys_a(a0); let rd=aphys_a(res)
-                        // cmp xn, #0
-                        araw(0xF100001F | ((r1 & 31) << 5))
-                        // cset xd, eq (cond=0): 0x9A9F17E0 | rd | (0<<12)
-                        araw(0x9A9F17E0 | (rd & 31))
-                        asdef(res, rd)
-                    }
-                    else if op==IR_VOLATILE_LOAD {  // P6: volatile load
-                        aflsuh_all()
-                        let rd=aphys_a(res)
-                        let rs=aphys_a(a0)
-                        aldr(rd, rs, 0)
-                        asdef(res, rd)
-                    }
-                    else if op==IR_VOLATILE_STORE {  // P6: volatile store
-                        aflsuh_all()
-                        let rs=aphys_a(a0)
-                        let rt=aphys_a(a1)
-                        astr(rt, rs, 0)
-                    }
-                    else if op==IR_FFI_CALL {  // P6: FFI call - AAPCS64
-                        aflsuh_all()
-                        // a0 = function pointer, a1 = num args, a2 = args array
-                        let fn_ptr = aphys_a(a0)
-                        let args_ptr = aphys_a(a2)
-                        
-                        // Load args into X0-X7 (AAPCS64: X0-X7 for first 8 args)
-                        let arg0 = nv(); let arg1 = nv(); let arg2 = nv()
-                        let arg3 = nv(); let arg4 = nv(); let arg5 = nv()
-                        let arg6 = nv(); let arg7 = nv()
-                        
-                        aldr(arg0, aphys_a(a2), 0)
-                        aldr(arg1, aphys_a(a2), 8)
-                        aldr(arg2, aphys_a(a2), 16)
-                        aldr(arg3, aphys_a(a2), 24)
-                        aldr(arg4, aphys_a(a2), 32)
-                        aldr(arg5, aphys_a(a2), 40)
-                        aldr(arg6, aphys_a(a2), 48)
-                        aldr(arg7, aphys_a(a2), 56)
-                        
-                        // Move to AAPCS64 argument registers X0-X7
-                        if arg0 != 0 { araw(0xAA0003E0 | (arg0 << 16) | 0) }  // X0
-                        if arg1 != 0 { araw(0xAA0003E0 | (arg1 << 16) | 1) }  // X1
-                        if arg2 != 0 { araw(0xAA0003E0 | (arg2 << 16) | 2) }  // X2
-                        if arg3 != 0 { araw(0xAA0003E0 | (arg3 << 16) | 3) }  // X3
-                        if arg4 != 0 { araw(0xAA0003E0 | (arg4 << 16) | 4) }  // X4
-                        if arg5 != 0 { araw(0xAA0003E0 | (arg5 << 16) | 5) }  // X5
-                        if arg6 != 0 { araw(0xAA0003E0 | (arg6 << 16) | 6) }  // X6
-                        if arg7 != 0 { araw(0xAA0003E0 | (arg7 << 16) | 7) }  // X7
-                        
-                        // Call function pointer
-                        let fn_ptr = aphys_a(a0)
-                        if fn_ptr != 0 { araw(0xAA0003E0 | (fn_ptr << 16) | 16) }  // X16 = fn_ptr
-                        araw(0xD63F0100)  // blr x16
-                        
-                        // Return value in X0
-                        let rd = aphys_a(res)
-                        if rd != 0 { araw(0xAA0003E0 | (0 << 16) | rd) }  // mov rd, X0
-                        asdef(res, rd)
-                    }
-                    else if op==IR_VEC128 {  // P6: SIMD vec128 (placeholder)
-                        aflsuh_all()
-                        araw(0xD503201F)  // nop
-                        let rd=aphys_a(res)
-                        rxor(rd, rd)
-                        sdef(res, rd)
-                    }
-                    else if op==IR_UNSAFE_BLOCK {  // P6: unsafe block marker (no-op at runtime)
-                        // No-op: unsafe{} is a compile-time construct
-                    }
-                    else if op==IR_ASM {  // P6: inline assembly (placeholder)
-                        aflsuh_all()
-                        araw(0xD503201F)  // nop
-                        let rd=aphys_a(res)
-                        rxor(rd,rd)
-                        sdef(res, rd)
-                    }
+            let rd=aphys_a(res)
+            let rs=aphys_a(a0)
+            aldr(rd, rs, 0)
+            asdef(res, rd)
+        }
+        else if op==IR_DEREF_MUT {  // P6: *p = v (store through raw pointer)
+            aflsuh_all()
+            let rs=aphys_a(a0)   // pointer
+            let rv=aphys_a(a1)   // value
+            astr(rv, rs, 0)
+        }
+        else if op==IR_PTR_ADD {  // P6: p + n (element-sized)
+            let r1=aphys_a(a0); let r2=aphys_a(a1); let rd=adistinct_a(res,r1,r2)
+            if rd!=r1 { amovr(rd, r1) }
+            if r2!=0 { alsl(r2, r2, 3) }
+            aadd(rd, rd, r2)
+            asdef(res, rd)
+        }
+        else if op==IR_PTR_SUB {  // P6: p - n (element-sized)
+            let r1=aphys_a(a0); let r2=aphys_a(a1); let rd=adistinct_a(res,r1,r2)
+            if rd!=r1 { amovr(rd, r1) }
+            if r2!=0 { alsl(r2, r2, 3) }
+            asub(rd, rd, r2)
+            asdef(res, rd)
+        }
+        else if op==IR_PTR_DIFF {  // P6: p - q (elements)
+            let r1=aphys_a(a0); let r2=aphys_a(a1); let rd=adistinct_a(res,r1,r2)
+            if rd!=r1 { amovr(rd, r1) }
+            asub(rd, r1, r2)
+            alsr(rd, rd, 3)
+            asdef(res, rd)
+        }
+        else if op==IR_PTR_CAST {  // P6: &p or cast to raw pointer
+            let rd=aphys_a(res)
+            let rs=aphys_a(a0)
+            if rd!=rs { araw(0xAA0003E0 | (rs << 16) | rd) }
+            asdef(res, rd)
+        }
+        else if op==IR_IS_NULL {  // P6: p == 0
+            let r1=aphys_a(a0); let rd=aphys_a(res)
+            araw(0xF100001F | ((r1 & 31) << 5))
+            araw(0x9A9F17E0 | (rd & 31))
+            asdef(res, rd)
+        }
+        else if op==IR_VOLATILE_LOAD {  // P6: volatile load
+            aflsuh_all()
+            let rd=aphys_a(res)
+            let rs=aphys_a(a0)
+            aldr(rd, rs, 0)
+            asdef(res, rd)
+        }
+        else if op==IR_VOLATILE_STORE {  // P6: volatile store
+            aflsuh_all()
+            let rs=aphys_a(a0)
+            let rt=aphys_a(a1)
+            astr(rt, rs, 0)
+        }
+        else if op==IR_FFI_CALL {  // P6: FFI call - AAPCS64
+            aflsuh_all()
+            let fn_ptr = aphys_a(a0)
+            let args_ptr = aphys_a(a2)
+            let arg0 = nv(); let arg1 = nv(); let arg2 = nv()
+            let arg3 = nv(); let arg4 = nv(); let arg5 = nv()
+            let arg6 = nv(); let arg7 = nv()
+            aldr(arg0, aphys_a(a2), 0)
+            aldr(arg1, aphys_a(a2), 8)
+            aldr(arg2, aphys_a(a2), 16)
+            aldr(arg3, aphys_a(a2), 24)
+            aldr(arg4, aphys_a(a2), 32)
+            aldr(arg5, aphys_a(a2), 40)
+            aldr(arg6, aphys_a(a2), 48)
+            aldr(arg7, aphys_a(a2), 56)
+            if arg0 != 0 { araw(0xAA0003E0 | (arg0 << 16) | 0) }
+            if arg1 != 0 { araw(0xAA0003E0 | (arg1 << 16) | 1) }
+            if arg2 != 0 { araw(0xAA0003E0 | (arg2 << 16) | 2) }
+            if arg3 != 0 { araw(0xAA0003E0 | (arg3 << 16) | 3) }
+            if arg4 != 0 { araw(0xAA0003E0 | (arg4 << 16) | 4) }
+            if arg5 != 0 { araw(0xAA0003E0 | (arg5 << 16) | 5) }
+            if arg6 != 0 { araw(0xAA0003E0 | (arg6 << 16) | 6) }
+            if arg7 != 0 { araw(0xAA0003E0 | (arg7 << 16) | 7) }
+            let fn_ptr2 = aphys_a(a0)
+            if fn_ptr2 != 0 { araw(0xAA0003E0 | (fn_ptr2 << 16) | 16) }
+            araw(0xD63F0100)  // blr x16
+            let rd = aphys_a(res)
+            if rd != 0 { araw(0xAA0003E0 | (0 << 16) | rd) }
+            asdef(res, rd)
+        }
+        else if op==IR_VEC128 {  // P6: SIMD vec128 (placeholder)
+            aflsuh_all()
+            araw(0xD503201F)  // nop
+            let rd=aphys_a(res)
+            rxor(rd, rd)
+            sdef(res, rd)
+        }
+        else if op==IR_UNSAFE_BLOCK {  // P6: unsafe block marker (no-op at runtime)
+        }
+        else if op==IR_ASM {  // P6: inline assembly (placeholder)
+            aflsuh_all()
+            araw(0xD503201F)  // nop
+            let rd=aphys_a(res)
+            rxor(rd,rd)
+            sdef(res, rd)
+        }
+        else if op==IR_STR {
             let sp2=a0+1; let ln=0; let scp=sp2
             while scp<srclen&&r8(src+scp)!=34 { ln=ln+1; if r8(src+scp)==92&&scp+1<srclen { scp=scp+2 } else { scp=scp+1 } }
             let gdata_size=(INTERNAL_GLOBAL_COUNT+gvarc)*8
@@ -6406,13 +6331,9 @@ fn write_elf(outp) {
     // the loader reject/fault the RW segment (x86) or skew gdata content (ARM bionic).
     { let trm=tp%pg; if trm>0 { tp=tp+(pg-trm) } }
     // Size of the global data segment (bss), page aligned. Include internal globals
-    // so the compiler's own globals are mapped in the output binary. CRITICAL: the
-    // RW segment also holds the string-literal pool starting at GDATA+gdata_size
-    // (src_data_off bytes appended after the globals). If it is NOT folded into gsz,
-    // the ELF file ends (elf_total=tp+gsz) short of the declared gdata_filesz, the
-    // loader maps the RW segment truncated, and any global past the mapped end is a
-    // SIGBUS at runtime. Fold data_off in so the file covers the whole data segment.
+    // so the compiler's own globals are mapped in the output binary.
     let gsz=(gvarc+INTERNAL_GLOBAL_COUNT)*8 + data_off; let grm=gsz%pg; if grm>0 { gsz=gsz+(pg-grm) }
+    if gsz<pg { gsz=pg }
     if gsz<pg { gsz=pg }
     // ARM64 static PIE: reserve a dynamic tail in the gdata region for bionic:
     // .dynamic(144) + .dynstr(1) + .dynsym(24) + .gnu.hash(32) + .hash(16) = 217 -> 224.
