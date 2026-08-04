@@ -51,6 +51,9 @@ let TT_PANIC = 38
 let TT_STRUCT = 39
 // P10: for-in loop keyword
 let TT_IN = 40
+// P10: Generics - generic type delimiters
+let TT_GENERIC_LT = 41
+let TT_GENERIC_GT = 42
 
 // === KEYWORD HASHES ===
 // h = h*31 + byte for each character
@@ -115,6 +118,7 @@ let H_PANIC = (((((112*31 + 97)*31 + 110)*31 + 105)*31 + 99))
 let H_STRUCT = (((((115*31 + 116)*31 + 114)*31 + 117)*31 + 99)*31 + 116)
 // P10: 'in' keyword for for-in loops
 let H_IN = 43
+// P10: Generics - no keyword hashes needed, uses context-sensitive < >
 
 // === IR OPS ===
 let IR_CONST = 0; let IR_MOV = 1; let IR_ADD = 2; let IR_SUB = 3
@@ -185,6 +189,8 @@ let IR_FFI_CALL = 66     // FFI call
 let IR_VEC128 = 67       // SIMD vec128
 let IR_UNSAFE_BLOCK = 68 // unsafe block marker (no-op)
 let IR_ARRAY_LEN = 69    // get array length from header [base]
+// P10: Generics monomorphization
+let IR_GENERIC_INST = 70  // instantiate generic function with type args
 
 // === GLOBAL BUFFERS ===
 // Source
@@ -232,6 +238,9 @@ let fn_pnames = mmap(4000000)   // flat [name_ptr,name_len] per param, fn_pbase-
 let fn_pncnt = mmap(2000000)    // per-fn param count
 let fn_pbase = mmap(2000000)    // per-fn base offset into fn_pnames
 let fn_retstruct = mmap(2000000) // per-fn: struct index returned by `return StructCtor(...)` (-1 if none)
+// P10: per-fn return type name (for generic return types like [U])
+let fn_rettype_name = mmap(2000000)
+let fn_rettype_len = mmap(2000000)
 // Phase 4.3: per-fn-param struct type. fn_partype[(fi*200 + z)*8] = struct
 // index of param z's declared `: Type` annotation (-1 if scalar/none).
 let fn_partype = mmap(2000000)
@@ -240,6 +249,14 @@ let alias_c = 0
 let fn_poff = 0
 // P3: per-fn extern linkage flag (1 = extern "C", 0 = internal)
 let fn_extern = mmap(2000000)
+// P10: Generic function table extensions
+let fn_generic = mmap(2000000)      // 1 if function has generic params
+let fn_genparams = mmap(2000000)    // number of generic type params
+let fn_genparam_names = mmap(8000000) // flat [name_ptr,name_len] per generic param
+let fn_genparam_base = mmap(2000000)  // base offset into fn_genparam_names
+// Monomorphization cache: key = (fn_index, type_args_hash) -> instantiated_fn_index
+let mono_cache = mmap(2000000)
+let mono_cache_size = 0
 // === STRUCT TYPES (Phase 4.3) — named-field tuples ===
 // A struct is a compile-time record: name + ordered field names. Construction
 // `Name(a,b,...)` emits IR_TALLOC(n)+stores and tags the result vreg with the
@@ -770,7 +787,7 @@ let data = mmap(33554432); let data_off = 0  // 32MB string-literal buffer
 // Label map: 16 bytes [label,ir_pos]
 let lblmap = mmap(2000000); let lblc = 0
 
-let TKS = 40; let IRS = 40; let FNS = 40; let VRS = 24; let PCS = 24; let LBS = 16
+let TKS = 40; let IRS = 40; let FNS = 56; let VRS = 24; let PCS = 24; let LBS = 16
 
 // === HELPERS ===
 fn r8(p) { return mem_load8(p) }
@@ -917,11 +934,17 @@ fn fn_nlen(i) { return r64(fns + i*FNS + 8) }
 fn fn_btok(i) { return r64(fns + i*FNS + 16) }
 fn fn_cofs(i) { return r64(fns + i*FNS + 24) }
 fn fn_pc(i) { return r64(fns + i*FNS + 32) }
-fn sfn(i,nm,nl,bt,co,pc) {
+fn fn_rettype_name_f(i) { return r64(fns + i*FNS + 40) }
+fn fn_rettype_len_f(i) { return r64(fns + i*FNS + 48) }
+fn sfn(i,nm,nl,bt,co,pc,ret_nm,ret_nl) {
     if i >= FN_CAP { emit_ovf() }
     w64(fns + i*FNS, nm); w64(fns + i*FNS + 8, nl)
     w64(fns + i*FNS + 16, bt); w64(fns + i*FNS + 24, co)
     w64(fns + i*FNS + 32, pc)
+    w64(fns + i*FNS + 40, ret_nm)
+    w64(fns + i*FNS + 48, ret_nl)
+    w64(fn_rettype_name + i*8, ret_nm)
+    w64(fn_rettype_len + i*8, ret_nl)
 }
 
 fn vadd(nm,nl,vr) {
@@ -1235,6 +1258,7 @@ fn ispnct(c) {
     if c==40||c==41||c==44||c==46||c==58||c==59 { return 1 }
     if c==91||c==93||c==123||c==125 { return 1 }
     if c==63 { return 1 }  // '?' for unwrap/try operator
+    if c==60||c==62 { return 1 }  // '<' '>' for generic type params
     return 0
 }
 
@@ -1403,7 +1427,11 @@ fn tokenize() {
         } else if isoc(ch) {
             stok(tokc,TT_OP,ch,l,c,1); tokc=tokc+1; p=p+1; c=c+1
         } else if ispnct(ch) {
-            stok(tokc,TT_PNCT,ch,l,c,1); tokc=tokc+1; p=p+1; c=c+1
+            // P10: Generic type delimiters < > - emit as separate token types
+            // to distinguish from comparison operators
+            if ch==60 { stok(tokc,TT_GENERIC_LT,ch,l,c,1); tokc=tokc+1; p=p+1; c=c+1 }
+            else if ch==62 { stok(tokc,TT_GENERIC_GT,ch,l,c,1); tokc=tokc+1; p=p+1; c=c+1 }
+            else { stok(tokc,TT_PNCT,ch,l,c,1); tokc=tokc+1; p=p+1; c=c+1 }
         } else { exit(12) }
     }
 }
@@ -1453,6 +1481,28 @@ fn scanfns() {
             if nt<tokc&&tokt(nt)==TT_ID {
                 let nm=tokv(nt); let nl=tokln(nt)
                 let d=0; let bp=0; let j=nt+1
+                // P10: Parse generic parameters <T, U> after function name
+                let gen_count = 0
+                let gen_poff = 0  // separate offset for generic parameters
+                let gen_base = gen_poff  // SAVE start offset BEFORE writing
+                if kstart<tokc && tokt(kstart)==TT_GENERIC_LT {
+                    let gk = kstart + 1
+                    while gk<tokc {
+                        let gtk = tokt(gk)
+                        if gtk==TT_GENERIC_GT { gk=gk+1; break }
+                        if gtk==TT_ID {
+                            w64(fn_genparam_names + gen_poff, tokv(gk)); gen_poff=gen_poff+8
+                            w64(fn_genparam_names + gen_poff, tokln(gk)); gen_poff=gen_poff+8
+                            gen_count=gen_count+1
+                            gk=gk+1
+                            // skip optional comma
+                            if gk<tokc && tokt(gk)==TT_PNCT && tokv(gk)==44 { gk=gk+1 }
+                        } else {
+                            gk=gk+1
+                        }
+                    }
+                    kstart = gk  // continue from after '>'
+                }
                 // Scan signature: count fixed params + detect trailing ...
                 let pcnt=0; let isvar=0; let depth=0; let k=kstart
                 let pnbase = fn_poff   // capture START offset BEFORE storing params
@@ -1515,6 +1565,10 @@ fn scanfns() {
                 // not the comma count (comma count = N-1 and is fragile here).
                 w64(fn_pcount + fnc*8, saw_param)
                 w64(fn_pbase + fnc*8, pnbase)
+                // P10: Store generic parameter info
+                w64(fn_generic + fnc*8, gen_count>0)
+                w64(fn_genparams + fnc*8, gen_count)
+                w64(fn_genparam_base + fnc*8, gen_base)
                 // t5: count leading params (from index 0) that have NO default ->
                 // the mandatory minimum arg count at the call site.
                 let pfz=0
@@ -1532,7 +1586,20 @@ fn scanfns() {
                     }
                     j=j+1
                 }
-                sfn(fnc,nm,nl,bp,0,saw_param)
+                // P10: Parse return type `-> Type` after the closing ')' of signature
+                let ret_type_name = 0; let ret_type_len = 0
+                if j<tokc && tokt(j)==TT_OP && tokv(j)==45 {  // '-' (part of '->')
+                    let next_j = j+1
+                    if next_j<tokc && tokt(next_j)==TT_OP && tokv(next_j)==62 {  // '>'
+                        j = next_j + 1
+                        if j<tokc && (tokt(j)==TT_ID || tokt(j)==TT_KEY) {
+                            ret_type_name = tokv(j)
+                            ret_type_len = tokln(j)
+                            j = j + 1
+                        }
+                    }
+                }
+                sfn(fnc,nm,nl,bp,0,saw_param,ret_type_name,ret_type_len)
             fnc=fnc+1; p=j
             } else { p=p+1 }
         } else { p=p+1 }
@@ -2575,6 +2642,24 @@ fn parse_method_call(selfv, mnm, ml) {
 }
 
 fn parse_call_impl(nm, nl, selfv) {
+    // P10: Check for generic type arguments <T, U> after function name
+    let gen_args_count = 0
+    let gen_args = mmap(8000)  // store type argument identifiers
+    if tokp<tokc && tokt(tokp)==TT_GENERIC_LT {
+        adv()  // consume '<'
+        while tokp<tokc {
+            if tokt(tokp)==TT_GENERIC_GT { adv(); break }
+            if tokt(tokp)==TT_ID || tokt(tokp)==TT_KEY {
+                w64(gen_args + gen_args_count*16, tokv(tokp))
+                w64(gen_args + gen_args_count*16 + 8, tokln(tokp))
+                gen_args_count = gen_args_count + 1
+                adv()
+                if tokp<tokc && tokt(tokp)==TT_PNCT && tokv(tokp)==44 { adv() }  // skip comma
+            } else {
+                adv()
+            }
+        }
+    }
     // t10: fnptr(FNAME) -> code pointer as a runtime value. Special-cased
     // because its argument is a compile-time function NAME, not a value expr.
     if nl==5&&r8(src+nm)=='f'&&r8(src+nm+1)=='n'&&r8(src+nm+2)=='p'&&r8(src+nm+3)=='t'&&r8(src+nm+4)=='r' {
@@ -2668,23 +2753,29 @@ fn parse_call_impl(nm, nl, selfv) {
         rk = rk + 1
     }
     let ck=0
-    while ck<nargs { w64(argstack + (base+ck)*8, r64(arg_tmp + (base+ck)*8)); ck=ck+1 }
-    let fchk=findfn(nm,nl)
-    let do_call=0
-    if fchk>=0 { do_call=1 }
-    if do_call==0 { if is_bltn(nm,nl)==1 { do_call=1 } }
-    if do_call==1 {
-        let avs=irc
-        let k=base
-        while k<argsp { let mv=nv(); iremit(IR_MOV,mv,r64(argstack+k*8),0,0); k=k+1 }
-        argsp=base
-        // t10: closure_call(fnb, args...) -> dedicated IR (env-shift + indirect call).
-        if nl==12&&r8(src+nm)=='c'&&r8(src+nm+1)=='l'&&r8(src+nm+2)=='o'&&r8(src+nm+3)=='s'&&r8(src+nm+4)=='u'&&r8(src+nm+5)=='r'&&r8(src+nm+6)=='e'&&r8(src+nm+7)=='_'&&r8(src+nm+8)=='c'&&r8(src+nm+9)=='a'&&r8(src+nm+10)=='l'&&r8(src+nm+11)=='l' {
-            // fnb is the first collected arg (argstack[base]); caller args start at avs+1.
-            let fnbv = irres(avs)
-            let vr2=nv(); iremit(IR_CLOSURE_CALL, vr2, fnbv, avs+1, nargs-1); return vr2
-        }
-        let vr2=nv(); iremit(IR_CALL,vr2,nm,nargs,avs)
+        while ck<nargs { w64(argstack + (base+ck)*8, r64(arg_tmp + (base+ck)*8)); ck=ck+1 }
+        // P10: Check for generic type arguments and monomorphize
+        let gen_args_count = 0
+        let gen_args = mmap(8000)
+        // Note: generic args already parsed earlier in parse_call_impl
+        // For now, just use the original function
+        let fchk=findfn(nm,nl)
+        let effective_fi = fchk
+        let do_call=0
+        if fchk>=0 { do_call=1 }
+        if do_call==0 { if is_bltn(nm,nl)==1 { do_call=1 } }
+        if do_call==1 {
+            let avs=irc
+            let k=base
+            while k<argsp { let mv=nv(); iremit(IR_MOV,mv,r64(argstack+k*8),0,0); k=k+1 }
+            argsp=base
+            // t10: closure_call(fnb, args...) -> dedicated IR (env-shift + indirect call).
+            if nl==12&&r8(src+nm)=='c'&&r8(src+nm+1)=='l'&&r8(src+nm+2)=='o'&&r8(src+nm+3)=='s'&&r8(src+nm+4)=='u'&&r8(src+nm+3)=='r'&&r8(src+nm+4)=='e'&&r8(src+nm+4)=='u'&&r8(src+nm+5)=='r'&&r8(src+nm+6)=='e'&&r8(src+nm+5)=='r'&&r8(src+nm+6)=='e'&&r8(src+nm+7)=='_'&&r8(src+nm+8)=='c'&&r8(src+nm+9)=='a'&&r8(src+nm+10)=='l'&&r8(src+nm+11)=='l' {
+                // fnb is the first collected arg (argstack[base]); caller args start at avs+1.
+                let fnbv = irres(avs)
+                let vr2=nv(); iremit(IR_CLOSURE_CALL, vr2, fnbv, avs+1, nargs-1); return vr2
+            }
+            let vr2=nv(); iremit(IR_CALL,vr2,nm,nargs,avs)
         // G2: builtins str()/push() return a byte-stride string -> tag vr2.
         // nm is an offset; builtin names are at src+nm (same as is_bltn()).
         if vr2>=0 && vr2<8192 {
@@ -7522,9 +7613,26 @@ fn main(argc, argv) {
             if ptyp < 0-1 { w64(vreg_trait + vr*8, (ptyp * -1) - 2) }
             pc=pc+1
             pz=pz+1
-        }
-
-        parse_block()
+                    }
+                    // P10: Bind generic type parameters in function body scope
+                    let gen_count = r64(fn_genparams + fi*8)
+                    if gen_count>0 {
+                        let gen_base = r64(fn_genparam_base + fi*8)
+                        let gz = 0
+                        while gz<gen_count {
+                            let gnm = r64(fn_genparam_names + gen_base + gz*16)
+                            let gnl = r64(fn_genparam_names + gen_base + gz*16 + 8)
+                            let vr = nv()
+                            // Create a type marker vreg for this generic parameter
+                            iremit(IR_CONST, vr, gz, 0, 0)
+                            // Tag as generic type parameter
+                            w64(vreg_type + vr*8, 10)
+                            vadd(gnm, gnl, vr)
+                            gz = gz + 1
+                        }
+                    }
+        
+                    parse_block()
         iremit(IR_RET,0,-1,0,0)
 
         // Save IR start and param count
