@@ -7,7 +7,7 @@ compiles to every tier — bare-metal kernel, edge WASM, GPU kernel, cloud servi
 |----------|-------|
 | **Self-hosting** | Compiler in Quanta; byte-identical fixed-point on x86-64 |
 | **Bootstrapping** | `qc-bootstrap-0.0.0` seed binary |
-| **Version** | `qc-0.0.6` (bare Some/None/Ok/Err + enum/match; x86_64 self-host verified; ARM64 bare-variant bug) |
+| **Version** | `qc-0.0.14-wip` (P10: for-in loops working; generics next). Stable `qc-0.0.13` (P9 traits). See systems/version_history.md. |
 | **Optimizer** | Tier-1 IR passes (const fold, DCE, tail-call, loop strength), ON by default since 1.0.12 |
 | **Memory model** | Ownership-by-default (compiler-inserted `free` at scope exit), no GC |
 | **Secure by default** | Overflow/shift/bounds traps ON; `unsafe {}` marks opt-out regions |
@@ -27,7 +27,7 @@ compiles to every tier — bare-metal kernel, edge WASM, GPU kernel, cloud servi
 Execution starts at `fn main()`; return value is the process exit code
 (default `0` if no explicit `return`).
 
-> **P6 status:** `enum` and `match` **implemented (qc-0.0.4)**; `trait`, `impl`, generics `<T>` tokens exist but parser/codegen NOT wired. Examples below describe target syntax.
+> **P6 status:** `enum`, `match`, `Option/Result` implemented (qc-0.0.4–0.0.7); `trait`/`impl`/vtable dispatch + struct literals implemented (qc-0.0.13); generics `<T>` NOT yet wired (P10 next). The syntax sections below reflect the working language.
 
 ### 2.2 Functions
 
@@ -79,14 +79,14 @@ fn make(a, b) { return Point(a, b) }
 fn main() { let p = make(3, 4); return p.x + p.y }  // 7
 ```
 
-### 2.5 Enums (implemented qc-0.0.4)
+### 2.5 Enums (implemented, qc-0.0.4+; full match support qc-0.0.11)
 
 ```quanta
 enum Color { Red, Green, Blue }
 let c = Color.Red
 ```
 
-### 2.6 Match (implemented qc-0.0.4 for enum patterns)
+### 2.6 Match (implemented for enum patterns, qc-0.0.4+; P7 full)
 
 ```quanta
 match c {
@@ -96,7 +96,7 @@ match c {
 }
 ```
 
-### 2.7 Option / Result (built-in enums; bare constructors compile but match limited)
+### 2.7 Option / Result (built-in enums, fully implemented qc-0.0.11)
 
 ```quanta
 let x = Some(42)
@@ -108,10 +108,10 @@ fn divide(a, b) -> Result<int, string> {
 }
 ```
 - `Option` and `Result` are built-in enum types with compiler support for `Some`/`None` and `Ok`/`Err` constructors.
-- **Note**: Bare `Some(val)`, `None`, `Ok(val)`, `Err(val)` expressions compile but pattern matching on them requires the `match` implementation (qc-0.0.4+). Currently they work as expressions but `match` on built-in enum variants is partially implemented.
-- See `option_test.quanta` / `result_test.quanta` for status.
+- **Note**: Bare `Some(val)`, `None`, `Ok(val)`, `Err(val)` expressions and `match` on them are fully implemented on x86_64 AND ARM64 (P7, qc-0.0.11). Payload access via `.1` (index 1): `let v = Some(42); v.1 == 42`.
+- See `option_test.quanta` (42), `result_test.quanta` (5), `option_simple/option_tuple/option_ctor` (42/42/0).
 
-### 2.8 Generics (P6 WIP — not wired)
+### 2.8 Generics (P10 — NOT yet wired)
 
 ```quanta
 fn first<T>(arr: [T]) -> T { return arr[0] }
@@ -121,23 +121,30 @@ fn map<T, U>(arr: [T], f: fn(T) -> U) -> [U] {
     for item in arr { result.push(f(item)) }
     return result
 }
-### 2.10 Associated Types & Where Clauses
-Not yet implemented.
-
 ```
+> `<T>` type parameters are NOT implemented — `fn map<T,U>` fails with
+> "undeclared variable: U". This is the next P10 milestone.
+
+### 2.9 Declarations & assignment
+
+```quanta
 let x = 10            // new binding
 x = x + 1             // assign to existing
 ```
 
 `let` shadows previous bindings (newest wins). Type inferred from RHS.
 
+### 2.10 Associated Types & Where Clauses
+Not yet implemented.
+
 ### 2.11 Control flow
 
-```
+```quanta
 if cond { ... } else if cond { ... } else { ... }
 loop { ... break continue }
 while cond { ... }
-for i = start; cond; step { ... }
+for i = start; cond; step { ... }      // C-style for
+for x in arr { ... }                   // for-in over array (P10)
 ```
 
 - `cond` truthy when non-zero.
@@ -460,7 +467,7 @@ All ON by default. Suppressed inside `unsafe {}`. Disable with
 
 ## 8. Test Suite
 
-39 programs gated by exit code in `test_suites/EXPECTED.tsv`. **0.0.4 baseline: all 39 tests compile, 37 runtime correct, 2 compile-fail (trait, generics).**
+39 programs gated by exit code in `test_suites/EXPECTED.tsv`. **qc-0.0.14-wip baseline: 39/39 pass, 0 fail, 1 expected compile-fail (generics = P10).** Cross-compiled, all but unported-backend features pass on ARM64 (see systems/test_suite.md §8).
 
 | Test | Expect | Status |
 |------|--------|--------|
@@ -482,35 +489,20 @@ All ON by default. Suppressed inside `unsafe {}`. Disable with
 | stdlib_test | 0 | ✅ |
 | test_many_globals | 42 | ✅ |
 | builtins_test | 198 | ✅ (pre-existing) |
-| **option_test** | 42 | ❌ bare Some/None compile but match on built-in variants not fully implemented |
-| **result_test** | 5 | ❌ bare Ok/Err compile but match on built-in variants not fully implemented |
-| **trait_test** | 0 | ❌ compile error — trait/impl system not implemented |
-| **generics_test** | 12 | ❌ compile error — `<T>` generics not implemented |
+| **option_test** | 42 | ✅ | P7 |
+| **result_test** | 5 | ✅ | P7 |
+| **trait_test** | 0 | ✅ | P9 |
+| **generics_test** | 12 | ❌ compile error — `<T>` generics not implemented (P10 next) |
 
-> 37 file-io/arithmetic/memory/enum tests pass. 2 aspirational tests (trait, generics) compile-fail. 2 built-in enum tests (option, result) compile but match incomplete.
+> 39/39 pass, 0 fail; the only compile-fail is the aspirational generics test (P10). For-in / `arr[-1]` / unsafe regression tests added separately (see systems/test_suite.md §8 — currently ad-hoc 12/12, to be gated in EXPECTED.tsv).
 
 ---
 
 
 ## 9. Version History
 
-| Version | Date | What |
-|---------|------|------|
-|| **0.0.5** | **2026-07-30** | **Bare Some/None/Ok/Err support (expressions + match patterns). x86_64 self-host verified (stage2==stage3), 39/39 x86_64 tests pass. ARM64 cross-compile works but ARM64 bare-variant pattern match broken (exit 0) — BLOCKS ARM64 promotion.** |
-| **0.0.4** | **2026-07-30** | **Enum support + self-host verified. Enum declarations, constructors, match expressions working. 37/39 tests pass (trait, generics not implemented; option/result match on built-ins incomplete).** |
-| **0.0.2** | **2026-07-29** | **WIP. option_test + result_test fixed (bare Some/None/Ok/Err). struct_test regression + enum_test match capture + file_open_test string-header all fixed. 38/39 compile, 38/38 runtime pass. 2 remaining: trait, generics.** |
-| — legacy 1.x — | — | — |
-| 1.1.0 | 2026-07-20 | Security review + F1/F2 fixes (STABLE) |
-| 1.1.1 | 2026-07-20 | Unsigned builtins (udiv/umod/ult/...) |
-| 1.1.2 | 2026-07-20 | G1: `unsafe {}` block |
-| 1.1.3 | 2026-07-20 | G2 part 1: overflow trap (opt-in) |
-| 1.1.4 | 2026-07-20 | G2 part 2: overflow trap ON by default |
-| 1.1.5 | 2026-07-20 | G2 part 3: shift-count UB trap |
-| 1.1.6 | 2026-07-20 | Parenthesized-expr parse fix |
-| 1.1.7 | 2026-07-20 | G2 containers + subscript-assign + string stride |
-| 1.1.8 | 2026-07-21 | P2 ownership: compiler-inserted free |
-| 1.1.9 | 2026-07-22 | P3 FFI: `extern "C"` |
-| 1.1.10–1.33 | — | ARM64 backend, P6 scaffolding, bug fixes |
-| 1.1.34-wip | current | P6 enum/match/generics/type-system tokens |
+The authoritative version history is in `systems/version_history.md`. Summary of the 0.0.x line: **0.0.1** bootstrapped self-host → **0.0.2–0.0.3** P6 low-level (pointers/asm/volatile/FFI/SIMD/unsafe) → **0.0.4–0.0.5** enums/match + bare Some/None/Ok/Err → **0.0.6** promoted enums → **0.0.7** ARM64 self-host fixed → **0.0.8–0.0.10** P6 batches (pointers, FFI/asm/SIMD/unsafe) → **0.0.11** P7 Option/Result/match both backends → **0.0.12** P8 structs → **0.0.13** P9 traits/impl/vtable/struct-literals (stable) → **0.0.14-wip** P10 for-in (nested, `arr[-1]`) + gsz BSS fix; generics next.
+
+Legacy 1.1.x line (2026-07-20 → 1.1.34) is historical/superseded.
 
 ---

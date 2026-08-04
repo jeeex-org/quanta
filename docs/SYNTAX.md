@@ -2,7 +2,7 @@
 
 Quanta is designed to be simple and supports multiple modes—interpreter, WASM, JIT, pre‑compiler (e.g., `quanta run`), and native compilation to binary (`qc`).
 
-This document describes the language as implemented in the current stable compiler (`src/qc-0.0.13.quanta`).
+This document describes the language as implemented in the current stable compiler (`src/qc-0.0.13.quanta`; WIP `src/qc-0.0.14-wip.quanta` with P10 for-in).
 
 ---
 
@@ -119,7 +119,7 @@ fn main() {
   - Positional, separated by commas.
   - Optional default value after `=` (only for trailing parameters).
   - Named‑argument call: `f(b: 2, a: 1)` – order does not matter.
-  - Variadic: `fn f(a, b, ...)` – inside the function use `argc()` and `arg(i)` to access extra arguments.
+  - Variadic: `fn f(a, b, ...)` – inside the function use `arg(i)` to access extra arguments (`argc()` is not implemented).
 - **Return type**
   - If omitted, defaults to `i64` (but treated as advisory).
   - Multiple values can be returned via a tuple: `return a, b, c;` → caller can destructure with `let x, y = f()`.
@@ -159,13 +159,14 @@ fn main() {
 | 9     | `=` (assignment) | Right |
 | 10    | `,` (sequence, tuple element separator) | Left |
 
-*Note*: Bitwise operators (`&`, `|`, `^`, `~`, `<<`, `>>`) are present in the IR but currently **not** exposed as surface syntax in the WIP compiler (they appear as builtins).  Logical `&&`/`||` are short‑circuit.
+*Note*: Bitwise operators (`&`, `|`, `^`, `~`, `<<`, `>>`) are exposed as surface syntax (parsed to `IR_BAND`/`IR_BOR`/`IR_BXOR`/`IR_BNOT`/`IR_SHL`/`IR_SHR`).  Logical `&&`/`||` (also `and`/`or`) are short‑circuit.
 
 ### Control‑Flow Expressions
 - `if cond { then } else { else }` – yields the value of the chosen branch (if both sides produce a value).
 - `loop { … }` – infinite loop; use `break` to exit with a value: `break expr`.
 - `while cond { … }`
 - `for i = start; cond; step { … }` – classic C‑style loop.
+- `for x in arr { … }` – iterates over an array (implemented, P10); elements are 0‑indexed, and `arr[-1]` is the array length.
 - `match disc { pat => expr, … }` – pattern‑matching expression (see §7).
 
 ---
@@ -225,7 +226,7 @@ All builtins are emitted inline; they have no call overhead.
 | `println(val)` | `()` | Integer + newline |
 | `printsp(val)` | `()` | Integer + space |
 | `newline()` | `()` | Output `\n` |
-| `print_f(fval)` | `()` | Float output (WIP) |
+
 
 ### Conversions & Helpers
 | Builtin | Signature | Description |
@@ -233,9 +234,9 @@ All builtins are emitted inline; they have no call overhead.
 | `u8(x)`, `u16(x)`, `u32(x)`, `u64(x)` | `-> truncated` | Bit‑mask to width |
 | `udiv(a,b)`, `umod(a,b)` | `-> unsigned` | Unsigned division/modulo |
 | `ult(a,b)`, `ugt(a,b)`, `ulte(a,b)`, `ugte(a,b)` | `-> 0/1` | Unsigned comparisons |
-| `fadd(a,b)`, `fsub(a,b)`, `fmul(a,b)`, `fdiv(a,b)` | `-> f64` | Float arithmetic (WIP) |
+| `fadd(a,b)`, `fsub(a,b)`, `fmul(a,b)`, `fdiv(a,b)` | `-> f64` | Float arithmetic |
 | `i2f(x)`, `f2i(x)` | `-> f64/i64` | Float/int conversion |
-| `argc()` | `-> i64` | Variadic argument count |
+
 | `arg(i)` | `-> i64` | i‑th variadic argument (0‑based) |
 | `len(v)` | `-> i64` | Length prefix of string/array/slice |
 | `str(a,b)` | `-> string` | Concatenate two byte buffers |
@@ -301,6 +302,7 @@ fn main() {
 ```
 - Constructor can also be positional: `Point(1,2)`.
 - Fields may have a `: Type` annotation; if omitted, the type is inferred from the initializer (if any) or left generic.
+- Struct literal syntax `Point { x: 3, y: 4 }` is also supported (P9, qc-0.0.13; rewritten to a constructor call).
 
 ### Enums (implemented)
 
@@ -324,7 +326,7 @@ fn main() {
 - Discriminant is stored in the first word (0‑based variant index).
 - Payload follows the discriminant, laid out as a tuple.
 
-### Option & Result (built‑in enums; bare constructors + match working on x86_64, ARM64 backend bug)
+### Option & Result (built‑in enums; constructors + match implemented on x86_64 and ARM64, P7)
 
 ```quanta
 enum Option<T> { None, Some(T) }
@@ -336,7 +338,7 @@ Constructors:
 - `err(expr)` → `Result::Err(expr)`
 - `ok(expr)` → `Result::Ok(expr)`
 
-**Note**: Bare `Some(val)`, `None`, `Ok(val)`, `Err(val)` expressions compile and work correctly on x86_64. Pattern matching on them via `match` is fully implemented on x86_64 (qc-0.0.5). ARM64 cross-compilation works but ARM64 backend has a register emission bug causing bare variant pattern matches to return 0 — fix tracked for qc-0.0.6.
+**Note**: Bare `Some(val)`, `None`, `Ok(val)`, `Err(val)` expressions and `match` on them work on **both** x86_64 and ARM64 (P7, qc-0.0.11). The earlier ARM64 register‑emission bug (bare variant matches returning 0) was fixed in qc-0.0.11.
 
 ```quanta
 let some_val = Some(42)
@@ -371,7 +373,7 @@ fn main() {
 }
 ```
 - Tuple elements accessed via `.0`, `.1`, … (or by destructuring).
-- Array length is part of the type; indexing uses `a[i]` (bounds‑checked by default, traps on out‑of‑range).
+- Array length is part of the type; indexing uses `a[i]` (bounds‑checked by default, traps on out‑of‑range).  `a[-1]` yields the array length (implemented, P10).
 
 ---
 
@@ -402,9 +404,9 @@ include std/io          // bare name: searches ./std, ./, /usr/local/quanta/std,
 
 ---
 
-## 11. Generics, Traits, and Implementations (WIP)
+## 11. Generics, Traits, and Implementations
 
-The parser recognises the following tokens, but code generation for generics and trait dispatch is **not yet complete**.
+Generic type parameters `<T>` are **not implemented** (a generic signature fails to compile).  Traits, impls, and struct literals **are** implemented (P9, qc-0.0.13).
 
 ### Generic Functions
 ```
@@ -426,9 +428,12 @@ fn main() {
     return doubled[0] + doubled[1] + doubled[2]
 }
 ```
-- Type parameters are substituted at compile time (monomorphisation).
+- **Not implemented** — the example above does not compile with the current compiler (type parameters are not yet supported).
 
 ### Traits (interfaces)
+
+Implemented (P9, qc-0.0.13): trait declarations, `impl Trait for Struct` blocks, and dispatch through trait‑typed parameters.
+
 ```
 
 trait Drawable {
@@ -465,7 +470,7 @@ impl Drawable for Circle {
     }
 }
 ```
-- Instances of `Circle` can be used wherever a `Drawable` is expected (via vtable‑based dispatch).
+- Instances of `Circle` can be passed wherever a `Drawable` trait‑typed parameter is expected; dispatch resolves the (single) impl method.  Multi‑impl vtable dispatch is not yet implemented.
 
 ### Associated Types & Where Clauses
 Not yet implemented.
