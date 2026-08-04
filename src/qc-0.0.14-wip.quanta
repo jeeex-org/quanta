@@ -6059,6 +6059,15 @@ fn arm_ci_func(fi, is_main) {
             let rd=aphys_a(res); if rd!=0 { araw(0xAA0003E0|(0<<16)|rd) }
             amovz(2, a0); astr(2, 0, 0); asdef(res, rd)
         }
+        else if op==IR_ARRAY_LEN {  // op=69: get array length from header [base]
+            // Array header: length stored at [base] (qword). Result = *(base).
+            aflsuh_all()
+            aldr(0, 31, ahome(a0))   // x0 = base ptr
+            araw(0xF9400000)          // ldr x0, [x0]  ; x0 = length header
+            let rd=aphys_a(res)
+            if rd!=0 { araw(0xAA0003E0|(0<<16)|rd) }  // x_rd = x0
+            asdef(res, rd)
+        }
         // P7: IR_SOME - Option::Some(payload) -> header layout [base]=len=2, [base+8]=tag=1, [base+16]=payload
         else if op==IR_SOME {
             aflsuh_all(); amov_imm64(0, 0x60000000); amovz(1, 24); amovz(2,3); amovz(3,0x22); araw(0x92800004); amovz(5,0); amovz(8,222); asvc()

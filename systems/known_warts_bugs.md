@@ -22,7 +22,8 @@
 | `generics_test` | `error: undeclared variable: in` + "source too many tokens/IR limit" | generic fn signatures that reference for-in (`for item in arr`) — generics not wired | 🔴 OPEN — part of P10 |
 | `let p: *u64 = &x` | "source too many tokens/IR limit" | Raw-pointer **type annotation** (`*T`) in a `let` explodes IR (type-annotation path for pointer types). `&x`/`*p` deref ops alone work. | 🔴 OPEN — P6.type-annotation gap |
 | `let x: int = 42` | `undeclared variable: int` | `int` is not a recognized type keyword (only u8/u16/u32/u64/usize/bool/char/byte are). Use a bare literal (defaults to signed 64-bit). | 🔴 OPEN — advisory `-> int` only, no `int` keyword |
-| **ARM64 for-in parity** | for-in / `arr[-1]` compile to wrong code on ARM64 | `IR_ARRAY_LEN` (op 69) has an **x86 handler only** — absent from `arm_ci_func`. Also `vr_loop_live`/`av_loop_live` allocator support is not present. Native ARM64 compiler binary segfaults on-device (pre-existing, stable 0.0.12-0.0.13 behavior) — cross-compile is the supported ARM path. | 🔴 OPEN — P10 ARM64 backend |
+| **ARM64 for-in parity** | — | `IR_ARRAY_LEN` (op 69) ARM64 handler added to `arm_ci_func` (2026-08-04). All 5 for-in/arr[-1] tests pass on ARM64 under qemu-aarch64 (rc 42/10/66/3/3, matching x86). Native ARM64 compiler binary segfaults on-device (pre-existing, stable 0.0.12-0.0.13) — cross-compile is the supported ARM path. | ✅ CLOSED (for-in) |
+| **ARM64 syscall numbers** | file I/O / stdout tests segfault under qemu-aarch64 | `sysc()` (line 3194) unconditionally emits x86-64 `int 0x80` (`eb(15);eb(5)`) — no `target_arch==1` branch for ARM64 `svc #0` with ARM syscall numbers (93=exit, 64=write, etc.). Affects file_io, file_open_test, prints_family, stdlib_test on ARM64 only. | 🔴 OPEN — separate ARM64 backend gap |
 
 ### 10.3 Known tooling traps (documentation of past debugging effort)
 
