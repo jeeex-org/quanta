@@ -191,6 +191,15 @@ let IR_UNSAFE_BLOCK = 68 // unsafe block marker (no-op)
 let IR_ARRAY_LEN = 69    // get array length from header [base]
 // P10: Generics monomorphization
 let IR_GENERIC_INST = 70  // instantiate generic function with type args
+let IR_APUSH = 72         // P10: array push (qword append; header counts elements)
+let IR_ARRNEW = 73        // P10: runtime-count array alloc (n = VALUE of vreg a0).
+                          // IR_TALLOC's count is a compile-time literal; slices
+                          // need a runtime n, so this mirrors mem_alloc(n) but
+                          // loads n from the vreg's home slot instead of rdi.
+// P10: fn-value tuple: a0 = fn index -> [codeptr, env=0] 16-byte no-header
+// tuple (same layout mk_any produces), so fn-typed params called via
+// IR_CLOSURE_CALL work unchanged on both arches.
+let IR_FNVAL = 71
 
 // === GLOBAL BUFFERS ===
 // Source
@@ -244,6 +253,9 @@ let fn_rettype_len = mmap(2000000)
 // Phase 4.3: per-fn-param struct type. fn_partype[(fi*200 + z)*8] = struct
 // index of param z's declared `: Type` annotation (-1 if scalar/none).
 let fn_partype = mmap(2000000)
+// P10: per-fn-param fn-pointer flag. fn_parfn[(fi*200 + z)*8] = 1 when the
+// param's declared type is fn(...) -> ... (indirect-call params).
+let fn_parfn = mmap(2000000)
 let alias_tab = mmap(8000000)   // t6: [name_ptr,name_len,target_idx]*N (24B each)
 let alias_c = 0
 let fn_poff = 0
@@ -257,6 +269,13 @@ let fn_genparam_base = mmap(2000000)  // base offset into fn_genparam_names
 // Monomorphization cache: key = (fn_index, type_args_hash) -> instantiated_fn_index
 let mono_cache = mmap(2000000)
 let mono_cache_size = 0
+// P10: global scratch for generic scanning — locals inside scanfns reuse
+// register slots across nested blocks (bootstrap allocator), so the generic
+// parse state lives here where no local assignment can clobber it.
+let gscan_kstart = 0
+let gscan_gcount = 0
+let gscan_gpoff = 0
+let gscan_isgen = 0
 // === STRUCT TYPES (Phase 4.3) — named-field tuples ===
 // A struct is a compile-time record: name + ordered field names. Construction
 // `Name(a,b,...)` emits IR_TALLOC(n)+stores and tags the result vreg with the
@@ -536,9 +555,12 @@ fn scanstructs() {
                     }
                   }
                   // skip the ':' and the type-name token so the loop doesn't
-                  // re-scan them as field names
+                  // re-scan them as field names. NOTE: only set cp to the type
+                  // token here — the loop's trailing `cp = cp+1` below advances
+                  // past it exactly once. An extra `cp = cp+1` here would skip
+                  // the struct's closing '}' and pollute the field table with
+                  // every later token (fn/let/vars) as phantom fields.
                   cp = tp
-                  if cp<tokc { cp = cp+1 }
                 }
                 w64(sfldtyp + (si*64 + fc)*8, ftyp)
                 fc = fc+1
@@ -970,7 +992,14 @@ fn vfind(nm,nl) {
     }
     return -1
 }
-fn vclr() { varc = 0; vreg_n = 0 }
+fn vclr() {
+    // P10: also clear vreg_type (fn-value tag 11 / generic-marker 10) so a
+    // recycled vreg index can't carry a stale tag into the next function —
+    // a stale 11 would falsely route `f(21)` through IR_CLOSURE_CALL.
+    let vci = 0
+    while vci < vreg_n { w64(vreg_type + vci*8, 0); vci = vci + 1 }
+    varc = 0; vreg_n = 0
+}
 
 // === P2 OWNERSHIP: compiler-inserted free of mem_alloc-owned bindings ===
 // A binding `let p = mem_alloc(...)` is compiler-owned: on every exit edge of
@@ -1162,7 +1191,7 @@ fn len_name_colon(nm) {
     let l=0
     while l<256 {
         let c0=r8(src+nm+l)
-        if c0==58||c0==0||c0==40||c0==59||c0==123||c0==125||c0==44||c0==32||c0==9||c0==10||c0==13 { break }
+        if c0==58||c0==0||c0==40||c0==59||c0==123||c0==125||c0==44||c0==60||c0==62||c0==32||c0==9||c0==10||c0==13 { break }
         l=l+1
     }
     return l
@@ -1257,8 +1286,8 @@ fn isoc(c) {
 fn ispnct(c) {
     if c==40||c==41||c==44||c==46||c==58||c==59 { return 1 }
     if c==91||c==93||c==123||c==125 { return 1 }
-    if c==63 { return 1 }  // '?' for unwrap/try operator
-    if c==60||c==62 { return 1 }  // '<' '>' for generic type params
+    if c==63 { return 1 }
+    // '<' and '>' are operators (isoc), not punctuation for generics
     return 0
 }
 
@@ -1425,13 +1454,10 @@ fn tokenize() {
         } else if ismop(p) {
             stok(tokc,TT_OP,mopv(p),l,c,2); tokc=tokc+1; p=p+2; c=c+2
         } else if isoc(ch) {
+            // Always emit < and > as TT_OP - parser handles context
             stok(tokc,TT_OP,ch,l,c,1); tokc=tokc+1; p=p+1; c=c+1
         } else if ispnct(ch) {
-            // P10: Generic type delimiters < > - emit as separate token types
-            // to distinguish from comparison operators
-            if ch==60 { stok(tokc,TT_GENERIC_LT,ch,l,c,1); tokc=tokc+1; p=p+1; c=c+1 }
-            else if ch==62 { stok(tokc,TT_GENERIC_GT,ch,l,c,1); tokc=tokc+1; p=p+1; c=c+1 }
-            else { stok(tokc,TT_PNCT,ch,l,c,1); tokc=tokc+1; p=p+1; c=c+1 }
+            stok(tokc,TT_PNCT,ch,l,c,1); tokc=tokc+1; p=p+1; c=c+1
         } else { exit(12) }
     }
 }
@@ -1481,19 +1507,22 @@ fn scanfns() {
             if nt<tokc&&tokt(nt)==TT_ID {
                 let nm=tokv(nt); let nl=tokln(nt)
                 let d=0; let bp=0; let j=nt+1
-                // P10: Parse generic parameters <T, U> after function name
-                let gen_count = 0
-                let gen_poff = 0  // separate offset for generic parameters
-                let gen_base = gen_poff  // SAVE start offset BEFORE writing
-                if kstart<tokc && tokt(kstart)==TT_GENERIC_LT {
+                // P10: Parse generic parameters <T, U> after function name.
+                // State lives in globals (gscan_*) — nested-block locals in
+                // scanfns reuse register slots and would clobber each other.
+                gscan_gcount = 0
+                gscan_gpoff = 0
+                gscan_isgen = 0
+                if kstart<tokc && tokt(kstart)==TT_OP && tokv(kstart)==60 {
+                    gscan_isgen = 1
                     let gk = kstart + 1
                     while gk<tokc {
                         let gtk = tokt(gk)
-                        if gtk==TT_GENERIC_GT { gk=gk+1; break }
-                        if gtk==TT_ID {
-                            w64(fn_genparam_names + gen_poff, tokv(gk)); gen_poff=gen_poff+8
-                            w64(fn_genparam_names + gen_poff, tokln(gk)); gen_poff=gen_poff+8
-                            gen_count=gen_count+1
+                        if gtk==TT_OP && tokv(gk)==62 { gk=gk+1; break }
+                        if gtk==TT_ID || gtk==TT_KEY {
+                            w64(fn_genparam_names + gscan_gpoff, tokv(gk)); gscan_gpoff=gscan_gpoff+8
+                            w64(fn_genparam_names + gscan_gpoff, tokln(gk)); gscan_gpoff=gscan_gpoff+8
+                            gscan_gcount=gscan_gcount+1
                             gk=gk+1
                             // skip optional comma
                             if gk<tokc && tokt(gk)==TT_PNCT && tokv(gk)==44 { gk=gk+1 }
@@ -1554,8 +1583,30 @@ fn scanfns() {
                         last_param_tok=k
                         // Phase 4.3: skip an optional `: Type` annotation so the
                         // type name is NOT counted as a phantom parameter.
-                        if k+2<tokc && tokt(k+1)==TT_PNCT && tokv(k+1)==58 && (tokt(k+2)==TT_ID || tokt(k+2)==TT_KEY) {
-                            k = k+2   // skip ':' and the type name
+                        // Types may be: ID/KEY (int), [T] (array), fn(...) -> U (fn ptr).
+                        if k+2<tokc && tokt(k+1)==TT_PNCT && tokv(k+1)==58 {
+                            // P10: flag fn-pointer params (f: fn(...) -> ...)
+                            if ktext(tokv(k+2), tokln(k+2))==1 {
+                                w64(fn_parfn + (fnc*200 + saw_param-1)*8, 1)
+                            }
+                            // Consume the full type expression, tracking [] and ()
+                            // nesting; stop at a top-level ',' or ')' (param boundary).
+                            let td = 0
+                            let kk = k+2
+                            let done = 0
+                            while kk<tokc && done==0 {
+                                let ttk=tokt(kk); let ttv=tokv(kk)
+                                if ttk==TT_PNCT {
+                                    if ttv==91 { td=td+1 }        // '['
+                                    else if ttv==93 { td=td-1 }   // ']'
+                                    else if ttv==40 { td=td+1 }   // '('
+                                    else if ttv==41 { if td==0 { done=1 } else { td=td-1 } }  // ')' closes fn-type paren
+                                    else if td==0 && ttv==44 { done=1 }  // ',' ends type at top level
+                                }
+                                if done==1 { break }
+                                kk=kk+1
+                            }
+                            k = kk-1   // outer k=k+1 moves past the terminator
                         }
                     }
                     k=k+1
@@ -1565,10 +1616,10 @@ fn scanfns() {
                 // not the comma count (comma count = N-1 and is fragile here).
                 w64(fn_pcount + fnc*8, saw_param)
                 w64(fn_pbase + fnc*8, pnbase)
-                // P10: Store generic parameter info
-                w64(fn_generic + fnc*8, gen_count>0)
-                w64(fn_genparams + fnc*8, gen_count)
-                w64(fn_genparam_base + fnc*8, gen_base)
+                // P10: Store generic parameter info (from global scratch)
+                w64(fn_generic + fnc*8, gscan_isgen)
+                w64(fn_genparams + fnc*8, gscan_gcount)
+                w64(fn_genparam_base + fnc*8, gscan_gpoff - gscan_gcount*16)
                 // t5: count leading params (from index 0) that have NO default ->
                 // the mandatory minimum arg count at the call site.
                 let pfz=0
@@ -1577,6 +1628,9 @@ fn scanfns() {
                     if dr==0 { pfz=pfz+1 } else { break }
                 }
                 w64(fn_pdfixed + fnc*8, pfz)
+                // Re-init d/bp here: the generic-param and signature blocks above
+                // clobber the slot aliasing `d`/`bp` (bootstrap register reuse).
+                d=0; bp=0
                 while j<tokc {
                     if tokt(j)==TT_PNCT {
                         if tokv(j)==123 { if d==0&&bp==0 { bp=j }; d=d+1 }
@@ -2060,6 +2114,21 @@ fn parse_let() {
     if vss>=0 { w64(vreg_is_str + vr*8, vss) }
     // P6.1b: tag the vreg with its declared type (if any)
     if vtype>0 { w64(vreg_type + vr*8, vtype) }
+    // P10: fn-value binding. Tag the BOUND vreg (11) when the RHS is a fn
+    // value: either a chain (RHS vreg already tagged 11, `let g = f`) or a
+    // fresh IR_FNVAL result (`let f = double`). Tagged HERE, NOT at
+    // parse_primary's IR_FNVAL site: that site sits deep in parse_primary
+    // where live-local pressure trips the allocator's caller-saved clobber
+    // (self-host SIGSEGV; see comments ~280/~660/3176). parse_let's w64
+    // calls are proven safe (struct/str/type tags above).
+    let fvtag = r64(vreg_type + v*8)
+    if fvtag==11 { w64(vreg_type + vr*8, 11) }
+    else {
+        // The IR_MOV was just emitted (line 2096), so a bare-fn-name RHS
+        // (IR_FNVAL) is the record BEFORE it: irc-2.
+        let lr = irc - 2
+        if lr>=0 && irop(lr)==IR_FNVAL && irres(lr)==v { w64(vreg_type + vr*8, 11) }
+    }
     // P2 ownership: if RHS was a direct `mem_alloc(...)` call, this binding is
     // compiler-owned -> free it automatically at scope exit. Detect by peeking
     // the last IR record: IR_CALL whose callee name is `mem_alloc` (9 chars).
@@ -2643,12 +2712,13 @@ fn parse_method_call(selfv, mnm, ml) {
 
 fn parse_call_impl(nm, nl, selfv) {
     // P10: Check for generic type arguments <T, U> after function name
+    // '<' and '>' are TT_OP (values 60/62) — parser checks context
     let gen_args_count = 0
     let gen_args = mmap(8000)  // store type argument identifiers
-    if tokp<tokc && tokt(tokp)==TT_GENERIC_LT {
+    if tokp<tokc && tokt(tokp)==TT_OP && tokv(tokp)==60 {
         adv()  // consume '<'
         while tokp<tokc {
-            if tokt(tokp)==TT_GENERIC_GT { adv(); break }
+            if tokt(tokp)==TT_OP && tokv(tokp)==62 { adv(); break }
             if tokt(tokp)==TT_ID || tokt(tokp)==TT_KEY {
                 w64(gen_args + gen_args_count*16, tokv(tokp))
                 w64(gen_args + gen_args_count*16 + 8, tokln(tokp))
@@ -2659,6 +2729,8 @@ fn parse_call_impl(nm, nl, selfv) {
                 adv()
             }
         }
+        // After loop, tokp is at '>' or past it; advance to '('
+        adv()  // consume '('
     }
     // t10: fnptr(FNAME) -> code pointer as a runtime value. Special-cased
     // because its argument is a compile-time function NAME, not a value expr.
@@ -2671,7 +2743,10 @@ fn parse_call_impl(nm, nl, selfv) {
         if fi<0 { compile_error(0, fnnm, fnln) }
         let vr = nv(); iremit(IR_FNPTR, vr, fi, 0, 0); return vr
     }
-    adv()   // consume '('
+    // For non-generic calls, consume '('
+    if tokp<tokc && tokt(tokp)==TT_PNCT && tokv(tokp)==40 {
+        adv()   // consume '('
+    }
     let base=argsp
     let ac=0
     // t8: if this is a method call, prepend self as the first argument (param 0).
@@ -2764,23 +2839,77 @@ fn parse_call_impl(nm, nl, selfv) {
         let do_call=0
         if fchk>=0 { do_call=1 }
         if do_call==0 { if is_bltn(nm,nl)==1 { do_call=1 } }
+        // P10: fn-typed param indirect call: name is not a function but IS a
+        // param of the current fn declared as fn(...) -> ... -> the param's
+        // vreg holds a [codeptr, env] tuple -> route through IR_CLOSURE_CALL.
+        let fpar_pz = -1
+        if do_call==0 && cur_fi>=0 {
+            let pz2 = findparam(cur_fi, nm, nl)
+            if pz2>=0 && r64(fn_parfn + (cur_fi*200 + pz2)*8)==1 { fpar_pz = pz2; do_call=1 }
+        }
+        // P10: fn-value LOCAL indirect call: `let f = double; f(21)`. The name
+        // is not a function/builtin/param but IS a local vreg tagged 11 (fn
+        // value bound via parse_let). Route through IR_CLOSURE_CALL with the
+        // local's vreg as the tuple ptr. Marker: fpar_pz=-2 (distinct from the
+        // fn-typed-PARAM case >=0).
+        if do_call==0 {
+            let fvl = vfind(nm, nl)
+            if fvl>=0 && r64(vreg_type + fvl*8)==11 { fpar_pz = -2; do_call=1 }
+        }
         if do_call==1 {
             let avs=irc
             let k=base
             while k<argsp { let mv=nv(); iremit(IR_MOV,mv,r64(argstack+k*8),0,0); k=k+1 }
             argsp=base
+            // P10: fn-value LOCAL indirect call: fnb = the local's vreg (holds
+            // a [codeptr, env] tuple from IR_FNVAL), caller args are the
+            // collected args.
+            if fpar_pz==-2 {
+                let fvl = vfind(nm, nl)
+                let vr2=nv(); iremit(IR_CLOSURE_CALL, vr2, fvl, avs, nargs); return vr2
+            }
+            // P10: fn-typed param indirect call: fnb = the param's vreg (holds
+            // a [codeptr, env] tuple), caller args are the collected args.
+            if fpar_pz>=0 {
+                let pvr = -1
+                let pi2 = varc-1
+                while pi2>=0 {
+                    let pvnm = r64(vars + pi2*VRS); let pvnl = r64(vars + pi2*VRS + 16)
+                    if pvnl==nl {
+                        let ok=1; let j2=0
+                        while j2<nl { if r8(src+pvnm+j2)!=r8(src+nm+j2){ok=0;break}; j2=j2+1 }
+                        if ok==1 { pvr=r64(vars+pi2*VRS+8); break }
+                    }
+                    pi2=pi2-1
+                }
+                let vr2=nv(); iremit(IR_CLOSURE_CALL, vr2, pvr, avs, nargs); return vr2
+            }
             // t10: closure_call(fnb, args...) -> dedicated IR (env-shift + indirect call).
-            if nl==12&&r8(src+nm)=='c'&&r8(src+nm+1)=='l'&&r8(src+nm+2)=='o'&&r8(src+nm+3)=='s'&&r8(src+nm+4)=='u'&&r8(src+nm+3)=='r'&&r8(src+nm+4)=='e'&&r8(src+nm+4)=='u'&&r8(src+nm+5)=='r'&&r8(src+nm+6)=='e'&&r8(src+nm+5)=='r'&&r8(src+nm+6)=='e'&&r8(src+nm+7)=='_'&&r8(src+nm+8)=='c'&&r8(src+nm+9)=='a'&&r8(src+nm+10)=='l'&&r8(src+nm+11)=='l' {
+            if nl==12&&r8(src+nm)=='c'&&r8(src+nm+1)=='l'&&r8(src+nm+2)=='o'&&r8(src+nm+3)=='s'&&r8(src+nm+4)=='u'&&r8(src+nm+5)=='r'&&r8(src+nm+6)=='e'&&r8(src+nm+7)=='_'&&r8(src+nm+8)=='c'&&r8(src+nm+9)=='a'&&r8(src+nm+10)=='l'&&r8(src+nm+11)=='l' {
                 // fnb is the first collected arg (argstack[base]); caller args start at avs+1.
                 let fnbv = irres(avs)
                 let vr2=nv(); iremit(IR_CLOSURE_CALL, vr2, fnbv, avs+1, nargs-1); return vr2
             }
-            let vr2=nv(); iremit(IR_CALL,vr2,nm,nargs,avs)
+            let vr2=nv()
+            // P10: method-form push on an ARRAY (receiver not str-tagged) ->
+            // qword append (IR_APUSH) and reassign the receiver to the new
+            // array (mutating method semantics, like `result.push(x)`).
+            let is_arr_push = 0
+            if nl==4 && r8(src+nm)=='p' && r8(src+nm+1)=='u' && r8(src+nm+2)=='s' && r8(src+nm+3)=='h' {
+                if selfv>=0 && r64(vreg_is_str + selfv*8)!=1 { is_arr_push = 1 }
+            }
+            if is_arr_push==1 {
+                iremit(IR_APUSH, vr2, 0, nargs, avs)
+                if selfv>=0 { iremit(IR_MOV, selfv, vr2, 0, 0) }  // result = new array
+            } else {
+                iremit(IR_CALL,vr2,nm,nargs,avs)
+            }
         // G2: builtins str()/push() return a byte-stride string -> tag vr2.
         // nm is an offset; builtin names are at src+nm (same as is_bltn()).
+        // P10: array push (is_arr_push) returns an ARRAY — do NOT tag as str.
         if vr2>=0 && vr2<8192 {
             if nl==3&&r8(src+nm)=='s'&&r8(src+nm+1)=='t'&&r8(src+nm+2)=='r' { w64(vreg_is_str + vr2*8, 1) }
-            if nl==4&&r8(src+nm)=='p'&&r8(src+nm+1)=='u'&&r8(src+nm+2)=='s'&&r8(src+nm+3)=='h' { w64(vreg_is_str + vr2*8, 1) }
+            if nl==4&&r8(src+nm)=='p'&&r8(src+nm+1)=='u'&&r8(src+nm+2)=='s'&&r8(src+nm+3)=='h' { if is_arr_push==0 { w64(vreg_is_str + vr2*8, 1) } }
         }
         // Phase 4.3: if the callee returns a struct, tag vr2 so `q.field` works.
         if fchk>=0 {
@@ -2800,6 +2929,12 @@ fn parse_primary() {
     if peek()==TT_STR { let v=pval(); adv(); let vr=nv(); iremit(IR_STR,vr,v,0,0); w64(vreg_is_str + vr*8, 1); return vr }
     // G2 containers: array literal [e1, e2, ...] -> IR_TALLOC(n), IR_ISTORE each.
     if peek()==TT_PNCT&&pval()==91 {
+        // P10: [TYPE]() = type-annotated EMPTY array literal (e.g. `let result
+        // = [U]()` in a generic fn). Detect ID `]` `(` `)` and emit TALLOC(0).
+        if tokp+3<tokc && tokt(tokp)==TT_PNCT && tokv(tokp)==91 && tokt(tokp+1)==TT_ID && tokt(tokp+2)==TT_PNCT && tokv(tokp+2)==93 && tokt(tokp+3)==TT_PNCT && tokv(tokp+3)==40 && tokp+4<tokc && tokt(tokp+4)==TT_PNCT && tokv(tokp+4)==41 {
+            adv(); adv(); adv(); adv(); adv()  // consume [ TYPE ] ( )
+            let tr0=nv(); iremit(IR_TALLOC,tr0,0,0,0); return tr0
+        }
         adv()
         let elems=mmap(8000)   // stash element vregs
         let cnt=0
@@ -3059,16 +3194,94 @@ fn parse_primary() {
                             return vr
                         }
                     }
-                    // Check for function call: name(args) - this comes AFTER enum/struct checks
-        if peek()==TT_PNCT&&pval()==40 {
-            return parse_call(nm, nl)
-        }
-        if peek()==TT_PNCT&&pval()==91 {  // index: a[idx]
-            adv(); let idx=parse_expr(); mpnct(93)
+                    // Check for function call: name(args) or name<args>(args)
+                    // Both '(' and '<' (for generic type args) trigger function call
+                    // NOTE: tokp already advanced past the name (line 3029 adv()),
+                    // so it points AT the '(' or '<' token now.
+                    let is_call = 0
+                    let fchk = findfn(nm, nl)
+                    if tokp<tokc && tokt(tokp)==TT_PNCT && tokv(tokp)==40 { is_call = 1 }
+                    else if tokp<tokc && tokt(tokp)==TT_OP && tokv(tokp)==60 && fchk>=0 && r64(fn_generic + fchk*8)!=0 { is_call = 1 }
+                    if is_call==1 {
+                        return parse_call(nm, nl)
+                    }
+        if peek()==TT_PNCT&&pval()==91 {  // index: a[idx] OR slice: a[lo:hi] / a[:hi] / a[lo:]
+            adv()  // consume '['
+            let is_slice = 0
+            let lo_vr = -1
+            let hi_vr = -1
+            let e0 = -1
+            if peek()==TT_PNCT&&pval()==58 {
+                // a[:hi] — no lower bound (defaults to 0)
+                is_slice = 1
+                adv()  // consume ':'
+                if !(peek()==TT_PNCT&&pval()==93) { hi_vr = parse_expr() }
+            } else {
+                e0 = parse_expr()
+                if peek()==TT_PNCT&&pval()==58 {
+                    is_slice = 1
+                    lo_vr = e0
+                    adv()  // consume ':'
+                    if !(peek()==TT_PNCT&&pval()==93) { hi_vr = parse_expr() }
+                }
+            }
+            if is_slice==1 {
+                mpnct(93)  // ']'
+                let fv=vfind(nm,nl)
+                let base_vr = -1
+                if fv>=0 { base_vr = fv }
+                else {
+                    let gv=gfind(nm,nl)
+                    if gv>=0 { let pg=nv(); iremit(IR_LOADG,pg,gv,0,0); base_vr = pg }
+                }
+                if base_vr<0 { compile_error(1, nm, nl); return 0 }
+                let sstr = r64(vreg_is_str + base_vr*8)
+                if sstr>=0 {
+                    let mn = "error: slice of string not supported (arrays only)\n"
+                    file_write(2, mn+8, len(mn)); exit(1)
+                }
+                // Slice lowering (pure IR — works on x86 AND ARM64):
+                //   n = clamp(hi - lo, 0);  dst = TALLOC(n)
+                //   loop idx in 0..n: dst[idx] = base[lo+idx]
+                // The IR_IDX inside the loop carries the bounds trap, so an
+                // out-of-range slice (hi > len) SIGILLs like a[idx] does.
+                let zero=nv(); iremit(IR_CONST,zero,0,0,0)
+                let len_vr=nv(); iremit(IR_ARRAY_LEN, len_vr, base_vr, 0, 0)
+                let lo = lo_vr
+                if lo<0 { lo = zero }
+                let hi = hi_vr
+                if hi<0 { hi = len_vr }
+                let nraw=nv(); iremit(IR_SUB, nraw, hi, lo, 0)
+                let neg=nv(); iremit(IR_LT, neg, nraw, zero, 0)
+                let n=nv(); iremit(IR_MOV, n, nraw, 0, 0)
+                let lafter=nl()
+                iremit(IR_BR,0,neg,lafter,0)   // neg==0 (nraw>=0) -> skip clamp
+                iremit(IR_MOV,n,zero,0,0)      // neg==1 -> n = 0 (empty slice)
+                iremit(IR_LABEL,0,lafter,0,0)
+                let dst=nv(); iremit(IR_ARRNEW, dst, n, 0, 0)   // runtime-count alloc
+                let cond=nl(); let body=nl(); let end=nl()
+                let idx_vr=nv(); iremit(IR_MOV, idx_vr, zero, 0, 0)
+                iremit(IR_JMP,0,cond,0,0)
+                iremit(IR_LABEL,0,cond,0,0)
+                let cmp=nv(); iremit(IR_LT, cmp, idx_vr, n, 0)
+                iremit(IR_BR,0,cmp,end,body)   // idx>=n -> end, else body
+                iremit(IR_LABEL,0,body,0,0)
+                let sio=nv(); iremit(IR_ADD, sio, lo, idx_vr, 0)
+                let val=nv(); iremit(32, val, base_vr, sio, 0)   // base[lo+idx]
+                iremit(IR_ISTORE,0,dst,idx_vr,val)               // dst[idx]=val
+                let one=nv(); iremit(IR_CONST, one, 1, 0, 0)
+                let nidx=nv(); iremit(IR_ADD, nidx, idx_vr, one, 0)
+                let idx2=nv(); iremit(IR_MOV, idx2, nidx, 0, 0)
+                iremit(IR_MOV, idx_vr, idx2, 0, 0)
+                iremit(IR_JMP,0,cond,0,0)
+                iremit(IR_LABEL,0,end,0,0)
+                return dst
+            }
+            mpnct(93)
             let f=vfind(nm,nl)
-            if f>=0 { let vr=nv(); iremit(32,vr,f,idx,0); return vr }
+            if f>=0 { let vr=nv(); iremit(32,vr,f,e0,0); return vr }
             let g=gfind(nm,nl)
-            if g>=0 { let pg=nv(); iremit(IR_LOADG,pg,g,0,0); let vr=nv(); iremit(32,vr,pg,idx,0); return vr }
+            if g>=0 { let pg=nv(); iremit(IR_LOADG,pg,g,0,0); let vr=nv(); iremit(32,vr,pg,e0,0); return vr }
             compile_error(1, nm, nl)  // undeclared array/string index -> error
         }
         // Phase 4.3: postfix `.N` (tuple), `.field` (struct), `.method` (t8) —
@@ -3181,12 +3394,41 @@ fn parse_primary() {
         if selfv>=0 { return selfv }
         let f=vfind(nm,nl); if f>=0 { return f }
         let g=gfind(nm,nl); if g>=0 { let vr=nv(); iremit(IR_LOADG,vr,g,0,0); return vr }
+        // P10: bare function name in value position (e.g. `map(arr, double)`)
+        // -> IR_FNVAL builds a fn-value 2-tuple [codeptr, env=0] (same shape
+        // mk_any makes, so fn-typed params called via IR_CLOSURE_CALL work).
+        let ffi=findfn(nm,nl)
+        if ffi>=0 {
+            let vr=nv(); iremit(IR_FNVAL, vr, ffi, 0, 0)
+            return vr
+        }
         compile_error(1, nm, nl)  // undeclared variable -> hard error (no silent 0)
     }
     if peek()==TT_PNCT&&(pval()==91||pval()==123) {
         let mu = "error: unexpected token in expression\n"
         file_write(2, mu+8, len(mu)); exit(1)
     }
+    // G4-fix: token-aware guard. `}` (125) and `,` (44) legitimately reach
+    // parse_primary from the match arm parser: parse_match's trailing
+    // `else if peek()==95 {wildcard} else {literal}` runs as a SEPARATE
+    // statement after every arm (parse_if handles only one else), so its
+    // literal branch calls parse_expr on the arm terminator. The match loop
+    // consumes the token itself; emitting CONST-0 WITHOUT advancing yields
+    // dead-but-skipped IR (the arm's IR_JMP end precedes it), matching the
+    // known-good 9a7ec10 behavior. ALL other tokens hard-fail: emitting
+    // CONST-0 without advancing on e.g. ':' or ')' loops forever
+    // (g6 slice-hang: "source too many tokens/IR limit").
+    if peek()==TT_PNCT&&(pval()==125||pval()==44) {
+        let vr5=nv(); iremit(IR_CONST,vr5,0,0,0); return vr5
+    }
+    let mu2 = "error: unexpected token in expression (type="
+    file_write(2, mu2+8, len(mu2))
+    let v=peek(); let c0=48+v/100; let c1=48+(v/10)%10; let c2=48+v%10
+    let dbg1=mmap(8); w8(dbg1,c0); w8(dbg1+1,c1); w8(dbg1+2,c2); w8(dbg1+3,44)
+    let dbg2=mmap(8); w8(dbg2,32); w8(dbg2+1,118); w8(dbg2+2,61); w8(dbg2+3,32)
+    let vv=pval(); let d0=48+vv/1000; let d1=48+(vv/100)%10; let d2=48+(vv/10)%10; let d3=48+vv%10
+    let dbg3=mmap(8); w8(dbg3,d0); w8(dbg3+1,d1); w8(dbg3+2,d2); w8(dbg3+3,d3); w8(dbg3+4,10)
+    file_write(2, dbg1, 3); file_write(2, dbg2, 3); file_write(2, dbg3, 5); exit(1)
     let vr5=nv(); iremit(IR_CONST,vr5,0,0,0); return vr5
 }
 
@@ -3296,6 +3538,15 @@ fn shl_trap_emit(ii) { if ovf_trap==1 && r8(ir_unsafe+ii)==0 { eb(72); eb(131); 
 //   SIGILL rc=132. Suppressed inside unsafe{} (same ir_unsafe gate). The +8 data
 //   offset is applied in the lea that follows this check.
 fn idx_trap_emit(ii) { if ovf_trap==1 && r8(ir_unsafe+ii)==0 { eb(72); eb(59); eb(8); eb(114); eb(2); eb(15); eb(11) } }
+// P10: ARM64 bounds-check trap for `a[idx]` — parity with x86 idx_trap_emit.
+// At the call site x0 = base ptr, x1 = idx. Emit:
+//   ldr x9,[x0]    ; x9 = len (header)
+//   cmp x1, x9     ; idx - len (unsigned)
+//   b.lo +8        ; if idx < len skip the udf (imm19=2: pc+8 past the 4B udf)
+//   udf #0         ; 0x00000000 = permanently undefined -> SIGILL rc=132
+// Negative idx (huge unsigned) fails the unsigned compare -> traps. Same
+// ir_unsafe/ovf_trap gate as x86.
+fn a_idx_trap_emit(ii) { if ovf_trap==1 && r8(ir_unsafe+ii)==0 { araw(0xF9400009); araw(0xEB09003F); araw(0x54000043); araw(0x00000000) } }
 
 // === REGISTER ALLOCATOR (corrected: reload on use, persist results) ===
 let REGS = mmap(112)  // 14 physical regs (all except RSP=4, RBP=5)
@@ -4080,6 +4331,8 @@ let opt_on = 1
 let ovf_trap = 1
 let cur_fnname = 0
 let cur_fnnlen = 0
+// P10: index of the function currently being compiled (for fn-param lookup).
+let cur_fi = 0
 
 // opt_func iterates over IR records with the GLOBAL loop counter `i` so the
 // const-resolution helpers (op_is_const / op_const_val) can read it.
@@ -4677,6 +4930,29 @@ fn ci_func(fi, is_main) {
             eb(72); eb(137); eb(16)             // mov [rax], rdx   ([base] = len header)
             sdef(res, rd)
         }
+        // P10: IR_ARRNEW (op 73) — runtime-count array alloc, same layout as
+        // IR_TALLOC ([base]=n, elems at base+8). Unlike TALLOC (count is a
+        // compile-time literal), n is the RUNTIME VALUE of vreg a0 — needed by
+        // slice lowering where n = hi-lo is dynamic. Mirrors mem_alloc's bytes.
+        else if op==IR_ARRNEW {
+            flush_all()
+            rbp(7, spill_home(a0))               // rdi = n (value of vreg a0)
+            eb(72); eb(137); eb(251)             // mov rbx, rdi  (rbx = n, saved across syscall)
+            eb(72); eb(137); eb(249)             // mov rcx, rdi  (rcx = n)
+            eb(72); eb(107); eb(201); eb(8)      // imul rcx, rcx, 8   (n*8)
+            eb(72); eb(131); eb(193); eb(8)      // add rcx, 8         (n*8+8 = len)
+            eb(72); eb(137); eb(206)             // mov rsi, rcx  (rsi = len)
+            eb(191); ei(0x60000001)              // mov edi, 0x60000001 (hint addr)
+            eb(186); ei(3)                       // mov edx, 3     (PROT_READ|WRITE)
+            eb(65); eb(186); ei(34)              // mov r10d, 0x22 (MAP_PRIVATE|ANON)
+            eb(65); eb(184); ei(0-1)             // mov r8d, -1    (fd)
+            eb(69); eb(49); eb(201)              // xor r9d, r9d   (offset=0)
+            eb(184); ei(9)                       // mov eax, 9
+            sysc()                               // rax = ptr
+            eb(72); eb(137); eb(24)              // mov [rax], rbx  ([base] = n header; rbx preserved)
+            let rd=aphys(res); if rd!=0 { rr(rd,0) }
+            sdef(res, rd)
+        }
         // P7: IR_SOME - Option::Some(payload) -> header layout [base]=len=2, [base+8]=tag=1, [base+16]=payload
         else if op==IR_SOME {
             flush_all()
@@ -4834,6 +5110,30 @@ fn ci_func(fi, is_main) {
             let rres=aphys(res)
             if rres!=0 { rr(rres,0) }; sdef(res, rres)
         }
+        else if op==IR_FNVAL {
+            // P10: fn-value tuple [codeptr, env=0] (16 bytes, NO length header —
+            // same layout as mk_any so IR_CLOSURE_CALL can read it directly).
+            flush_all()
+            ri(7, 16)                          // rdi = 16 bytes
+            eb(72); eb(137); eb(254)          // mov rsi, rdi   (len)
+            eb(191); ei(0x60000001)          // mov edi, hint addr
+            eb(186); ei(3)                    // mov edx, 3     (PROT_READ|WRITE)
+            eb(65); eb(186); ei(34)           // mov r10d, 0x22 (MAP_PRIVATE|ANON)
+            eb(65); eb(184); ei(0-1)          // mov r8d, -1    (fd)
+            eb(69); eb(49); eb(201)           // xor r9d, r9d
+            eb(184); ei(9)                    // mov eax, 9
+            sysc()                            // rax = 16-byte buffer
+            // rdx = codeptr: lea rdx,[rip+disp32] (deferred patch like IR_FNPTR)
+            let lea_ofs2=codelen
+            eb(72); eb(141); eb(21); ei(0)   // 48 8D 15 disp32 = lea rdx,[rip+disp]
+            let fi2=a0
+            w64(patches+patchc*PCS, lea_ofs2); w64(patches+patchc*PCS+8, fi2); w64(patches+patchc*PCS+16, 4); patchc=patchc+1
+            // [rax] = rdx (codeptr) ; [rax+8] = 0 (env)
+            eb(72); eb(137); eb(16)           // 48 89 10 = mov [rax], rdx
+            eb(72); eb(199); eb(64); eb(8); ei(0)   // 48 C7 40 08 00000000 = mov qword [rax+8], 0
+            let rres=aphys(res)
+            if rres!=0 { rr(rres,0) }; sdef(res, rres)
+        }
         else if op==IR_CLOSURE_CALL {
             // closure_call(fnb, args...): fnb is a mk_any tuple (tag=codeptr, val=env).
             // FIX: the callee is a NORMAL function (e.g. add(a,b)) using the standard
@@ -4868,6 +5168,44 @@ fn ci_func(fi, is_main) {
             }
             // call r11
             eb(65); eb(255); mr(3, 2, R_R11%8)              // 41 FF D3 = call r11
+            let rres=aphys(res)
+            if rres!=0 { rr(rres,0) }; sdef(res, rres)
+        }
+        else if op==IR_APUSH {
+            // P10: array push — append a QWORD element (array header counts
+            // elements, qword stride; IR_ISTORE/IR_IDX read base+8+i*8).
+            // v=rdi (arg0), e=rsi (arg1). Returns new header ptr.
+            flush_all()
+            let arg_start = a2; let arg_cnt = a1
+            let av0 = irres(arg_start)
+            let av1 = irres(arg_start+1)
+            rbp(7, spill_home(av0))   // rdi = v
+            rbp(6, spill_home(av1))   // rsi = e
+            rr(3,7)                   // rbx = v
+            rr(13,6)                  // r13 = e
+            rmr(14,3)                 // r14 = oldlen = [v]
+            rr(0,14); eb(72);eb(255);eb(192)   // rax = oldlen+1 = newlen (48 FF C0)
+            rr(15,0)                  // r15 = newlen
+            eb(72);eb(193);eb(224);eb(3)       // shl rax,3 -> newlen*8 (48 C1 E0 03)
+            eb(72);eb(131);eb(192);eb(8)       // add rax,8 -> size = newlen*8+8 (48 83 C0 08)
+            rr(6,0)                   // rsi = size
+            ri(7,0x60000000); ri(2,3); ri(10,0x22); ri(8,-1); rxor(9,9); ri(0,9); sysc()  // rax = new
+            rr(12,0)                  // r12 = new
+            rr(7,12)                  // rdi = new
+            rr(0,15)                  // rax = newlen
+            eb(72);eb(137);eb(7)      // [new] = newlen (48 89 07)
+            // copy oldlen*8 bytes v+8 -> new+8 via rep movsb
+            rr(6,3); eb(72);eb(131);eb(198);eb(8)   // rsi = v+8 (48 83 C6 08)
+            rr(7,12); eb(72);eb(131);eb(199);eb(8)  // rdi = new+8 (48 83 C7 08)
+            rr(1,14); eb(72);eb(193);eb(225);eb(3)  // rcx = oldlen*8 (48 C1 E1 03)
+            eb(243);eb(164)           // rep movsb
+            // store qword e at new+8+oldlen*8
+            rr(7,12); eb(72);eb(131);eb(199);eb(8)  // rdi = new+8
+            rr(0,14); eb(72);eb(193);eb(224);eb(3)  // rax = oldlen*8 (48 C1 E0 03)
+            ra(7,0)                   // rdi += rax -> new+8+oldlen*8
+            rr(0,13)                  // rax = e
+            eb(72);eb(137);eb(7)      // mov [rdi], rax (48 89 07 qword store)
+            rr(0,12)                  // rax = new
             let rres=aphys(res)
             if rres!=0 { rr(rres,0) }; sdef(res, rres)
         }
@@ -4921,7 +5259,7 @@ fn ci_func(fi, is_main) {
             let nm=a0; let nl=0
             while nl<256 {
                 let c0=r8(src+nm+nl)
-                if c0==0||c0==40||c0==59||c0==123||c0==125||c0==44 { break }
+                if c0==0||c0==40||c0==59||c0==123||c0==125||c0==44||c0==60||c0==62 { break }
                 if c0==32||c0==9||c0==10||c0==13 { break }
                 nl=nl+1
             }
@@ -6073,6 +6411,7 @@ fn arm_ci_func(fi, is_main) {
             aflsuh_all()
             aldr(0, 31, ahome(a0))            // x0 = base ptr (reload from spill-home, SP-relative to match asdef/aflsuh_all)
             aldr(1, 31, ahome(a1))            // x1 = field/element idx
+            a_idx_trap_emit(ii)               // P10: bounds check (parity with x86)
             let isstr = r64(vreg_is_str + a0*8)
             if isstr>=0 { aadd(1, 0, 1); aaddi(1, 1, 8) }   // byte stride: x1 = base + idx + 8 (skip header)
             else { amovz(9, 3); alsl(1, 1, 9); aadd(1, 0, 1); aaddi(1, 1, 8) }  // qword stride: x1 = base + idx*8 + 8
@@ -6086,6 +6425,7 @@ fn arm_ci_func(fi, is_main) {
             aldr(0, 31, ahome(a0))            // x0 = base ptr
             aldr(1, 31, ahome(a1))            // x1 = field/element idx
             aldr(2, 31, ahome(a2))            // x2 = value
+            a_idx_trap_emit(ii)               // P10: bounds check (parity with x86)
             let isstr2 = r64(vreg_is_str + a0*8)
             if isstr2>=0 { aadd(1, 0, 1); aaddi(1, 1, 8); astrb(2, 1, 0) }     // byte[x1+8] = x2
             else { amovz(9, 3); alsl(1, 1, 9); aadd(1, 0, 1); aaddi(1, 1, 8); astr(2, 1, 0) }  // [base+idx*8+8] = x2
@@ -6095,6 +6435,20 @@ fn arm_ci_func(fi, is_main) {
             aflsuh_all(); amov_imm64(0, 0x60000000); amovz(1, a0*8+8); amovz(2,3); amovz(3,0x22); araw(0x92800004); amovz(5,0); amovz(8,222); asvc()
             let rd=aphys_a(res); if rd!=0 { araw(0xAA0003E0|(0<<16)|rd) }
             amovz(2, a0); astr(2, 0, 0); asdef(res, rd)
+        }
+        // P10: IR_ARRNEW (op 73) — runtime-count array alloc (n = VALUE of vreg
+        // a0, not a compile-time literal like IR_TALLOC). Same layout: [base]=n,
+        // elems at base+8. x19 = n saved across the syscall (callee-saved).
+        else if op==IR_ARRNEW {
+            aflsuh_all()
+            aldr(1, 31, ahome(a0))    // x1 = n (value of vreg a0)
+            araw(0xAA0003F3)          // mov x19, x1  (x19 = n)
+            alsli(1, 1, 3)            // x1 = n*8
+            aaddi(1, 1, 8)            // x1 = n*8+8 (size)
+            arm_mmap_seq()            // x0 = ptr (hint in x0, len in x1)
+            astr(19, 0, 0)            // [ptr] = n header
+            let rd=aphys_a(res); if rd!=0 { araw(0xAA0003E0|(0<<16)|rd) }
+            asdef(res, rd)
         }
         // P10: IR_ARRAY_LEN (op 69) — get array length from header [base]
         else if op==IR_ARRAY_LEN {
@@ -6205,7 +6559,7 @@ fn arm_ci_func(fi, is_main) {
             }
             // load args a0..a7 from homes into x0..x7 (offsets shifted by blk)
             let nm=a0; let nl=0
-            while nl<256 { let c0=r8(src+nm+nl); if c0==0||c0==40||c0==59||c0==123||c0==125||c0==44 { break }; if c0==32||c0==9||c0==10||c0==13 { break }; nl=nl+1 }
+            while nl<256 { let c0=r8(src+nm+nl); if c0==0||c0==40||c0==59||c0==123||c0==125||c0==44||c0==60||c0==62 { break }; if c0==32||c0==9||c0==10||c0==13 { break }; nl=nl+1 }
             
             // compute name length
             let ai2=0
@@ -6215,6 +6569,31 @@ fn arm_ci_func(fi, is_main) {
             }
             if nstack>0 { amov_imm64(9, blk); araw(0x8B2963FF) }   // add sp, sp, x9 (restore)
             let rres=aphys_a(res); if rres!=0 { araw(0xAA0003E0|(0<<16)|rres) }; asdef(res, rres)
+        }
+        else if op==IR_APUSH {
+            // P10: array push — append a QWORD element. v=x0, e=x1. New header ptr in x0.
+            aflsuh_all()
+            let arg_start=a2; let arg_cnt=a1
+            let av0=irres(arg_start)
+            let av1=irres(arg_start+1)
+            aldr(0, 31, ahome(av0))   // x0 = v
+            aldr(1, 31, ahome(av1))   // x1 = e
+            amovr(19, 0)              // x19 = v
+            amovr(20, 1)              // x20 = e
+            aldr(21, 19, 0)           // x21 = oldlen
+            aaddi(9, 21, 1)           // x9 = newlen
+            alsli(1, 9, 3)            // x1 = newlen*8 (bytes for qword elements)
+            aaddi(1, 1, 8)            // x1 += 8 (header) -> size
+            arm_mmap_seq()            // x0 = new
+            amovr(23, 0)              // x23 = new
+            astr(9, 23, 0)            // [new] = newlen
+            aaddi(10, 19, 8)          // x10 = v+8
+            aaddi(11, 23, 8)          // x11 = new+8
+            alsli(12, 21, 3)          // x12 = oldlen*8 (byte count to copy)
+            arm_bcopy(10, 11, 12)     // after: x11 = new+8+oldlen*8
+            astr(20, 11, 0)           // [new+8+oldlen*8] = e (qword)
+            amovr(0, 23)
+            let rres2=aphys_a(res); if rres2!=0 { araw(0xAA0003E0|(0<<16)|rres2) }; asdef(res, rres2)
         }
         else if op==IR_FNPTR {
             // ARM64 fnptr(FNAME): load the function's code pointer via PC-relative
@@ -6233,6 +6612,30 @@ fn arm_ci_func(fi, is_main) {
             w64(fnptr_patches + fnptr_patchc*32 + 24, 0)
             fnptr_patchc = fnptr_patchc + 1
             asdef(res, rd)
+        }
+        else if op==IR_FNVAL {
+            // P10: fn-value tuple [codeptr, env=0] (16 bytes, NO header — same
+            // layout as mk_any, so IR_CLOSURE_CALL reads [x0]=codeptr,[x0+8]=env).
+            // x19/x20 are callee-saved scratch in arm_emit_bltn; use x19 for
+            // codeptr, x20 for the buffer pointer.
+            aflsuh_all()
+            amov_imm64(1, 16)                 // x1 = len
+            arm_mmap_seq()                    // x0 = 16-byte buffer (syscall 222)
+            araw(0xAA0003F4)                  // mov x20, x0  (save buffer ptr)
+            let fi2=a0
+            let rd2=19
+            let adrp_ofs2=codelen
+            araw(0x90000000 | (rd2 & 31))                 // adrp x19, #0 (placeholder)
+            let add_ofs2=codelen
+            araw(0x91000000 | ((rd2 & 31) << 5) | (rd2 & 31))  // add x19, x19, #0 (placeholder)
+            w64(fnptr_patches + fnptr_patchc*32 + 0, adrp_ofs2)
+            w64(fnptr_patches + fnptr_patchc*32 + 8, add_ofs2)
+            w64(fnptr_patches + fnptr_patchc*32 + 16, fi2)
+            w64(fnptr_patches + fnptr_patchc*32 + 24, 0)
+            fnptr_patchc = fnptr_patchc + 1
+            astr(19, 20, 0)                   // str x19, [x20]   (codeptr)
+            amovz(19, 0); astr(19, 20, 8)     // str x19, [x20+8] (env=0)
+            let rres=aphys_a(res); if rres!=0 { araw(0xAA0003E0|(0<<16)|rres) }; asdef(res, rres)
         }
         else if op==IR_CLOSURE_CALL {
             // ARM64 closure_call(fnb, args...): fnb is a mk_any tuple (codeptr, env).
@@ -6637,7 +7040,7 @@ fn patch_it() {
                 let tg_nl=0
                 while tg_nl<256 {
                     let c0=r8(src+tg+tg_nl)
-                    if c0==0||c0==40||c0==59||c0==123||c0==125||c0==44 { break }
+                    if c0==0||c0==40||c0==59||c0==123||c0==125||c0==44||c0==60||c0==62 { break }
                     if c0==32||c0==9||c0==10||c0==13 { break }
                     tg_nl=tg_nl+1
                 }
@@ -6967,7 +7370,7 @@ fn p5_elf_obj(out_p) {
             let tg=r64(patches+pi*PCS+8)
             let tg_nl=0
             while tg_nl<256 { let c0=r8(src+tg+tg_nl)
-                if c0==0||c0==40||c0==59||c0==123||c0==125||c0==44 { break }
+                if c0==0||c0==40||c0==59||c0==123||c0==125||c0==44||c0==60||c0==62 { break }
                 if c0==32||c0==9||c0==10||c0==13 { break }; tg_nl=tg_nl+1 }
             let tfi=findfn(tg,tg_nl)
             if tfi>=0 {
@@ -6987,7 +7390,7 @@ fn p5_elf_obj(out_p) {
             let tg=r64(patches+pi*PCS+8)
             let tg_nl=0
             while tg_nl<256 { let c0=r8(src+tg+tg_nl)
-                if c0==0||c0==40||c0==59||c0==123||c0==125||c0==44 { break }
+                if c0==0||c0==40||c0==59||c0==123||c0==125||c0==44||c0==60||c0==62 { break }
                 if c0==32||c0==9||c0==10||c0==13 { break }; tg_nl=tg_nl+1 }
             let es = p5_sym_for_name(tg, tg_nl)
             p5_add_reloc(po, es)
@@ -7632,6 +8035,12 @@ fn main(argc, argv) {
                         }
                     }
         
+        // P10: cur_fi must be set BEFORE parse_block so that parse_call_impl's
+        // fn-typed-param lookup (findparam(cur_fi, ...)) sees THIS function's
+        // param table while the body is parsed — not the previous fn's (the
+        // register-slot hazard: cross-block state must live in globals).
+        cur_fi=fi
+
                     parse_block()
         iremit(IR_RET,0,-1,0,0)
 
@@ -7664,7 +8073,7 @@ fn main(argc, argv) {
             let tg_nl=0
             while tg_nl<256 {
                 let c0=r8(src+tg+tg_nl)
-                if c0==0||c0==40||c0==59||c0==123||c0==125||c0==44 { break }
+                if c0==0||c0==40||c0==59||c0==123||c0==125||c0==44||c0==60||c0==62 { break }
                 if c0==32||c0==9||c0==10||c0==13 { break }
                 tg_nl=tg_nl+1
             }
