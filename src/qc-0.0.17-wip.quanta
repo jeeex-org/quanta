@@ -1998,7 +1998,7 @@ fn parse_block() {
             else { parse_expr() }
         } else if t==TT_PNCT&&v==123 {    // nested bare block: { ... }
             adv(); parse_block(); mpnct(125)
-        } else if t==TT_NUM||t==TT_STR||t==TT_OP||t==TT_PNCT {
+        } else if t==TT_NUM||t==TT_STR||t==TT_OP||t==TT_PNCT||t==TT_ASM {
             parse_expr()
         } else { break }
     }
@@ -2967,6 +2967,28 @@ fn parse_call_impl(nm, nl, selfv) {
 }
 
 fn parse_primary() {
+    if peek()==TT_ASM {  // P11: inline asm: asm!("hex bytes") — raw machine code
+        adv()  // consume 'asm'
+        if !(peek()==TT_OP && pval()==33) {
+            let mn = "error: expected '!' after asm\n"; file_write(2, mn+8, len(mn)); exit(1)
+        }
+        adv()  // consume '!'
+        if !(peek()==TT_PNCT && pval()==40) {
+            let mn = "error: expected '(' after asm!\n"; file_write(2, mn+8, len(mn)); exit(1)
+        }
+        adv()  // consume '('
+        if peek()!=TT_STR {
+            let mn = "error: expected string template in asm!\n"; file_write(2, mn+8, len(mn)); exit(1)
+        }
+        let sv=pval(); adv()  // string source offset (opening quote)
+        if !(peek()==TT_PNCT && pval()==41) {
+            let mn = "error: expected ')' in asm!\n"; file_write(2, mn+8, len(mn)); exit(1)
+        }
+        adv()  // consume ')'
+        let vr=nv()
+        iremit(IR_ASM, vr, sv, 0, 0)
+        return vr
+    }
     if peek()==TT_MATCH { return parse_match() }   // P6.1b: match in expression position
     if peek()==TT_NUM { let v=pval(); adv(); let vr=nv(); iremit(IR_CONST,vr,v,0,0); return vr }
     if peek()==TT_STR { let v=pval(); adv(); let vr=nv(); iremit(IR_STR,vr,v,0,0); w64(vreg_is_str + vr*8, 1); return vr }
@@ -5684,11 +5706,27 @@ fn ci_func(fi, is_main) {
             // No-op: unsafe{} is a compile-time construct
         }
         else if op==IR_ASM {
-            // TODO: parse asm template, constraints, emit instructions
-            // For now, emit nop
-            eb(144)  // nop
+            // P11: inline asm — template at src+a0 is a hex byte string like
+            // "b8 2a 00 00 00" (mov eax, 42). Emit each byte verbatim.
+            // Result register convention: RAX.
+            flush_all()
+            let sp=a0+1  // skip opening quote
+            let hi=0; let hn=0; let got=0
+            while sp<srclen {
+                let c=r8(src+sp)
+                if c==34 { break }  // closing quote
+                let dv=-1
+                if c>=48&&c<=57 { dv=c-48 }
+                else if c>=97&&c<=102 { dv=c-87 }
+                else if c>=65&&c<=70 { dv=c-55 }
+                if dv>=0 {
+                    if hn==0 { hi=dv; hn=1 } else { eb(hi*16+dv); got=1; hn=0 }
+                }
+                sp=sp+1
+            }
+            if got==0 { eb(144) }  // empty template -> nop
             let rd=aphys(res)
-            rxor(rd,rd)
+            if rd!=0 { rr(rd,0) }   // result convention: RAX -> rd
             sdef(res, rd)
         }
         ii=ii+1
@@ -6827,12 +6865,29 @@ fn arm_ci_func(fi, is_main) {
         }
         else if op==IR_UNSAFE_BLOCK {  // P6: unsafe block marker (no-op at runtime)
         }
-        else if op==IR_ASM {  // P6: inline assembly (placeholder)
+        else if op==IR_ASM {  // P11: inline assembly — hex byte template at src+a0
+            // Emit each byte verbatim (ARM64 instructions are 4-byte little-endian
+            // words; the template supplies them as hex, e.g. "20 00 80 d2" = mov x0, #1).
+            // Result register convention: x0.
             aflsuh_all()
-            araw(0xD503201F)  // nop
+            let sp=a0+1  // skip opening quote
+            let hi=0; let hn=0; let got=0
+            while sp<srclen {
+                let c=r8(src+sp)
+                if c==34 { break }  // closing quote
+                let dv=-1
+                if c>=48&&c<=57 { dv=c-48 }
+                else if c>=97&&c<=102 { dv=c-87 }
+                else if c>=65&&c<=70 { dv=c-55 }
+                if dv>=0 {
+                    if hn==0 { hi=dv; hn=1 } else { aeb(hi*16+dv); got=1; hn=0 }
+                }
+                sp=sp+1
+            }
+            if got==0 { araw(0xD503201F) }  // empty template -> nop
             let rd=aphys_a(res)
-            rxor(rd,rd)
-            sdef(res, rd)
+            araw(0xAA0003E0 | (0 << 16) | rd)   // mov rd, x0 (orr rd, xzr, x0)
+            asdef(res, rd)   // NOTE: asdef (ARM64), NOT sdef (x86) — sdef emits x86 code!
         }
         else if op==IR_STR {
             let sp2=a0+1; let ln=0; let scp=sp2
