@@ -2574,7 +2574,13 @@ fn parse_bxor() {
 }
 fn parse_band() {
     let l=parse_cmp()
-    while peek()==TT_OP&&pval()==38 { adv(); let r=parse_cmp(); let vr=nv(); iremit(IR_BAND,vr,l,r,0); l=vr }
+    while peek()==TT_OP&&pval()==38 {
+        // P6: '&' at the start of a NEW line is address-of of the next
+        // statement, not a bitwise-AND continuation (newlines are whitespace).
+        // Line number lives at TKS+16 (tokln/TKS+32 is the token LENGTH).
+        if tokp>0 && r64(toks + tokp*TKS + 16)!=r64(toks + (tokp-1)*TKS + 16) { break }
+        adv(); let r=parse_cmp(); let vr=nv(); iremit(IR_BAND,vr,l,r,0); l=vr
+    }
     return l
 }
 
@@ -2637,6 +2643,10 @@ fn parse_add() {
     let l=parse_mul()  // add binds looser than mul
     while peek()==TT_OP {
         let v=pval(); let rr=nv()
+        // P6: '-' at the start of a NEW line is a negation of the next
+        // statement, not a subtraction continuation (newlines are whitespace).
+        // Line number lives at TKS+16 (tokln/TKS+32 is the token LENGTH).
+        if v==45 && tokp>0 && r64(toks + tokp*TKS + 16)!=r64(toks + (tokp-1)*TKS + 16) { break }
         if v==43 { adv(); let r=parse_mul(); iremit(IR_ADD,rr,l,r,0); l=rr }
         else if v==45 { adv(); let r=parse_mul(); iremit(IR_SUB,rr,l,r,0); l=rr }
         else { break }
@@ -2648,6 +2658,10 @@ fn parse_mul() {
     let l=parse_unary()
     while peek()==TT_OP {
         let v=pval(); let rr=nv()
+        // P6: '*' at the start of a NEW line is a deref of the next statement,
+        // not a multiplication continuation (newlines are whitespace).
+        // Line number lives at TKS+16 (tokln/TKS+32 is the token LENGTH).
+        if v==42 && tokp>0 && r64(toks + tokp*TKS + 16)!=r64(toks + (tokp-1)*TKS + 16) { break }
         if v==42 { adv(); let r=parse_unary(); iremit(IR_MUL,rr,l,r,0); l=rr }
         else if v==47 { adv(); let r=parse_unary(); iremit(IR_DIV,rr,l,r,0); l=rr }
         else if v==37 { adv(); let r=parse_unary(); iremit(IR_MOD,rr,l,r,0); l=rr }
@@ -5345,14 +5359,14 @@ fn ci_func(fi, is_main) {
             flush_all()
             let rd=aphys(res)
             let rs=aphys(a0)
-            eb(72); mr(1, rd, rs)   // mov (rd), [rs]  (64-bit load)
+            eb(72); eb(139); mr(0, rd, rs)   // mov rd, [rs]  (64-bit load)
             sdef(res, rd)
         }
         else if op==IR_DEREF_MUT {  // P6: *p = v (store through raw pointer)
             flush_all()
             let rs=aphys(a0)   // pointer
             let rv=aphys(a1)   // value
-            eb(72); mr(0, rs, rv)   // mov [rs], rv  (64-bit store)
+            eb(72); eb(137); mr(0, rv, rs)   // mov [rs], rv  (64-bit store)
         }
         else if op==IR_PTR_ADD {  // P6: p + n (element-sized)
             let r1=aphys(a0); let r2=aphys(a1); let rd=adistinct(res,r1,r2)
@@ -5400,14 +5414,24 @@ fn ci_func(fi, is_main) {
             sdef(res, rd)
         }
         else if op==IR_PTR_CAST {  // P6: &p or cast to raw pointer
-            // a1: 1 = address-of, 0 = cast (no-op, just type change)
-            // For address-of, a0 is the vreg of a local; we need its stack address.
-            // The backend already has the vreg in a register or spill slot.
-            // Just move the value through (address-of handled by using spill_home).
-            let rd=aphys(res)
-            let rs=aphys(a0)
-            if rd!=rs { rr(rd, rs) }
-            sdef(res, rd)
+            // a2: 1 = address-of, 0 = cast. (a1 is the type tag from the
+            // `x as T` cast path — the address-of marker is passed in a2 by
+            // parse_unary's `&` branch: iremit(IR_PTR_CAST, vr, o, 0, 1).)
+            if a2==1 {
+                // address-of LOCAL: lea rd, [rbp + spill_home(a0)] gives the
+                // stack address of the local's home slot. (Globals: the a0
+                // vreg is an IR_LOADG temp, so &global is not yet supported —
+                // same limitation as before, but locals now work.)
+                let rd=aphys(res)
+                let off=spill_home(a0)
+                rw(rd,5); eb(141); if rd>=8 { mr(2,rd%8,4); eb(37) } else { mr(2,rd%8,5) }; ei(off)
+                sdef(res, rd)
+            } else {
+                let rd=aphys(res)
+                let rs=aphys(a0)
+                if rd!=rs { rr(rd, rs) }
+                sdef(res, rd)
+            }
         }
         else if op==IR_IS_NULL {  // P6: p == 0
             let r1=aphys(a0); let rd=adistinct(res,r1,r1)
@@ -6729,10 +6753,19 @@ fn arm_ci_func(fi, is_main) {
             asdef(res, rd)
         }
         else if op==IR_PTR_CAST {  // P6: &p or cast to raw pointer
-            let rd=aphys_a(res)
-            let rs=aphys_a(a0)
-            if rd!=rs { araw(0xAA0003E0 | (rs << 16) | rd) }
-            asdef(res, rd)
+            // a2: 1 = address-of, 0 = cast (see x86 handler comment).
+            if a2==1 {
+                // address-of LOCAL: add rd, sp, #ahome(a0) = stack address of
+                // the local's home slot. (Globals not yet supported, same as x86.)
+                let rd=aphys_a(res)
+                aaddi(rd, 31, ahome(a0))   // add rd, sp, #ahome(a0)
+                asdef(res, rd)
+            } else {
+                let rd=aphys_a(res)
+                let rs=aphys_a(a0)
+                if rd!=rs { araw(0xAA0003E0 | (rs << 16) | rd) }
+                asdef(res, rd)
+            }
         }
         else if op==IR_IS_NULL {  // P6: p == 0
             let r1=aphys_a(a0); let rd=aphys_a(res)
