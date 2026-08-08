@@ -767,6 +767,7 @@ let LINK_HT = 400         // ELF header + 6 program headers (64 + 56*6) — must
 // Set from the --target=arm64 CLI flag in main(); all ARM-specific codegen/ELF paths
 // branch on this. x86-64 path is completely unaffected when target_arch==0.
 let target_arch = 0
+let host_target_arch = 0  // build-time: default target_arch for the emitted binary
 // P4: code-buffer offsets of __init and main, recorded at emit time, used by the
 // startup-stub bl patcher. Globals (cannot be shadowed by block-scoped lets).
 let g_init_ofs = 0
@@ -5993,7 +5994,7 @@ fn arm_bcopy(sr, dr, cr) {
     araw(0x17FFFFFA)         // b -24 (back to cbz)
 }
 
-// --- ARM64 register allocator (parallel to x86; spills to frame at [sp+8+vr*8]) ---
+// --- ARM64 register allocator (parallel to x86; spills to frame at [x29+8+vr*8]) ---
 let AREGS = mmap(112)  // 14 physical ARM regs (x1..x7, x9..x15)
 fn init_aregs() {
     w64(AREGS+0, 1); w64(AREGS+8, 2); w64(AREGS+16, 3); w64(AREGS+24, 4)
@@ -6149,6 +6150,7 @@ fn arm_mmap_seq() {
 // AAPCS64: args in x0..x7; result in x0. Syscall: x8=num, svc #0.
 // IR_CALL has already called aflsuh_all() and loaded args into x0..x7.
 // We use x19,x20,x21,x22 as scratch (callee-saved, preserved by our prologue).
+// Register allocator now uses x29 (frame base) for spills, so no clobber.
 // ============================================================================
 fn arm_emit_bltn(nmi, nl) {
     let nm=src+nmi
@@ -6514,118 +6516,11 @@ fn arm_ci_func(fi, is_main) {
     araw(0xCB2963FF)                  // sub sp, sp, x9  (SUB extended reg: Rm=9 UXTX, Rn=sp, Rd=sp)
     let csi = 80; astr(0, 31, csi)    // save x0 (arg0) at [sp + 80]
 
-    // If this is the __init function (fi==0), emit keyword table initialization first
-    if fi == 0 {
-        // DEBUG: Emit a NOP pattern we can search for to confirm this code runs
-        araw(0xD503201F)  // NOP with specific pattern
-        araw(0xD503201F)
-        araw(0xD503201F)
-        
-        // Emit keyword table initialization for ARM64 output binary
-        // Keywords in order matching ktext(): 1=fn, 2=let, 3=if, 4=else, 5=loop, 6=while, 7=for,
-        // 8=break, 9=continue, 10=true, 11=false, 12=none, 13=and, 14=or, 15=not,
-        // 16=return, 17=alias, 18=unsafe, 19=extern, 20=global, 21=enum, 22=match,
-        // 23=type, 24=interface, 25=impl, 26=trait, 27=where, 28=Option, 29=Some,
-        // 30=None, 31=Result, 32=Ok, 33=Err, 34=ref, 35=mut, 36=move, 37=String,
-        // 38=raw, 39=volatile, 40=asm, 41=as, 42=usize, 43=dyn
-        let kt_base = GDATA_ARM + 0x4e0
-        let i = 0
-        let str_ptr = GDATA_ARM + 0x800
-        // Output binary: code at BASE=0x400000, GDATA at GDATA_ARM=0x500000
-        // Page delta is constant: (0x500000>>12) - (0x400000>>12) = 0x500 - 0x400 = 0x100 (256 pages)
-        // adrp immediate: imm = 256 -> immlo=0, immhi=64
-        // adrp encoding: 0x90000000 | (0<<29) | (64<<5) | rd = 0x90000800 | rd
-        
-        // fn\0 (102, 110, 0)
-        amovz(9, 102); arm_gptr(10, str_ptr); araw(0x39000000 | ((10 & 31) << 5) | (9 & 31) | (0 << 10))
-        amovz(9, 110); arm_gptr(10, str_ptr); araw(0x39000000 | ((10 & 31) << 5) | (9 & 31) | (1 << 10))
-        amovz(9, 0); arm_gptr(10, str_ptr); araw(0x39000000 | ((10 & 31) << 5) | (9 & 31) | (2 << 10))
-        arm_gptr(9, str_ptr); arm_gptr(10, kt_base + i * 8); araw(0xF9000000 | ((10 & 31) << 5) | (9 & 31)); str_ptr = str_ptr + 3; i = i + 1
-        // let\0 (108, 101, 116, 0)
-        amovz(9, 108); arm_gptr(10, str_ptr); araw(0x39000000 | ((10 & 31) << 5) | (9 & 31) | (0 << 10))
-        amovz(9, 101); arm_gptr(10, str_ptr); araw(0x39000000 | ((10 & 31) << 5) | (9 & 31) | (1 << 10))
-        amovz(9, 116); arm_gptr(10, str_ptr); araw(0x39000000 | ((10 & 31) << 5) | (9 & 31) | (2 << 10))
-        amovz(9, 0); arm_gptr(10, str_ptr); araw(0x39000000 | ((10 & 31) << 5) | (9 & 31) | (3 << 10))
-        arm_gptr(9, str_ptr); arm_gptr(10, kt_base + i * 8); araw(0xF9000000 | ((10 & 31) << 5) | (9 & 31)); str_ptr = str_ptr + 4; i = i + 1
-        // if\0 (105, 102, 0)
-        amovz(9, 105); arm_gptr(10, str_ptr); araw(0x39000000 | ((10 & 31) << 5) | (9 & 31) | (0 << 10))
-        amovz(9, 102); arm_gptr(10, str_ptr); araw(0x39000000 | ((10 & 31) << 5) | (9 & 31) | (1 << 10))
-        amovz(9, 0); arm_gptr(10, str_ptr); araw(0x39000000 | ((10 & 31) << 5) | (9 & 31) | (2 << 10))
-        arm_gptr(9, str_ptr); arm_gptr(10, kt_base + i * 8); araw(0xF9000000 | ((10 & 31) << 5) | (9 & 31)); str_ptr = str_ptr + 3; i = i + 1
-        // else\0 (101, 108, 115, 101, 0)
-        amovz(9, 101); arm_gptr(10, str_ptr); araw(0x39000000 | ((10 & 31) << 5) | (9 & 31) | (0 << 10))
-        amovz(9, 108); arm_gptr(10, str_ptr); araw(0x39000000 | ((10 & 31) << 5) | (9 & 31) | (1 << 10))
-        amovz(9, 115); arm_gptr(10, str_ptr); araw(0x39000000 | ((10 & 31) << 5) | (9 & 31) | (2 << 10))
-        amovz(9, 101); arm_gptr(10, str_ptr); araw(0x39000000 | ((10 & 31) << 5) | (9 & 31) | (3 << 10))
-        amovz(9, 0); arm_gptr(10, str_ptr); araw(0x39000000 | ((10 & 31) << 5) | (9 & 31) | (4 << 10))
-        arm_gptr(9, str_ptr); arm_gptr(10, kt_base + i * 8); araw(0xF9000000 | ((10 & 31) << 5) | (9 & 31)); str_ptr = str_ptr + 5; i = i + 1
-        // loop\0 (108, 111, 111, 112, 0)
-        amovz(9, 108); arm_gptr(10, str_ptr); araw(0x39000000 | ((10 & 31) << 5) | (9 & 31) | (0 << 10))
-        amovz(9, 111); arm_gptr(10, str_ptr); araw(0x39000000 | ((10 & 31) << 5) | (9 & 31) | (1 << 10))
-        amovz(9, 111); arm_gptr(10, str_ptr); araw(0x39000000 | ((10 & 31) << 5) | (9 & 31) | (2 << 10))
-        amovz(9, 112); arm_gptr(10, str_ptr); araw(0x39000000 | ((10 & 31) << 5) | (9 & 31) | (3 << 10))
-        amovz(9, 0); arm_gptr(10, str_ptr); araw(0x39000000 | ((10 & 31) << 5) | (9 & 31) | (4 << 10))
-        arm_gptr(9, str_ptr); arm_gptr(10, kt_base + i * 8); araw(0xF9000000 | ((10 & 31) << 5) | (9 & 31)); str_ptr = str_ptr + 5; i = i + 1
-        // while\0 (119, 104, 105, 108, 101, 0)
-        amovz(9, 119); arm_gptr(10, str_ptr); araw(0x39000000 | ((10 & 31) << 5) | (9 & 31) | (0 << 10))
-        amovz(9, 104); arm_gptr(10, str_ptr); araw(0x39000000 | ((10 & 31) << 5) | (9 & 31) | (1 << 10))
-        amovz(9, 105); arm_gptr(10, str_ptr); araw(0x39000000 | ((10 & 31) << 5) | (9 & 31) | (2 << 10))
-        amovz(9, 108); arm_gptr(10, str_ptr); araw(0x39000000 | ((10 & 31) << 5) | (9 & 31) | (3 << 10))
-        amovz(9, 101); arm_gptr(10, str_ptr); araw(0x39000000 | ((10 & 31) << 5) | (9 & 31) | (4 << 10))
-        amovz(9, 0); arm_gptr(10, str_ptr); araw(0x39000000 | ((10 & 31) << 5) | (9 & 31) | (5 << 10))
-        arm_gptr(9, str_ptr); arm_gptr(10, kt_base + i * 8); araw(0xF9000000 | ((10 & 31) << 5) | (9 & 31)); str_ptr = str_ptr + 6; i = i + 1
-        // for\0 (102, 111, 114, 0)
-        amovz(9, 102); arm_gptr(10, str_ptr); araw(0x39000000 | ((10 & 31) << 5) | (9 & 31) | (0 << 10))
-        amovz(9, 111); arm_gptr(10, str_ptr); araw(0x39000000 | ((10 & 31) << 5) | (9 & 31) | (1 << 10))
-        amovz(9, 114); arm_gptr(10, str_ptr); araw(0x39000000 | ((10 & 31) << 5) | (9 & 31) | (2 << 10))
-        amovz(9, 0); arm_gptr(10, str_ptr); araw(0x39000000 | ((10 & 31) << 5) | (9 & 31) | (3 << 10))
-        arm_gptr(9, str_ptr); arm_gptr(10, kt_base + i * 8); araw(0xF9000000 | ((10 & 31) << 5) | (9 & 31)); str_ptr = str_ptr + 4; i = i + 1
-        // break\0 (98, 114, 101, 97, 107, 0)
-        amovz(9, 98); arm_gptr(10, str_ptr); araw(0x39000000 | ((10 & 31) << 5) | (9 & 31) | (0 << 10))
-        amovz(9, 114); arm_gptr(10, str_ptr); araw(0x39000000 | ((10 & 31) << 5) | (9 & 31) | (1 << 10))
-        amovz(9, 101); arm_gptr(10, str_ptr); araw(0x39000000 | ((10 & 31) << 5) | (9 & 31) | (2 << 10))
-        amovz(9, 97); arm_gptr(10, str_ptr); araw(0x39000000 | ((10 & 31) << 5) | (9 & 31) | (3 << 10))
-        amovz(9, 107); arm_gptr(10, str_ptr); araw(0x39000000 | ((10 & 31) << 5) | (9 & 31) | (4 << 10))
-        amovz(9, 0); arm_gptr(10, str_ptr); araw(0x39000000 | ((10 & 31) << 5) | (9 & 31) | (5 << 10))
-        arm_gptr(9, str_ptr); arm_gptr(10, kt_base + i * 8); araw(0xF9000000 | ((10 & 31) << 5) | (9 & 31)); str_ptr = str_ptr + 6; i = i + 1
-        // continue\0 (99, 111, 110, 116, 105, 110, 117, 101, 0)
-        amovz(9, 99); arm_gptr(10, str_ptr); araw(0x39000000 | ((10 & 31) << 5) | (9 & 31) | (0 << 10))
-        amovz(9, 111); arm_gptr(10, str_ptr); araw(0x39000000 | ((10 & 31) << 5) | (9 & 31) | (1 << 10))
-        amovz(9, 110); arm_gptr(10, str_ptr); araw(0x39000000 | ((10 & 31) << 5) | (9 & 31) | (2 << 10))
-        amovz(9, 116); arm_gptr(10, str_ptr); araw(0x39000000 | ((10 & 31) << 5) | (9 & 31) | (3 << 10))
-        amovz(9, 105); arm_gptr(10, str_ptr); araw(0x39000000 | ((10 & 31) << 5) | (9 & 31) | (4 << 10))
-        amovz(9, 110); arm_gptr(10, str_ptr); araw(0x39000000 | ((10 & 31) << 5) | (9 & 31) | (5 << 10))
-        amovz(9, 117); arm_gptr(10, str_ptr); araw(0x39000000 | ((10 & 31) << 5) | (9 & 31) | (6 << 10))
-        amovz(9, 101); arm_gptr(10, str_ptr); araw(0x39000000 | ((10 & 31) << 5) | (9 & 31) | (7 << 10))
-        amovz(9, 0); arm_gptr(10, str_ptr); araw(0x39000000 | ((10 & 31) << 5) | (9 & 31) | (8 << 10))
-        arm_gptr(9, str_ptr); arm_gptr(10, kt_base + i * 8); araw(0xF9000000 | ((10 & 31) << 5) | (9 & 31)); str_ptr = str_ptr + 9; i = i + 1
-        // true\0 (116, 114, 117, 101, 0)
-        amovz(9, 116); arm_gptr(10, str_ptr); araw(0x39000000 | ((10 & 31) << 5) | (9 & 31) | (0 << 10))
-        amovz(9, 114); arm_gptr(10, str_ptr); araw(0x39000000 | ((10 & 31) << 5) | (9 & 31) | (1 << 10))
-        amovz(9, 117); arm_gptr(10, str_ptr); araw(0x39000000 | ((10 & 31) << 5) | (9 & 31) | (2 << 10))
-        amovz(9, 101); arm_gptr(10, str_ptr); araw(0x39000000 | ((10 & 31) << 5) | (9 & 31) | (3 << 10))
-        amovz(9, 0); arm_gptr(10, str_ptr); araw(0x39000000 | ((10 & 31) << 5) | (9 & 31) | (4 << 10))
-        arm_gptr(9, str_ptr); arm_gptr(10, kt_base + i * 8); araw(0xF9000000 | ((10 & 31) << 5) | (9 & 31)); str_ptr = str_ptr + 5; i = i + 1
-        // false\0 (102, 97, 108, 115, 101, 0)
-        amovz(9, 102); arm_gptr(10, str_ptr); araw(0x39000000 | ((10 & 31) << 5) | (9 & 31) | (0 << 10))
-        amovz(9, 97); arm_gptr(10, str_ptr); araw(0x39000000 | ((10 & 31) << 5) | (9 & 31) | (1 << 10))
-        amovz(9, 108); arm_gptr(10, str_ptr); araw(0x39000000 | ((10 & 31) << 5) | (9 & 31) | (2 << 10))
-        amovz(9, 115); arm_gptr(10, str_ptr); araw(0x39000000 | ((10 & 31) << 5) | (9 & 31) | (3 << 10))
-        amovz(9, 101); arm_gptr(10, str_ptr); araw(0x39000000 | ((10 & 31) << 5) | (9 & 31) | (4 << 10))
-        amovz(9, 0); arm_gptr(10, str_ptr); araw(0x39000000 | ((10 & 31) << 5) | (9 & 31) | (5 << 10))
-        arm_gptr(9, str_ptr); arm_gptr(10, kt_base + i * 8); araw(0xF9000000 | ((10 & 31) << 5) | (9 & 31)); str_ptr = str_ptr + 6; i = i + 1
-        // none\0 (110, 111, 110, 101, 0)
-        amovz(9, 110); arm_gptr(10, str_ptr); araw(0x39000000 | ((10 & 31) << 5) | (9 & 31) | (0 << 10))
-        amovz(9, 111); arm_gptr(10, str_ptr); araw(0x39000000 | ((10 & 31) << 5) | (9 & 31) | (1 << 10))
-        amovz(9, 110); arm_gptr(10, str_ptr); araw(0x39000000 | ((10 & 31) << 5) | (9 & 31) | (2 << 10))
-        amovz(9, 101); arm_gptr(10, str_ptr); araw(0x39000000 | ((10 & 31) << 5) | (9 & 31) | (3 << 10))
-        amovz(9, 0); arm_gptr(10, str_ptr); araw(0x39000000 | ((10 & 31) << 5) | (9 & 31) | (4 << 10))
-        arm_gptr(9, str_ptr); arm_gptr(10, kt_base + i * 8); araw(0xF9000000 | ((10 & 31) << 5) | (9 & 31)); str_ptr = str_ptr + 5; i = i + 1
-    }
     
     let ii=0
     while ii<irc {
         let op=irop(ii); let res=irres(ii); let a0=ira0(ii); let a1=ira1(ii); let a2=ira2(ii)
+        // DBG: probe each IR op
         if op==IR_CONST {
             let rd=aphys_a(res); if a0<0||a0>0xFFFFFFFF { amov_imm64(rd, a0) } else { amovz(rd, a0 & 0xFFFF); if (a0>>16)!=0 { amovk(rd, (a0>>16)&0xFFFF, 1) } }; asdef(res, rd)
         }
@@ -6918,7 +6813,7 @@ fn arm_ci_func(fi, is_main) {
             let rres=aphys_a(res); if rres!=0 { araw(0xAA0003E0|(0<<16)|rres) }; asdef(res, rres)
         }
         else if op==IR_FREE {
-            aflsuh_all(); aldr(0,31,ahome(irres(a0))); aldr(1,0,0); amovz(8,215); asvc()
+            aflsuh_all(); aldr(0,29,ahome(irres(a0))); aldr(1,0,0); amovz(8,215); asvc()
         }
         else if op==IR_DEREF {  // P6: *p - raw pointer dereference (load)
             aflsuh_all()
@@ -8050,7 +7945,10 @@ fn expand_includes(buf, len, depth) {
 
 // === MAIN ===
 fn main(argc, argv) {
-    kregs(); init_regs(); init_fregs(); init_cs(); 
+    kregs(); init_regs(); init_fregs(); init_cs();
+    // Apply build-time default target_arch (set by --host-target=arm64 when
+    // cross-compiling the compiler for ARM64).
+    target_arch = host_target_arch
     // Phase 4.3: mark all vregs as "not a struct" (-1). mmap zero-fills, which
     // would collide with struct index 0, so explicitly init to -1.
     let vsi_init = 0
@@ -8102,6 +8000,12 @@ fn main(argc, argv) {
                     let armstr = "target=arm64"
                     while ka<12 { if r8(ap+2+ka) != r8(armstr+8+ka) { is_arm=0; break }; ka=ka+1 }
                     if is_arm==1 { target_arch = 1 }
+                    // P11: --host-target=arm64 (17 chars) — sets default target_arch for
+                    // the emitted binary when cross-compiling the compiler itself.
+                    let is_host_arm = 1; let kh=0
+                    let hoststr = "host-target=arm64"
+                    while kh<17 { if r8(ap+2+kh) != r8(hoststr+8+kh) { is_host_arm=0; break }; kh=kh+1 }
+                    if is_host_arm==1 { host_target_arch = 1 }
                     // P5: try "--emit-obj" (relocatable .o + linker, object-format pillar)
                     let is_obj=1; let oa=0
                     let emobj = "emit-obj"
@@ -8112,7 +8016,7 @@ fn main(argc, argv) {
                     let nostr = "no-start"
                     while kc<9 { if r8(ap+2+kc) != r8(nostr+8+kc) { is_nostart=0; break }; kc=kc+1 }
                     if is_nostart==1 { no_start=1 }
-                    if !is_novf && !is_arm && !is_obj && !is_nostart {
+                    if !is_novf && !is_arm && !is_host_arm && !is_obj && !is_nostart {
                         if srcp==0 { srcp=ap } else if out_p==0 { out_p=ap }
                     }
                 }
@@ -8334,6 +8238,31 @@ fn main(argc, argv) {
         if fn_nlen(fi)==4 && r8(src+fn_name(fi))==109 && r8(src+fn_name(fi)+1)==97 && r8(src+fn_name(fi)+2)==105 && r8(src+fn_name(fi)+3)==110 { g_main_ofs = cstart }
         opt_func()      // Tier-1 IR opt (constant folding). No-op when opt_on==0.
         cur_fnname=fn_name(fi); cur_fnnlen=fn_nlen(fi)
+        // DBG: dump IR for arm_emit_bltn to inspect the && chain
+        if fn_nlen(fi)==13 && r8(src+fn_name(fi))==97 && r8(src+fn_name(fi)+1)==114 && r8(src+fn_name(fi)+2)==109 && r8(src+fn_name(fi)+3)==95 && r8(src+fn_name(fi)+4)==101 && r8(src+fn_name(fi)+5)==109 && r8(src+fn_name(fi)+6)==105 && r8(src+fn_name(fi)+7)==116 && r8(src+fn_name(fi)+8)==95 && r8(src+fn_name(fi)+9)==98 && r8(src+fn_name(fi)+10)==108 && r8(src+fn_name(fi)+11)==116 && r8(src+fn_name(fi)+12)==110 {
+            let di=0
+            while di<irc {
+                let dop=irop(di); let dr=irres(di); let da0=ira0(di); let da1=ira1(di); let da2=ira2(di)
+                let ms="IR"; file_write(2, ms+8, 2)
+                let m2=" "; file_write(2, m2+8, 1)
+                let nb=0
+                while nb<6 { let c0=48+((dop>>(nb*4))&15); if c0>57 { c0=c0+7 }; let mb=""; w8(mb,c0); file_write(2, mb, 1); nb=nb+1 }
+                let m3=" r="; file_write(2, m3+8, 3)
+                let nb=0
+                while nb<6 { let c0=48+((dr>>(nb*4))&15); if c0>57 { c0=c0+7 }; let mb=""; w8(mb,c0); file_write(2, mb, 1); nb=nb+1 }
+                let m4=" a0="; file_write(2, m4+8, 4)
+                let nb=0
+                while nb<6 { let c0=48+((da0>>(nb*4))&15); if c0>57 { c0=c0+7 }; let mb=""; w8(mb,c0); file_write(2, mb, 1); nb=nb+1 }
+                let m5=" a1="; file_write(2, m5+8, 4)
+                let nb=0
+                while nb<6 { let c0=48+((da1>>(nb*4))&15); if c0>57 { c0=c0+7 }; let mb=""; w8(mb,c0); file_write(2, mb, 1); nb=nb+1 }
+                let m6=" a2="; file_write(2, m6+8, 4)
+                let nb=0
+                while nb<6 { let c0=48+((da2>>(nb*4))&15); if c0>57 { c0=c0+7 }; let mb=""; w8(mb,c0); file_write(2, mb, 1); nb=nb+1 }
+                let m5b="\n"; file_write(2, m5b+8, 1)
+                di=di+1
+            }
+        }
         if target_arch == 1 { arm_ci_func(fi,0) } else { ci_func(fi,0) }
         sfn(fi,fn_name(fi),fn_nlen(fi),fn_btok(fi),cstart,pc)
 

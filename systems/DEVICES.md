@@ -1,7 +1,7 @@
 # Devices (ARM64 test targets)
 
 ```
-ai-arm-01 (NATIVE aarch64 Alpine, ~3.8GB RAM, SSH)   <-- REAL ARM64 SILICON, not qemu
+arm-01 (NATIVE aarch64 Alpine, ~3.8GB RAM, SSH)   <-- REAL ARM64 SILICON, not qemu
 ssh tali@192.168.254.231   (alias: arm-01.i.jeeex.org)
 ```
 ```
