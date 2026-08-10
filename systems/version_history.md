@@ -46,8 +46,9 @@
 | **P8** | Structs (decl, ctor, field access) | 0.0.12 | ✅ DONE |
 | **P9** | Traits/impl/vtable/dyn + struct literals | 0.0.13 | ✅ DONE |
 | **P10** | **For-in + `arr[-1]` + nested** | 0.0.14-wip | ✅ **DONE** |
-| **P10** | **Generics `<T>` monomorphization** | 0.0.15 (next) | ❌ **OPEN** |
-| **P11** | **P6 stubs cleanup** (type annotation, ARM volatile barrier, inline asm, SIMD) | 0.0.14-wip → | ❌ **OPEN** |
-| **P12** | **GPU/PTX/SPIR-V/WASM/bare-metal** | future | ❌ **NOT STARTED** |
+| **P10** | **Generics `<T>` monomorphization** | 0.0.15 | ✅ **DONE** (verified on ARM-01 hw, rc=12) |
+| **P11** | **P6 stubs cleanup** (raw-ptr type annotation, ARM `dmb ish`, inline asm, SIMD vec128) + `int` keyword | 0.0.14-wip → 0.0.20-wip | ✅ **CLOSED** (all verified on hw; `int` added in 0.0.20-wip) |
+| **P12** | **ARM64 backend hardening** — native self-host (stage-2 SIGSEGV on hw), syscall correctness | 0.0.20-wip → | 🔴 **OPEN** (native self-host SIGSEGV rc=139 reproduced on ARM-01; cross-compile path fully working) |
+| **P13** | **GPU/PTX/SPIR-V/WASM/bare-metal** | future | ❌ **NOT STARTED** |
 
 **Key correction:** Original docs had P8=concurrency (never existed). P8 was always Structs. P9 was Traits. P10 was For-in + Generics (For-in done, Generics next). P11 and P12 are newly defined for remaining work.

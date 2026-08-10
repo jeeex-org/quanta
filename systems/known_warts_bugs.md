@@ -25,8 +25,8 @@
 | ARM64 volatile barrier | `dmb ish` | ✅ **DONE** — emitted at lines 7011/7019. P11. |
 | Inline asm | hex template | ✅ **DONE** — real hex-byte emitter (line 7060+). P11. |
 | SIMD vec128 | SSE2/NEON | ✅ **DONE** — real `addpd`/`mulpd`/`fadd v0.2d` etc. `simd_test` rc=52 x86+ARM. P11. (The `IR_VEC128` op at 5796/7051 is dead `nop` stub — builtins bypass it and emit SIMD directly.) |
-| **ARM64 syscall numbers** | `int 0x80` vs `svc #0` | 🔴 OPEN — native ARM only; cross-compile path unaffected (uses correct ARM syscalls via `sysc()` on ARM target). |
-| **ARM64 native self-host** | Stage-2 SIGSEGV on real hw | 🔴 OPEN — OOB read into globals at `0x1dd7` past data seg. Blocks true ARM self-host; cross-compile is the supported path. |
+| **ARM64 syscalls** | `svc #0` | ✅ **DONE** — ARM64 backend emits `asvc()` (svc #0) with correct AArch64 syscall numbers (64=write, 93=exit, 222=mmap, 56=openat) via the `asvc()` helper (line 5978). The x86 `int 0x80` (`sysc()`) is only used on `target_arch==0`. Cross-compile + native paths both correct; full 62/62 suite passes on ARM-01 including `file_io`/`file_open_test`. (Prior docs claiming this was OPEN were stale.) |
+| **ARM64 native self-host** | Stage-2 SIGSEGV rc=139 on real hw | 🔴 OPEN (P12) — reproduced on ARM-01: `qc-0.0.19-arm /tmp/qc_src.quanta /tmp/out.bin` → segfault (rc=139) at stage-2 self-host. Cross-compile path is the supported/full-working path (62/62 on hw). |
 
 ### 10.3 Known tooling traps (documentation of past debugging effort)
 
@@ -37,7 +37,8 @@
 
 ---
 
-**Pillar mapping (verified 2026-08-10):**
+**Pillar mapping (verified 2026-08-11):**
 - P10: Generics monomorphization — ✅ DONE (generics_test rc=12 x86+ARM)
-- P11: P6 stub cleanup — ✅ DONE (raw-ptr type anno, ARM volatile `dmb ish`, inline asm, SIMD vec128 all working)
-- ARM64 backend: syscall numbers — 🔴 OPEN (native only); native self-host crash — 🔴 OPEN
+- P11: P6 stub cleanup + `int` keyword — ✅ CLOSED (raw-ptr type anno, ARM `dmb ish`, inline asm, SIMD vec128, `int` all working on hw)
+- P12: ARM64 backend hardening — 🔴 OPEN (native self-host SIGSEGV rc=139 reproduced on ARM-01; ARM syscalls already correct)
+- P13: GPU/PTX/SPIR-V/WASM/bare-metal — ❌ NOT STARTED
