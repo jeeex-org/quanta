@@ -6340,6 +6340,10 @@ fn arm_emit_bltn(nmi, nl) {
     //   AAPCS64 IR_CALL leaves path=x0, flags=x1, mode=x2. openat wants (dirfd,x0,x1,x2).
     if nl>=8&&r8(nm)=='f'&&r8(nm+1)=='i'&&r8(nm+2)=='l'&&r8(nm+3)=='e'&&r8(nm+4)=='_'&&r8(nm+5)=='o' {
         aflsuh_all()
+        // mode (x2) comes from the caller's 3rd arg via IR_CALL (x0=path,x1=flags,x2=mode).
+        // For 2-arg calls (O_RDONLY) the mode is ignored by the kernel, so the
+        // (undefined) x2 value is harmless; do NOT unconditionally zero it or
+        // O_CREAT calls lose their mode and create files with perms 0 (EACCES on read-back).
         araw(0xAA0203E3)            // mov x3, x2   (mode)
         araw(0xAA0103E2)            // mov x2, x1   (flags)
         araw(0xAA0003E1)            // mov x1, x0   (path)
@@ -6511,11 +6515,13 @@ fn arm_ci_func(fi, is_main) {
     vreg_n = maxvr + 1
     init_aregs()
     aclr_a_hard()
-    // Prologue: save callee-saved x28,x29,x30; set up frame
-    // x28 is our stable spill base and is callee-saved, so it MUST be saved here.
-    araw(0xA9BF73FD)                // stp x28,x29,[sp,#-16]!  (Rt2=29)
-    araw(0xF9000BFE)                // str x30,[sp,#16]
-    araw(0x910003FD)                // mov x29, sp
+    // Prologue: save callee-saved x29,x30,x28; set up frame.
+    // Layout matches AAPCS: x29@entry-16, x30(LR)@entry-8 (so the >8-arg
+    // read slot [x29+16]=entry+0 is NOT clobbered by LR). x28 (spill base)
+    // is saved separately at [x29,#-8]=entry-24, clear of all arg/stack slots.
+    araw(0xA9BF7BFD)                // stp x29,x30,[sp,#-16]!  (x29@entry-16, x30@entry-8)
+    araw(0x910003FD)                // mov x29, sp              (x29 = entry-16; arg9 read slot intact)
+    araw(0xF81F83BC)                // stur x28,[x29,#-8]      (x28 saved at entry-24, clear of LR@entry-8 and arg9@entry+0)
     let spill_region = 48 + vreg_n * 8
     let frame_size = spill_region + total_str + 80
     let min_spill = 16384
@@ -6792,12 +6798,12 @@ fn arm_ci_func(fi, is_main) {
             lbladd(done_lbl, codelen)
         }
         else if op==IR_PARAM {
-            if a0<8 { let preg=0; if a0==0 { preg=0 } else if a0==1 { preg=1 } else if a0==2 { preg=2 } else if a0==3 { preg=3 } else if a0==4 { preg=4 } else if a0==5 { preg=5 } else if a0==6 { preg=6 } else { preg=7 }
-                // param in register: move to x0 then spill to home
-                if preg==0 { /* already in x0 */ } else { araw(0xAA0003E0 | (preg<<16) | 0) }  // mov x0, xpreg
-                astr(0, 28, ahome(res)); w8(av_init+res,1); w8(av_spill+res,1) }
-            else { aldr(0, 28, 16 + (a0-8)*8); astr(0, 28, ahome(res)); w8(av_init+res,1); w8(av_spill+res,1) }  // stack args
-        }
+                    if a0<8 { let preg=0; if a0==0 { preg=0 } else if a0==1 { preg=1 } else if a0==2 { preg=2 } else if a0==3 { preg=3 } else if a0==4 { preg=4 } else if a0==5 { preg=5 } else if a0==6 { preg=6 } else { preg=7 }
+                        // param in register: move to x0 then spill to home
+                        if preg==0 { /* already in x0 */ } else { araw(0xAA0003E0 | (preg<<16) | 0) }  // mov x0, xpreg
+                        astr(0, 28, ahome(res)); w8(av_init+res,1); w8(av_spill+res,1) }
+                    else { aldr(0, 29, 16 + (a0-8)*8); astr(0, 28, ahome(res)); w8(av_init+res,1); w8(av_spill+res,1) }  // stack args (x29 = FP)
+                }
         else if op==IR_LABEL { aflsuh_all(); let lp=codelen; lbladd(a0, lp+4) }
         else if op==IR_JMP { aflsuh_all(); let po=codelen; araw(0x94000000); w64(patches+patchc*PCS,po); w64(patches+patchc*PCS+8,a0); w64(patches+patchc*PCS+16,0); patchc=patchc+1 }
         else if op==IR_BR {
@@ -6808,10 +6814,10 @@ fn arm_ci_func(fi, is_main) {
         else if op==IR_RET {
             aflsuh_all()
             if a0>=0 { let rv=aphys_a(a0); if rv!=0 { araw(0xAA0003E0|(rv<<16)|0) } }  // mov x0, rv
-            // epilogue: restore callee-saved x29,x28,x30 (mirror of prologue at 6516-6517)
-            araw(0x910003BF)            // mov sp, x29   (sp -> saved-region base = entry_sp-16)
-            araw(0xA8C173FD)            // ldp x29,x28,[sp],#16  (restore x29,x28; sp -> entry_sp)
-            araw(0xF94003FE)            // ldr x30,[sp]  (restore x30 at entry_sp; sp unchanged)
+            // epilogue: restore callee-saved x28,x29,x30 (mirror of prologue)
+            araw(0x910003BF)            // mov sp, x29   (sp -> entry-16)
+            araw(0xF85F83BC)            // ldur x28,[x29,#-8]  (restore x28 from entry-24)
+            araw(0xA8C17BFD)            // ldp x29,x30,[sp],#16  (restore x29,x30; sp -> entry)
             aret()
         }
         else if op==IR_CALL {
@@ -6829,7 +6835,7 @@ fn arm_ci_func(fi, is_main) {
                 let sj=0
                 while sj<nstack {
                     let sav=irres(arg_start+8+sj)
-                    if (arg_start+8+sj)<irc { aldr(10, 28, ahome(sav)); astr(10, 31, sj*8) }
+                    if (arg_start+8+sj)<irc { aldr(10, 31, ahome(sav)+blk); astr(10, 31, sj*8) }
                     sj=sj+1
                 }
             }
@@ -6928,12 +6934,12 @@ fn arm_ci_func(fi, is_main) {
             while j<nargc {
                 let av=irres(avs2+j)
                 let hm=ahome(av)
-                if j==0 { aldr(0, 29, hm) }
-                if j==1 { aldr(1, 29, hm) }
-                if j==2 { aldr(2, 29, hm) }
-                if j==3 { aldr(3, 29, hm) }
-                if j==4 { aldr(4, 29, hm) }
-                if j==5 { aldr(5, 29, hm) }
+                if j==0 { aldr(0, 28, hm) }
+                if j==1 { aldr(1, 28, hm) }
+                if j==2 { aldr(2, 28, hm) }
+                if j==3 { aldr(3, 28, hm) }
+                if j==4 { aldr(4, 28, hm) }
+                if j==5 { aldr(5, 28, hm) }
                 j=j+1
             }
             araw(0xD63F0000 | (9 << 5))      // blr x9
