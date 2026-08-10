@@ -3,18 +3,34 @@
 Quanta designed with simple syntax that supports multiple execution modes: Native compilation, Pre-compilation, Interpreter, JIT and WebAssembly
 
 ## Status
-- Native compilation (`qc`) — [Active] (qc-0.0.14-wip: P10 for-in loops working — nested for-in, `arr[-1]` array-length, unsafe blocks; 39/39 tests pass + for-in regression tests; self-host fixed-point verified; P10 generics next. Stable: qc-0.0.13 P9 traits/impl/vtable dispatch/struct literals on x86_64 and ARM64)
+- **Native compilation (`qc`)** — [Active] **qc-0.0.19 promoted** (x86_64 self-host fixed-point + ARM64 cross-compile 61/61 device tests verified). Stable base: qc-0.0.18 (P11 SIMD vec128).
 - Pre-compilation (`qc run`) — [Planned]
 - Interpreter (`qc --mode int`) — [Planned]
 - JIT (`qc --mode jit`) — [Planned]
 - WebAssembly (`qc --mode wasm`) — [Planned]
+
+## Promotion Workflow (Guarded)
+Promotions are **not manual** — they use `scripts/promote.sh` with hard regression guards:
+
+```bash
+./scripts/promote.sh <version> <wip_source>
+# Example: ./scripts/promote.sh 0.0.19 src/qc-0.0.19-wip.quanta
+```
+
+**Guards enforced (fail fast, leave repo clean):**
+1. **x86 self-host fixed-point** — stage1 == stage2 byte-identical
+2. **ARM64 cross-compile 61/61** — all 61 tests compile cleanly
+3. **ARM-01 hardware 61/61** — all 61 tests PASS on device (no "known gaps" allowed)
+4. **Old version removed from git** — stale binaries/source deleted before commit
+5. **bin/qc symlink updated** — points to new x86_64 binary
+
+If ANY guard fails, script exits non-zero, no partial commit.
 
 ## Getting Started
 ```quanta
 qc example/hello-work.quanta -o hello-world
 ./hello-world
 ```
-
 
 ## Documentation
 
