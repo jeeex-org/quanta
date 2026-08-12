@@ -1,9 +1,6 @@
 # Quanta Programming Language
 
-Quanta is a systems programming language with simple syntax, designed for
-multiple execution modes: **native compilation, pre-compilation (`go run`
-style), interpreter, JIT, and WebAssembly** — one language for backend,
-frontend, AI, blockchain, and embedded work.
+Quanta designed with simple syntax that supports multiple execution modes: Native compilation, Pre-compilation, Interpreter, JIT and WebAssembly
 
 > **Vocabulary:** "frontend" / "backend" refer to *domain capability*
 > (web UI vs server/systems). The compiler itself is organized by *stage*
