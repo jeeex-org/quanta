@@ -831,6 +831,12 @@ let IR_CAP  = 26000000     // ir arena 1024MB / 40B per record
 let VAR_CAP = 250000       // vars arena 2MB / 24B (VRS=24? keep headroom)
 let FN_CAP  = 250000       // fns arena 2MB / 40B (FNS=40)
 let ALLOC_CAP = 131000     // alloc arena 2MB / 16B
+let GVAR_CAP = 83000       // gvars arena 2MB / 24B (VRS=24), keep headroom
+let VREG_CAP = 32000       // vreg_is_str/type arenas 32768 slots, keep headroom
+let LBL_CAP  = 124000      // lblmap arena 2MB / 16B (LBS=16), keep headroom
+let PATCH_CAP = 330000     // patches arena 8MB / 24B (PCS=24), keep headroom
+let GPATCH_CAP = 62000     // gpatches arena 2MB / 32B, keep headroom
+let IMPSEEN_CAP = 8100     // imp_seen arena 8192 slots, keep headroom
 
 // Clean abort when an emit arena is exhausted: write a clear message to stderr
 // and exit(17) instead of writing out-of-bounds (which previously SIGSEGV'd).
@@ -1092,6 +1098,7 @@ fn scan_globals() {
                     // ginit: skip name and '='; for `global NAME` with no init it
                     // still points past '=', harmless (initializer is empty / 0).
                     w64(ginit+gvarc*8, nt+2)
+                    if gvarc >= GVAR_CAP { emit_ovf() }
                     gvarc=gvarc+1
                 }
             }
@@ -1106,6 +1113,7 @@ fn scan_globals() {
                             w64(gvars+gvarc*16, tokv(nt)); w64(gvars+gvarc*16+8, tokln(nt))
                             w64(g_named+gvarc*8, 2)   // imported (UNDEF named symbol)
                             w64(ginit+gvarc*8, 0)       // no initializer
+                            if gvarc >= GVAR_CAP { emit_ovf() }
                             gvarc=gvarc+1
                             // FIX (1.1.14): consume the whole `extern "C" global NAME`
                             // construct. Otherwise the inner `global` keyword (at p+2,
@@ -1131,10 +1139,10 @@ fn lbladd(l,ip) { let i=lblc; lblc=i+1; w64(lblmap+i*LBS,l); w64(lblmap+i*LBS+8,
 fn lblf(l) { let i=0; while i<lblc { if r64(lblmap+i*LBS)==l { return r64(lblmap+i*LBS+8) }; i=i+1 }; return -1 }
 // Record a forward/backward branch patch for the current function. ty: 0=jmp, 1=je.
 // Resolved by ci_func's per-function label fixup (after emit_bltn runs).
-fn emit_patch(po, lbl, ty) { w64(patches+patchc*PCS, po); w64(patches+patchc*PCS+8, lbl); w64(patches+patchc*PCS+16, ty); patchc=patchc+1 }
+fn emit_patch(po, lbl, ty) { if patchc >= PATCH_CAP { emit_ovf() }; w64(patches+patchc*PCS, po); w64(patches+patchc*PCS+8, lbl); w64(patches+patchc*PCS+16, ty); patchc=patchc+1 }
 
-fn nv() { let v=vreg_n; vreg_n=vreg_n+1; w64(vreg_is_str + v*8, 0-1); return v }
-fn nl() { let l=lbl_n; lbl_n=lbl_n+1; return l }
+fn nv() { if vreg_n >= VREG_CAP { emit_ovf() }; let v=vreg_n; vreg_n=vreg_n+1; w64(vreg_is_str + v*8, 0-1); return v }
+fn nl() { if lbl_n >= LBL_CAP { emit_ovf() }; let l=lbl_n; lbl_n=lbl_n+1; return l }
 
 fn findfn(nm,nl) {
     let ai=0
@@ -1349,7 +1357,7 @@ fn tokenize() {
             while p<srclen&&r8(src+p)!=34 {
                 if r8(src+p)==92&&p+1<srclen { p=p+2; c=c+2 } else { p=p+1; c=c+1 }
             }
-            if p>=srclen { exit(11) }; p=p+1; c=c+1
+            if p>=srclen { let mh = "error: unterminated string literal (missing closing quote)\n"; file_write(2, mh+8, len(mh)); exit(1) }; p=p+1; c=c+1
             stok(tokc,TT_STR,sp,sl,sc,p-sp); tokc=tokc+1
         } else if ch==39 {
             let sc=c; let cval=0
@@ -1462,7 +1470,7 @@ fn tokenize() {
             stok(tokc,TT_OP,ch,l,c,1); tokc=tokc+1; p=p+1; c=c+1
         } else if ispnct(ch) {
             stok(tokc,TT_PNCT,ch,l,c,1); tokc=tokc+1; p=p+1; c=c+1
-        } else { exit(12) }
+        } else { let mh = "error: invalid character in source (byte not a token)\n"; file_write(2, mh+8, len(mh)); exit(1) }
     }
 }
 
@@ -5008,6 +5016,7 @@ fn ci_func(fi, is_main) {
             w64(gpatches+gpatchc*24, pofs)
             w64(gpatches+gpatchc*24+8, a0)
             w8(gpatches+gpatchc*24+16, 0)
+            if gpatchc >= GPATCH_CAP { emit_ovf() }
             gpatchc=gpatchc+1
             sdef(res, rd)
         }
@@ -5020,6 +5029,7 @@ fn ci_func(fi, is_main) {
             w64(gpatches+gpatchc*24, pofs)
             w64(gpatches+gpatchc*24+8, a1)
             w8(gpatches+gpatchc*24+16, 1)
+            if gpatchc >= GPATCH_CAP { emit_ovf() }
             gpatchc=gpatchc+1
         }
         else if op==32 {
@@ -5590,6 +5600,7 @@ fn ci_func(fi, is_main) {
                 w64(gpatches+gpatchc*24, codelen-4)
                 w64(gpatches+gpatchc*24+8, gdata_size + data_off)
                 w8(gpatches+gpatchc*24+16, 2)
+                if gpatchc >= GPATCH_CAP { emit_ovf() }
                 gpatchc=gpatchc+1
             } else {
                 ri64(rd, str_addr)
@@ -6607,7 +6618,7 @@ fn imp_try(name, nl, pfx, pl) {
 
 fn imp_load(fd, depth) {     // read fd into depth buffer, dedup, recurse-expand
   if imp_already()==0 {
-    w64(imp_seen + imp_seenc*8, imp_hash()); imp_seenc=imp_seenc+1
+    w64(imp_seen + imp_seenc*8, imp_hash()); if imp_seenc >= IMPSEEN_CAP { emit_ovf() }; imp_seenc=imp_seenc+1
     let ib = impbufs + (depth%8)*16777216
     let n = file_read(fd, ib, 16777216); file_close(fd)
     if n>0 { expand_includes(ib, n, depth+1) }
