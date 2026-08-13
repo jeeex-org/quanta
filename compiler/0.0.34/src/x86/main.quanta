@@ -1389,7 +1389,6 @@ fn is_bltn(nm,nl) {
     if nl==4&&r8(src+nm)=='u'&&r8(src+nm+1)=='g'&&r8(src+nm+2)=='t'&&r8(src+nm+3)=='e' { return 1 } // ugte(a,b): unsigned a>=b
     if nl==2&&r8(src+nm)=='u'&&r8(src+nm+1)=='8' { return 1 } // u8(x): mask to 8 bits
     if nl==3&&r8(src+nm)=='u'&&r8(src+nm+1)=='3'&&r8(src+nm+2)=='2' { return 1 } // u32(x): mask to 32 bits
-    if nl==8&&r8(src+nm)=='s'&&r8(src+nm+1)=='y'&&r8(src+nm+2)=='s'&&r8(src+nm+3)=='c'&&r8(src+nm+4)=='a'&&r8(src+nm+5)=='l'&&r8(src+nm+6)=='l'&&r8(src+nm+7)=='3' { return 1 } // syscall3(num,a,b,c)
     if nl==3&&r8(src+nm)=='u'&&r8(src+nm+1)=='6'&&r8(src+nm+2)=='4' { return 1 } // u64(x): identity at 64-bit runtime
     if nl==5&&r8(src+nm)=='p'&&r8(src+nm+1)=='a'&&r8(src+nm+2)=='n'&&r8(src+nm+3)=='i'&&r8(src+nm+4)=='c' { return 1 } // panic() -> exit(1)
     // P6.1a: float builtins (SSE on x86). Args/results are raw
@@ -1502,14 +1501,19 @@ fn tokenize() {
             let sp=p; let sc=c
             if ch==48 && p+1<srclen && (r8(src+p+1)==120 || r8(src+p+1)==88) {
                 // hex literal 0x... / 0X...
+                // NOTE: do NOT mask with 0xFFFFFFFFFFFFFFFF here — that literal
+                // is itself truncated by the (pre-fix) hex lexer, so the mask
+                // would silently clobber the high 32 bits. `val` is a 64-bit
+                // slot and val*16+digit stays within 64 bits for any valid hex
+                // literal, so no mask is required.
                 p=p+2; c=c+2
                 let val=0
                 let hdig=0
                 while p<srclen {
                     let d=r8(src+p)
-                    if d>=48&&d<=57 { val=(val*16 + (d-48)) & 0xFFFFFFFFFFFFFFFF; p=p+1; c=c+1; hdig=hdig+1 }
-                    else if d>=97&&d<=102 { val=(val*16 + (d-87)) & 0xFFFFFFFFFFFFFFFF; p=p+1; c=c+1; hdig=hdig+1 }
-                    else if d>=65&&d<=70 { val=(val*16 + (d-55)) & 0xFFFFFFFFFFFFFFFF; p=p+1; c=c+1; hdig=hdig+1 }
+                    if d>=48&&d<=57 { val=val*16 + (d-48); p=p+1; c=c+1; hdig=hdig+1 }
+                    else if d>=97&&d<=102 { val=val*16 + (d-87); p=p+1; c=c+1; hdig=hdig+1 }
+                    else if d>=65&&d<=70 { val=val*16 + (d-55); p=p+1; c=c+1; hdig=hdig+1 }
                     else { break }
                 }
                 // NEW-5: a bare `0x` / `0X` with no hex digits must not silently
@@ -4593,17 +4597,6 @@ fn emit_bltn(nmi,nl) {
     if nl==2&&r8(nm)=='u'&&r8(nm+1)=='8' { flush_all(); rr(0,7); eb(72); eb(129); mr(3,4,0); ei(255); return 1 }   // rax=rdi; and rax,0xFF (0x81 imm32: 0xFF sign-extends, so MUST use imm32 form)
     if nl==3&&r8(nm)=='u'&&r8(nm+1)=='3'&&r8(nm+2)=='2' { flush_all(); rr(0,7); eb(37); eb(255); eb(255); eb(255); eb(255); return 1 }  // and eax,0xFFFFFFFF (opcode 0x25 + imm32)
     if nl==3&&r8(nm)=='u'&&r8(nm+1)=='6'&&r8(nm+2)=='4' { flush_all(); rr(0,7); return 1 }                          // 64-bit: identity (mov rax,rdi)
-    // syscall3(num, a, b, c): generic 3-arg Linux syscall. IR_CALL arg-load places
-    // arg0->rdi(num), arg1->rsi(a), arg2->rdx(b), arg3->r10(c). Re-shuffle so the
-    // syscall number goes in rax and the args land in the ABI syscall registers.
-    if nl==8&&r8(nm)=='s'&&r8(nm+1)=='y'&&r8(nm+2)=='s'&&r8(nm+3)=='c'&&r8(nm+4)=='a'&&r8(nm+5)=='l'&&r8(nm+6)=='l'&&r8(nm+7)=='3' {
-        flush_all()
-        rr(0,7)                 // rax = rdi (num)
-        rr(7,6)                 // rdi = rsi (arg a)
-        rr(6,2)                 // rsi = rdx (arg b)
-        rr(2,10)                // rdx = r10 (arg c)
-        sysc(); return 1
-    }
     // str(a,b): a=rdi, b=rsi. returns header ptr (len at [new], bytes at new+8)
     if nl==3&&r8(nm)=='s'&&r8(nm+1)=='t'&&r8(nm+2)=='r' {
         flush_all()
@@ -5863,7 +5856,7 @@ fn ci_func(fi, is_main) {
             } else {
                 ri64(rd, str_addr)
             }
-            if data!=0 && data!=0xFFFFFFFFFFFFFFFF {
+            if data!=0 && data+1!=0 {
                 let ci=0
                 let si=sp
                 while ci<ln {
