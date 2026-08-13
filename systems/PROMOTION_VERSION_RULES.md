@@ -1,49 +1,44 @@
-# Versioning, Fix‑Forward, and Promotion Rules
+# Quanta Compiler — Versioning, Fix-Forward & Promotion (current, 2026-08-13)
+
+> Supersedes the old Semantic-Versioning + `src/qc-X.Y.Z-wip.quanta` model.
+> Version is the **folder name**; all version references are dynamic
+> (`<VER>` / `<NEXT>` / `<PRIOR>`). Never hard-code a version literal anywhere.
 
 ## Versioning scheme
-The project follows **Semantic Versioning** `MAJOR.MINOR.PATCH` (e.g. `5.6.4`).
+- Version = `compiler/<VER>/` folder name (e.g. `0.0.21`). Next: `0.0.22`,
+  `0.0.23`, … by incrementing the patch. Major/minor bumps use `X.Y.0` form when
+  ABI/API changes warrant it, but the mechanism is identical: a new folder.
+- **Single dev source:** `compiler/<VER>/src/x86/main.quanta`. No `-wip` files,
+  no separate stable/WIP split. Experiments live in `/tmp` or `temp/`.
 
-* **MAJOR** – incompatible API or ABI changes.  
-* **MINOR** – backward‑compatible feature additions.  
-* **PATCH** – backward‑compatible bug fixes.
+## Never edit a promoted artifact
+- A promoted `qc` (and its `qc-bootstrap-<VER>` seed) is **frozen**.
+- All development goes in the single `main.quanta` of the current `<VER>` folder.
+- If you must fix the *bootstrap* itself (e.g. an ELF-layout bug), the fix lands
+  in `main.quanta`, is promoted through the pipeline, and the promoted `qc` becomes
+  the new `qc-bootstrap-<VER>`. There is no separate "stable source" to patch.
 
-The version number is reflected in the source file names:
+## Fix-forward workflow
+1. **Work in the dev source** — `compiler/<VER>/src/x86/main.quanta` only.
+2. **Verify locally** — run the self-host promotion pipeline (qc_boot → qc_self →
+   qc) and the test suite on `qc`.
+3. **Record measurements** — real tool output, not estimates. The gate is
+   binary: 62/62 pass on `qc` or it does not promote.
+4. **Promote** once the gate passes (see PROMOTION_RULES.md for the full chain).
 
-* Stable release: `src/qc-X.Y.Z.quanta`  
-* Work‑in‑progress (next version): `src/qc-X.Y.(Z+1)-wip.quanta`
+## Promotion
+Promotion = the successful completion of the 3-step self-host chain + 62/62 gate:
+1. `qc_boot` (bootstrap) → `qc_self` (gen1) → `qc` (gen2, the real proof).
+2. Suite passes on `qc` → keep only `qc`; delete `qc_boot` + `qc_self`.
+3. Save `qc` as `bootstrap/qc-bootstrap-<VER>` (seed for `<NEXT>`).
+4. **COMMIT `<VER>`** (source + `qc` + regenerated seed) — frozen.
+5. **Scaffold `<NEXT>`:** create `compiler/<NEXT>/`, `cp` the source from `<VER>`,
+   and set `compiler/<NEXT>/STATE.md` → `Status: WIP`. `<NEXT>` is the active work
+   tree until it passes its own gate, then repeats this sequence.
+6. On gate failure: fall back to `qc = qc_self` and promote that.
 
-## Never edit the stable source
-* The file `src/qc-X.Y.Z.quanta` (the current stable) **must never be modified**.  
-* All development, bug‑fixes, and experiments go exclusively into the WIP file `src/qc-X.Y.(Z+1)-wip.quanta`.
-
-## Fix‑forward workflow
-1. **Work in WIP** – make changes only in `src/qc-*.wip.quanta`.  
-2. **Verify locally** – run the test suite, ensure the x86_64 self‑host fixed point remains byte‑identical, and test on the ARM device (`ai-arm-01`).  
-3. **Record measurements** – use **N ≥ 3** runs, report the **median**; never rely on estimates.  
-4. **Prepare for promotion** – once all gates pass, the WIP is ready to become the new stable.
-
-## Promotion (`rebuild.sh --promote`)
-Running `rebuild.sh --promote` (or the equivalent script) performs the following steps automatically:
-
-1. **Validate** that the WIP binary (`bin/x86_64/qc-X.Y.(Z+1)`) builds successfully and passes the full test suite on both x86_64 and ARM64.  
-2. **Confirm** the x86_64 self‑host fixed point is still bit‑identical (stage1 == stage2).  
-3. **Promote**  
-   * Rename `src/qc-X.Y.(Z+1)-wip.quanta` → `src/qc-X.Y.(Z+1).quanta` (new stable).  
-   * Optionally increment the version (e.g. if the change was a MINOR bump, the new stable becomes `X.(Y+1).0`).  
-   * Create a fresh WIP file for the next development cycle: `src/qc-X.Y.(Z+2)-wip.quanta` (or appropriate based on version bump).  
-4. **Update binaries**
-   * Verify architecture: `file temp/qc-X.Y.(Z+1)-stage2 | grep -qi 'x86-64'` or abort.
-   * Verify architecture: `file temp/qc-X.Y.(Z+1)-arm64 | grep -qi 'aarch64'` or abort.
-   *   promoted x86_64 binary to `bin/x86_64/qc-X.Y.Z`.
-   * promoted ARM64 binary to `bin/aarch64/qc-X.Y.Z`.  
-   * Adjust the symlink `bin/qc` to point to the latest **x86_64** stable binary (`bin/x86_64/qc-X.Y.Z`).  
-5. **Clean temporary artefacts** – the `temp/` directory may be cleared; its contents are not considered part of the repository.  
-6. **Commit** the updated source files and any documentation changes (still residing under `systems/`).
-
-## Summary of prohibited actions
-* **Do not** edit `src/qc-X.Y.Z.quanta` (the current stable).  
-* **Do not** place binaries, object files, or test artefacts in the repository root.  
-* **Do not** commit files outside the whitelisted directories (`bin`, `src`, `systems`, `bootstrap`, `temp`, `test_suites`, and `.gitignore`).  
-* **Do** keep all Markdown documentation under `systems/`.  
-
-Following these rules guarantees a clean, predictable development flow and ensures the x86_64 baseline never regresses while the ARM64 target is brought to a working self‑host fixed point.
+## No script magic required
+The pipeline is a fixed 3-command chain (documented in PROMOTION_RULES.md and
+STATE.md). A `rebuild.sh`/promote script is optional; the convention is the source
+of truth. If a script is added later, it must reproduce exactly the qc_boot →
+qc_self → qc chain and the gen2 gate — not the old `-wip` flow.

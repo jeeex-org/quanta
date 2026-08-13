@@ -1,149 +1,78 @@
-# Quanta Compiler Promotion Rules
+# Quanta Compiler — Promotion Rules (current, 2026-08-13)
 
-## Versioning Scheme
-- **Stable**: `src/qc-X.Y.Z.quanta` — promoted, frozen, no changes allowed
-- **WIP**: `src/qc-X.Y.(Z+1)-wip.quanta` — active development, all changes here
-- **Bootstrap**: `src/qc-X.Y.(Z-1).quanta` — previous stable, used to build new stable
-- **Binary**: `bin/{x86_64,aarch64}/qc-X.Y.Z` — promoted compiler binaries
+> Supersedes the old `src/qc-X.Y.Z-wip.quanta` / ARM64 dual-arch promotion model.
+> Version is the **folder name** (`compiler/<VER>/`); use `<VER>` / `<NEXT>` /
+> `<PRIOR>` placeholders — never hard-code a version literal.
 
-## Current state (2026-08-04)
+## Versioning scheme
+- **Dev source (one only):** `compiler/<VER>/src/x86/main.quanta` — all edits here.
+  No `-wip` duplicate files. Experiments go in `/tmp` or `temp/`.
+- **Binaries (built, mostly intermediate):** `compiler/<VER>/bin/x86/{qc_boot,qc_self,qc}`.
+- **Bootstrap seed:** `bootstrap/qc-bootstrap-<PRIOR>` — the **promoted `qc` of the
+  previous version**, regenerated each promotion (NOT a fixed historical file).
 
-> Snapshot of where the project stands today. The generic workflow below is unchanged.
+## Self-host promotion pipeline
+The real self-hosting proof is the **final compile** (gen1 → gen2), not just
+bootstrap → qc. Three steps:
 
-- **Stable (frozen)**: `src/qc-0.0.13.quanta` (P9)
-- **WIP (active)**: `src/qc-0.0.14-wip.quanta` (P10) — current focus is P10 generics; `for-in` support is **done**
-- **Bootstrap binary**: `bin/x86_64/qc-0.0.13` is the gsz-patched bootstrap; `bin/aarch64/` holds ARM64 binaries
-- **Symlink**: `bin/qc -> x86_64/qc-0.0.13`
-- **Promotion mechanics**: a promotion flips `src/qc-X.Y.(Z+1)-wip.quanta` → new stable, creates the next `-wip`, updates `bin/x86_64/qc-X.Y.(Z+1)` + `bin/aarch64`, and flips the `bin/qc` symlink
-- **Fix-forward workflow**: new feature/bug development happens in `-wip` and moves forward only
-- **Bootstrap integrity exceptions**: per the gsz BSS fix (`7421bbb`), a bootstrap bug-fix is NOT just a WIP change — because ELF layout comes from the compiler that RUNS `write_elf`, an integrity fix touches the **stable source + binary as a pair** (both `src/qc-0.0.13.quanta` and `bin/x86_64/qc-0.0.13` rebuilt together). Such fixes are the one carve-out to the "stable is frozen" rule.
-
-## Promotion Workflow
-
-### 1. Development Phase (WIP Only)
 ```
-All edits → src/qc-X.Y.(Z+1)-wip.quanta
+bootstrap (qc-bootstrap-<PRIOR> = last stable)  compiles source →
+  qc_boot    (gen 0: built by previous stable)   compiles source →
+    qc_self  (gen 1: FIRST self-hosting test)    compiles source →
+      qc     (gen 2: built by a self-hosted compiler — the real proof)
 ```
-- Never edit stable source (`src/qc-X.Y.Z.quanta`)
-- Never edit bootstrap source
-- Cross-compile tests use promoted stable compiler (`bin/x86_64/qc-X.Y.Z`)
-- Self-host tests use WIP-built compiler (stored in `temp/`)
 
-### 2. Verification Phase (Temporary Artifacts in `temp/`)
+Concrete for `<VER>=0.0.21`, `<PRIOR>=0.0.20`:
 ```bash
-# Build artifacts go to temp/
-temp/
-  qc-X.Y.(Z+1)-stage1    # bootstrap → WIP
-  qc-X.Y.(Z+1)-stage2    # stage1 → WIP
-  qc-X.Y.(Z+1)-stage3    # stage2 → WIP (fixed-point check)
-  qc-X.Y.(Z+1)-arm64     # cross-compiled ARM64 binary for device testing
-  *.quanta               # test files
+bootstrap/qc-bootstrap-0.0.20  compiler/0.0.21/src/x86/main.quanta  compiler/0.0.21/bin/x86/qc_boot
+compiler/0.0.21/bin/x86/qc_boot  compiler/0.0.21/src/x86/main.quanta  compiler/0.0.21/bin/x86/qc_self
+compiler/0.0.21/bin/x86/qc_self  compiler/0.0.21/src/x86/main.quanta  compiler/0.0.21/bin/x86/qc
 ```
 
-**Required Gates:**
-1. x86_64 self-host fixed-point: `stage2` == `stage3` (byte-identical)
-2. ARM64 cross-compile succeeds
-3. ARM64 device test suite passes **(ALL tests must match x86_64 expected results)**
-4. x86_64 test suite passes
-5. 3-char function regression test passes (5 runs, median)
-
-### 3. Promotion Phase
+## Gate
+Run the suite against the **gen2 `qc`** binary:
 ```bash
-# 1. Promote WIP source to new stable
-mv src/qc-X.Y.(Z+1)-wip.quanta src/qc-X.Y.(Z+1).quanta
-
-# 2. Promote verified binaries (architecture-checked)
-file temp/qc-X.Y.(Z+1)-stage2 | grep -qi 'x86-64'   || { echo "ERROR: stage2 is not x86-64"; exit 1; }
-file temp/qc-X.Y.(Z+1)-arm64  | grep -qi 'aarch64'   || { echo "ERROR: arm64 binary is not AArch64"; exit 1; }
-cp temp/qc-X.Y.(Z+1)-stage2 bin/x86_64/qc-X.Y.(Z+1)
-cp temp/qc-X.Y.(Z+1)-arm64  bin/aarch64/qc-X.Y.(Z+1)
-
-# 3. Create fresh WIP for next cycle
-cp src/qc-X.Y.(Z+1).quanta src/qc-X.Y.(Z+2)-wip.quanta
-
-# 4. Clean ALL temp artifacts
-rm -rf temp/*
-
-# 5. Update symlink
-ln -sf x86_64/qc-X.Y.(Z+1) bin/qc
+QC=compiler/<VER>/bin/x86/qc bash test_suites/scripts/run_tests.sh   # expect 62/62, 0 fail
 ```
 
-### 4. Post-Promotion Rules
-- **Stable source is frozen**: No edits to `src/qc-X.Y.(Z+1).quanta` ever
-- **Promoted binaries are frozen**: No rebuilds of `bin/*/qc-X.Y.(Z+1)`
-- **All new work**: Goes to `src/qc-X.Y.(Z+2)-wip.quanta` only
-- **Bootstrap preserved**: `src/qc-X.Y.Z.quanta` + `bin/*/qc-X.Y.Z` unchanged for next cycle
+- **All 62/62 pass** → self-hosting works → **PROMOTE**:
+  1. Keep only `qc` (delete `qc_boot` + `qc_self` — intermediates).
+  2. Save the promoted `qc` as `bootstrap/qc-bootstrap-<VER>` (becomes the seed
+     for `<NEXT>`).
+  3. Update `compiler/<VER>/STATE.md` date + `agents/memory/quanta.md` LAST VERIFIED
+     STATE; bump `agents/memory/LAST_UPDATED`.
+- **Tests FAIL** → self-hosting is NOT working at gen2. Fall back: **`qc = qc_self`**
+  (use the gen1 binary — it proved at least one generation of self-hosting), then
+  promote `qc_self` as `qc` and save it as `bootstrap/qc-bootstrap-<VER>`.
 
-## Directory Structure (Enforced by .gitignore)
+## Promotion sequence (full, per version bump `<VER>` → `<NEXT>`)
+When `<VER>` passes the gate (62/62 on `qc`):
 
-```
-quanta/
-├── bin/
-│   ├── x86_64/
-│   │   ├── qc-X.Y.Z          # promoted stable binaries
-│   │   └── qc                # symlink to current stable
-│   └── aarch64/
-│       └── qc-X.Y.Z
-├── src/
-│   ├── qc-X.Y.Z.quanta       # stable (frozen)
-│   ├── qc-X.Y.(Z+1)-wip.quanta  # WIP (active)
-│   └── qc-X.Y.(Z-1).quanta   # bootstrap (frozen)
-├── temp/                     # ALL build artifacts, cleaned on promotion
-├── test_suites/
-│   ├── codes/                # test source files
-│   ├── bin/                  # compiled test binaries (x86_64)
-│   │   └── arm64/            # compiled test binaries (ARM64)
-│   ├── scripts/
-│   └── EXPECTED.tsv
-├── systems/                  # ALL documentation (.md files)
-├── bootstrap/
-│   └── qc-bootstrap-0.0.0    # original bootstrap binary
-└── .gitignore                # whitelists: bin/, src/, docs/, bootstrap/, temp/
-```
+1. **Promote `<VER>`:** keep only `qc` (delete `qc_boot` + `qc_self`); save `qc`
+   as `bootstrap/qc-bootstrap-<VER>`.
+2. **COMMIT `<VER>`:** commit the promoted folder (source + `qc` + the regenerated
+   `bootstrap/qc-bootstrap-<VER>` seed). Message e.g. `Promote Quanta <VER>:
+   self-host qc_boot→qc_self→qc, 62/62`. The committed version is frozen.
+3. **Create `<NEXT>`:** `mkdir -p compiler/<NEXT>/src/x86 compiler/<NEXT>/bin/x86`.
+4. **Copy source from previous stable:** `cp compiler/<VER>/src/x86/main.quanta
+   compiler/<NEXT>/src/x86/main.quanta`. (The next version starts from the last
+   promoted source — no `-wip` fork.)
+5. **STATE.md for `<NEXT>` = `Status: WIP`:** scaffold `compiler/<NEXT>/STATE.md`
+   with `Status: WIP` (work-in-progress), version `<NEXT>`, date today. It becomes
+   `STABLE` only after `<NEXT>` itself passes the gate and is committed.
+6. Continue development in `compiler/<NEXT>/src/x86/main.quanta` until `<NEXT>`
+   passes its own pipeline + gate, then repeat this sequence.
 
-## Build Artifact Rules
+> Note: the `WIP` is a **status field inside STATE.md**, not a separate `-wip`
+> source file. There is exactly ONE source file per version.
 
-| Artifact Type | Location | Lifetime |
-|--------------|----------|----------|
-| Stage binaries (stage1,2,3) | `temp/` | Until promotion, then **deleted** |
-| Cross-compiled ARM64 binary | `temp/` | Until promotion, then **deleted** |
-| Test binaries (x86_64) | `test_suites/bin/` | Persistent |
-| Test binaries (ARM64) | `test_suites/bin/arm64/` | Persistent |
-| Promoted compiler binaries | `bin/x86_64/`, `bin/aarch64/` | Permanent (versioned) |
-| `out.exe` (compiler output) | Project root | Temporary, cleaned before each build |
-| Compiler self-build output | `temp/` | Until promotion, then **deleted** |
+## After promotion (summary)
+- Only `qc` is kept in the promoted `<VER>` folder.
+- The `<NEXT>` folder is the active work tree (typically uncommitted until it
+  passes its own gate).
+- The bootstrap seed for `<NEXT>` is `qc-bootstrap-<VER>` (regenerated above).
 
-## Version Bump Rules
-
-| Change Type | Version Bump |
-|-------------|--------------|
-| Bug fix (like 3-char fn name) | PATCH: X.Y.Z → X.Y.(Z+1) |
-| New feature (backend, syntax) | MINOR: X.Y.Z → X.(Y+1).0 |
-| Breaking change / self-host milestone | MAJOR: X.Y.Z → (X+1).0.0 |
-
-## Enforcement
-
-- `.gitignore` whitelists only: `bin/`, `src/`, `docs/`, `bootstrap/`, `.gitignore`
-- `temp/` is **always ignored** and **always cleaned** on promotion
-- No `.md` files in root or `docs/` — all docs in `systems/`
-- Test binaries in `test_suites/bin/` and `test_suites/bin/arm64/`
-- Source code **exclusively** in `src/`
-
-## Example: 0.0.1 → 0.0.2 Promotion (Completed)
-
-```
-Before:
-  src/qc-0.0.1.quanta          (bootstrap, frozen)
-  src/qc-0.0.2-wip.quanta      (WIP with fix)
-  temp/qc-0.0.2-stage1,2,3     (verification artifacts)
-  temp/qc-0.0.2-arm64          (ARM64 test binary)
-
-After:
-  src/qc-0.0.1.quanta          (bootstrap, preserved)
-  src/qc-0.0.2.quanta          (NEW stable, frozen)
-  src/qc-0.0.3-wip.quanta      (NEW WIP, active)
-  bin/x86_64/qc-0.0.2          (promoted)
-  bin/aarch64/qc-0.0.2         (promoted)
-  bin/qc -> x86_64/qc-0.0.2    (symlink)
-  temp/                        (EMPTY)
-```
+## Rules
+- NEVER edit a promoted `qc` (frozen). All dev in the single `main.quanta`.
+- NEVER declare "done"/"fixed" without the gate (62/62 on `qc`) passing.
+- Bootstrap is regenerated from each promoted `qc` — not hand-maintained.
