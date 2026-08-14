@@ -1,0 +1,33 @@
+// file_io: file_open/file_read/file_write/file_close round-trip.
+// Creates a temp file, writes 26 bytes, reads back, verifies contents.
+fn r8x(p) { unsafe { return mem_load8(p) } }
+fn w8x(p,v) { unsafe { mem_store8(p,v) } }
+fn main() {
+  let path = mmap(64)
+  // "qfio_test.bin" (cwd-relative: writable on host AND Termux device;
+  // /tmp is not app-writable under Android's sandbox)
+  let s = "qfio_test.bin"
+  let sl = len(s)
+  let i=0
+  while i<sl { w8x(path+i, r8x(s+8+i)); i=i+1 }
+  w8x(path+sl, 0)
+  // write: O_WRONLY|O_CREAT|O_TRUNC = 577, mode 420
+  let wfd = file_open(path, 577, 420)
+  if wfd < 0 { return 1 }
+  let buf = mmap(64)
+  i=0
+  while i<26 { w8x(buf+i, 65+i); i=i+1 }
+  let wn = file_write(wfd, buf, 26)
+  file_close(wfd)
+  if wn != 26 { return 2 }
+  // read back
+  let rfd = file_open(path, 0)
+  if rfd < 0 { return 3 }
+  let rbuf = mmap(64)
+  let rn = file_read(rfd, rbuf, 64)
+  file_close(rfd)
+  if rn != 26 { return 4 }
+  i=0
+  while i<26 { if r8x(rbuf+i) != 65+i { return 5 }; i=i+1 }
+  return 0
+}
