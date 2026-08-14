@@ -1,6 +1,6 @@
 # Quanta — SME HANDOFF (read this first when taking over)
 
-Last updated: 2026-08-15. Author: Hermes agent session. Status: x86-only
+Last updated: 2026-08-15. Author: JEEEX.ORG. Status: x86-only
 compiler verified + hardened; multi-mode architecture designed but only the
 native AOT backend is built.
 
