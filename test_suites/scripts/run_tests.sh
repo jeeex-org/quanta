@@ -53,5 +53,31 @@ echo "=== Results: $PASS/$TOTAL pass, $((FAIL + COMPILE_FAIL)) fail (incl. $COMP
 # A compile-fail is a broken feature, not a green row. Exit non-zero if anything
 # failed to compile or produced the wrong result, so CI / promotion gates catch it.
 if [ $((FAIL + COMPILE_FAIL)) -gt 0 ]; then
+  FUNCTIONAL_RC=1
+else
+  FUNCTIONAL_RC=0
+fi
+
+# --- Stage 2: SECURITY layer (overflow traps, OOB, malformed/garbage input) ---
+echo ""
+echo "########## SECURITY TEST LAYER ##########"
+QC="$QC" bash "$TEST_SUITES/scripts/security_tests.sh" || SECURITY_RC=1
+SECURITY_RC=${SECURITY_RC:-0}
+
+# --- Stage 3: PERFORMANCE layer (timed kernels vs regression baseline) ------
+echo ""
+echo "########## PERFORMANCE TEST LAYER ##########"
+QC="$QC" bash "$TEST_SUITES/scripts/perf_tests.sh" || PERF_RC=1
+PERF_RC=${PERF_RC:-0}
+
+echo ""
+echo "=== GATE SUMMARY ==="
+echo "  functional : $([ $FUNCTIONAL_RC = 0 ] && echo GREEN || echo RED)"
+echo "  security   : $([ $SECURITY_RC = 0 ] && echo GREEN || echo RED)  (KNOWN bugs reported by script, not blocking)"
+echo "  performance: $([ $PERF_RC = 0 ] && echo GREEN || echo RED)"
+# Block promotion on a real functional/security/perf regression. Security
+# KNOWN issues are surfaced by the script but do not turn the gate red.
+if [ $FUNCTIONAL_RC -ne 0 ] || [ $SECURITY_RC -ne 0 ] || [ $PERF_RC -ne 0 ]; then
   exit 1
 fi
+exit 0
