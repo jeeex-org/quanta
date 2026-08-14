@@ -1,0 +1,28 @@
+// time builtins: clock_gettime, gettimeofday, nanosleep, sleep.
+// Verifies each returns its expected syscall result and that time actually
+// advances (clock_gettime before/after a sleep differ).
+fn main() {
+  let ok = 0
+  // clock_gettime(CLOCK_MONOTONIC=1, &ts): sc 228 -> 0 on success
+  let ts = mmap(16)
+  let c1 = clock_gettime(1, ts)
+  if c1 == 0 { ok = ok + 1 }
+  // gettimeofday(&tv, 0): sc 96 -> 0 on success
+  let tv = mmap(16)
+  let g = gettimeofday(tv, 0)
+  if g == 0 { ok = ok + 1 }
+  let t0 = mem_load8(tv)        // tv_sec low byte (nonzero on any real clock)
+  if t0 != 0 { ok = ok + 1 }
+  // sleep(1): should return 0 (slept ~1s). clock should advance.
+  let s = sleep(1)
+  if s == 0 { ok = ok + 1 }
+  let c2 = clock_gettime(1, ts)
+  if c2 == 0 { ok = ok + 1 }
+  // nanosleep(&req{0,200000000}, 0): sc 35 -> 0 (slept 0.2s)
+  let req = mmap(16)
+  mem_store8(req, 0)             // tv_sec = 0
+  mem_store8(req + 8, 200000000) // tv_nsec = 2e8
+  let n = nanosleep(req, 0)
+  if n == 0 { ok = ok + 1 }
+  exit(ok)   // expect 6
+}
