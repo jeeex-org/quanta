@@ -1,0 +1,1590 @@
+// === X86-64 CODE EMITTER ===
+// All arithmetic, no bitwise ops
+// Registers: RAX=0, RCX=1, RDX=2, RBX=3, RSP=4, RBP=5, RSI=6, RDI=7, R8..R15=8..15
+let R_RAX=0; let R_RCX=1; let R_RDX=2; let R_RBX=3; let R_RSP=4; let R_RBP=5
+let R_RSI=6; let R_RDI=7; let R_R8=8; let R_R9=9; let R_R10=10; let R_R11=11
+let R_R12=12; let R_R13=13; let R_R14=14; let R_R15=15
+
+let cs = 0  // caller-saved count for save/restore
+
+// Emit helpers (use builtins emit_byte, emit_i32, emit_i64)
+fn eb(v) { let a=codelen; codelen=a+1; w8(code+a,v%256) }
+fn ei(v) { let a=codelen; codelen=a+4; w32(code+a,v) }
+fn eq(v) { let a=codelen; codelen=a+8; w64(code+a,v) }
+
+// Write a 4-byte little-endian value into the code buffer (used for patching
+// relative offsets without disturbing the following bytes).
+fn w32(p,v) {
+    w8(p, v&255); w8(p+1, (v>>8)&255); w8(p+2, (v>>16)&255); w8(p+3, (v>>24)&255)
+}
+
+fn mr(mod, reg, rm) { eb(mod*64 + (reg&7)*8 + (rm&7)) }
+fn rw(reg, rm) {
+    let v=72; if reg>=8 { v=v+4 }; if rm>=8 { v=v+1 }; eb(v)
+}
+fn ri(reg, imm) {
+    if reg>=8 { eb(65); eb(184+(reg%8)) } else { eb(184+reg) }; ei(imm)
+}
+fn ri64(reg, imm) {
+    if reg>=8 { eb(73); eb(184+(reg%8)) } else { eb(72); eb(184+reg) }; eq(imm)
+}
+fn rr(d,s) {
+    if d==s { return }
+    if s<8&&d<8 { rw(s,d); eb(137); mr(3,s,d) } else { rw(s,d); eb(137); mr(3,s%8,d%8) }
+}
+fn ra(d,s) { rw(s,d); eb(1); mr(3,s%8,d%8) }
+fn rs(d,s) { rw(s,d); eb(41); mr(3,s%8,d%8) }
+fn rm(d,s) { rw(d,s); eb(15); eb(175); mr(3,d%8,s%8) }
+fn rxor(d,s) { rw(s,d); eb(49); mr(3,s%8,d%8) }
+fn rand(d,s) { rw(s,d); eb(33); mr(3,s%8,d%8) }
+fn ror(d,s) { rw(s,d); eb(9); mr(3,s%8,d%8) }
+fn rcmp(r1,r2) { rw(r2,r1); eb(57); mr(3,r2%8,r1%8) }
+fn rtest(r1,r2) { rw(r1,r2); eb(133); mr(3,r1%8,r2%8) }
+fn rcqo() { eb(72); eb(153) }
+fn smov(memreg, srcreg) { rw(srcreg, memreg); eb(137); mr(0, srcreg%8, memreg%8) }  // mov [memreg], srcreg
+fn rneg(r) { if r>=8 { eb(73) } else { eb(72) }; eb(247); mr(3,3,r%8) }
+fn rnot(r) { if r>=8 { eb(73) } else { eb(72) }; eb(247); mr(3,2,r%8) }
+fn ridiv(r) { if r>=8 { eb(73) } else { eb(72) }; eb(247); mr(3,7,r%8) }
+fn rshl(d,s) { if s!=1 { rr(1,s) }; eb(72); eb(211); mr(3,4,d%8) }
+fn rshr(d,s) { if s!=1 { rr(1,s) }; eb(72); eb(211); mr(3,5,d%8) }
+
+fn rsetc(cc,r) {
+    let c=0
+    if cc==0 { c=148 } else if cc==1 { c=149 } else if cc==2 { c=156 } else if cc==3 { c=159 } else if cc==4 { c=158 } else if cc==5 { c=157 }
+    if r<4 { eb(15); eb(c); mr(3,0,r) } else if r<8 { eb(64); eb(15); eb(c); mr(3,0,r%8) } else { eb(65); eb(15); eb(c); mr(3,0,r%8) }
+}
+fn rzx(d,s) {
+    if d<8&&s<8 { eb(72); eb(15); eb(182); mr(3,d%8,s%8); return }
+    rw(d,s); eb(15); eb(182); mr(3,d%8,s%8)
+}
+fn xpush(r) { if r<8 { eb(80+r) } else { eb(65); eb(80+(r%8)) } }
+fn xpop(r) { if r<8 { eb(88+r) } else { eb(65); eb(88+(r%8)) } }
+fn ret() { eb(195) }
+fn sysc() { eb(15); eb(5) }
+fn callr(r) { if r<8 { eb(255); mr(3,2,r) } else { eb(65); eb(255); mr(3,2,r%8) } }
+fn sbi(imm) { eb(72); eb(129); mr(3,5,4); ei(imm) }
+fn abi(imm) { eb(72); eb(129); mr(3,0,4); ei(imm) }
+fn wbp(d,r) { rw(r,5); eb(137); if r>=8 { mr(2,r%8,4); eb(37) } else { mr(2,r%8,5) }; ei(d) }
+fn rbp(r,d) { rw(r,5); eb(139); if r>=8 { mr(2,r%8,4); eb(37) } else { mr(2,r%8,5) }; ei(d) }
+fn wsp(d,r) { rw(r,4); eb(137); mr(2,r%8,4); eb(36); ei(d) }
+fn rsp(r,d) { rw(r,4); eb(139); mr(2,r%8,4); eb(36); ei(d) }
+// wbase(d, vr): mov [r11+d], vr  -- r11 is an explicit base reg (NOT rbp), so it
+// avoids the REX.B/rbp conflict that breaks rbp+extended-reg encodings.
+fn wbase(d, vr) { let rex=73; if vr>=8 { rex=77 }; eb(rex); eb(137); mr(2, vr%8, 3); ei(d) }
+// lbase(d, vr): mov vr, [r11+d]
+fn lbase(d, vr) { let rex=73; if vr>=8 { rex=77 }; eb(rex); eb(139); mr(2, vr%8, 3); ei(d) }
+fn leabp(r,d) { let v=72; if r>=8 { v=73 }; eb(v); eb(141); if r>=8 { mr(2,r%8,4); eb(37) } else { mr(2,r%8,5) }; ei(d) }
+fn rmr(rd,ad) { rw(rd,ad); eb(139); mr(0,rd%8,ad%8) }
+fn wmr(ad,vl) { rw(vl,ad); eb(137); mr(0,vl%8,ad%8) }
+fn rmr8(rd,ad) { rw(rd,ad); eb(15); eb(182); mr(0,rd%8,ad%8) }
+fn wmr8(ad,vl) { if vl<4 { eb(72) }; eb(136); mr(0,vl%8,ad%8) }
+fn lesp(r,d) { rw(r,4); eb(141); mr(2,r%8,4); eb(36); ei(d) }
+fn wmi(b,d,i) { if b>=8 { eb(73) } else { eb(72) }; eb(199); mr(2,0,b%8); ei(d); ei(i) }
+fn wm8i(b,d,i) { if b>=8 { eb(65) } else { eb(64) }; eb(198); mr(2,0,b%8); ei(d); eb(i%256) }
+fn jmp32(o) { eb(233); ei(o) }
+fn jcc32(cc,o) {
+    let c=0; if cc==0 { c=132 } else if cc==1 { c=133 } else if cc==2 { c=140 } else if cc==3 { c=143 } else if cc==4 { c=142 } else if cc==5 { c=141 }
+    eb(15); eb(c); ei(o)
+}
+// G2: inline overflow trap. After a signed arithmetic op sets OF, a short `jno`
+// skips a 2-byte `ud2` (0F 0B). On overflow (OF=1) we fall into ud2 -> #UD ->
+// SIGILL (signal 4): deterministic death. No rel32 relocation needed (rel8).
+// `ii` = current IR record index; if it was emitted inside `unsafe {}`
+// (ir_unsafe[ii]!=0) the trap is suppressed (user opted out).
+fn ovf_trap_emit(ii) { if ovf_trap==1 && r8(ir_unsafe+ii)==0 { eb(113); eb(2); eb(15); eb(11) } }
+// G2p3: shift-COUNT UB trap. x86 `shl/shr r/m64, cl` masks the count to 6 bits,
+// so `x << 64` silently == `x << 0`. With the count already in rcx, emit:
+//   cmp rcx,64 ; jb +2 ; ud2   (48 83 F9 40 / 72 02 / 0F 0B)
+// count>=64 (or negative -> huge unsigned) falls into ud2 -> SIGILL. Suppressed
+// inside unsafe{} (same ir_unsafe gate as the overflow trap).
+fn shl_trap_emit(ii) { if ovf_trap==1 && r8(ir_unsafe+ii)==0 { eb(72); eb(131); eb(249); eb(64); eb(114); eb(2); eb(15); eb(11) } }
+// G2 containers: bounds-check for indexed access `a[idx]`. At the call site the
+// base pointer is in rax and idx is in rcx. Emit `cmp [rax], rcx; jb +2; ud2`:
+//   unsigned idx >= len (or negative -> huge unsigned) falls through into ud2 ->
+//   SIGILL rc=132. Suppressed inside unsafe{} (same ir_unsafe gate). The +8 data
+//   offset is applied in the lea that follows this check.
+fn idx_trap_emit(ii) { if ovf_trap==1 && r8(ir_unsafe+ii)==0 { eb(72); eb(59); eb(8); eb(114); eb(2); eb(15); eb(11) } }
+// P10: ARM64 bounds-check trap for `a[idx]` — parity with x86 idx_trap_emit.
+// At the call site x0 = base ptr, x1 = idx. Emit:
+//   ldr x9,[x0]    ; x9 = len (header)
+//   cmp x1, x9     ; idx - len (unsigned)
+//   b.lo +8        ; if idx < len skip the udf (imm19=2: pc+8 past the 4B udf)
+// === REGISTER ALLOCATOR (corrected: reload on use, persist results) ===
+let REGS = mmap(112)  // 14 physical regs (all except RSP=4, RBP=5)
+fn init_regs() {
+    w64(REGS+0, 0); w64(REGS+8, 1); w64(REGS+16, 2); w64(REGS+24, 3)
+    w64(REGS+32, 6); w64(REGS+40, 7); w64(REGS+48, 8); w64(REGS+56, 9)
+    w64(REGS+64, 10); w64(REGS+72, 12); w64(REGS+80, 13); w64(REGS+88, 14)
+    w64(REGS+96, 15)
+}
+
+let alloc = mmap(2000000); let allocfc = 0
+let vr_init = mmap(2000000)
+let vr_spill = mmap(2000000)
+let SPILL_BASE = 48
+fn spill_home(v) { return -(SPILL_BASE + (v + 1) * 8) }
+
+// aphys(vr): return a physical reg holding vr's value. On first use, allocate a
+// reg and reload from the home slot if the vreg has a defined value.
+fn aphys(vr) {
+    let f=afind(vr); if f>=0 { return f }
+    let p=afree()
+    if r8(vr_init+vr)!=0 { rbp(p, spill_home(vr)) }
+    aset(vr,p); return p
+}
+
+// adistinct(res, a1, a2): like aphys(res) but guarantees the returned physical
+// register is NOT a1 and NOT a2 (the operand registers).  This prevents a
+// binary result dst from aliasing an operand, which would let the zeroing /
+// read-modify-write (xor dst,dst / or dst,r2 / and dst,r2) clobber the operand
+// before it is consumed.  Operands must be loaded with aphys FIRST (so they
+// own their registers), then adistinct picks a distinct register for the result.
+fn adistinct(res, a1, a2) {
+    let f=afind(res); if f>=0 { if f!=a1&&f!=a2 { return f } }
+    // evict everything mapped to a1 or a2 so the result cannot reuse them
+    let i=0
+    while i<allocfc {
+        let pr=r64(alloc+i*16+8)
+        if pr==a1||pr==a2 {
+            let ev_vr=r64(alloc+i*16)
+            if r8(vr_init+ev_vr)!=0 { wbp(spill_home(ev_vr), pr) }
+            w8(vr_spill+ev_vr, 1)
+            // remove this entry by overwriting with last
+            allocfc=allocfc-1
+            w64(alloc+i*16, r64(alloc+allocfc*16))
+            w64(alloc+i*16+8, r64(alloc+allocfc*16+8))
+        } else { i=i+1 }
+    }
+    // Pick a free physical reg that is NEITHER a1 NOR a2.  afree()
+    // would otherwise hand back a just-evicted operand register as the
+    // result, aliasing rd with an operand so the xor/or/and rd,rd
+    // clobbers the operand before cmp consumes it.
+    let p=-1; let k=0
+    while k<14 {
+        let pr=r64(REGS+k*8)
+        if pr!=a1 && pr!=a2 {
+            let used=0; let j=0
+            while j<allocfc { if r64(alloc+j*16+8)==pr { used=1; break }; j=j+1 }
+            if used==0 { p=pr; break }
+        }
+        k=k+1
+    }
+    if p<0 {
+        // Degenerate: only a1/a2 still mapped. Evict a vreg that is NEITHER a1
+        // NOR a2 and reuse its register, so the result never aliases an operand.
+        allocfc=allocfc-1
+        let ev_vr=r64(alloc+allocfc*16); let ev_pr=r64(alloc+allocfc*16+8)
+        while ev_pr==a1 || ev_pr==a2 {
+            w64(alloc+allocfc*16, r64(alloc+(allocfc-1)*16))
+            w64(alloc+allocfc*16+8, r64(alloc+(allocfc-1)*16+8))
+            allocfc=allocfc-1
+            ev_vr=r64(alloc+allocfc*16); ev_pr=r64(alloc+allocfc*16+8)
+        }
+        if r8(vr_init+ev_vr)!=0 { wbp(spill_home(ev_vr), ev_pr) }
+        w8(vr_spill+ev_vr, 1)
+        p=ev_pr
+    }
+    if r8(vr_init+res)!=0 { rbp(p, spill_home(res)) }
+    aset(res,p); return p
+}
+
+fn afind(vr) {
+    let i=0; while i<allocfc { if r64(alloc+i*16)==vr { return r64(alloc+i*16+8) }; i=i+1 }; return -1
+}
+
+fn aset(vr,pr) {
+    if allocfc >= ALLOC_CAP { emit_ovf() }
+    w64(alloc+allocfc*16,vr); w64(alloc+allocfc*16+8,pr); allocfc=allocfc+1
+}
+
+fn aclr() { allocfc=0; let i=0; while i<vreg_n { w8(vr_init+i,0); w8(vr_spill+i,0); i=i+1 } }
+
+// afree(): return a free physical reg, evicting a mapped vreg (spilling it) if needed.
+fn afree() {
+    let k=0
+    while k<14 {
+        let pr=r64(REGS+k*8)
+        let used=0; let j=0
+        while j<allocfc { if r64(alloc+j*16+8)==pr { used=1; break }; j=j+1 }
+        if used==0 { return pr }
+        k=k+1
+    }
+    allocfc=allocfc-1
+    let ev_vr=r64(alloc+allocfc*16); let ev_pr=r64(alloc+allocfc*16+8)
+    if r8(vr_init+ev_vr)!=0 { wbp(spill_home(ev_vr), ev_pr) }
+    w8(vr_spill+ev_vr, 1)
+    return ev_pr
+}
+
+fn flush_all() {
+    let i=0
+    while i<allocfc {
+        let vr=r64(alloc+i*16); let pr=r64(alloc+i*16+8)
+        if r8(vr_init+vr)!=0 { wbp(spill_home(vr), pr) }
+        w8(vr_spill+vr, 1)
+        i=i+1
+    }
+    allocfc=0
+}
+
+// flush_clob(r0,r1,r2): target clobber-save for arithmetic ops (idiv/shl/shr)
+// that only destroy the given physical regs (rax=0, rcx=1, rdx=2). Spills just
+// those vregs to their home slots (already current via sdef) and frees the
+// physical regs, leaving every OTHER live vreg resident -> far fewer downstream
+// reloads than flush_all(). Home slots stay current, so the existing
+// rbp(0,home)/rbp(1,home) reloads after the op remain correct.
+fn flush_clob(r0,r1,r2) {
+    let i=0
+    while i<allocfc {
+        let vr=r64(alloc+i*16); let pr=r64(alloc+i*16+8)
+        if pr==r0 || pr==r1 || pr==r2 {
+            if r8(vr_init+vr)!=0 { wbp(spill_home(vr), pr) }
+            w8(vr_spill+vr, 1)
+            allocfc=allocfc-1
+            w64(alloc+i*16, r64(alloc+allocfc*16))
+            w64(alloc+i*16+8, r64(alloc+allocfc*16+8))
+        } else { i=i+1 }
+    }
+}
+
+// === FLOAT REGISTER ALLOCATOR (x86: xmm0-7; ARM: v0-7) ===
+// Mirrors the integer allocator but routes float vregs to the FP register file.
+// Float homes live in a SEPARATE spill region (fspill_home) so they never collide
+// with integer homes (which use spill_home). Both write 8 bytes; a float vreg vr
+// and an int vreg vr with the same index must NOT share a slot.
+let FREGS = mmap(64)   // 8 xmm/v physical regs
+fn init_fregs() {
+    w64(FREGS+0, 0); w64(FREGS+8, 1); w64(FREGS+16, 2); w64(FREGS+24, 3)
+    w64(FREGS+32, 4); w64(FREGS+40, 5); w64(FREGS+48, 6); w64(FREGS+56, 7)
+}
+let falloc = mmap(2000000); let fallocfc = 0
+let fvr_init = mmap(2000000)
+let fvr_spill = mmap(2000000)
+fn fspill_home(v) { return -(SPILL_BASE + 8192 + (v + 1) * 8) }
+
+fn fphys(vr) {
+    let f=ffind(vr); if f>=0 { return f }
+    let p=ffree()
+    if r8(fvr_init+vr)!=0 { frld(p, fspill_home(vr)) }
+    fset(vr,p); return p
+}
+fn fdistinct(res, a1, a2) {
+    let f=ffind(res); if f>=0 { if f!=a1&&f!=a2 { return f } }
+    let i=0
+    while i<fallocfc {
+        let pr=r64(falloc+i*16+8)
+        if pr==a1||pr==a2 {
+            let ev_vr=r64(falloc+i*16)
+            if r8(fvr_init+ev_vr)!=0 { frld(pr, fspill_home(ev_vr)) }
+            w8(fvr_spill+ev_vr, 1)
+            fallocfc=fallocfc-1
+            w64(falloc+i*16, r64(falloc+fallocfc*16))
+            w64(falloc+i*16+8, r64(falloc+fallocfc*16+8))
+        } else { i=i+1 }
+    }
+    let p=-1; let k=0
+    while k<8 {
+        let pr=r64(FREGS+k*8)
+        if pr!=a1 && pr!=a2 {
+            let used=0; let j=0
+            while j<fallocfc { if r64(falloc+j*16+8)==pr { used=1; break }; j=j+1 }
+            if used==0 { p=pr; break }
+        }
+        k=k+1
+    }
+    if p<0 {
+        fallocfc=fallocfc-1
+        let ev_vr=r64(falloc+fallocfc*16); let ev_pr=r64(falloc+fallocfc*16+8)
+        while ev_pr==a1 || ev_pr==a2 {
+            w64(falloc+fallocfc*16, r64(falloc+(fallocfc-1)*16))
+            w64(falloc+fallocfc*16+8, r64(falloc+(fallocfc-1)*16+8))
+            fallocfc=fallocfc-1
+            ev_vr=r64(falloc+fallocfc*16); ev_pr=r64(falloc+fallocfc*16+8)
+        }
+        if r8(fvr_init+ev_vr)!=0 { frld(ev_pr, fspill_home(ev_vr)) }
+        w8(fvr_spill+ev_vr, 1)
+        p=ev_pr
+    }
+    if r8(fvr_init+res)!=0 { frld(p, fspill_home(res)) }
+    fset(res,p); return p
+}
+fn ffind(vr) {
+    let i=0; while i<fallocfc { if r64(falloc+i*16)==vr { return r64(falloc+i*16+8) }; i=i+1 }; return -1
+}
+fn fset(vr,pr) {
+    if fallocfc >= ALLOC_CAP { emit_ovf() }
+    w64(falloc+fallocfc*16,vr); w64(falloc+fallocfc*16+8,pr); fallocfc=fallocfc+1
+}
+fn fclr() { fallocfc=0; let i=0; while i<vreg_n { w8(fvr_init+i,0); w8(fvr_spill+i,0); i=i+1 } }
+fn ffree() {
+    let k=0
+    while k<8 {
+        let pr=r64(FREGS+k*8)
+        let used=0; let j=0
+        while j<fallocfc { if r64(falloc+j*16+8)==pr { used=1; break }; j=j+1 }
+        if used==0 { return pr }
+        k=k+1
+    }
+    fallocfc=fallocfc-1
+    let ev_vr=r64(falloc+fallocfc*16); let ev_pr=r64(falloc+fallocfc*16+8)
+    if r8(fvr_init+ev_vr)!=0 { frld(ev_pr, fspill_home(ev_vr)) }
+    w8(fvr_spill+ev_vr, 1)
+    return ev_pr
+}
+fn fflush_all() {
+    let i=0
+    while i<fallocfc {
+        let vr=r64(falloc+i*16); let pr=r64(falloc+i*16+8)
+        if r8(fvr_init+vr)!=0 { frld(pr, fspill_home(vr)) }
+        w8(fvr_spill+vr, 1)
+        i=i+1
+    }
+    fallocfc=0
+}
+fn fdef(vr, reg) { frld(reg, fspill_home(vr)); w8(fvr_init+vr, 1) }
+// frld(xmm, off): movsd xmm, [rbp+off]  (REX.W F2 0F 10 /r with rbp base)
+fn frld(xmm, off) { eb(0xF2); eb(73); eb(15); eb(16); mr(2, xmm, 5); ei(off) }
+
+// x86 SSE emit helpers (target_arch==0)
+// xmm reg encoding in ModRM/reg fields: just the index 0-7.
+fn frr(d,s) { if d==s { return }; eb(0xF2); eb(15); eb(16); mr(3,d,s) }   // movsd xmm(d), xmm(s)
+fn fadd(d,s) { eb(0xF2); eb(15); eb(88); mr(3,d,s) }   // addsd xmm(d), xmm(s)
+fn fsub(d,s) { eb(0xF2); eb(15); eb(92); mr(3,d,s) }   // subsd xmm(d), xmm(s)
+fn fmul(d,s) { eb(0xF2); eb(15); eb(89); mr(3,d,s) }   // mulsd xmm(d), xmm(s)
+fn fdiv(d,s) { eb(0xF2); eb(15); eb(94); mr(3,d,s) }   // divsd xmm(d), xmm(s)
+fn fld_x(rdx_gp, xmm) { eb(0xF2); eb(15); eb(16); mr(2, xmm, rdx_gp%8) }   // movsd xmm, [gp]  (REX.W + F2 0F 10 /r)
+fn fst_x(gp, xmm) { eb(0xF2); eb(15); eb(17); mr(2, xmm, gp%8) }           // movsd [gp], xmm
+fn fi2f(xmm, gp) { eb(0xF2); eb(15); eb(42); mr(2, xmm, gp%8) }  // cvtsi2sd xmm, gp  (REX.W F2 0F 2A /r)
+fn ff2i(gp, xmm) { eb(0xF2); eb(15); eb(46); mr(2, gp%8, xmm) }  // cvttsd2si gp, xmm (REX.W F2 0F 2C /r)
+fn fcomi(xmm1, xmm2) { eb(0x66); eb(15); eb(44); mr(3, xmm1, xmm2) }  // comisd xmm1, xmm2 (sets EFLAGS)
+
+
+// === divide-by-const signed magic (strength reduction for IR_DIV by constant) ===
+let magicM = 0
+let magicSh = 0
+// unsigned >= without xor: if signs equal use signed compare; else the
+// non-negative operand is larger in unsigned order.
+fn uge(a, b) {
+  if a >= 0 {
+    if b >= 0 { return a >= b }
+    return 1
+  }
+  if b >= 0 { return 0 }
+  return a >= b
+}
+// compute signed-division magic (M, sh) for nonzero divisor d.
+// M is negated when d<0 so the mul-add recovery needs no separate negation.
+fn compute_magic(d) {
+  // G2: signed-division magic-number recovery does deliberate 64-bit
+  // wraparound (H = 2^63-1, shifts past bit 63, negations). Wrap in unsafe{}
+  // so it is exempt from the overflow trap during self-host bootstrapping.
+  unsafe {
+  let ad = d
+  if d < 0 { ad = -d }
+  let H = 9223372036854775807   // 2^63 - 1 (literal: avoids (1<<63)-1 overflow trap)
+  let anc = H - (H % ad)
+  let q1 = H / anc
+  let r1 = H - q1 * anc + 1
+  let q2 = H / ad
+  let r2 = H - q2 * ad + 1
+  let p = 63
+  while 1 == 1 {
+    p = p + 1
+    q1 = q1 << 1
+    r1 = r1 << 1
+    if uge(r1, anc) { q1 = q1 + 1; r1 = r1 - anc }
+    q2 = q2 << 1
+    r2 = r2 << 1
+    if uge(r2, ad) { q2 = q2 + 1; r2 = r2 - ad }
+    let delta = ad - r2
+    let brk = uge(q1, delta)
+    if brk == 1 {
+      if q1 == delta && r1 == 0 { brk = 0 }
+    }
+    if brk == 1 { break }
+  }
+  let M = q2 + 1
+  if d < 0 { M = -M }
+  let sh = p - 64
+  magicM = M
+  magicSh = sh
+  return 0
+  }
+}
+
+// sdef(vr, reg): store result to home slot AND mark vreg defined (so later
+// aphys reloads the correct value after a flush_all).
+fn sdef(vr, reg) { wbp(spill_home(vr), reg); w8(vr_init+vr, 1) }
+// === BUILD IN NAME CHECK ===
+
+// Emit inline machine code for a built-in call.  Arguments have already been
+// placed in the ABI registers (rdi,rsi,rdx,rcx,r8,r9); the result is left in
+// rax.  Returns 1 if a built-in was emitted, 0 otherwise.
+// === X86-64 CODE EMITTER ===
+// All arithmetic, no bitwise ops
+// Registers: RAX=0, RCX=1, RDX=2, RBX=3, RSP=4, RBP=5, RSI=6, RDI=7, R8..R15=8..15
+let R_RAX=0; let R_RCX=1; let R_RDX=2; let R_RBX=3; let R_RSP=4; let R_RBP=5
+let R_RSI=6; let R_RDI=7; let R_R8=8; let R_R9=9; let R_R10=10; let R_R11=11
+let R_R12=12; let R_R13=13; let R_R14=14; let R_R15=15
+
+let cs = 0  // caller-saved count for save/restore
+
+// Emit helpers (use builtins emit_byte, emit_i32, emit_i64)
+fn eb(v) { let a=codelen; codelen=a+1; w8(code+a,v%256) }
+fn ei(v) { let a=codelen; codelen=a+4; w32(code+a,v) }
+fn eq(v) { let a=codelen; codelen=a+8; w64(code+a,v) }
+
+// Write a 4-byte little-endian value into the code buffer (used for patching
+// relative offsets without disturbing the following bytes).
+fn w32(p,v) {
+    w8(p, v&255); w8(p+1, (v>>8)&255); w8(p+2, (v>>16)&255); w8(p+3, (v>>24)&255)
+}
+
+fn mr(mod, reg, rm) { eb(mod*64 + (reg&7)*8 + (rm&7)) }
+fn rw(reg, rm) {
+    let v=72; if reg>=8 { v=v+4 }; if rm>=8 { v=v+1 }; eb(v)
+}
+fn ri(reg, imm) {
+    if reg>=8 { eb(65); eb(184+(reg%8)) } else { eb(184+reg) }; ei(imm)
+}
+fn ri64(reg, imm) {
+    if reg>=8 { eb(73); eb(184+(reg%8)) } else { eb(72); eb(184+reg) }; eq(imm)
+}
+fn rr(d,s) {
+    if d==s { return }
+    if s<8&&d<8 { rw(s,d); eb(137); mr(3,s,d) } else { rw(s,d); eb(137); mr(3,s%8,d%8) }
+}
+fn ra(d,s) { rw(s,d); eb(1); mr(3,s%8,d%8) }
+fn rs(d,s) { rw(s,d); eb(41); mr(3,s%8,d%8) }
+fn rm(d,s) { rw(d,s); eb(15); eb(175); mr(3,d%8,s%8) }
+fn rxor(d,s) { rw(s,d); eb(49); mr(3,s%8,d%8) }
+fn rand(d,s) { rw(s,d); eb(33); mr(3,s%8,d%8) }
+fn ror(d,s) { rw(s,d); eb(9); mr(3,s%8,d%8) }
+fn rcmp(r1,r2) { rw(r2,r1); eb(57); mr(3,r2%8,r1%8) }
+fn rtest(r1,r2) { rw(r1,r2); eb(133); mr(3,r1%8,r2%8) }
+fn rcqo() { eb(72); eb(153) }
+fn smov(memreg, srcreg) { rw(srcreg, memreg); eb(137); mr(0, srcreg%8, memreg%8) }  // mov [memreg], srcreg
+fn rneg(r) { if r>=8 { eb(73) } else { eb(72) }; eb(247); mr(3,3,r%8) }
+fn rnot(r) { if r>=8 { eb(73) } else { eb(72) }; eb(247); mr(3,2,r%8) }
+fn ridiv(r) { if r>=8 { eb(73) } else { eb(72) }; eb(247); mr(3,7,r%8) }
+fn rshl(d,s) { if s!=1 { rr(1,s) }; eb(72); eb(211); mr(3,4,d%8) }
+fn rshr(d,s) { if s!=1 { rr(1,s) }; eb(72); eb(211); mr(3,5,d%8) }
+
+fn rsetc(cc,r) {
+    let c=0
+    if cc==0 { c=148 } else if cc==1 { c=149 } else if cc==2 { c=156 } else if cc==3 { c=159 } else if cc==4 { c=158 } else if cc==5 { c=157 }
+    if r<4 { eb(15); eb(c); mr(3,0,r) } else if r<8 { eb(64); eb(15); eb(c); mr(3,0,r%8) } else { eb(65); eb(15); eb(c); mr(3,0,r%8) }
+}
+fn rzx(d,s) {
+    if d<8&&s<8 { eb(72); eb(15); eb(182); mr(3,d%8,s%8); return }
+    rw(d,s); eb(15); eb(182); mr(3,d%8,s%8)
+}
+fn xpush(r) { if r<8 { eb(80+r) } else { eb(65); eb(80+(r%8)) } }
+fn xpop(r) { if r<8 { eb(88+r) } else { eb(65); eb(88+(r%8)) } }
+fn ret() { eb(195) }
+fn sysc() { eb(15); eb(5) }
+fn callr(r) { if r<8 { eb(255); mr(3,2,r) } else { eb(65); eb(255); mr(3,2,r%8) } }
+fn sbi(imm) { eb(72); eb(129); mr(3,5,4); ei(imm) }
+fn abi(imm) { eb(72); eb(129); mr(3,0,4); ei(imm) }
+fn wbp(d,r) { rw(r,5); eb(137); if r>=8 { mr(2,r%8,4); eb(37) } else { mr(2,r%8,5) }; ei(d) }
+fn rbp(r,d) { rw(r,5); eb(139); if r>=8 { mr(2,r%8,4); eb(37) } else { mr(2,r%8,5) }; ei(d) }
+fn wsp(d,r) { rw(r,4); eb(137); mr(2,r%8,4); eb(36); ei(d) }
+fn rsp(r,d) { rw(r,4); eb(139); mr(2,r%8,4); eb(36); ei(d) }
+// wbase(d, vr): mov [r11+d], vr  -- r11 is an explicit base reg (NOT rbp), so it
+// avoids the REX.B/rbp conflict that breaks rbp+extended-reg encodings.
+fn wbase(d, vr) { let rex=73; if vr>=8 { rex=77 }; eb(rex); eb(137); mr(2, vr%8, 3); ei(d) }
+// lbase(d, vr): mov vr, [r11+d]
+fn lbase(d, vr) { let rex=73; if vr>=8 { rex=77 }; eb(rex); eb(139); mr(2, vr%8, 3); ei(d) }
+fn leabp(r,d) { let v=72; if r>=8 { v=73 }; eb(v); eb(141); if r>=8 { mr(2,r%8,4); eb(37) } else { mr(2,r%8,5) }; ei(d) }
+fn rmr(rd,ad) { rw(rd,ad); eb(139); mr(0,rd%8,ad%8) }
+fn wmr(ad,vl) { rw(vl,ad); eb(137); mr(0,vl%8,ad%8) }
+fn rmr8(rd,ad) { rw(rd,ad); eb(15); eb(182); mr(0,rd%8,ad%8) }
+fn wmr8(ad,vl) { if vl<4 { eb(72) }; eb(136); mr(0,vl%8,ad%8) }
+fn lesp(r,d) { rw(r,4); eb(141); mr(2,r%8,4); eb(36); ei(d) }
+fn wmi(b,d,i) { if b>=8 { eb(73) } else { eb(72) }; eb(199); mr(2,0,b%8); ei(d); ei(i) }
+fn wm8i(b,d,i) { if b>=8 { eb(65) } else { eb(64) }; eb(198); mr(2,0,b%8); ei(d); eb(i%256) }
+fn jmp32(o) { eb(233); ei(o) }
+fn jcc32(cc,o) {
+    let c=0; if cc==0 { c=132 } else if cc==1 { c=133 } else if cc==2 { c=140 } else if cc==3 { c=143 } else if cc==4 { c=142 } else if cc==5 { c=141 }
+    eb(15); eb(c); ei(o)
+}
+// G2: inline overflow trap. After a signed arithmetic op sets OF, a short `jno`
+// skips a 2-byte `ud2` (0F 0B). On overflow (OF=1) we fall into ud2 -> #UD ->
+// SIGILL (signal 4): deterministic death. No rel32 relocation needed (rel8).
+// `ii` = current IR record index; if it was emitted inside `unsafe {}`
+// (ir_unsafe[ii]!=0) the trap is suppressed (user opted out).
+fn ovf_trap_emit(ii) { if ovf_trap==1 && r8(ir_unsafe+ii)==0 { eb(113); eb(2); eb(15); eb(11) } }
+// G2p3: shift-COUNT UB trap. x86 `shl/shr r/m64, cl` masks the count to 6 bits,
+// so `x << 64` silently == `x << 0`. With the count already in rcx, emit:
+//   cmp rcx,64 ; jb +2 ; ud2   (48 83 F9 40 / 72 02 / 0F 0B)
+// count>=64 (or negative -> huge unsigned) falls into ud2 -> SIGILL. Suppressed
+// inside unsafe{} (same ir_unsafe gate as the overflow trap).
+fn shl_trap_emit(ii) { if ovf_trap==1 && r8(ir_unsafe+ii)==0 { eb(72); eb(131); eb(249); eb(64); eb(114); eb(2); eb(15); eb(11) } }
+// G2 containers: bounds-check for indexed access `a[idx]`. At the call site the
+// base pointer is in rax and idx is in rcx. Emit `cmp [rax], rcx; jb +2; ud2`:
+//   unsigned idx >= len (or negative -> huge unsigned) falls through into ud2 ->
+//   SIGILL rc=132. Suppressed inside unsafe{} (same ir_unsafe gate). The +8 data
+//   offset is applied in the lea that follows this check.
+fn idx_trap_emit(ii) { if ovf_trap==1 && r8(ir_unsafe+ii)==0 { eb(72); eb(59); eb(8); eb(114); eb(2); eb(15); eb(11) } }
+// P10: ARM64 bounds-check trap for `a[idx]` — parity with x86 idx_trap_emit.
+// At the call site x0 = base ptr, x1 = idx. Emit:
+//   ldr x9,[x0]    ; x9 = len (header)
+//   cmp x1, x9     ; idx - len (unsigned)
+//   b.lo +8        ; if idx < len skip the udf (imm19=2: pc+8 past the 4B udf)
+// === REGISTER ALLOCATOR (corrected: reload on use, persist results) ===
+let REGS = mmap(112)  // 14 physical regs (all except RSP=4, RBP=5)
+fn init_regs() {
+    w64(REGS+0, 0); w64(REGS+8, 1); w64(REGS+16, 2); w64(REGS+24, 3)
+    w64(REGS+32, 6); w64(REGS+40, 7); w64(REGS+48, 8); w64(REGS+56, 9)
+    w64(REGS+64, 10); w64(REGS+72, 12); w64(REGS+80, 13); w64(REGS+88, 14)
+    w64(REGS+96, 15)
+}
+
+let alloc = mmap(2000000); let allocfc = 0
+let vr_init = mmap(2000000)
+let vr_spill = mmap(2000000)
+let SPILL_BASE = 48
+fn spill_home(v) { return -(SPILL_BASE + (v + 1) * 8) }
+
+// aphys(vr): return a physical reg holding vr's value. On first use, allocate a
+// reg and reload from the home slot if the vreg has a defined value.
+fn aphys(vr) {
+    let f=afind(vr); if f>=0 { return f }
+    let p=afree()
+    if r8(vr_init+vr)!=0 { rbp(p, spill_home(vr)) }
+    aset(vr,p); return p
+}
+
+// adistinct(res, a1, a2): like aphys(res) but guarantees the returned physical
+// register is NOT a1 and NOT a2 (the operand registers).  This prevents a
+// binary result dst from aliasing an operand, which would let the zeroing /
+// read-modify-write (xor dst,dst / or dst,r2 / and dst,r2) clobber the operand
+// before it is consumed.  Operands must be loaded with aphys FIRST (so they
+// own their registers), then adistinct picks a distinct register for the result.
+fn adistinct(res, a1, a2) {
+    let f=afind(res); if f>=0 { if f!=a1&&f!=a2 { return f } }
+    // evict everything mapped to a1 or a2 so the result cannot reuse them
+    let i=0
+    while i<allocfc {
+        let pr=r64(alloc+i*16+8)
+        if pr==a1||pr==a2 {
+            let ev_vr=r64(alloc+i*16)
+            if r8(vr_init+ev_vr)!=0 { wbp(spill_home(ev_vr), pr) }
+            w8(vr_spill+ev_vr, 1)
+            // remove this entry by overwriting with last
+            allocfc=allocfc-1
+            w64(alloc+i*16, r64(alloc+allocfc*16))
+            w64(alloc+i*16+8, r64(alloc+allocfc*16+8))
+        } else { i=i+1 }
+    }
+    // Pick a free physical reg that is NEITHER a1 NOR a2.  afree()
+    // would otherwise hand back a just-evicted operand register as the
+    // result, aliasing rd with an operand so the xor/or/and rd,rd
+    // clobbers the operand before cmp consumes it.
+    let p=-1; let k=0
+    while k<14 {
+        let pr=r64(REGS+k*8)
+        if pr!=a1 && pr!=a2 {
+            let used=0; let j=0
+            while j<allocfc { if r64(alloc+j*16+8)==pr { used=1; break }; j=j+1 }
+            if used==0 { p=pr; break }
+        }
+        k=k+1
+    }
+    if p<0 {
+        // Degenerate: only a1/a2 still mapped. Evict a vreg that is NEITHER a1
+        // NOR a2 and reuse its register, so the result never aliases an operand.
+        allocfc=allocfc-1
+        let ev_vr=r64(alloc+allocfc*16); let ev_pr=r64(alloc+allocfc*16+8)
+        while ev_pr==a1 || ev_pr==a2 {
+            w64(alloc+allocfc*16, r64(alloc+(allocfc-1)*16))
+            w64(alloc+allocfc*16+8, r64(alloc+(allocfc-1)*16+8))
+            allocfc=allocfc-1
+            ev_vr=r64(alloc+allocfc*16); ev_pr=r64(alloc+allocfc*16+8)
+        }
+        if r8(vr_init+ev_vr)!=0 { wbp(spill_home(ev_vr), ev_pr) }
+        w8(vr_spill+ev_vr, 1)
+        p=ev_pr
+    }
+    if r8(vr_init+res)!=0 { rbp(p, spill_home(res)) }
+    aset(res,p); return p
+}
+
+fn afind(vr) {
+    let i=0; while i<allocfc { if r64(alloc+i*16)==vr { return r64(alloc+i*16+8) }; i=i+1 }; return -1
+}
+
+fn aset(vr,pr) {
+    if allocfc >= ALLOC_CAP { emit_ovf() }
+    w64(alloc+allocfc*16,vr); w64(alloc+allocfc*16+8,pr); allocfc=allocfc+1
+}
+
+fn aclr() { allocfc=0; let i=0; while i<vreg_n { w8(vr_init+i,0); w8(vr_spill+i,0); i=i+1 } }
+
+// afree(): return a free physical reg, evicting a mapped vreg (spilling it) if needed.
+fn afree() {
+    let k=0
+    while k<14 {
+        let pr=r64(REGS+k*8)
+        let used=0; let j=0
+        while j<allocfc { if r64(alloc+j*16+8)==pr { used=1; break }; j=j+1 }
+        if used==0 { return pr }
+        k=k+1
+    }
+    allocfc=allocfc-1
+    let ev_vr=r64(alloc+allocfc*16); let ev_pr=r64(alloc+allocfc*16+8)
+    if r8(vr_init+ev_vr)!=0 { wbp(spill_home(ev_vr), ev_pr) }
+    w8(vr_spill+ev_vr, 1)
+    return ev_pr
+}
+
+fn flush_all() {
+    let i=0
+    while i<allocfc {
+        let vr=r64(alloc+i*16); let pr=r64(alloc+i*16+8)
+        if r8(vr_init+vr)!=0 { wbp(spill_home(vr), pr) }
+        w8(vr_spill+vr, 1)
+        i=i+1
+    }
+    allocfc=0
+}
+
+// flush_clob(r0,r1,r2): target clobber-save for arithmetic ops (idiv/shl/shr)
+// that only destroy the given physical regs (rax=0, rcx=1, rdx=2). Spills just
+// those vregs to their home slots (already current via sdef) and frees the
+// physical regs, leaving every OTHER live vreg resident -> far fewer downstream
+// reloads than flush_all(). Home slots stay current, so the existing
+// rbp(0,home)/rbp(1,home) reloads after the op remain correct.
+fn flush_clob(r0,r1,r2) {
+    let i=0
+    while i<allocfc {
+        let vr=r64(alloc+i*16); let pr=r64(alloc+i*16+8)
+        if pr==r0 || pr==r1 || pr==r2 {
+            if r8(vr_init+vr)!=0 { wbp(spill_home(vr), pr) }
+            w8(vr_spill+vr, 1)
+            allocfc=allocfc-1
+            w64(alloc+i*16, r64(alloc+allocfc*16))
+            w64(alloc+i*16+8, r64(alloc+allocfc*16+8))
+        } else { i=i+1 }
+    }
+}
+
+// === FLOAT REGISTER ALLOCATOR (x86: xmm0-7; ARM: v0-7) ===
+// Mirrors the integer allocator but routes float vregs to the FP register file.
+// Float homes live in a SEPARATE spill region (fspill_home) so they never collide
+// with integer homes (which use spill_home). Both write 8 bytes; a float vreg vr
+// and an int vreg vr with the same index must NOT share a slot.
+let FREGS = mmap(64)   // 8 xmm/v physical regs
+fn init_fregs() {
+    w64(FREGS+0, 0); w64(FREGS+8, 1); w64(FREGS+16, 2); w64(FREGS+24, 3)
+    w64(FREGS+32, 4); w64(FREGS+40, 5); w64(FREGS+48, 6); w64(FREGS+56, 7)
+}
+let falloc = mmap(2000000); let fallocfc = 0
+let fvr_init = mmap(2000000)
+let fvr_spill = mmap(2000000)
+fn fspill_home(v) { return -(SPILL_BASE + 8192 + (v + 1) * 8) }
+
+fn fphys(vr) {
+    let f=ffind(vr); if f>=0 { return f }
+    let p=ffree()
+    if r8(fvr_init+vr)!=0 { frld(p, fspill_home(vr)) }
+    fset(vr,p); return p
+}
+fn fdistinct(res, a1, a2) {
+    let f=ffind(res); if f>=0 { if f!=a1&&f!=a2 { return f } }
+    let i=0
+    while i<fallocfc {
+        let pr=r64(falloc+i*16+8)
+        if pr==a1||pr==a2 {
+            let ev_vr=r64(falloc+i*16)
+            if r8(fvr_init+ev_vr)!=0 { frld(pr, fspill_home(ev_vr)) }
+            w8(fvr_spill+ev_vr, 1)
+            fallocfc=fallocfc-1
+            w64(falloc+i*16, r64(falloc+fallocfc*16))
+            w64(falloc+i*16+8, r64(falloc+fallocfc*16+8))
+        } else { i=i+1 }
+    }
+    let p=-1; let k=0
+    while k<8 {
+        let pr=r64(FREGS+k*8)
+        if pr!=a1 && pr!=a2 {
+            let used=0; let j=0
+            while j<fallocfc { if r64(falloc+j*16+8)==pr { used=1; break }; j=j+1 }
+            if used==0 { p=pr; break }
+        }
+        k=k+1
+    }
+    if p<0 {
+        fallocfc=fallocfc-1
+        let ev_vr=r64(falloc+fallocfc*16); let ev_pr=r64(falloc+fallocfc*16+8)
+        while ev_pr==a1 || ev_pr==a2 {
+            w64(falloc+fallocfc*16, r64(falloc+(fallocfc-1)*16))
+            w64(falloc+fallocfc*16+8, r64(falloc+(fallocfc-1)*16+8))
+            fallocfc=fallocfc-1
+            ev_vr=r64(falloc+fallocfc*16); ev_pr=r64(falloc+fallocfc*16+8)
+        }
+        if r8(fvr_init+ev_vr)!=0 { frld(ev_pr, fspill_home(ev_vr)) }
+        w8(fvr_spill+ev_vr, 1)
+        p=ev_pr
+    }
+    if r8(fvr_init+res)!=0 { frld(p, fspill_home(res)) }
+    fset(res,p); return p
+}
+fn ffind(vr) {
+    let i=0; while i<fallocfc { if r64(falloc+i*16)==vr { return r64(falloc+i*16+8) }; i=i+1 }; return -1
+}
+fn fset(vr,pr) {
+    if fallocfc >= ALLOC_CAP { emit_ovf() }
+    w64(falloc+fallocfc*16,vr); w64(falloc+fallocfc*16+8,pr); fallocfc=fallocfc+1
+}
+fn fclr() { fallocfc=0; let i=0; while i<vreg_n { w8(fvr_init+i,0); w8(fvr_spill+i,0); i=i+1 } }
+fn ffree() {
+    let k=0
+    while k<8 {
+        let pr=r64(FREGS+k*8)
+        let used=0; let j=0
+        while j<fallocfc { if r64(falloc+j*16+8)==pr { used=1; break }; j=j+1 }
+        if used==0 { return pr }
+        k=k+1
+    }
+    fallocfc=fallocfc-1
+    let ev_vr=r64(falloc+fallocfc*16); let ev_pr=r64(falloc+fallocfc*16+8)
+    if r8(fvr_init+ev_vr)!=0 { frld(ev_pr, fspill_home(ev_vr)) }
+    w8(fvr_spill+ev_vr, 1)
+    return ev_pr
+}
+fn fflush_all() {
+    let i=0
+    while i<fallocfc {
+        let vr=r64(falloc+i*16); let pr=r64(falloc+i*16+8)
+        if r8(fvr_init+vr)!=0 { frld(pr, fspill_home(vr)) }
+        w8(fvr_spill+vr, 1)
+        i=i+1
+    }
+    fallocfc=0
+}
+fn fdef(vr, reg) { frld(reg, fspill_home(vr)); w8(fvr_init+vr, 1) }
+// frld(xmm, off): movsd xmm, [rbp+off]  (REX.W F2 0F 10 /r with rbp base)
+fn frld(xmm, off) { eb(0xF2); eb(73); eb(15); eb(16); mr(2, xmm, 5); ei(off) }
+
+// x86 SSE emit helpers (target_arch==0)
+// xmm reg encoding in ModRM/reg fields: just the index 0-7.
+fn frr(d,s) { if d==s { return }; eb(0xF2); eb(15); eb(16); mr(3,d,s) }   // movsd xmm(d), xmm(s)
+fn fadd(d,s) { eb(0xF2); eb(15); eb(88); mr(3,d,s) }   // addsd xmm(d), xmm(s)
+fn fsub(d,s) { eb(0xF2); eb(15); eb(92); mr(3,d,s) }   // subsd xmm(d), xmm(s)
+fn fmul(d,s) { eb(0xF2); eb(15); eb(89); mr(3,d,s) }   // mulsd xmm(d), xmm(s)
+fn fdiv(d,s) { eb(0xF2); eb(15); eb(94); mr(3,d,s) }   // divsd xmm(d), xmm(s)
+fn fld_x(rdx_gp, xmm) { eb(0xF2); eb(15); eb(16); mr(2, xmm, rdx_gp%8) }   // movsd xmm, [gp]  (REX.W + F2 0F 10 /r)
+fn fst_x(gp, xmm) { eb(0xF2); eb(15); eb(17); mr(2, xmm, gp%8) }           // movsd [gp], xmm
+fn fi2f(xmm, gp) { eb(0xF2); eb(15); eb(42); mr(2, xmm, gp%8) }  // cvtsi2sd xmm, gp  (REX.W F2 0F 2A /r)
+fn ff2i(gp, xmm) { eb(0xF2); eb(15); eb(46); mr(2, gp%8, xmm) }  // cvttsd2si gp, xmm (REX.W F2 0F 2C /r)
+fn fcomi(xmm1, xmm2) { eb(0x66); eb(15); eb(44); mr(3, xmm1, xmm2) }  // comisd xmm1, xmm2 (sets EFLAGS)
+
+
+// === divide-by-const signed magic (strength reduction for IR_DIV by constant) ===
+let magicM = 0
+let magicSh = 0
+// unsigned >= without xor: if signs equal use signed compare; else the
+// non-negative operand is larger in unsigned order.
+fn uge(a, b) {
+  if a >= 0 {
+    if b >= 0 { return a >= b }
+    return 1
+  }
+  if b >= 0 { return 0 }
+  return a >= b
+}
+// compute signed-division magic (M, sh) for nonzero divisor d.
+// M is negated when d<0 so the mul-add recovery needs no separate negation.
+fn compute_magic(d) {
+  // G2: signed-division magic-number recovery does deliberate 64-bit
+  // wraparound (H = 2^63-1, shifts past bit 63, negations). Wrap in unsafe{}
+  // so it is exempt from the overflow trap during self-host bootstrapping.
+  unsafe {
+  let ad = d
+  if d < 0 { ad = -d }
+  let H = 9223372036854775807   // 2^63 - 1 (literal: avoids (1<<63)-1 overflow trap)
+  let anc = H - (H % ad)
+  let q1 = H / anc
+  let r1 = H - q1 * anc + 1
+  let q2 = H / ad
+  let r2 = H - q2 * ad + 1
+  let p = 63
+  while 1 == 1 {
+    p = p + 1
+    q1 = q1 << 1
+    r1 = r1 << 1
+    if uge(r1, anc) { q1 = q1 + 1; r1 = r1 - anc }
+    q2 = q2 << 1
+    r2 = r2 << 1
+    if uge(r2, ad) { q2 = q2 + 1; r2 = r2 - ad }
+    let delta = ad - r2
+    let brk = uge(q1, delta)
+    if brk == 1 {
+      if q1 == delta && r1 == 0 { brk = 0 }
+    }
+    if brk == 1 { break }
+  }
+  let M = q2 + 1
+  if d < 0 { M = -M }
+  let sh = p - 64
+  magicM = M
+  magicSh = sh
+  return 0
+  }
+}
+
+// sdef(vr, reg): store result to home slot AND mark vreg defined (so later
+// aphys reloads the correct value after a flush_all).
+fn sdef(vr, reg) { wbp(spill_home(vr), reg); w8(vr_init+vr, 1) }
+// === BUILD IN NAME CHECK ===
+
+// Emit inline machine code for a built-in call.  Arguments have already been
+// placed in the ABI registers (rdi,rsi,rdx,rcx,r8,r9); the result is left in
+// rax.  Returns 1 if a built-in was emitted, 0 otherwise.
+fn emit_bltn(nmi,nl,ii) {
+    let nm=src+nmi
+    // exit(code): mov eax,60; syscall   (arg0 already in rdi from IR_CALL arg load)
+    if nl==4&&r8(nm)=='e'&&r8(nm+1)=='x'&&r8(nm+2)=='i'&&r8(nm+3)=='t' {
+        eb(184); ei(60); sysc(); return 1
+    }
+    // free(ptr): munmap(ptr, len) where len = *(ptr) (the header = element count).
+    //   mmap rounds the base up to a page, so the region starting at the user
+    //   pointer (mapped length n*8+8) is exactly one page; unmapping len bytes
+    //   (the kernel rounds len up to a page) frees the whole allocation.
+    if nl==4&&r8(nm)=='f'&&r8(nm+1)=='r'&&r8(nm+2)=='e'&&r8(nm+3)=='e' {
+        flush_all()
+        // free(ptr): munmap(ptr, len).  The allocation carries a header word
+        // ([ptr] = element count n); munmap rounds len up to a page so passing
+        // n frees the whole page-granular region.  arg0 (ptr) is in rdi from
+        // the IR_CALL arg load; we read the header into rsi for the length.
+        eb(72); eb(139); eb(55)        // mov rsi, [rdi]   (len = header; munmap rounds up)
+        eb(184); ei(11)                // mov eax, 11      (munmap)
+        sysc(); return 1
+    }
+    // P6.1a: float builtins. Args arrive as raw 64-bit bit-patterns in rdi (arg0)
+    // / rsi (arg1) from the IR_CALL arg load. Float results are returned as raw
+    // 64-bit bit-patterns in rax (so callers chain them through i2f/f2i and the
+    // arithmetic builtins below with no FP register-file involvement in the IR).
+    // Encoding notes (REX.W=48):
+    //   movq xmmN, rM  = 66 48 0F 6E modrm   (GP -> xmm, raw 64b)
+    //   movq rM, xmmN  = 66 48 0F 7E modrm   (xmm -> GP, raw 64b)
+    //   cvtsi2sd xmmN, rM = 48 F2 0F 2A modrm (int64 -> double)
+    //   cvttsd2si rM, xmmN = 48 F2 0F 2C modrm (double -> int64 truncate)
+    //   addsd/subsd/mulsd/divsd xmmD, xmmS = F2 0F 58/5C/59/5E modrm
+    if nl==3&&r8(nm)=='i'&&r8(nm+1)=='2'&&r8(nm+2)=='f' {  // i2f(x): int64 -> f64
+        flush_all()
+        eb(72); eb(242); eb(15); eb(42); eb(199)  // 48 F2 0F 2A C7  cvtsi2sd xmm0, rdi
+        eb(102); eb(72); eb(15); eb(126); eb(192) // 66 48 0F 7E C0  movq rax, xmm0
+        return 1
+    }
+    if nl==3&&r8(nm)=='f'&&r8(nm+1)=='2'&&r8(nm+2)=='i' {  // f2i(x): f64 -> int64 (trunc)
+        flush_all()
+        eb(102); eb(72); eb(15); eb(110); eb(199) // 66 48 0F 6E C7  movq xmm0, rdi
+        eb(72); eb(242); eb(15); eb(44); eb(192)  // 48 F2 0F 2C C0  cvttsd2si rax, xmm0
+        return 1
+    }
+    if nl==4&&r8(nm)=='f'&&r8(nm+1)=='a'&&r8(nm+2)=='d'&&r8(nm+3)=='d' {  // fadd(a,b): int args -> truncated int
+        flush_all()
+        eb(72); eb(242); eb(15); eb(42); eb(199)  // cvtsi2sd xmm0, rdi
+        eb(72); eb(242); eb(15); eb(42); eb(206)  // cvtsi2sd xmm1, rsi
+        eb(242); eb(15); eb(88); eb(193)          // addsd xmm0, xmm1
+        eb(72); eb(242); eb(15); eb(44); eb(192)  // cvttsd2si rax, xmm0  (48 F2 0F 2C C0)
+        return 1
+    }
+    if nl==4&&r8(nm)=='f'&&r8(nm+1)=='s'&&r8(nm+2)=='u'&&r8(nm+3)=='b' {  // fsub(a,b)
+        flush_all()
+        eb(72); eb(242); eb(15); eb(42); eb(199)  // cvtsi2sd xmm0, rdi
+        eb(72); eb(242); eb(15); eb(42); eb(206)  // cvtsi2sd xmm1, rsi
+        eb(242); eb(15); eb(92); eb(193)          // subsd xmm0, xmm1
+        eb(72); eb(242); eb(15); eb(44); eb(192)  // cvttsd2si rax, xmm0
+        return 1
+    }
+    if nl==4&&r8(nm)=='f'&&r8(nm+1)=='m'&&r8(nm+2)=='u'&&r8(nm+3)=='l' {  // fmul(a,b)
+        flush_all()
+        eb(72); eb(242); eb(15); eb(42); eb(199)  // cvtsi2sd xmm0, rdi
+        eb(72); eb(242); eb(15); eb(42); eb(206)  // cvtsi2sd xmm1, rsi
+        eb(242); eb(15); eb(89); eb(193)          // mulsd xmm0, xmm1
+        eb(72); eb(242); eb(15); eb(44); eb(192)  // cvttsd2si rax, xmm0
+        return 1
+    }
+    if nl==4&&r8(nm)=='f'&&r8(nm+1)=='d'&&r8(nm+2)=='i'&&r8(nm+3)=='v' {  // fdiv(a,b)
+        flush_all()
+        eb(72); eb(242); eb(15); eb(42); eb(199)  // cvtsi2sd xmm0, rdi
+        eb(72); eb(242); eb(15); eb(42); eb(206)  // cvtsi2sd xmm1, rsi
+        eb(242); eb(15); eb(94); eb(193)          // divsd xmm0, xmm1
+        eb(72); eb(242); eb(15); eb(44); eb(192)  // cvttsd2si rax, xmm0
+        return 1
+    }
+    // P11: SIMD vec128 builtins (x86 SSE2, packed double). A vec128 is a 16-byte
+    // buffer = 2x f64; dst/a/b are POINTERS to such buffers. Args arrive in
+    // rdi(dst)/rsi(a)/rdx(b) from the IR_CALL arg load. We load 16 bytes into
+    // xmm0/xmm1 with movupd, do the packed-double op, store back. Result (dst)
+    // returned in rax for chaining. Encodings verified vs GNU as:
+    //   movupd xmm0,[rsi] = 66 0F 10 06 ; movupd xmm1,[rdx] = 66 0F 10 0A
+    //   movupd [rdi],xmm0 = 66 0F 11 07
+    //   addpd xmm0,xmm1 = 66 0F 58 C1 ; subpd = 66 0F 5C C1
+    //   mulpd = 66 0F 59 C1 ; divpd = 66 0F 5E C1
+    if nl==8&&r8(nm)=='v'&&r8(nm+1)=='e'&&r8(nm+2)=='c'&&r8(nm+3)=='_'&&r8(nm+4)=='l'&&r8(nm+5)=='o'&&r8(nm+6)=='a'&&r8(nm+7)=='d' {  // vec_load(dst,src): 16B copy
+        flush_all()
+        eb(102); eb(15); eb(16); eb(6)     // movupd xmm0, [rsi]
+        eb(102); eb(15); eb(17); eb(7)     // movupd [rdi], xmm0
+        eb(72); eb(137); eb(248)           // mov rax, rdi (return dst)
+        return 1
+    }
+    if nl==9&&r8(nm)=='v'&&r8(nm+1)=='e'&&r8(nm+2)=='c'&&r8(nm+3)=='_'&&r8(nm+4)=='s'&&r8(nm+5)=='t'&&r8(nm+6)=='o'&&r8(nm+7)=='r'&&r8(nm+8)=='e' {  // vec_store(dst,src)
+        flush_all()
+        eb(102); eb(15); eb(16); eb(6)     // movupd xmm0, [rsi]
+        eb(102); eb(15); eb(17); eb(7)     // movupd [rdi], xmm0
+        eb(72); eb(137); eb(248)           // mov rax, rdi (return dst)
+        return 1
+    }
+    if nl==7&&r8(nm)=='v'&&r8(nm+1)=='e'&&r8(nm+2)=='c'&&r8(nm+3)=='_'&&r8(nm+4)=='a'&&r8(nm+5)=='d'&&r8(nm+6)=='d' {  // vec_add(dst,a,b)
+        flush_all()
+        eb(102); eb(15); eb(16); eb(6)     // movupd xmm0, [rsi]
+        eb(102); eb(15); eb(16); eb(10)    // movupd xmm1, [rdx]
+        eb(102); eb(15); eb(88); eb(193)   // addpd xmm0, xmm1
+        eb(102); eb(15); eb(17); eb(7)     // movupd [rdi], xmm0
+        eb(72); eb(137); eb(248)           // mov rax, rdi (return dst)
+        return 1
+    }
+    if nl==7&&r8(nm)=='v'&&r8(nm+1)=='e'&&r8(nm+2)=='c'&&r8(nm+3)=='_'&&r8(nm+4)=='s'&&r8(nm+5)=='u'&&r8(nm+6)=='b' {  // vec_sub(dst,a,b)
+        flush_all()
+        eb(102); eb(15); eb(16); eb(6)     // movupd xmm0, [rsi]
+        eb(102); eb(15); eb(16); eb(10)    // movupd xmm1, [rdx]
+        eb(102); eb(15); eb(92); eb(193)   // subpd xmm0, xmm1
+        eb(102); eb(15); eb(17); eb(7)     // movupd [rdi], xmm0
+        eb(72); eb(137); eb(248)           // mov rax, rdi (return dst)
+        return 1
+    }
+    if nl==7&&r8(nm)=='v'&&r8(nm+1)=='e'&&r8(nm+2)=='c'&&r8(nm+3)=='_'&&r8(nm+4)=='m'&&r8(nm+5)=='u'&&r8(nm+6)=='l' {  // vec_mul(dst,a,b)
+        flush_all()
+        eb(102); eb(15); eb(16); eb(6)     // movupd xmm0, [rsi]
+        eb(102); eb(15); eb(16); eb(10)    // movupd xmm1, [rdx]
+        eb(102); eb(15); eb(89); eb(193)   // mulpd xmm0, xmm1
+        eb(102); eb(15); eb(17); eb(7)     // movupd [rdi], xmm0
+        eb(72); eb(137); eb(248)           // mov rax, rdi (return dst)
+        return 1
+    }
+    if nl==7&&r8(nm)=='v'&&r8(nm+1)=='e'&&r8(nm+2)=='c'&&r8(nm+3)=='_'&&r8(nm+4)=='d'&&r8(nm+5)=='i'&&r8(nm+6)=='v' {  // vec_div(dst,a,b)
+        flush_all()
+        eb(102); eb(15); eb(16); eb(6)     // movupd xmm0, [rsi]
+        eb(102); eb(15); eb(16); eb(10)    // movupd xmm1, [rdx]
+        eb(102); eb(15); eb(94); eb(193)   // divpd xmm0, xmm1
+        eb(102); eb(15); eb(17); eb(7)     // movupd [rdi], xmm0
+        eb(72); eb(137); eb(248)           // mov rax, rdi (return dst)
+        return 1
+    }
+    // vec_set(ptr, lane, val): write one f64 lane (lane 0/1). ptr=rdi, lane=rsi,
+    // val=rdx. addr = ptr + lane*8. Encodings: mov rax,rdi=48 89 F8;
+    // shl rsi,3=48 C1 E6 03; add rax,rsi=48 01 F0; mov [rax],rdx=48 89 10.
+    if nl==7&&r8(nm)=='v'&&r8(nm+1)=='e'&&r8(nm+2)=='c'&&r8(nm+3)=='_'&&r8(nm+4)=='s'&&r8(nm+5)=='e'&&r8(nm+6)=='t' {
+        flush_all()
+        eb(72); eb(137); eb(248)           // mov rax, rdi
+        eb(72); eb(193); eb(230); eb(3)    // shl rsi, 3
+        eb(72); eb(1); eb(240)             // add rax, rsi
+        eb(72); eb(137); eb(16)            // mov [rax], rdx
+        return 1
+    }
+    // vec_get(ptr, lane): read one f64 lane into rax. addr = ptr + lane*8.
+    // Encodings: mov rax,rdi=48 89 F8; shl rsi,3=48 C1 E6 03; add rax,rsi=48 01
+    // F0; mov rax,[rax]=48 8B 00.
+    if nl==7&&r8(nm)=='v'&&r8(nm+1)=='e'&&r8(nm+2)=='c'&&r8(nm+3)=='_'&&r8(nm+4)=='g'&&r8(nm+5)=='e'&&r8(nm+6)=='t' {
+        flush_all()
+        eb(72); eb(137); eb(248)           // mov rax, rdi
+        eb(72); eb(193); eb(230); eb(3)    // shl rsi, 3
+        eb(72); eb(1); eb(240)             // add rax, rsi
+        eb(72); eb(139); eb(0)             // mov rax, [rax]
+        return 1
+    }
+    // mem_alloc(n): G2 containers. Returns a header-carrying array:
+    //   [base] = n (element count); base+8 .. base+8+n*8 = n qwords.
+    //   Layout matches IR_TALLOC so a[i]/a[i]=v work.  arg0 (n) arrives in
+    //   rdi from the IR_CALL arg load (same path as mmap(64), which works).
+    if nl==9&&r8(nm)=='m'&&r8(nm+1)=='e'&&r8(nm+2)=='m'&&r8(nm+3)=='_'&&r8(nm+4)=='a'&&r8(nm+5)=='l'&&r8(nm+6)=='l'&&r8(nm+7)=='o'&&r8(nm+8)=='c' {
+        flush_all()
+        eb(72); eb(137); eb(251)        // mov rbx, rdi   (rbx = n, saved across hint-set + syscall)
+        eb(72); eb(137); eb(249)        // mov rcx, rdi   (rcx = n)
+        eb(72); eb(107); eb(201); eb(8)   // imul rcx, rcx, 8   (n*8)
+        eb(72); eb(131); eb(193); eb(8)   // add rcx, 8           (n*8+8 = len)
+        eb(72); eb(137); eb(206)         // mov rsi, rcx   (rsi = len)
+        eb(191); ei(0x60000001)          // mov edi, 0x60000001 (hint addr)
+        eb(186); ei(3)                   // mov edx, 3     (PROT_READ|WRITE)
+        eb(65); eb(186); ei(34)          // mov r10d, 0x22 (MAP_PRIVATE|ANON)
+        eb(65); eb(184); ei(0-1)         // mov r8d, -1    (fd)
+        eb(69); eb(49); eb(201)          // xor r9d, r9d   (offset=0)
+        eb(184); ei(9)                   // mov eax, 9
+        sysc()                           // rax = ptr
+        eb(72); eb(137); eb(24)          // mov [rax], rbx   ([base] = n header; rbx preserved)
+        return 1
+    }
+    // mk_any(tag, val): t9 generics primitive. Returns a STACK-LOCAL 2-tuple
+    // (ptr, len=16); [ptr]=tag, [ptr+8]=val. Caller may copy it (w64) if it
+    // must outlive this frame (tuple/return semantics handle the copy).
+    if nl==6&&r8(nm)=='m'&&r8(nm+1)=='k'&&r8(nm+2)=='_'&&r8(nm+3)=='a'&&r8(nm+4)=='n'&&r8(nm+5)=='y' {
+        // mk_any(tag, val): allocate a 16-byte tagged tuple via mmap and store
+        // (tag, val). Args arrive in rdi=tag, rsi=val (loaded by IR_CALL).
+        // SYSCALL clobbers r11/rcx, and any other register may be reused or
+        // clobbered by an interleaved helper call. The only spill guaranteed
+        // safe across the syscall AND any call is the stack, so push tag/val,
+        // do the mmap, pop into scratch, and store.
+        eb(87)                            // push rdi   (save tag)
+        eb(86)                            // push rsi   (save val)
+        ri(7, 16)                          // rdi = 16 bytes
+        eb(72); eb(137); eb(254)          // mov rsi, rdi   (len)
+        eb(191); ei(0x60000001)          // mov edi, 0x60000000 (hint addr)
+        eb(186); ei(3)                    // mov edx, 3     (PROT_READ|WRITE)
+        eb(65); eb(186); ei(34)           // mov r10d, 0x22 (MAP_PRIVATE|ANON)
+        eb(65); eb(184); ei(0-1)          // mov r8d, -1    (fd)
+        eb(69); eb(49); eb(201)           // xor r9d, r9d   (offset=0)
+        eb(184); ei(9)                    // mov eax, 9
+        sysc()                            // rax = ptr to 16-byte buffer
+        eb(90)                            // pop rdx    (val)
+        eb(89)                            // pop rcx    (tag)
+        eb(72); eb(137); eb(8)            // 48 89 08 = mov [rax], rcx   (tag)
+        eb(72); eb(137); eb(80); eb(8)    // 48 89 50 08 = mov [rax+8], rdx  (val)
+        return 1                          // result (ptr) already in rax -> IR_CALL saves it
+    }
+    if nl==4&&r8(nm)=='m'&&r8(nm+1)=='m'&&r8(nm+2)=='a'&&r8(nm+3)=='p' {
+        eb(72); eb(137); eb(254)      // mov rsi, rdi   (len)
+        eb(191); ei(0x60000001)       // mov edi, 0x60000000 (addr HINT: high, away from fixed GDATA@0x42200000)
+        eb(186); ei(3)                // mov edx, 3     (PROT_READ|WRITE)
+        eb(65); eb(186); ei(34)       // mov r10d, 0x22 (MAP_PRIVATE|ANON)
+        eb(65); eb(184); ei(0-1)      // mov r8d, -1    (fd)
+        eb(69); eb(49); eb(201)       // xor r9d, r9d   (offset=0)
+        eb(184); ei(9)                // mov eax, 9
+        sysc(); return 1
+    }
+    // --- memory ops: memcpy / memcmp / memmove / realloc (placed BEFORE the mem_ block;
+    //     checks placed after the mem_ block fail to dispatch in this compiler) ---
+    if nl==5&&r8(nm)=='b'&&r8(nm+1)=='s'&&r8(nm+2)=='w'&&r8(nm+3)=='a'&&r8(nm+4)=='p' {
+        flush_all(); eb(72); eb(137); eb(248); eb(72); eb(15); eb(200); return 1
+    }    if nl==8&&r8(nm)=='p'&&r8(nm+1)=='o'&&r8(nm+2)=='p'&&r8(nm+3)=='c'&&r8(nm+4)=='o'&&r8(nm+5)=='u'&&r8(nm+6)=='n'&&r8(nm+7)=='t' {
+        flush_all(); eb(72); eb(248); eb(243); eb(72); eb(15); eb(184); eb(192); return 1
+    }    if nl==3&&r8(nm)=='c'&&r8(nm+1)=='l'&&r8(nm+2)=='z' {
+        flush_all(); eb(72); eb(248); eb(243); eb(72); eb(15); eb(189); eb(192); return 1
+    }    if nl==3&&r8(nm)=='c'&&r8(nm+1)=='t'&&r8(nm+2)=='z' {
+        flush_all(); eb(72); eb(248); eb(243); eb(72); eb(15); eb(188); eb(192); return 1
+    }    if nl==4&&r8(nm)=='r'&&r8(nm+1)=='o'&&r8(nm+2)=='t'&&r8(nm+3)=='l' {
+        flush_all(); eb(72); eb(137); eb(241); eb(72); eb(211); eb(192); return 1
+    }    if nl==4&&r8(nm)=='r'&&r8(nm+1)=='o'&&r8(nm+2)=='t'&&r8(nm+3)=='r' {
+        flush_all(); eb(72); eb(137); eb(241); eb(72); eb(211); eb(200); return 1
+    }
+    // memcpy(dst, src, n): forward rep movsb.  m-e-m-c-p-y
+    if nl==6&&r8(nm)=='m'&&r8(nm+1)=='e'&&r8(nm+2)=='m'&&r8(nm+3)=='c'&&r8(nm+4)=='p'&&r8(nm+5)=='y' {
+        flush_all()
+        eb(87)                            // push rdi (save dst)
+        rr(1,2)                          // rcx = rdx (n)
+        eb(252)                          // cld
+        eb(243); eb(164)                 // rep movsb
+        eb(89)                           // pop rax (dst = return)
+        return 1
+    }
+    // memcmp(a, b, n): repe cmpsb, return <0/0/>0.  m-e-m-c-m-p
+    if nl==6&&r8(nm)=='m'&&r8(nm+1)=='e'&&r8(nm+2)=='m'&&r8(nm+3)=='c'&&r8(nm+4)=='m'&&r8(nm+5)=='p' {
+        flush_all()
+        eb(87)                            // push rdi (save a; balance stack)
+        ri(0,0)                           // rax = 0 (default: equal)
+        rr(1,2)                          // rcx = rdx (n)
+        eb(252)                          // cld
+        eb(243); eb(166)                 // repe cmpsb (f3 a6)
+        jcc32(0,14)                      // JE -> skip diff calc (14 bytes)
+        eb(138); eb(71); eb(255)         // mov al, [rdi-1]   (8A 47 FF)
+        eb(138); eb(94); eb(255)         // mov bl, [rsi-1]   (8A 5E FF)
+        eb(15); eb(182); eb(192)         // movzx eax, al     (0F B6 C0)
+        eb(15); eb(182); eb(219)         // movzx ebx, bl     (0F B6 DB)
+        eb(41); eb(216)                  // sub eax, ebx      (29 D8)  [32-bit diff]
+        eb(72); eb(152)                  // cdqe               (48 98)  sign-extend eax->rax
+        eb(89)                           // pop rdx (balance)
+        return 1                         // rax = signed diff (or 0 if equal)
+    }
+    // memmove(dst, src, n): direction-aware copy.  m-e-m-m-o-v-e
+    if nl==7&&r8(nm)=='m'&&r8(nm+1)=='e'&&r8(nm+2)=='m'&&r8(nm+3)=='m'&&r8(nm+4)=='o'&&r8(nm+5)=='v'&&r8(nm+6)=='e' {
+        flush_all()
+        eb(87)                            // push rdi (save dst)
+        eb(72); eb(57); eb(247)          // cmp rdi, rsi (48 39 F7)
+        jcc32(4,11)                      // JA dst>src -> skip forward, do backward (11 bytes)
+        // FORWARD:
+        eb(252)                          // cld
+        rr(1,2)                          // rcx = rdx (n)
+        eb(243); eb(164)                 // rep movsb
+        jmp32(21)                        // skip backward block (21 bytes)
+        // BACKWARD:
+        eb(253)                          // std
+        eb(72); eb(1); eb(215)           // add rdi, rdx (48 01 D7)  rdi = dst+n
+        eb(72); eb(131); eb(239); eb(1)  // sub rdi, 1    (48 83 EF 01) rdi = dst+n-1
+        eb(72); eb(1); eb(214)           // add rsi, rdx (48 01 D6)  rsi = src+n
+        eb(72); eb(131); eb(238); eb(1)  // sub rsi, 1    (48 83 EE 01) rsi = src+n-1
+        rr(1,2)                          // rcx = rdx (n)
+        eb(243); eb(164)                 // rep movsb
+        eb(252)                          // cld (restore)
+        eb(89)                           // pop rax (dst = return)
+        return 1
+    }
+    // realloc(old_ptr, old_n, new_n): mmap new (new_n*8+8), copy min(old_n,new_n)*8
+    //   bytes old+8 -> new+8 via forward rep movsb, munmap old (old_n*8+8), return new.
+    if nl==7&&r8(nm)=='r'&&r8(nm+1)=='e'&&r8(nm+2)=='a'&&r8(nm+3)=='l'&&r8(nm+4)=='l'&&r8(nm+5)=='o'&&r8(nm+6)=='c' {
+        flush_all()
+        eb(82)                            // push rdx  ([rsp+16]=new_n)
+        eb(86)                            // push rsi  ([rsp+8]=old_n)
+        eb(87)                            // push rdi  ([rsp]=old)
+        // new_len = new_n*8+8 -> rsi
+        eb(72); eb(139); eb(116); eb(36); eb(16)   // mov rsi, [rsp+16]  (new_n)  [rsp needs SIB 0x24]
+        eb(72); eb(193); eb(230); eb(3)   // shl rsi, 3  (new_n*8)        48 C1 E6 03
+        eb(72); eb(131); eb(198); eb(8)   // add rsi, 8   (new_n*8+8)     48 83 C6 08
+        eb(191); ei(0x60000001)           // mov edi, 0x60000001
+        eb(186); ei(3)                    // mov edx, 3
+        eb(65); eb(186); ei(34)           // mov r10d, 0x22
+        eb(65); eb(184); ei(0-1)          // mov r8d, -1
+        eb(69); eb(49); eb(201)           // xor r9d, r9d
+        eb(184); ei(9)                    // mov eax, 9
+        sysc()                            // rax = new
+        rr(3,0)                           // rbx = new (preserve)
+        // copy count = min(old_n, new_n), then *8 -> rcx
+        eb(72); eb(139); eb(76); eb(36); eb(8)   // mov rcx, [rsp+8]   (old_n)  48 8B 4C 24 08
+        eb(72); eb(139); eb(84); eb(36); eb(16)  // mov rdx, [rsp+16]  (new_n)  48 8B 54 24 10
+        eb(72); eb(57); eb(209)           // cmp rdx, rcx  (new_n vs old_n)  48 39 D1
+        jcc32(5,7)                        // JGE (new_n>=old_n) -> skip mov rcx,[rsp+16] (rcx stays old_n=min)
+        eb(72); eb(139); eb(76); eb(36); eb(16)   // mov rcx, [rsp+16]  (new_n)  [7 bytes]  48 8B 4C 24 10
+        eb(72); eb(193); eb(225); eb(3)   // shl rcx, 3  (count*8)  48 C1 E1 03
+        // rdi = new+8, rsi = old+8
+        eb(72); eb(141); eb(120); eb(8)   // lea rdi, [rax+8]  48 8D 78 08
+        eb(72); eb(139); eb(116); eb(36); eb(0)   // mov rsi, [rsp]  (old)  48 8B 74 24 00
+        eb(72); eb(141); eb(118); eb(8)   // lea rsi, [rsi+8]  48 8D 76 08
+        eb(252)                           // cld
+        eb(243); eb(164)                  // rep movsb
+        // munmap(old, old_n*8+8)
+        eb(72); eb(139); eb(116); eb(36); eb(0)   // mov rsi, [rsp]  (old)  48 8B 74 24 00
+        eb(72); eb(137); eb(247)          // mov rdi, rsi  (rdi=old)  48 89 F7
+        eb(72); eb(139); eb(116); eb(36); eb(8)   // mov rsi, [rsp+8]  (old_n)  48 8B 74 24 08
+        eb(72); eb(193); eb(230); eb(3)   // shl rsi, 3  (old_n*8)  48 C1 E6 03
+        eb(72); eb(131); eb(198); eb(8)   // add rsi, 8  (old_n*8+8)  48 83 C6 08
+        eb(184); ei(11)                   // mov eax, 11 (munmap)
+        sysc()
+        rr(0,3)                           // rax = rbx (new)
+        eb(89); eb(94); eb(95)             // pop rdx, pop rsi, pop rdi (balance 3 pushes)
+        return 1
+    }
+    // mem_load / mem_load8 / mem_store / mem_store8
+    if nl>=8&&r8(nm)=='m'&&r8(nm+1)=='e'&&r8(nm+2)=='m'&&r8(nm+3)=='_' {
+        flush_all()   // memory builtins clobber rdi/rsi/rax; spill live vregs first
+        if r8(nm+4)=='l' {
+            if nl==9 { eb(72); eb(15); eb(182); eb(7); return 1 }  // mem_load8: movzx rax,byte[rdi]
+            eb(72); eb(139); eb(7); return 1                       // mem_load:  mov rax,[rdi]
+        }
+        if r8(nm+4)=='s' {
+            if nl==10 { 
+                eb(72); eb(133); eb(255)       // test rdi, rdi
+                eb(116); eb(3)                 // jz +3 (skip the store when rdi==0)
+                eb(64); eb(136); eb(55)        // mov [rdi], sil
+                eb(72); eb(137); eb(240)       // mov rax, rsi  (return value)
+                return 1 
+            }        // mem_store8 (inline): null-guarded store, no ret
+            eb(72); eb(137); eb(55); return 1                      // mem_store:  mov [rdi],rsi
+        }
+    }
+    // Fallback to emit_bltn2 to keep each dispatch fn under the size ceiling.
+    if emit_bltn2(nmi,nl,ii)==1 { return 1 }
+    return 0
+}
+fn emit_bltn2(nmi,nl,ii) {
+    let nm=src+nmi
+
+    // file_open / file_read / file_write / file_close
+    if nl>=8&&r8(nm)=='f'&&r8(nm+1)=='i'&&r8(nm+2)=='l'&&r8(nm+3)=='e'&&r8(nm+4)=='_' {
+        flush_all()   // syscalls clobber rdi/rsi/rdx/rax; spill live vregs first
+        let c5=r8(nm+5)
+        if c5=='o' { eb(184); ei(2); sysc(); return 1 }  // open: rdi=path rsi=flags rdx=mode (caller sets); mov eax,2; syscall
+        if c5=='r' { eb(184); ei(0); sysc(); return 1 }                    // read
+        if c5=='w' { eb(184); ei(1); sysc(); return 1 }                    // write
+        if c5=='c' { eb(184); ei(3); sysc(); return 1 }                    // close
+    }
+    // syscall(num, a, b, c, d, e, f): GENERIC raw Linux syscall (any arity 1..7).
+    //   IR_CALL already did flush_all() and loaded args rdi/rsi/rdx/rcx/r8/r9
+    //   (and pushed arg6+ on the stack). We do NOT rely on those registers;
+    //   instead we reload each arg vreg from its SPILL HOME directly into the
+    //   exact syscall-ABI register:
+    //     rax=num, rdi=a, rsi=b, rdx=c, r10=d, r8=e, r9=f
+    //   (the 4th syscall arg is r10, not rcx — that's why we reload from homes
+    //   rather than just shuffling IR_CALL's registers; arg6 also lives on the
+    //   stack in IR_CALL's layout, so reloading from home covers it too.)
+    if nl==7&&r8(nm)=='s'&&r8(nm+1)=='y'&&r8(nm+2)=='s'&&r8(nm+3)=='c'&&r8(nm+4)=='a'&&r8(nm+5)=='l'&&r8(nm+6)=='l' {
+        // arg count = ira1(ii); arg-start index = ira2(ii)
+        let sc_cnt = ira1(ii)
+        let sc_base = ira2(ii)
+        // Load arg k from its vreg home into the matching syscall register.
+        // target regs: 0=rax,7=rdi,6=rsi,2=rdx,10=r10,8=r8,9=r9
+        let sk = 0
+        while sk < sc_cnt {
+            if sk < 7 {
+                let sv = irres(sc_base + sk)
+                if sk == 0 { rbp(0, spill_home(sv)) }      // rax = num
+                if sk == 1 { rbp(7, spill_home(sv)) }      // rdi = a
+                if sk == 2 { rbp(6, spill_home(sv)) }      // rsi = b
+                if sk == 3 { rbp(2, spill_home(sv)) }      // rdx = c
+                if sk == 4 { rbp(10, spill_home(sv)) }     // r10 = d
+                if sk == 5 { rbp(8, spill_home(sv)) }      // r8  = e
+                if sk == 6 { rbp(9, spill_home(sv)) }      // r9  = f
+            }
+            sk = sk + 1
+        }
+        sysc()    // syscall (result in rax)
+        return 1
+    }
+    // clock_gettime(clk_id, ts_ptr): sc 228. IR_CALL loaded rdi=clk_id, rsi=ts_ptr.
+    if nl==13&&r8(nm)=='c'&&r8(nm+4)=='k'&&r8(nm+5)=='_'&&r8(nm+6)=='g'&&r8(nm+11)=='m'&&r8(nm+12)=='e' {
+        ri(0,228); sysc(); return 1
+    }
+    // gettimeofday(tv_ptr, tz_ptr): sc 96. rdi=tv, rsi=tz already loaded.
+    if nl==12&&r8(nm)=='g'&&r8(nm+1)=='e'&&r8(nm+2)=='t'&&r8(nm+3)=='t'&&r8(nm+4)=='i'&&r8(nm+5)=='m'&&r8(nm+6)=='e'&&r8(nm+7)=='o'&&r8(nm+8)=='f'&&r8(nm+9)=='d'&&r8(nm+10)=='a'&&r8(nm+11)=='y' {
+        ri(0,96); sysc(); return 1
+    }
+    // nanosleep(req_ptr, rem_ptr): sc 35. rdi=req, rsi=rem already loaded.
+    if nl==9&&r8(nm)=='n'&&r8(nm+1)=='a'&&r8(nm+2)=='n'&&r8(nm+3)=='o'&&r8(nm+4)=='s'&&r8(nm+5)=='l'&&r8(nm+6)=='e'&&r8(nm+7)=='e'&&r8(nm+8)=='p' {
+        ri(0,35); sysc(); return 1
+    }
+    // sleep(sec): internal mmap(16) -> fill {sec,0} -> nanosleep -> munmap.
+    //   rdi holds sec (arg0) from IR_CALL. Push it, mmap a scratch timespec,
+    //   pop sec into rdx, store [buf]=sec and [buf+8]=0, nanosleep(buf,0),
+    //   munmap(buf,16), return 0. buf is kept in rbx across the nanosleep
+    //   syscall (kernel preserves rbx; no live vregs in it after IR_CALL flush).
+    if nl==5&&r8(nm)=='s'&&r8(nm+1)=='l'&&r8(nm+2)=='e'&&r8(nm+3)=='e'&&r8(nm+4)=='p' {
+        eb(87)                            // push rdi   (save sec)
+        ri(7, 16)                         // rdi = 16
+        eb(72); eb(137); eb(254)          // mov rsi, rdi   (len=16)
+        eb(191); ei(0x60000001)           // mov edi, 0x60000001 (addr hint)
+        eb(186); ei(3)                    // mov edx, 3     (PROT_READ|WRITE)
+        eb(65); eb(186); ei(34)           // mov r10d, 0x22 (MAP_PRIVATE|ANON)
+        eb(65); eb(184); ei(0-1)          // mov r8d, -1    (fd)
+        eb(69); eb(49); eb(201)           // xor r9d, r9d   (offset=0)
+        eb(184); ei(9)                    // mov eax, 9
+        sysc()                            // rax = buf
+        rr(3,0)                           // rbx = buf  (preserve across nanosleep)
+        eb(90)                            // pop rdx    (sec)
+        eb(72); eb(137); eb(16)           // mov [rax], rdx  (buf.sec = sec)
+        eb(72); eb(49); eb(201)           // xor rcx, rcx
+        eb(72); eb(137); eb(72); eb(8)     // mov [rax+8], rcx (buf.nsec = 0)
+        ri(0,35)                          // rax = 35 (nanosleep)
+        rr(7,3)                           // rdi = rbx (buf)
+        ri(6,0)                           // esi = 0 (rem = 0)
+        sysc()                            // nanosleep(buf, 0)
+        ri(0,11)                          // rax = 11 (munmap)
+        rr(7,3)                           // rdi = rbx (buf)
+        ri(6,16)                          // rsi = 16
+        sysc()                            // munmap(buf, 16)  (rax -> 0)
+        return 1
+    }
+    //   IR_CALL arg load places: rdi=num, rsi=a, rdx=b, rcx=c.
+    //   The syscall instruction wants: rax=num, rdi=a, rsi=b, rdx=c.
+    //   Shuffle via rr() (register numbers: rax=0, rsi=6, rdi=7, rdx=2, rcx=1).
+    if nl==8&&r8(nm)=='s'&&r8(nm+1)=='y'&&r8(nm+2)=='s'&&r8(nm+3)=='c'&&r8(nm+4)=='a'&&r8(nm+5)=='l'&&r8(nm+6)=='l'&&r8(nm+7)=='3' {
+        flush_all()
+        rr(0,7)   // rax = rdi (syscall number)
+        rr(7,6)   // rdi = rsi (arg a)
+        rr(6,2)   // rsi = rdx (arg b)
+        rr(2,1)   // rdx = rcx (arg c)
+        sysc()    // syscall
+        return 1
+    }
+    // print(buf, len): write(1, buf, len)
+    // call convention leaves rdi=buf, rsi=len. Need: rax=1, rdi=1, rsi=buf, rdx=len.
+    if nl==5&&r8(nm)=='p'&&r8(nm+1)=='r'&&r8(nm+2)=='i'&&r8(nm+3)=='n'&&r8(nm+4)=='t' {
+        flush_all()   // write syscall clobbers rdi/rsi/rdx/rax
+        eb(72); eb(137); eb(242)     // mov rdx, rsi   (count = len)
+        eb(72); eb(137); eb(254)     // mov rsi, rdi   (buf = buf)
+        eb(191); ei(1)               // mov edi, 1     (fd = stdout; zero-extends to rdi)
+        eb(184); ei(1)               // mov eax, 1     (sys_write)
+        sysc(); return 1
+    }
+    // printi(val): write decimal representation of the integer in rdi to stdout.
+    if nl==6&&r8(nm)=='p'&&r8(nm+1)=='r'&&r8(nm+2)=='i'&&r8(nm+3)=='n'&&r8(nm+4)=='t'&&r8(nm+5)=='i' {
+        flush_all()   // spill all live vregs; after this any register is safe to clobber
+        let l_pos=nl(); let l_zero=nl(); let l_loop=nl(); let l_done=nl(); let l_signprep=nl(); let l_write=nl()
+        rr(0,7)                          // rax = rdi (value)
+        sbi(32)                          // sub rsp, 32  (decimal digit buffer)
+        lesp(10, 23)                      // r10 = rsp + 23  (direct buffer pointer, high end)
+        rxor(8,8)                        // r8 = len = 0
+        rxor(9,9)                        // r9 = sign = 0
+        rr(9,0)                          // r9 = value (for sign-bit extraction)
+        eb(77); eb(193); eb(233); eb(63) // shr r9, 63   (sign bit)
+        rtest(9,9)
+        let p=codelen; jcc32(0,0); emit_patch(p, l_pos, 1)   // je l_pos (non-negative)
+        rneg(0)                          // neg rax (make positive)
+        lbladd(l_pos, codelen)
+        rtest(0,0)
+        let p=codelen; jcc32(0,0); emit_patch(p, l_zero, 1)  // je l_zero (value == 0)
+        let p=codelen; jmp32(0); emit_patch(p, l_loop, 0)    // jmp l_loop
+        lbladd(l_zero, codelen)
+        eb(178); eb(48)                  // mov dl, '0'  (0x30)
+        eb(65); eb(136); eb(18)          // mov [r10], dl  (REX.B->r10, reg=2=dl)
+        eb(73); eb(255); eb(202)         // dec r10
+        eb(73); eb(255); eb(192)         // inc r8
+        let p=codelen; jmp32(0); emit_patch(p, l_signprep, 0) // jmp l_signprep
+        lbladd(l_loop, codelen)
+        rtest(0,0)
+        let p=codelen; jcc32(0,0); emit_patch(p, l_done, 1)   // je l_done (no more digits)
+        rxor(2,2)                        // xor rdx, rdx
+        ri(1,10)                         // rcx = 10
+        ridiv(1)                         // rax = quotient, rdx = remainder (digit)
+        eb(72); eb(129); eb(194); ei(48) // add rdx, 0x30  (digit -> ascii)
+        eb(65); eb(136); eb(18)          // mov [r10], dl  (REX.B->r10, reg=2=dl)
+        eb(73); eb(255); eb(202)         // dec r10
+        eb(73); eb(255); eb(192)         // inc r8
+        let p=codelen; jmp32(0); emit_patch(p, l_loop, 0)     // jmp l_loop
+        lbladd(l_done, codelen)
+        lbladd(l_signprep, codelen)
+        rtest(9,9)
+        let p=codelen; jcc32(0,0); emit_patch(p, l_write, 1)  // je l_write (skip if positive)
+        eb(178); eb(45)                  // mov dl, '-'  (0x2D)
+        eb(65); eb(136); eb(18)          // mov [r10], dl  (REX.B->r10, reg=2=dl)
+        eb(73); eb(255); eb(202)         // dec r10
+        eb(73); eb(255); eb(192)         // inc r8
+        lbladd(l_write, codelen)
+        eb(73); eb(141); eb(114); eb(1)  // lea rsi, [r10+1]  (buffer start = rsp+24-len)
+        rr(2,8)                          // rdx = r8 (length)
+        ri(7,1)                          // rdi = 1 (stdout)
+        ri(0,1)                          // rax = 1 (sys_write)
+        sysc()
+        abi(32)
+        return 1
+    }
+    // println(i): print integer i (decimal) followed by a newline to stdout.
+    if nl==7&&r8(nm)=='p'&&r8(nm+1)=='r'&&r8(nm+2)=='i'&&r8(nm+3)=='n'&&r8(nm+4)=='t'&&r8(nm+5)=='l'&&r8(nm+6)=='n' {
+        flush_all()
+        let lp_pos=nl(); let lp_zero=nl(); let lp_loop=nl(); let lp_done=nl(); let lp_signprep=nl(); let lp_write=nl()
+        rr(0,7)                          // rax = rdi (value)
+        sbi(32)                          // sub rsp, 32
+        lesp(10, 23)                     // r10 = rsp + 23
+        rxor(8,8); rxor(9,9); rr(9,0)
+        eb(77); eb(193); eb(233); eb(63) // shr r9, 63
+        rtest(9,9); let p=codelen; jcc32(0,0); emit_patch(p, lp_pos, 1)   // je lp_pos (non-negative)
+        rneg(0)                          // neg rax
+        lbladd(lp_pos, codelen)
+        rtest(0,0); let p=codelen; jcc32(0,0); emit_patch(p, lp_zero, 1)   // je lp_zero (value == 0)
+        let p=codelen; jmp32(0); emit_patch(p, lp_loop, 0)                // jmp lp_loop
+        lbladd(lp_zero, codelen)
+        eb(178); eb(48); eb(65); eb(136); eb(18); eb(73); eb(255); eb(202); eb(73); eb(255); eb(192) // '0', dec r10, inc r8
+        let p=codelen; jmp32(0); emit_patch(p, lp_signprep, 0)            // jmp lp_signprep
+        lbladd(lp_loop, codelen)
+        rtest(0,0); let p=codelen; jcc32(0,0); emit_patch(p, lp_done, 1)   // je lp_done
+        rxor(2,2); ri(1,10); ridiv(1)
+        eb(72); eb(129); eb(194); ei(48); eb(65); eb(136); eb(18); eb(73); eb(255); eb(202); eb(73); eb(255); eb(192)
+        let p=codelen; jmp32(0); emit_patch(p, lp_loop, 0)                // jmp lp_loop
+        lbladd(lp_done, codelen); lbladd(lp_signprep, codelen)
+        rtest(9,9); let p=codelen; jcc32(0,0); emit_patch(p, lp_write, 1)  // je lp_write (skip if positive)
+        eb(178); eb(45); eb(65); eb(136); eb(18); eb(73); eb(255); eb(202); eb(73); eb(255); eb(192) // '-'
+        lbladd(lp_write, codelen)
+        eb(73); eb(141); eb(114); eb(1)   // lea rsi, [r10+1]
+        rr(2,8); ri(7,1); ri(0,1); sysc()  // write integer
+        // write '\n'
+        sbi(8); lesp(10,0); eb(178); eb(10); eb(65); eb(136); eb(18)
+        rr(6,10); ri(2,1); ri(7,1); ri(0,1); sysc(); abi(8)
+        abi(32)
+        return 1
+    }
+    // newline(): emit a single '\n' to stdout.
+    if nl==7&&r8(nm)=='n'&&r8(nm+1)=='e'&&r8(nm+2)=='w'&&r8(nm+3)=='l'&&r8(nm+4)=='i'&&r8(nm+5)=='n'&&r8(nm+6)=='e' {
+        flush_all()
+        sbi(8); lesp(10,0); eb(178); eb(10); eb(65); eb(136); eb(18)
+        rr(6,10); ri(2,1); ri(7,1); ri(0,1); sysc(); abi(8)
+        return 1
+    }
+    // printsp(i): print integer i followed by a space.
+    if nl==7&&r8(nm)=='p'&&r8(nm+1)=='r'&&r8(nm+2)=='i'&&r8(nm+3)=='n'&&r8(nm+4)=='t'&&r8(nm+5)=='s'&&r8(nm+6)=='p' {
+        flush_all(); let lp3_pos=nl(); let lp3_zero=nl(); let lp3_loop=nl(); let lp3_done=nl(); let lp3_signprep=nl(); let lp3_write=nl()
+        rr(0,7); sbi(32); lesp(10,23); rxor(8,8); rxor(9,9); rr(9,0)
+        eb(77); eb(193); eb(233); eb(63); rtest(9,9); let p=codelen; jcc32(0,0); emit_patch(p, lp3_pos, 1)
+        rneg(0); lbladd(lp3_pos, codelen); rtest(0,0); let p=codelen; jcc32(0,0); emit_patch(p, lp3_zero, 1)
+        let p=codelen; jmp32(0); emit_patch(p, lp3_loop, 0); lbladd(lp3_zero, codelen)
+        eb(178); eb(48); eb(65); eb(136); eb(18); eb(73); eb(255); eb(202); eb(73); eb(255); eb(192)
+        let p=codelen; jmp32(0); emit_patch(p, lp3_signprep, 0); lbladd(lp3_loop, codelen)
+        rtest(0,0); let p=codelen; jcc32(0,0); emit_patch(p, lp3_done, 1); rxor(2,2); ri(1,10); ridiv(1)
+        eb(72); eb(129); eb(194); ei(48); eb(65); eb(136); eb(18); eb(73); eb(255); eb(202); eb(73); eb(255); eb(192)
+        let p=codelen; jmp32(0); emit_patch(p, lp3_loop, 0); lbladd(lp3_done, codelen); lbladd(lp3_signprep, codelen)
+        rtest(9,9); let p=codelen; jcc32(0,0); emit_patch(p, lp3_write, 1)
+        eb(178); eb(45); eb(65); eb(136); eb(18); eb(73); eb(255); eb(202); eb(73); eb(255); eb(192)
+        lbladd(lp3_write, codelen); eb(73); eb(141); eb(114); eb(1); rr(2,8); ri(7,1); ri(0,1); sysc()
+        sbi(8); lesp(10,0); eb(178); eb(32); eb(65); eb(136); eb(18)
+        rr(6,10); ri(2,1); ri(7,1); ri(0,1); sysc(); abi(8); abi(32); return 1
+    }
+    // prints(s): write header-string s (bytes at s+8, length len(s)) to stdout.
+    if nl==6&&r8(nm)=='p'&&r8(nm+1)=='r'&&r8(nm+2)=='i'&&r8(nm+3)=='n'&&r8(nm+4)=='t'&&r8(nm+5)=='s' {
+        flush_all()
+        rr(6,7)                          // rsi = rdi (string ptr)
+        eb(72); eb(129); eb(198); ei(8)  // rsi = ptr + 8 (byte start)  [modrm 0xC6 = add rsi, imm32]
+        eb(72); eb(139); eb(23)          // rdx = [rdi] = len(s) (count)  [modrm 0x17 = mov rdx,[rdi]]
+        ri(7,1); ri(0,1); sysc()         // sys_write(1, ptr+8, len)
+        return 1
+    }
+    // --- Phase A1: unsigned arithmetic builtins (true unsigned x86) ---
+    // IR_CALL has already flush_all()'d and loaded a=rdi, b=rsi. Do NOT call
+    // flush_all() again here: emit_bltn's scratch spill relocates rsi -> rbx,
+    // corrupting arg1. Use rdi/rsi directly.
+    // udiv(a,b): unsigned a/b.
+    if nl==4&&r8(nm)=='u'&&r8(nm+1)=='d'&&r8(nm+2)=='i'&&r8(nm+3)=='v' {
+        rr(0,7)                            // rax = rdi = a (dividend low)
+        rxor(2,2)                          // xor edx,edx (clear dividend high)
+        eb(72); eb(247); eb(246)           // 48 F7 F6 = div rsi  (rax = a/b unsigned)
+        return 1
+    }
+    // umod(a,b): unsigned a%b
+    if nl==4&&r8(nm)=='u'&&r8(nm+1)=='m'&&r8(nm+2)=='o'&&r8(nm+3)=='d' {
+        rr(0,7)                            // rax = rdi = a
+        rxor(2,2)
+        eb(72); eb(247); eb(246)           // div rsi
+        rr(0,2)                            // rax = rdx (remainder)
+        return 1
+    }
+    // ult/ugt/ulte/ugte(a,b): unsigned compares -> 0/1 in rax (low byte)
+    // a=rdi(7), b=rsi(6); rcmp(r1,r2)=cmp r1,r2.
+    // UNSIGNED setcc (rsetc uses the SIGNED setl/setg, so emit bytes directly).
+    // Each setcc is "0F OP C0" = eb(15); eb(OP); mr(3,0,0)  (setX %al)
+    //   0F 92=setb(<)  0F 97=seta(>)  0F 96=setbe(<=)  0F 93=setae(>=)
+    if nl==3&&r8(nm)=='u'&&r8(nm+1)=='l'&&r8(nm+2)=='t' {
+        rxor(0,0); rcmp(7,6); eb(15); eb(146); mr(3,0,0); return 1
+    }
+    if nl==3&&r8(nm)=='u'&&r8(nm+1)=='g'&&r8(nm+2)=='t' {
+        rxor(0,0); rcmp(7,6); eb(15); eb(151); mr(3,0,0); return 1
+    }
+    if nl==4&&r8(nm)=='u'&&r8(nm+1)=='l'&&r8(nm+2)=='t'&&r8(nm+3)=='e' {
+        rxor(0,0); rcmp(7,6); eb(15); eb(150); mr(3,0,0); return 1
+    }
+    if nl==4&&r8(nm)=='u'&&r8(nm+1)=='g'&&r8(nm+2)=='t'&&r8(nm+3)=='e' {
+        rxor(0,0); rcmp(7,6); eb(15); eb(147); mr(3,0,0); return 1
+    }
+    if nl==3&&r8(nm)=='l'&&r8(nm+1)=='e'&&r8(nm+2)=='n' {
+        rmr(0,7); return 1
+    }
+    // u8/u32/u64(x): reinterpret x as unsigned of N bits (mask). Identity at the
+    // 64-bit runtime; the mask bounds the value to the named unsigned width so
+    // unsigned arithmetic/comparisons stay in range. Self-host neutral (emit is a
+    // mov+and, well-defined regardless of optimizer state).
+    if nl==2&&r8(nm)=='u'&&r8(nm+1)=='8' { flush_all(); rr(0,7); eb(72); eb(129); mr(3,4,0); ei(255); return 1 }   // rax=rdi; and rax,0xFF (0x81 imm32: 0xFF sign-extends, so MUST use imm32 form)
+    if nl==3&&r8(nm)=='u'&&r8(nm+1)=='3'&&r8(nm+2)=='2' { flush_all(); rr(0,7); eb(37); eb(255); eb(255); eb(255); eb(255); return 1 }  // and eax,0xFFFFFFFF (opcode 0x25 + imm32)
+    if nl==3&&r8(nm)=='u'&&r8(nm+1)=='6'&&r8(nm+2)=='4' { flush_all(); rr(0,7); return 1 }                          // 64-bit: identity (mov rax,rdi)
+    // str(a,b): a=rdi, b=rsi. returns header ptr (len at [new], bytes at new+8)
+    if nl==3&&r8(nm)=='s'&&r8(nm+1)=='t'&&r8(nm+2)=='r' {
+        flush_all()
+        rr(3,7)            // rbx = a
+        rr(14,6)           // r14 = b
+        rmr(0,3)           // rax = [rbx] = la
+        rr(15,0)           // r15 = la
+        rmr(0,14)          // rax = [r14] = lb
+        rr(13,0)           // r13 = lb
+        rr(7,15); ra(7,13) // rdi = la + lb = total
+        eb(72);eb(255);eb(199)   // inc rdi -> total+1
+        eb(72);eb(131);eb(199);eb(8)  // rdi += 8 -> size = total+9
+        rr(6,7)            // rsi = size
+        ri(7,0x60000000); ri(2,3); ri(10,0x22); ri(8,-1); rxor(9,9); ri(0,9); sysc()  // rax = new
+        rr(12,0)           // r12 = new
+        rr(0,15); ra(0,13) // rax = total
+        rr(7,12); eb(72);eb(137);eb(7)   // [new] = total
+        // copy la bytes a+8 -> new+8
+        rr(6,3); eb(72);eb(131);eb(198);eb(8)   // rsi = a+8 (rbx+8)
+        rr(7,12); eb(72);eb(131);eb(199);eb(8)  // rdi = new+8
+        rr(1,15); eb(243);eb(164)    // rcx = la; rep movsb
+        // copy lb bytes b+8 -> new+8+la
+        rr(6,14); eb(72);eb(131);eb(198);eb(8)  // rsi = b+8 (r14+8)
+        rr(7,12); eb(72);eb(131);eb(199);eb(8)  // rdi = new+8
+        ra(7,15)          // rdi += r15 (la) -- dest for b's bytes = new+8+la
+        rr(1,13); eb(243);eb(164)    // rcx = lb; rep movsb
+        // nul at new+8+total
+        rr(7,12); eb(72);eb(131);eb(199);eb(8)  // rdi = new+8
+        ra(7,15)          // rdi += r15 (la)
+        ra(7,13)          // rdi += r13 (lb)
+        eb(198);eb(7);eb(0)    // mov byte [rdi], 0  (C6 07 00)
+        rr(0,12)           // rax = new
+        return 1
+    }
+    // push(v,e): append byte e to v (byte-oriented, matches str). v=rdi, e=rsi. returns new header ptr.
+    // NOTE: a user-defined fn push(...) MUST win over this builtin. If a user fn
+    // named "push" exists, this is not the builtin -> return 0 so the IR_CALL
+    // handler emits a real (patched) call to the user function instead.
+    if nl==4&&r8(nm)=='p'&&r8(nm+1)=='u'&&r8(nm+2)=='s'&&r8(nm+3)=='h' {
+        if findfn(nmi,nl)>=0 { return 0 }
+        flush_all()
+        rr(3,7)            // rbx = v
+        rr(13,6)           // r13 = e
+        rmr(14,3)          // r14 = oldlen = [v]
+        rr(7,14)           // rdi = oldlen
+        eb(72);eb(131);eb(199);eb(9)      // add rdi, 9 -> size = oldlen+1(byte)+8(header) (48 83 C7 09)
+        rr(6,7)            // rsi = size
+        ri(7,0x60000000); ri(2,3); ri(10,0x22); ri(8,-1); rxor(9,9); ri(0,9); sysc()  // rax = new
+        rr(12,0)           // r12 = new
+        rr(0,14); eb(72);eb(255);eb(192)  // rax = oldlen+1 = newlen (inc rax -> 48 FF C0)
+        rr(7,12); eb(72);eb(137);eb(7)    // [new] = newlen
+        // copy oldlen bytes v+8 -> new+8 via rep movsb
+        rr(6,3); eb(72);eb(131);eb(198);eb(8)   // rsi = v+8 (rbx+8)
+        rr(7,12); eb(72);eb(131);eb(199);eb(8)  // rdi = new+8
+        rr(1,14); eb(243);eb(164)               // rcx = oldlen; rep movsb
+        // store byte e at new+8+oldlen
+        rr(7,12); eb(72);eb(131);eb(199);eb(8)  // rdi = new+8
+        ra(7,14)          // rdi += r14 (oldlen) -> new+8+oldlen
+        eb(68);eb(136);eb(47)  // mov [rdi], r13b  (44 88 2F: REX.R->r13, byte store)
+        rr(0,12)           // rax = new
+        return 1
+    }
+    // pop(v): remove last byte, return it (or 0 if empty). byte-oriented (matches str). v=rdi.
+    // Same user-wins guard as push: a user-defined fn pop(...) shadows this builtin.
+    if nl==3&&r8(nm)=='p'&&r8(nm+1)=='o'&&r8(nm+2)=='p' {
+        if findfn(nmi,nl)>=0 { return 0 }
+        flush_all()
+        rr(3,7)            // rbx = v
+        rmr(14,3)          // r14 = oldlen
+        let lz=nl(); let lret=nl()
+        rtest(14,14)
+        let p=codelen; jcc32(0,0); emit_patch(p, lz, 1)  // je lz (empty)
+        rr(7,3)            // rdi = v
+        eb(72);eb(131);eb(199);eb(7)   // add rdi, 7 (48 83 C7 07)
+        ra(7,14)          // rdi += r14 (oldlen) -> v+7+oldlen = &last byte
+        eb(72);eb(15);eb(182);eb(7)    // movzx rax, byte [rdi] (48 0F B6 07)
+        rr(15,0)          // r15 = elem (save)
+        rr(7,3)           // rdi = v
+        rr(0,14); eb(72);eb(131);eb(232);eb(1)  // rax = oldlen-1 (sub rax,1)
+        eb(72);eb(137);eb(7)   // [v] = rax
+        rr(0,15)          // rax = elem
+        let p2=codelen; jmp32(0); emit_patch(p2, lret, 0)
+        lbladd(lz, codelen)
+        rxor(0,0)         // rax = 0
+        lbladd(lret, codelen)
+        return 1
+    }
+    // argc(): return saved variadic arg count (frame-local, set by prologue).
+    if nl==4&&r8(nm)=='a'&&r8(nm+1)=='r'&&r8(nm+2)=='g'&&r8(nm+3)=='c' {
+        rbp(0, g_va_cnt_off)   // rax = [rbp + g_va_cnt_off]
+        return 1
+    }
+    // arg(i): return variadic arg i (0-based, includes named params).
+    //   i < 6  -> saved reg-arg area:  [r11 + g_va_reg_off + i*8]
+    //   i >= 6 -> stack arg still there: [r11 + 16 + (i-6)*8]   (r11 = rbp)
+    // i arrives in rdi (arg0). PRESERVE rdi (loop var) via push/pop.
+    if nl==3&&r8(nm)=='a'&&r8(nm+1)=='r'&&r8(nm+2)=='g' {
+        let lstack=nl(); let ldone=nl()
+        eb(72); eb(129); mr(3,7,7); ei(6)   // cmp rdi, 6 (immediate)
+        let p=codelen; jcc32(2, 0); emit_patch(p, lstack, 1)  // jl lstack (i<6)
+        // --- i >= 6: r11 = rbp + 16 + (i-6)*8 ---
+        eb(87)                          // push rdi (preserve index)
+        rr(11, 5)                       // r11 = rbp
+        eb(73); eb(129); mr(3,0,3); ei(16)   // add r11, 16
+        rr(1, 7)                        // rcx = rdi (i)
+        eb(72); eb(131); mr(3,5,1); eb(6)    // sub rcx, 6   -> rcx = i - 6
+        eb(72); eb(193); eb(225); eb(3) // shl rcx, 3  (48 C1 E1 03) -> (i-6)*8
+        ra(11, 1)                       // r11 += rcx
+        lbase(0, 0)                     // rax = [r11]
+        eb(95)                          // pop rdi
+        let p1=codelen; jmp32(0); emit_patch(p1, ldone, 0)
+        lbladd(lstack, codelen)
+        // --- i < 6: r11 = rbp + g_va_reg_off + i*8 ---
+        eb(87)                          // push rdi (preserve index)
+        rr(11, 5)                       // r11 = rbp
+        eb(73); eb(129); mr(3,0,3); ei(g_va_reg_off)  // add r11, g_va_reg_off
+        eb(72); eb(193); eb(231); eb(3) // shl rdi, 3  (48 C1 E7 03) -> i*8
+        ra(11, 7)                       // r11 += rdi
+        lbase(0, 0)                     // rax = [r11]
+        eb(95)                          // pop rdi
+        lbladd(ldone, codelen)
+        return 1
+    }
+    return 0
+}
+
