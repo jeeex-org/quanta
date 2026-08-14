@@ -1,29 +1,30 @@
 # Quanta — SME HANDOFF (read this first when taking over)
 
-Last updated: 2026-08-13. Author: Hermes agent session. Status: x86-only
+Last updated: 2026-08-15. Author: Hermes agent session. Status: x86-only
 compiler verified + hardened; multi-mode architecture designed but only the
 native AOT backend is built.
 
 ## WHAT IS REAL (verified, not claimed)
-- `compiler/0.0.21/src/x86/main.quanta` — 7,097-line SINGLE-FILE x86-only
-  Quanta compiler. Self-hosts (compiles its own source). Passes 62/62.
-- bootstrap/qc-bootstrap-0.0.20 AND qc-bootstrap-0.0.21 are byte-identical
-  x86-only binaries (the seed for self-hosting).
+- `compiler/0.0.46/src/x86/` — multi-file x86-only Quanta compiler (main.quanta
+  + helpers/lexer/parse/codegen/emitter/elf/globals/features.quanta). Self-hosts
+  (3-stage: qc_boot -> qc_self -> qc, byte-identical, `fp=YES`). Passes 81/81.
+- bootstrap/qc-bootstrap-0.0.45 is the seed for self-hosting (in /opt/tali/quanta/bootstrap/).
 - Security: overflow trap (ud2 -> SIGILL rc=132), bounds trap, `unsafe{}`
-  opt-out. All emit arenas bounds-checked (commit 8571fda). Lexer reports
-  unterminated-string / invalid-char errors instead of silent exit.
-- 62-test regression gate: `bash test_suites/scripts/run_tests.sh`
-  -> "62/62 pass, 0 fail" and harness exit 0.
+  opt-out. Lexer reports unterminated-string / invalid-char / integer-overflow
+  errors instead of silent exit (integer-overflow guards added 0.0.46).
+- 81-test regression gate: `bash test_suites/scripts/run_tests.sh`
+  -> "81/81 pass, 0 fail" (functional) + 6/6 security + 3/3 perf, harness exit 0.
+- Valgrind-clean: the mmap address-hint crash (BUG #3, -22/EINVAL under
+  Valgrind) is fixed; `valgrind --leak-check=summary qc ...` reports 0 errors
+  on all crash-repro programs.
 
 ## INVARIANTS (never break these)
-1. Self-host: `./compiler/0.0.21/bin/x86/qc compiler/0.0.21/src/x86/main.quanta OUT`
-   must exit 0.
-2. 62/62 test_suites must pass after any change.
+1. Self-host: `cd compiler/0.0.46/src/x86; SEED=qc-bootstrap-0.0.45; $SEED main.quanta qc_boot && ./qc_boot main.quanta qc_self && ./qc_self main.quanta qc` must produce byte-identical qc_boot==qc_self==qc (`fp=YES`).
+2. 81/81 test_suites must pass after any change (plus security 6/6, perf 3/3).
 3. No ARM emitter code in the x86-only source (ARM is a SEPARATE future
-   backend, built from scratch). Past stripping attempts of 0.0.20 FAILED
-   (brace imbalance). The current file was built by: copy 0.0.20 verbatim,
-   delete ARM backend lines 5894-7114 + cset 7116-7126, hand-fix target_arch
-   branches + IR_FFI_CALL + a_idx_trap_emit. See prior session notes.
+   backend, built from scratch). The x86 emitter was de-duplicated in 0.0.46
+   (the entire emitter had been copy-pasted as two blocks; only the second
+   was live — last-definition-wins — and the dead first block was removed).
 
 ## VOCABULARY (do not violate)
 - "frontend"/"backend" = DOMAIN capability ONLY (web UI vs server/systems).
@@ -40,27 +41,27 @@ The IR (ops/accessors at src/x86/main.quanta ~L120-L150, IRS=40 record)
 is the STABILITY BOUNDARY every backend agrees on. See docs/LANGUAGE_DESIGN.md.
 
 ## WHERE WE LEFT OFF
-- Just designed the multi-mode architecture and the file-structure plan.
-- Did NOT yet implement the interpreter (Stage 1). The user redirected to
-  settle file structure / vocabulary first.
-- Open decision: whether to (a) keep the 7,097-line single file and add an
-  `interp_run()` to it (fastest, self-host-safe), or (b) migrate to the
-  modular tree via #import first. The modular tree is cleaner for human
-  reviewers but is a refactor that must preserve self-host + 62/62.
+- Multi-mode architecture designed; only the x86 AOT backend is built.
+- The source is now a MULTI-FILE tree (main.quanta + helpers/lexer/parse/
+  codegen/emitter/elf/globals/features.quanta under compiler/0.0.46/src/x86/),
+  not the old single file. The modular migration is DONE.
+- Interpreter (Stage 1) still NOT implemented.
 
 ## HOW TO RESUME
-1. Read docs/ARCHITECTURE.md (this file), docs/LANGUAGE_DESIGN.md, docs/SYNTAX.md.
-2. Re-establish green state: run the self-host + 62/62 gate above. If red,
-   `git log` to the last green commit (8571fda) and diff.
+1. Read docs/ARCHITECTURE.md (this file), docs/LANGUAGE_DESIGN.md, docs/SYNTAX.md, docs/FEATURES.md.
+2. Re-establish green state: run `bash test_suites/scripts/run_tests.sh` (expect
+   81/81 functional + 6/6 security + 3/3 perf, exit 0). Self-host: see INVARIANTS #1.
 3. Next concrete task = Stage 1 interpreter. Mirror emit_bltn builtin
-   semantics (src/x86/main.quanta ~L3936-L4460) in a register VM. Wire
+   semantics (src/x86/emitter.quanta) in a register VM. Wire
    `--interp` in main() to bypass ci_func/write_elf and run the IR directly.
-   Verify identical exit codes vs the AOT path on the 62-suite.
+   Verify identical exit codes vs the AOT path on the 81-suite.
 
 ## KNOWN GOTCHAS
-- The single file uses a hand-rolled tokenizer/brace model; do NOT trust
-  naive brace-counting tools (comments/strings confuse them). Compile with
-  the bootstrap binary to truly validate braces.
+- The source is a multi-file tree (main.quanta splits into helpers/lexer/
+  parse/codegen/emitter/elf/globals/features.quanta). The Quanta tokenizer is
+  hand-rolled; do NOT trust naive brace-counting tools on .quanta files
+  (comments/strings confuse them). Compile with the bootstrap binary to truly
+  validate braces.
 - `emit_bltn` is the builtin x86 emitter; the interpreter must reproduce its
   exact semantics (esp. string layout [base]=len,[base+8..]=bytes; array
   layout mem_alloc [base]=n; GDATA fixed base 0x42200000).

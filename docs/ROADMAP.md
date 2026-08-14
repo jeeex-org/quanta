@@ -1,5 +1,11 @@
 # Quanta ROADMAP — core + builtins campaign (0.0.39 → 0.1.0)
 
+> **Actual status as of 0.0.46 (2026-08-15):** the debt-window items below
+> (0.0.43 aliasing fix, 0.0.46 `?` propagation) are already SHIPPED — `reg_alias`
+> and `question_mark` are in the gate and passing (81/81). The version labels in
+> this document are a historical campaign queue, not live assignments. Current
+> compiler = 0.0.46, multi-file x86 tree, Valgrind-clean, self-host `fp=YES`.
+
 Goal: complete ALL core builtins before any new std/lib work. One patch version
 per feature/function. After EACH successful builtin, add/extend a test_suite test
 that exercises it (so the gate grows with the language). 0.1.0 = milestone where

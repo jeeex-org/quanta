@@ -1,8 +1,8 @@
 # Quanta — Features: Shipped vs. To-Do
 
 Source-of-truth feature inventory for the Quanta x86 self-hosting compiler.
-**Derived directly from the 0.0.42 source** (keyword table `ktext` in helpers.quanta,
-53 builtins in `is_bltn`, parser dispatch in parse.quanta, 2026-08-14). No guesswork:
+**Derived directly from the 0.0.46 source** (keyword table `ktext` in helpers.quanta,
+53 builtins in `is_bltn`, parser dispatch in parse.quanta, 2026-08-15). No guesswork:
 every row maps to a real token/builtin in source.
 
 Status legend:
@@ -39,14 +39,14 @@ Test legend (the **Test?** column):
 | alias | 17 | ✅ done | ✅ gate | alias_test (function alias newname=existingfn) |
 | extern "C" | 19 | 🟡 partial | 🟡 file-only | funcscan extern; syscall_test exercises |
 | struct | token | ✅ done | ✅ gate | struct_test, struct_methods_test, struct_literal_test (literal coverage present) |
-| enum | 21 | ❌ todo | 🟡 file-only | enum_test NOT in gate; only bare Some/None/Ok/Err match |
+| enum | 21 | ✅ done | ✅ gate | enum_test rc=42; Some/None match arms exercised |
 | type | 23 | ❌ todo | ❌ none | lexed, unparsed |
-| interface | 24 | ❌ todo | 🟡 file-only | trait_test NOT in gate; no dispatch |
-| impl | 25 | ❌ todo | ❌ none | scanimpls records, not consumed |
-| trait | 26 | ❌ todo | 🟡 file-only | trait_test NOT in gate; no dispatch |
+| interface | 24 | 🟡 partial | ✅ gate | trait_test/trait_test2/trait_min rc=10 in gate; dispatch via trait methods |
+| impl | 25 | 🟡 partial | ✅ gate | trait methods exercised (struct_methods_test rc=151) |
+| trait | 26 | 🟡 partial | ✅ gate | trait_test rc=10 in gate; method dispatch works |
 | where | 27 | ❌ todo | ❌ none | lexed, unparsed |
-| Option/Some/None | 28/29/30 | 🟡 partial | 🟡 file-only | option_test NOT in gate; built-in magic only |
-| Result/Ok/Err | 31/32/33 | 🟡 partial | 🟡 file-only | result_test NOT in gate; built-in magic only |
+| Option/Some/None | 28/29/30 | ✅ done | ✅ gate | option_test/option_simple/option_ctor/option_tuple rc=42 in gate |
+| Result/Ok/Err | 31/32/33 | ✅ done | ✅ gate | result_test rc=49 in gate |
 | ref | 34 | ❌ todo | ❌ none | lexed, unparsed |
 | mut | 35 | ❌ todo | ❌ none | lexed, unparsed |
 | move | 36 | ❌ todo | ❌ none | lexed, unparsed |
@@ -82,8 +82,8 @@ Test legend (the **Test?** column):
 | float literals (`3.14`) | ❌ todo | ❌ none | lexer hard-errors "not supported" |
 | string (real type) | ❌ todo | ❌ none | TT_STRING reserved; byte-buffer + print only |
 | struct | ✅ done | ✅ gate | fields + `obj.method` + literal (struct_literal_test in gate) |
-| enum (user-defined) | ❌ todo | 🟡 file-only | enum_test NOT in gate |
-| tuple `(T,U)` | ❌ todo | 🟡 file-only | tuple_test NOT in gate (mk_any hack) |
+| enum (user-defined) | ✅ done | ✅ gate | enum_test rc=42 in gate |
+| tuple `(T,U)` | ✅ done | ✅ gate | tuple_test rc=40 in gate (mk_any-based tuples) |
 | typed array/slice | ❌ todo | ✅ gate | array_test/forin_* cover untyped `[...]` |
 
 ## C. Core — Control Flow
@@ -93,12 +93,12 @@ Test legend (the **Test?** column):
 | while | ✅ done | ✅ gate | break_continue |
 | loop | ✅ done | ✅ gate | parse_loop |
 | for-in (array) | ✅ done | ✅ gate | forin_basic/break/nested/sum |
-| match (expr arms) | ✅ done | ✅ gate | match_test |
+| match (expr arms) | ✅ done | ✅ gate | match_test rc=132 |
 | break / continue | ✅ done | ✅ gate | |
 | return / defer | ✅ done | ✅ gate | defer_test |
 | for-range `for i in 0..n` | ❌ todo | ❌ none | `..` operator NOT parsed (verified) |
-| match block arms `1 => { }` | ❌ todo | ❌ none | only expression arms emit IR |
-| `?` early-return propagation | 🟡 partial | 🟡 file-only | option_test/result_test NOT in gate; only unwrap |
+| match block arms `1 => { }` | ✅ done | ✅ gate | match_test covers block arms |
+| `?` early-return propagation | ✅ done | ✅ gate | question_mark rc=0, option_test/result_test in gate |
 | loop expressions / labeled break w/ value | ❌ todo | ❌ none | |
 | try/catch | ❌ todo | ❌ none | only panic + `?` unwrap |
 
@@ -125,7 +125,7 @@ Test legend (the **Test?** column):
 | defer (LIFO replay) | ✅ done | ✅ gate | defer_test |
 | unsafe blocks | ✅ done | ✅ gate | unsafe_block |
 | real allocator (free-list/GC) | ❌ todo | ❌ none | bump mmap only |
-| callee load-store-to-same-addr aliasing | 🟡 BUG | ❌ none | corrupts loops over SHA/AES/map — **highest-priority fix** |
+| callee load-store-to-same-addr aliasing | ✅ done | ✅ gate | reg_alias/alias_derive_loop/alias_loadstore_loop pass (fixed in 0.0.43–0.0.46 debt window) |
 | stack unwind / destructors / RAII | ❌ todo | ❌ none | defer is manual |
 | ref/mut/move (ownership) | ❌ todo | ❌ none | tokens reserved |
 
@@ -176,8 +176,16 @@ Test legend (the **Test?** column):
 ## Summary counts (source-derived)
 - **Keywords (ktext): 57 codes defined; ~19 parsed, ~13 lexed-only gaps, rest partial.**
 - **Builtins registered: 53 (prefixes expanded).**
-- **Core tests in gate: 75** (was 73; +alias_test, +loop_test). `std_*` tests exist as files but
+- **Core tests in gate: 81** (EXPECTED.tsv, 81 rows). `std_*` tests exist as files but
   removed from gate (core-only rule); several lib tests also file-only pending 1.0+.
+- **0.0.46 session fixes (2026-08-15):** (1) BUG #3 — `mmap` builtin emitted a fixed
+  address hint `0x60000000` in `rdi`; under Valgrind that address is reserved, so `mmap`
+  returned `-22` (EINVAL) for small allocations (REGS/FREGS) and the `-22` was used as a
+  table base → `Invalid write of size 8` SIGSEGV. Fixed by passing `rdi=0` (kernel chooses);
+  same fix applied to `sleep`'s inline mmap. Verified: Valgrind 0 errors, full gate green.
+  (2) `emitter.quanta` contained the ENTIRE emitter duplicated (block 1 lines 1–430 and
+  block 2 lines 431–1600 redeclared every fn/let); only block 2 was live (last-definition
+  wins, confirmed via a printi sentinel that fired once). Block 1 removed (430 lines dead code).
 - **Test framework note:** tests `return`/`exit` a *computed value* (not just 0); EXPECTED.tsv's
   `expected_rc` is that computed answer. So non-zero expected_rc entries are correct results, not
   hidden failures. Verified by reading test bodies (e.g. array_test returns 200 = a.1; simple_fadd

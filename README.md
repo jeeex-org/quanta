@@ -9,9 +9,10 @@ Quanta designed with simple syntax that supports multiple execution modes: Nativ
 
 ## Status (verified)
 
-- **Native AOT compilation (`qc`)** — **ACTIVE, 0.0.21**. x86-64 only.
-  Self-hosts with a **byte-identical fixed point** (the compiler fully
-  regenerates itself), and passes **62/62** test_suites.
+- **Native AOT compilation (`qc`)** — **ACTIVE, 0.0.46**. x86-64 only.
+  Self-hosts with a **byte-identical fixed point** (3-stage: qc_boot → qc_self
+  → qc, all identical), and passes **81/81** test_suites (+ 6/6 security,
+  3/3 perf). Valgrind-clean (the mmap address-hint crash is fixed).
 - **Interpreter (`qc --interp`)** — PLANNED (Stage 1). Not yet landed.
 - **Pre-compilation (`go run` style)** — PLANNED (Stage 2).
 - **WebAssembly** — PLANNED (Stage 3).
@@ -32,21 +33,21 @@ behaviorally consistent (identical exit codes, traps, ABI).
 source.quanta → core/scan/parse → IR → opt/ → backend (codegen/x86_64 | run/interp | run/wasm | ...)
 ```
 
-Current source form: a single self-hosting file at
-`compiler/0.0.21/src/x86/main.quanta`. The modular tree
-(`core/ scan/ parse/ ir/ opt/ codegen/ run/`, capability libs in
-`lib/<domain>/`) is the target structure — see `docs/ARCHITECTURE.md`.
-Note: `#import` is **not yet functional**, so the split requires a module
-system first (a future stage, not just file moves).
+Current source form: a multi-file self-hosting tree at
+`compiler/0.0.46/src/x86/` (`main.quanta` + `helpers`/`lexer`/`parse`/
+`codegen`/`emitter`/`elf`/`globals`/`features.quanta`). The modular split
+is DONE. `#import` is still not functional (a future stage).
 
 ## Verification (the green-state invariant)
 
 Every change is gated by:
 
 ```bash
-# recompile the compiler with the bootstrap seed
-./bootstrap/qc-bootstrap-0.0.20 compiler/0.0.21/src/x86/main.quanta compiler/0.0.21/bin/x86/qc
-# self-host (must exit 0) + 62/62 regression
+# recompile the compiler with the bootstrap seed (3-stage self-host)
+cd compiler/0.0.46/src/x86
+SEED=/opt/tali/quanta/bootstrap/qc-bootstrap-0.0.45
+$SEED main.quanta qc_boot && ./qc_boot main.quanta qc_self && ./qc_self main.quanta qc
+# self-host fixed point (qc_boot == qc_self == qc) + 81/81 regression
 bash test_suites/scripts/run_tests.sh
 ```
 

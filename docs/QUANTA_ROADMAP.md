@@ -1,5 +1,10 @@
 # QUANTA ROADMAP — "One Language to Replace Them All"
 
+> **Sync note (2026-08-15):** this is the long-range *vision* document. Concrete
+> current status lives in README.md / docs/ARCHITECTURE.md / docs/FEATURES.md.
+> As of 0.0.46 the compiler is a multi-file x86 self-hoster (81/81 gate,
+> Valgrind-clean); the roadmap below describes the campaign toward 0.1.0+.
+
 > Vision (user, 2026-08-13): *Once people use Quanta, they will never need another
 > language again. It can do it all.* Quanta must be **differentiated**, not "just
 > another language": built-in **security, quantum resilience (post-quantum
