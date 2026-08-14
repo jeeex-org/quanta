@@ -633,6 +633,59 @@ fn emit_bltn(nmi,nl,ii) {
         eb(184); ei(9)                // mov eax, 9
         sysc(); return 1
     }
+    // --- memory ops: memcpy / memcmp / memmove / realloc (placed BEFORE the mem_ block;
+    //     checks placed after the mem_ block fail to dispatch in this compiler) ---
+    // memcpy(dst, src, n): forward rep movsb.  m-e-m-c-p-y
+    if nl==6&&r8(nm)=='m'&&r8(nm+1)=='e'&&r8(nm+2)=='m'&&r8(nm+3)=='c'&&r8(nm+4)=='p'&&r8(nm+5)=='y' {
+        flush_all()
+        eb(87)                            // push rdi (save dst)
+        rr(1,2)                          // rcx = rdx (n)
+        eb(252)                          // cld
+        eb(243); eb(164)                 // rep movsb
+        eb(89)                           // pop rax (dst = return)
+        return 1
+    }
+    // memcmp(a, b, n): repe cmpsb, return <0/0/>0.  m-e-m-c-m-p
+    if nl==6&&r8(nm)=='m'&&r8(nm+1)=='e'&&r8(nm+2)=='m'&&r8(nm+3)=='c'&&r8(nm+4)=='m'&&r8(nm+5)=='p' {
+        flush_all()
+        eb(87)                            // push rdi (save a; balance stack)
+        ri(0,0)                           // rax = 0 (default: equal)
+        rr(1,2)                          // rcx = rdx (n)
+        eb(252)                          // cld
+        eb(243); eb(166)                 // repe cmpsb (f3 a6)
+        jcc32(0,14)                      // JE -> skip diff calc (14 bytes)
+        eb(138); eb(71); eb(255)         // mov al, [rdi-1]   (8A 47 FF)
+        eb(138); eb(94); eb(255)         // mov bl, [rsi-1]   (8A 5E FF)
+        eb(15); eb(182); eb(192)         // movzx eax, al     (0F B6 C0)
+        eb(15); eb(182); eb(219)         // movzx ebx, bl     (0F B6 DB)
+        eb(41); eb(216)                  // sub eax, ebx      (29 D8)  [32-bit diff]
+        eb(72); eb(152)                  // cdqe               (48 98)  sign-extend eax->rax
+        eb(89)                           // pop rdx (balance)
+        return 1                         // rax = signed diff (or 0 if equal)
+    }
+    // memmove(dst, src, n): direction-aware copy.  m-e-m-m-o-v-e
+    if nl==7&&r8(nm)=='m'&&r8(nm+1)=='e'&&r8(nm+2)=='m'&&r8(nm+3)=='m'&&r8(nm+4)=='o'&&r8(nm+5)=='v'&&r8(nm+6)=='e' {
+        flush_all()
+        eb(87)                            // push rdi (save dst)
+        eb(72); eb(57); eb(247)          // cmp rdi, rsi (48 39 F7)
+        jcc32(4,11)                      // JA dst>src -> skip forward, do backward (11 bytes)
+        // FORWARD:
+        eb(252)                          // cld
+        rr(1,2)                          // rcx = rdx (n)
+        eb(243); eb(164)                 // rep movsb
+        jmp32(21)                        // skip backward block (21 bytes)
+        // BACKWARD:
+        eb(253)                          // std
+        eb(72); eb(1); eb(215)           // add rdi, rdx (48 01 D7)  rdi = dst+n
+        eb(72); eb(131); eb(239); eb(1)  // sub rdi, 1    (48 83 EF 01) rdi = dst+n-1
+        eb(72); eb(1); eb(214)           // add rsi, rdx (48 01 D6)  rsi = src+n
+        eb(72); eb(131); eb(238); eb(1)  // sub rsi, 1    (48 83 EE 01) rsi = src+n-1
+        rr(1,2)                          // rcx = rdx (n)
+        eb(243); eb(164)                 // rep movsb
+        eb(252)                          // cld (restore)
+        eb(89)                           // pop rax (dst = return)
+        return 1
+    }
     // realloc(old_ptr, old_n, new_n): mmap new (new_n*8+8), copy min(old_n,new_n)*8
     //   bytes old+8 -> new+8 via forward rep movsb, munmap old (old_n*8+8), return new.
     if nl==7&&r8(nm)=='r'&&r8(nm+1)=='e'&&r8(nm+2)=='a'&&r8(nm+3)=='l'&&r8(nm+4)=='l'&&r8(nm+5)=='o'&&r8(nm+6)=='c' {
@@ -695,58 +748,8 @@ fn emit_bltn(nmi,nl,ii) {
             eb(72); eb(137); eb(55); return 1                      // mem_store:  mov [rdi],rsi
         }
     }
-    // memcpy(dst, src, n): forward rep movsb. m-e-m-c-p-y (top-level; nl=6)
-    if nl==6&&r8(nm)=='m'&&r8(nm+2)=='m'&&r8(nm+3)=='c'&&r8(nm+4)=='p' {
-        flush_all()
-        eb(87)                            // push rdi (save dst)
-        rr(1,2)                          // rcx = rdx (n)
-        eb(252)                          // cld
-        eb(243); eb(164)                 // rep movsb
-        eb(89)                           // pop rax (dst = return)
-        return 1
-    }
-    // memcmp(a, b, n): repe cmpsb, return <0/0/>0. m-e-m-c-m-p (nl=6)
-    if nl==6&&r8(nm)=='m'&&r8(nm+2)=='m'&&r8(nm+3)=='c'&&r8(nm+4)=='m' {
-        flush_all()
-        eb(87)                            // push rdi (save a; balance stack)
-        ri(0,0)                           // rax = 0 (default: equal)
-        rr(1,2)                          // rcx = rdx (n)
-        eb(252)                          // cld
-        eb(243); eb(166)                 // repe cmpsb (f3 a6)
-        jcc32(0,14)                      // JE -> skip diff calc (14 bytes)
-        eb(138); eb(71); eb(255)         // mov al, [rdi-1]   (8A 47 FF)
-        eb(138); eb(94); eb(255)         // mov bl, [rsi-1]   (8A 5E FF)
-        eb(15); eb(182); eb(192)         // movzx eax, al     (0F B6 C0)
-        eb(15); eb(182); eb(219)         // movzx ebx, bl     (0F B6 DB)
-        eb(41); eb(216)                  // sub eax, ebx      (29 D8)  [32-bit diff]
-        eb(72); eb(152)                  // cdqe               (48 98)  sign-extend eax->rax
-        eb(89)                           // pop rdx (balance)
-        return 1                         // rax = signed diff (or 0 if equal)
-    }
-    // memmove(dst, src, n): direction-aware copy. m-e-m-m-o-v-e (nl=7)
-    if nl==7&&r8(nm)=='m'&&r8(nm+2)=='m'&&r8(nm+3)=='m'&&r8(nm+4)=='o' {
-        flush_all()
-        eb(87)                            // push rdi (save dst)
-        eb(72); eb(57); eb(247)          // cmp rdi, rsi (48 39 F7)
-        jcc32(4,11)                      // JA dst>src -> skip forward, do backward (11 bytes)
-        // FORWARD:
-        eb(252)                          // cld
-        rr(1,2)                          // rcx = rdx (n)
-        eb(243); eb(164)                 // rep movsb
-        jmp32(21)                        // skip backward block (21 bytes)
-        // BACKWARD:
-        eb(253)                          // std
-        eb(72); eb(1); eb(215)           // add rdi, rdx (48 01 D7)  rdi = dst+n
-        eb(72); eb(131); eb(239); eb(1)  // sub rdi, 1    (48 83 EF 01) rdi = dst+n-1
-        eb(72); eb(1); eb(214)           // add rsi, rdx (48 01 D6)  rsi = src+n
-        eb(72); eb(131); eb(238); eb(1)  // sub rsi, 1    (48 83 EE 01) rsi = src+n-1
-        rr(1,2)                          // rcx = rdx (n)
-        eb(243); eb(164)                 // rep movsb
-        eb(252)                          // cld (restore)
-        eb(89)                           // pop rax (dst = return)
-        return 1
-    }
-// file_open / file_read / file_write / file_close
+
+    // file_open / file_read / file_write / file_close
     if nl>=8&&r8(nm)=='f'&&r8(nm+1)=='i'&&r8(nm+2)=='l'&&r8(nm+3)=='e'&&r8(nm+4)=='_' {
         flush_all()   // syscalls clobber rdi/rsi/rdx/rax; spill live vregs first
         let c5=r8(nm+5)
@@ -787,7 +790,49 @@ fn emit_bltn(nmi,nl,ii) {
         sysc()    // syscall (result in rax)
         return 1
     }
-    // syscall3(num, a, b, c): raw 3-argument Linux syscall (legacy, kept for compat).
+    // clock_gettime(clk_id, ts_ptr): sc 228. IR_CALL loaded rdi=clk_id, rsi=ts_ptr.
+    if nl==13&&r8(nm)=='c'&&r8(nm+4)=='k'&&r8(nm+5)=='_'&&r8(nm+6)=='g'&&r8(nm+11)=='m'&&r8(nm+12)=='e' {
+        ri(0,228); sysc(); return 1
+    }
+    // gettimeofday(tv_ptr, tz_ptr): sc 96. rdi=tv, rsi=tz already loaded.
+    if nl==12&&r8(nm)=='g'&&r8(nm+1)=='e'&&r8(nm+2)=='t'&&r8(nm+3)=='t'&&r8(nm+4)=='i'&&r8(nm+5)=='m'&&r8(nm+6)=='e'&&r8(nm+7)=='o'&&r8(nm+8)=='f'&&r8(nm+9)=='d'&&r8(nm+10)=='a'&&r8(nm+11)=='y' {
+        ri(0,96); sysc(); return 1
+    }
+    // nanosleep(req_ptr, rem_ptr): sc 35. rdi=req, rsi=rem already loaded.
+    if nl==9&&r8(nm)=='n'&&r8(nm+1)=='a'&&r8(nm+2)=='n'&&r8(nm+3)=='o'&&r8(nm+4)=='s'&&r8(nm+5)=='l'&&r8(nm+6)=='e'&&r8(nm+7)=='e'&&r8(nm+8)=='p' {
+        ri(0,35); sysc(); return 1
+    }
+    // sleep(sec): internal mmap(16) -> fill {sec,0} -> nanosleep -> munmap.
+    //   rdi holds sec (arg0) from IR_CALL. Push it, mmap a scratch timespec,
+    //   pop sec into rdx, store [buf]=sec and [buf+8]=0, nanosleep(buf,0),
+    //   munmap(buf,16), return 0. buf is kept in rbx across the nanosleep
+    //   syscall (kernel preserves rbx; no live vregs in it after IR_CALL flush).
+    if nl==5&&r8(nm)=='s'&&r8(nm+1)=='l'&&r8(nm+2)=='e'&&r8(nm+3)=='e'&&r8(nm+4)=='p' {
+        eb(87)                            // push rdi   (save sec)
+        ri(7, 16)                         // rdi = 16
+        eb(72); eb(137); eb(254)          // mov rsi, rdi   (len=16)
+        eb(191); ei(0x60000001)           // mov edi, 0x60000001 (addr hint)
+        eb(186); ei(3)                    // mov edx, 3     (PROT_READ|WRITE)
+        eb(65); eb(186); ei(34)           // mov r10d, 0x22 (MAP_PRIVATE|ANON)
+        eb(65); eb(184); ei(0-1)          // mov r8d, -1    (fd)
+        eb(69); eb(49); eb(201)           // xor r9d, r9d   (offset=0)
+        eb(184); ei(9)                    // mov eax, 9
+        sysc()                            // rax = buf
+        rr(3,0)                           // rbx = buf  (preserve across nanosleep)
+        eb(90)                            // pop rdx    (sec)
+        eb(72); eb(137); eb(16)           // mov [rax], rdx  (buf.sec = sec)
+        eb(72); eb(49); eb(201)           // xor rcx, rcx
+        eb(72); eb(137); eb(72); eb(8)     // mov [rax+8], rcx (buf.nsec = 0)
+        ri(0,35)                          // rax = 35 (nanosleep)
+        rr(7,3)                           // rdi = rbx (buf)
+        ri(6,0)                           // esi = 0 (rem = 0)
+        sysc()                            // nanosleep(buf, 0)
+        ri(0,11)                          // rax = 11 (munmap)
+        rr(7,3)                           // rdi = rbx (buf)
+        ri(6,16)                          // rsi = 16
+        sysc()                            // munmap(buf, 16)  (rax -> 0)
+        return 1
+    }
     //   IR_CALL arg load places: rdi=num, rsi=a, rdx=b, rcx=c.
     //   The syscall instruction wants: rax=num, rdi=a, rsi=b, rdx=c.
     //   Shuffle via rr() (register numbers: rax=0, rsi=6, rdi=7, rdx=2, rcx=1).

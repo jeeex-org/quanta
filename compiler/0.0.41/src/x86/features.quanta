@@ -350,13 +350,13 @@ fn compile_error(kind, nm, nl) {
 
 fn is_bltn(nm,nl) {
     if nl>=8&&r8(src+nm)=='m'&&r8(src+nm+1)=='e'&&r8(src+nm+2)=='m'&&r8(src+nm+3)=='_' { return 1 } // mem_*
-    // memcpy(dst, src, n): rep movsb (forward). m-e-m-c-p-y
-    if nl==6&&r8(src+nm)=='m'&&r8(src+nm+2)=='m'&&r8(src+nm+3)=='c'&&r8(src+nm+4)=='p' { return 1 }
-    // memcmp(a, b, n): rep cmpsb, returns <0/0/>0. m-e-m-c-m-p
-    if nl==6&&r8(src+nm)=='m'&&r8(src+nm+2)=='m'&&r8(src+nm+3)=='c'&&r8(src+nm+4)=='m' { return 1 }
-    // memmove(dst, src, n): direction-aware copy. m-e-m-m-o-v-e
-    if nl==7&&r8(src+nm)=='m'&&r8(src+nm+2)=='m'&&r8(src+nm+3)=='m'&&r8(src+nm+4)=='o' { return 1 }
-    // realloc(old_ptr, old_n, new_n): mmap new, copy, munmap old.
+    // memcpy(dst, src, n): rep movsb (forward).  m-e-m-c-p-y
+    if nl==6&&r8(src+nm)=='m'&&r8(src+nm+1)=='e'&&r8(src+nm+2)=='m'&&r8(src+nm+3)=='c'&&r8(src+nm+4)=='p'&&r8(src+nm+5)=='y' { return 1 }
+    // memcmp(a, b, n): repe cmpsb, return <0/0/>0.  m-e-m-c-m-p
+    if nl==6&&r8(src+nm)=='m'&&r8(src+nm+1)=='e'&&r8(src+nm+2)=='m'&&r8(src+nm+3)=='c'&&r8(src+nm+4)=='m'&&r8(src+nm+5)=='p' { return 1 }
+    // memmove(dst, src, n): direction-aware copy.  m-e-m-m-o-v-e
+    if nl==7&&r8(src+nm)=='m'&&r8(src+nm+1)=='e'&&r8(src+nm+2)=='m'&&r8(src+nm+3)=='m'&&r8(src+nm+4)=='o'&&r8(src+nm+5)=='v'&&r8(src+nm+6)=='e' { return 1 }
+    // realloc(old_ptr, old_n, new_n): mmap new, copy, munmap old.  r-e-a-l-l-o-c
     if nl==7&&r8(src+nm)=='r'&&r8(src+nm+1)=='e'&&r8(src+nm+2)=='a'&&r8(src+nm+3)=='l'&&r8(src+nm+4)=='l'&&r8(src+nm+5)=='o'&&r8(src+nm+6)=='c' { return 1 }
     if nl>=8&&r8(src+nm)=='f'&&r8(src+nm+1)=='i'&&r8(src+nm+2)=='l'&&r8(src+nm+3)=='e'&&r8(src+nm+4)=='_' { return 1 } // file_*
     if nl==4&&r8(src+nm)=='e'&&r8(src+nm+1)=='x'&&r8(src+nm+2)=='i'&&r8(src+nm+3)=='t' { return 1 } // exit
@@ -390,6 +390,11 @@ fn is_bltn(nm,nl) {
     if nl==5&&r8(src+nm)=='p'&&r8(src+nm+1)=='a'&&r8(src+nm+2)=='n'&&r8(src+nm+3)=='i'&&r8(src+nm+4)=='c' { return 1 } // panic() -> exit(1)
     if nl==8&&r8(src+nm)=='s'&&r8(src+nm+1)=='y'&&r8(src+nm+2)=='s'&&r8(src+nm+3)=='c'&&r8(src+nm+4)=='a'&&r8(src+nm+5)=='l'&&r8(src+nm+6)=='l'&&r8(src+nm+7)=='3' { return 1 } // syscall3(num,a,b,c): raw 3-arg syscall
     if nl==7&&r8(src+nm)=='s'&&r8(src+nm+1)=='y'&&r8(src+nm+2)=='s'&&r8(src+nm+3)=='c'&&r8(src+nm+4)=='a'&&r8(src+nm+5)=='l'&&r8(src+nm+6)=='l' { return 1 } // syscall(num,a,b,c,d,e,f): generic raw syscall (any arity 1..7)
+    // --- Phase A2: time builtins (x86_64 syscall numbers) ---
+    if nl==13&&r8(src+nm)=='c'&&r8(src+nm+4)=='k'&&r8(src+nm+5)=='_'&&r8(src+nm+6)=='g'&&r8(src+nm+11)=='m'&&r8(src+nm+12)=='e' { return 1 } // clock_gettime(clk_id, ts_ptr): sc 228
+    if nl==12&&r8(src+nm)=='g'&&r8(src+nm+1)=='e'&&r8(src+nm+2)=='t'&&r8(src+nm+3)=='t'&&r8(src+nm+4)=='i'&&r8(src+nm+5)=='m'&&r8(src+nm+6)=='e'&&r8(src+nm+7)=='o'&&r8(src+nm+8)=='f'&&r8(src+nm+9)=='d'&&r8(src+nm+10)=='a'&&r8(src+nm+11)=='y' { return 1 } // gettimeofday(tv_ptr, tz_ptr): sc 96
+    if nl==9&&r8(src+nm)=='n'&&r8(src+nm+1)=='a'&&r8(src+nm+2)=='n'&&r8(src+nm+3)=='o'&&r8(src+nm+4)=='s'&&r8(src+nm+5)=='l'&&r8(src+nm+6)=='e'&&r8(src+nm+7)=='e'&&r8(src+nm+8)=='p' { return 1 } // nanosleep(req_ptr, rem_ptr): sc 35
+    if nl==5&&r8(src+nm)=='s'&&r8(src+nm+1)=='l'&&r8(src+nm+2)=='e'&&r8(src+nm+3)=='e'&&r8(src+nm+4)=='p' { return 1 } // sleep(sec): internal mmap + nanosleep + munmap
     // P6.1a: float builtins (SSE on x86). Args/results are raw
     // 64-bit bit-patterns; emit_bltn inline the FP op.
     if nl==3&&r8(src+nm)=='i'&&r8(src+nm+1)=='2'&&r8(src+nm+2)=='f' { return 1 } // i2f(x)
