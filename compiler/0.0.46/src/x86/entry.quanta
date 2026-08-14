@@ -58,7 +58,12 @@ fn main(argc, argv) {
                     let nostr = "no-start"
                     while kc<9 { if r8(ap+2+kc) != r8(nostr+8+kc) { is_nostart=0; break }; kc=kc+1 }
                     if is_nostart==1 { no_start=1 }
-                    if !is_novf && !is_arm && !is_obj && !is_nostart {
+                    // --debug: emit <out>.sym sidecar (fn_name code_offset) for Valgrind/backtrace attribution
+                    let is_dbg=1; let kd=0
+                    let dbgstr = "debug"
+                    while kd<5 { if r8(ap+2+kd) != r8(dbgstr+8+kd) { is_dbg=0; break }; kd=kd+1 }
+                    if is_dbg==1 { debug_mode=1 }
+                    if !is_novf && !is_arm && !is_obj && !is_nostart && !is_dbg {
                         if srcp==0 { srcp=ap } else if out_p==0 { out_p=ap }
                     }
                 }
@@ -392,6 +397,7 @@ fn main(argc, argv) {
     w32(code+init_call+1, r64(func_code_starts+0)-(init_call+5))
     w32(code+stub_call+1, r64(func_code_starts+(mfi+1)*8)-(stub_call+5))
     write_elf(out_p)
+    if debug_mode==1 { write_symtab(out_p) }
     exit(0)
 }
 

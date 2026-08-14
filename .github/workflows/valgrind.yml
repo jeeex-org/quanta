@@ -1,0 +1,62 @@
+name: valgrind-memory-scan
+
+# Memory-safety scan of the Quanta x86 self-hosting compiler (qc).
+#
+# Memory-safety scan of the Quanta x86 self-hosting compiler (qc). Quanta emits
+# a stripped ELF with no DWARF/.symtab, so generic source-level scanners
+# (CodeRabbit/CodeQL) cannot attribute crashes. Instead we run the COMPILER
+# BINARY under Valgrind - it catches real memory unsafety in qc itself (e.g.
+# out-of-bounds writes, use-after-free) that the functional gate misses.
+#
+# The compiler is built from its bootstrap seed via the 3-stage self-host
+# (seed -> qc_boot -> qc_self -> qc), exactly as a local build does. The scan
+# runs qc under Valgrind on a smoke program; --debug emits a <out>.sym sidecar
+# so any crash PC can be mapped to a function via tools/symbolize.py.
+#
+# Fails the workflow if Valgrind reports ANY error (ERROR SUMMARY > 0).
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  valgrind:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Valgrind
+        run: sudo apt-get update && sudo apt-get install -y valgrind
+
+      - name: Build qc via 3-stage self-host from bootstrap seed
+        working-directory: compiler/0.0.46/src/x86
+        run: |
+          SEED=../../../../bootstrap/qc-bootstrap-0.0.45
+          S=main.quanta
+          test -x "$SEED" || { echo "bootstrap seed missing"; exit 1; }
+          "$SEED" "$S" qc_boot
+          ./qc_boot "$S" qc_self
+          ./qc_self "$S" qc
+          test -x qc || { echo "qc not produced"; exit 1; }
+          echo "built qc: $(md5sum qc | cut -d' ' -f1)"
+
+      - name: Sanity check that qc compiles a program
+        working-directory: compiler/0.0.46/src/x86
+        run: ./qc ../../../../test_suites/codes/simple.quanta /tmp/smoke.bin --debug
+
+      - name: Valgrind scan of qc for memory unsafety
+        working-directory: compiler/0.0.46/src/x86
+        run: |
+          set -e
+          valgrind --error-exitcode=42 --leak-check=summary \
+            ./qc ../../../../test_suites/codes/simple.quanta /tmp/val_smoke.bin 2> /tmp/vg.log
+          echo "Valgrind: no errors reported"
+
+      - name: Upload Valgrind log on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: valgrind-log
+          path: /tmp/vg.log
