@@ -91,11 +91,22 @@ fn tokenize() {
                 p=p+2; c=c+2
                 let val=0
                 let hdig=0
+                // Overflow guard (same as decimal): I64MAX/16 = 576460752303423487.
+                // A hex literal overflows if val exceeds that (next digit would
+                // push past I64MAX). Max hex digit is 15 = I64MAX%16, so no
+                // separate digit check is needed.
+                let HMAXD = 576460752303423487
                 while p<srclen {
                     let d=r8(src+p)
-                    if d>=48&&d<=57 { val=val*16 + (d-48); p=p+1; c=c+1; hdig=hdig+1 }
-                    else if d>=97&&d<=102 { val=val*16 + (d-87); p=p+1; c=c+1; hdig=hdig+1 }
-                    else if d>=65&&d<=70 { val=val*16 + (d-55); p=p+1; c=c+1; hdig=hdig+1 }
+                    if d>=48&&d<=57 { 
+                        if val > HMAXD { let mh="error: integer literal overflows i64 range\n"; file_write(2, mh+8, len(mh)); exit(1) }
+                        val=val*16 + (d-48); p=p+1; c=c+1; hdig=hdig+1 }
+                    else if d>=97&&d<=102 { 
+                        if val > HMAXD { let mh="error: integer literal overflows i64 range\n"; file_write(2, mh+8, len(mh)); exit(1) }
+                        val=val*16 + (d-87); p=p+1; c=c+1; hdig=hdig+1 }
+                    else if d>=65&&d<=70 { 
+                        if val > HMAXD { let mh="error: integer literal overflows i64 range\n"; file_write(2, mh+8, len(mh)); exit(1) }
+                        val=val*16 + (d-55); p=p+1; c=c+1; hdig=hdig+1 }
                     else { break }
                 }
                 // NEW-5: a bare `0x` / `0X` with no hex digits must not silently
@@ -107,10 +118,20 @@ fn tokenize() {
                 stok(tokc,TT_NUM,val,l,sc,p-sp); tokc=tokc+1
             } else {
                 let val=0
+                // Overflow guard: I64MAX = 9223372036854775807. A positive
+                // decimal literal overflows if val > I64MAX/10 (=922337203685477580)
+                // or (val == I64MAX/10 and next digit > 7). Reject cleanly
+                // instead of emitting a wrapped value that crashes codegen.
+                let IMAXD = 922337203685477580
                 while p<srclen {
                     let dch=r8(src+p)
                     if idigit(dch)==0 { break }
-                    val=val*10+(dch-48)
+                    let d = dch-48
+                    if val > IMAXD || (val == IMAXD && d > 7) {
+                        let mh = "error: integer literal overflows i64 range\n"
+                        file_write(2, mh+8, len(mh)); exit(1)
+                    }
+                    val = val*10 + d
                     p=p+1; c=c+1
                 }
                 let nlen=p-sp

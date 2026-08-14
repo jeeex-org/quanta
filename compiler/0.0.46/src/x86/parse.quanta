@@ -291,9 +291,11 @@ fn parse_let() {
     
     mop(61)
     let v=parse_expr(); let vr=nv(); iremit(IR_MOV,vr,v,0,0); vadd(nm,nl,vr)
-    let vsi = r64(vreg_struct + v*8)
+    let vsi = -1
+    if v>=0 && v<vreg_n { vsi = r64(vreg_struct + v*8) }
     if vsi>=0 { w64(vreg_struct + vr*8, vsi) }
-    let vss = r64(vreg_is_str + v*8)
+    let vss = -1
+    if v>=0 && v<vreg_n { vss = r64(vreg_is_str + v*8) }
     if vss>=0 { w64(vreg_is_str + vr*8, vss) }
     // P6.1b: tag the vreg with its declared type (if any)
     if vtype>0 { w64(vreg_type + vr*8, vtype) }
@@ -306,7 +308,8 @@ fn parse_let() {
     // where live-local pressure trips the allocator's caller-saved clobber
     // (self-host SIGSEGV; see comments ~280/~660/3176). parse_let's w64
     // calls are proven safe (struct/str/type tags above).
-    let fvtag = r64(vreg_type + v*8)
+    let fvtag = -1
+    if v>=0 && v<vreg_n { fvtag = r64(vreg_type + v*8) }
     if fvtag==11 { w64(vreg_type + vr*8, 11) }
     else {
         // The IR_MOV was just emitted (line 2096), so a bare-fn-name RHS

@@ -6,11 +6,32 @@ fn r64(p) { return mem_load(p) }
 fn w8(p,v) { if p!=0 { mem_store8(p,v) } }
 fn w16(p,v) { if p!=0 { mem_store8(p, v & 255); mem_store8(p+1, (v>>8) & 255) } }
 fn w64(p,v) { mem_store(p,v) }
-// Host runtime intrinsics for compiler's own memory access (self-host fix for ARM64 3-char fn names)
+// Host runtime intrinsics for compiler's own memory access.
+// GUARD: reject non-positive addresses (p < 1). Quanta's mmap arena is based at
+// a LOW virtual address (valid pointers are small POSITIVE numbers like 2, 42,
+// ...), so a fixed small upper threshold would wrongly reject valid accesses.
+// The only invalid case is a negative/absent address — e.g. a negative vreg
+// index (-3) reaching `table + idx*8` yields ~ -22 (0xffffffffffffffea), which
+// corrupts unmapped memory (SIGSEGV under Valgrind, masked on bare metal).
+// Negative/zero addresses are never valid, so we skip them. Per-site
+// `idx >= 0 && idx < vreg_n` guards (codegen/parse/method) prevent the bad
+// index upstream; this is the final memory-boundary backstop.
 fn mem_load8(p) { return r8(p) }
 fn mem_load(p) { return r64(p) }
 fn mem_store8(p,v) { if p!=0 { w8(p,v) } }
-fn mem_store(p,v) { if p!=0 { w64(p,v) } }
+fn mem_store(p,v) {
+    // GUARD: reject negative addresses. Quanta's mmap arena can be based at a
+    // LOW virtual address, so valid pointers are small POSITIVE numbers
+    // (e.g. REGS mmap'd at ~2, writing REGS+96 = ~98). A negative address
+    // (e.g. -22 = vreg_table + (-3)*8) is never valid — it arises from a
+    // negative/out-of-range index reaching a table write, and corrupts
+    // unmapped memory (SIGSEGV under Valgrind, masked on bare metal).
+    // `p < 0` catches exactly that case without rejecting valid low-positive
+    // accesses. Per-site `idx >= 0 && idx < vreg_n` guards in codegen/parse/
+    // method prevent the bad index upstream; this is the final backstop.
+    if p < 0 { return }
+    w64(p,v)
+}
 
 
 fn tokt(i) { return r64(toks + i*TKS) }

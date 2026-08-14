@@ -325,6 +325,11 @@ fn ffree() {
         if used==0 { return pr }
         k=k+1
     }
+    // GUARD: do not decrement fallocfc below 0. If nothing is allocated
+    // (fallocfc==0), there is no register to free — return -1 (no reg) instead
+    // of wrapping to -1 and then indexing falloc + (-1)*16 (negative address
+    // -> SIGSEGV under Valgrind, masked corruption on bare metal).
+    if fallocfc <= 0 { return -1 }
     fallocfc=fallocfc-1
     let ev_vr=r64(falloc+fallocfc*16); let ev_pr=r64(falloc+fallocfc*16+8)
     if r8(fvr_init+ev_vr)!=0 { frld(ev_pr, fspill_home(ev_vr)) }
@@ -747,6 +752,11 @@ fn ffree() {
         if used==0 { return pr }
         k=k+1
     }
+    // GUARD: do not decrement fallocfc below 0. If nothing is allocated
+    // (fallocfc==0), there is no register to free — return -1 (no reg) instead
+    // of wrapping to -1 and then indexing falloc + (-1)*16 (negative address
+    // -> SIGSEGV under Valgrind, masked corruption on bare metal).
+    if fallocfc <= 0 { return -1 }
     fallocfc=fallocfc-1
     let ev_vr=r64(falloc+fallocfc*16); let ev_pr=r64(falloc+fallocfc*16+8)
     if r8(fvr_init+ev_vr)!=0 { frld(ev_pr, fspill_home(ev_vr)) }
@@ -1047,7 +1057,7 @@ fn emit_bltn(nmi,nl,ii) {
     }
     if nl==4&&r8(nm)=='m'&&r8(nm+1)=='m'&&r8(nm+2)=='a'&&r8(nm+3)=='p' {
         eb(72); eb(137); eb(254)      // mov rsi, rdi   (len)
-        eb(191); ei(0x60000001)       // mov edi, 0x60000000 (addr HINT: high, away from fixed GDATA@0x42200000)
+        eb(191); ei(0)                 // mov edi, 0  (addr=0: let kernel choose; avoids fixed-hint collisions e.g. under Valgrind where 0x60000000 is reserved -> mmap returns -22/EINVAL)
         eb(186); ei(3)                // mov edx, 3     (PROT_READ|WRITE)
         eb(65); eb(186); ei(34)       // mov r10d, 0x22 (MAP_PRIVATE|ANON)
         eb(65); eb(184); ei(0-1)      // mov r8d, -1    (fd)
@@ -1252,7 +1262,7 @@ fn emit_bltn2(nmi,nl,ii) {
         eb(87)                            // push rdi   (save sec)
         ri(7, 16)                         // rdi = 16
         eb(72); eb(137); eb(254)          // mov rsi, rdi   (len=16)
-        eb(191); ei(0x60000001)           // mov edi, 0x60000001 (addr hint)
+        eb(191); ei(0)                    // mov edi, 0  (addr=0: let kernel choose; avoids fixed-hint collisions under Valgrind)
         eb(186); ei(3)                    // mov edx, 3     (PROT_READ|WRITE)
         eb(65); eb(186); ei(34)           // mov r10d, 0x22 (MAP_PRIVATE|ANON)
         eb(65); eb(184); ei(0-1)          // mov r8d, -1    (fd)

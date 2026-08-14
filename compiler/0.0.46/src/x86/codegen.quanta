@@ -123,9 +123,9 @@ fn constfold(i, op, r0, a0, a1) {
 // Called from IR_ADD/SUB/MUL emit after sdef.
 fn width_mask(o0, o1, rd) {
     let vt = 0
-    if o0 < vreg_n { vt = r64(vreg_type + o0*8) }
+    if o0 >= 0 && o0 < vreg_n { vt = r64(vreg_type + o0*8) }
     if vt < 1 || vt > 3 {
-        if o1 < vreg_n { vt = r64(vreg_type + o1*8) }
+        if o1 >= 0 && o1 < vreg_n { vt = r64(vreg_type + o1*8) }
     }
     if vt >= 1 && vt <= 3 && rd != 0 {
         if vt == 1 { eb(72); eb(129); eb(224 + (rd%8)); ei(0xFF) }
@@ -632,7 +632,8 @@ fn ci_func(fi, is_main) {
             flush_all()
             rbp(0, spill_home(a0))   // rax = base
             rbp(1, spill_home(a1))   // rcx = idx
-            let isstr = r64(vreg_is_str + a0*8)
+            let isstr = 0
+            if a0 >= 0 && a0 < vreg_n { isstr = r64(vreg_is_str + a0*8) }
             if isstr>=0 {
                 idx_trap_emit(ii)        // cmp [rax], rcx ; jb +2 ; ud2
                 eb(72); eb(141); eb(68); eb(8); eb(8)   // lea rax,[rax+rcx*1+8]
@@ -650,7 +651,8 @@ fn ci_func(fi, is_main) {
             flush_all()
             rbp(0, spill_home(a0))   // rax = base
             rbp(1, spill_home(a1))   // rcx = idx
-            let isstr = r64(vreg_is_str + a0*8)
+            let isstr = 0
+            if a0 >= 0 && a0 < vreg_n { isstr = r64(vreg_is_str + a0*8) }
             if isstr>=0 {
                 idx_trap_emit(ii)        // cmp [rax], rcx ; jb +2 ; ud2
                 eb(72); eb(141); eb(68); eb(8); eb(8)   // lea rax,[rax+rcx*1+8]
