@@ -1,0 +1,68 @@
+// std/str — real string ops. A Quanta string is a header pointer:
+//   [0]  = byte length (i64)
+//   [8]  = first byte ... (length bytes follow)
+// `len(s)` returns the byte length; `s + 8` is the byte buffer.
+// `str(a,b)` concatenates two strings (builtin). Byte access via mem_load8/mem_store8.
+// Import with:  import std/str
+
+// Concatenate two strings (builtin str wrapper).
+fn concat(a, b) {
+  return str(a, b)
+}
+
+// Get the i-th byte of string s (0-based). Returns the byte value (0..255).
+fn byte_at(s, i) {
+  return mem_load8(s + 8 + i)
+}
+
+// Set the i-th byte of string s to v (0..255).
+fn byte_set(s, i, v) {
+  mem_store8(s + 8 + i, v)
+}
+
+// True if two strings are byte-equal.
+fn equals(a, b) {
+  let la = len(a)
+  let lb = len(b)
+  if la != lb { return 0 }
+  let i = 0
+  while i < la {
+    if mem_load8(a + 8 + i) != mem_load8(b + 8 + i) { return 0 }
+    i = i + 1
+  }
+  return 1
+}
+
+// Return a substring of s: count bytes starting at byte index `start`.
+// Allocates a fresh string via mem_alloc (mirrors the str() header layout).
+fn substr(s, start, count) {
+  let buf = mem_alloc((count + 9 + 7) / 8)   // round up to 8-byte multiples
+  mem_store(buf, count)                        // header: length
+  let i = 0
+  while i < count {
+    mem_store8(buf + 8 + i, mem_load8(s + 8 + start + i))
+    i = i + 1
+  }
+  return buf
+}
+
+// Parse a base-10 signed integer from string s. Supports an optional leading '-'.
+// Returns the i64 value (0 if no digits).
+fn parse_i64(s) {
+  let n = len(s)
+  let i = 0
+  let neg = 0
+  if n > 0 {
+    let c0 = mem_load8(s + 8)
+    if c0 == 45 { neg = 1; i = 1 }   // '-'
+  }
+  let val = 0
+  while i < n {
+    let c = mem_load8(s + 8 + i)
+    if c < 48 || c > 57 { return val }   // not a digit -> stop
+    val = val * 10 + (c - 48)
+    i = i + 1
+  }
+  if neg == 1 { return 0 - val }
+  return val
+}

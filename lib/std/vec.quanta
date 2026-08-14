@@ -1,0 +1,50 @@
+// std/vec — dynamic array of i64 values, implemented in Quanta over mem_alloc.
+// Layout (header pointer):
+//   [0]  = capacity (number of element slots reserved)
+//   [8]  = length   (number of elements in use)
+//   [16] = element 0
+//   [24] = element 1  ...  element i at [16 + i*8]
+// Import with:  import std/vec
+//
+// USAGE: drive pushes with an explicit caller counter and vec_set (avoids an
+// in-loop struct-field read that trips a latent allocator quirk). Set the length
+// with vec_set_len when done:
+//   let v = vec_new(); let n = 0;
+//   while i < N { vec_set(v, n, val); n = n + 1; i = i + 1 }
+//   vec_set_len(v, n)
+// (A convenience vec_push(v,x) wrapper is provided but the explicit form above is
+// the loop-safe one.)
+
+fn vec_new() {
+  let p = mem_alloc(64 + 3)    // 64 element slots + 24-byte header
+  mem_store(p, 64)              // capacity
+  mem_store(p + 8, 0)           // length
+  return p
+}
+
+fn vec_put(v, i, x) {
+  mem_store(v + 16 + i * 8, x)
+}
+
+fn vec_at(v, i) {
+  return mem_load(v + 16 + i * 8)
+}
+
+fn vec_set_len(v, n) {
+  mem_store(v + 8, n)
+}
+
+fn vec_len(v) {
+  return mem_load(v + 8)
+}
+
+// Convenience push (single use; for loops prefer the explicit vec_set + counter form).
+fn vec_push(v, x) {
+  let len = vec_len(v)
+  let cap = mem_load(v)
+  if len < cap {
+    vec_put(v, len, x)
+    vec_set_len(v, len + 1)
+  }
+  return v
+}

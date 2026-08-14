@@ -1,0 +1,45 @@
+// std/fs — file I/O over the existing file_* builtins (syscalls:
+// open=2, read=0, write=1, close=3). Quanta talks to the OS directly (no libc).
+// Import with:  import std/fs
+//
+// NOTE: Quanta strings are length-prefixed, NOT null-terminated, and store their
+// bytes at [ptr+8]. The syscalls expect C-strings (null-terminated) and raw byte
+// buffers, so the wrappers below convert: open() null-terminates the path, and
+// write_str()/read_str() address the byte buffer at ptr+8.
+
+// open(path, flags, mode): null-terminate `path`, return fd (i64) or -1.
+fn open(path, flags, mode) {
+  let n = len(path)
+  let cp = mem_alloc((n + 1 + 7) / 8)
+  let i = 0
+  while i < n { mem_store8(cp + 8 + i, mem_load8(path + 8 + i)); i = i + 1 }
+  mem_store8(cp + 8 + n, 0)            // C null terminator
+  return file_open(cp + 8, flags, mode)
+}
+
+// write_str(fd, s): write the bytes of string s. Returns bytes written.
+fn write_str(fd, s) {
+  return file_write(fd, s + 8, len(s))
+}
+
+// read_str(fd, max): read up to `max` bytes into a fresh string. Returns it.
+fn read_str(fd, max) {
+  let buf = mem_alloc((max + 9 + 7) / 8)
+  let n = file_read(fd, buf + 8, max)
+  mem_store(buf, n)                    // header: actual bytes read
+  return buf
+}
+
+// Low-level raw read into a caller-provided buffer (from mem_alloc). Returns bytes.
+fn read_raw(fd, buf, count) {
+  return file_read(fd, buf, count)
+}
+
+// Low-level raw write from a caller-provided byte buffer. Returns bytes.
+fn write_raw(fd, buf, count) {
+  return file_write(fd, buf, count)
+}
+
+fn close(fd) {
+  return file_close(fd)
+}

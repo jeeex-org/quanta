@@ -1,0 +1,643 @@
+// lib/crypto — built-in cryptography for Quanta. Pure-Quanta implementations
+// over mem_* and the syscall3 builtin. 32-bit words are carried in i64 and masked
+// with u32() after every operation (Quanta arithmetic is 64-bit).
+// Import with:  import std/crypto
+import std/str
+
+// ---------- 32-bit helpers ----------
+fn shr32(x, n) { return u32(x >> n) }
+fn shl32(x, n) { return u32(x << n) }
+fn rotr(x, n) { return u32(shr32(x, n) | shl32(x, 32 - n)) }
+fn Ch(x, y, z) { return (x & y) ^ ((~x) & z) }
+fn Maj(x, y, z) { return (x & y) ^ (x & z) ^ (y & z) }
+fn Sig0(x) { return rotr(x, 2) ^ rotr(x, 13) ^ rotr(x, 22) }
+fn Sig1(x) { return rotr(x, 6) ^ rotr(x, 11) ^ rotr(x, 25) }
+fn sig0(x) { return rotr(x, 7) ^ rotr(x, 18) ^ shr32(x, 3) }
+fn sig1(x) { return rotr(x, 17) ^ rotr(x, 19) ^ shr32(x, 10) }
+
+// K: first 32 bits of the fractional parts of cube roots of primes 2..311.
+fn k256(i) {
+  if i == 0 { return 0x428a2f98 }
+  if i == 1 { return 0x71374491 }
+  if i == 2 { return 0xb5c0fbcf }
+  if i == 3 { return 0xe9b5dba5 }
+  if i == 4 { return 0x3956c25b }
+  if i == 5 { return 0x59f111f1 }
+  if i == 6 { return 0x923f82a4 }
+  if i == 7 { return 0xab1c5ed5 }
+  if i == 8 { return 0xd807aa98 }
+  if i == 9 { return 0x12835b01 }
+  if i == 10 { return 0x243185be }
+  if i == 11 { return 0x550c7dc3 }
+  if i == 12 { return 0x72be5d74 }
+  if i == 13 { return 0x80deb1fe }
+  if i == 14 { return 0x9bdc06a7 }
+  if i == 15 { return 0xc19bf174 }
+  if i == 16 { return 0xe49b69c1 }
+  if i == 17 { return 0xefbe4786 }
+  if i == 18 { return 0x0fc19dc6 }
+  if i == 19 { return 0x240ca1cc }
+  if i == 20 { return 0x2de92c6f }
+  if i == 21 { return 0x4a7484aa }
+  if i == 22 { return 0x5cb0a9dc }
+  if i == 23 { return 0x76f988da }
+  if i == 24 { return 0x983e5152 }
+  if i == 25 { return 0xa831c66d }
+  if i == 26 { return 0xb00327c8 }
+  if i == 27 { return 0xbf597fc7 }
+  if i == 28 { return 0xc6e00bf3 }
+  if i == 29 { return 0xd5a79147 }
+  if i == 30 { return 0x06ca6351 }
+  if i == 31 { return 0x14292967 }
+  if i == 32 { return 0x27b70a85 }
+  if i == 33 { return 0x2e1b2138 }
+  if i == 34 { return 0x4d2c6dfc }
+  if i == 35 { return 0x53380d13 }
+  if i == 36 { return 0x650a7354 }
+  if i == 37 { return 0x766a0abb }
+  if i == 38 { return 0x81c2c92e }
+  if i == 39 { return 0x92722c85 }
+  if i == 40 { return 0xa2bfe8a1 }
+  if i == 41 { return 0xa81a664b }
+  if i == 42 { return 0xc24b8b70 }
+  if i == 43 { return 0xc76c51a3 }
+  if i == 44 { return 0xd192e819 }
+  if i == 45 { return 0xd6990624 }
+  if i == 46 { return 0xf40e3585 }
+  if i == 47 { return 0x106aa070 }
+  if i == 48 { return 0x19a4c116 }
+  if i == 49 { return 0x1e376c08 }
+  if i == 50 { return 0x2748774c }
+  if i == 51 { return 0x34b0bcb5 }
+  if i == 52 { return 0x391c0cb3 }
+  if i == 53 { return 0x4ed8aa4a }
+  if i == 54 { return 0x5b9cca4f }
+  if i == 55 { return 0x682e6ff3 }
+  if i == 56 { return 0x748f82ee }
+  if i == 57 { return 0x78a5636f }
+  if i == 58 { return 0x84c87814 }
+  if i == 59 { return 0x8cc70208 }
+  if i == 60 { return 0x90befffa }
+  if i == 61 { return 0xa4506ceb }
+  if i == 62 { return 0xbef9a3f7 }
+  return 0xc67178f2   // 63
+}
+
+// padbyte: the byte that belongs at absolute message position `p` within block
+// `blk` (of `total` blocks). Standard SHA-256 padding:
+//   - if p < mlen: the actual message byte
+//   - else if p == mlen: 0x80 (the appended '1' bit)
+//   - in the FINAL block, bytes 56..63 carry the 64-bit big-endian length in bits
+//   - otherwise: 0x00
+fn padbyte(msg, mlen, p, total, blk) {
+  if p < mlen { return mem_load8(msg + p) }
+  if p == mlen { return 0x80 }
+  if blk == total - 1 {
+    let pos_in_block = p - blk * 64
+    if pos_in_block >= 56 {
+      let bitlen = mlen * 8
+      let li = pos_in_block - 56
+      return u32(bitlen >> (56 - li * 8)) & 0xff
+    }
+  }
+  return 0
+}
+
+// sha256(msg, len) -> ptr to 32-byte big-endian digest buffer.
+fn sha256(msg, mlen) {
+  // H init
+  let H = mem_alloc(8)          // 8 words (each 8 bytes) -> we store as i64 masked u32
+  mem_store(H,       0x6a09e667)
+  mem_store(H + 8,   0xbb67ae85)
+  mem_store(H + 16,  0x3c6ef372)
+  mem_store(H + 24,  0xa54ff53a)
+  mem_store(H + 32,  0x510e527f)
+  mem_store(H + 40,  0x9b05688c)
+  mem_store(H + 48,  0x1f83d9ab)
+  mem_store(H + 56,  0x5be0cd19)
+  // message schedule
+  let w = mem_alloc(64)
+  // padded length = (mlen + 1 + pad) padded to 64; total = ((mlen+8)>>6 +1)*64
+  let total = ((mlen + 8) >> 6) + 1
+  let total_bytes = total * 64
+  let blk = 0
+  while blk < total {
+    let base = blk * 64
+    // copy 16 words big-endian, with correct SHA-256 padding:
+    //   - byte at position == mlen gets 0x80
+    //   - the final block's last 8 bytes carry the 64-bit big-endian length
+    let t = 0
+    while t < 16 {
+      let off = base + t * 4
+      let b0 = padbyte(msg, mlen, off,     total, blk)
+      let b1 = padbyte(msg, mlen, off + 1, total, blk)
+      let b2 = padbyte(msg, mlen, off + 2, total, blk)
+      let b3 = padbyte(msg, mlen, off + 3, total, blk)
+      let word = u32((b0 << 24) | (b1 << 16) | (b2 << 8) | b3)
+      mem_store(w + t * 8, word)
+      t = t + 1
+    }
+    // extend
+    t = 16
+    while t < 64 {
+      let s0 = sig0(mem_load(w + (t - 15) * 8))
+      let s1 = sig1(mem_load(w + (t - 2) * 8))
+      let val = u32(s1 + mem_load(w + (t - 7) * 8) + s0 + mem_load(w + (t - 16) * 8))
+      mem_store(w + t * 8, val)
+      t = t + 1
+    }
+    // compression
+    let a = mem_load(H); let b = mem_load(H + 8); let c = mem_load(H + 16); let d = mem_load(H + 24)
+    let e = mem_load(H + 32); let f = mem_load(H + 40); let g = mem_load(H + 48); let h = mem_load(H + 56)
+    t = 0
+    while t < 64 {
+      let wt = mem_load(w + t * 8)
+      let T1 = u32(h + Sig1(e) + Ch(e, f, g) + k256(t) + wt)
+      let T2 = u32(Sig0(a) + Maj(a, b, c))
+      h = g; g = f; f = e; e = u32(d + T1)
+      d = c; c = b; b = a; a = u32(T1 + T2)
+      t = t + 1
+    }
+    mem_store(H,      u32(a + mem_load(H)))
+    mem_store(H + 8,  u32(b + mem_load(H + 8)))
+    mem_store(H + 16, u32(c + mem_load(H + 16)))
+    mem_store(H + 24, u32(d + mem_load(H + 24)))
+    mem_store(H + 32, u32(e + mem_load(H + 32)))
+    mem_store(H + 40, u32(f + mem_load(H + 40)))
+    mem_store(H + 48, u32(g + mem_load(H + 48)))
+    mem_store(H + 56, u32(h + mem_load(H + 56)))
+    blk = blk + 1
+  }
+  // produce 32-byte big-endian digest
+  let out = mem_alloc(4)        // 32 bytes = 4*8
+  let i = 0
+  while i < 8 {
+    let word = mem_load(H + i * 8)
+    mem_store8(out + i * 4,     u32(word >> 24) & 0xff)
+    mem_store8(out + i * 4 + 1, u32(word >> 16) & 0xff)
+    mem_store8(out + i * 4 + 2, u32(word >> 8) & 0xff)
+    mem_store8(out + i * 4 + 3, u32(word) & 0xff)
+    i = i + 1
+  }
+  return out
+}
+
+// sha256_str(s, len): convenience — hashes a Quanta string s (bytes live at s+8).
+fn sha256_str(s, len) { return sha256(s + 8, len) }
+
+// rand_bytes(buf, n): fill buf with n cryptographically-strong random bytes.
+fn rand_bytes(buf, n) {
+  return syscall3(318, buf, n, 0)   // getrandom
+}
+
+// hex(bytes, n) -> hex string (for displaying digests).
+fn hex(bytes, n) {
+  let s = ""
+  let i = 0
+  while i < n {
+    let b = mem_load8(bytes + i)
+    let hi = b >> 4; let lo = b & 0xf
+    s = str(s, hexdig(hi))
+    s = str(s, hexdig(lo))
+    i = i + 1
+  }
+  return s
+}
+
+fn hexdig(v) {
+  if v == 0 { return "0" }
+  if v == 1 { return "1" }
+  if v == 2 { return "2" }
+  if v == 3 { return "3" }
+  if v == 4 { return "4" }
+  if v == 5 { return "5" }
+  if v == 6 { return "6" }
+  if v == 7 { return "7" }
+  if v == 8 { return "8" }
+  if v == 9 { return "9" }
+  if v == 10 { return "a" }
+  if v == 11 { return "b" }
+  if v == 12 { return "c" }
+  if v == 13 { return "d" }
+  if v == 14 { return "e" }
+  return "f"
+}
+
+// ---------- HMAC-SHA256 ----------
+// hmac_sha256(key, klen, msg, mlen) -> ptr to 32-byte digest.
+// HMAC(K,m) = SHA256( (K' xor opad) || SHA256( (K' xor ipad) || m ) )
+fn hmac_sha256(key, klen, msg, mlen) {
+  // Normalize key to exactly 32 bytes (SHA-256 block size).
+  // If the key is longer than 32 bytes, hash it first; otherwise copy (left-padded
+  // with zeros by zeroing kpad up front).
+  let kpad = mem_alloc(4)            // 32 bytes
+  let ki = 0
+  while ki < 4 { mem_store(kpad + ki * 8, 0); ki = ki + 1 }
+  if klen > 32 {
+    let hk = sha256(key, klen)       // hk is a raw 32-byte buffer
+    let j = 0
+    while j < 32 { mem_store8(kpad + j, mem_load8(hk + j)); j = j + 1 }
+  } else {
+    let j = 0
+    while j < klen { mem_store8(kpad + j, mem_load8(key + j)); j = j + 1 }
+  }
+  // inner = (kpad XOR ipad) || msg   where ipad = 0x36 * 64
+  let inner = mem_alloc(8)           // 64 bytes
+  let i2 = 0
+  while i2 < 8 { mem_store(inner + i2 * 8, 0); i2 = i2 + 1 }
+  let i = 0
+  while i < 64 {
+    if i < 32 { mem_store8(inner + i, mem_load8(kpad + i) ^ 0x36) }
+    else { mem_store8(inner + i, 0x36) }
+    i = i + 1
+  }
+  // inner || msg  -> we build a buffer of (64 + mlen) and hash it
+  let ibuf = mem_alloc(((64 + mlen + 8) >> 6) + 1)   // generous; bytes region from +8
+  let w = 0
+  while w < 64 { mem_store8(ibuf + 8 + w, mem_load8(inner + w)); w = w + 1 }
+  let q = 0
+  while q < mlen { mem_store8(ibuf + 8 + 64 + q, mem_load8(msg + q)); q = q + 1 }
+  let inner_hash = sha256(ibuf + 8, 64 + mlen)
+  // outer: opad XOR key || inner_hash
+  let outer = mem_alloc(8)           // 64 bytes
+  let o2 = 0
+  while o2 < 8 { mem_store(outer + o2 * 8, 0); o2 = o2 + 1 }
+  let o = 0
+  while o < 64 {
+    if o < 32 { mem_store8(outer + o, mem_load8(kpad + o) ^ 0x5c) }
+    else { mem_store8(outer + o, 0x5c) }
+    o = o + 1
+  }
+  let obuf = mem_alloc(((64 + 32 + 8) >> 6) + 1)
+  let r = 0
+  while r < 64 { mem_store8(obuf + 8 + r, mem_load8(outer + r)); r = r + 1 }
+  let s = 0
+  while s < 32 { mem_store8(obuf + 8 + 64 + s, mem_load8(inner_hash + s)); s = s + 1 }
+  return sha256(obuf + 8, 64 + 32)
+}
+
+// ---------- AES-128 (ECB) ----------
+// aes128_enc(key16, plaintext16) -> ptr to 16-byte ciphertext (raw buffer).
+// Key schedule + 10 rounds (SubBytes, ShiftRows, MixColumns, AddRoundKey).
+fn aes_xtime(x) { let t = x << 1; if t > 255 { t = t ^ 0x11b }; return t & 0xff }
+fn aes_mul(a, b) {
+  let r = 0
+  let i = 0
+  while i < 8 {
+    if (b & 1) == 1 { r = r ^ a }
+    let ta = a
+    a = aes_xtime(a)
+    b = b >> 1
+    i = i + 1
+  }
+  return r & 0xff
+}
+// S-box (AES substitution box, 256 entries).
+fn aes_sbox(b) {
+  if b == 0 { return 0x63 }
+  if b == 1 { return 0x7c }
+  if b == 2 { return 0x77 }
+  if b == 3 { return 0x7b }
+  if b == 4 { return 0xf2 }
+  if b == 5 { return 0x6b }
+  if b == 6 { return 0x6f }
+  if b == 7 { return 0xc5 }
+  if b == 8 { return 0x30 }
+  if b == 9 { return 0x01 }
+  if b == 10 { return 0x67 }
+  if b == 11 { return 0x2b }
+  if b == 12 { return 0xfe }
+  if b == 13 { return 0xd7 }
+  if b == 14 { return 0xab }
+  if b == 15 { return 0x76 }
+  if b == 16 { return 0xca }
+  if b == 17 { return 0x82 }
+  if b == 18 { return 0xc9 }
+  if b == 19 { return 0x7d }
+  if b == 20 { return 0xfa }
+  if b == 21 { return 0x59 }
+  if b == 22 { return 0x47 }
+  if b == 23 { return 0xf0 }
+  if b == 24 { return 0xad }
+  if b == 25 { return 0xd4 }
+  if b == 26 { return 0xa2 }
+  if b == 27 { return 0xaf }
+  if b == 28 { return 0x9c }
+  if b == 29 { return 0xa4 }
+  if b == 30 { return 0x72 }
+  if b == 31 { return 0xc0 }
+  if b == 32 { return 0xb7 }
+  if b == 33 { return 0xfd }
+  if b == 34 { return 0x93 }
+  if b == 35 { return 0x26 }
+  if b == 36 { return 0x36 }
+  if b == 37 { return 0x3f }
+  if b == 38 { return 0xf7 }
+  if b == 39 { return 0xcc }
+  if b == 40 { return 0x34 }
+  if b == 41 { return 0xa5 }
+  if b == 42 { return 0xe5 }
+  if b == 43 { return 0xf1 }
+  if b == 44 { return 0x71 }
+  if b == 45 { return 0xd8 }
+  if b == 46 { return 0x31 }
+  if b == 47 { return 0x15 }
+  if b == 48 { return 0x04 }
+  if b == 49 { return 0xc7 }
+  if b == 50 { return 0x23 }
+  if b == 51 { return 0xc3 }
+  if b == 52 { return 0x18 }
+  if b == 53 { return 0x96 }
+  if b == 54 { return 0x05 }
+  if b == 55 { return 0x9a }
+  if b == 56 { return 0x07 }
+  if b == 57 { return 0x12 }
+  if b == 58 { return 0x80 }
+  if b == 59 { return 0xe2 }
+  if b == 60 { return 0xeb }
+  if b == 61 { return 0x27 }
+  if b == 62 { return 0xb2 }
+  if b == 63 { return 0x75 }
+  if b == 64 { return 0x09 }
+  if b == 65 { return 0x83 }
+  if b == 66 { return 0x2c }
+  if b == 67 { return 0x1a }
+  if b == 68 { return 0x1b }
+  if b == 69 { return 0x6e }
+  if b == 70 { return 0x5a }
+  if b == 71 { return 0xa0 }
+  if b == 72 { return 0x52 }
+  if b == 73 { return 0x3b }
+  if b == 74 { return 0xd6 }
+  if b == 75 { return 0xb3 }
+  if b == 76 { return 0x29 }
+  if b == 77 { return 0xe3 }
+  if b == 78 { return 0x2f }
+  if b == 79 { return 0x84 }
+  if b == 80 { return 0x53 }
+  if b == 81 { return 0xd1 }
+  if b == 82 { return 0x00 }
+  if b == 83 { return 0xed }
+  if b == 84 { return 0x20 }
+  if b == 85 { return 0xfc }
+  if b == 86 { return 0xb1 }
+  if b == 87 { return 0x5b }
+  if b == 88 { return 0x6a }
+  if b == 89 { return 0xcb }
+  if b == 90 { return 0xbe }
+  if b == 91 { return 0x39 }
+  if b == 92 { return 0x4a }
+  if b == 93 { return 0x4c }
+  if b == 94 { return 0x58 }
+  if b == 95 { return 0xcf }
+  if b == 96 { return 0xd0 }
+  if b == 97 { return 0xef }
+  if b == 98 { return 0xaa }
+  if b == 99 { return 0xfb }
+  if b == 100 { return 0x43 }
+  if b == 101 { return 0x4d }
+  if b == 102 { return 0x33 }
+  if b == 103 { return 0x85 }
+  if b == 104 { return 0x45 }
+  if b == 105 { return 0xf9 }
+  if b == 106 { return 0x02 }
+  if b == 107 { return 0x7f }
+  if b == 108 { return 0x50 }
+  if b == 109 { return 0x3c }
+  if b == 110 { return 0x9f }
+  if b == 111 { return 0xa8 }
+  if b == 112 { return 0x51 }
+  if b == 113 { return 0xa3 }
+  if b == 114 { return 0x40 }
+  if b == 115 { return 0x8f }
+  if b == 116 { return 0x92 }
+  if b == 117 { return 0x9d }
+  if b == 118 { return 0x38 }
+  if b == 119 { return 0xf5 }
+  if b == 120 { return 0xbc }
+  if b == 121 { return 0xb6 }
+  if b == 122 { return 0xda }
+  if b == 123 { return 0x21 }
+  if b == 124 { return 0x10 }
+  if b == 125 { return 0xff }
+  if b == 126 { return 0xf3 }
+  if b == 127 { return 0xd2 }
+  if b == 128 { return 0xcd }
+  if b == 129 { return 0x0c }
+  if b == 130 { return 0x13 }
+  if b == 131 { return 0xec }
+  if b == 132 { return 0x5f }
+  if b == 133 { return 0x97 }
+  if b == 134 { return 0x44 }
+  if b == 135 { return 0x17 }
+  if b == 136 { return 0xc4 }
+  if b == 137 { return 0xa7 }
+  if b == 138 { return 0x7e }
+  if b == 139 { return 0x3d }
+  if b == 140 { return 0x64 }
+  if b == 141 { return 0x5d }
+  if b == 142 { return 0x19 }
+  if b == 143 { return 0x73 }
+  if b == 144 { return 0x60 }
+  if b == 145 { return 0x81 }
+  if b == 146 { return 0x4f }
+  if b == 147 { return 0xdc }
+  if b == 148 { return 0x22 }
+  if b == 149 { return 0x2a }
+  if b == 150 { return 0x90 }
+  if b == 151 { return 0x88 }
+  if b == 152 { return 0x46 }
+  if b == 153 { return 0xee }
+  if b == 154 { return 0xb8 }
+  if b == 155 { return 0x14 }
+  if b == 156 { return 0xde }
+  if b == 157 { return 0x5e }
+  if b == 158 { return 0x0b }
+  if b == 159 { return 0xdb }
+  if b == 160 { return 0xe0 }
+  if b == 161 { return 0x32 }
+  if b == 162 { return 0x3a }
+  if b == 163 { return 0x0a }
+  if b == 164 { return 0x49 }
+  if b == 165 { return 0x06 }
+  if b == 166 { return 0x24 }
+  if b == 167 { return 0x5c }
+  if b == 168 { return 0xc2 }
+  if b == 169 { return 0xd3 }
+  if b == 170 { return 0xac }
+  if b == 171 { return 0x62 }
+  if b == 172 { return 0x91 }
+  if b == 173 { return 0x95 }
+  if b == 174 { return 0xe4 }
+  if b == 175 { return 0x79 }
+  if b == 176 { return 0xe7 }
+  if b == 177 { return 0xc8 }
+  if b == 178 { return 0x37 }
+  if b == 179 { return 0x6d }
+  if b == 180 { return 0x8d }
+  if b == 181 { return 0xd5 }
+  if b == 182 { return 0x4e }
+  if b == 183 { return 0xa9 }
+  if b == 184 { return 0x6c }
+  if b == 185 { return 0x56 }
+  if b == 186 { return 0xf4 }
+  if b == 187 { return 0xea }
+  if b == 188 { return 0x65 }
+  if b == 189 { return 0x7a }
+  if b == 190 { return 0xae }
+  if b == 191 { return 0x08 }
+  if b == 192 { return 0xba }
+  if b == 193 { return 0x78 }
+  if b == 194 { return 0x25 }
+  if b == 195 { return 0x2e }
+  if b == 196 { return 0x1c }
+  if b == 197 { return 0xa6 }
+  if b == 198 { return 0xb4 }
+  if b == 199 { return 0xc6 }
+  if b == 200 { return 0xe8 }
+  if b == 201 { return 0xdd }
+  if b == 202 { return 0x74 }
+  if b == 203 { return 0x1f }
+  if b == 204 { return 0x4b }
+  if b == 205 { return 0xbd }
+  if b == 206 { return 0x8b }
+  if b == 207 { return 0x8a }
+  if b == 208 { return 0x70 }
+  if b == 209 { return 0x3e }
+  if b == 210 { return 0xb5 }
+  if b == 211 { return 0x66 }
+  if b == 212 { return 0x48 }
+  if b == 213 { return 0x03 }
+  if b == 214 { return 0xf6 }
+  if b == 215 { return 0x0e }
+  if b == 216 { return 0x61 }
+  if b == 217 { return 0x35 }
+  if b == 218 { return 0x57 }
+  if b == 219 { return 0xb9 }
+  if b == 220 { return 0x86 }
+  if b == 221 { return 0xc1 }
+  if b == 222 { return 0x1d }
+  if b == 223 { return 0x9e }
+  if b == 224 { return 0xe1 }
+  if b == 225 { return 0xf8 }
+  if b == 226 { return 0x98 }
+  if b == 227 { return 0x11 }
+  if b == 228 { return 0x69 }
+  if b == 229 { return 0xd9 }
+  if b == 230 { return 0x8e }
+  if b == 231 { return 0x94 }
+  if b == 232 { return 0x9b }
+  if b == 233 { return 0x1e }
+  if b == 234 { return 0x87 }
+  if b == 235 { return 0xe9 }
+  if b == 236 { return 0xce }
+  if b == 237 { return 0x55 }
+  if b == 238 { return 0x28 }
+  if b == 239 { return 0xdf }
+  if b == 240 { return 0x8c }
+  if b == 241 { return 0xa1 }
+  if b == 242 { return 0x89 }
+  if b == 243 { return 0x0d }
+  if b == 244 { return 0xbf }
+  if b == 245 { return 0xe6 }
+  if b == 246 { return 0x42 }
+  if b == 247 { return 0x68 }
+  if b == 248 { return 0x41 }
+  if b == 249 { return 0x99 }
+  if b == 250 { return 0x2d }
+  if b == 251 { return 0x0f }
+  if b == 252 { return 0xb0 }
+  if b == 253 { return 0x54 }
+  if b == 254 { return 0xbb }
+  return 0x16
+}
+fn aes128_enc(key16, pt16) {
+  // state: 16 bytes (column-major: state[r + 4*c])
+  let st = mem_alloc(2)              // 16 bytes
+  let i = 0
+  while i < 16 { mem_store8(st + i, mem_load8(pt16 + i)); i = i + 1 }
+  // key schedule: 11 round keys of 16 bytes each
+  let rk = mem_alloc(11 * 2)        // 11*16 = 176 bytes = 22 i64
+  let c = 0
+  while c < 16 { mem_store8(rk + c, mem_load8(key16 + c)); c = c + 1 }
+  let rcon = 1
+  let r = 1
+  while r < 11 {
+    let base = r * 16
+    let prev = (r - 1) * 16
+    // last word of previous round key
+    let t0 = mem_load8(rk + prev + 12)
+    let t1 = mem_load8(rk + prev + 13)
+    let t2 = mem_load8(rk + prev + 14)
+    let t3 = mem_load8(rk + prev + 15)
+    // RotWord + SubWord
+    let g0 = aes_sbox(t1) ^ rcon
+    let g1 = aes_sbox(t2)
+    let g2 = aes_sbox(t3)
+    let g3 = aes_sbox(t0)
+    mem_store8(rk + base + 0, mem_load8(rk + prev + 0) ^ g0)
+    mem_store8(rk + base + 1, mem_load8(rk + prev + 1) ^ g1)
+    mem_store8(rk + base + 2, mem_load8(rk + prev + 2) ^ g2)
+    mem_store8(rk + base + 3, mem_load8(rk + prev + 3) ^ g3)
+    mem_store8(rk + base + 4, mem_load8(rk + prev + 4) ^ mem_load8(rk + base + 0))
+    mem_store8(rk + base + 5, mem_load8(rk + prev + 5) ^ mem_load8(rk + base + 1))
+    mem_store8(rk + base + 6, mem_load8(rk + prev + 6) ^ mem_load8(rk + base + 2))
+    mem_store8(rk + base + 7, mem_load8(rk + prev + 7) ^ mem_load8(rk + base + 3))
+    mem_store8(rk + base + 8, mem_load8(rk + prev + 8) ^ mem_load8(rk + base + 4))
+    mem_store8(rk + base + 9, mem_load8(rk + prev + 9) ^ mem_load8(rk + base + 5))
+    mem_store8(rk + base + 10, mem_load8(rk + prev + 10) ^ mem_load8(rk + base + 6))
+    mem_store8(rk + base + 11, mem_load8(rk + prev + 11) ^ mem_load8(rk + base + 7))
+    mem_store8(rk + base + 12, mem_load8(rk + prev + 12) ^ mem_load8(rk + base + 8))
+    mem_store8(rk + base + 13, mem_load8(rk + prev + 13) ^ mem_load8(rk + base + 9))
+    mem_store8(rk + base + 14, mem_load8(rk + prev + 14) ^ mem_load8(rk + base + 10))
+    mem_store8(rk + base + 15, mem_load8(rk + prev + 15) ^ mem_load8(rk + base + 11))
+    // update rcon for next round (multiply by 2 in GF(2^8))
+    rcon = aes_xtime(rcon)
+    r = r + 1
+  }
+  // AddRoundKey(0)
+  i = 0
+  while i < 16 { mem_store8(st + i, mem_load8(st + i) ^ mem_load8(rk + 0 + i)); i = i + 1 }
+  // 9 full rounds + final round
+  r = 1
+  while r < 10 {
+    // SubBytes
+    i = 0
+    while i < 16 { mem_store8(st + i, aes_sbox(mem_load8(st + i))); i = i + 1 }
+    // ShiftRows
+    let s1 = mem_load8(st + 1); let s5 = mem_load8(st + 5); let s9 = mem_load8(st + 9); let s13 = mem_load8(st + 13)
+    let s2 = mem_load8(st + 2); let s6 = mem_load8(st + 6); let s10 = mem_load8(st + 10); let s14 = mem_load8(st + 14)
+    let s3 = mem_load8(st + 3); let s7 = mem_load8(st + 7); let s11 = mem_load8(st + 11); let s15 = mem_load8(st + 15)
+    mem_store8(st + 1, s5); mem_store8(st + 5, s9); mem_store8(st + 9, s13); mem_store8(st + 13, s1)
+    mem_store8(st + 2, s10); mem_store8(st + 6, s14); mem_store8(st + 10, s2); mem_store8(st + 14, s6)
+    mem_store8(st + 3, s15); mem_store8(st + 7, s3); mem_store8(st + 11, s7); mem_store8(st + 15, s11)
+    // MixColumns
+    i = 0
+    while i < 4 {
+      let c0 = i * 4 + 0; let c1 = i * 4 + 1; let c2 = i * 4 + 2; let c3 = i * 4 + 3
+      let a0 = mem_load8(st + c0); let a1 = mem_load8(st + c1); let a2 = mem_load8(st + c2); let a3 = mem_load8(st + c3)
+      mem_store8(st + c0, aes_mul(a0, 2) ^ aes_mul(a1, 3) ^ a2 ^ a3)
+      mem_store8(st + c1, a0 ^ aes_mul(a1, 2) ^ aes_mul(a2, 3) ^ a3)
+      mem_store8(st + c2, a0 ^ a1 ^ aes_mul(a2, 2) ^ aes_mul(a3, 3))
+      mem_store8(st + c3, aes_mul(a0, 3) ^ a1 ^ a2 ^ aes_mul(a3, 2))
+      i = i + 1
+    }
+    // AddRoundKey(r)
+    i = 0
+    while i < 16 { mem_store8(st + i, mem_load8(st + i) ^ mem_load8(rk + r * 16 + i)); i = i + 1 }
+    r = r + 1
+  }
+  // final round (SubBytes, ShiftRows, AddRoundKey — no MixColumns)
+  i = 0
+  while i < 16 { mem_store8(st + i, aes_sbox(mem_load8(st + i))); i = i + 1 }
+  let s1 = mem_load8(st + 1); let s5 = mem_load8(st + 5); let s9 = mem_load8(st + 9); let s13 = mem_load8(st + 13)
+  let s2 = mem_load8(st + 2); let s6 = mem_load8(st + 6); let s10 = mem_load8(st + 10); let s14 = mem_load8(st + 14)
+  let s3 = mem_load8(st + 3); let s7 = mem_load8(st + 7); let s11 = mem_load8(st + 11); let s15 = mem_load8(st + 15)
+  mem_store8(st + 1, s5); mem_store8(st + 5, s9); mem_store8(st + 9, s13); mem_store8(st + 13, s1)
+  mem_store8(st + 2, s10); mem_store8(st + 6, s14); mem_store8(st + 10, s2); mem_store8(st + 14, s6)
+  mem_store8(st + 3, s15); mem_store8(st + 7, s3); mem_store8(st + 11, s7); mem_store8(st + 15, s11)
+  i = 0
+  while i < 16 { mem_store8(st + i, mem_load8(st + i) ^ mem_load8(rk + 10 * 16 + i)); i = i + 1 }
+  return st
+}
+

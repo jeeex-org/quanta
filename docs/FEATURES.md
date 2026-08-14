@@ -1,0 +1,215 @@
+# Quanta — Features: Shipped vs. To-Do
+
+Source-of-truth feature inventory for the Quanta x86 self-hosting compiler.
+**Derived directly from the 0.0.42 source** (keyword table `ktext` in helpers.quanta,
+53 builtins in `is_bltn`, parser dispatch in parse.quanta, 2026-08-14). No guesswork:
+every row maps to a real token/builtin in source.
+
+Status legend:
+- ✅ done — implemented and exercised
+- 🟡 partial — works in a limited form, or has a known bug/limitation, or lexed-but-not-parsed
+- ❌ todo — not implemented (on the build-order queue to 1.0)
+
+Test legend (the **Test?** column):
+- ✅ gate — a test_suite in the gate (EXPECTED.tsv, 73 core tests) covers it
+- 🟡 file-only — a test file exists but is NOT in the gate (e.g. std_* removed per rule "core only until 1.0", or feature unimplemented)
+- ❌ none — no test exists
+
+"Core" = the language itself. "Builtins" = inline-code primitives emitted by the compiler.
+
+---
+
+## A. Core — Keywords & Syntax (lexer `ktext` codes 1–57)
+| Keyword | ktext | Status | Test? | Notes |
+|---|---|---|---|---|
+| fn | 1 | ✅ done | ✅ gate | func defs |
+| let | 2 | ✅ done | ✅ gate | variable binding |
+| if | 3 | ✅ done | ✅ gate | elseif_test |
+| loop | 5 | ✅ done | ✅ gate | loop_test, parse_loop |
+| while | 6 | ✅ done | ✅ gate | break_continue |
+| for | 7 | ✅ done | ✅ gate | for-in (array) + C-style `for i=1;i<=n;i=i+1`; range `..` NOT parsed |
+| break | 8 | ✅ done | ✅ gate | |
+| continue | 9 | ✅ done | ✅ gate | |
+| return | 16 | ✅ done | ✅ gate | |
+| unsafe | 18 | ✅ done | ✅ gate | unsafe_block |
+| match | 22 | 🟡 partial | ✅ gate | match_test; expression arms only (block arms TODO) |
+| const | 57 | ✅ done | ✅ gate | const_test |
+| defer | token | ✅ done | ✅ gate | defer_test |
+| in | token | ✅ done | ✅ gate | for-in |
+| alias | 17 | ✅ done | ✅ gate | alias_test (function alias newname=existingfn) |
+| extern "C" | 19 | 🟡 partial | 🟡 file-only | funcscan extern; syscall_test exercises |
+| struct | token | ✅ done | ✅ gate | struct_test, struct_methods_test, struct_literal_test (literal coverage present) |
+| enum | 21 | ❌ todo | 🟡 file-only | enum_test NOT in gate; only bare Some/None/Ok/Err match |
+| type | 23 | ❌ todo | ❌ none | lexed, unparsed |
+| interface | 24 | ❌ todo | 🟡 file-only | trait_test NOT in gate; no dispatch |
+| impl | 25 | ❌ todo | ❌ none | scanimpls records, not consumed |
+| trait | 26 | ❌ todo | 🟡 file-only | trait_test NOT in gate; no dispatch |
+| where | 27 | ❌ todo | ❌ none | lexed, unparsed |
+| Option/Some/None | 28/29/30 | 🟡 partial | 🟡 file-only | option_test NOT in gate; built-in magic only |
+| Result/Ok/Err | 31/32/33 | 🟡 partial | 🟡 file-only | result_test NOT in gate; built-in magic only |
+| ref | 34 | ❌ todo | ❌ none | lexed, unparsed |
+| mut | 35 | ❌ todo | ❌ none | lexed, unparsed |
+| move | 36 | ❌ todo | ❌ none | lexed, unparsed |
+| String | 37 | ❌ todo | ❌ none | lexed, unparsed |
+| as | 41 | ❌ todo | ❌ none | lexed, unparsed |
+| raw | 38/52 | ❌ todo | ❌ none | lexed, unparsed |
+| asm | 40/53 | ❌ todo | 🟡 file-only | asm_test exists but NOT in gate |
+| volatile | 39/54 | ❌ todo | ❌ none | lexed, unparsed |
+| usize | 42/48 | 🟡 partial | ✅ gate | lexed; used as size type |
+| u8 | 44 | ❌ todo | ❌ none | lexed, unparsed (mask builtin u8 exists) |
+| u16 | 45 | ❌ todo | ❌ none | lexed, unparsed |
+| u32 | 46 | 🟡 partial | ✅ gate | u32 mask builtin exists |
+| u64 | 47 | 🟡 partial | ✅ gate | u64 mask builtin exists |
+| bool | 49 | ❌ todo | ❌ none | lexed, unparsed |
+| char | 50 | ❌ todo | ❌ none | lexed, unparsed |
+| byte | 51 | ❌ todo | ❌ none | lexed, unparsed |
+| int | 55 | ❌ todo | ✅ gate | signed default alias; bare literal type |
+| and / or / not | 13/14/15 | ❌ todo | ❌ none | lexed, NOT parsed (use && / \|\| / !) |
+| true / false | 10/11 | ❌ todo | ❌ none | lexed, NOT parsed (use 1/0) |
+| global | 20 | ❌ todo | ❌ none | lexed, NOT parsed (use extern/let) |
+
+## B. Core — Types
+| Type | Status | Test? | Notes |
+|---|---|---|---|
+| i64 (default integer) | ✅ done | ✅ gate | arithmetic, param* |
+| f64 | ✅ done | ✅ gate | float_test rc=159, simple_fadd rc=7 |
+| usize | 🟡 partial | ✅ gate | lexed; used as size type |
+| u32 / u64 (masks) | 🟡 partial | ✅ gate | u32/u64 builtins; no native type keyword |
+| u8 / u16 | ❌ todo | ❌ none | only mask builtins conceptually |
+| bool | ❌ todo | ❌ none | lexed, unparsed |
+| char | ❌ todo | ❌ none | lexed, unparsed |
+| byte | ❌ todo | ❌ none | lexed, unparsed |
+| float literals (`3.14`) | ❌ todo | ❌ none | lexer hard-errors "not supported" |
+| string (real type) | ❌ todo | ❌ none | TT_STRING reserved; byte-buffer + print only |
+| struct | ✅ done | ✅ gate | fields + `obj.method` + literal (struct_literal_test in gate) |
+| enum (user-defined) | ❌ todo | 🟡 file-only | enum_test NOT in gate |
+| tuple `(T,U)` | ❌ todo | 🟡 file-only | tuple_test NOT in gate (mk_any hack) |
+| typed array/slice | ❌ todo | ✅ gate | array_test/forin_* cover untyped `[...]` |
+
+## C. Core — Control Flow
+| Feature | Status | Test? | Notes |
+|---|---|---|---|
+| if/else | ✅ done | ✅ gate | elseif_test |
+| while | ✅ done | ✅ gate | break_continue |
+| loop | ✅ done | ✅ gate | parse_loop |
+| for-in (array) | ✅ done | ✅ gate | forin_basic/break/nested/sum |
+| match (expr arms) | ✅ done | ✅ gate | match_test |
+| break / continue | ✅ done | ✅ gate | |
+| return / defer | ✅ done | ✅ gate | defer_test |
+| for-range `for i in 0..n` | ❌ todo | ❌ none | `..` operator NOT parsed (verified) |
+| match block arms `1 => { }` | ❌ todo | ❌ none | only expression arms emit IR |
+| `?` early-return propagation | 🟡 partial | 🟡 file-only | option_test/result_test NOT in gate; only unwrap |
+| loop expressions / labeled break w/ value | ❌ todo | ❌ none | |
+| try/catch | ❌ todo | ❌ none | only panic + `?` unwrap |
+
+## D. Core — Expressions & Operators
+| Feature | Status | Test? | Notes |
+|---|---|---|---|
+| arithmetic (+ - * / %) | ✅ done | ✅ gate | arithmetic |
+| bitwise (& | ^ ~ << >>) | ✅ done | ✅ gate | bitwise_not |
+| comparisons (== != < > <= >=) | ✅ done | ✅ gate | |
+| logical (&& \|\| !) | ✅ done | ✅ gate | (and/or/not keywords unparsed; use symbols) |
+| ternary | ✅ done | ✅ gate | |
+| field access / index | ✅ done | ✅ gate | struct_test, array_test |
+| unsigned arith | ✅ done | ✅ gate | unsigned_ops (udiv/umod/ult/ugt/ulte/ugte) |
+| operator overloading | ❌ todo | ❌ none | |
+| range `..` expression | ❌ todo | ❌ none | needed by for-range |
+| closure literals `|a| a+1` | ❌ todo | 🟡 file-only | closure_test NOT in gate (no lambda syntax) |
+
+## E. Memory & Runtime
+| Feature | Status | Test? | Notes |
+|---|---|---|---|
+| mem_alloc/free/mmap/realloc | ✅ done | ✅ gate | mem_test, test_mmap |
+| memcpy/memcmp/memmove | ✅ done | ✅ gate | memops_test |
+| mem_load/mem_store(+8) | ✅ done | ✅ gate | raw_ptr_test |
+| defer (LIFO replay) | ✅ done | ✅ gate | defer_test |
+| unsafe blocks | ✅ done | ✅ gate | unsafe_block |
+| real allocator (free-list/GC) | ❌ todo | ❌ none | bump mmap only |
+| callee load-store-to-same-addr aliasing | 🟡 BUG | ❌ none | corrupts loops over SHA/AES/map — **highest-priority fix** |
+| stack unwind / destructors / RAII | ❌ todo | ❌ none | defer is manual |
+| ref/mut/move (ownership) | ❌ todo | ❌ none | tokens reserved |
+
+## F. Builtins — Already Shipped (53 registered, prefixes expanded)
+| Group | Items | Test? |
+|---|---|---|
+| syscall family | syscall(1–6) | ✅ gate (syscall_test) |
+| exit / panic | exit, panic | ✅ gate (exit_test) |
+| memory map | mmap | ✅ gate (test_mmap) |
+| heap | mem_alloc/free/realloc | ✅ gate (mem_test) |
+| mem ops | memcpy, memcmp, memmove, mem_load, mem_store(+8) | ✅ gate (memops_test, raw_ptr_test) |
+| file I/O | file_open, file_read, file_write, file_close | ✅ gate (file_open_test rc=3, file_io, file_write_test) |
+| print | print, printi, println, prints, printsp, newline | ✅ gate (prints_family) |
+| container | len, str, push, pop, vec_get, vec_set, vec_load, vec_store, vec_add, vec_sub, vec_mul, vec_div | ✅ gate (array_test, etc.) |
+| variadic / any | arg, mk_any | ✅ gate (arg_or rc=1, arg_test rc=40) |
+| closures | fnptr, closure_call | ✅ gate (fnptr_test rc=7, closure_test rc=7) |
+| float arith | fadd, fsub, fmul, fdiv, i2f, f2i | ✅ gate (float_test rc=159, simple_fadd rc=7) |
+| unsigned arith | udiv, umod, ult, ugt, ulte, ugte, u8, u32, u64 | ✅ gate (unsigned_ops) |
+| byte/endianness | bswap, popcount, clz, ctz, rotl, rotr | ✅ gate (bits_test) |
+| time | gettimeofday, nanosleep, sleep | ✅ gate (time_test) |
+
+## G. Builtins — To-Do
+| Group | Items | Test? |
+|---|---|---|
+| float comparisons | feq, flt, fgt, fle, fge, fisnan, fisinf | ❌ none (planned: fcmp_test) |
+| process/env | getpid, getppid, getenv, argc/environ | ❌ none (planned: proc_test) |
+| stdin I/O | getchar, getline | ❌ none (planned: input_test) |
+| fs metadata | stat, fstat, lseek, unlink, mkdir, chdir, rename | ❌ none (planned: fsmeta_test) |
+| string ops | strcat, substr, strcmp, str_split, utf8 | ❌ none (planned: strtest) |
+| math | sqrt, sin, cos, tan, pow, log, abs, min/max, floor, ceil | ❌ none (planned: math_test) |
+| atomics | atomic_load/store/add/cmpxchg + futex | ❌ none (planned: atomic_test) |
+| networking | socket/connect/bind/listen/accept | ❌ none (planned: net_test) |
+| introspection | abort, debugbreak, stack-trace | ❌ none (planned: abort_test) |
+| random | getrandom, rand | ❌ none (planned: rand_test) |
+| bit/byte extras | parity, bitfield insert/extract, per-size swap | ❌ none |
+| intrinsics | prefetch, fence, branch hints | ❌ none |
+
+## H. Tooling
+| Item | Status | Test? | Notes |
+|---|---|---|---|
+| Quanta-native code-writing tool | ❌ todo | ❌ none | user-stated goal — replace python heredoc surgery |
+| debugger/objdump integration | ❌ todo | ❌ none | |
+| package manager | ❌ todo | ❌ none | |
+| build system (beyond `qc src bin`) | ❌ todo | ❌ none | |
+
+---
+
+## Summary counts (source-derived)
+- **Keywords (ktext): 57 codes defined; ~19 parsed, ~13 lexed-only gaps, rest partial.**
+- **Builtins registered: 53 (prefixes expanded).**
+- **Core tests in gate: 75** (was 73; +alias_test, +loop_test). `std_*` tests exist as files but
+  removed from gate (core-only rule); several lib tests also file-only pending 1.0+.
+- **Test framework note:** tests `return`/`exit` a *computed value* (not just 0); EXPECTED.tsv's
+  `expected_rc` is that computed answer. So non-zero expected_rc entries are correct results, not
+  hidden failures. Verified by reading test bodies (e.g. array_test returns 200 = a.1; simple_fadd
+  returns 7 = 3.0+4.0). The gate is genuinely green.
+
+## Build Order to 1.0 (one WIP version each; gate green before promote)
+
+**Sequencing (2026-08-14):** core tech-debts fixed FIRST, one atomic fix per version, before
+new features. **0.0.43 – 0.0.50 = bug/debt window; 0.0.51+ = new features.** Diagnosis is
+context (done), not a version.
+
+| Priority | Versions | Scope (debt to clear, each version ONE small fix) |
+|---|---|---|
+| **Aliasing fix** | 0.0.43 | Fix the store memory-barrier in `flush_all`/`mem_store` path so live vregs derived from `mem_load` survive a `mem_store`. `reg_alias` goes GREEN + 2nd regression. |
+| **Remaining partials** | 0.0.44–0.0.46 | 0.44 `usize`/`u32`/`u64`/`u8`/`u16` type keywords; 0.45 complete `extern "C"`; 0.46 `?` early-return propagation. |
+| **Spare debt** | 0.0.47–0.0.50 | Absorb any debt found during 0.0.43–0.0.46. |
+| **P2 builtins** | 0.0.51–0.0.60 | float cmp, proc/env, stdin, fs, strings, math, atomics, net, introspection, random |
+| **P3 language** | 0.0.61–0.0.71 | float literals, enums (user-defined), tuples, generics, traits, modules, real char/byte/string/bool, ref/mut/move, op-overload, closure literals, parse and/or/not/true/false/global |
+| **P4 tooling** | 0.0.72 | Quanta-native code-writing tool |
+
+**1.0 = core + builtins complete** → std/lib (crypto split, net/lib, serde) resumes at 1.0+.
+
+
+### Notes
+- **Derived from source**, not memory: ktext table (helpers.quanta), is_bltn (features.quanta),
+  parser dispatch (parse.quanta), token tables (tokens.quanta), 2026-08-14.
+- "One feature per WIP version" still holds — the build-order list is a QUEUE, not a bundle.
+- Correctness fixes (0.0.43–0.0.50 debt window) come BEFORE new builtins: a wrong
+  codegen silently breaks earlier-green tests. Each debt version is ONE small atomic fix.
+- **0.0.43–0.0.50 = bug/debt window; 0.0.51+ = new features.** No new builtin/feature
+  work starts until the debt window clears (per 2026-08-14 sequencing decision).
+- Test column reflects the CURRENT gate (EXPECTED.tsv, 73 core tests). `std_*` and several lib
+  tests exist as files but were removed from the gate per "core only until 1.0".
+- Related docs: ROADMAP.md (campaign plan), agents/rules/PROJECT_RULES.md (rules). All gitignored
+  (machine-local); FEATURES.md is the human-readable summary.

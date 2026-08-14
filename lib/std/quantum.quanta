@@ -1,0 +1,240 @@
+// lib/quantum — post-quantum cryptographic primitives for Quanta.
+// Keccak-f[1600] family: SHA-3 (256/512) and SHAKE128/256 XOFs. SHA-3 is the
+// NIST-standard quantum-resistant hash (Grover yields only a sqrt speedup, and
+// its Sponge construction is algorithmically independent of SHA-2). SHAKE is
+// the XOF used inside lattice PQC (Kyber/Dilithium), so this module is the
+// foundation for those KEM/signature schemes.
+//   import std/quantum
+import std/crypto
+
+// Round constants for Keccak-f[1600].
+fn keccak_rc(t) {
+  if t == 0 { return 0x0000000000000001 }
+  if t == 1 { return 0x0000000000008082 }
+  if t == 2 { return 0x800000000000808a }
+  if t == 3 { return 0x8000000080008000 }
+  if t == 4 { return 0x000000000000808b }
+  if t == 5 { return 0x0000000080000001 }
+  if t == 6 { return 0x8000000080008081 }
+  if t == 7 { return 0x8000000000008009 }
+  if t == 8 { return 0x000000000000008a }
+  if t == 9 { return 0x0000000000000088 }
+  if t == 10 { return 0x0000000080008009 }
+  if t == 11 { return 0x000000008000000a }
+  if t == 12 { return 0x000000008000808b }
+  if t == 13 { return 0x800000000000008b }
+  if t == 14 { return 0x8000000000008089 }
+  if t == 15 { return 0x8000000000008003 }
+  if t == 16 { return 0x8000000000008002 }
+  if t == 17 { return 0x8000000000000080 }
+  if t == 18 { return 0x000000000000800a }
+  if t == 19 { return 0x800000008000000a }
+  if t == 20 { return 0x8000000080008081 }
+  if t == 21 { return 0x8000000000008080 }
+  if t == 22 { return 0x0000000080000001 }
+  return 0x8000000080008008
+}
+
+// rotl64(x, n): rotate-left within 64 bits.
+fn rotl64(x, n) { return u64((x << n) | (x >> (64 - n))) }
+
+// keccak_f(st): in-place 24-round Keccak-f[1600] on 25 i64 lanes (st[0..24]).
+fn keccak_f(st) {
+  let rnd = 0
+  while rnd < 24 {
+    // --- theta ---
+    let c0 = mem_load(st + 0*8) ^ mem_load(st + 5*8) ^ mem_load(st + 10*8) ^ mem_load(st + 15*8) ^ mem_load(st + 20*8)
+    let c1 = mem_load(st + 1*8) ^ mem_load(st + 6*8) ^ mem_load(st + 11*8) ^ mem_load(st + 16*8) ^ mem_load(st + 21*8)
+    let c2 = mem_load(st + 2*8) ^ mem_load(st + 7*8) ^ mem_load(st + 12*8) ^ mem_load(st + 17*8) ^ mem_load(st + 22*8)
+    let c3 = mem_load(st + 3*8) ^ mem_load(st + 8*8) ^ mem_load(st + 13*8) ^ mem_load(st + 18*8) ^ mem_load(st + 23*8)
+    let c4 = mem_load(st + 4*8) ^ mem_load(st + 9*8) ^ mem_load(st + 14*8) ^ mem_load(st + 19*8) ^ mem_load(st + 24*8)
+    let d0 = c4 ^ rotl64(c1, 1)
+    let d1 = c0 ^ rotl64(c2, 1)
+    let d2 = c1 ^ rotl64(c3, 1)
+    let d3 = c2 ^ rotl64(c4, 1)
+    let d4 = c3 ^ rotl64(c0, 1)
+    let x = 0
+    while x < 25 {
+      let lane = mem_load(st + x*8)
+      if x == 0 || x == 5 || x == 10 || x == 15 || x == 20 { lane = lane ^ d0 }
+      if x == 1 || x == 6 || x == 11 || x == 16 || x == 21 { lane = lane ^ d1 }
+      if x == 2 || x == 7 || x == 12 || x == 17 || x == 22 { lane = lane ^ d2 }
+      if x == 3 || x == 8 || x == 13 || x == 18 || x == 23 { lane = lane ^ d3 }
+      if x == 4 || x == 9 || x == 14 || x == 19 || x == 24 { lane = lane ^ d4 }
+      mem_store(st + x*8, lane)
+      x = x + 1
+    }
+    // --- rho + pi ---
+    // Read all 25 lanes, apply rho (rotation) and pi (permutation) into a temp, then write back.
+    let A0 = mem_load(st + 0*8); let A1 = mem_load(st + 1*8); let A2 = mem_load(st + 2*8); let A3 = mem_load(st + 3*8); let A4 = mem_load(st + 4*8)
+    let A5 = mem_load(st + 5*8); let A6 = mem_load(st + 6*8); let A7 = mem_load(st + 7*8); let A8 = mem_load(st + 8*8); let A9 = mem_load(st + 9*8)
+    let A10 = mem_load(st + 10*8); let A11 = mem_load(st + 11*8); let A12 = mem_load(st + 12*8); let A13 = mem_load(st + 13*8); let A14 = mem_load(st + 14*8)
+    let A15 = mem_load(st + 15*8); let A16 = mem_load(st + 16*8); let A17 = mem_load(st + 17*8); let A18 = mem_load(st + 18*8); let A19 = mem_load(st + 19*8)
+    let A20 = mem_load(st + 20*8); let A21 = mem_load(st + 21*8); let A22 = mem_load(st + 22*8); let A23 = mem_load(st + 23*8); let A24 = mem_load(st + 24*8)
+    // pi: (x,y) -> (y, (2x+3y)%5) ; rho offset r[x,y]
+    mem_store(st + 0*8,  A0)
+    mem_store(st + 1*8,  rotl64(A1, 44))
+    mem_store(st + 2*8,  rotl64(A12, 43))
+    mem_store(st + 3*8,  rotl64(A23, 21))
+    mem_store(st + 4*8,  rotl64(A14, 14))
+    mem_store(st + 5*8,  rotl64(A10, 3))
+    mem_store(st + 6*8,  rotl64(A21, 45))
+    mem_store(st + 7*8,  rotl64(A7, 8))
+    mem_store(st + 8*8,  rotl64(A18, 18))
+    mem_store(st + 9*8,  rotl64(A4, 2))
+    mem_store(st + 10*8, rotl64(A20, 62))
+    mem_store(st + 11*8, rotl64(A11, 6))
+    mem_store(st + 12*8, rotl64(A2, 61))
+    mem_store(st + 13*8, rotl64(A13, 28))
+    mem_store(st + 14*8, rotl64(A24, 23))
+    mem_store(st + 15*8, rotl64(A15, 20))
+    mem_store(st + 16*8, rotl64(A6, 1))
+    mem_store(st + 17*8, rotl64(A22, 36))
+    mem_store(st + 18*8, rotl64(A8, 10))
+    mem_store(st + 19*8, rotl64(A19, 15))
+    mem_store(st + 20*8, rotl64(A5, 39))
+    mem_store(st + 21*8, rotl64(A16, 41))
+    mem_store(st + 22*8, rotl64(A17, 45))
+    mem_store(st + 23*8, rotl64(A3, 25))
+    mem_store(st + 24*8, rotl64(A9, 29))
+    // --- chi ---
+    let B0 = mem_load(st + 0*8); let B1 = mem_load(st + 1*8); let B2 = mem_load(st + 2*8); let B3 = mem_load(st + 3*8); let B4 = mem_load(st + 4*8)
+    let B5 = mem_load(st + 5*8); let B6 = mem_load(st + 6*8); let B7 = mem_load(st + 7*8); let B8 = mem_load(st + 8*8); let B9 = mem_load(st + 9*8)
+    let B10 = mem_load(st + 10*8); let B11 = mem_load(st + 11*8); let B12 = mem_load(st + 12*8); let B13 = mem_load(st + 13*8); let B14 = mem_load(st + 14*8)
+    let B15 = mem_load(st + 15*8); let B16 = mem_load(st + 16*8); let B17 = mem_load(st + 17*8); let B18 = mem_load(st + 18*8); let B19 = mem_load(st + 19*8)
+    let B20 = mem_load(st + 20*8); let B21 = mem_load(st + 21*8); let B22 = mem_load(st + 22*8); let B23 = mem_load(st + 23*8); let B24 = mem_load(st + 24*8)
+    mem_store(st + 0*8,  B0 ^ ((~B1) & B2))
+    mem_store(st + 1*8,  B1 ^ ((~B2) & B3))
+    mem_store(st + 2*8,  B2 ^ ((~B3) & B4))
+    mem_store(st + 3*8,  B3 ^ ((~B4) & B0))
+    mem_store(st + 4*8,  B4 ^ ((~B0) & B1))
+    mem_store(st + 5*8,  B5 ^ ((~B6) & B7))
+    mem_store(st + 6*8,  B6 ^ ((~B7) & B8))
+    mem_store(st + 7*8,  B7 ^ ((~B8) & B9))
+    mem_store(st + 8*8,  B8 ^ ((~B9) & B5))
+    mem_store(st + 9*8,  B9 ^ ((~B5) & B6))
+    mem_store(st + 10*8, B10 ^ ((~B11) & B12))
+    mem_store(st + 11*8, B11 ^ ((~B12) & B13))
+    mem_store(st + 12*8, B12 ^ ((~B13) & B14))
+    mem_store(st + 13*8, B13 ^ ((~B14) & B10))
+    mem_store(st + 14*8, B14 ^ ((~B10) & B11))
+    mem_store(st + 15*8, B15 ^ ((~B16) & B17))
+    mem_store(st + 16*8, B16 ^ ((~B17) & B18))
+    mem_store(st + 17*8, B17 ^ ((~B18) & B19))
+    mem_store(st + 18*8, B18 ^ ((~B19) & B15))
+    mem_store(st + 19*8, B19 ^ ((~B15) & B16))
+    mem_store(st + 20*8, B20 ^ ((~B21) & B22))
+    mem_store(st + 21*8, B21 ^ ((~B22) & B23))
+    mem_store(st + 22*8, B22 ^ ((~B23) & B24))
+    mem_store(st + 23*8, B23 ^ ((~B24) & B20))
+    mem_store(st + 24*8, B24 ^ ((~B20) & B21))
+    // --- iota ---
+    let rc = keccak_rc(rnd)
+    mem_store(st + 0*8, mem_load(st + 0*8) ^ rc)
+    rnd = rnd + 1
+  }
+}
+
+// sha3(out, outlen, msg, mlen, rate, delim): generic Keccak sponge.
+//   rate  = lane-rate in BYTES (136 for SHA3-256, 144 for SHA3-512, etc.)
+//   delim = domain suffix byte (0x06 for SHA-3, 0x1f for SHAKE)
+fn keccak_sponge(msg, mlen, rate, delim, out, outlen) {
+  let st = mem_alloc(25)            // 25 i64 lanes (200 bytes)
+  let i = 0
+  while i < 25 { mem_store(st + i*8, 0); i = i + 1 }
+  // absorb (rate in bytes -> rate/8 lanes per block)
+  let rate_lanes = rate >> 3
+  let blocks = (mlen + rate) / rate
+  let b = 0
+  while b < blocks {
+    let off = b * rate
+    let j = 0
+    while j < rate_lanes {
+      // XOR message bytes into lane j (big-endian? Keccak is little-endian per lane)
+      let lane = 0
+      let k = 0
+      while k < 8 {
+        let pos = off + j*8 + k
+        let bb = 0
+        if pos < mlen { bb = mem_load8(msg + pos) }
+        lane = lane | (bb << (k*8))
+        k = k + 1
+      }
+      mem_store(st + j*8, mem_load(st + j*8) ^ u64(lane))
+      j = j + 1
+    }
+    keccak_f(st)
+    b = b + 1
+  }
+  // pad: append delim then 0x00... then 0x80 at the last lane byte of the block
+  // (Handled by treating the message's remainder + padding in the final partial block.)
+  // Simpler robust approach: re-absorb the final partial block with padding.
+  let rem = mlen % rate
+  let last_off = (blocks - 1) * rate   // wait; for mlen < rate, blocks=1, last_off=0
+  // We already absorbed full blocks above. For the final (possibly partial) block we
+  // must absorb the tail + padding. Recompute tail block:
+  let tail_off = blocks * rate
+  // (if mlen is an exact multiple of rate and delim needs a new block, handle below)
+  // Absorb the remainder:
+  let jj = 0
+  while jj < rate_lanes {
+    let lane = 0
+    let k = 0
+    while k < 8 {
+      let pos = tail_off + jj*8 + k
+      let bb = 0
+      if pos < mlen { bb = mem_load8(msg + pos) }
+      // padding: first free byte gets delim; last lane byte of block gets 0x80
+      if pos == mlen { bb = delim }
+      if pos == ((blocks + 1) * rate - 1) { bb = bb | 0x80 }
+      lane = lane | (bb << (k*8))
+      k = k + 1
+    }
+    mem_store(st + jj*8, mem_load(st + jj*8) ^ u64(lane))
+    jj = jj + 1
+  }
+  keccak_f(st)
+  // squeeze
+  let produced = 0
+  while produced < outlen {
+    let j = 0
+    while j < rate_lanes {
+      let lane = mem_load(st + j*8)
+      let k = 0
+      while k < 8 {
+        if produced + j*8 + k < outlen {
+          mem_store8(out + produced + j*8 + k, u64(lane >> (k*8)) & 0xff)
+        }
+        k = k + 1
+      }
+      j = j + 1
+      produced = produced + rate
+      if produced < outlen { keccak_f(st) }
+    }
+  }
+}
+
+// sha3_256(msg, mlen) -> 32-byte digest buffer.
+fn sha3_256(msg, mlen) {
+  let out = mem_alloc(4)   // 32 bytes
+  keccak_sponge(msg, mlen, 136, 0x06, out, 32)
+  return out
+}
+// sha3_512(msg, mlen) -> 64-byte digest buffer.
+fn sha3_512(msg, mlen) {
+  let out = mem_alloc(8)   // 64 bytes
+  keccak_sponge(msg, mlen, 72, 0x06, out, 64)
+  return out
+}
+// shake128(msg, mlen, outlen) -> outlen-byte buffer (XOF).
+fn shake128(msg, mlen, outlen) {
+  let out = mem_alloc((outlen + 7) >> 3)
+  keccak_sponge(msg, mlen, 168, 0x1f, out, outlen)
+  return out
+}
+// shake256(msg, mlen, outlen) -> outlen-byte buffer (XOF).
+fn shake256(msg, mlen, outlen) {
+  let out = mem_alloc((outlen + 7) >> 3)
+  keccak_sponge(msg, mlen, 136, 0x1f, out, outlen)
+  return out
+}
