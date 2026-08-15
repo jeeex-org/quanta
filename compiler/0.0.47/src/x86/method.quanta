@@ -1,0 +1,773 @@
+// === METHOD / SELF (t8) ===
+// obj.method(args) desugars to method(obj, args...): `self` is just the
+// method's first parameter (a regular name, no new keyword). The method-call
+// path only runs when user code uses `obj.NAME` (alpha); the compiler source
+// never does, so it does not trip the allocator hazard.
+
+// parse_call(nm, nl): parse `name(args)` using the shared arg machinery and
+// emit IR_CALL. Returns the result vreg. Accepts an optional leading `selfv`
+// (a vreg to prepend as param 0) for method calls.
+fn parse_call(nm, nl) {
+    let selfv = -1
+    return parse_call_impl(nm, nl, selfv)
+}
+
+fn parse_method_call(selfv, mnm, ml) {
+    return parse_call_impl(mnm, ml, selfv)
+}
+
+fn parse_call_impl(nm, nl, selfv) {
+    // P10: Check for generic type arguments <T, U> after function name
+    // '<' and '>' are TT_OP (values 60/62) — parser checks context
+    let gen_args_count = 0
+    let gen_args = mmap(8000)  // store type argument identifiers
+    if tokp<tokc && tokt(tokp)==TT_OP && tokv(tokp)==60 {
+        adv()  // consume '<'
+        while tokp<tokc {
+            if tokt(tokp)==TT_OP && tokv(tokp)==62 { adv(); break }
+            if tokt(tokp)==TT_ID || tokt(tokp)==TT_KEY {
+                w64(gen_args + gen_args_count*16, tokv(tokp))
+                w64(gen_args + gen_args_count*16 + 8, tokln(tokp))
+                gen_args_count = gen_args_count + 1
+                adv()
+                if tokp<tokc && tokt(tokp)==TT_PNCT && tokv(tokp)==44 { adv() }  // skip comma
+            } else {
+                adv()
+            }
+        }
+        // After loop, tokp is at '>' or past it; advance to '('
+        adv()  // consume '('
+    }
+    // t10: fnptr(FNAME) -> code pointer as a runtime value. Special-cased
+    // because its argument is a compile-time function NAME, not a value expr.
+    if nl==5&&r8(src+nm)=='f'&&r8(src+nm+1)=='n'&&r8(src+nm+2)=='p'&&r8(src+nm+3)=='t'&&r8(src+nm+4)=='r' {
+        adv()  // consume '('
+        if !(peek()==TT_ID) { compile_error(0, nm, nl) }
+        let fnnm = pval(); let fnln = plen(); adv()  // consume FNAME
+        mpnct(41)  // ')'
+        let fi = findfn(fnnm, fnln)
+        if fi<0 { compile_error(0, fnnm, fnln) }
+        let vr = nv(); iremit(IR_FNPTR, vr, fi, 0, 0); return vr
+    }
+    // For non-generic calls, consume '('
+    if tokp<tokc && tokt(tokp)==TT_PNCT && tokv(tokp)==40 {
+        adv()   // consume '('
+    }
+    let base=argsp
+    let ac=0
+    // t8: if this is a method call, prepend self as the first argument (param 0).
+    if selfv>=0 {
+        w64(argstack + argsp*8, selfv)
+        w64(arg_tgt + (base+ac)*8, ac)
+        w8(arg_filled + (base*64 + ac), 1)
+        argsp = argsp + 1
+        ac = ac + 1
+    }
+    if !(peek()==TT_PNCT&&pval()==41) {
+        while true {
+            // t4: detect a named argument: ID immediately followed by ':'.
+            let anm = 0
+            if peek()==TT_ID && tokp+1<tokc && tokt(tokp+1)==TT_PNCT && tokv(tokp+1)==58 {
+                anm = tokv(tokp)   // remember name src-ptr
+                adv()              // consume name ID
+                adv()              // consume ':'
+            }
+            let a=parse_expr()
+            // target slot = argument order by default; remapped if named.
+            let tgt = ac
+            if anm!=0 {
+                let callee = findfn(nm, nl)
+                if callee>=0 {
+                    let pidx = findparam(callee, anm, len_name_colon(anm))
+                    if pidx>=0 { tgt = pidx } else { compile_error(2, nm, nl) }
+                }
+            }
+            // Collect in ARGUMENT order (increment argsp so nested calls
+            // get distinct bases), recording the target param index.
+            w64(argstack + argsp*8, a)
+            w64(arg_tgt + (base+ac)*8, tgt)
+            w8(arg_filled + (base*64 + tgt), 1)   // t5: mark param index tgt as supplied
+            argsp = argsp + 1
+            ac = ac + 1
+            if peek()==TT_PNCT&&pval()==44 { adv() } else { break }
+        }
+    }
+    mpnct(41)
+    let nargs=argsp-base
+    // t5: fill omitted params with their default expressions.
+    let dfn = findfn(nm, nl)
+    if dfn>=0 {
+        let dfull = r64(fn_pcount + dfn*8)
+        let zz=0
+        while zz<dfull {
+            if r8(arg_filled + (base*64 + zz))==0 {
+                let dr0 = r64(fn_defargs + (dfn*64 + zz)*16)
+                let dr1 = r64(fn_defargs + (dfn*64 + zz)*16 + 8)
+                if dr0!=0 && dr1>dr0 {
+                    let saved_p = tokp; let saved_c = tokc; let saved_a = argsp
+                    tokp = dr0; tokc = dr1
+                    let dval = parse_expr()
+                    tokp = saved_p; tokc = saved_c; argsp = saved_a
+                    w64(argstack + argsp*8, dval)
+                    w64(arg_tgt + (base+nargs)*8, zz)
+                    argsp = argsp + 1
+                    nargs = nargs + 1
+                }
+            }
+            zz = zz + 1
+        }
+        let cz=0
+        while cz<dfull {
+            if r8(arg_filled + (base*64 + cz))==0 {
+                let cdr0 = r64(fn_defargs + (dfn*64 + cz)*16)
+                if cdr0==0 { compile_error(2, nm, nl) }
+            }
+            cz = cz + 1
+        }
+    }
+    // t4: permute collected args from argument order into callee
+    // parameter order so the MOV-emit below loads them correctly.
+    let rk=0
+    while rk<nargs {
+        let p = r64(arg_tgt + (base+rk)*8)
+        w64(arg_tmp + (base+p)*8, r64(argstack + (base+rk)*8))
+        rk = rk + 1
+    }
+    let ck=0
+        while ck<nargs { w64(argstack + (base+ck)*8, r64(arg_tmp + (base+ck)*8)); ck=ck+1 }
+        // P10: Check for generic type arguments and monomorphize
+        let gen_args_count = 0
+        let gen_args = mmap(8000)
+        // Note: generic args already parsed earlier in parse_call_impl
+        // For now, just use the original function
+        let fchk=findfn(nm,nl)
+        let effective_fi = fchk
+        let do_call=0
+        if fchk>=0 { do_call=1 }
+        if do_call==0 { if is_bltn(nm,nl)==1 { do_call=1 } }
+        // P10: fn-typed param indirect call: name is not a function but IS a
+        // param of the current fn declared as fn(...) -> ... -> the param's
+        // vreg holds a [codeptr, env] tuple -> route through IR_CLOSURE_CALL.
+        let fpar_pz = -1
+        if do_call==0 && cur_fi>=0 {
+            let pz2 = findparam(cur_fi, nm, nl)
+            if pz2>=0 && r64(fn_parfn + (cur_fi*200 + pz2)*8)==1 { fpar_pz = pz2; do_call=1 }
+        }
+        // P10: fn-value LOCAL indirect call: `let f = double; f(21)`. The name
+        // is not a function/builtin/param but IS a local vreg tagged 11 (fn
+        // value bound via parse_let). Route through IR_CLOSURE_CALL with the
+        // local's vreg as the tuple ptr. Marker: fpar_pz=-2 (distinct from the
+        // fn-typed-PARAM case >=0).
+        if do_call==0 {
+            let fvl = vfind(nm, nl)
+            if fvl>=0 && r64(vreg_type + fvl*8)==11 { fpar_pz = -2; do_call=1 }
+        }
+        if do_call==1 {
+            let avs=irc
+            let k=base
+            while k<argsp { let mv=nv(); iremit(IR_MOV,mv,r64(argstack+k*8),0,0); k=k+1 }
+            argsp=base
+            // P10: fn-value LOCAL indirect call: fnb = the local's vreg (holds
+            // a [codeptr, env] tuple from IR_FNVAL), caller args are the
+            // collected args.
+            if fpar_pz==-2 {
+                let fvl = vfind(nm, nl)
+                let vr2=nv(); iremit(IR_CLOSURE_CALL, vr2, fvl, avs, nargs); return vr2
+            }
+            // P10: fn-typed param indirect call: fnb = the param's vreg (holds
+            // a [codeptr, env] tuple), caller args are the collected args.
+            if fpar_pz>=0 {
+                let pvr = -1
+                let pi2 = varc-1
+                while pi2>=0 {
+                    let pvnm = r64(vars + pi2*VRS); let pvnl = r64(vars + pi2*VRS + 16)
+                    if pvnl==nl {
+                        let ok=1; let j2=0
+                        while j2<nl { if r8(src+pvnm+j2)!=r8(src+nm+j2){ok=0;break}; j2=j2+1 }
+                        if ok==1 { pvr=r64(vars+pi2*VRS+8); break }
+                    }
+                    pi2=pi2-1
+                }
+                let vr2=nv(); iremit(IR_CLOSURE_CALL, vr2, pvr, avs, nargs); return vr2
+            }
+            // t10: closure_call(fnb, args...) -> dedicated IR (env-shift + indirect call).
+            if nl==12&&r8(src+nm)=='c'&&r8(src+nm+1)=='l'&&r8(src+nm+2)=='o'&&r8(src+nm+3)=='s'&&r8(src+nm+4)=='u'&&r8(src+nm+5)=='r'&&r8(src+nm+6)=='e'&&r8(src+nm+7)=='_'&&r8(src+nm+8)=='c'&&r8(src+nm+9)=='a'&&r8(src+nm+10)=='l'&&r8(src+nm+11)=='l' {
+                // fnb is the first collected arg (argstack[base]); caller args start at avs+1.
+                let fnbv = irres(avs)
+                let vr2=nv(); iremit(IR_CLOSURE_CALL, vr2, fnbv, avs+1, nargs-1); return vr2
+            }
+            let vr2=nv()
+            // P10: method-form push on an ARRAY (receiver not str-tagged) ->
+            // qword append (IR_APUSH) and reassign the receiver to the new
+            // array (mutating method semantics, like `result.push(x)`).
+            let is_arr_push = 0
+            if nl==4 && r8(src+nm)=='p' && r8(src+nm+1)=='u' && r8(src+nm+2)=='s' && r8(src+nm+3)=='h' {
+                if selfv>=0 && r64(vreg_is_str + selfv*8)!=1 { is_arr_push = 1 }
+            }
+            if is_arr_push==1 {
+                iremit(IR_APUSH, vr2, 0, nargs, avs)
+                if selfv>=0 { iremit(IR_MOV, selfv, vr2, 0, 0) }  // result = new array
+            } else {
+                iremit(IR_CALL,vr2,nm,nargs,avs)
+            }
+        // G2: builtins str()/push() return a byte-stride string -> tag vr2.
+        // nm is an offset; builtin names are at src+nm (same as is_bltn()).
+        // P10: array push (is_arr_push) returns an ARRAY — do NOT tag as str.
+        if vr2>=0 && vr2<8192 {
+            if nl==3&&r8(src+nm)=='s'&&r8(src+nm+1)=='t'&&r8(src+nm+2)=='r' { w64(vreg_is_str + vr2*8, 1) }
+            // Removed: tagging "push" result as str. A user-defined fn push(...)
+            // is a plain function, not a string. This str-tag corrupted calls
+            // to any user fn literally named "push". Array-push method semantics
+            // are handled by the is_arr_push path above (which does NOT tag str).
+        }
+        // Phase 4.3: if the callee returns a struct, tag vr2 so `q.field` works.
+        if fchk>=0 {
+            let rsi = r64(fn_retstruct + fchk*8)
+            if rsi>=0 { w64(vreg_struct + vr2*8, rsi) }
+        }
+        return vr2
+    } else {
+        // Undeclared, non-builtin call: hard compile error (no silent 0).
+        compile_error(0, nm, nl)
+    }
+}
+
+fn parse_primary() {
+    if peek()==TT_ASM {  // P11: inline asm: asm!("hex bytes") — raw machine code
+        adv()  // consume 'asm'
+        if !(peek()==TT_OP && pval()==33) {
+            let mn = "error: expected '!' after asm\n"; file_write(2, mn+8, len(mn)); exit(1)
+        }
+        adv()  // consume '!'
+        if !(peek()==TT_PNCT && pval()==40) {
+            let mn = "error: expected '(' after asm!\n"; file_write(2, mn+8, len(mn)); exit(1)
+        }
+        adv()  // consume '('
+        if peek()!=TT_STR {
+            let mn = "error: expected string template in asm!\n"; file_write(2, mn+8, len(mn)); exit(1)
+        }
+        let sv=pval(); adv()  // string source offset (opening quote)
+        if !(peek()==TT_PNCT && pval()==41) {
+            let mn = "error: expected ')' in asm!\n"; file_write(2, mn+8, len(mn)); exit(1)
+        }
+        adv()  // consume ')'
+        let vr=nv()
+        iremit(IR_ASM, vr, sv, 0, 0)
+        return vr
+    }
+    if peek()==TT_MATCH { return parse_match() }   // P6.1b: match in expression position
+    if peek()==TT_NUM { let v=pval(); adv(); let vr=nv(); iremit(IR_CONST,vr,v,0,0); return vr }
+    if peek()==TT_STR { let v=pval(); adv(); let vr=nv(); iremit(IR_STR,vr,v,0,0); w64(vreg_is_str + vr*8, 1); return vr }
+    // G2 containers: array literal [e1, e2, ...] -> IR_TALLOC(n), IR_ISTORE each.
+    if peek()==TT_PNCT&&pval()==91 {
+        // P10: [TYPE]() = type-annotated EMPTY array literal (e.g. `let result
+        // = [U]()` in a generic fn). Detect ID `]` `(` `)` and emit TALLOC(0).
+        if tokp+3<tokc && tokt(tokp)==TT_PNCT && tokv(tokp)==91 && tokt(tokp+1)==TT_ID && tokt(tokp+2)==TT_PNCT && tokv(tokp+2)==93 && tokt(tokp+3)==TT_PNCT && tokv(tokp+3)==40 && tokp+4<tokc && tokt(tokp+4)==TT_PNCT && tokv(tokp+4)==41 {
+            adv(); adv(); adv(); adv(); adv()  // consume [ TYPE ] ( )
+            let tr0=nv(); iremit(IR_TALLOC,tr0,0,0,0); return tr0
+        }
+        adv()
+        let elems=mmap(8000)   // stash element vregs
+        let cnt=0
+        if peek()!=TT_PNCT || pval()!=93 {  // non-empty literal
+            let e0=parse_expr(); w64(elems+cnt*8, e0); cnt=cnt+1
+            while peek()==TT_PNCT&&pval()==44 { adv(); let e=parse_expr(); w64(elems+cnt*8, e); cnt=cnt+1 }
+        }
+        mpnct(93)  // ']'
+        let tr=nv(); iremit(IR_TALLOC,tr,cnt,0,0)
+        let ci=0
+        while ci<cnt {
+            let ev=r64(elems+ci*8); let fi=nv(); iremit(IR_CONST,fi,ci,0,0)
+            iremit(IR_ISTORE,0,tr,fi,ev)
+            ci=ci+1
+        }
+        return tr
+    }
+    if peek()==TT_PNCT&&pval()==40 {
+        pdepth=pdepth+1
+        if pdepth>PDEPTH_MAX {
+            let mn = "error: expression nesting too deep\n"
+            file_write(2, mn+8, len(mn)); exit(1)
+        }
+        adv(); let e=parse_expr()
+        // G2 Part A: tuple literal (e1, e2, ...) -> IR_TALLOC(n) + IR_ISTORE each.
+        // Reuses the B aggregate layout (header-carrying, qword stride); elements
+        // are read back via the existing '.N' postfix (IR_IDX, base+idx*8).
+        if peek()==TT_PNCT&&pval()==44 {
+            let elems=mmap(8000); let cnt=0
+            w64(elems+cnt*8, e); cnt=cnt+1
+            while peek()==TT_PNCT&&pval()==44 { adv(); let ev=parse_expr(); w64(elems+cnt*8, ev); cnt=cnt+1 }
+            if mpnct(41)==0 { let mn="error: expected ')' in tuple literal\n"; file_write(2,mn+8,len(mn)); exit(1) }
+            let tr=nv(); iremit(IR_TALLOC, tr, cnt, 0, 0)
+            let ci=0
+            while ci<cnt { let ev=r64(elems+ci*8); let fi=nv(); iremit(IR_CONST,fi,ci,0,0); iremit(IR_ISTORE,0,tr,fi,ev); ci=ci+1 }
+            pdepth=pdepth-1; return tr
+        }
+        if mpnct(41)==0 {
+            // No matching ')'. Reading a comma (e.g. `(1,2)`) is now a tuple
+            // literal handled above; reaching here means a dangling '('.
+            let mn = "error: expected ')' in parenthesized expression\n"
+            file_write(2, mn+8, len(mn)); exit(1)
+        }
+        pdepth=pdepth-1; return e
+    }
+    if peek()==TT_KEY {
+        let v=pval(); let ln=plen(); let h=ktext(v,ln); let vr=nv()
+        if h==10 { adv(); iremit(IR_CONST,vr,1,0,0); return vr }
+        if h==11 { adv(); iremit(IR_CONST,vr,0,0,0); return vr }
+        if h==12 { adv(); iremit(IR_CONST,vr,0,0,0); return vr }
+        // P7 fix: type keywords (u8/u16/u32/u64/...) used as BUILTIN CALLS,
+        // e.g. `u8(511)`. The tokenizer marks them TT_KEY for `let x: u64 = 5`
+        // annotations, but as expression-primary they must route to parse_call
+        // when followed by '(' — otherwise `u8(511)` silently became CONST 0
+        // (phantom value, `(511)` left unparsed). is_bltn matches the name at
+        // src+v (same source-offset layout as TT_ID tokens). Consume the
+        // keyword first (parse_call_impl's adv() then eats the '(').
+        if tokp+1<tokc && tokt(tokp+1)==TT_PNCT && tokv(tokp+1)==40 && is_bltn(v,ln)==1 {
+            adv(); return parse_call(v, ln)
+        }
+        adv(); iremit(IR_CONST,vr,0,0,0); return vr
+    }
+    if peek()==TT_ID {
+            // Check for struct constructor: StructName(args) - MUST BE FIRST before enum lookahead
+            let nm = pval(); let nl = plen()
+            let si = findstruct(nm, nl)
+            if si >= 0 {
+                adv()  // consume struct name
+                if peek()==TT_PNCT && pval()==40 {
+                    adv()  // consume '('
+                    let fc = r64(sdefs + si*64 + 16)  // field count
+                    let vr = nv(); iremit(IR_TALLOC, vr, fc, 0, 0)
+                    let ac = 0
+                    if !(peek()==TT_PNCT&&pval()==41) {
+                        while true {
+                            let a = parse_expr()
+                            if ac < fc {
+                                let fi = nv(); iremit(IR_CONST, fi, ac, 0, 0)
+                                iremit(IR_ISTORE, 0, vr, fi, a)
+                            }
+                            ac = ac + 1
+                            if peek()==TT_PNCT&&pval()==44 { adv() } else { break }
+                        }
+                    }
+                    mpnct(41)  // consume ')'
+                    w64(vreg_struct + vr*8, si)
+                    return vr
+                }
+            }
+            // P6.1b: Check for enum variant constructor BEFORE consuming the ID token.
+            // We need to peek ahead: ID followed by '::' or '.' followed by ID.
+            if tokp+1<tokc && (tokt(tokp+1)==TT_OP || tokt(tokp+1)==TT_PNCT) && (tokv(tokp+1)==58*256+58 || tokv(tokp+1)==46) && tokp+2<tokc && tokt(tokp+2)==TT_ID {
+                let nm=tokv(tokp); let nl=tokln(tokp)
+                let sep = tokv(tokp+1)  // 58*256+58='::' or 46='.'
+                let vnm=tokv(tokp+2); let vnl=tokln(tokp+2)
+                // Check if this is an enum variant before consuming tokens
+                let ei=findenum(nm,nl)
+                if ei>=0 {
+                    let vidx=evariant_idx(ei,vnm,vnl)
+                    if vidx>=0 {
+                        // It's a real enum variant - consume the three tokens
+                        adv(); adv(); adv()
+                        // It's a real enum variant
+                        if peek()==TT_PNCT && pval()==40 {  // tuple payload
+                            adv()
+                            let fc=evariant_fcount(ei,vidx)
+                            let vr=nv(); iremit(IR_TALLOC, vr, 1+fc, 0, 0)  // 1 word tag + payload
+                            let ti=nv(); iremit(IR_CONST,ti,evariant_tag(ei,vidx),0,0)
+                            let zi=nv(); iremit(IR_CONST,zi,0,0,0)
+                            iremit(IR_ISTORE,0,vr,zi,ti)
+                            let ac=0
+                            if !(peek()==TT_PNCT&&pval()==41) {
+                                while true {
+                                    let a=parse_expr()
+                                    if ac<fc {
+                                        let fi=nv(); iremit(IR_CONST,fi,1+ac,0,0)
+                                        iremit(IR_ISTORE,0,vr,fi,a)
+                                    }
+                                    ac=ac+1
+                                    if peek()==TT_PNCT&&pval()==44 { adv() } else { break }
+                                }
+                            }
+                            mpnct(41)
+                        } else {
+                            // unit variant (no payload)
+                            let vr=nv(); iremit(IR_TALLOC, vr, 1, 0, 0)
+                            let ti=nv(); iremit(IR_CONST,ti,evariant_tag(ei,vidx),0,0)
+                            let zi=nv(); iremit(IR_CONST,zi,0,0,0)
+                            iremit(IR_ISTORE,0,vr,zi,ti)
+                        }
+                        w64(vreg_enum + vr*8, ei)
+                        w64(vreg_enum_var + vr*8, vidx)
+                        return vr
+                    }
+                }
+                // Check for Option::Some / Option::None / Result::Ok / Result::Err
+                // (builtins: NOT declared enums, so this must run even if findenum<0)
+                let hk_enum = ktext(nm,nl)
+                let hk_var = ktext(vnm,vnl)
+                if hk_enum==H_OPTION || hk_enum==H_RESULT {
+                    // consume the three tokens: Enum Variant  (Option :: Some)
+                    adv(); adv(); adv()
+                    // It's an Option or Result variant
+                    if hk_enum==H_OPTION {
+                        if hk_var==H_SOME {
+                            if peek()==TT_PNCT && pval()==40 {
+                                adv(); let a=parse_expr(); mpnct(41)
+                                let vr=nv(); iremit(IR_SOME, vr, a, 0, 0)
+                                w64(vreg_enum + vr*8, -2)  // tag as Option
+                                w64(vreg_enum_var + vr*8, 1)  // Some = tag 1
+                                return vr
+                            }
+                        } else if hk_var==H_NONE {
+                            let vr=nv(); iremit(IR_NONE, vr, 0, 0, 0)
+                            w64(vreg_enum + vr*8, -2)
+                            w64(vreg_enum_var + vr*8, 0)
+                            return vr
+                        }
+                    } else if hk_enum==H_RESULT {
+                        if hk_var==H_OK {
+                            if peek()==TT_PNCT && pval()==40 {
+                                adv(); let a=parse_expr(); mpnct(41)
+                                let vr=nv(); iremit(IR_OK, vr, a, 0, 0)
+                                w64(vreg_enum + vr*8, -3)
+                                w64(vreg_enum_var + vr*8, 1)
+                                return vr
+                            }
+                        } else if hk_var==H_ERR {
+                            if peek()==TT_PNCT && pval()==40 {
+                                adv(); let a=parse_expr(); mpnct(41)
+                                let vr=nv(); iremit(IR_ERR, vr, a, 0, 0)
+                                w64(vreg_enum + vr*8, -3)
+                                w64(vreg_enum_var + vr*8, 0)
+                                return vr
+                            }
+                        }
+                    }
+                }
+            }
+                    // Check for bare Some/None/Ok/Err (built-in enum variants without Option:: prefix)
+                    let hk_bare = ktext(nm, nl)
+                    if hk_bare==H_SOME {
+                        if peek()==TT_PNCT && pval()==40 {
+                            adv(); let a=parse_expr(); mpnct(41)
+                            let vr=nv(); iremit(IR_TALLOC, vr, 2, 0, 0)
+                            let ti=nv(); iremit(IR_CONST,ti,1,0,0); let zi=nv(); iremit(IR_CONST,zi,0,0,0); iremit(IR_ISTORE,0,vr,zi,ti)
+                            let fi=nv(); iremit(IR_CONST,fi,1,0,0); iremit(IR_ISTORE,0,vr,fi,a)
+                            w64(vreg_enum + vr*8, -2)  // tag as Option
+                            w64(vreg_enum_var + vr*8, 1)  // Some = tag 1
+                            return vr
+                        }
+                    }
+                    if hk_bare==H_NONE {
+                        let vr=nv(); iremit(IR_TALLOC, vr, 1, 0, 0)
+                        let ti=nv(); iremit(IR_CONST,ti,0,0,0); let zi=nv(); iremit(IR_CONST,zi,0,0,0); iremit(IR_ISTORE,0,vr,zi,ti)
+                        w64(vreg_enum + vr*8, -2)
+                        w64(vreg_enum_var + vr*8, 0)
+                        return vr
+                    }
+                    if hk_bare==H_OK {
+                        if peek()==TT_PNCT && pval()==40 {
+                            adv(); let a=parse_expr(); mpnct(41)
+                            let vr=nv(); iremit(IR_TALLOC, vr, 2, 0, 0)
+                            let ti=nv(); iremit(IR_CONST,ti,1,0,0); let zi=nv(); iremit(IR_CONST,zi,0,0,0); iremit(IR_ISTORE,0,vr,zi,ti)
+                            let fi=nv(); iremit(IR_CONST,fi,1,0,0); iremit(IR_ISTORE,0,vr,fi,a)
+                            w64(vreg_enum + vr*8, -3)
+                            w64(vreg_enum_var + vr*8, 1)
+                            return vr
+                        }
+                    }
+                    if hk_bare==H_ERR {
+                        if peek()==TT_PNCT && pval()==40 {
+                            adv(); let a=parse_expr(); mpnct(41)
+                            let vr=nv(); iremit(IR_TALLOC, vr, 2, 0, 0)
+                            let ti=nv(); iremit(IR_CONST,ti,0,0,0); let zi=nv(); iremit(IR_CONST,zi,0,0,0); iremit(IR_ISTORE,0,vr,zi,ti)
+                            let fi=nv(); iremit(IR_CONST,fi,1,0,0); iremit(IR_ISTORE,0,vr,fi,a)
+                            w64(vreg_enum + vr*8, -3)
+                            w64(vreg_enum_var + vr*8, 0)
+                            return vr
+                        }
+                    }
+                    // Check for function call: name(args) - this comes AFTER enum/struct checks
+                        // Not an enum variant, now consume the ID token for regular handling
+                        let nm=pval(); let nl=plen(); adv()
+                    // F7: compile-time constant substitution — emit IR_CONST directly.
+                    let cv0 = cfind(nm,nl)
+                    if cv0>=0 { let cvr=nv(); iremit(IR_CONST,cvr,cv0,0,0); return cvr }
+                    // Check for bare Some/None/Ok/Err (built-in enum variants without Option:: prefix)
+                    let hk_bare = ktext(nm, nl)
+                    if hk_bare==H_SOME {
+                        if peek()==TT_PNCT && pval()==40 {
+                            adv(); let a=parse_expr(); mpnct(41)
+                            let vr=nv(); iremit(IR_SOME, vr, a, 0, 0)
+                            w64(vreg_enum + vr*8, -2)  // tag as Option
+                            w64(vreg_enum_var + vr*8, 1)  // Some = tag 1
+                            return vr
+                        }
+                    }
+                    if hk_bare==H_NONE {
+                        let vr=nv(); iremit(IR_NONE, vr, 0, 0, 0)
+                        w64(vreg_enum + vr*8, -2)
+                        w64(vreg_enum_var + vr*8, 0)
+                        return vr
+                    }
+                    if hk_bare==H_OK {
+                        if peek()==TT_PNCT && pval()==40 {
+                            adv(); let a=parse_expr(); mpnct(41)
+                            let vr=nv(); iremit(IR_OK, vr, a, 0, 0)
+                            w64(vreg_enum + vr*8, -3)
+                            w64(vreg_enum_var + vr*8, 1)
+                            return vr
+                        }
+                    }
+                    if hk_bare==H_ERR {
+                        if peek()==TT_PNCT && pval()==40 {
+                            adv(); let a=parse_expr(); mpnct(41)
+                            let vr=nv(); iremit(IR_ERR, vr, a, 0, 0)
+                            w64(vreg_enum + vr*8, -3)
+                            w64(vreg_enum_var + vr*8, 0)
+                            return vr
+                        }
+                    }
+                    // Check for function call: name(args) or name<args>(args)
+                    // Both '(' and '<' (for generic type args) trigger function call
+                    // NOTE: tokp already advanced past the name (line 3029 adv()),
+                    // so it points AT the '(' or '<' token now.
+                    let is_call = 0
+                    let fchk = findfn(nm, nl)
+                    if tokp<tokc && tokt(tokp)==TT_PNCT && tokv(tokp)==40 { is_call = 1 }
+                    else if tokp<tokc && tokt(tokp)==TT_OP && tokv(tokp)==60 && fchk>=0 && r64(fn_generic + fchk*8)!=0 { is_call = 1 }
+                    if is_call==1 {
+                        return parse_call(nm, nl)
+                    }
+        if peek()==TT_PNCT&&pval()==91 {  // index: a[idx] OR slice: a[lo:hi] / a[:hi] / a[lo:]
+            adv()  // consume '['
+            let is_slice = 0
+            let lo_vr = -1
+            let hi_vr = -1
+            let e0 = -1
+            if peek()==TT_PNCT&&pval()==58 {
+                // a[:hi] — no lower bound (defaults to 0)
+                is_slice = 1
+                adv()  // consume ':'
+                if !(peek()==TT_PNCT&&pval()==93) { hi_vr = parse_expr() }
+            } else {
+                e0 = parse_expr()
+                if peek()==TT_PNCT&&pval()==58 {
+                    is_slice = 1
+                    lo_vr = e0
+                    adv()  // consume ':'
+                    if !(peek()==TT_PNCT&&pval()==93) { hi_vr = parse_expr() }
+                }
+            }
+            if is_slice==1 {
+                mpnct(93)  // ']'
+                let fv=vfind(nm,nl)
+                let base_vr = -1
+                if fv>=0 { base_vr = fv }
+                else {
+                    let gv=gfind(nm,nl)
+                    if gv>=0 { let pg=nv(); iremit(IR_LOADG,pg,gv,0,0); base_vr = pg }
+                }
+                if base_vr<0 { compile_error(1, nm, nl); return 0 }
+                let sstr = r64(vreg_is_str + base_vr*8)
+                if sstr>=0 {
+                    let mn = "error: slice of string not supported (arrays only)\n"
+                    file_write(2, mn+8, len(mn)); exit(1)
+                }
+                // Slice lowering (pure IR — works on x86 AND ARM64):
+                //   n = clamp(hi - lo, 0);  dst = TALLOC(n)
+                //   loop idx in 0..n: dst[idx] = base[lo+idx]
+                // The IR_IDX inside the loop carries the bounds trap, so an
+                // out-of-range slice (hi > len) SIGILLs like a[idx] does.
+                let zero=nv(); iremit(IR_CONST,zero,0,0,0)
+                let len_vr=nv(); iremit(IR_ARRAY_LEN, len_vr, base_vr, 0, 0)
+                let lo = lo_vr
+                if lo<0 { lo = zero }
+                let hi = hi_vr
+                if hi<0 { hi = len_vr }
+                let nraw=nv(); iremit(IR_SUB, nraw, hi, lo, 0)
+                let neg=nv(); iremit(IR_LT, neg, nraw, zero, 0)
+                let n=nv(); iremit(IR_MOV, n, nraw, 0, 0)
+                let lafter=nl()
+                iremit(IR_BR,0,neg,lafter,0)   // neg==0 (nraw>=0) -> skip clamp
+                iremit(IR_MOV,n,zero,0,0)      // neg==1 -> n = 0 (empty slice)
+                iremit(IR_LABEL,0,lafter,0,0)
+                let dst=nv(); iremit(IR_ARRNEW, dst, n, 0, 0)   // runtime-count alloc
+                let cond=nl(); let body=nl(); let end=nl()
+                let idx_vr=nv(); iremit(IR_MOV, idx_vr, zero, 0, 0)
+                iremit(IR_JMP,0,cond,0,0)
+                iremit(IR_LABEL,0,cond,0,0)
+                let cmp=nv(); iremit(IR_LT, cmp, idx_vr, n, 0)
+                iremit(IR_BR,0,cmp,end,body)   // idx>=n -> end, else body
+                iremit(IR_LABEL,0,body,0,0)
+                let sio=nv(); iremit(IR_ADD, sio, lo, idx_vr, 0)
+                let val=nv(); iremit(32, val, base_vr, sio, 0)   // base[lo+idx]
+                iremit(IR_ISTORE,0,dst,idx_vr,val)               // dst[idx]=val
+                let one=nv(); iremit(IR_CONST, one, 1, 0, 0)
+                let nidx=nv(); iremit(IR_ADD, nidx, idx_vr, one, 0)
+                let idx2=nv(); iremit(IR_MOV, idx2, nidx, 0, 0)
+                iremit(IR_MOV, idx_vr, idx2, 0, 0)
+                iremit(IR_JMP,0,cond,0,0)
+                iremit(IR_LABEL,0,end,0,0)
+                return dst
+            }
+            mpnct(93)
+            let f=vfind(nm,nl)
+            if f>=0 { let vr=nv(); iremit(32,vr,f,e0,0); return vr }
+            let g=gfind(nm,nl)
+            if g>=0 { let pg=nv(); iremit(IR_LOADG,pg,g,0,0); let vr=nv(); iremit(32,vr,pg,e0,0); return vr }
+            compile_error(1, nm, nl)  // undeclared array/string index -> error
+        }
+        // Phase 4.3: postfix `.N` (tuple), `.field` (struct), `.method` (t8) —
+        // CHAINED (e.g. r.topleft.x). `selfv` holds the object vreg: for the
+        // first `.` it is resolved from the name `nm`/`nl`; for later chain
+        // links it is the previous field's result vreg (tagged via sfldtyp so
+        // the next `.` resolves). All name lookups are INLINED — calling a
+        // user-fn with live locals trips the allocator clobber bug.
+        let selfv = -1
+        while peek()==TT_PNCT&&pval()==46 {
+            adv()
+            if peek()==TT_NUM {
+                let fld=pval(); adv()
+                let fi=nv(); iremit(IR_CONST,fi,fld,0,0)
+                if selfv<0 {
+                    // inline vfind(nm,nl)
+                    let i = varc-1
+                    while i>=0 {
+                        let vnm = r64(vars + i*VRS); let vnl = r64(vars + i*VRS + 16)
+                        if vnl==nl {
+                            let ok=1; let j=0
+                            while j<nl { if r8(src+vnm+j)!=r8(src+nm+j){ok=0;break}; j=j+1 }
+                            if ok==1 { selfv=r64(vars+i*VRS+8); break }
+                        }
+                        i=i-1
+                    }
+                    if selfv<0 {
+                        // inline gfind(nm,nl)
+                        let gi=0
+                        while gi<gvarc {
+                            if r64(gvars+gi*16+8)==nl {
+                                let gnm=r64(gvars+gi*16); let ok=1; let j=0
+                                while j<nl { if r8(src+gnm+j)!=r8(src+nm+j){ok=0;break}; j=j+1 }
+                                if ok==1 { selfv=nv(); iremit(IR_LOADG,selfv,gi,0,0); break }
+                            }
+                            gi=gi+1
+                        }
+                    }
+                }
+                if selfv<0 { compile_error(1, nm, nl); return 0 }
+                if peek()==TT_OP&&pval()==61 { adv(); let v=parse_expr(); iremit(IR_ISTORE,0,selfv,fi,v); return 0 }
+                let vr=nv(); iremit(32,vr,selfv,fi,0); selfv=vr
+            } else if peek()==TT_ID {
+                if selfv<0 {
+                    // F7: compile-time constant substitution — emit IR_CONST directly.
+                    let cv = cfind(nm,nl)
+                    if cv>=0 { let vr=nv(); iremit(IR_CONST,vr,cv,0,0); selfv=vr }
+                }
+                if selfv<0 {
+                    // inline vfind(nm,nl)
+                    let i = varc-1
+                    while i>=0 {
+                        let vnm = r64(vars + i*VRS); let vnl = r64(vars + i*VRS + 16)
+                        if vnl==nl {
+                            let ok=1; let j=0
+                            while j<nl { if r8(src+vnm+j)!=r8(src+nm+j){ok=0;break}; j=j+1 }
+                            if ok==1 { selfv=r64(vars+i*VRS+8); break }
+                        }
+                        i=i-1
+                    }
+                    if selfv<0 {
+                        // inline gfind(nm,nl)
+                        let gi=0
+                        while gi<gvarc {
+                            if r64(gvars+gi*16+8)==nl {
+                                let gnm=r64(gvars+gi*16); let ok=1; let j=0
+                                while j<nl { if r8(src+gnm+j)!=r8(src+nm+j){ok=0;break}; j=j+1 }
+                                if ok==1 { selfv=nv(); iremit(IR_LOADG,selfv,gi,0,0); break }
+                            }
+                            gi=gi+1
+                        }
+                    }
+                }
+                if selfv<0 { compile_error(1, nm, nl); return 0 }
+                let mnm=pval(); let ml=plen()
+                let si=r64(vreg_struct + selfv*8)
+                if si>=0 {
+                    // inline sfield_idx(si, mnm, ml)
+                    let fc=r64(sdefs + si*64 + 16); let fb=r64(sdefs + si*64 + 24)
+                    let fidx=-1; let fj=0
+                    while fj<fc {
+                        let fp=r64(sfldtab + (fb+fj)*16); let fl2=r64(sfldtab + (fb+fj)*16 + 8)
+                        if fl2==ml {
+                            let ok=1; let fk=0
+                            while fk<ml { if r8(src+fp+fk)!=r8(src+mnm+fk){ok=0;break}; fk=fk+1 }
+                            if ok==1 { fidx=fj; break }
+                        }
+                        fj=fj+1
+                    }
+                    if fidx>=0 {
+                        adv()
+                        let fi=nv(); iremit(IR_CONST,fi,fidx,0,0)
+                        if peek()==TT_OP&&pval()==61 { adv(); let v=parse_expr(); iremit(IR_ISTORE,0,selfv,fi,v); return 0 }
+                        let vr=nv(); iremit(32,vr,selfv,fi,0)
+                        // tag result with field's struct type (enables next chain link)
+                        let ftype=r64(sfldtyp + (fb+fidx)*8)
+                        if ftype>=0 { w64(vreg_struct + vr*8, ftype) }
+                        selfv=vr
+                    } else {
+                        adv(); return parse_method_call(selfv, mnm, ml)
+                    }
+                } else {
+                    // P9: dyn-trait receiver -> dispatch via impl table. The
+                    // impl method is registered in the fn table under its own
+                    // name, so the standard method-call path (findfn by name)
+                    // already resolves and calls it with selfv prepended as
+                    // arg 0. The vreg_trait tag marks it as a dyn trait so a
+                    // real vtable dispatch can replace this later.
+                    adv(); return parse_method_call(selfv, mnm, ml)
+                }
+            } else {
+                compile_error(1, nm, nl); return 0
+            }
+        }
+        if selfv>=0 { return selfv }
+        let f=vfind(nm,nl); if f>=0 { return f }
+        let g=gfind(nm,nl); if g>=0 { let vr=nv(); iremit(IR_LOADG,vr,g,0,0); return vr }
+        // P10: bare function name in value position (e.g. `map(arr, double)`)
+        // -> IR_FNVAL builds a fn-value 2-tuple [codeptr, env=0] (same shape
+        // mk_any makes, so fn-typed params called via IR_CLOSURE_CALL work).
+        let ffi=findfn(nm,nl)
+        if ffi>=0 {
+            let vr=nv(); iremit(IR_FNVAL, vr, ffi, 0, 0)
+            return vr
+        }
+        compile_error(1, nm, nl)  // undeclared variable -> hard error (no silent 0)
+    }
+    if peek()==TT_PNCT&&(pval()==91||pval()==123) {
+        let mu = "error: unexpected token in expression\n"
+        file_write(2, mu+8, len(mu)); exit(1)
+    }
+    // G4-fix: token-aware guard. `}` (125) and `,` (44) legitimately reach
+    // parse_primary from the match arm parser: parse_match's trailing
+    // `else if peek()==95 {wildcard} else {literal}` runs as a SEPARATE
+    // statement after every arm (parse_if handles only one else), so its
+    // literal branch calls parse_expr on the arm terminator. The match loop
+    // consumes the token itself; emitting CONST-0 WITHOUT advancing yields
+    // dead-but-skipped IR (the arm's IR_JMP end precedes it), matching the
+    // known-good 9a7ec10 behavior. ALL other tokens hard-fail: emitting
+    // CONST-0 without advancing on e.g. ':' or ')' loops forever
+    // (g6 slice-hang: "source too many tokens/IR limit").
+    if peek()==TT_PNCT&&(pval()==125||pval()==44) {
+        let vr5=nv(); iremit(IR_CONST,vr5,0,0,0); return vr5
+    }
+    let mu2 = "error: unexpected token in expression (type="
+    file_write(2, mu2+8, len(mu2))
+    let v=peek(); let c0=48+v/100; let c1=48+(v/10)%10; let c2=48+v%10
+    let dbg1=mmap(8); w8(dbg1,c0); w8(dbg1+1,c1); w8(dbg1+2,c2); w8(dbg1+3,44)
+    let dbg2=mmap(8); w8(dbg2,32); w8(dbg2+1,118); w8(dbg2+2,61); w8(dbg2+3,32)
+    let vv=pval(); let d0=48+vv/1000; let d1=48+(vv/100)%10; let d2=48+(vv/10)%10; let d3=48+vv%10
+    let dbg3=mmap(8); w8(dbg3,d0); w8(dbg3+1,d1); w8(dbg3+2,d2); w8(dbg3+3,d3); w8(dbg3+4,10)
+    file_write(2, dbg1, 3); file_write(2, dbg2, 3); file_write(2, dbg3, 5); exit(1)
+    let vr5=nv(); iremit(IR_CONST,vr5,0,0,0); return vr5
+}
+
