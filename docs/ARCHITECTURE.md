@@ -1,25 +1,31 @@
 # Quanta — SME HANDOFF (read this first when taking over)
 
-Last updated: 2026-08-15. Author: JEEEX.ORG. Status: x86-only
-compiler verified + hardened; multi-mode architecture designed but only the
-native AOT backend is built.
+Last updated: 2026-08-16. Author: JEEEX.ORG. Status: x86-64 + AArch64
+native AOT compiler verified + hardened; multi-mode architecture designed
+but only the native AOT backend is built.
 
 ## WHAT IS REAL (verified, not claimed)
-- `compiler/0.0.46/src/x86/` — multi-file x86-only Quanta compiler (main.quanta
-  + helpers/lexer/parse/codegen/emitter/elf/globals/features.quanta). Self-hosts
-  (3-stage: qc_boot -> qc_self -> qc, byte-identical, `fp=YES`). Passes 81/81.
-- bootstrap/qc-bootstrap-0.0.45 is the seed for self-hosting (in /opt/tali/quanta/bootstrap/).
-- Security: overflow trap (ud2 -> SIGILL rc=132), bounds trap, `unsafe{}`
-  opt-out. Lexer reports unterminated-string / invalid-char / integer-overflow
-  errors instead of silent exit (integer-overflow guards added 0.0.46).
-- 81-test regression gate: `bash test_suites/scripts/run_tests.sh`
-  -> "81/81 pass, 0 fail" (functional) + 6/6 security + 3/3 perf, harness exit 0.
-- Valgrind-clean: the mmap address-hint crash (BUG #3, -22/EINVAL under
-  Valgrind) is fixed; `valgrind --leak-check=summary qc ...` reports 0 errors
-  on all crash-repro programs.
+- `compiler/0.0.53/src/x86/` — multi-file x86-64 + AArch64 Quanta compiler
+  (main.quanta + helpers/lexer/parse/codegen/emitter/elf/globals/quanta).
+  Self-hosts (3-stage: qc_boot -> qc_self -> qc, byte-identical, `fp=YES`).
+- `bootstrap/qc-bootstrap-0.0.45` is the seed for self-hosting.
+- Security (fail-closed): overflow trap (ud2 -> SIGILL rc=132), bounds trap,
+  `unsafe{}` opt-out; MAP_FAILED -> abort rc=1 (NOT SIGSEGV 139, fixed 0.0.49);
+  undeclared fn / cyclic struct -> compile error rc=7 (fixed 0.0.48).
+- Valgrind-clean: 0 errors on self-compile and all crash-repro programs.
+- Grammar: `tree-sitter-quanta` parses ALL 15 compiler modules with 0 errors
+  (v0.0.53). Enables CodeRabbit / CI static review.
+- Latent-defect caught & fixed (0.0.53): keyword-hash constants H_ENUM/H_MUT/
+  H_MOVE had mismatched parens -> wrong lexer hashes for enum/mut/move
+  (silent corruption). Now balanced + verified.
+- **New (standards work):** `docs/SPEC.md` (language spec, v0.0.53) and
+  `docs/SAFETY_MANUAL.md` (ISO 26262-8 / IEC 61508-3 qualification status).
+  Quanta is at the documentation + partial-validation stage — NOT yet a
+  qualified tool. See SAFETY_MANUAL.md §6 for blockers (formal semantics,
+  independent implementation, manual memory model).
 
 ## INVARIANTS (never break these)
-1. Self-host: `cd compiler/0.0.46/src/x86; SEED=qc-bootstrap-0.0.45; $SEED main.quanta qc_boot && ./qc_boot main.quanta qc_self && ./qc_self main.quanta qc` must produce byte-identical qc_boot==qc_self==qc (`fp=YES`).
+1. Self-host: `cd compiler/0.0.53/src/x86; SEED=qc-bootstrap-0.0.45; $SEED main.quanta qc_boot && ./qc_boot main.quanta qc_self && ./qc_self main.quanta qc` must produce byte-identical qc_boot==qc_self==qc (`fp=YES`).
 2. 81/81 test_suites must pass after any change (plus security 6/6, perf 3/3).
 3. No ARM emitter code in the x86-only source (ARM is a SEPARATE future
    backend, built from scratch). The x86 emitter was de-duplicated in 0.0.46
