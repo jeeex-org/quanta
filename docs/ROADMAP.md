@@ -41,6 +41,13 @@ CRITICAL PROCESS RULES (learned the hard way):
   limit, a per-function return-path/branch cap, or IR/branch corruption in how the
   compiler compiles emit_bltn-family functions when they grow. ROOT CAUSE NOT PINNED.
   BLOCKS 0.0.42+ builtins until the compiler's emit_bltn/is_bltn codegen is fixed.
+
+> **CORRECTION (0.0.49):** this "emit_bltn codegen limit" is a RED HERRING. A trivial
+> `noop()` probe handler added to emit_bltn/is_bltn self-hosted CLEAN (s1/s2/s3 = 0,
+> full binary emitted). The actual breakage seen while adding a MAP_FAILED guard was an
+> INVERTED BRANCH in the guard itself (`jl` instead of `jge`), not a codegen limit.
+> Adding builtin handlers is SAFE. BUILTIN ENCODINGS are correct (verified in 0.0.49).
+> This BLOCKER is RESOLVED — 0.0.42+ builtins are unblocked.
   The byte/endianness BUILTIN ENCODINGS themselves are correct (bswap=48 0F C8,
   popcnt=F3 48 0F B8 C0, lzcnt=F3 48 0F BD C0, tzcnt=F3 48 0F BC C0, rol=48 D3 C0,
   ror=48 D3 C8; all load arg via 48 89 F8 mov rax,rdi), verified in isolation.
