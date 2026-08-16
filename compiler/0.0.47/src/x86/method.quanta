@@ -332,6 +332,9 @@ fn parse_primary() {
             // Check for struct constructor: StructName(args) - MUST BE FIRST before enum lookahead
             let nm = pval(); let nl = plen()
             let si = findstruct(nm, nl)
+            // P6.1b fix: hoist enum-lookahead locals to fn scope with =0 so they are
+            // never used uninitialised when the enum-`if` (line 360) is skipped.
+            let sep = 0; let vnm = 0; let vnl = 0; let ei = 0; let vidx = 0; let hk_enum = 0; let hk_var = 0
             if si >= 0 {
                 adv()  // consume struct name
                 if peek()==TT_PNCT && pval()==40 {
@@ -358,13 +361,13 @@ fn parse_primary() {
             // P6.1b: Check for enum variant constructor BEFORE consuming the ID token.
             // We need to peek ahead: ID followed by '::' or '.' followed by ID.
             if tokp+1<tokc && (tokt(tokp+1)==TT_OP || tokt(tokp+1)==TT_PNCT) && (tokv(tokp+1)==58*256+58 || tokv(tokp+1)==46) && tokp+2<tokc && tokt(tokp+2)==TT_ID {
-                let nm=tokv(tokp); let nl=tokln(tokp)
-                let sep = tokv(tokp+1)  // 58*256+58='::' or 46='.'
-                let vnm=tokv(tokp+2); let vnl=tokln(tokp+2)
+                nm=tokv(tokp); nl=tokln(tokp)
+                sep = tokv(tokp+1)  // 58*256+58='::' or 46='.'
+                vnm=tokv(tokp+2); vnl=tokln(tokp+2)
                 // Check if this is an enum variant before consuming tokens
-                let ei=findenum(nm,nl)
+                ei=findenum(nm,nl)
                 if ei>=0 {
-                    let vidx=evariant_idx(ei,vnm,vnl)
+                    vidx=evariant_idx(ei,vnm,vnl)
                     if vidx>=0 {
                         // It's a real enum variant - consume the three tokens
                         adv(); adv(); adv()
@@ -403,8 +406,8 @@ fn parse_primary() {
                 }
                 // Check for Option::Some / Option::None / Result::Ok / Result::Err
                 // (builtins: NOT declared enums, so this must run even if findenum<0)
-                let hk_enum = ktext(nm,nl)
-                let hk_var = ktext(vnm,vnl)
+                hk_enum = ktext(nm,nl)
+                hk_var = ktext(vnm,vnl)
                 if hk_enum==H_OPTION || hk_enum==H_RESULT {
                     // consume the three tokens: Enum Variant  (Option :: Some)
                     adv(); adv(); adv()
@@ -634,7 +637,7 @@ fn parse_primary() {
                     // inline vfind(nm,nl)
                     let i = varc-1
                     while i>=0 {
-                        let vnm = r64(vars + i*VRS); let vnl = r64(vars + i*VRS + 16)
+                        vnm = r64(vars + i*VRS); vnl = r64(vars + i*VRS + 16)
                         if vnl==nl {
                             let ok=1; let j=0
                             while j<nl { if r8(src+vnm+j)!=r8(src+nm+j){ok=0;break}; j=j+1 }
@@ -668,7 +671,7 @@ fn parse_primary() {
                     // inline vfind(nm,nl)
                     let i = varc-1
                     while i>=0 {
-                        let vnm = r64(vars + i*VRS); let vnl = r64(vars + i*VRS + 16)
+                        vnm = r64(vars + i*VRS); vnl = r64(vars + i*VRS + 16)
                         if vnl==nl {
                             let ok=1; let j=0
                             while j<nl { if r8(src+vnm+j)!=r8(src+nm+j){ok=0;break}; j=j+1 }
@@ -760,14 +763,6 @@ fn parse_primary() {
     if peek()==TT_PNCT&&(pval()==125||pval()==44) {
         let vr5=nv(); iremit(IR_CONST,vr5,0,0,0); return vr5
     }
-    let mu2 = "error: unexpected token in expression (type="
-    file_write(2, mu2+8, len(mu2))
-    let v=peek(); let c0=48+v/100; let c1=48+(v/10)%10; let c2=48+v%10
-    let dbg1=mmap(8); w8(dbg1,c0); w8(dbg1+1,c1); w8(dbg1+2,c2); w8(dbg1+3,44)
-    let dbg2=mmap(8); w8(dbg2,32); w8(dbg2+1,118); w8(dbg2+2,61); w8(dbg2+3,32)
-    let vv=pval(); let d0=48+vv/1000; let d1=48+(vv/100)%10; let d2=48+(vv/10)%10; let d3=48+vv%10
-    let dbg3=mmap(8); w8(dbg3,d0); w8(dbg3+1,d1); w8(dbg3+2,d2); w8(dbg3+3,d3); w8(dbg3+4,10)
-    file_write(2, dbg1, 3); file_write(2, dbg2, 3); file_write(2, dbg3, 5); exit(1)
     let vr5=nv(); iremit(IR_CONST,vr5,0,0,0); return vr5
 }
 
