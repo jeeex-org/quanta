@@ -199,7 +199,7 @@ module.exports = grammar({
       optional(seq(':', $.type)),
       '=',
       field('value', $.expression),
-      ';',
+      optional(';'),
     ),
 
     return_stmt: $ => seq('return', optional($.expression), optional(';')),
@@ -291,7 +291,6 @@ module.exports = grammar({
     int_literal: $ => choice(
       /0[xX][0-9a-fA-F]+/,
       /[0-9]+/,
-      seq('-', /[0-9]+/),
     ),
 
     string_literal: $ => token(seq(
@@ -328,11 +327,11 @@ module.exports = grammar({
     )),
 
     unary_expr: $ => prec.right(3, seq(
-      $.unary_op,
+      choice('!', '~', '-'),
       $.expression,
     )),
 
-    unary_op: $ => token(choice('-', '!', '~', '*')),
+    unary_op: $ => token(choice('!', '~')),
 
     call_expr: $ => seq(
       field('function', $.expression),
