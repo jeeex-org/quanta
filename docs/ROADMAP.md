@@ -151,12 +151,16 @@ alias analysis for speed is deferred to 0.1.0+.
 - 0.0.45 Complete `extern "C"` (funcscan path).
 - 0.0.46 `?` early-return propagation (needs IR_RET DCE fix; sibling of aliasing).
 - 0.0.47..0.0.50 spare debt slots (absorb any debt discovered during 0.0.43–0.0.46, or
-  pull forward if a debt needs more room). New features do NOT start before 0.0.51.
+  pull forward if a debt needs more room). New features do NOT start before 0.0.55.
 
-### 0.0.51+ : new planned features / functions
+### 0.0.51 – 0.0.54: grammar + bug-fix window
+- 0.0.51 tree-sitter grammar: semicolon-aware statement parsing (module files parse clean)
+- 0.0.52..0.0.54 spare slots for grammar refinements + any residual compiler bugs found during review
+
+### 0.0.55+ : new planned features / functions
 
 PRIORITY 2 — builtin families (G):
-- 0.0.51 Float comparisons (feq/flt/fgt/fle/fge/fisnan/fisinf) + fcmp_test
+- 0.0.55 Float comparisons (feq/flt/fgt/fle/fge/fisnan/fisinf) + fcmp_test
 - 0.0.52 Process/env (getpid/getppid/getenv/argc) + proc_test
 - 0.0.53 Stdin I/O (getchar/getline) + input_test
 - 0.0.54 fs metadata (stat/fstat/lseek/unlink/mkdir/chdir/rename) + fsmeta_test

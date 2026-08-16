@@ -30,22 +30,27 @@ module.exports = grammar({
     // match-arm `identifier =>` is ambiguous with identifier-as-expression
     [$.pattern, $.primary_expr],
     [$.pattern, $.expression],
-    // expression_stmt with optional ';' vs call_expr (expression '(')
-    [$.expression_stmt, $.call_expr],
-    [$.expression_stmt, $.index_expr],
-    [$.expression_stmt, $.field_access],
-    [$.expression_stmt, $.empty_stmt],
-    // expression_stmt optional ';' self-associativity
-    [$.expression_stmt, $.expression_stmt],
-    // return_stmt with optional ';'
-    [$.return_stmt, $.expression_stmt],
+    // defer_stmt (defer call) vs call_expr
+    [$.defer_stmt, $.call_expr],
+    [$.defer_stmt, $.index_expr],
+    [$.defer_stmt, $.field_access],
+    // top_level_item with bare expression vs call_expr
+    [$.top_level_item, $.call_expr],
+    [$.top_level_item, $.index_expr],
+    [$.top_level_item, $.field_access],
+    [$.statement, $.call_expr],
+    [$.statement, $.index_expr],
+    [$.statement, $.field_access],
+    [$.let_stmt, $.call_expr],
+    [$.let_stmt, $.index_expr],
+    [$.let_stmt, $.field_access],
+    [$.return_stmt, $.call_expr],
+    [$.return_stmt, $.index_expr],
+    [$.return_stmt, $.field_access],
     [$.return_stmt, $.return_stmt],
-    // break_stmt/continue_stmt with optional ';'
-    [$.break_stmt, $.expression_stmt],
-    [$.break_stmt, $.break_stmt],
-    [$.continue_stmt, $.expression_stmt],
-    [$.continue_stmt, $.continue_stmt],
-    [$.match_arm, $.expression_stmt],
+    [$.match_arm, $.call_expr],
+    [$.match_arm, $.index_expr],
+    [$.match_arm, $.field_access],
   ],
 
   rules: {
@@ -66,7 +71,7 @@ module.exports = grammar({
       $.defer_stmt,
       $.const_decl,
       $.let_stmt,
-      $.expression_stmt,
+      $.expression,
     ),
 
     // ---- declarations ----
@@ -181,8 +186,7 @@ module.exports = grammar({
       $.continue_stmt,
       $.defer_stmt,
       $.unsafe_block,
-      $.expression_stmt,
-      $.empty_stmt,
+      $.expression,
     ),
 
     let_stmt: $ => seq(
@@ -232,7 +236,7 @@ module.exports = grammar({
     match_arm: $ => seq(
       $.pattern,
       '=>',
-      choice($.block, seq($.expression, optional(';'))),
+      choice($.block, $.expression),
     ),
 
     pattern: $ => choice(
@@ -242,18 +246,14 @@ module.exports = grammar({
       $.expression,
     ),
 
-    break_stmt: $ => seq('break', optional(';')),
-    continue_stmt: $ => seq('continue', optional(';')),
+    break_stmt: $ => seq('break'),
+    continue_stmt: $ => seq('continue'),
 
-    defer_stmt: $ => seq('defer', $.expression_stmt),
+    defer_stmt: $ => seq('defer', $.expression),
 
     include_directive: $ => seq('include', $.string_literal),
 
     unsafe_block: $ => seq('unsafe', $.block),
-
-    expression_stmt: $ => seq($.expression, optional(';')),
-
-    empty_stmt: $ => ';',
 
     // ---- expressions ----
     expression: $ => choice(
