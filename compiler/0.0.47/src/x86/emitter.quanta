@@ -628,7 +628,12 @@ fn emit_bltn(nmi,nl,ii) {
         eb(65); eb(184); ei(0-1)      // mov r8d, -1    (fd)
         eb(69); eb(49); eb(201)       // xor r9d, r9d   (offset=0)
         eb(184); ei(9)                // mov eax, 9
-        sysc(); return 1
+        sysc()
+        // P6.2: mmap failure guard. Negative rax (-errno) = mapping failed.
+        eb(72); eb(131); eb(248); eb(0)   // cmp rax, 0
+        eb(125); eb(12)                   // jge +12 (skip abort if rax >= 0; fall through to abort if rax < 0)
+        eb(191); ei(1); eb(184); ei(60); eb(15); eb(5)  // mov edi,1; mov eax,60; syscall (exit 1)
+        return 1
     }
     // --- memory ops: memcpy / memcmp / memmove / realloc (placed BEFORE the mem_ block;
     //     checks placed after the mem_ block fail to dispatch in this compiler) ---
@@ -1051,6 +1056,7 @@ fn emit_bltn2(nmi,nl,ii) {
         eb(72);eb(131);eb(199);eb(8)  // rdi += 8 -> size = total+9
         rr(6,7)            // rsi = size
         ri(7,0); ri(2,3); ri(10,0x22); ri(8,-1); rxor(9,9); ri(0,9); sysc()  // rax = new
+        eb(72); eb(131); eb(248); eb(0); eb(125); eb(12); eb(191); ei(1); eb(184); ei(60); eb(15); eb(5)  // mmap-fail guard: if rax<0 exit(1)
         rr(12,0)           // r12 = new
         rr(0,15); ra(0,13) // rax = total
         rr(7,12); eb(72);eb(137);eb(7)   // [new] = total
@@ -1085,6 +1091,7 @@ fn emit_bltn2(nmi,nl,ii) {
         eb(72);eb(131);eb(199);eb(9)      // add rdi, 9 -> size = oldlen+1(byte)+8(header) (48 83 C7 09)
         rr(6,7)            // rsi = size
         ri(7,0); ri(2,3); ri(10,0x22); ri(8,-1); rxor(9,9); ri(0,9); sysc()  // rax = new
+        eb(72); eb(131); eb(248); eb(0); eb(125); eb(12); eb(191); ei(1); eb(184); ei(60); eb(15); eb(5)  // mmap-fail guard: if rax<0 exit(1)
         rr(12,0)           // r12 = new
         rr(0,14); eb(72);eb(255);eb(192)  // rax = oldlen+1 = newlen (inc rax -> 48 FF C0)
         rr(7,12); eb(72);eb(137);eb(7)    // [new] = newlen
