@@ -414,16 +414,6 @@ fn scanstructs() {
             while cp<tokc && !(tokt(cp)==TT_PNCT && tokv(cp)==125) {
               if tokt(cp)==TT_ID {
                 let fldp = tokv(cp); let fldl = tokln(cp)
-                // P6.2: reject a field token that is the struct's own name
-                // (e.g. `struct S { x S }` — `S` here is a self-reference by name,
-                // which is infinitely sized and yields a malformed binary). This
-                // catches the bare `field Name` form that the `: Type` colon block
-                // (below) does not see.
-                if fldl==onl {
-                  let sm2=0; let selfref=1
-                  while sm2<fldl { if r8(src+fldp+sm2)!=r8(src+onm+sm2) { selfref=0; break }; sm2=sm2+1 }
-                  if selfref==1 { let mh="error: struct "; file_write(2, mh+8, len(mh)); file_write(2, onm, onl); let mc=" cannot contain itself as a field\n"; file_write(2, mc+8, len(mc)); had_error=1 }
-                }
                 let slot = (si*64 + fc)*16
                 w64(sfldtab + slot, fldp); w64(sfldtab + slot + 8, fldl)
                 // optional `: Type` annotation -> field holds a struct of that type
@@ -439,13 +429,7 @@ fn scanstructs() {
                       if r64(sdefs + su*64 + 8)==tokln(tp) {
                         let sp=r64(sdefs + su*64); let sl=tokln(tp); let sm=0; let smatch=1
                         while sm<sl { if r8(src+sp+sm)!=r8(src+tokv(tp)+sm) { smatch=0; break }; sm=sm+1 }
-                        if smatch==1 {
-                            // P6.2: reject direct self-reference (struct S { x S }) —
-                            // it is infinitely sized and produces a malformed binary.
-                            if su==si { let mh="error: struct "; file_write(2, mh+8, len(mh)); file_write(2, r64(sdefs+si*64), onl); let mc=" cannot contain itself as a field type\n"; file_write(2, mc+8, len(mc)); had_error=1 }
-                            else { ftyp=su }
-                            break
-                        }
+                        if smatch==1 { ftyp=su; break }
                       }
                       su=su+1
                     }
