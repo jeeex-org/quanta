@@ -34,6 +34,18 @@ module.exports = grammar({
     [$.expression_stmt, $.call_expr],
     [$.expression_stmt, $.index_expr],
     [$.expression_stmt, $.field_access],
+    [$.expression_stmt, $.empty_stmt],
+    // expression_stmt optional ';' self-associativity
+    [$.expression_stmt, $.expression_stmt],
+    // return_stmt with optional ';'
+    [$.return_stmt, $.expression_stmt],
+    [$.return_stmt, $.return_stmt],
+    // break_stmt/continue_stmt with optional ';'
+    [$.break_stmt, $.expression_stmt],
+    [$.break_stmt, $.break_stmt],
+    [$.continue_stmt, $.expression_stmt],
+    [$.continue_stmt, $.continue_stmt],
+    [$.match_arm, $.expression_stmt],
   ],
 
   rules: {
@@ -170,6 +182,7 @@ module.exports = grammar({
       $.defer_stmt,
       $.unsafe_block,
       $.expression_stmt,
+      $.empty_stmt,
     ),
 
     let_stmt: $ => seq(
@@ -183,7 +196,7 @@ module.exports = grammar({
       ';',
     ),
 
-    return_stmt: $ => seq('return', optional($.expression), ';'),
+    return_stmt: $ => seq('return', optional($.expression), optional(';')),
 
     if_stmt: $ => seq(
       'if',
@@ -219,7 +232,7 @@ module.exports = grammar({
     match_arm: $ => seq(
       $.pattern,
       '=>',
-      choice($.block, seq($.expression, ';')),
+      choice($.block, seq($.expression, optional(';'))),
     ),
 
     pattern: $ => choice(
@@ -229,8 +242,8 @@ module.exports = grammar({
       $.expression,
     ),
 
-    break_stmt: $ => seq('break', ';'),
-    continue_stmt: $ => seq('continue', ';'),
+    break_stmt: $ => seq('break', optional(';')),
+    continue_stmt: $ => seq('continue', optional(';')),
 
     defer_stmt: $ => seq('defer', $.expression_stmt),
 
@@ -239,6 +252,8 @@ module.exports = grammar({
     unsafe_block: $ => seq('unsafe', $.block),
 
     expression_stmt: $ => seq($.expression, optional(';')),
+
+    empty_stmt: $ => ';',
 
     // ---- expressions ----
     expression: $ => choice(
