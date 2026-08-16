@@ -21,6 +21,7 @@ module.exports = grammar({
     $.block_comment,
     $.hash_comment,
     /[ \t\r\n]/,
+    ';',
   ],
 
   conflicts: $ => [
@@ -186,6 +187,7 @@ module.exports = grammar({
       $.continue_stmt,
       $.defer_stmt,
       $.unsafe_block,
+      $.block,
       $.expression,
     ),
 
@@ -273,6 +275,7 @@ module.exports = grammar({
       $.identifier,
       $.int_literal,
       $.string_literal,
+      $.char_literal,
       $.bool_literal,
       $.unit_literal,
       $.array_literal,
@@ -295,6 +298,12 @@ module.exports = grammar({
       '"',
       repeat(choice(/[^"\\]/, /\\./)),
       '"',
+    )),
+
+    char_literal: $ => token(seq(
+      "'",
+      choice(/[^'\\]/, /\\./),
+      "'",
     )),
 
     bool_literal: $ => choice('true', 'false'),
@@ -366,7 +375,7 @@ module.exports = grammar({
       ')',
     ),
 
-    assignment: $ => prec.right(1, seq(
+    assignment: $ => prec.right(3, seq(
       $.expression,
       '=',
       $.expression,
