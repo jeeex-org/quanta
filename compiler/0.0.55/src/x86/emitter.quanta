@@ -876,6 +876,14 @@ fn emit_bltn2(nmi,nl,ii) {
         eb(184); ei(1)               // mov eax, 1     (sys_write)
         sysc(); return 1
     }
+    if nl==5&&r8(nm)=='p'&&r8(nm+1)=='r'&&r8(nm+2)=='i'&&r8(nm+3)=='n'&&r8(nm+4)=='t' {
+        flush_all()   // write syscall clobbers rdi/rsi/rdx/rax
+        eb(72); eb(137); eb(242)     // mov rdx, rsi   (count = len)
+        eb(72); eb(137); eb(254)     // mov rsi, rdi   (buf = buf)
+        eb(191); ei(1)               // mov edi, 1     (fd = stdout; zero-extends to rdi)
+        eb(184); ei(1)               // mov eax, 1     (sys_write)
+        sysc(); return 1
+    }
     // printi(val): write decimal representation of the integer in rdi to stdout.
     if nl==6&&r8(nm)=='p'&&r8(nm+1)=='r'&&r8(nm+2)=='i'&&r8(nm+3)=='n'&&r8(nm+4)=='t'&&r8(nm+5)=='i' {
         flush_all()   // spill all live vregs; after this any register is safe to clobber
