@@ -84,10 +84,65 @@ fn main(argc, argv) {
     // quoted include in the main file resolves next to it).
     imp_dir_from(srcp, src_strlen(srcp))
     expand_includes(mainsrc, mlen, 0)
-    // SIMPLE-SURFACE: implicit main. A pure-statement script (no top-level
-    // fn/struct/enum/global/const declarations) is wrapped in `fn main(){...}`
-    // so a beginner never writes `fn main`. Library files that declare things
-    // but omit main keep the hard error below.
+    // SIMPLE-SURFACE: detect if this looks like a pure script (no top-level
+    // fn/struct/enum/global/const). If so, rewrite bare `name () {` to `fn name () {`
+    // then wrap in `fn main(){...}`. This runs BEFORE final wrap check so
+    // the final wrap sees the rewritten "fn main" and skips.
+    let is_pure_script = 1
+    let si = 0
+    while si < srclen {
+        let prev = 0; if si>0 { prev = r8(src+si-1) }
+        if si==0 || prev==10 || prev==32 || prev==9 || prev==13 {
+            if r8(src+si)==102 && r8(src+si+1)==110 && r8(src+si+2)==32 { is_pure_script=0 }      // "fn "
+            else if r8(src+si)==115 && r8(src+si+1)==116 && r8(src+si+2)==114 && r8(src+si+3)==117 && r8(src+si+4)==99 && r8(src+si+5)==116 && r8(src+si+6)==32 { is_pure_script=0 } // "struct "
+            else if r8(src+si)==101 && r8(src+si+1)==110 && r8(src+si+2)==117 && r8(src+si+3)==109 && r8(src+si+4)==32 { is_pure_script=0 } // "enum "
+            else if r8(src+si)==103 && r8(src+si+1)==108 && r8(src+si+2)==111 && r8(src+si+3)==98 && r8(src+si+4)==97 && r8(src+si+5)==108 && r8(src+si+6)==32 { is_pure_script=0 } // "global "
+            else if r8(src+si)==99 && r8(src+si+1)==111 && r8(src+si+2)==110 && r8(src+si+3)==115 && r8(src+si+4)==116 && r8(src+si+5)==32 { is_pure_script=0 } // "const "
+        }
+        si = si + 1
+    }
+    // If pure script, rewrite bare `name () {` -> `fn name () {`
+    if is_pure_script==1 {
+        {
+            let bi = 0
+            while bi < srclen {
+                let c0 = r8(src+bi)
+                if (c0>=65&&c0<=90)||(c0>=97&&c0<=122)||c0==95 {
+                    // scan identifier
+                    let ie = bi
+                    while ie < srclen {
+                        let cc = r8(src+ie)
+                        if (cc>=65&&cc<=90)||(cc>=97&&cc<=122)||(cc>=48&&cc<=57)||cc==95 { ie = ie + 1 } else { break }
+                    }
+                    // skip if already preceded by "fn "
+                    let skip_fn = 0
+                    if bi>=3 && r8(src+bi-3)==102 && r8(src+bi-2)==110 && r8(src+bi-1)==32 { skip_fn = 1 }
+                    if skip_fn==0 {
+                        // after identifier: optional spaces, then '('
+                        let p = ie; while p<srclen && (r8(src+p)==32||r8(src+p)==9) { p = p + 1 }
+                        if p<srclen && r8(src+p)==40 {
+                            // find matching ')'
+                            let d=1; let q=p+1
+                            while q<srclen && d>0 { let cc=r8(src+q); if cc==40 { d=d+1 } else if cc==41 { d=d-1 }; q=q+1 }
+                            if d==0 && q<srclen {
+                                // optional spaces then '{'
+                                let r2=q; while r2<srclen && (r8(src+r2)==32||r8(src+r2)==9) { r2=r2+1 }
+                                if r2<srclen && r8(src+r2)==123 {
+                                    // insert "fn " before bi: shift [bi..srclen) right by 3
+                                    let e2 = srclen
+                                    while e2 >= bi { w8(src+e2+3, r8(src+e2)); e2 = e2 - 1 }
+                                    w8(src+bi,102); w8(src+bi+1,110); w8(src+bi+2,32) // "fn "
+                                    srclen = srclen + 3
+                                    bi = bi + 3 + (ie - bi) // skip past "fn " + name
+                                } else { bi = ie }
+                            } else { bi = ie }
+                        } else { bi = ie }
+                    } else { bi = ie }
+                } else { bi = bi + 1 }
+            }
+        }
+    }
+    // NOW compute wrap_main on the REWRITTEN source
     let wrap_main = 1
     let si = 0
     while si < srclen {
