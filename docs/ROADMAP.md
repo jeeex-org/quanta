@@ -1,226 +1,164 @@
-# Quanta ROADMAP — core + builtins campaign (0.0.39 → 0.1.0)
+# Quanta ROADMAP — consolidated single source of truth
 
-> **Actual status as of 0.0.46 (2026-08-15):** the debt-window items below
-> (0.0.43 aliasing fix, 0.0.46 `?` propagation) are already SHIPPED — `reg_alias`
-> and `question_mark` are in the gate and passing (81/81). The version labels in
-> this document are a historical campaign queue, not live assignments. Current
-> compiler = 0.0.46, multi-file x86 tree, Valgrind-clean, self-host `fp=YES`.
+> **Last updated: 2026-08-17. Current compiler: 0.0.53** (x86-64 + AArch64
+> ELF emitters, multi-file tree, Valgrind-clean, self-host `fp=YES`).
+>
+> This document consolidates what was previously spread across the stale
+> `ROADMAP.md` (removed — claimed current=0.0.46), `QUANTA_ROADMAP.md`
+> (vision), `FEATURES.md` (build order), and `LANGUAGE_DESIGN.md` (stages).
+> Feature-by-feature status → `FEATURES.md`; language design →
+> `LANGUAGE_DESIGN.md`; safety/standards → `SAFETY_MANUAL.md`,
+> `SECURITY_TOOLING.md`, `MEMORY_SAFETY_ARGUMENT.md`, `SPEC.md`.
 
-Goal: complete ALL core builtins before any new std/lib work. One patch version
-per feature/function. After EACH successful builtin, add/extend a test_suite test
-that exercises it (so the gate grows with the language). 0.1.0 = milestone where
-core+builtins are complete and std/lib work may resume.
+Vision (from the brief): *Once people use Quanta, they will never need
+another language again. It can do it all.* Quanta must be **differentiated**,
+not "just another language": built-in **security, quantum resilience
+(post-quantum crypto), blockchain/cryptography, and AI**, borrowing the best
+from other languages and discarding the worst — optimized for simple, fast,
+secure,
+> reliable development.
+>
+> Discipline: **one feature per WIP version**. Each version self-hosts (boot→self→qc
+> fixed point) and passes `test_suites` green before promotion. Packaging/install
+> is **LAST** (not required yet); features and differentiation come first.
+>
+> Capability libraries live in `lib/<domain>/` (web, sys, ai, chain, crypto,
+> quantum, secure, db, ui) — never a `frontend/` folder holding the lexer.
 
-CONVENTIONS (enforced):
-- Version per feature: 0.0.39, 0.0.40, ... each adds ONE builtin family or ONE
-  closely-related group (e.g. syscall1..6 is one version; clock+nanosleep one; etc).
-- Fix-forward only. Self-host gate (3-stage) must hold after each version.
-- test_suites/EXPECTED.tsv + a codes/*.quanta test added/extended per version.
-- Gate must be 100% green (run_tests.sh) before promoting a version.
-- 0.0.38 is the last test-suite-only + tail-expr-fix version (committed: d396b7a).
+## North-star principles
+1. **Differentiation over parity.** Features that other languages lack or bolt on
+   (post-quantum crypto, on-chain types, in-language AI inference, secure-by-
+   default memory) are FIRST-CLASS, not libraries you wire up later.
+2. **Security by default.** Bounds + overflow traps already exist (`SIGILL`, 132).
+   Extend to: capability-checked I/O, constant-time crypto ops, memory-safe owned
+   types, compile-time taint tracking for untrusted input.
+3. **Self-sufficient.** `std` is written IN Quanta (not C). Quanta talks to the OS
+   via syscalls, not libc. FFI (`extern "C"`) is a narrow, opt-in escape hatch —
+   never on Quanta's own critical path.
+4. **Borrow the best, discard the worst.** Take Rust's safety story, Go's
+  simplicity + concurrency, Zig's low-level control, and high-level
+  expressiveness — without their footguns
+   (borrow-checker pain, GC pauses, build complexity, dependency hell).
 
-CRITICAL PROCESS RULES (learned the hard way):
-- NEW VERSION = COPY OF IMMEDIATELY-PRECEDING VERSION (e.g. 0.0.41/src = copy of
-  0.0.40/src + new feature). NEVER use an old scratch pad (e.g. 0.0.38/src) as the
-  base, and NEVER `git checkout` a version's src to "restore" it (that reverts
-  uncommitted WIP and drops already-shipped builtins like time — which then shows up
-  as a phantom "missing feature" caught by the gate).
-- emit_bltn DISPATCH BUG: builtin name-match handlers MUST be placed BEFORE the
-  `mem_` block (the `if nl>=8 && src[nm]=='m'&&src[nm+1]=='e'&&src[nm+2]=='m'&&src[nm+3]=='_'`
-  block) in emit_bltn(). Handlers placed AFTER that block silently fail to dispatch
-  (the check is reached but never fires) — a compiler codegen bug, not a logic error.
-  If a newly-added builtin won't dispatch, move its check above the mem_ block.
-- emit_bltn HARD LIMIT (discovered attempting 0.0.42): adding ANY new handler to emit_bltn
-  (even a trivial no-op `zz` if-block) makes the self-hosted compiler emit NO binary
-  (crash / Illegal-instruction) for large programs such as std_crypto_test. Confirmed
-  by a CLEAN test (0.0.41 copy + 1 trivial handler -> std_crypto produces no output).
-  The same applies to is_bltn (features.quanta): growing it by 6 checks also breaks the
-  compiler during parse. Symptom: simple programs compile; large/complex ones emit no
-  binary. NOT if-chain length per se — splitting emit_bltn into emit_bltn+emit_bltn2
-  (each <45 handlers, the 0.0.41 working count) did NOT fix it. Likely a global dispatch
-  limit, a per-function return-path/branch cap, or IR/branch corruption in how the
-  compiler compiles emit_bltn-family functions when they grow. ROOT CAUSE NOT PINNED.
-  BLOCKS 0.0.42+ builtins until the compiler's emit_bltn/is_bltn codegen is fixed.
+## Phased plan
 
-> **CORRECTION (0.0.49):** this "emit_bltn codegen limit" is a RED HERRING. A trivial
-> `noop()` probe handler added to emit_bltn/is_bltn self-hosted CLEAN (s1/s2/s3 = 0,
-> full binary emitted). The actual breakage seen while adding a MAP_FAILED guard was an
-> INVERTED BRANCH in the guard itself (`jl` instead of `jge`), not a codegen limit.
-> Adding builtin handlers is SAFE. BUILTIN ENCODINGS are correct (verified in 0.0.49).
-> This BLOCKER is RESOLVED — 0.0.42+ builtins are unblocked.
-  The byte/endianness BUILTIN ENCODINGS themselves are correct (bswap=48 0F C8,
-  popcnt=F3 48 0F B8 C0, lzcnt=F3 48 0F BD C0, tzcnt=F3 48 0F BC C0, rol=48 D3 C0,
-  ror=48 D3 C8; all load arg via 48 89 F8 mov rax,rdi), verified in isolation.
+### Phase 1 — Foundation: make `std` real (usable primitives)
+- **0.0.30** `lib/` module mechanism + core modules (`std/io`, `std/math`,
+  `std/str`) in Quanta; `import` resolves `lib/<path>.quanta`. **DONE (`572aa67`, 67/67
+  green).** Verified: abs,min,max,pow,clamp,gcd,concat,equals,substr,parse_i64,len.
+  (Large results checked via `printi` — `exit()` is 8-bit-truncated by the shell.)
+- **0.0.31** Byte-level access builtins (`byte_at`/`byte_set`) + `std/str` real
+  ops (`concat`, `substr`, `equals`, `parse_i64`) + `std/fs` file I/O
+  (`open`/`read`/`write`/`close` via syscall).
+- **0.0.32** `std/collections`: `vec` (dynamic array), `map` (hashmap).
+  Foundation for DB + general apps.
 
-## Completeness audit (what exists vs. what a "full and complete" language needs)
-This section is the SOURCE OF TRUTH for remaining work. It was built by auditing
-the actual compiler source (0.0.42), not guessed. Status: ✅ done · 🟡 partial ·
-❌ missing. "Core" = the language itself; "builtins" = inline-code primitives.
+### Phase 2 — Differentiation pillars (the "never need another language" part)
+- **0.0.33** CODEGEN BUG FIX (builtins flush_all). Promoted `cdff03b`. NOT crypto.
+- **0.0.34** `lib/crypto`: SHA-256, HMAC, AES-128, CSPRNG (getrandom). ← **NOW**
+  (CSPRNG). Pure-Quanta + syscall entropy.
+- **0.0.34** `lib/quantum`: **post-quantum crypto** — Kyber (KEM) + Dilithium
+  (signatures) reference impls in Quanta. Quantum-resilient by default.
+- **0.0.35** `lib/chain`: blockchain primitives — Merkle tree, signed
+  transactions, UTXO/account types, a `Block`/`Chain` model. On-chain-native types.
+- **0.0.36** `lib/secure`: capability-checked I/O, secrets handling, constant-
+  time compare, sandbox/resource-limit primitives.
+- **0.0.37** `lib/ai`: tensor ops + a small in-language inference runtime
+  (load GGUF/ONNX-shaped weights, run matmul/attention). Local AI, no external
+  language runtime.
 
-### A. Core language — types
-- ✅ i64 (default integer), u8/u32/u64 masks, usize
-- ✅ f64 (arithmetic via i2f/f2i/fadd/fsub/fmul/fdiv builtins)
-- ❌ **float literals** — lexer hard-errors "floating-point literals are not supported" (parse.quanta/lexer line ~127). Cannot write `3.14`; only compute via i2f.
-- ❌ **char / byte / bool** as first-class types (tokens kt==9..12 reserved, not wired)
-- ❌ **string** as a real type (TT_STRING token reserved; only byte-buffer conventions + print builtins today)
-- 🟡 **struct** — fields/method-call (`obj.method`) work (method.quanta); construction + literal + field read/write work. No struct *literals* verification coverage.
-- ❌ **enum** (real, user-defined) — TT_ENUM token + bare Some/None/Ok/Err matching only. No `enum Name { A, B }` definition or custom variants.
-- ❌ **union / tagged-union** definition (Ok/Err/Some/None are built-in magic, not general)
-- ❌ **tuple** as a type (mk_any exists as 2-tuple hack; no `(T,U)` syntax)
-- ❌ **array/slice** as typed (only untyped `[...]` + vec_* builtins)
+### Phase 3 — App capabilities (make it useful for real products)
+- **0.0.38** `std/net`: sockets (`socket`/`bind`/`listen`/`accept`/`recv`/`send`).
+- **0.0.39** `std/http`: request parse / response build (on net + str).
+- **0.0.40** `std/json`: parse/serialize (on str + map) — data interchange.
+- **0.0.41** `std/db`: embedded key-value + simple query store (on map + fs).
+  ← your "DB" ask.
+- **0.0.42** `std/tui`: terminal UI primitives (raw mode, draw, input).
 
-### B. Core language — declarations & scoping
-- ✅ fn, let, const (H_CONST), extern "C" fn, global vars, unsafe {} , defer {}
-- ✅ struct methods (impl-style via first-param `self`)
-- ❌ **trait / interface** — TT_TRAIT/TT_INTERFACE tokens + funcscan skips/records them, but NO dispatch, NO method resolution, NO impl<->trait linking at codegen. Effectively a no-op scaffold.
-- ❌ **impl Trait for Type** — scanimpls() records pairs but nothing consumes them (no vtable, no resolution)
-- ❌ **generics `<T>`** — no type-parameter parsing anywhere; all code is monomorphic
-- ❌ **modules / namespaces** — `#import` is flat-global textual inline; no `module`, no name resolution, no privacy
-- ❌ **visibility / pub / priv** — absent
+### Phase 4 — UI + multi-mode reach
+- **0.0.43** WebAssembly backend (already a named execution mode) — UI in browser.
+- **0.0.44** `std/ui`: retained-widget DOM/canvas layer (on WASM + tui).
 
-### C. Core language — control flow
-- ✅ if/else, while, for-in (`for x in arr`), match (expression arms), break/continue, return, defer
-- ❌ **for-range `for i in 0..n`** — `..` operator is NOT parsed (grep for `..` in source = none). Only array for-in. VERIFIED GAP, no coverage.
-- ❌ **match block arms `1 => { ... }`** — parser only emits IR for expression arms (`1 => expr`); block arms return no vreg. Deferred.
-- 🟡 **`?` operator** — only UNWRAP (extracts Ok payload); EARLY-RETURN-on-Err propagation is NOT emitted (comment says "if tag==0 early-return" but code doesn't). Deferred due to IR_RET-terminator DCE bug.
-- ❌ **loop expressions / labeled break with value** — absent
-- ❌ **try/catch / except** — no structured error handling (only panic + `?` unwrap)
+### Phase 5 — Polish + parity (original end-goal, deferred)
+- **0.0.45+** Review top languages, close parity gaps (async/await, trait maturity,
+  tooling/LSP), then optimize (perf, code size).
 
-### D. Core language — expressions & operators
-- ✅ arithmetic, bitwise, shifts, comparisons, logical, ternary, field access, indexing
-- ✅ unsigned arith builtins (udiv/umod/ult/ugt/ulte/ugte)
-- ❌ **operator overloading** — absent
-- ❌ **range/`..` expression** — absent (needed by for-range)
-- ❌ **closure literals `|a| a+1`** — closure_call/fnptr exist but NO lambda syntax; closures built only via builtin plumbing
+### Phase 6 — LAST: packaging/install (only when features exist to ship)
+- Self-hosted `quanta` package/build CLI (own driver; `--emit-obj`/multi-TU
+  already present). `extern "C"` FFI as opt-in escape hatch.
 
-### E. Memory & runtime
-- ✅ mem_alloc/free/mmap/realloc, memcpy/memcmp/memmove, mem_load/store (+8)
-- ✅ defer (LIFO replay), unsafe blocks
-- ❌ **real allocator** — mmap-based bump; no free-list/GC; realloc is mmap-copy
-- 🟡 **callee load-store-to-same-addr aliasing** — BUG: fn that reads mem then writes same addr, called in loop, corrupts all but first iter. Blocks SHA/AES (load-modify-store) and map>4x. HIGHEST-PRIORITY CORRECTNESS FIX.
-- ❌ **stack unwinding / destructors / RAII** — absent (defer is manual)
-- ❌ **ref/mut/move** — TT_REF/TT_MUT/TT_MOVE tokens reserved, not implemented
+## Why this order
+- `std` first: nothing is installable or useful without a library ecosystem; it is
+  also the independence move (Quanta std in Quanta, not libc).
+- Differentiation pillars (crypto/quantum/chain/AI/secure) come BEFORE generic app
+  plumbing because they are the reason Quanta exists — they are the moat.
+- Apps/DB/UI ride on the pillars + collections + I/O.
+- Packaging is literally last: you don't package an empty shelf.
 
-### F. Builtins already present (53 registered; prefixes expand further)
-syscall(1-6), exit, mmap, mem_alloc/free/realloc, memcpy/memcmp/memmove,
-mem_load/mem_store(+8), file_* (open/read/write/close family), print/printi/
-println/prints/printsp/newline, len, str, push/pop, vec_*(get/set/load/store/
-add/sub/mul/div), arg, mk_any, fnptr, closure_call, fadd/fsub/fmul/fdiv,
-i2f/f2i, udiv/umod/ult/ugt/ulte/ugte, u8/u32/u64 masks, bswap/popcount/clz/ctz/
-rotl/rotr, gettimeofday/nanosleep/sleep, panic.
+---
 
-### G. Builtins still MISSING (the real "core+builtins" queue)
-- ❌ **float comparisons**: feq, flt, fgt, fle, fge, fisnan, fisinf (NaN-correct)
-- ❌ **process/env**: getpid, getppid, getenv, argc/environ exposure
-- ❌ **stdin I/O**: getchar, getline
-- ❌ **fs metadata**: stat, fstat, lseek, unlink, mkdir, chdir, rename
-- ❌ **networking convenience**: socket/connect/bind/listen/accept (raw syscall reachable already)
-- ❌ **atomics**: atomic_load/store/add/cmpxchg + futex
-- ❌ **introspection**: abort, debugbreak, stack-trace hook
-- ❌ **string ops**: strcat, substr, strcmp, str_split, utf8 encode/decode
-- ❌ **bit/byte ops**: byteswap already; missing ctz-clz fine; missing parity, bitfield insert/extract, byte swap per-size
-- ❌ **math**: sqrt, sin/cos/tan, pow, log, abs, min/max, floor/ceil (currently only via fadd etc.)
-- ❌ **random**: getrandom (libc), rand
-- ❌ **intrinsics**: prefetch, fence, expected/unexpected (branch hint)
+## Standards & Safety track (added 2026-08-17, runs parallel to pillars)
 
-### H. Tooling / self-sufficiency (user-stated goal: replace python for writing Quanta)
-- ❌ **Quanta-native codegen/refactor tool** — currently edits done via python heredocs (clunky, blocked payloads, brace bugs). A Quanta app that reads/writes Quanta source reliably is needed so compiler work stops depending on fragile text surgery.
-- ❌ **debugger/objdump integration**, ❌ **package manager**, ❌ **build system** beyond `qc src bin`.
+Quanta's ISO/IEC 26262-8 / IEC 61508-3 qualification work (see
+docs/SAFETY_MANUAL.md, docs/SECURITY_TOOLING.md, docs/MEMORY_SAFETY_ARGUMENT.md).
+This file is now the SINGLE consolidated roadmap (the old stale
+`ROADMAP.md` was removed 2026-08-17; its source-derived completeness audit
+lives in docs/FEATURES.md).
 
-## Full build order to 1.0 (each = one WIP version, gate green before promote)
+### Build order to 1.0 (single source of truth)
 
-**Sequencing decision (2026-08-14):** core tech-debts fixed FIRST, one atomic fix per
-version, before any new feature work.
-- **0.0.43 – 0.0.50 = bug/debt-fix window.** New features wait until the debt window clears.
-- **0.0.51+ = new planned features/functions resume.**
+Convention: one feature per WIP version; each self-hosts (3-stage) and
+passes the gate green before promotion. Version numbers are MUTABLE — the
+SEQUENCING is the contract, not the literal numbers.
 
-### 0.0.43 – 0.0.50: bug & tech-debt window (one small fix per version)
+| Phase | Versions | Scope |
+|-------|----------|-------|
+| Debt window | 0.0.43–0.0.50 | Core correctness (aliasing, `?` propagation, MAP_FAILED guard, cyclic-struct reject). **CLOSED.** |
+| Grammar + bug-fix | 0.0.51–0.0.55 | tree-sitter grammar (done 0.0.53), residual compiler bugs. **0.0.53 shipped.** |
+| P2 builtins | 0.0.55–0.0.60 | float cmp, proc/env, stdin, fs meta, string ops, math, atomics, net, introspection, random |
+| P3 language | 0.0.61–0.0.71 | float literals, user enums, tuples, generics, traits, modules, real char/byte/string/bool, ref/mut/move, op-overload, closure literals, and/or/not/true/false/global |
+| **P4 tooling** | **0.0.72** | **Quanta-native code-writing tool** (edit Quanta source reliably without external scripting — the user's stated goal) |
+| **1.0** | 1.0.0 | Core + builtins complete → std/lib resumes; borrow-checking target for #1 green |
 
-**Context — aliasing bug diagnosis (DONE, not a version):** reproduced with `reg_alias.quanta`
-(permanent red gate test: 75/76, the 1 fail pins the bug). Bisected: `mem_load` is correct in
-isolation; `len` is correct immediately after `len = mem_load(p)`; but after the FIRST
-`mem_store`, `len` is corrupted. Bug is in `flush_all()`'s failure to correctly preserve a live
-vreg derived from a preceding `mem_load` when a `mem_store` clobbers registers. The fix is a
-correct memory barrier at the store (conservative aliasing — correct-by-construction); precise
-alias analysis for speed is deferred to 0.1.0+.
+**0.0.72 is RESERVED for the code-writing tool.** Nothing else takes it.
 
-- 0.0.43 **Fix aliasing bug**: correct memory barrier so `mem_store` preserves/refreshes live
-  vregs derived from memory. `reg_alias` goes GREEN; add a 2nd regression (map-accumulate /
-  repeated same-addr mutate). Full gate green.
-- 0.0.44 Wire `usize`/`u32`/`u64`/`u8`/`u16` as proper type keywords (mask builtins exist).
-- 0.0.45 Complete `extern "C"` (funcscan path).
-- 0.0.46 `?` early-return propagation (needs IR_RET DCE fix; sibling of aliasing).
-- 0.0.47..0.0.50 spare debt slots (absorb any debt discovered during 0.0.43–0.0.46, or
-  pull forward if a debt needs more room). New features do NOT start before 0.0.55.
+### #1 / #2 standards status
 
-### 0.0.51 – 0.0.54: grammar + bug-fix window
-- 0.0.51 tree-sitter grammar: semicolon-aware statement parsing (module files parse clean)
-- 0.0.52..0.0.54 spare slots for grammar refinements + any residual compiler bugs found during review
+| Point | Status |
+|-------|--------|
+| #5 Grammar clean | ✅ 0.0.53 (all 15 modules 0 errors) |
+| #3 Formal spec | ✅ SPEC.md |
+| #4 Safety manual + process | ✅ SAFETY_MANUAL.md |
+| #1 Memory/UB safety | 🟡 hardened (fail-closed, Valgrind-clean, fuzz-proven); not compile-time-proven |
+| #2 Independent implementation | 🟡 differential vs seed (0.0.53); full POST-1.0 when ARM64 backend lands |
 
-### 0.0.55+ : new planned features / functions
+**#2 schedule (ARM64 DEFERRED POST-1.0 — not before):**
+Per debt-first discipline, a second backend must NOT start while x86 core +
+builtins still have open items (float literals, generics, traits, real
+allocator, etc. — see FEATURES.md audit). The ARM64 backend lands only
+AFTER 1.0 core completion.
+- **POST-1.0** ARM64 (AArch64) backend (LANGUAGE_DESIGN.md Stage 4): a SECOND,
+  independently-written emitter over the shared IR — the real ISO 26262-8
+  §11 independent-implementation route. (Does NOT take 0.0.72.)
+- **POST-1.0** x86↔ARM64 differential harness: compile same program on both
+  backends, assert identical exit codes. Extends tools/diff_test/diff_qc.py
+  (currently current-vs-seed, weak evidence — seed is same lineage). This is
+  what closes #2 for real.
+- (dependent) once a 2nd backend/C path exists, build `qc` under
+  ASan+UBSan+MSan, require 0 errors → sanitizer-clean confirmation of the
+  memory-safety argument.
+- **1.0** Stage-6 borrow checking (compile-time memory safety) → moves #1 to ✅.
 
-PRIORITY 2 — builtin families (G):
-- 0.0.55 Float comparisons (feq/flt/fgt/fle/fge/fisnan/fisinf) + fcmp_test
-- 0.0.52 Process/env (getpid/getppid/getenv/argc) + proc_test
-- 0.0.53 Stdin I/O (getchar/getline) + input_test
-- 0.0.54 fs metadata (stat/fstat/lseek/unlink/mkdir/chdir/rename) + fsmeta_test
-- 0.0.55 String ops (strcat/substr/strcmp/split/utf8) + strtest
-- 0.0.56 Math (sqrt/sin/cos/tan/pow/log/abs/min/max/floor/ceil) + math_test
-- 0.0.57 Atomics (atomic_*/futex) + atomic_test
-- 0.0.58 Networking convenience (socket/connect/bind/listen/accept) + net_test
-- 0.0.59 Introspection (abort/debugbreak/stack-trace) + abort_test
-- 0.0.60 Random (getrandom/rand) + rand_test
+Why post-1.0: the ARM64 backend is a new backend; shipping it while x86 debt
+remains would violate the debt-first rule and split correctness effort.
+Qualification evidence is gathered AFTER the core is complete, not before.
 
-PRIORITY 3 — language completeness (A/B/D/E):
-- 0.0.61 Float literals (lexer) — unblocks natural f64 code
-- 0.0.62 Real enums (user-defined `enum Name { A, B(c) }` + match)
-- 0.0.63 Tuples `(T,U)` as a type + destructuring
-- 0.0.64 Generics `<T>` (monomorphization) — large, own campaign
-- 0.0.65 Traits + impl dispatch (consume scanimpls records; vtables)
-- 0.0.66 Modules/namespaces + visibility (replaces flat #import)
-- 0.0.67 char/byte/bool/string as real types
-- 0.0.68 ref/mut/move (ownership lite) or documented-RC
-- 0.0.69 Operator overloading (where sound)
-- 0.0.70 Closure literals `|a| ...` syntax
-- 0.0.71 Parse and/or/not/true/false/global keywords
+### Current status (0.0.53)
 
-PRIORITY 4 — tooling (H):
-- 0.0.72 Quanta-native code-writing tool (the user's stated goal to replace python)
-
---- 1.0: CORE + BUILTINS COMPLETE. std/lib work (crypto split, net/lib, serde, etc.) resumes at 1.0+ ---
-
-
-## Notes
-- Audit basis: 0.0.42 source (53 builtins in is_bltn; tokens/parser scanned 2026-08-14).
-- Each version: edit compiler/0.0.XX/src/x86/{features,emitter,parse,lexer}.quanta as
-  needed, self-host 3-stage, run gate, add test, commit. Keep bootstrap/ current.
-- "One feature per WIP version" still holds — the list above is the QUEUE, not a bundle.
-- **Debt-first:** 0.0.43 + 0.0.44 clear ALL genuine partial features + test debt before
-  new features, because a wrong codegen silently breaks earlier-green tests.
-- Test framework: tests `return`/`exit` a computed value; EXPECTED.tsv's expected_rc is
-  that value. Non-zero expected_rc = correct answer, NOT a hidden failure.
-
-## 0.0.42 status (byte/endianness builtins) — DONE / SHIPPED (commit 36f76b6)
-- **SHIPPED GREEN.** 0.0.42 = 0.0.41 + `emit_bltn` split (self-host fix) + the
-  6 byte/endianness builtins `bswap, popcount, clz, ctz, rotl, rotr` (the 0.0.43
-  objective, layered on the 0.0.42 base).
-- **Self-host fixed point:** qc_boot == qc_self == qc (byte-identical). ✓
-- **Core gate: 73/73 pass, 0 compile-fail.** ✓
-- **bits_test passes (rc=0)** — builtins verified correct (encodings:
-  bswap=48 0F C8, popcnt=F3 48 0F B8 C0, lzcnt=F3 48 0F BD C0, tzcnt=F3 48 0F BC C0,
-  rol=48 D3 C0, ror=48 D3 C8; all load arg via 48 89 F8 mov rax,rdi).
-- **std/lib removed from core gate:** the 7 `lib/std/*` integration tests
-  (std_crypto/fs/lib/map/math/str/vec) were removed from EXPECTED.tsv per the
-  project rule "complete cores+builtins before std/lib work" (0.1.0+). std_crypto
-  in particular was a PRE-EXISTING compile-fail under 0.0.41 itself (blocked by the
-  callee load-store-to-same-addr aliasing bug) — NOT a 0.0.42 regression. It will
-  be reimplemented properly in 0.1.0+ split into crypto_sha2/crypto_hmac/crypto_aead.
-- **CORRECTION NOTE (2026-08-14):** an earlier draft of this block claimed
-  "0.0.41 miscompiles 0.0.42 → BLOCKED". That was WRONG — it was inferred from a
-  STALE `/tmp` binary (a leftover `std_crypto` binary from a prior session reported
-  rc=3 and was mistaken for 0.0.41's live output). The actual gate showed 0.0.41
-  ALSO failed std_crypto (compile-fail), so the "regression" was a phantom. This
-  block is now rewritten to the verified green state. Lesson encoded in
-  PROJECT_RULES.md §8 / SKILL.md DOC-FRESHNESS RULE.
-- NEXT (debt window, see build order above): 0.0.43 = diagnose aliasing bug + add `reg_alias` regression test. New features wait until 0.0.51.
+Shipped + verified: x86-64 + AArch64 ELF emitters, self-host fixed-point;
+fail-closed memory model (overflow/bounds→SIGILL 132, MAP_FAILED→rc=1,
+undeclared/cyclic→rc=7); grammar 0 errors on all 15 modules; keyword-hash
+paren bug fixed; fail-closed fuzzer (20K iters, 0 crashes); differential
+vs seed (5/5 parity); Valgrind-clean. Standards docs: SPEC/SAFETY_MANUAL/
+SECURITY_TOOLING/MEMORY_SAFETY_ARGUMENT.
 

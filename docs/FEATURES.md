@@ -1,8 +1,8 @@
 # Quanta — Features: Shipped vs. To-Do
 
 Source-of-truth feature inventory for the Quanta x86 self-hosting compiler.
-**Derived directly from the 0.0.46 source** (keyword table `ktext` in helpers.quanta,
-53 builtins in `is_bltn`, parser dispatch in parse.quanta, 2026-08-15). No guesswork:
+**Derived directly from the 0.0.53 source** (keyword table `ktext` in helpers.quanta,
+53 builtins in `is_bltn`, parser dispatch in parse.quanta, 2026-08-17). No guesswork:
 every row maps to a real token/builtin in source.
 
 Status legend:
@@ -166,7 +166,7 @@ Test legend (the **Test?** column):
 ## H. Tooling
 | Item | Status | Test? | Notes |
 |---|---|---|---|
-| Quanta-native code-writing tool | ❌ todo | ❌ none | user-stated goal — replace python heredoc surgery |
+| Quanta-native code-writing tool | ❌ todo | ❌ none | user-stated goal — edit Quanta source reliably without external scripting |
 | debugger/objdump integration | ❌ todo | ❌ none | |
 | package manager | ❌ todo | ❌ none | |
 | build system (beyond `qc src bin`) | ❌ todo | ❌ none | |
@@ -191,33 +191,15 @@ Test legend (the **Test?** column):
   hidden failures. Verified by reading test bodies (e.g. array_test returns 200 = a.1; simple_fadd
   returns 7 = 3.0+4.0). The gate is genuinely green.
 
-## Build Order to 1.0 (one WIP version each; gate green before promote)
+## Build order & sequencing
 
-**Sequencing (2026-08-14):** core tech-debts fixed FIRST, one atomic fix per version, before
-new features. **0.0.43 – 0.0.50 = bug/debt window; 0.0.51+ = new features.** Diagnosis is
-context (done), not a version.
+The authoritative build order to 1.0 (debt window → P2 builtins → P3
+language → P4 tooling → 1.0) now lives in **`docs/ROADMAP.md` §3** (single
+source of truth, consolidated 2026-08-17). It is no longer duplicated here
+to prevent version-number drift.
 
-| Priority | Versions | Scope (debt to clear, each version ONE small fix) |
-|---|---|---|
-| **Aliasing fix** | 0.0.43 | Fix the store memory-barrier in `flush_all`/`mem_store` path so live vregs derived from `mem_load` survive a `mem_store`. `reg_alias` goes GREEN + 2nd regression. |
-| **Remaining partials** | 0.0.44–0.0.46 | 0.44 `usize`/`u32`/`u64`/`u8`/`u16` type keywords; 0.45 complete `extern "C"`; 0.46 `?` early-return propagation. |
-| **Spare debt** | 0.0.47–0.0.50 | Absorb any debt found during 0.0.43–0.0.46. |
-| **P2 builtins** | 0.0.51–0.0.60 | float cmp, proc/env, stdin, fs, strings, math, atomics, net, introspection, random |
-| **P3 language** | 0.0.61–0.0.71 | float literals, enums (user-defined), tuples, generics, traits, modules, real char/byte/string/bool, ref/mut/move, op-overload, closure literals, parse and/or/not/true/false/global |
-| **P4 tooling** | 0.0.72 | Quanta-native code-writing tool |
+Key invariants (unchanged): one feature per WIP version; debt window
+(0.0.43–0.0.50) closed before new features; gate green before promotion;
+0.0.72 reserved for the Quanta-native code-writing tool; ARM64 backend
+deferred to POST-1.0.
 
-**1.0 = core + builtins complete** → std/lib (crypto split, net/lib, serde) resumes at 1.0+.
-
-
-### Notes
-- **Derived from source**, not memory: ktext table (helpers.quanta), is_bltn (features.quanta),
-  parser dispatch (parse.quanta), token tables (tokens.quanta), 2026-08-14.
-- "One feature per WIP version" still holds — the build-order list is a QUEUE, not a bundle.
-- Correctness fixes (0.0.43–0.0.50 debt window) come BEFORE new builtins: a wrong
-  codegen silently breaks earlier-green tests. Each debt version is ONE small atomic fix.
-- **0.0.43–0.0.50 = bug/debt window; 0.0.51+ = new features.** No new builtin/feature
-  work starts until the debt window clears (per 2026-08-14 sequencing decision).
-- Test column reflects the CURRENT gate (EXPECTED.tsv, 73 core tests). `std_*` and several lib
-  tests exist as files but were removed from the gate per "core only until 1.0".
-- Related docs: ROADMAP.md (campaign plan), agents/rules/PROJECT_RULES.md (rules). All gitignored
-  (machine-local); FEATURES.md is the human-readable summary.
