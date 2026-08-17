@@ -842,7 +842,23 @@ fn parse_add() {
         // statement, not a subtraction continuation (newlines are whitespace).
         // Line number lives at TKS+16 (tokln/TKS+32 is the token LENGTH).
         if v==45 && tokp>0 && r64(toks + tokp*TKS + 16)!=r64(toks + (tokp-1)*TKS + 16) { break }
-        if v==43 { adv(); let r=parse_mul(); iremit(IR_ADD,rr,l,r,0); l=rr }
+        // .. : string concatenation operator. Desugars to builtin str(a,b)
+        // (which mmaps a buffer and copies a then b). The builtin name "str"
+        // is injected past the end of src (srclen) once; tokenization is done,
+        // so this region is never re-scanned.
+        if v==46*256+46 {
+            adv()
+            let r=parse_mul()
+            let cnm = srclen
+            w8(src+cnm, 115); w8(src+cnm+1, 116); w8(src+cnm+2, 114); w8(src+cnm+3, 0)  // "str\0"
+            let cavs = irc
+            let ma = nv(); iremit(IR_MOV, ma, l, 0, 0)
+            let mb = nv(); iremit(IR_MOV, mb, r, 0, 0)
+            let cr = nv()
+            iremit(IR_CALL, cr, cnm, 2, cavs)
+            l = cr
+        }
+        else if v==43 { adv(); let r=parse_mul(); iremit(IR_ADD,rr,l,r,0); l=rr }
         else if v==45 { adv(); let r=parse_mul(); iremit(IR_SUB,rr,l,r,0); l=rr }
         else { break }
     }
