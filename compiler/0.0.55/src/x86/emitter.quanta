@@ -459,36 +459,36 @@ fn emit_bltn(nmi,nl,ii) {
         eb(72); eb(242); eb(15); eb(44); eb(192)  // 48 F2 0F 2C C0  cvttsd2si rax, xmm0
         return 1
     }
-    if nl==4&&r8(nm)=='f'&&r8(nm+1)=='a'&&r8(nm+2)=='d'&&r8(nm+3)=='d' {  // fadd(a,b): int args -> truncated int
+    if nl==4&&r8(nm)=='f'&&r8(nm+1)=='a'&&r8(nm+2)=='d'&&r8(nm+3)=='d' {  // fadd(a,b): f64 bit-patterns
         flush_all()
-        eb(72); eb(242); eb(15); eb(42); eb(199)  // cvtsi2sd xmm0, rdi
-        eb(72); eb(242); eb(15); eb(42); eb(206)  // cvtsi2sd xmm1, rsi
+        eb(102); eb(72); eb(15); eb(110); eb(199)  // movq xmm0, rdi
+        eb(102); eb(72); eb(15); eb(110); eb(206)  // movq xmm1, rsi
         eb(242); eb(15); eb(88); eb(193)          // addsd xmm0, xmm1
-        eb(72); eb(242); eb(15); eb(44); eb(192)  // cvttsd2si rax, xmm0  (48 F2 0F 2C C0)
+        eb(102); eb(72); eb(15); eb(126); eb(192)  // movq rax, xmm0
         return 1
     }
     if nl==4&&r8(nm)=='f'&&r8(nm+1)=='s'&&r8(nm+2)=='u'&&r8(nm+3)=='b' {  // fsub(a,b)
         flush_all()
-        eb(72); eb(242); eb(15); eb(42); eb(199)  // cvtsi2sd xmm0, rdi
-        eb(72); eb(242); eb(15); eb(42); eb(206)  // cvtsi2sd xmm1, rsi
+        eb(102); eb(72); eb(15); eb(110); eb(199)  // movq xmm0, rdi
+        eb(102); eb(72); eb(15); eb(110); eb(206)  // movq xmm1, rsi
         eb(242); eb(15); eb(92); eb(193)          // subsd xmm0, xmm1
-        eb(72); eb(242); eb(15); eb(44); eb(192)  // cvttsd2si rax, xmm0
+        eb(102); eb(72); eb(15); eb(126); eb(192)  // movq rax, xmm0
         return 1
     }
     if nl==4&&r8(nm)=='f'&&r8(nm+1)=='m'&&r8(nm+2)=='u'&&r8(nm+3)=='l' {  // fmul(a,b)
         flush_all()
-        eb(72); eb(242); eb(15); eb(42); eb(199)  // cvtsi2sd xmm0, rdi
-        eb(72); eb(242); eb(15); eb(42); eb(206)  // cvtsi2sd xmm1, rsi
+        eb(102); eb(72); eb(15); eb(110); eb(199)  // movq xmm0, rdi
+        eb(102); eb(72); eb(15); eb(110); eb(206)  // movq xmm1, rsi
         eb(242); eb(15); eb(89); eb(193)          // mulsd xmm0, xmm1
-        eb(72); eb(242); eb(15); eb(44); eb(192)  // cvttsd2si rax, xmm0
+        eb(102); eb(72); eb(15); eb(126); eb(192)  // movq rax, xmm0
         return 1
     }
     if nl==4&&r8(nm)=='f'&&r8(nm+1)=='d'&&r8(nm+2)=='i'&&r8(nm+3)=='v' {  // fdiv(a,b)
         flush_all()
-        eb(72); eb(242); eb(15); eb(42); eb(199)  // cvtsi2sd xmm0, rdi
-        eb(72); eb(242); eb(15); eb(42); eb(206)  // cvtsi2sd xmm1, rsi
+        eb(102); eb(72); eb(15); eb(110); eb(199)  // movq xmm0, rdi
+        eb(102); eb(72); eb(15); eb(110); eb(206)  // movq xmm1, rsi
         eb(242); eb(15); eb(94); eb(193)          // divsd xmm0, xmm1
-        eb(72); eb(242); eb(15); eb(44); eb(192)  // cvttsd2si rax, xmm0
+        eb(102); eb(72); eb(15); eb(126); eb(192)  // movq rax, xmm0
         return 1
     }
     // P11: SIMD vec128 builtins (x86 SSE2, packed double). A vec128 is a 16-byte
@@ -1227,14 +1227,171 @@ fn emit_bltn2(nmi,nl,ii) {
         eb(72); eb(131); eb(196); eb(16)       // add rsp, 16  - imm8
         sdef(0, 0); return 1
     }
-    // getline(buf, maxlen): read up to maxlen bytes from stdin into buf.
-    //   Returns bytes read (0 = EOF). arg0=buf(rdi), arg1=maxlen(rsi).
-    if nl==7&&r8(nm)=='g'&&r8(nm+1)=='e'&&r8(nm+2)=='t'&&r8(nm+3)=='l'&&r8(nm+4)=='i'&&r8(nm+5)=='n'&&r8(nm+6)=='e' {
+    // ---- P2: float comparison builtins (SSE, return int 0/1, BRANCHLESS via setcc) ----
+    // All comparisons use comisd (66 0F 2F) then a setcc to avoid jump/label patching.
+    // NOTE: ucomisd (F2 0F 2E) triggers #UD in this target environment, so comisd is used.
+    // comisd result flags:  a<b => CF=1,ZF=0 ; a==b => ZF=1 ; unordered => CF=ZF=PF=1
+    // feq(a,b): ordered-equal (unordered => 0)
+    if nl==3&&r8(nm)=='f'&&r8(nm+1)=='e'&&r8(nm+2)=='q' {
         flush_all()
-        // rdx = maxlen (currently in rsi). mov rdx, rsi
-        eb(72); eb(137); eb(242)               // mov rdx, rsi
-        eb(184); ei(0); sysc()                 // read(0, buf, maxlen)
-        sdef(0, 0); return 1
+        eb(102); eb(72); eb(15); eb(110); eb(199)  // movq xmm0, rdi
+        eb(102); eb(72); eb(15); eb(110); eb(206)  // movq xmm1, rsi
+        eb(102); eb(15); eb(47); eb(193)          // comisd xmm0, xmm1
+        rxor(0,0)                                  // xor eax, eax
+        eb(15); eb(148); eb(192)                   // sete al  (ZF=1: equal OR unordered)
+        eb(15); eb(155); eb(193)                   // setnp cl (PF=0: ordered)
+        eb(32); eb(193)                            // and al, cl -> al=1 only if equal AND ordered
+        eb(15); eb(182); eb(192)                   // movzx eax, al
+        return 1
+    }
+    // flt(a,b): a<b
+    if nl==3&&r8(nm)=='f'&&r8(nm+1)=='l'&&r8(nm+2)=='t' {
+        flush_all()
+        eb(102); eb(72); eb(15); eb(110); eb(199)
+        eb(102); eb(72); eb(15); eb(110); eb(206)
+        eb(102); eb(15); eb(47); eb(193)          // comisd xmm0, xmm1
+        eb(15); eb(146); eb(192)                   // setb al  (CF=1,ZF=0 => a<b)
+        eb(15); eb(182); eb(192)                   // movzx eax, al
+        return 1
+    }
+    // fle(a,b): a<=b
+    if nl==3&&r8(nm)=='f'&&r8(nm+1)=='l'&&r8(nm+2)=='e' {
+        flush_all()
+        eb(102); eb(72); eb(15); eb(110); eb(199)
+        eb(102); eb(72); eb(15); eb(110); eb(206)
+        eb(102); eb(15); eb(47); eb(193)          // comisd xmm0, xmm1
+        eb(15); eb(150); eb(192)                   // setbe al (CF=1 or ZF=1 => a<=b)
+        eb(15); eb(182); eb(192)                   // movzx eax, al
+        return 1
+    }
+    // fgt(a,b): a>b  (comisd a,b then seta)
+    if nl==3&&r8(nm)=='f'&&r8(nm+1)=='g'&&r8(nm+2)=='t' {
+        flush_all()
+        eb(102); eb(72); eb(15); eb(110); eb(199)  // movq xmm0, rdi (a)
+        eb(102); eb(72); eb(15); eb(110); eb(206)  // movq xmm1, rsi (b)
+        eb(102); eb(15); eb(47); eb(193)          // comisd xmm0(=a), xmm1(=b)
+        eb(15); eb(151); eb(192)                   // seta al (CF=0,ZF=0 => a>b)
+        eb(15); eb(182); eb(192)                   // movzx eax, al
+        return 1
+    }
+    // fge(a,b): a>=b  (comisd a,b then setae)
+    if nl==3&&r8(nm)=='f'&&r8(nm+1)=='g'&&r8(nm+2)=='e' {
+        flush_all()
+        eb(102); eb(72); eb(15); eb(110); eb(199)  // movq xmm0, rdi (a)
+        eb(102); eb(72); eb(15); eb(110); eb(206)  // movq xmm1, rsi (b)
+        eb(102); eb(15); eb(47); eb(193)
+        eb(15); eb(147); eb(192)                   // setae al (CF=0 => a>=b)
+        eb(15); eb(182); eb(192)                   // movzx eax, al
+        return 1
+    }
+    // fisnan(a): unordered (PF=1)
+    if nl==6&&r8(nm)=='f'&&r8(nm+1)=='i'&&r8(nm+2)=='s'&&r8(nm+3)=='n'&&r8(nm+4)=='a'&&r8(nm+5)=='n' {
+        flush_all()
+        eb(102); eb(72); eb(15); eb(110); eb(199)  // movq xmm0, rdi
+        eb(102); eb(15); eb(47); eb(192)          // comisd xmm0, xmm0 (nan => PF=1)
+        eb(15); eb(154); eb(192)                   // setp al (PF=1 => nan)
+        eb(15); eb(182); eb(192)                   // movzx eax, al
+        return 1
+    }
+    // fisinf(a): abs(a)==inf
+    if nl==6&&r8(nm)=='f'&&r8(nm+1)=='i'&&r8(nm+2)=='s'&&r8(nm+3)=='i'&&r8(nm+4)=='n'&&r8(nm+5)=='f' {
+        flush_all()
+        eb(102); eb(72); eb(15); eb(110); eb(199)  // movq xmm0, rdi
+        ri(0, 0x7FF0000000000000)
+        eb(102); eb(72); eb(15); eb(110); eb(192)  // movq xmm1, rax (inf bits)
+        eb(102); eb(15); eb(80); eb(193)          // andpd xmm0, xmm1 (abs)
+        eb(102); eb(72); eb(15); eb(110); eb(192)  // movq xmm1, rax
+        eb(102); eb(15); eb(47); eb(193)          // comisd xmm0, xmm1
+        eb(15); eb(148); eb(192)                   // sete al (equal => inf)
+        eb(15); eb(182); eb(192)                   // movzx eax, al
+        return 1
+    }
+    // ---- P2: math builtins (SSE, f64 bit-pattern in/out) ----
+    // sqrt(a): a=rdi
+    if nl==4&&r8(nm)=='s'&&r8(nm+1)=='q'&&r8(nm+2)=='r'&&r8(nm+3)=='t' {
+        flush_all()
+        eb(102); eb(72); eb(15); eb(110); eb(199)      // movq xmm0, rdi
+        eb(242); eb(15); eb(81); eb(192)               // sqrtsd xmm0, xmm0 (F2 0F 51 C0)
+        eb(102); eb(72); eb(15); eb(126); eb(192)      // movq rax, xmm0
+        return 1
+    }
+    // floor(a), ceil(a): use roundsd
+    if nl==5&&r8(nm)=='f'&&r8(nm+1)=='l'&&r8(nm+2)=='o'&&r8(nm+3)=='o'&&r8(nm+4)=='r' {
+        flush_all()
+        eb(102); eb(72); eb(15); eb(110); eb(199)
+        eb(102); eb(15); eb(58); eb(11); eb(192); eb(1)  // roundsd xmm0, xmm0, 1 (66 0F 3A 0B C0 01)
+        eb(102); eb(72); eb(15); eb(126); eb(192)
+        return 1
+    }
+    if nl==4&&r8(nm)=='c'&&r8(nm+1)=='e'&&r8(nm+2)=='i'&&r8(nm+3)=='l' {
+        flush_all()
+        eb(102); eb(72); eb(15); eb(110); eb(199)
+        eb(102); eb(15); eb(58); eb(11); eb(192); eb(2)  // roundsd xmm0, xmm0, 2 (66 0F 3A 0B C0 02)
+        eb(102); eb(72); eb(15); eb(126); eb(192)
+        return 1
+    }
+    // abs(a) for f64: clear sign bit
+    if nl==3&&r8(nm)=='a'&&r8(nm+1)=='b'&&r8(nm+2)=='s' {
+        flush_all()
+        eb(72); eb(137); eb(192)           // mov rax, rdi
+        ri64(1, 0x7FFFFFFFFFFFFFFF)        // mov rcx, mask
+        eb(72); eb(33); eb(200)            // and rax, rcx (48 21 C8)
+        return 1
+    }
+    // ---- P2: random / fs-meta / introspection builtins (syscall-backed) ----
+    // getrandom(buf, len, flags): sc 318
+    if nl==9&&r8(nm)=='g'&&r8(nm+1)=='e'&&r8(nm+2)=='t'&&r8(nm+3)=='r'&&r8(nm+4)=='a'&&r8(nm+5)=='n'&&r8(nm+6)=='d'&&r8(nm+7)=='o'&&r8(nm+8)=='m' {
+        flush_all()
+        ri(0,318); sysc(); return 1
+    }
+    // lseek(fd, offset, whence): sc 8
+    if nl==5&&r8(nm)=='l'&&r8(nm+1)=='s'&&r8(nm+2)=='e'&&r8(nm+3)=='e'&&r8(nm+4)=='k' {
+        flush_all()
+        ri(0,8); sysc(); return 1
+    }
+    // unlink(path): sc 87
+    if nl==6&&r8(nm)=='u'&&r8(nm+1)=='n'&&r8(nm+2)=='l'&&r8(nm+3)=='i'&&r8(nm+4)=='n'&&r8(nm+5)=='k' {
+        flush_all()
+        ri(0,87); sysc(); return 1
+    }
+    // mkdir(path, mode): sc 83
+    if nl==5&&r8(nm)=='m'&&r8(nm+1)=='k'&&r8(nm+2)=='d'&&r8(nm+3)=='i'&&r8(nm+4)=='r' {
+        flush_all()
+        ri(0,83); sysc(); return 1
+    }
+    // chdir(path): sc 80
+    if nl==5&&r8(nm)=='c'&&r8(nm+1)=='h'&&r8(nm+2)=='d'&&r8(nm+3)=='i'&&r8(nm+4)=='r' {
+        flush_all()
+        ri(0,80); sysc(); return 1
+    }
+    // rename(old, new): sc 82
+    if nl==6&&r8(nm)=='r'&&r8(nm+1)=='e'&&r8(nm+2)=='n'&&r8(nm+3)=='a'&&r8(nm+4)=='m'&&r8(nm+5)=='e' {
+        flush_all()
+        ri(0,82); sysc(); return 1
+    }
+    // fstat(fd, buf): sc 5
+    if nl==5&&r8(nm)=='f'&&r8(nm+1)=='s'&&r8(nm+2)=='t'&&r8(nm+3)=='a'&&r8(nm+4)=='t' {
+        flush_all()
+        ri(0,5); sysc(); return 1
+    }
+    // stat(path, buf): newfstatat(AT_FDCWD, path, buf, 0) = sc 262
+    if nl==4&&r8(nm)=='s'&&r8(nm+1)=='t'&&r8(nm+2)=='a'&&r8(nm+3)=='t' {
+        flush_all()
+        rr(2,6)        // rdx = rsi (buf)
+        rr(6,7)        // rsi = rdi (path)
+        ri(7,-100)     // rdi = AT_FDCWD
+        ri(10,0)       // r10 = 0 (flags)
+        ri(0,262); sysc(); return 1
+    }
+    // abort(): exit(134) = 128 + SIGABRT
+    if nl==5&&r8(nm)=='a'&&r8(nm+1)=='b'&&r8(nm+2)=='o'&&r8(nm+3)=='r'&&r8(nm+4)=='t' {
+        flush_all()
+        ri(7,134); ri(0,60); sysc(); return 1
+    }
+    // debugbreak(): int3
+    if nl==10&&r8(nm)=='d'&&r8(nm+1)=='e'&&r8(nm+2)=='b'&&r8(nm+3)=='u'&&r8(nm+4)=='g'&&r8(nm+5)=='b'&&r8(nm+6)=='r'&&r8(nm+7)=='e'&&r8(nm+8)=='a'&&r8(nm+9)=='k' {
+        flush_all()
+        eb(204); return 1
     }
     return 0
 }
