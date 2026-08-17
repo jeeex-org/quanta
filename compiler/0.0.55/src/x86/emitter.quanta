@@ -459,36 +459,36 @@ fn emit_bltn(nmi,nl,ii) {
         eb(72); eb(242); eb(15); eb(44); eb(192)  // 48 F2 0F 2C C0  cvttsd2si rax, xmm0
         return 1
     }
-    if nl==4&&r8(nm)=='f'&&r8(nm+1)=='a'&&r8(nm+2)=='d'&&r8(nm+3)=='d' {  // fadd(a,b): f64 bit-patterns
+    if nl==4&&r8(nm)=='f'&&r8(nm+1)=='a'&&r8(nm+2)=='d'&&r8(nm+3)=='d' {  // fadd(a,b): int args -> (double)a+(double)b -> int
         flush_all()
-        eb(102); eb(72); eb(15); eb(110); eb(199)  // movq xmm0, rdi
-        eb(102); eb(72); eb(15); eb(110); eb(206)  // movq xmm1, rsi
-        eb(242); eb(15); eb(88); eb(193)          // addsd xmm0, xmm1
-        eb(102); eb(72); eb(15); eb(126); eb(192)  // movq rax, xmm0
+        eb(72); eb(242); eb(15); eb(42); eb(199)   // cvtsi2sd xmm0, rdi  (48 F2 0F 2A C7)
+        eb(72); eb(242); eb(15); eb(42); eb(206)   // cvtsi2sd xmm1, rsi  (48 F2 0F 2A CE)
+        eb(242); eb(15); eb(88); eb(193)          // addsd xmm0, xmm1     (F2 0F 58 C1)
+        eb(72); eb(242); eb(15); eb(44); eb(192)  // cvttsd2si rax, xmm0  (48 F2 0F 2C C0)
         return 1
     }
     if nl==4&&r8(nm)=='f'&&r8(nm+1)=='s'&&r8(nm+2)=='u'&&r8(nm+3)=='b' {  // fsub(a,b)
         flush_all()
-        eb(102); eb(72); eb(15); eb(110); eb(199)  // movq xmm0, rdi
-        eb(102); eb(72); eb(15); eb(110); eb(206)  // movq xmm1, rsi
+        eb(72); eb(242); eb(15); eb(42); eb(199)
+        eb(72); eb(242); eb(15); eb(42); eb(206)
         eb(242); eb(15); eb(92); eb(193)          // subsd xmm0, xmm1
-        eb(102); eb(72); eb(15); eb(126); eb(192)  // movq rax, xmm0
+        eb(72); eb(242); eb(15); eb(44); eb(192)
         return 1
     }
     if nl==4&&r8(nm)=='f'&&r8(nm+1)=='m'&&r8(nm+2)=='u'&&r8(nm+3)=='l' {  // fmul(a,b)
         flush_all()
-        eb(102); eb(72); eb(15); eb(110); eb(199)  // movq xmm0, rdi
-        eb(102); eb(72); eb(15); eb(110); eb(206)  // movq xmm1, rsi
+        eb(72); eb(242); eb(15); eb(42); eb(199)
+        eb(72); eb(242); eb(15); eb(42); eb(206)
         eb(242); eb(15); eb(89); eb(193)          // mulsd xmm0, xmm1
-        eb(102); eb(72); eb(15); eb(126); eb(192)  // movq rax, xmm0
+        eb(72); eb(242); eb(15); eb(44); eb(192)
         return 1
     }
     if nl==4&&r8(nm)=='f'&&r8(nm+1)=='d'&&r8(nm+2)=='i'&&r8(nm+3)=='v' {  // fdiv(a,b)
         flush_all()
-        eb(102); eb(72); eb(15); eb(110); eb(199)  // movq xmm0, rdi
-        eb(102); eb(72); eb(15); eb(110); eb(206)  // movq xmm1, rsi
+        eb(72); eb(242); eb(15); eb(42); eb(199)
+        eb(72); eb(242); eb(15); eb(42); eb(206)
         eb(242); eb(15); eb(94); eb(193)          // divsd xmm0, xmm1
-        eb(102); eb(72); eb(15); eb(126); eb(192)  // movq rax, xmm0
+        eb(72); eb(242); eb(15); eb(44); eb(192)
         return 1
     }
     // P11: SIMD vec128 builtins (x86 SSE2, packed double). A vec128 is a 16-byte
@@ -1231,16 +1231,17 @@ fn emit_bltn2(nmi,nl,ii) {
     // All comparisons use comisd (66 0F 2F) then a setcc to avoid jump/label patching.
     // NOTE: ucomisd (F2 0F 2E) triggers #UD in this target environment, so comisd is used.
     // comisd result flags:  a<b => CF=1,ZF=0 ; a==b => ZF=1 ; unordered => CF=ZF=PF=1
-    // feq(a,b): ordered-equal (unordered => 0)
+    // feq(a,b): ordered-equal. comisd sets ZF=1 for equal OR unordered, CF=1 for
+    // a<b/unordered. Ordered-equal = ZF=1 AND CF=0 = sete AND setae. NOTE: do NOT
+    // insert xor eax,eax here -- it sets ZF and clobbers the comisd flags.
     if nl==3&&r8(nm)=='f'&&r8(nm+1)=='e'&&r8(nm+2)=='q' {
         flush_all()
         eb(102); eb(72); eb(15); eb(110); eb(199)  // movq xmm0, rdi
         eb(102); eb(72); eb(15); eb(110); eb(206)  // movq xmm1, rsi
         eb(102); eb(15); eb(47); eb(193)          // comisd xmm0, xmm1
-        rxor(0,0)                                  // xor eax, eax
-        eb(15); eb(148); eb(192)                   // sete al  (ZF=1: equal OR unordered)
-        eb(15); eb(155); eb(193)                   // setnp cl (PF=0: ordered)
-        eb(32); eb(193)                            // and al, cl -> al=1 only if equal AND ordered
+        eb(15); eb(148); eb(192)                   // sete al  (ZF=1)
+        eb(15); eb(147); eb(193)                   // setae cl (CF=0)
+        eb(32); eb(200)                            // and al, cl (20 C8) -> 1 only if ZF=1 AND CF=0
         eb(15); eb(182); eb(192)                   // movzx eax, al
         return 1
     }
