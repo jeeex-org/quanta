@@ -211,6 +211,21 @@ fn tokenize() {
             stok(tokc,TT_OP,ch,l,c,1); tokc=tokc+1; p=p+1; c=c+1
         } else if ispnct(ch) {
             stok(tokc,TT_PNCT,ch,l,c,1); tokc=tokc+1; p=p+1; c=c+1
+        } else if ch==36&&p+1<srclen&&r8(src+p+1)==123 {
+            // ${name} : a variable reference (identical to writing `name`).
+            // Tokenizes the inner name as a TT_ID; the surrounding $ { } are
+            // skipped. Kept in the MAIN tokenizer (outside any string scan) so
+            // it never alters string-literal tokenization or self-host.
+            p=p+2; c=c+2   // skip ${
+            let sp2=p; let sc2=c
+            while p<srclen&&r8(src+p)!=125 { p=p+1; c=c+1 }
+            if p>=srclen { let mh="error: unterminated variable reference (missing '}')\n"; file_write(2, mh+8, len(mh)); exit(1) }
+            let nl2=p-sp2
+            let kt2 = ktext(sp2,nl2)
+            let ty2 = TT_ID
+            if kt2!=0 { ty2=TT_KEY }
+            stok(tokc,ty2,sp2,l,sc2,nl2); tokc=tokc+1
+            p=p+1; c=c+1   // skip }
         } else { let mh = "error: invalid character in source (byte not a token)\n"; file_write(2, mh+8, len(mh)); exit(1) }
     }
 }
