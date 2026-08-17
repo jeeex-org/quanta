@@ -618,8 +618,12 @@ let g_va_cnt_off = 0   // rbp-relative offset of saved arg count
 let g_va_reg_off = 0   // rbp-relative offset of saved reg-arg[0..5] area
 // Code
 let code = mmap(33554432); let codelen = 0
+let CODE_CAP = 33554432  // fail-closed cap: emit aborts (rc=1) if codelen exceeds this.
+                       // Mirrors the MAP_FAILED guard — out-of-bounds code emission
+                       // must never silently corrupt (SAFETY_MANUAL sec 3/6.3).
 // Patches: 24 bytes each [code_ofs,target,type]
 let patches = mmap(8000000); let patchc = 0
+let PATCH_CAP = 8000000
 // Global RIP-relative patches: [code_offset, global_index, is_internal]
 let gpatches = mmap(2000000); let gpatchc = 0
 // t11: ARM64 fnptr patches: [adrp_ofs, add_ofs, fn_index, 0]
@@ -696,6 +700,7 @@ let gdata_sym = 0            // .symtab index of the _gdata symbol (set in p5_el
 let INTERNAL_GLOBAL_COUNT = 38
 // Output binary data section (string literals) - mmap'd so IR_STR writes are valid.
 let data = mmap(33554432); let data_off = 0  // 32MB string-literal buffer
+let DAT_CAP = 33554432  // fail-closed cap for data buffer (parallel to CODE_CAP)
 // Label map: 16 bytes [label,ir_pos]
 let lblmap = mmap(2000000); let lblc = 0
 

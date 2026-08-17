@@ -30,14 +30,15 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 DEFAULT_QC = os.path.join(HERE, "..", "..", "compiler", "0.0.53", "bin", "x86", "qc")
 SEED_DIR = os.path.join(HERE, "seeds")
 OUT_DIR = os.path.join(HERE, "crashes")
-EXPECTED_RCS = {0, 1, 7, 13, 14, 15, 16}
+EXPECTED_RCS = {0, 1, 7, 13, 14, 15, 16, 17}
 #  0   success
-#  1   internal/memory failure (MAP_FAILED) or write error
+#  1   internal/memory failure (MAP_FAILED) or write-buffer overflow (CODE_CAP/DAT_CAP)
 #  7   compile error (undeclared fn, cyclic struct, parse error)
 #  13  argc < 2 (no input file)
 #  14  input file open failed
 #  15  input file empty / zero length
 #  16  import/include resolution failed
+#  17  IR/token buffer overflow (fail-closed, NOT a crash)
 #  (132 only from RUNNING the emitted binary, never from qc itself)
 MAX_INPUT = 65536  # hard cap: never let mutated input exceed 64KB (prevents
                    # exponential blowup from the slice-duplicate op)
