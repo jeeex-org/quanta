@@ -256,6 +256,36 @@ fn parse_primary() {
         return vr
     }
     if peek()==TT_MATCH { return parse_match() }   // P6.1b: match in expression position
+    // HANG FIX (g6 class): `Some`/`None`/`Ok`/`Err` are valid expression
+    // primaries (Option/Result variants). Handle them HERE, up front, advancing
+    // tokp so the caller always makes progress. The TT_ID branch below also
+    // handles them, but only after the struct/enum/scope machinery; if any of
+    // that machinery returns without advancing (e.g. a variant reached in a
+    // context where the surrounding statement parser re-invokes parse_unary),
+    // the token cursor would never move and the compiler would emit unbounded
+    // IR (rc=17). Handling them up front makes `return None` / `x = Ok(v)`
+    // always terminate.
+    if peek()==TT_ID {
+        let hk = ktext(pval(), plen())
+        if hk==H_SOME {
+            adv()
+            if peek()==TT_PNCT && pval()==40 { adv(); let a=parse_expr(); mpnct(41) }
+            else { let a=-1 }
+            let vr=nv(); iremit(IR_SOME, vr, a, 0, 0); w64(vreg_enum+vr*8,-2); w64(vreg_enum_var+vr*8,1); return vr
+        } else if hk==H_NONE {
+            adv(); let vr=nv(); iremit(IR_NONE, vr, 0, 0, 0); w64(vreg_enum+vr*8,-2); w64(vreg_enum_var+vr*8,0); return vr
+        } else if hk==H_OK {
+            adv()
+            if peek()==TT_PNCT && pval()==40 { adv(); let a=parse_expr(); mpnct(41) }
+            else { let a=-1 }
+            let vr=nv(); iremit(IR_OK, vr, a, 0, 0); w64(vreg_enum+vr*8,-3); w64(vreg_enum_var+vr*8,1); return vr
+        } else if hk==H_ERR {
+            adv()
+            if peek()==TT_PNCT && pval()==40 { adv(); let a=parse_expr(); mpnct(41) }
+            else { let a=-1 }
+            let vr=nv(); iremit(IR_ERR, vr, a, 0, 0); w64(vreg_enum+vr*8,-3); w64(vreg_enum_var+vr*8,0); return vr
+        }
+    }
     if peek()==TT_NUM { let v=pval(); adv(); let vr=nv(); iremit(IR_CONST,vr,v,0,0); return vr }
     if peek()==TT_STR { let v=pval(); adv(); let vr=nv(); iremit(IR_STR,vr,v,0,0); w64(vreg_is_str + vr*8, 1); return vr }
     // G2 containers: array literal [e1, e2, ...] -> IR_TALLOC(n), IR_ISTORE each.
