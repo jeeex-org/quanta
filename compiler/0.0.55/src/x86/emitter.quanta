@@ -866,23 +866,74 @@ fn emit_bltn2(nmi,nl,ii) {
         sysc()    // syscall
         return 1
     }
-    // print(buf, len): write(1, buf, len)
-    // call convention leaves rdi=buf, rsi=len. Need: rax=1, rdi=1, rsi=buf, rdx=len.
+    // print: 2-arg print(buf,len) OR 1-arg unified print(x) auto-detecting
+    // string vs int via arg0's vreg_is_str tag. In IR_CALL: a1=arg count,
+    // a2=arg-start. So argc = ira1(ii); arg0 vreg = irres(ira2(ii)).
     if nl==5&&r8(nm)=='p'&&r8(nm+1)=='r'&&r8(nm+2)=='i'&&r8(nm+3)=='n'&&r8(nm+4)=='t' {
-        flush_all()   // write syscall clobbers rdi/rsi/rdx/rax
-        eb(72); eb(137); eb(242)     // mov rdx, rsi   (count = len)
-        eb(72); eb(137); eb(254)     // mov rsi, rdi   (buf = buf)
-        eb(191); ei(1)               // mov edi, 1     (fd = stdout; zero-extends to rdi)
-        eb(184); ei(1)               // mov eax, 1     (sys_write)
-        sysc(); return 1
+        let _pargc = ira1(ii)
+        if _pargc==2 {
+            // print(buf, len): write(1, buf, len)
+            flush_all()
+            eb(72); eb(137); eb(242)     // mov rdx, rsi   (count = len)
+            eb(72); eb(137); eb(254)     // mov rsi, rdi   (buf = buf)
+            eb(191); ei(1)               // mov edi, 1
+            eb(184); ei(1)               // mov eax, 1
+            sysc(); return 1
+        } else {
+            let _av = irres(ira2(ii))
+            let _aisop = irop(ira2(ii))
+            let _isstr = r64(vreg_is_str + _av*8)
+            if _isstr!=1 && _aisop==IR_MOV {
+                let _srcv = ira0(ira2(ii))
+                if r64(vreg_is_str + _srcv*8)==1 { _isstr = 1 }
+            }
+            if _isstr!=1 && _aisop==IR_STR { _isstr = 1 }
+            if _isstr==1 {
+                flush_all(); rr(6,7); eb(72); eb(129); eb(198); ei(8); eb(72); eb(139); eb(23); ri(7,1); ri(0,1); sysc(); return 1
+            } else {
+                flush_all(); let l_pos=nl(); let l_zero=nl(); let l_loop=nl(); let l_done=nl(); let l_signprep=nl(); let l_write=nl()
+                rr(0,7); sbi(32); lesp(10, 23); rxor(8,8); rxor(9,9); rr(9,0)
+                eb(77); eb(193); eb(233); eb(63); rtest(9,9); let p=codelen; jcc32(0,0); emit_patch(p, l_pos, 1)
+                rneg(0); lbladd(l_pos, codelen); rtest(0,0); let p=codelen; jcc32(0,0); emit_patch(p, l_zero, 1)
+                let p=codelen; jmp32(0); emit_patch(p, l_loop, 0); lbladd(l_zero, codelen)
+                eb(178); eb(48); eb(65); eb(136); eb(18); eb(73); eb(255); eb(202); eb(73); eb(255); eb(192)
+                let p=codelen; jmp32(0); emit_patch(p, l_signprep, 0); lbladd(l_loop, codelen)
+                rtest(0,0); let p=codelen; jcc32(0,0); emit_patch(p, l_done, 1); rxor(2,2); ri(1,10); ridiv(1)
+                eb(72); eb(129); eb(194); ei(48); eb(65); eb(136); eb(18); eb(73); eb(255); eb(202); eb(73); eb(255); eb(192)
+                let p=codelen; jmp32(0); emit_patch(p, l_loop, 0); lbladd(l_done, codelen); lbladd(l_signprep, codelen)
+                rtest(9,9); let p=codelen; jcc32(0,0); emit_patch(p, l_write, 1)
+                eb(178); eb(45); eb(65); eb(136); eb(18); eb(73); eb(255); eb(202); eb(73); eb(255); eb(192)
+                lbladd(l_write, codelen); eb(73); eb(141); eb(114); eb(1); rr(2,8); ri(7,1); ri(0,1); sysc(); abi(32); return 1
+            }
+        }
     }
-    if nl==5&&r8(nm)=='p'&&r8(nm+1)=='r'&&r8(nm+2)=='i'&&r8(nm+3)=='n'&&r8(nm+4)=='t' {
-        flush_all()   // write syscall clobbers rdi/rsi/rdx/rax
-        eb(72); eb(137); eb(242)     // mov rdx, rsi   (count = len)
-        eb(72); eb(137); eb(254)     // mov rsi, rdi   (buf = buf)
-        eb(191); ei(1)               // mov edi, 1     (fd = stdout; zero-extends to rdi)
-        eb(184); ei(1)               // mov eax, 1     (sys_write)
-        sysc(); return 1
+    // echo(x): 1-arg unified print (same as print). argc = ira1(ii); arg0 = irres(ira2(ii)).
+    if nl==4&&r8(nm)=='e'&&r8(nm+1)=='c'&&r8(nm+2)=='h'&&r8(nm+3)=='o' {
+        let _ave = irres(ira2(ii))
+        let _aeop = irop(ira2(ii))
+        let _isstre = r64(vreg_is_str + _ave*8)
+        if _isstre!=1 && _aeop==IR_MOV {
+            let _esv = ira0(ira2(ii))
+            if r64(vreg_is_str + _esv*8)==1 { _isstre = 1 }
+        }
+        if _isstre!=1 && _aeop==IR_STR { _isstre = 1 }
+        if _isstre==1 {
+            flush_all(); rr(6,7); eb(72); eb(129); eb(198); ei(8); eb(72); eb(139); eb(23); ri(7,1); ri(0,1); sysc(); return 1
+        } else {
+            flush_all(); let el_pos=nl(); let el_zero=nl(); let el_loop=nl(); let el_done=nl(); let el_signprep=nl(); let el_write=nl()
+            rr(0,7); sbi(32); lesp(10, 23); rxor(8,8); rxor(9,9); rr(9,0)
+            eb(77); eb(193); eb(233); eb(63); rtest(9,9); let p=codelen; jcc32(0,0); emit_patch(p, el_pos, 1)
+            rneg(0); lbladd(el_pos, codelen); rtest(0,0); let p=codelen; jcc32(0,0); emit_patch(p, el_zero, 1)
+            let p=codelen; jmp32(0); emit_patch(p, el_loop, 0); lbladd(el_zero, codelen)
+            eb(178); eb(48); eb(65); eb(136); eb(18); eb(73); eb(255); eb(202); eb(73); eb(255); eb(192)
+            let p=codelen; jmp32(0); emit_patch(p, el_signprep, 0); lbladd(el_loop, codelen)
+            rtest(0,0); let p=codelen; jcc32(0,0); emit_patch(p, el_done, 1); rxor(2,2); ri(1,10); ridiv(1)
+            eb(72); eb(129); eb(194); ei(48); eb(65); eb(136); eb(18); eb(73); eb(255); eb(202); eb(73); eb(255); eb(192)
+            let p=codelen; jmp32(0); emit_patch(p, el_loop, 0); lbladd(el_done, codelen); lbladd(el_signprep, codelen)
+            rtest(9,9); let p=codelen; jcc32(0,0); emit_patch(p, el_write, 1)
+            eb(178); eb(45); eb(65); eb(136); eb(18); eb(73); eb(255); eb(202); eb(73); eb(255); eb(192)
+            lbladd(el_write, codelen); eb(73); eb(141); eb(114); eb(1); rr(2,8); ri(7,1); ri(0,1); sysc(); abi(32); return 1
+        }
     }
     // printi(val): write decimal representation of the integer in rdi to stdout.
     if nl==6&&r8(nm)=='p'&&r8(nm+1)=='r'&&r8(nm+2)=='i'&&r8(nm+3)=='n'&&r8(nm+4)=='t'&&r8(nm+5)=='i' {
