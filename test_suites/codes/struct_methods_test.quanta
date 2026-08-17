@@ -1,0 +1,37 @@
+// Regression test: struct field tables must NOT be polluted by tokens after
+// the struct's closing '}' (scanstructs double-advance bug, fixed 2026-08-06).
+// Covers: multi-field structs with ': Type' annotations, method calls on
+// struct receivers, chained field access through struct-typed fields, and
+// field names that collide with method names across structs.
+struct Point {
+    x: int
+    y: int
+}
+struct Line {
+    a: Point
+    b: Point
+}
+struct Box {
+    w: int
+    h: int
+}
+fn length() {
+    return 100
+}
+fn width(l: Line) {
+    return l.b.x - l.a.x
+}
+fn area(b: Box) {
+    return b.w * b.h
+}
+fn main() {
+    let p1 = Point { x: 3, y: 4 }
+    let p2 = Point { x: 7, y: 9 }
+    let ln = Line { a: p1, b: p2 }
+    let bx = Box { w: 6, h: 7 }
+    let dx = ln.b.x - ln.a.x   // chained: field of struct-typed field = 7-3 = 4
+    let dy = ln.b.y - ln.a.y   // 9-4 = 5
+    let m = ln.length()        // method name collides with Box field names
+    let ar = bx.area()         // 6*7 = 42
+    return dx + dy + m + ar    // 4 + 5 + 100 + 42 = 151
+}
