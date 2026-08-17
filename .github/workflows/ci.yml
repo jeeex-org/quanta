@@ -11,13 +11,9 @@ name: ci
 #   3. Fuzz             - tools/fuzz/fuzz_qc.py: random .quanta input must NEVER
 #      crash qc (fail-closed). Expects rc in {0,1,7,13,14,15,16,17}.
 #   4. Differential      - tools/diff_test/diff_qc.py: current qc vs the committed
-#      seed qc must agree on exit codes for reference programs.
+#      qc must agree on exit codes for reference programs.
 #
-# NOTE: the functional gate is currently expected to be RED on `question_mark`
-# and `option_test` (the `?` postfix operator IR_TRY path overflows the
-# IR/token cap on 2+ uses in one function — a known debt-window bug, see
-# docs/ROADMAP.md / docs/FEATURES.md). The `?` fix is the immediate next task;
-# once landed this workflow goes GREEN. Tracked, not hidden.
+# Current version: 0.0.54 (grammar/bug-fix window closed; gate 81/81 GREEN).
 
 on:
   push:
@@ -32,10 +28,10 @@ jobs:
       - uses: actions/checkout@v4
 
       - name: Self-host build (3-stage) from committed qc
-        working-directory: compiler/0.0.53/src/x86
+        working-directory: compiler/0.0.54/src/x86
         run: |
           set -e
-          SEED=../../../../compiler/0.0.53/bin/x86/qc
+          SEED=../../../../compiler/0.0.54/bin/x86/qc
           test -x "$SEED" || { echo "committed qc seed missing"; exit 1; }
           "$SEED" main.quanta qc_boot
           test -x qc_boot || { echo "qc_boot not produced"; exit 1; }
@@ -48,17 +44,17 @@ jobs:
 
       - name: Functional gate (run_tests.sh)
         env:
-          QC: compiler/0.0.53/src/x86/qc
+          QC: compiler/0.0.54/src/x86/qc
         run: bash test_suites/scripts/run_tests.sh
 
       - name: Fuzz (fail-closed proof)
         run: |
           set -e
-          python3 tools/fuzz/fuzz_qc.py --qc compiler/0.0.53/src/x86/qc --iter 5000
+          python3 tools/fuzz/fuzz_qc.py --qc compiler/0.0.54/src/x86/qc --iter 5000
 
-      - name: Differential (cross-check vs seed)
+      - name: Differential (cross-check vs committed qc)
         run: |
           set -e
           python3 tools/diff_test/diff_qc.py \
-            --current compiler/0.0.53/src/x86/qc \
-            --seed compiler/0.0.53/bin/x86/qc
+            --current compiler/0.0.54/src/x86/qc \
+            --seed compiler/0.0.54/bin/x86/qc
