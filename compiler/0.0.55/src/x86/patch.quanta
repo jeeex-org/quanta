@@ -63,14 +63,14 @@ fn patch_globals() {
         // single data segment at GDATA; index directly. Patched to RIP-relative disp.
         let gaddr = GDATA + gidx*8
         // Code is loaded at vaddr (BASE + ht) where ht = ELF header + phdr
-        // size = 64 + 56*3 = 232, matching write_elf's p_vaddr=BASE,
-        // file offset 0, code copied to elfb+ht.  A code byte at buffer
-        // offset gp therefore executes at vaddr (BASE + 232 + gp).
-        // gp points at the 4-byte disp (byte 3 of the 7-byte
+        // size = 64 + 56*4 = 288 for x86-64 (PT_PHDR, code LOAD, data LOAD,
+        // GNU_STACK = 4 program headers), matching write_elf's e_entry=BASE+ht.
+        // A code byte at buffer offset gp therefore executes at vaddr
+        // (BASE + 288 + gp).  gp points at the 4-byte disp (byte 3 of the 7-byte
         // REX.W 8B mod=00 disp32 instruction), so the instruction end is
-        // at (BASE + 232 + gp + 4).  The RIP-relative disp is measured
+        // at (BASE + 288 + gp + 4).  The RIP-relative disp is measured
         // from there, matching the Python oracle (rip = base + patch_ofs + 4).
-        let rip = BASE + 232 + gp + 4
+        let rip = BASE + 288 + gp + 4
         let disp = gaddr - rip
         w32(code+gp, disp)
         i=i+1
