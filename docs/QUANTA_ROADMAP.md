@@ -96,3 +96,42 @@
   syscall emission, ELF object/executable + `--emit-obj`/`--no-start` (P5.1).
 - Deferred gaps: F4 match block-arms, F5 `?` propagation, F7 const = literals only.
 - `lib/` directory does NOT exist yet — 0.0.30 creates it.
+
+---
+
+## Standards & Safety track (added 2026-08-17, runs parallel to pillars)
+
+Quanta's ISO/IEC 26262-8 / IEC 61508-3 qualification work (see
+docs/SAFETY_MANUAL.md, docs/SECURITY_TOOLING.md, docs/MEMORY_SAFETY_ARGUMENT.md).
+Version assignments below follow the established convention:
+0.0.43–0.0.50 debt window (CLOSED), 0.0.51+ P2 builtins, 0.0.61+ P3
+language, **0.0.72 = tooling**, 1.0 = stdlib resumes.
+
+- **0.0.51–0.0.55** grammar + bug-fix window (DONE: all 15 modules parse 0
+  errors; keyword-hash paren bug fixed).
+- **0.0.53** memory-safety hardening (CODE_CAP/DAT_CAP guards) + fail-closed
+  fuzzer (20K iters, 0 crashes) + differential cross-check vs bootstrap seed.
+  Status: 🟡 hardened, not proven (runtime traps, no compile-time proof).
+- **0.0.72+ (tooling phase, BEFORE 0.1.0)** — **#2 INDEPENDENT
+  IMPLEMENTATION**:
+  - **0.0.72** ARM64 (AArch64) backend (Stage 4 from LANGUAGE_DESIGN.md):
+    a SECOND, independently-written emitter over the shared IR. This is the
+    real "independent implementation" route for ISO 26262-8 §11 / IEC 61508-3
+    Annex F — two separate emitters that must agree.
+  - **0.0.73** x86↔ARM64 differential test harness: compile the same program
+    on both backends, assert identical exit codes / behavior. Extends
+    tools/diff_test/diff_qc.py (currently current-vs-seed). This closes the
+    weak-evidence gap from 0.0.53 (seed is same-lineage; ARM64 is
+    genuinely independent).
+  - (dependent) once a C/LLVM emit path or second backend exists, build `qc`
+    under ASan+UBSan+MSan and require 0 errors — unlocks sanitizer-clean
+    confirmation of the memory-safety argument (MEMORY_SAFETY_ARGUMENT.md §6).
+- **1.0** stdlib resumes (per convention); memory safety target = Stage-6
+  borrow checking (compile-time guarantee) to move #1 from 🟡 to ✅.
+
+Why 0.0.72+ and not earlier: the ARM64 backend is a tooling/backend
+capability (the 0.0.72 phase), and it is the prerequisite for genuine
+independent cross-checking. It must land BEFORE 0.1.0 (the stdlib
+resumption point) so that qualification evidence exists before the
+language is declared 1.0-ready.
+
