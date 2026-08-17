@@ -35,7 +35,7 @@ while IFS=$'\t' read -r name expected; do
     continue
   fi
   set +e
-  "$bin" > /dev/null 2>&1
+  "$bin" < /dev/null > /dev/null 2>&1
   actual=$?
   set -e
   if [ "$actual" = "$expected" ]; then

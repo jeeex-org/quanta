@@ -5,10 +5,11 @@ native AOT compiler verified + hardened; multi-mode architecture designed
 but only the native AOT backend is built.
 
 ## WHAT IS REAL (verified, not claimed)
-- `compiler/0.0.53/src/x86/` — multi-file x86-64 + AArch64 Quanta compiler
+- `compiler/0.0.55/src/x86/` — multi-file x86-64 + AArch64 Quanta compiler
   (main.quanta + helpers/lexer/parse/codegen/emitter/elf/globals/quanta).
   Self-hosts (3-stage: qc_boot -> qc_self -> qc, byte-identical, `fp=YES`).
-- `bootstrap/qc-bootstrap-0.0.45` is the seed for self-hosting.
+- `compiler/0.0.53/bin/x86/qc` is the seed for self-hosting (3-stage rebuild
+  uses it as `SEED` to produce the next qc; see README verification block).
 - Security (fail-closed): overflow trap (ud2 -> SIGILL rc=132), bounds trap,
   `unsafe{}` opt-out; MAP_FAILED -> abort rc=1 (NOT SIGSEGV 139, fixed 0.0.49);
   undeclared fn / cyclic struct -> compile error rc=7 (fixed 0.0.48).
@@ -25,8 +26,8 @@ but only the native AOT backend is built.
   independent implementation, manual memory model).
 
 ## INVARIANTS (never break these)
-1. Self-host: `cd compiler/0.0.53/src/x86; SEED=qc-bootstrap-0.0.45; $SEED main.quanta qc_boot && ./qc_boot main.quanta qc_self && ./qc_self main.quanta qc` must produce byte-identical qc_boot==qc_self==qc (`fp=YES`).
-2. 81/81 test_suites must pass after any change (plus security 6/6, perf 3/3).
+1. Self-host: `cd compiler/0.0.55/src/x86; SEED=../../../../compiler/0.0.53/bin/x86/qc; $SEED main.quanta qc_boot && ./qc_boot main.quanta qc_self && ./qc_self main.quanta qc` must produce byte-identical qc_boot==qc_self==qc (`fp=YES`).
+2. 88/88 test_suites must pass after any change (plus security 6/6, perf 3/3).
 3. No ARM emitter code in the x86-only source (ARM is a SEPARATE future
    backend, built from scratch). The x86 emitter was de-duplicated in 0.0.46
    (the entire emitter had been copy-pasted as two blocks; only the second

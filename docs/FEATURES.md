@@ -1,8 +1,8 @@
 # Quanta — Features: Shipped vs. To-Do
 
 Source-of-truth feature inventory for the Quanta x86 self-hosting compiler.
-**Derived directly from the 0.0.53 source** (keyword table `ktext` in helpers.quanta,
-53 builtins in `is_bltn`, parser dispatch in parse.quanta, 2026-08-17). No guesswork:
+**Derived directly from the 0.0.55 source** (keyword table `ktext` in helpers.quanta,
+87 builtins in `is_bltn`, parser dispatch in parse.quanta, 2026-08-17). No guesswork:
 every row maps to a real token/builtin in source.
 
 Status legend:
@@ -11,7 +11,7 @@ Status legend:
 - ❌ todo — not implemented (on the build-order queue to 1.0)
 
 Test legend (the **Test?** column):
-- ✅ gate — a test_suite in the gate (EXPECTED.tsv, 73 core tests) covers it
+- ✅ gate — a test_suite in the gate (EXPECTED.tsv, 85 core tests) covers it
 - 🟡 file-only — a test file exists but is NOT in the gate (e.g. std_* removed per rule "core only until 1.0", or feature unimplemented)
 - ❌ none — no test exists
 
@@ -32,7 +32,7 @@ Test legend (the **Test?** column):
 | continue | 9 | ✅ done | ✅ gate | |
 | return | 16 | ✅ done | ✅ gate | |
 | unsafe | 18 | ✅ done | ✅ gate | unsafe_block |
-| match | 22 | 🟡 partial | ✅ gate | match_test; expression arms only (block arms TODO) |
+| match | 22 | 🟡 partial | ✅ gate | match_test rc=132 (gate GREEN); expression arms only (block arms TODO) |
 | const | 57 | ✅ done | ✅ gate | const_test |
 | defer | token | ✅ done | ✅ gate | defer_test |
 | in | token | ✅ done | ✅ gate | for-in |
@@ -129,7 +129,7 @@ Test legend (the **Test?** column):
 | stack unwind / destructors / RAII | ❌ todo | ❌ none | defer is manual |
 | ref/mut/move (ownership) | ❌ todo | ❌ none | tokens reserved |
 
-## F. Builtins — Already Shipped (53 registered, prefixes expanded)
+## F. Builtins — Already Shipped (87 registered, prefixes expanded)
 | Group | Items | Test? |
 |---|---|---|
 | syscall family | syscall(1–6) | ✅ gate (syscall_test) |
@@ -142,7 +142,14 @@ Test legend (the **Test?** column):
 | container | len, str, push, pop, vec_get, vec_set, vec_load, vec_store, vec_add, vec_sub, vec_mul, vec_div | ✅ gate (array_test, etc.) |
 | variadic / any | arg, mk_any | ✅ gate (arg_or rc=1, arg_test rc=40) |
 | closures | fnptr, closure_call | ✅ gate (fnptr_test rc=7, closure_test rc=7) |
-| float arith | fadd, fsub, fmul, fdiv, i2f, f2i | ✅ gate (float_test rc=159, simple_fadd rc=7) |
+| float arith | fadd, fsub, fmul, fdiv (int args → int result), i2f, f2i | ✅ gate (float_test rc=159, simple_fadd rc=7) |
+| float compare | feq, flt, fgt, fle, fge, fisnan, fisinf (f64 bit-pattern args → 0/1) | ✅ gate (float_test rc=159) |
+| float math | sqrt, floor, ceil, abs (f64 bit-pattern in/out) | ✅ gate (float_test rc=159) |
+| process / env | getpid, getppid, arg_count, environ (getenv is a STUB: returns 0) | ✅ gate (getpid_test, getppid_test, argc_test) |
+| stdin I/O | getc (getline untested-in-gate) | ✅ gate (getc_test) |
+| fs metadata | stat, fstat, lseek, unlink, mkdir, chdir, rename | 🟡 PARTIAL — fstat/lseek work; stat/unlink/mkdir/chdir/rename BROKEN (path-string remap returns -ENOENT, see §I) |
+| introspection | abort, debugbreak | ✅ gate (abort_test rc=134; debugbreak = int3 → rc=133) |
+| random | getrandom | ✅ gate (getrandom_test rc=1) |
 | unsigned arith | udiv, umod, ult, ugt, ulte, ugte, u8, u32, u64 | ✅ gate (unsigned_ops) |
 | byte/endianness | bswap, popcount, clz, ctz, rotl, rotr | ✅ gate (bits_test) |
 | time | gettimeofday, nanosleep, sleep | ✅ gate (time_test) |
@@ -150,18 +157,30 @@ Test legend (the **Test?** column):
 ## G. Builtins — To-Do
 | Group | Items | Test? |
 |---|---|---|
-| float comparisons | feq, flt, fgt, fle, fge, fisnan, fisinf | ❌ none (planned: fcmp_test) |
-| process/env | getpid, getppid, getenv, argc/environ | ❌ none (planned: proc_test) |
-| stdin I/O | getchar, getline | ❌ none (planned: input_test) |
-| fs metadata | stat, fstat, lseek, unlink, mkdir, chdir, rename | ❌ none (planned: fsmeta_test) |
+| float math (remaining) | sin, cos, tan, pow, log, min, max | ❌ none (planned: math_test) |
 | string ops | strcat, substr, strcmp, str_split, utf8 | ❌ none (planned: strtest) |
-| math | sqrt, sin, cos, tan, pow, log, abs, min/max, floor, ceil | ❌ none (planned: math_test) |
 | atomics | atomic_load/store/add/cmpxchg + futex | ❌ none (planned: atomic_test) |
 | networking | socket/connect/bind/listen/accept | ❌ none (planned: net_test) |
-| introspection | abort, debugbreak, stack-trace | ❌ none (planned: abort_test) |
-| random | getrandom, rand | ❌ none (planned: rand_test) |
+| introspection (remaining) | stack-trace | ❌ none (planned: abort_test) |
+| random (remaining) | rand | ❌ none (planned: rand_test) |
 | bit/byte extras | parity, bitfield insert/extract, per-size swap | ❌ none |
 | intrinsics | prefetch, fence, branch hints | ❌ none |
+
+## I. Known issues (tracked, not blocking promotion)
+- **fs-meta path-string remap (stat/unlink/mkdir/chdir/rename): BROKEN.** These
+  builtins call `newfstatat`/`unlinkat`/etc. with the path pointer taken from the
+  string *length-prefix base* (off by 8) and/or a faulty `rr`-based register
+  remap that ends up passing the buffer as the path → kernel returns `-ENOENT`
+  (rc=254). `fstat(fd,buf)` and `lseek(fd,off,whence)` work (no path string, no
+  remap). Quanta strings are length-prefixed `[8-byte len][null-term data]`; the
+  syscall ABI needs `base + 8`. `file_open` works only when called as
+  `file_open(path + 8, flags)` (see `file_open_test.quanta`). Fix: correct the
+  path-pointer offset / remap in `emit_bltn2` (compiler/0.0.55/src/x86/emitter.quanta).
+- **`getenv(name)` is a STUB** — returns `0` unconditionally (environment parsing
+  not yet implemented). Documented as such; `getenv_test.quanta` pins the stub
+  behaviour so a future real implementation is caught by the gate.
+- **`debugbreak()` = `int3`** → SIGTRAP (rc=133). Works but not in the gate
+  (would need a harness that tolerates the trap). `abort()` → `exit(134)` is gated.
 
 ## H. Tooling
 | Item | Status | Test? | Notes |
@@ -175,9 +194,10 @@ Test legend (the **Test?** column):
 
 ## Summary counts (source-derived)
 - **Keywords (ktext): 57 codes defined; ~19 parsed, ~13 lexed-only gaps, rest partial.**
-- **Builtins registered: 53 (prefixes expanded).**
-- **Core tests in gate: 81** (EXPECTED.tsv, 81 rows). `std_*` tests exist as files but
-  removed from gate (core-only rule); several lib tests also file-only pending 1.0+.
+- **Builtins registered: 87 (prefixes expanded).**
+- **Core tests in gate: 88** (EXPECTED.tsv, 88 rows). `std_*` tests exist as files but
+  removed from gate (core-only rule); `mtu_*` multi-translation-unit experiments are
+  also file-only. So ~12 code files are file-only (not in the gate count).
 - **0.0.46 session fixes (2026-08-15):** (1) BUG #3 — `mmap` builtin emitted a fixed
   address hint `0x60000000` in `rdi`; under Valgrind that address is reserved, so `mmap`
   returned `-22` (EINVAL) for small allocations (REGS/FREGS) and the `-22` was used as a

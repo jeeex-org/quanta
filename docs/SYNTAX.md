@@ -234,8 +234,11 @@ All builtins are emitted inline; they have no call overhead.
 | `u8(x)`, `u16(x)`, `u32(x)`, `u64(x)` | `-> truncated` | Bit‑mask to width |
 | `udiv(a,b)`, `umod(a,b)` | `-> unsigned` | Unsigned division/modulo |
 | `ult(a,b)`, `ugt(a,b)`, `ulte(a,b)`, `ugte(a,b)` | `-> 0/1` | Unsigned comparisons |
-| `fadd(a,b)`, `fsub(a,b)`, `fmul(a,b)`, `fdiv(a,b)` | `-> f64` | Float arithmetic |
-| `i2f(x)`, `f2i(x)` | `-> f64/i64` | Float/int conversion |
+| `fadd(a,b)`, `fsub(a,b)`, `fmul(a,b)`, `fdiv(a,b)` | `-> i64` | Float arithmetic; takes **int** args, computes `(double)a OP (double)b`, returns **int** (truncated). `fadd(3,4)=7`. |
+| `i2f(x)`, `f2i(x)` | `-> f64 bit-pattern` / `-> i64` | Int↔f64 bit-pattern conversion (no rounding). `i2f(3)` is the f64 bits of `3.0`. |
+| `feq(a,b)`, `flt(a,b)`, `fgt(a,b)`, `fle(a,b)`, `fge(a,b)` | `-> 0/1` | Float comparisons; args are f64 **bit-patterns** (pass `i2f(x)`). `feq(i2f(25),i2f(10))=0`, `fgt(i2f(25),i2f(10))=1`. |
+| `fisnan(a)`, `fisinf(a)` | `-> 0/1` | Float introspection on f64 bit-pattern. |
+| `sqrt(a)`, `floor(a)`, `ceil(a)`, `abs(a)` | `-> f64 bit-pattern` | Float math on f64 bit-pattern in/out. `sqrt(i2f(144))=i2f(12)`. |
 
 | `arg(i)` | `-> i64` | i‑th variadic argument (0‑based) |
 | `len(v)` | `-> i64` | Length prefix of string/array/slice |

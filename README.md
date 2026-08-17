@@ -1,17 +1,12 @@
 # Quanta Programming Language
 
-Quanta designed with simple syntax that supports multiple execution modes: Native compilation, Pre-compilation, Interpreter, JIT and WebAssembly
-
-> **Vocabulary:** "frontend" / "backend" refer to *domain capability*
-> (web UI vs server/systems). The compiler itself is organized by *stage*
-> (core / scan / parse / opt / codegen / run). See
-> [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md).
+Quanta designed with simple syntax that supports multiple execution modes: Native compilation, Pre-compilation, Interpreter, JIT and WebAssembly.
 
 ## Status (verified)
 
-- **Native AOT compilation (`qc`)** — **ACTIVE, 0.0.46**. x86-64 only.
+- **Native AOT compilation (`qc`)** — **ACTIVE, 0.0.55**. x86-64 only.
   Self-hosts with a **byte-identical fixed point** (3-stage: qc_boot → qc_self
-  → qc, all identical), and passes **81/81** test_suites (+ 6/6 security,
+  → qc, all identical), and passes **88/88** test_suites (+ 6/6 security,
   3/3 perf). Valgrind-clean (the mmap address-hint crash is fixed).
 - **Interpreter (`qc --interp`)** — PLANNED (Stage 1). Not yet landed.
 - **Pre-compilation (`go run` style)** — PLANNED (Stage 2).
@@ -21,6 +16,294 @@ Quanta designed with simple syntax that supports multiple execution modes: Nativ
 
 Security: secure-by-default — signed-overflow and out-of-bounds traps
 (`SIGILL`, exit 132), opt-out via `unsafe {}`.
+
+## Syntax at a glance
+
+Quanta has **no semicolons** — statements are separated by newlines (or spaces,
+as in `let i=0 let s=0`). Blocks use `{ }`. Everything is an expression;
+`return` exits a function with a value.
+
+```quanta
+fn main() {
+    prints("Hello, world!\n")
+    return 0
+}
+```
+
+Compile and run (native AOT):
+
+```bash
+qc yourfile.quanta yourbinary
+./yourbinary
+```
+
+## Examples
+
+### Variables, arithmetic, and printing
+
+```quanta
+fn main() {
+    let x = 10
+    let y = 20
+    let sum = x + y
+    prints("Sum: ")
+    printi(sum)
+    prints("\n")
+    return 0
+}
+```
+
+### Conditionals (if / else)
+
+```quanta
+fn main() {
+    let number = 7
+    if number % 2 == 0 {
+        prints("Even number\n")
+    } else {
+        prints("Odd number\n")
+    }
+    return 0
+}
+```
+
+### Loops: `loop` with `break` / `continue`
+
+```quanta
+fn main() {
+    let i = 0
+    let s = 0
+    loop {
+        i = i + 1
+        if i > 10 { break }
+        s = s + i
+    }
+    prints("Sum 1..10 = ")
+    printi(s)        // 55
+    prints("\n")
+    return 0
+}
+```
+
+### Loops: `while`
+
+```quanta
+fn main() {
+    let i = 0
+    let s = 0
+    while i < 5 {
+        prints("i = ")
+        printi(i)
+        prints("\n")
+        i = i + 1
+    }
+    return 0
+}
+```
+
+### Iteration: `for ... in` over an array literal
+
+```quanta
+fn main() {
+    let s = 0
+    for x in [1, 2, 3, 4] {
+        s = s + x
+    }
+    prints("Sum = ")
+    printi(s)        // 10
+    prints("\n")
+    return 0
+}
+```
+
+### Functions, recursion, and return values
+
+```quanta
+fn factorial(n) {
+    if n <= 1 { return 1 }
+    return n * factorial(n - 1)
+}
+
+fn main() {
+    let result = factorial(5)
+    prints("Factorial of 5 is ")
+    printi(result)   // 120
+    prints("\n")
+    return 0
+}
+```
+
+### Arrays and indexing
+
+```quanta
+fn main() {
+    let a = [100, 200, 300]
+    let second = a.1          // 200
+    prints("second = ")
+    printi(second)
+    prints("\n")
+    return 0
+}
+```
+
+### Structs
+
+```quanta
+struct Point { x y }
+
+fn make(a, b) {
+    return Point(a, b)
+}
+
+fn main() {
+    let p = make(3, 4)
+    prints("x + y = ")
+    printi(p.x + p.y)     // 7
+    prints("\n")
+    return 0
+}
+```
+
+### Enums and `match`
+
+```quanta
+enum Color {
+    Red,
+    Green,
+    Blue,
+}
+
+fn main() {
+    let c = Color.Green
+    let v = match c {
+        Color.Red   => 42,
+        Color.Green => 2,
+        Color.Blue  => 3,
+    }
+    prints("value = ")
+    printi(v)            // 2
+    prints("\n")
+    return 0
+}
+```
+
+`match` also works on integers and supports a `_` catch-all arm:
+
+```quanta
+fn main() {
+    let x = 5
+    let n = match x {
+        1 => 10,
+        2 => 20,
+        _ => 30,
+    }
+    return n            // 30
+}
+```
+
+### `const` (compile-time constants)
+
+```quanta
+const A = 3
+const B = A * 4       // 12
+const C = B + 2       // 14
+
+fn main() {
+    let y = A + B + C
+    printi(y)          // 29
+    prints("\n")
+    return 0
+}
+```
+
+### `defer` (runs at function exit, LIFO)
+
+```quanta
+global counter = 0
+
+fn get() -> i64 {
+    defer { counter = counter + 1 }
+    defer { counter = counter + 2 }
+    counter = counter + 8
+    return 1
+}
+
+fn main() {
+    get()
+    exit(counter)      // 8 + 2 + 1 = 11
+}
+```
+
+### `unsafe` blocks (opt out of overflow/bounds traps)
+
+```quanta
+fn main() {
+    unsafe {
+        return 42
+    }
+}
+```
+
+### Closures and function pointers
+
+```quanta
+fn add(a, b) {
+    return a + b
+}
+
+fn main() {
+    let f = mk_any(fnptr(add), 0)
+    let r = closure_call(f, 3, 4)
+    printi(r)          // 7
+    prints("\n")
+    return 0
+}
+```
+
+### File I/O
+
+> Quanta strings are length-prefixed (`[8-byte len][data]`). Syscalls that take
+> a C string expect the data pointer, so pass `string + 8` to skip the prefix.
+
+```quanta
+fn main() {
+    let path = "test_suites/codes/simple.quanta" + 8
+    let fd = file_open(path, 0)
+    printi(fd)         // a valid file descriptor (> 0)
+    prints("\n")
+    return 0
+}
+```
+
+### Floating-point math
+
+> Float *literals* (`3.14`) are not parsed yet. Use the `i2f`/`f2i` bit-pattern
+> builtins and the comparison/math builtins instead.
+
+```quanta
+fn main() {
+    let a = i2f(25)
+    let b = i2f(10)
+    let eq = feq(a, b)        // 0 (false)
+    let gt = fgt(a, b)        // 1 (true)
+    let root = sqrt(i2f(144)) // i2f(12)
+    printi(gt)
+    prints("\n")
+    return 0
+}
+```
+
+### Low-level: syscalls and memory
+
+```quanta
+fn main() {
+    let buf = mem_alloc(64)
+    let n = getrandom(buf, 16, 0)
+    printi(n == 16)     // 1 on success
+    prints("\n")
+    return 0
+}
+```
 
 ## Architecture: one IR, N backends
 
@@ -34,7 +317,7 @@ source.quanta → core/scan/parse → IR → opt/ → backend (codegen/x86_64 | 
 ```
 
 Current source form: a multi-file self-hosting tree at
-`compiler/0.0.46/src/x86/` (`main.quanta` + `helpers`/`lexer`/`parse`/
+`compiler/0.0.55/src/x86/` (`main.quanta` + `helpers`/`lexer`/`parse`/
 `codegen`/`emitter`/`elf`/`globals`/`features.quanta`). The modular split
 is DONE. `#import` is still not functional (a future stage).
 
@@ -44,31 +327,15 @@ Every change is gated by:
 
 ```bash
 # recompile the compiler with the bootstrap seed (3-stage self-host)
-cd compiler/0.0.46/src/x86
-SEED=/opt/tali/quanta/bootstrap/qc-bootstrap-0.0.45
+cd compiler/0.0.55/src/x86
+SEED=../../../../compiler/0.0.53/bin/x86/qc
 $SEED main.quanta qc_boot && ./qc_boot main.quanta qc_self && ./qc_self main.quanta qc
-# self-host fixed point (qc_boot == qc_self == qc) + 81/81 regression
+# self-host fixed point (qc_boot == qc_self == qc) + 88/88 regression
 bash test_suites/scripts/run_tests.sh
 ```
 
-Promotion history and rules live in `systems/PROMOTION_RULES.md` /
-`systems/PROMOTION_VERSION_RULES.md`.
-
-## Getting Started
-
-```quanta
-fn main() {
-    prints("Hello, world!\n");
-    return 0;
-}
-```
-
-Compile and run (native AOT):
-
-```bash
-qc yourfile.quanta yourbinary
-./yourbinary
-```
+Promotion history and version-bump rules are maintained in-repo
+(see `docs/ROADMAP.md` for the public promotion timeline).
 
 ## Documentation
 
@@ -77,65 +344,6 @@ qc yourfile.quanta yourbinary
   this to take over development)
 - [`docs/LANGUAGE_DESIGN.md`](docs/LANGUAGE_DESIGN.md) — multi-mode architecture
   and staged roadmap
-
-## Example Code
-
-### Variables and basic arithmetic
-
-```quanta
-fn main() {
-    let x = 10;
-    let y = 20;
-    let sum = x + y;
-    prints("Sum: ");
-    printi(sum);
-    prints("\n");
-    return 0;
-}
-```
-
-### Loop
-
-```quanta
-fn main() {
-    let i = 0;
-    loop i < 5 {
-        prints("i = ");
-        printi(i);
-        prints("\n");
-        i = i + 1;
-    }
-    return 0;
-}
-```
-
-### If-Else
-
-```quanta
-fn main() {
-    let number = 7;
-    if number % 2 == 0 {
-        prints("Even number\n");
-    } else {
-        prints("Odd number\n");
-    }
-    return 0;
-}
-```
-
-### Function with parameters and return
-
-```quanta
-fn factorial(n) {
-    if n <= 1 { return 1; }
-    return n * factorial(n - 1);
-}
-
-fn main() {
-    let result = factorial(5);
-    prints("Factorial of 5 is ");
-    printi(result);
-    prints("\n");
-    return 0;
-}
-```
+- [`docs/FEATURES.md`](docs/FEATURES.md) — shipped vs. to-do feature inventory
+- [`docs/ROADMAP.md`](docs/ROADMAP.md) — consolidated roadmap
+- [`docs/SPEC.md`](docs/SPEC.md) — formal language specification (tool-qualification)

@@ -1,7 +1,7 @@
-# Quanta Language Specification (v0.0.53)
+# Quanta Language Specification (v0.0.55)
 
 > Status: DRAFT / WORKING SPECIFICATION. Derived from the self-hosting
-> compiler source at `compiler/0.0.53/` (x86-64 + AArch64 native AOT).
+> compiler source at `compiler/0.0.55/` (x86-64 + AArch64 native AOT).
 > This document is the authoritative definition of Quanta semantics for
 > the purpose of tool qualification (ISO/IEC 26262-8, IEC 61508-3).
 > Where the prose and the compiler diverge, the compiler is currently
@@ -171,7 +171,10 @@ properties, so every backend inherits them by construction.
 
 1. Formal denotational/operational semantics for the IR (currently defined
    by emitter behavior, not axioms).
-2. Float literal syntax (`feq`/`flt`/... builtins land at v0.0.55 per ROADMAP).
+2. Float literal syntax (`3.14`) is still NOT parsed (lexer hard-errors). The
+   `feq`/`flt`/`fgt`/`fle`/`fge`/`fisnan`/`fisinf` comparison builtins and
+   `sqrt`/`floor`/`ceil`/`abs` math builtins ARE shipped at 0.0.55 (operate on
+   f64 bit-patterns via `i2f`/`f2i`); see §6 and `float_test.quanta`.
 3. Generic instantiation semantics (syntax present, instantiation deferred).
 4. `match` exhaustiveness rules (parser accepts; semantic exhaustiveness
    check not yet specified).
@@ -184,6 +187,6 @@ IEC 61508 SIL 3/4 until closed. See SAFETY_MANUAL.md §6.
 
 ## 8. Version
 
-Spec corresponds to compiler `0.0.53` (commit chain `...be00162`).
+Spec corresponds to compiler `0.0.55` (commit chain `...4653d32`).
 Update this document in lockstep with any semantic change; every change
 MUST reference the committing version and the test that proves it.
