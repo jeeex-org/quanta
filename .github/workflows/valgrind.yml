@@ -1,0 +1,46 @@
+name: valgrind-memory-scan
+
+# Memory-safety scan of the Quanta x86 self-hosting compiler (qc).
+#
+# Quanta emits a stripped ELF with no DWARF/.symtab, so generic source-level
+# scanners (CodeRabbit/CodeQL) cannot attribute crashes. Instead we run the
+# COMPILER BINARY under Valgrind - it catches real memory unsafety in qc itself
+# (out-of-bounds writes, use-after-free) that the functional gate misses.
+#
+# The committed qc (compiler/0.0.53/bin/x86/qc) is a valid built 0.0.53 binary,
+# so we scan it directly (no seed rebuild needed for a memory scan). A separate
+# ci.yml rebuilds from source and runs the full gate.
+#
+# Fails the workflow if Valgrind reports ANY error (ERROR SUMMARY > 0).
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  valgrind:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Valgrind
+        run: sudo apt-get update && sudo apt-get install -y valgrind
+
+      - name: Sanity check that qc compiles a program
+        run: compiler/0.0.53/bin/x86/qc test_suites/codes/simple.quanta /tmp/smoke.bin
+
+      - name: Valgrind scan of qc for memory unsafety
+        run: |
+          set -e
+          valgrind --error-exitcode=42 --leak-check=summary \
+            compiler/0.0.53/bin/x86/qc test_suites/codes/simple.quanta /tmp/val_smoke.bin 2> /tmp/vg.log
+          echo "Valgrind: no errors reported"
+
+      - name: Upload Valgrind log on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: valgrind-log
+          path: /tmp/vg.log
