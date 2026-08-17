@@ -346,7 +346,11 @@ fn parse_assign() {
     }
     mop(61); let v=parse_expr()
     let f=vfind(nm,nl); if f>=0 { iremit(IR_MOV,f,v,0,0); return 0 }
-    let g=gfind(nm,nl); if g>=0 { iremit(IR_STOREG,0,v,g) }
+    let g=gfind(nm,nl); if g>=0 { iremit(IR_STOREG,0,v,g); return 0 }
+    // SIMPLE-SURFACE: `=` auto-binds a NEW name when undeclared (no `let`
+    // required), bash-style. `let` stays valid for explicit declaration.
+    // Only reached for plain `name = expr` at statement level.
+    let vr=nv(); iremit(IR_MOV,vr,v,0,0); vadd(nm,nl,vr)
 }
 
 fn parse_if() {

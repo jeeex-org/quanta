@@ -84,6 +84,32 @@ fn main(argc, argv) {
     // quoted include in the main file resolves next to it).
     imp_dir_from(srcp, src_strlen(srcp))
     expand_includes(mainsrc, mlen, 0)
+    // SIMPLE-SURFACE: implicit main. A pure-statement script (no top-level
+    // fn/struct/enum/global/const declarations) is wrapped in `fn main(){...}`
+    // so a beginner never writes `fn main`. Library files that declare things
+    // but omit main keep the hard error below.
+    let wrap_main = 1
+    let si = 0
+    while si < srclen {
+        let prev = 0; if si>0 { prev = r8(src+si-1) }
+        if si==0 || prev==10 || prev==32 || prev==9 || prev==13 {
+            if r8(src+si)==102 && r8(src+si+1)==110 && r8(src+si+2)==32 { wrap_main=0 }      // "fn "
+            else if r8(src+si)==115 && r8(src+si+1)==116 && r8(src+si+2)==114 && r8(src+si+3)==117 && r8(src+si+4)==99 && r8(src+si+5)==116 && r8(src+si+6)==32 { wrap_main=0 } // "struct "
+            else if r8(src+si)==101 && r8(src+si+1)==110 && r8(src+si+2)==117 && r8(src+si+3)==109 && r8(src+si+4)==32 { wrap_main=0 } // "enum "
+            else if r8(src+si)==103 && r8(src+si+1)==108 && r8(src+si+2)==111 && r8(src+si+3)==98 && r8(src+si+4)==97 && r8(src+si+5)==108 && r8(src+si+6)==32 { wrap_main=0 } // "global "
+            else if r8(src+si)==99 && r8(src+si+1)==111 && r8(src+si+2)==110 && r8(src+si+3)==115 && r8(src+si+4)==116 && r8(src+si+5)==32 { wrap_main=0 } // "const "
+        }
+        si = si + 1
+    }
+    if wrap_main==1 {
+        let shift = 10
+        let e = srclen
+        while e >= 0 { w8(src+e+shift, r8(src+e)); e = e - 1 }
+        w8(src+0,102); w8(src+1,110); w8(src+2,32); w8(src+3,109); w8(src+4,97); w8(src+5,105); w8(src+6,110); w8(src+7,40); w8(src+8,41); w8(src+9,123) // "fn main(){"
+        srclen = srclen + shift
+        w8(src+srclen, 125); srclen = srclen + 1   // "}"
+        w8(src+srclen, 10); srclen = srclen + 1     // newline
+    }
     if imp_err==1 { exit(16) }
     // 7.F / NEW-1: detect source truncation. The expanded source must fit the
     // src buffer; a source that fills it was truncated -> abort immediately.
