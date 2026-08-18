@@ -20,13 +20,36 @@ Security: secure-by-default — signed-overflow and out-of-bounds traps
 ## Syntax at a glance
 
 Quanta has **no semicolons** — statements are separated by newlines (or spaces,
-as in `let i=0 let s=0`). Blocks use `{ }`. Everything is an expression;
-`return` exits a function with a value.
+as in `x = 10 y = 20`). Blocks use `{ }`. Everything is an expression;
+the last expression of a function body is its return value (so `return` is
+optional). `fn` is also optional — a top-level `name(params) { }` defines a
+function with or without `fn`. Variable bindings don't need `let` either.
 
 ```quanta
+// FULL form (explicit fn / let / return)
 fn main() {
-    prints("Hello, world!\n")
-    return 0
+    let x = 10
+    let y = 20
+    return x + y
+}
+
+// SIMPLIFIED form (no fn, no let, implicit return) — byte-for-byte equivalent
+main() {
+    x = 10
+    y = 20
+    x + y
+}
+```
+
+Accessing globals vs locals is explicit via sigils:
+
+```quanta
+global user = "admin"          // writable global (or: const for read-only)
+
+greet() {                       // bare function (no fn)
+    who = "James"               // bare local (no let)
+    print("hi " .. $[who] .. " " .. ${user})   // $[local] and ${global} bare
+    print("hi ${user}, welcome $[who]!")        // same sigils inside strings
 }
 ```
 

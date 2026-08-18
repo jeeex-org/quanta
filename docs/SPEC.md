@@ -70,15 +70,31 @@ Program = sequence of top-level items:
 - `fn` decl, `struct` decl, `enum` decl, `interface` decl, `impl` decl,
   `extern "C"` decl, `alias` decl, `let` (global), `const`, `unsafe` block,
   `defer` stmt, bare expression statement, `include` directive.
+- **`fn` is OPTIONAL**: a top-level `name(params) { body }` is a function
+  definition with or without `fn`. (SIMPLE-SURFACE: the compiler rewrites
+  bare `name(){}` to `fn name(){}` before parsing; `init()`/`main()` bare work.)
+- **`let` is OPTIONAL**: a top-level `name = expr` declares a global; a
+  bare `name = expr` inside a function declares/assigns a local. `global name`
+  marks a writable global, `const name` a read-only one.
+- **`return` is OPTIONAL**: the last expression of a function body is its
+  return value (early `return` still available).
+- Condition parentheses are optional: `if cond`, `while cond`, `for ...`.
 
 Statement (block-internal):
-- `let [mut] name [: type] = expr [;]`
-- `return [expr] [;]`
-- `if cond { ... } [else if ...] [else { ... }]`
+- `let [mut] name [: type] = expr [;]`   (or bare `name = expr`)
+- `return [expr] [;]`                     (or implicit: last expr)
+- `if cond { ... } [else if ...] [else { ... }]`   (`cond` parens optional)
 - `while cond { ... }`, `for`, `loop`
 - `match expr { arm => stmt|block, ... }`
 - `break [;]`, `continue [;]`, `defer expr`, `unsafe { ... }`
 - bare `{ ... }` block (scoping), bare expression (call) `[;]`
+
+Variable references (disambiguate scope explicitly):
+- `${name}` — read a **global** (resolves via the global table; undeclared →
+  compile error). Writing `${name} = x` is forbidden.
+- `$[]` — read a **local** (resolves to the current function's local;
+  undeclared → compile error). Writing `$[name] = x` is forbidden.
+  Both forms work bare (combined with `..`) and inside string literals.
 
 Expressions: primary (ident, int, char, string, bool, `( )`, array,
 Option/Result literals), unary, binary, call `f(a,b)`, index `a[i]`,

@@ -88,33 +88,60 @@ All runtime values are 64‑bit words.  Types are *compile‑time* annotations t
 ## 3. Declarations and Bindings
 
 ### Variables
+```quanta
+let x = 42               // immutable binding (explicit)
+x = 42                   // also valid — `let` is OPTIONAL; bare name = new binding
+x = x + 1                // reassignment to a local declared without `let`
 ```
-let x = 42               // immutable binding
-let mut x = 42           // mutable (explicit mut keyword)
-x = x + 1                // reassignment (only if mutable)
-```
-- `let` introduces a new binding; it **shadows** any previous binding with the same name in the same scope.
+- `let` is **optional**. A bare `name = expr` at function-top-level or in a block
+  introduces a new local binding (same as `let name = expr`). Inside a function,
+  `name = expr` with an existing local assigns; `name = expr` with no existing
+  local declares a new one.
+- At **top level** (outside any function), a bare `name = expr` declares a
+  **global** binding. Use `global name` for an explicit writable global, or
+  `const name` for a read-only one.
 - The initializer is an expression; its type may be omitted and inferred.
 
 ### Constants
-Not a separate syntax; use `let` with an initializer that is known at compile time (the compiler treats it as a constant).
+- `const name = expr` — read-only top-level binding (compile-time-constant).
+- `let name = expr` with a compile-time-known initializer is also treated as a
+  constant.
+
+### Global / local variable references
+Two explicit sigils disambiguate scope inside expressions and string literals:
+- `${name}` — read a **global** binding (resolves to a `global`/`const`/`top-level
+  bare declaration via the global table; undeclared global → compile error).
+- `$[]` — read a **local** binding (resolves to the current function's local;
+  undeclared local → compile error).
+```quanta
+global user = "admin"
+fn greet() {
+    let who = "James"
+    print("hi " .. $[who] .. " " .. ${user})   // bare form: .. + sigils
+    print("hi ${user}, welcome $[who]!")        // inside-string interpolation
+}
+```
+Both forms work **bare** (combined with `..`) and **inside string literals**.
+Writing to a sigil (`${name} = x`, `$[name] = x`) is forbidden — assign via the
+plain name or `global`.
 
 ### Functions
-```
-
-// closure_call(fnb, args...) — indirect call through a mk_any(fnptr, env) tuple.
-// Exercises the closure_call ABI fix: caller args must land in STANDARD arg
-// registers (rdi/x0..), with env in a scratch reg the callee ignores.
-fn add(a, b) {
-    return a + b
-}
-
-fn main() {
-    let f = mk_any(fnptr(add), 0)
-    let r = closure_call(f, 3, 4)
-    return r   // 3 + 4 = 7
+```quanta
+// `fn` is OPTIONAL. All of these are equivalent function definitions:
+fn add(a, b) { return a + b }      // canonical
+add(a, b) { return a + b }         // bare form (no `fn`)
+init() { print("boot") }           // bare init (runs before main if present)
+main() {                            // bare main
+    let r = add(3, 4)
+    return r
 }
 ```
+- **`fn` is optional.** A top-level `name(params) { body }` is a function
+  definition with or without `fn`. Mixing is fine: `fn main() { helper() }`
+  alongside bare `helper() { ... }`.
+- **Condition parentheses are optional.** `if x > 5`, `while i < n`, `for i = 0; i < n; i = i + 1` — no parens needed (and `if (x > 5)` also works).
+- **`return` is optional.** The last expression of a function body is its
+  return value (Rust/ML style). `return` is still available for early exit.
 - **Parameters**
   - Positional, separated by commas.
   - Optional default value after `=` (only for trailing parameters).

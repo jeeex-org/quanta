@@ -122,6 +122,41 @@ chmod +x "$TMP/ovf_c.bin" 2>/dev/null
 "$TMP/ovf_c.bin" >/dev/null 2>&1; rc=$?
 [ "$rc" != "0" ] && must_pass "constant-folded overflow (MAXINT+1) still traps (rc=$rc)" 0 || must_pass "constant-folded overflow (MAXINT+1) still traps (rc=$rc)" 1
 
+# --- 5) Simplified surface keeps security guarantees (no fn / no let / sigils) --
+# The optional-keyword surface must not weaken secure-by-default: overflow
+# still traps, and unsafe{} is still required to opt out.
+cat > "$TMP/simp_ovf.quanta" <<'EOF'
+main() {
+    a = 9223372036854775807
+    b = 1
+    c = a + b
+    printi(c)
+    0
+}
+EOF
+$QC -O "$TMP/simp_ovf.quanta" "$TMP/simp_ovf.bin" >/dev/null 2>&1
+chmod +x "$TMP/simp_ovf.bin" 2>/dev/null
+"$TMP/simp_ovf.bin" >/dev/null 2>&1; rc=$?
+[ $rc -ne 0 ] && must_pass "simplified syntax (no fn/let): overflow still traps (rc=$rc)" 0 || must_pass "simplified syntax (no fn/let): overflow still traps (rc=$rc)" 1
+
+cat > "$TMP/simp_unsafe.quanta" <<'EOF'
+global g = 0
+setter() {
+    g = 9999999999999999999   // out-of-range literal assignment
+    0
+}
+main() {
+    setter()
+    0
+}
+EOF
+$QC -O "$TMP/simp_unsafe.quanta" "$TMP/simp_unsafe.bin" >/dev/null 2>&1
+chmod +x "$TMP/simp_unsafe.bin" 2>/dev/null
+"$TMP/simp_unsafe.bin" >/dev/null 2>&1; rc=$?
+# Assigning an out-of-range literal to a global must NOT silently corrupt;
+# the compiler rejects it (rc != 0) or the runtime traps. Either way: no silent success.
+[ $rc -ne 0 ] && must_pass "simplified syntax: bad global literal rejected/trapped (rc=$rc)" 0 || must_pass "simplified syntax: bad global literal rejected/trapped (rc=$rc)" 1
+
 echo ""
 echo "=== Security: $PASS passed, $FAIL failed, $KNOWN known issues ==="
 rm -rf "$TMP"

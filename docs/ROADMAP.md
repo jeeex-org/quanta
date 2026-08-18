@@ -115,7 +115,8 @@ SEQUENCING is the contract, not the literal numbers.
 |-------|----------|-------|
 | Debt window | 0.0.43–0.0.50 | Core correctness (aliasing, `?` propagation, MAP_FAILED guard, cyclic-struct reject). **CLOSED.** |
 | Grammar + bug-fix | 0.0.51–0.0.55 | tree-sitter grammar (done 0.0.53), residual compiler bugs. **0.0.53 shipped.** |
-| P2 builtins | 0.0.55–0.0.60 | float cmp ✅(0.0.55), proc/env ✅(0.0.55), stdin ✅(0.0.55), fs meta 🟡(stat/unlink/mkdir/chdir/rename BROKEN — path-string remap), string ops, math ✅(sqrt/floor/ceil/abs; sin/cos/tan/pow/log/min/max TODO), atomics, net, introspection ✅(abort/debugbreak), random ✅(getrandom) |
+| SIMPLE-SURFACE | 0.0.55 | **Simplified syntax landed**: `fn` keyword optional (bare `name(){}` works everywhere, `init()`/`main()` bare OK), `let` optional (bare `name = expr` = local/global), `return` optional (last-expr auto-returns), condition parens optional, `${name}` global / `$[]` local explicit sigils (bare + inside-string interpolation). Goal: bash-like, extremely simple surface. Docs (README/SYNTAX/SPEC) + test_suites + security script synced. |
+| P2 builtins | 0.0.55–0.0.60 | float cmp ✅(0.0.55), proc/env ✅(0.0.55), stdin ✅(0.0.55), fs meta ✅(0.0.55 — path-string remap fixed), string ops, math ✅(sqrt/floor/ceil/abs; sin/cos/tan/pow/log/min/max TODO), atomics, net, introspection ✅(abort/debugbreak), random ✅(getrandom) |
 | P3 language | 0.0.61–0.0.71 | float literals, user enums, tuples, generics, traits, modules, real char/byte/string/bool, ref/mut/move, op-overload, closure literals, and/or/not/true/false/global |
 | **P4 tooling** | **0.0.72** | **Quanta-native code-writing tool** (edit Quanta source reliably without external scripting — the user's stated goal) |
 | **1.0** | 1.0.0 | Core + builtins complete → std/lib resumes; borrow-checking target for #1 green |
@@ -167,6 +168,10 @@ P2 builtins landed in 0.0.55 (gate green, 88/88): float comparisons
 float arith (`fadd/fsub/fmul/fdiv` take int args → int), process/env
 (`getpid/getppid/arg_count/environ`; `getenv` is a stub returning 0),
 stdin (`getc`), random (`getrandom`), introspection (`abort`/`debugbreak`).
-Known gap: `stat/unlink/mkdir/chdir/rename` are BROKEN (path-string remap
-returns -ENOENT); `fstat`/`lseek` work. See FEATURES.md §I.
+**fs meta fixed**: `stat/unlink/mkdir/chdir/rename` now return correct rc
+(path-string remap bug resolved). **Simplified surface landed**: `fn`/`let`/
+`return` optional, no-parens conditions, `${name}`/`$[]` global/local sigils.
+
+Known gap: `getenv` is a stub; `fstat`/`lseek` work; string ops (concat via
+`..` and `${}`/`$[]` interpolation) work. See FEATURES.md §I.
 
