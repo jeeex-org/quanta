@@ -183,6 +183,24 @@ fn scanfns() {
                 // ret_type_name/len intentionally NOT captured (return-type checking
                 // deferred — see STATE.md F3 note). Pass 0 so sfn records "inferred".
                 let ret_type_name = 0; let ret_type_len = 0
+                // Same-level duplicate function name is a HARD ERROR (not silent
+                // first-wins). Check against already-registered fns[0..fnc].
+                let dup = 0; let di = 0
+                while di < fnc {
+                    if fn_nlen(di) == nl {
+                        let ok = 1; let k = 0
+                        while k < nl { if r8(src+fn_name(di)+k) != r8(src+nm+k) { ok = 0; break }; k = k+1 }
+                        if ok == 1 { dup = 1; break }
+                    }
+                    di = di + 1
+                }
+                if dup == 1 {
+                    let me = "error: duplicate function definition: "
+                    file_write(2, me+8, len(me))
+                    file_write(2, nm, nl)
+                    let mn = "\n"; file_write(2, mn+8, 1)
+                    exit(1)
+                }
                 sfn(fnc,nm,nl,bp,0,saw_param,ret_type_name,ret_type_len)
             w64(fn_extern + fnc*8, is_extern)
             fnc=fnc+1; p=j

@@ -241,6 +241,12 @@ fn tokenize() {
             let nl2=p-sp2
             stok(tokc,TT_LOCAL,sp2,l,sc2,nl2); tokc=tokc+1
             p=p+1; c=c+1   // skip ]
+        } else if ch==36&&p+1<srclen&&r8(src+p+1)==40 {
+            // $( is reserved for the future external/global function-call sigil
+            // (reaching an outer same-named function once nested scopes exist).
+            // Nested scopes are not implemented yet, so reject clearly.
+            let mh="error: $() external call sigil not yet supported (nested scopes pending)\n"
+            file_write(2, mh+8, len(mh)); exit(1)
         } else if ch==36&&p+1<srclen&&r8(src+p+1)==123&&p+2<srclen&&ialpha(r8(src+p+2)) {
             // ${name} : a GLOBAL reference (read-only cross-scope handle). The
             // inner name is tokenized as TT_DOLLAR so it resolves to a `global`
