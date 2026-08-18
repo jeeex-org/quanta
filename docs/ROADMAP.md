@@ -52,6 +52,12 @@ secure,
   (`open`/`read`/`write`/`close` via syscall).
 - **0.0.32** `std/collections`: `vec` (dynamic array), `map` (hashmap).
   Foundation for DB + general apps.
+- **0.0.57** `$$(cmd)` external-command substitution (P2 builtin; raw-syscall OS
+  capability, **no libc**). `unsafe`-gated. `$$(str)` → `/bin/sh -c str` (bash-style
+  convenience); `$$(arr)` → direct `execve` (no shell — injection-safe, the
+  better-than-libc form). Returns `CmdResult{stdout, stderr, status}`; capture grown
+  via `mem_alloc`/`realloc` (no fixed cap). Reuses the existing `syscall()` builtin
+  (fork 57 / execve 59 / pipe 22 / wait4 61 / dup2 33).
 
 ### Phase 2 — Differentiation pillars (the "never need another language" part)
 - **0.0.33** CODEGEN BUG FIX (builtins flush_all). Promoted `cdff03b`. NOT crypto.
@@ -116,7 +122,7 @@ SEQUENCING is the contract, not the literal numbers.
 | Debt window | 0.0.43–0.0.50 | Core correctness (aliasing, `?` propagation, MAP_FAILED guard, cyclic-struct reject). **CLOSED.** |
 | Grammar + bug-fix | 0.0.51–0.0.55 | tree-sitter grammar (done 0.0.53), residual compiler bugs. **0.0.53 shipped.** |
 | SIMPLE-SURFACE | 0.0.55 | **Simplified syntax landed**: `fn` keyword optional (bare `name(){}` works everywhere, `init()`/`main()` bare OK), `let` optional (bare `name = expr` = local/global), `return` optional (last-expr auto-returns), condition parens optional, `${name}` global / `$[]` local explicit sigils (bare + inside-string interpolation). Goal: bash-like, extremely simple surface. Docs (README/SYNTAX/SPEC) + test_suites + security script synced. |
-| P2 builtins | 0.0.55–0.0.60 | float cmp ✅(0.0.55), proc/env ✅(0.0.55), stdin ✅(0.0.55), fs meta ✅(0.0.55 — path-string remap fixed), string ops, math ✅(sqrt/floor/ceil/abs; sin/cos/tan/pow/log/min/max TODO), atomics, net, introspection ✅(abort/debugbreak), random ✅(getrandom) |
+| P2 builtins | 0.0.55–0.0.60 | float cmp ✅(0.0.55), proc/env ✅(0.0.55), stdin ✅(0.0.55), fs meta ✅(0.0.55 — path-string remap fixed), string ops, math ✅(sqrt/floor/ceil/abs; sin/cos/tan/pow/log/min/max TODO), atomics, net, introspection ✅(abort/debugbreak), random ✅(getrandom), **`$$(cmd)` external-command substitution (0.0.57)** — `unsafe`-gated runtime `fork`/`execve`/`pipe`/`wait4` via the raw `syscall()` builtin (no libc); `$$(str)`→`/bin/sh -c`, `$$(arr)`→direct `execve` (no shell, injection-safe). Returns `CmdResult{stdout,stderr,status}`. |
 | P3 language | 0.0.61–0.0.71 | float literals, user enums, tuples, generics, traits, modules, real char/byte/string/bool, ref/mut/move, op-overload, closure literals, and/or/not/true/false/global |
 | **P4 tooling** | **0.0.72** | **Quanta-native code-writing tool** (edit Quanta source reliably without external scripting — the user's stated goal) |
 | **1.0** | 1.0.0 | Core + builtins complete → std/lib resumes; borrow-checking target for #1 green |
