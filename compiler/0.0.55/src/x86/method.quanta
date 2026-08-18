@@ -240,9 +240,8 @@ fn parse_call_impl(nm, nl, selfv) {
 fn build_str(a, b) {
     let cnm = srclen
     w8(src+cnm,115); w8(src+cnm+1,116); w8(src+cnm+2,114); w8(src+cnm+3,0)
-    // NOTE: do NOT advance srclen here. The `..` desugar (parse.quanta) also
-    // writes "str\0" at srclen without advancing; advancing clobbers earlier
-    // str-call name bytes when multiple interpolations coexist in one binary.
+    srclen = cnm + 4   // reserve the name slot; matches the `..` desugar so the
+                       // interpolation walk's later literal writes never clobber it
     let cavs = irc
     let ma = nv(); iremit(IR_MOV, ma, a, 0, 0)
     let mb = nv(); iremit(IR_MOV, mb, b, 0, 0)
