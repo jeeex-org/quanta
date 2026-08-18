@@ -41,6 +41,18 @@ fn parse_block() {
             if h==16 { parse_ret() }
             else if h==2 { parse_let() }
             else if h==57 { parse_const() }   // F7: const NAME = EXPR
+            else if h==1 {
+                // Nested `fn name(){}` definition: already registered by scanfns.
+                // Skip the whole definition (name + signature + body) so the parser
+                // doesn't try to treat it as a statement. Scan to the matching '}'.
+                adv()  // consume 'fn'
+                // skip name + signature up to '{'
+                while peek()!=TT_PNCT||(pval()!=123&&pval()!=41) { if peek()==TT_EOF { break }; adv() }
+                // now at '(' or '{'; consume signature '(' ... ')' if present
+                if peek()==TT_PNCT&&pval()==40 { let d=1; adv(); while d>0&&peek()!=TT_EOF { if peek()==TT_PNCT&&pval()==40 { d=d+1 } else if peek()==TT_PNCT&&pval()==41 { d=d-1 }; adv() } }
+                // now at '{'; consume body
+                if peek()==TT_PNCT&&pval()==123 { let d=1; adv(); while d>0&&peek()!=TT_EOF { if peek()==TT_PNCT&&pval()==123 { d=d+1 } else if peek()==TT_PNCT&&pval()==125 { d=d-1 }; adv() } }
+            }
             else if h==3 { parse_if() }
             else if h==6 { parse_while() }
             else if h==5 { parse_loop() }
@@ -97,6 +109,10 @@ fn parse_block() {
                 let nm=pval(); let nl=plen()
                 compile_error(1, nm, nl)
             } else { let ev=parse_expr() }
+        } else if t==TT_CALL {
+            // $(func) explicit external call as a statement — parse and discard result.
+            let ev=parse_expr()
+            if in_fn_body==1 && blk_depth==1 && peek()==TT_PNCT && pval()==125 { iremit(IR_RET,0,ev,0,0) }
         } else if t==TT_PNCT&&v==123 {    // nested bare block: { ... }
             adv(); parse_block(); mpnct(125)
         } else if t==TT_NUM||t==TT_STR||t==TT_OP||t==TT_PNCT||t==TT_ASM {

@@ -355,12 +355,17 @@ fn main(argc, argv) {
         // param table while the body is parsed — not the previous fn's (the
         // register-slot hazard: cross-block state must live in globals).
         cur_fi=fi
+        // Push this function onto the scope stack so that local-first call
+        // resolution (resolve_call -> fn_curscope) is scoped to THIS function's
+        // body. Popped after the body is parsed.
+        fn_push(fi)
 
                     parse_block()
         iremit(IR_RET,0,-1,0,0)
+        fn_pop()
 
         // Save IR start and param count
-        sfn(fi,fn_name(fi),fn_nlen(fi),fn_btok(fi),0,pc)
+        sfn(fi,fn_name(fi),fn_nlen(fi),fn_btok(fi),0,pc,0,0)
         cur_fnname=fn_name(fi); cur_fnnlen=fn_nlen(fi)
 
         // Compile IR to code.  fn_cofs must be the START offset of the code.
@@ -371,7 +376,7 @@ fn main(argc, argv) {
         opt_func()      // Tier-1 IR opt (constant folding). No-op when opt_on==0.
         cur_fnname=fn_name(fi); cur_fnnlen=fn_nlen(fi)
         ci_func(fi,0)
-        sfn(fi,fn_name(fi),fn_nlen(fi),fn_btok(fi),cstart,pc)
+        sfn(fi,fn_name(fi),fn_nlen(fi),fn_btok(fi),cstart,pc,0,0)
 
         fi=fi+1
     }

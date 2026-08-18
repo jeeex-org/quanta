@@ -7,19 +7,26 @@
 // Global scratch buffer `segvreg` (declared in globals.quanta) holds the
 // segment vregs between pass 1 and pass 2 of string interpolation.
 
-// parse_call(nm, nl): parse `name(args)` using the shared arg machinery and
-// emit IR_CALL. Returns the result vreg. Accepts an optional leading `selfv`
+// parse_call(nm, nl, mode): parse `name(args)` using the shared arg machinery
+// and emit IR_CALL. mode: FI_LOCAL (bare call, local-first) or FI_GLOBAL ($( ),
+// global-only). Returns the result vreg. Accepts an optional leading `selfv`
 // (a vreg to prepend as param 0) for method calls.
-fn parse_call(nm, nl) {
+fn parse_call(nm, nl, mode) {
     let selfv = -1
-    return parse_call_impl(nm, nl, selfv)
+    return parse_call_impl(nm, nl, selfv, mode)
 }
 
 fn parse_method_call(selfv, mnm, ml) {
-    return parse_call_impl(mnm, ml, selfv)
+    return parse_call_impl(mnm, ml, selfv, FI_LOCAL)
 }
 
-fn parse_call_impl(nm, nl, selfv) {
+// resolve_fn(nm, nl, mode): pick the function index per resolution mode.
+fn resolve_fn(nm, nl, mode) {
+    if mode==FI_GLOBAL { return findfn_global(nm, nl) }
+    return resolve_call(nm, nl)
+}
+
+fn parse_call_impl(nm, nl, selfv, mode) {
     // P10: Check for generic type arguments <T, U> after function name
     // '<' and '>' are TT_OP (values 60/62) — parser checks context
     let gen_args_count = 0
@@ -38,7 +45,6 @@ fn parse_call_impl(nm, nl, selfv) {
                 adv()
             }
         }
-        // After loop, tokp is at '>' or past it; advance to '('
         adv()  // consume '('
     }
     // t10: fnptr(FNAME) -> code pointer as a runtime value. Special-cased
@@ -48,7 +54,7 @@ fn parse_call_impl(nm, nl, selfv) {
         if !(peek()==TT_ID) { compile_error(0, nm, nl) }
         let fnnm = pval(); let fnln = plen(); adv()  // consume FNAME
         mpnct(41)  // ')'
-        let fi = findfn(fnnm, fnln)
+        let fi = resolve_fn(fnnm, fnln, mode)
         if fi<0 { compile_error(0, fnnm, fnln) }
         let vr = nv(); iremit(IR_FNPTR, vr, fi, 0, 0); return vr
     }
@@ -79,7 +85,7 @@ fn parse_call_impl(nm, nl, selfv) {
             // target slot = argument order by default; remapped if named.
             let tgt = ac
             if anm!=0 {
-                let callee = findfn(nm, nl)
+                let callee = resolve_fn(nm, nl, mode)
                 if callee>=0 {
                     let pidx = findparam(callee, anm, len_name_colon(anm))
                     if pidx>=0 { tgt = pidx } else { compile_error(2, nm, nl) }
@@ -98,7 +104,7 @@ fn parse_call_impl(nm, nl, selfv) {
     mpnct(41)
     let nargs=argsp-base
     // t5: fill omitted params with their default expressions.
-    let dfn = findfn(nm, nl)
+    let dfn = resolve_fn(nm, nl, mode)
     if dfn>=0 {
         let dfull = r64(fn_pcount + dfn*8)
         let zz=0
@@ -143,7 +149,7 @@ fn parse_call_impl(nm, nl, selfv) {
         let gen_args = mmap(8000)
         // Note: generic args already parsed earlier in parse_call_impl
         // For now, just use the original function
-        let fchk=findfn(nm,nl)
+        let fchk=resolve_fn(nm,nl,mode)
         let effective_fi = fchk
         let do_call=0
         if fchk>=0 { do_call=1 }
@@ -544,9 +550,16 @@ fn parse_primary() {
         // src+v (same source-offset layout as TT_ID tokens). Consume the
         // keyword first (parse_call_impl's adv() then eats the '(').
         if tokp+1<tokc && tokt(tokp+1)==TT_PNCT && tokv(tokp+1)==40 && is_bltn(v,ln)==1 {
-            adv(); return parse_call(v, ln)
+            adv(); return parse_call(v, ln, FI_LOCAL)
         }
         adv(); iremit(IR_CONST,vr,0,0,0); return vr
+    }
+    if peek()==TT_CALL {
+        // $(name) or $(name(args)): explicit EXTERNAL / GLOBAL function call.
+        // Resolves via the GLOBAL table only (findfn_global), so it reaches the
+        // top-level definition even when a local same-named function shadows it.
+        let nm = pval(); let nl = plen(); adv()
+        return parse_call(nm, nl, FI_GLOBAL)
     }
     if peek()==TT_ID {
             // Check for struct constructor: StructName(args) - MUST BE FIRST before enum lookahead
@@ -756,11 +769,13 @@ fn parse_primary() {
                     // NOTE: tokp already advanced past the name (line 3029 adv()),
                     // so it points AT the '(' or '<' token now.
                     let is_call = 0
-                    let fchk = findfn(nm, nl)
+                    // Bare call: resolve LOCAL-FIRST (walk the scope chain). This
+                    // is what makes a local fn shadow a same-named global.
+                    let fchk = resolve_call(nm, nl)
                     if tokp<tokc && tokt(tokp)==TT_PNCT && tokv(tokp)==40 { is_call = 1 }
                     else if tokp<tokc && tokt(tokp)==TT_OP && tokv(tokp)==60 && fchk>=0 && r64(fn_generic + fchk*8)!=0 { is_call = 1 }
                     if is_call==1 {
-                        return parse_call(nm, nl)
+                        return parse_call(nm, nl, FI_LOCAL)
                     }
         if peek()==TT_PNCT&&pval()==91 {  // index: a[idx] OR slice: a[lo:hi] / a[:hi] / a[lo:]
             adv()  // consume '['

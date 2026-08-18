@@ -229,6 +229,16 @@ fn tokenize() {
             // Always emit < and > as TT_OP - parser handles context
             stok(tokc,TT_OP,ch,l,c,1); tokc=tokc+1; p=p+1; c=c+1
         } else if ispnct(ch) {
+            // dz: when >0 we are inside a $(name(...)) sigil; skip the ')' that
+            // closes the $( (the one AFTER the args' own ')'), so $(f(1,b)) does
+            // not leave a stray ')'.
+            if dz > 0 {
+                if ch==40 { dz = dz + 1 }
+                else if ch==41 {
+                    dz = dz - 1
+                    if dz == 0 { p=p+1; c=c+1; continue }  // skip the $( closer
+                }
+            }
             stok(tokc,TT_PNCT,ch,l,c,1); tokc=tokc+1; p=p+1; c=c+1
         } else if ch==36&&p+1<srclen&&r8(src+p+1)==91 {
             // $[name] : a read-only LOCAL handle (current function's local, via
@@ -241,12 +251,30 @@ fn tokenize() {
             let nl2=p-sp2
             stok(tokc,TT_LOCAL,sp2,l,sc2,nl2); tokc=tokc+1
             p=p+1; c=c+1   // skip ]
-        } else if ch==36&&p+1<srclen&&r8(src+p+1)==40 {
-            // $( is reserved for the future external/global function-call sigil
-            // (reaching an outer same-named function once nested scopes exist).
-            // Nested scopes are not implemented yet, so reject clearly.
-            let mh="error: $() external call sigil not yet supported (nested scopes pending)\n"
-            file_write(2, mh+8, len(mh)); exit(1)
+        } else if ch==36&&p+1<srclen&&r8(src+p+1)==40&&p+2<srclen&&ialpha(r8(src+p+2)) {
+            // $(name) or $(name(args)): explicit EXTERNAL / GLOBAL function call.
+            // Tokenized as TT_CALL (distinct from TT_ID, so a bare `name)` in
+            // normal code is never mistaken for a call). Resolves via the global
+            // function table only (findfn_global) — reaching the top-level
+            // definition even when a local same-named function shadows it.
+            p=p+2; c=c+2   // skip $(
+            let sp2=p; let sc2=c
+            while p<srclen && (ialpha(r8(src+p)) || (r8(src+p)>=48&&r8(src+p)<=57) || r8(src+p)==95) { p=p+1; c=c+1 }
+            let nl2 = p - sp2
+            if nl2==0 { let mh="error: empty external call name in $()\\n"; file_write(2, mh+8, len(mh)); exit(1) }
+            stok(tokc,TT_CALL,sp2,l,sc2,nl2); tokc=tokc+1
+            // If args follow ($(name(args))), the closing ')' of $( is the one
+            // AFTER the args' own ')'. Track depth so the generic PNCT handler
+            // skips exactly that trailing ')'.
+            if p<srclen && r8(src+p)==40 {
+                dz = 1   // we are now inside the $( 's paren pair
+            } else {
+                // 0-arg form $(name): no source '(' exists. Emit a single
+                // synthetic '(' so the stream is TT_CALL(name) '(' and the real
+                // ')' that follows closes the call — identical to a real name()
+                // call. (Do NOT emit a synthetic ')'; the source ')' is the close.)
+                stok(tokc,TT_PNCT,40,l,c,1); tokc=tokc+1
+            }
         } else if ch==36&&p+1<srclen&&r8(src+p+1)==123&&p+2<srclen&&ialpha(r8(src+p+2)) {
             // ${name} : a GLOBAL reference (read-only cross-scope handle). The
             // inner name is tokenized as TT_DOLLAR so it resolves to a `global`

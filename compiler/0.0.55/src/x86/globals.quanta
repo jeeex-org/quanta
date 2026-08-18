@@ -102,6 +102,10 @@ let imp_seen = mmap(8192); let imp_seenc = 0   // dedup: hashes of resolved path
 let imp_err = 0
 // Tokens: 40 bytes each [type,value,line,col,len]
 let toks = mmap(160000000); let tokc = 0; let tokp = 0
+// $(name(args)) sigil paren-depth tracker: when >0 we are inside a $(…) sigil
+// and the PNCT handler skips the ')' that closes the $() (the one AFTER the
+// args' own ')'), so $(f(1,b)) does not leave a stray ')'.
+let dz = 0
 // NEW-3: parser recursion-depth guard. parse_expr->parse_primary->'('->parse_expr
 // is unbounded native-stack recursion; a few hundred nested parens segfaults qc.
 // pdepth tracks current expression nesting; parse_primary aborts past PDEPTH_MAX.
@@ -607,6 +611,53 @@ fn scan_retstructs() {
 // default (the mandatory minimum arg count at the call site).
 let fn_defargs = mmap(8000000)
 let fn_pdfixed = mmap(2000000)
+// === FUNCTION SCOPES (lexical scoping of functions) ===
+// fn_parent[i] = enclosing function index for a local fn, or -1 for top-level.
+// A bare call `f()` resolves LOCAL-FIRST (walk parent chain), `$(f)` resolves
+// GLOBAL-ONLY (top-level table). fn_btok/fn_bdepth record the def site.
+let fn_parent = mmap(2000000)
+// fstack: runtime stack of function indices currently being parsed (top of chain
+// = innermost enclosing fn). fsp = stack pointer (number of entries).
+let fstack = mmap(2000000)
+let fsp = 0
+fn fn_push(i) { w64(fstack + fsp*8, i); fsp = fsp + 1 }
+fn fn_pop() { if fsp>0 { fsp = fsp - 1 } }
+fn fn_curscope() { if fsp>0 { return r64(fstack + (fsp-1)*8) } else { return -1 } }
+// resolve_call(nm,nl): lexical function lookup, LOCAL-FIRST.
+// Search the fns defined directly inside the current scope (fn_parent == scope);
+// if none match, walk up fn_parent to the enclosing scope, finally the global
+// scope (fn_parent < 0). A local fn shadows a same-named global. Returns -1 if
+// the name is defined nowhere.
+fn resolve_call(nm, nl) {
+    let fi = fn_curscope()
+    while true {
+        let i = 0
+        while i < fnc {
+            if r64(fn_parent + i*8)==fi && fn_nlen(i)==nl {
+                let ok=1; let k=0
+                while k<nl { if r8(src+fn_name(i)+k)!=r8(src+nm+k) { ok=0; break }; k=k+1 }
+                if ok==1 { return i }
+            }
+            i = i + 1
+        }
+        if fi < 0 { return -1 }              // global scope searched, not found
+        fi = r64(fn_parent + fi*8)          // up to parent scope
+    }
+    return -1
+}
+// findfn_global(nm,nl): top-level ONLY (used by the $(func) sigil).
+fn findfn_global(nm, nl) {
+    let i = 0
+    while i < fnc {
+        if r64(fn_parent + i*8) < 0 && fn_nlen(i)==nl {
+            let ok=1; let k=0
+            while k<nl { if r8(src+fn_name(i)+k)!=r8(src+nm+k) { ok=0; break }; k=k+1 }
+            if ok==1 { return i }
+        }
+        i = i + 1
+    }
+    return -1
+}
 // Variadic args are stored FRAME-LOCAL (not in a global table) so that a
 // variadic function calling another variadic function nests correctly.
 // For each variadic function, ci_func reserves 64 bytes at the bottom of its
@@ -704,6 +755,9 @@ let gapatchc = 0
 let gdata_sym = 0            // .symtab index of the _gdata symbol (set in p5_elf_obj)
 // unified data segment at GDATA holds: [internal globals][source globals][string data].
 let INTERNAL_GLOBAL_COUNT = 41
+// Function-call resolution modes (passed to parse_call / parse_call_impl).
+let FI_LOCAL = 0    // bare `f()`: resolve local-first (walk scope chain)
+let FI_GLOBAL = 1   // $(f): global table only (explicit external call)
 // Output binary data section (string literals) - mmap'd so IR_STR writes are valid.
 let data = mmap(33554432); let data_off = 0  // 32MB string-literal buffer
 let DAT_CAP = 33554432  // fail-closed cap for data buffer (parallel to CODE_CAP)
