@@ -414,6 +414,17 @@ fn compute_magic(d) {
 fn sdef(vr, reg) { wbp(spill_home(vr), reg); w8(vr_init+vr, 1) }
 // === BUILD IN NAME CHECK ===
 
+// argp8(reg, base, k): load arg k's spill-home pointer + 8 (skip the 8-byte
+// string length prefix) into reg. Quanta strings are [8:len][bytes]; syscall
+// path ABI needs base+8. Mirrors the reload-from-spill-home pattern used by the
+// generic syscall() helper.
+fn argp8(reg, base, k) {
+    let sv = irres(base + k)
+    rbp(reg, spill_home(sv))
+    ri(3, 8)          // rbx = 8  (low reg; ra() decodes high regs wrong)
+    ra(reg, 3)        // reg = reg + 8
+}
+
 // Emit inline machine code for a built-in call.  Arguments have already been
 // placed in the ABI registers (rdi,rsi,rdx,rcx,r8,r9); the result is left in
 // rax.  Returns 1 if a built-in was emitted, 0 otherwise.
@@ -1404,43 +1415,45 @@ fn emit_bltn2(nmi,nl,ii) {
         flush_all()
         ri(0,318); sysc(); return 1
     }
-    // lseek(fd, offset, whence): sc 8
-    if nl==5&&r8(nm)=='l'&&r8(nm+1)=='s'&&r8(nm+2)=='e'&&r8(nm+3)=='e'&&r8(nm+4)=='k' {
-        flush_all()
-        ri(0,8); sysc(); return 1
-    }
+    // argp8(reg, base, k): load arg k's spill-home pointer + 8 (skip the 8-byte
+    // string length prefix) into reg. Quanta strings are [8:len][bytes]; syscall
+    // path ABI needs base+8. Mirrors the reload-from-spill-home pattern used by
+    // the generic syscall() helper.
     // unlink(path): sc 87
     if nl==6&&r8(nm)=='u'&&r8(nm+1)=='n'&&r8(nm+2)=='l'&&r8(nm+3)=='i'&&r8(nm+4)=='n'&&r8(nm+5)=='k' {
         flush_all()
+        ri(3, 8); ra(7, 3)        // rdi (path from IR_CALL) += 8
         ri(0,87); sysc(); return 1
     }
     // mkdir(path, mode): sc 83
     if nl==5&&r8(nm)=='m'&&r8(nm+1)=='k'&&r8(nm+2)=='d'&&r8(nm+3)=='i'&&r8(nm+4)=='r' {
         flush_all()
+        let scb = ira2(ii)
+        argp8(7, scb, 0)        // rdi = path + 8
+        rbp(6, spill_home(irres(scb+1)))   // rsi = mode
         ri(0,83); sysc(); return 1
     }
     // chdir(path): sc 80
     if nl==5&&r8(nm)=='c'&&r8(nm+1)=='h'&&r8(nm+2)=='d'&&r8(nm+3)=='i'&&r8(nm+4)=='r' {
         flush_all()
+        ri(3, 8); ra(7, 3)        // rdi (path from IR_CALL) += 8
         ri(0,80); sysc(); return 1
     }
     // rename(old, new): sc 82
     if nl==6&&r8(nm)=='r'&&r8(nm+1)=='e'&&r8(nm+2)=='n'&&r8(nm+3)=='a'&&r8(nm+4)=='m'&&r8(nm+5)=='e' {
         flush_all()
+        ri(3, 8); ra(7, 3)        // rdi (old path from IR_CALL) += 8
+        rbp(6, spill_home(irres(ira2(ii)+1)))   // rsi = new
         ri(0,82); sysc(); return 1
-    }
-    // fstat(fd, buf): sc 5
-    if nl==5&&r8(nm)=='f'&&r8(nm+1)=='s'&&r8(nm+2)=='t'&&r8(nm+3)=='a'&&r8(nm+4)=='t' {
-        flush_all()
-        ri(0,5); sysc(); return 1
     }
     // stat(path, buf): newfstatat(AT_FDCWD, path, buf, 0) = sc 262
     if nl==4&&r8(nm)=='s'&&r8(nm+1)=='t'&&r8(nm+2)=='a'&&r8(nm+3)=='t' {
         flush_all()
-        rr(2,6)        // rdx = rsi (buf)
-        rr(6,7)        // rsi = rdi (path)
-        ri(7,-100)     // rdi = AT_FDCWD
-        ri(10,0)       // r10 = 0 (flags)
+        let scb = ira2(ii)
+        ri(7,-100)              // rdi = AT_FDCWD
+        argp8(6, scb, 0)        // rsi = path + 8
+        rbp(2, spill_home(irres(scb+1)))   // rdx = buf
+        ri(10,0)                // r10 = 0 (flags)
         ri(0,262); sysc(); return 1
     }
     // abort(): exit(134) = 128 + SIGABRT
