@@ -101,13 +101,18 @@ fn main(argc, argv) {
         }
         si = si + 1
     }
-    // If pure script, rewrite bare `name () {` -> `fn name () {`
-    if is_pure_script==1 {
-        {
-            let bi = 0
+    // Rewrite bare `name () {` -> `fn name () {` for EVERY file (not just pure
+    // scripts). `fn`-prefixed defs are skipped via skip_fn, so a file mixing
+    // `fn main(){}` and bare `helper(){}` compiles. `fn` is now optional.
+    {
+        let bi = 0
             while bi < srclen {
                 let c0 = r8(src+bi)
+                // Only convert identifiers at statement start (column 0 / start
+                // of file). Excludes indented control flow like `else if (x) {`
+                // which also matches name(){} but is NOT a function definition.
                 if (c0>=65&&c0<=90)||(c0>=97&&c0<=122)||c0==95 {
+                    if bi>0 { let pch=r8(src+bi-1); if !(pch==10||pch==13) { bi = bi + 1; continue } }
                     // scan identifier
                     let ie = bi
                     while ie < srclen {
@@ -141,7 +146,6 @@ fn main(argc, argv) {
                 } else { bi = bi + 1 }
             }
         }
-    }
     // NOW compute wrap_main on the REWRITTEN source
     let wrap_main = 1
     let si = 0
