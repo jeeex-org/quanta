@@ -4,6 +4,9 @@
 // path only runs when user code uses `obj.NAME` (alpha); the compiler source
 // never does, so it does not trip the allocator hazard.
 
+// Global scratch buffer `segvreg` (declared in globals.quanta) holds the
+// segment vregs between pass 1 and pass 2 of string interpolation.
+
 // parse_call(nm, nl): parse `name(args)` using the shared arg machinery and
 // emit IR_CALL. Returns the result vreg. Accepts an optional leading `selfv`
 // (a vreg to prepend as param 0) for method calls.
@@ -232,6 +235,21 @@ fn parse_call_impl(nm, nl, selfv) {
     }
 }
 
+// build_str(a, b): emit str(a, b) exactly like the `..` desugar. Returns the
+// result vreg (a string). Used by string-interpolation to combine segments.
+fn build_str(a, b) {
+    let cnm = srclen
+    w8(src+cnm,115); w8(src+cnm+1,116); w8(src+cnm+2,114); w8(src+cnm+3,0)
+    srclen = cnm + 4   // advance past "str\0" so later writes don't clobber the name
+    let cavs = irc
+    let ma = nv(); iremit(IR_MOV, ma, a, 0, 0)
+    let mb = nv(); iremit(IR_MOV, mb, b, 0, 0)
+    let cr = nv()
+    iremit(IR_CALL, cr, cnm, 2, cavs)
+    w64(vreg_is_str + cr*8, 1)
+    return cr
+}
+
 fn parse_primary() {
     if peek()==TT_ASM {  // P11: inline asm: asm!("hex bytes") — raw machine code
         adv()  // consume 'asm'
@@ -287,8 +305,179 @@ fn parse_primary() {
         }
     }
     if peek()==TT_NUM { let v=pval(); adv(); let vr=nv(); iremit(IR_CONST,vr,v,0,0); return vr }
-    if peek()==TT_STR { let v=pval(); adv(); let vr=nv(); iremit(IR_STR,vr,v,0,0); w64(vreg_is_str + vr*8, 1); return vr }
-    // G2 containers: array literal [e1, e2, ...] -> IR_TALLOC(n), IR_ISTORE each.
+    if peek()==TT_FNUM {
+        let v=pval(); adv()
+        // Float value: (M << 8) | frac_digits
+        let M = v >> 8
+        let frac_digits = v & 255
+        // Build decimal string: M / 10^frac_digits . M % 10^frac_digits
+        let scale = 1
+        let k = frac_digits
+        while k > 0 { scale = scale * 10; k = k - 1 }
+        let int_part = M / scale
+        let frac_part = M % scale
+        // Emit a synthetic string literal "..." into src so IR_STR can scan it.
+        // IR_STR does sp=a0+1 then scans for the closing quote 34.
+        let lip = srclen
+        w8(src+srclen, 34); srclen = srclen + 1  // opening quote
+        // int part
+        let ip = int_part
+        if ip == 0 {
+            w8(src+srclen, 48); srclen = srclen + 1  // '0'
+        } else {
+            let rev_start = srclen
+            let rev_end = srclen
+            while ip > 0 {
+                let d = ip % 10
+                w8(src+srclen, 48+d); srclen = srclen + 1
+                ip = ip / 10
+            }
+            // reverse in place
+            let l = rev_start
+            let r = srclen - 1
+            while l < r {
+                let tmp = r8(src+l)
+                w8(src+l, r8(src+r))
+                w8(src+r, tmp)
+                l = l + 1; r = r - 1
+            }
+        }
+        // fractional part
+        if frac_digits > 0 {
+            w8(src+srclen, 46); srclen = srclen + 1  // '.'
+            let scale = 1
+            let kk = frac_digits
+            while kk > 0 { scale = scale * 10; kk = kk - 1 }
+            let frac_part = M % scale
+            // pad with leading zeros
+            let i = 0
+            while i < frac_digits {
+                w8(src+srclen, 48); srclen = srclen + 1
+                i = i + 1
+            }
+            let f = frac_part
+            let fstart = srclen - frac_digits   // leftmost frac position
+            let fi = frac_digits - 1           // index from the right
+            while fi >= 0 {
+                let d = f % 10
+                w8(src + fstart + fi, 48+d)
+                f = f / 10
+                fi = fi - 1
+            }
+        }
+        w8(src+srclen, 34); srclen = srclen + 1  // closing quote
+        let vr = nv()
+        iremit(IR_STR, vr, lip, 0, 0)
+        w64(vreg_is_str + vr*8, 1)
+        return vr
+    }
+    if peek()==TT_STR {
+        let v=pval(); adv(); let vr=nv(); iremit(IR_STR,vr,v,0,0); w64(vreg_is_str + vr*8, 1)
+        // Parse-time string interpolation. The lexer keeps the whole string
+        // (incl. ${name}/$[name] text) as one literal token. Here we scan the
+        // string bytes; if an interpolation is present we split into a str(...)
+        // call whose literal segments are written as quote-framed strings at
+        // srclen (safe at parse time, after lexing). Nested-if conditions only
+        // (Quanta's && / || short-circuit is unreliable).
+        let so=v+1; let slen=0
+        while r8(src+so+slen)!=34 { slen=slen+1 }
+        // detect any ${ident} / $[ident]
+        let has_interp=0; let si=0
+        while si<slen {
+            let b=r8(src+so+si)
+            if b==36 {
+                if si+1<slen {
+                    let b1=r8(src+so+si+1)
+                    let isbr=0; if b1==123 { isbr=1 } else { if b1==91 { isbr=1 } }
+                    if isbr==1 {
+                        if si+2<slen {
+                            if ialpha(r8(src+so+si+2)) { has_interp=1; si=slen }
+                        }
+                    }
+                }
+            }
+            if has_interp==0 { si=si+1 }
+        }
+        if has_interp==0 { return vr }
+        // Build the interpolation as a chain of binary str() calls (identical
+        // to the proven `..` desugar). We walk segments left-to-right, keeping
+        // an accumulator `acc` and combining each new segment via build_str().
+        // No arrays / mmap needed. Scan conditions use nested-if only.
+        let acc=0; let have_acc=0
+        let seg_start=0; let i=0
+        while i<=slen {
+            let atend=0; if i==slen { atend=1 }
+            let isref=0
+            if atend==0 {
+                if r8(src+so+i)==36 {
+                    if i+1<slen {
+                        let b1=r8(src+so+i+1)
+                        let isbr=0; if b1==123 { isbr=1 } else { if b1==91 { isbr=1 } }
+                        if isbr==1 { isref=1 }
+                    }
+                }
+            }
+            if atend==1 { isref=0 }
+            if isref==1 {
+                // flush literal [seg_start, i) first (it precedes the ref)
+                if i>seg_start {
+                    let seglen=i-seg_start
+                    let ls=srclen
+                    w8(src+ls,34); let k=0; while k<seglen { w8(src+ls+1+k, r8(src+so+seg_start+k)); k=k+1 }
+                    w8(src+ls+1+seglen,34); w8(src+ls+2+seglen,0)
+                    srclen=ls+2+seglen+1
+                    let lv=nv(); iremit(IR_STR,lv,ls,0,0); w64(vreg_is_str+lv*8,1)
+                    if have_acc==0 { acc=lv; have_acc=1 } else { acc=build_str(acc, lv) }
+                }
+                // resolve the ref
+                let ob=r8(src+so+i+1); let cb=125; if ob==91 { cb=93 }
+                let ns=i+2; let ne=ns
+                let nep=0
+                while nep==0 { if ne>=slen { nep=1 } else { if r8(src+so+ne)==cb { nep=1 } else { ne=ne+1 } } }
+                let nm=so+ns; let nl2=ne-ns
+                let sv=0
+                if ob==123 {
+                    let g=gfind(nm,nl2)
+                    if g>=0 { sv=nv(); iremit(IR_LOADG,sv,g,0,0); w64(vreg_is_str+sv*8,1) } else { compile_error(1, nm, nl2); return 0 }
+                } else {
+                    let f=vfind(nm,nl2)
+                    if f>=0 { sv=f } else { compile_error(1, nm, nl2); return 0 }
+                }
+                if have_acc==0 { acc=sv; have_acc=1 } else { acc=build_str(acc, sv) }
+                i=ne+1; seg_start=i
+            } else { i=i+1 }
+        }
+        // trailing literal [seg_start, slen)
+        if seg_start<slen {
+            let seglen=slen-seg_start
+            let ls=srclen
+            w8(src+ls,34); let k=0; while k<seglen { w8(src+ls+1+k, r8(src+so+seg_start+k)); k=k+1 }
+            w8(src+ls+1+seglen,34); w8(src+ls+2+seglen,0)
+            srclen=ls+2+seglen+1
+            let lv=nv(); iremit(IR_STR,lv,ls,0,0); w64(vreg_is_str+lv*8,1)
+            if have_acc==0 { acc=lv; have_acc=1 } else { acc=build_str(acc, lv) }
+        }
+        return acc
+    }
+    // ${name}: read-only GLOBAL reference. Resolves to a `global name`
+    // declaration via gfind(); no such global -> compile error.
+    if peek()==TT_DOLLAR {
+        let nm=pval(); let nl=plen(); adv()
+        let g=gfind(nm,nl)
+        if g>=0 { let vr=nv(); iremit(IR_LOADG,vr,g,0,0); w64(vreg_is_str+vr*8,1); return vr }
+        // undeclared global reference: report the token's source position.
+        compile_error(1, nm, nl)
+        return 0
+    }
+    // $[name]: read-only LOCAL handle. Resolves to the current function's local
+    // via vfind(); no such local -> compile error.
+    if peek()==TT_LOCAL {
+        let nm=pval(); let nl=plen(); adv()
+        let f=vfind(nm,nl)
+        if f>=0 { w64(vreg_is_str+f*8,1); return f }
+        compile_error(1, nm, nl)
+        return 0
+    }
     if peek()==TT_PNCT&&pval()==91 {
         // P10: [TYPE]() = type-annotated EMPTY array literal (e.g. `let result
         // = [U]()` in a generic fn). Detect ID `]` `(` `)` and emit TALLOC(0).

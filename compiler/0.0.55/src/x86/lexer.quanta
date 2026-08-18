@@ -65,11 +65,14 @@ fn tokenize() {
             if p<srclen { p=p+1 }; l=l+1; c=1
         } else if ch==34 {
             let sl=l; let sc=c; let sp=p; p=p+1; c=c+1
+            // String literal: kept as a single literal token (including any
+            // ${...}/$[...] text). Interpolation is split later in parse_primary
+            // at parse time (where extending srclen is safe), not during lexing.
             while p<srclen&&r8(src+p)!=34 {
                 if r8(src+p)==92&&p+1<srclen { p=p+2; c=c+2 } else { p=p+1; c=c+1 }
             }
             if p>=srclen { let mh = "error: unterminated string literal (missing closing quote)\n"; file_write(2, mh+8, len(mh)); exit(1) }; p=p+1; c=c+1
-            stok(tokc,TT_STR,sp,sl,sc,p-sp); tokc=tokc+1
+            if p>sp { stok(tokc,TT_STR,sp,sl,sc,p-sp); tokc=tokc+1 }
         } else if ch==39 {
             let sc=c; let cval=0
             if r8(src+p+1)==92 {
@@ -146,11 +149,27 @@ fn tokenize() {
                 if p<srclen&&r8(src+p)==46 {
                     let prevdot = (tokc>0 && tokt(tokc-1)==TT_PNCT && tokv(tokc-1)==46)
                     if prevdot==0 && ((p+1<srclen && idigit(r8(src+p+1))==1) || p+1>=srclen) {
-                        let mf = "error: floating-point literals are not supported\n"
-                        file_write(2, mf+8, len(mf)); exit(1)
+                        // Float literal: scan fractional digits
+                        p = p + 1  // consume '.'
+                        let fsp = p; let fsc = c
+                        let fval = 0
+                        let fdigits = 0
+                        while p<srclen && idigit(r8(src+p))==1 {
+                            let d = r8(src+p) - 48
+                            val = val*10 + d
+                            fval = fval*10 + d
+                            fdigits = fdigits + 1
+                            p = p + 1; c = c + 1
+                        }
+                        let nlen = p - sp
+                        // Encode frac_digits in upper byte of value: (val << 8) | fdigits
+                        let fval_enc = (val << 8) | fdigits
+                        stok(tokc, TT_FNUM, fval_enc, l, sc, nlen); tokc = tokc + 1
+                        // Note: exponent (e/E) scanning could be added here if needed
+                        continue
                     }
                 }
-                stok(tokc,TT_NUM,val,l,sc,nlen); tokc=tokc+1
+                stok(tokc, TT_NUM, val, l, sc, nlen); tokc = tokc + 1
             }
         } else if ialpha(ch) {
             let sp=p; let sc=c
@@ -211,20 +230,27 @@ fn tokenize() {
             stok(tokc,TT_OP,ch,l,c,1); tokc=tokc+1; p=p+1; c=c+1
         } else if ispnct(ch) {
             stok(tokc,TT_PNCT,ch,l,c,1); tokc=tokc+1; p=p+1; c=c+1
-        } else if ch==36&&p+1<srclen&&r8(src+p+1)==123 {
-            // ${name} : a variable reference (identical to writing `name`).
-            // Tokenizes the inner name as a TT_ID; the surrounding $ { } are
-            // skipped. Kept in the MAIN tokenizer (outside any string scan) so
-            // it never alters string-literal tokenization or self-host.
+        } else if ch==36&&p+1<srclen&&r8(src+p+1)==91 {
+            // $[name] : a read-only LOCAL handle (current function's local, via
+            // vfind). Used for explicit local reference and string interpolation
+            // of a local. The inner name is tokenized as TT_LOCAL.
+            p=p+2; c=c+2   // skip $[
+            let sp2=p; let sc2=c
+            while p<srclen&&r8(src+p)!=93 { p=p+1; c=c+1 }   // until ]
+            if p>=srclen { let mh="error: unterminated local reference (missing ']')\\n"; file_write(2, mh+8, len(mh)); exit(1) }
+            let nl2=p-sp2
+            stok(tokc,TT_LOCAL,sp2,l,sc2,nl2); tokc=tokc+1
+            p=p+1; c=c+1   // skip ]
+        } else if ch==36&&p+1<srclen&&r8(src+p+1)==123&&p+2<srclen&&ialpha(r8(src+p+2)) {
+            // ${name} : a GLOBAL reference (read-only cross-scope handle). The
+            // inner name is tokenized as TT_DOLLAR so it resolves to a `global`
+            // declaration via gfind() — distinct from any local `name`.
             p=p+2; c=c+2   // skip ${
             let sp2=p; let sc2=c
             while p<srclen&&r8(src+p)!=125 { p=p+1; c=c+1 }
             if p>=srclen { let mh="error: unterminated variable reference (missing '}')\n"; file_write(2, mh+8, len(mh)); exit(1) }
             let nl2=p-sp2
-            let kt2 = ktext(sp2,nl2)
-            let ty2 = TT_ID
-            if kt2!=0 { ty2=TT_KEY }
-            stok(tokc,ty2,sp2,l,sc2,nl2); tokc=tokc+1
+            stok(tokc,TT_DOLLAR,sp2,l,sc2,nl2); tokc=tokc+1
             p=p+1; c=c+1   // skip }
         } else { let mh = "error: invalid character in source (byte not a token)\n"; file_write(2, mh+8, len(mh)); exit(1) }
     }

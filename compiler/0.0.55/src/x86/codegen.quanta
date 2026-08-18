@@ -176,7 +176,18 @@ fn opt_func() {
         // every op reads o0,o1 (and o2 where relevant); mark them live
         if op!=IR_CONST { w8(live_bits+o0,1) }
         if op!=IR_CONST && op!=IR_BR && op!=IR_JMP { w8(live_bits+o1,1) }
-        if op==IR_CALL { w8(live_bits+o2,1) }
+        if op==IR_CALL {
+            w8(live_bits+o2,1)   // arg-count IR index is live
+            // mark each argument vreg live (the call reads irres(a2+i))
+            let call_ac=ira1(j)   // arg count
+            let call_as=ira2(j)   // arg-start IR index
+            let call_ai=0
+            while call_ai<call_ac {
+                let call_arg_ir=call_as+call_ai
+                if call_arg_ir<irc { w8(live_bits+irres(call_arg_ir),1) }
+                call_ai=call_ai+1
+            }
+        }
         if op==IR_RET { w8(live_bits+o0,1) }
         if op==IR_PARAM { w8(live_bits+o0,1) }   // PARAM target vreg is live
         if op==IR_STOREG { w8(live_bits+o0,1) }  // STOREG reads o0

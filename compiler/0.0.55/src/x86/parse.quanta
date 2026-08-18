@@ -79,6 +79,24 @@ fn parse_block() {
                 else { let ev=parse_expr(); if in_fn_body==1&&blk_depth==1&&peek()==TT_PNCT&&pval()==125 { iremit(IR_RET,0,ev,0,0) } }
             } else if nxt<tokc&&tokt(nxt)==TT_OP&&tokv(nxt)==61 { parse_assign() }
             else { let ev=parse_expr(); if in_fn_body==1&&blk_depth==1&&peek()==TT_PNCT&&pval()==125 { iremit(IR_RET,0,ev,0,0) } }
+        } else if t==TT_DOLLAR {
+            // ${name}: read-only GLOBAL handle. Writing ${name} = x is forbidden
+            // (use `global name` to declare a writable global, or a local). A bare
+            // ${name} expression statement is parsed and its value discarded.
+            let nxt=tokp+1
+            if nxt<tokc&&tokt(nxt)==TT_OP&&tokv(nxt)==61 {
+                let nm=pval(); let nl=plen()
+                compile_error(1, nm, nl)
+            } else { let ev=parse_expr() }
+        } else if t==TT_LOCAL {
+            // $[name]: read-only LOCAL handle. Writing $[name] = x is forbidden
+            // (assign to the local via `name = x`). A bare $[name] expression
+            // statement is parsed and its value discarded.
+            let nxt=tokp+1
+            if nxt<tokc&&tokt(nxt)==TT_OP&&tokv(nxt)==61 {
+                let nm=pval(); let nl=plen()
+                compile_error(1, nm, nl)
+            } else { let ev=parse_expr() }
         } else if t==TT_PNCT&&v==123 {    // nested bare block: { ... }
             adv(); parse_block(); mpnct(125)
         } else if t==TT_NUM||t==TT_STR||t==TT_OP||t==TT_PNCT||t==TT_ASM {
@@ -856,6 +874,7 @@ fn parse_add() {
             let mb = nv(); iremit(IR_MOV, mb, r, 0, 0)
             let cr = nv()
             iremit(IR_CALL, cr, cnm, 2, cavs)
+            w64(vreg_is_str + cr*8, 1)   // str() returns a string -> tag it
             l = cr
         }
         else if v==43 { adv(); let r=parse_mul(); iremit(IR_ADD,rr,l,r,0); l=rr }
