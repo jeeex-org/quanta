@@ -1165,12 +1165,20 @@ fn emit_bltn2(nmi,nl,ii) {
     //   [24] = err_ptr (0; stderr not captured in this minimal impl)
     if nl==10&&r8(nm)=='q'&&r8(nm+1)=='c'&&r8(nm+2)=='_'&&r8(nm+3)=='s'&&r8(nm+4)=='y'&&r8(nm+5)=='s'&&r8(nm+6)=='_'&&r8(nm+7)=='c'&&r8(nm+8)=='m'&&r8(nm+9)=='d' {
         flush_all()
-        // 0.0.55: load the cmd's data-section address directly from the lit_addr
-        // map (keyed by the cmd vreg carried in the IR_CALL record's a1). This is
-        // robust against vreg recycling: every $$ call carries its OWN cmd vreg,
-        // and lit_addr holds that call's literal address at emit time.
-        ri64(7, r64(lit_addr + ira1(ii)*8))
-        let l_parent=nl(); let l_rdbrk=nl()
+        // 0.0.55: load the cmd. Two cases:
+        //   - compile-time string literal: its data-section address is in
+        //     lit_addr[cmd_vreg] (populated by IR_STR codegen) and is non-zero.
+        //   - runtime variable (e.g. let s="..."; $$(s)) or fn param: the string
+        //     pointer lives in the vreg's home slot at runtime -> spill_home(cmd).
+        // Discriminate by whether lit_addr[cmd] is populated (non-zero), since a
+        // literal's address is always known, while a variable's may not be.
+        let _cmdv = ira1(ii)
+        if r64(lit_addr + _cmdv*8) != 0 {
+            ri64(7, r64(lit_addr + _cmdv*8))      // literal: known data address
+        } else {
+            rbp(7, spill_home(_cmdv))             // variable/fn-param: runtime ptr
+        }
+        let l_parent=nl(); let l_rdbrk=nl(); let l_disc=nl()
         // Preserve callee-saved regs (r12-r15) per x86-64 ABI — this builtin
         // clobbers them, so save/restore to avoid corrupting caller state (e.g.
         // the result struct ptr held in r12 by the caller).
@@ -1180,15 +1188,25 @@ fn emit_bltn2(nmi,nl,ii) {
         eb(65); eb(87)   // push r15  (41 57)
         // SAVE cmd (rdi) FIRST — every syscall below clobbers rdi. r14 = cmd+8 (bytes ptr).
         rr(14,7); ri(8,8); ra(14,8)
-        // Allocate result struct: mmap(0, 32, RW, ANON|PRIVATE, -1, 0)
-        ri(6,32); ri(7,0); ri(2,3); ri(10,0x22); ri(8,-1); rxor(9,9); ri(0,9); sysc()
+        // Allocate result struct: mmap(0, 48, RW, ANON|PRIVATE, -1, 0). The extra
+        // 16 bytes past the 32-byte [len,out,code,err] header serve as the .err
+        // buffer (zero-filled by mmap -> len 0 -> ""). err_ptr points at this
+        // in-struct tail, so it is always a valid runtime address (no separate
+        // mmap / register-clobber pitfalls).
+        ri(6,48); ri(7,0); ri(2,3); ri(10,0x22); ri(8,-1); rxor(9,9); ri(0,9); sysc()
         rr(12,0)           // r12 = result struct ptr (rax)
         // struct field access uses IR_IDX => load [base + idx*8 + 8].
         // So fields live at out@8, code@16, err@24; [0] is a len header.
         ri(0,24); stx(12,0,0)   // [r12+0] = 24 (len)
         stx(12,8,0)        // [r12+8] = 0 (out_ptr)
         stx(12,16,0)       // [r12+16] = 0 (code)
-        stx(12,24,0)       // [r12+24] = 0 (err_ptr)
+        // 0.0.55: .err returns a VALID empty string (stderr is not captured in
+        // this minimal impl). The result struct was mmap'd as 48 bytes; the 16
+        // bytes past the 32-byte header [r12+32..r12+48] serve as the .err buffer
+        // (zero-filled by mmap -> len 0 -> ""). Point err_ptr at this in-struct
+        // tail: it is always a valid runtime address.
+        rr(0,12); ri(8,32); ra(0,8)   // r0 = r12 + 32 (err buffer inside struct)
+        stx(12,24,0)       // [r12+24] = err_ptr -> "" (in-struct, zero-filled)
         // output string buffer (header + 4096 bytes): mmap(0, 4104, ...)
         ri(6,4104); ri(7,0); ri(2,3); ri(10,0x22); ri(8,-1); rxor(9,9); ri(0,9); sysc()
         rr(15,0)           // r15 = out_buf (rax)
@@ -1227,6 +1245,13 @@ fn emit_bltn2(nmi,nl,ii) {
         rxor(9,9)                            // r9 = total = 0
         let l_rd=nl()
         lbladd(l_rd, codelen)
+        // 0.0.55: cap output at the 4096-byte buffer. If total >= 4096 the buffer
+        // is full; keep DRAINING the pipe (discard) so the child is not blocked on
+        // a full pipe (which would hang wait4 forever). We never store past 4096.
+        let _pjcap = codelen
+        eb(73); eb(129); eb(249); ei(4096)   // cmp r9, 4096  (49 81 F9 00001000)
+        let _pjcap2 = codelen
+        jcc32(5, 0); emit_patch(_pjcap2, l_disc, 1)  // jge -> discard path
         ldx(7,13,2048)                       // rdi = read_fd
         rr(6,15); ri(8,8); ra(6,9); ra(6,8)  // rsi = out_buf + 8 + total
         ri(10,4096); rs(10,9)            // rdx = 4096 - total
@@ -1234,6 +1259,15 @@ fn emit_bltn2(nmi,nl,ii) {
         rtest(0,0); let pj2=codelen; jcc32(4,0); emit_patch(pj2, l_rdbrk, 1)  // jle -> break (n<=0)
         ra(9,0)                              // total += n (rax=n)
         let pj3=codelen; jmp32(0); emit_patch(pj3, l_rd, 0)
+        // discard path: read into out_buf+8 (overwrite, stays within 4096),
+        // do NOT advance total. Keeps the pipe drained until child EOF.
+        lbladd(l_disc, codelen)
+        ldx(7,13,2048)                       // rdi = read_fd
+        rr(6,15); ri(8,8); ra(6,8)           // rsi = out_buf + 8 (fixed; within buf)
+        ri(10,4096); rs(10,0)            // rdx = 4096 (dummy; never stored)
+        ri(0,0); sysc()                      // read -> rax = n
+        rtest(0,0); let pj4=codelen; jcc32(4,0); emit_patch(pj4, l_rdbrk, 1)  // jle -> break
+        jmp32(0); emit_patch(codelen-5, l_disc, 0)
         lbladd(l_rdbrk, codelen)
         // set output string header: [out_buf] = total (len). rax is 0 here (n<=0).
         rr(7,15); stx(7,0,9)  // [out_buf+0] = total (r9)
@@ -1246,7 +1280,8 @@ fn emit_bltn2(nmi,nl,ii) {
         eb(72); eb(131); eb(230); eb(255) // and r6, 0xff (48 83 E6 FF)
         stx(12,16,6)      // [r12+16] = code
         stx(12,8,15)      // [r12+8] = out_buf (out_ptr)
-        stx(12,24,0)      // [r12+24] = 0 (err_ptr)
+        // NOTE: [r12+24] (err_ptr) is set earlier to the empty-string buffer
+        // (in-struct tail, line ~1205); do NOT overwrite it with 0 here.
         // munmap S (4096): rdi=S, rsi=4096, rax=11
         rr(7,13); ri(8,4096); ri(0,11); sysc()
         rr(0,12)           // rax = result struct ptr
