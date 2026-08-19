@@ -4,9 +4,9 @@ Quanta designed with simple syntax that supports multiple execution modes: Nativ
 
 ## Status (verified)
 
-- **Native AOT compilation (`qc`)** — **ACTIVE, 0.0.55**. x86-64 only.
+- **Native AOT compilation (`qc`)** — **ACTIVE, 0.0.57**. x86-64 only.
   Self-hosts with a **byte-identical fixed point** (3-stage: qc_boot → qc_self
-  → qc, all identical), and passes **88/88** test_suites (+ 6/6 security,
+  → qc, all identical), and passes **91/91** test_suites (+ 8/8 security,
   3/3 perf). Valgrind-clean (the mmap address-hint crash is fixed).
 - **Interpreter (`qc --interp`)** — PLANNED (Stage 1). Not yet landed.
 - **Pre-compilation (`go run` style)** — PLANNED (Stage 2).
@@ -22,8 +22,8 @@ Security: secure-by-default — signed-overflow and out-of-bounds traps
 Quanta has **no semicolons** — statements are separated by newlines (or spaces,
 as in `x = 10 y = 20`). Blocks use `{ }`. Everything is an expression;
 the last expression of a function body is its return value (so `return` is
-optional). `fn` is also optional — a top-level `name(params) { }` defines a
-function with or without `fn`. Variable bindings don't need `let` either.
+optional). **`fn`, `let`, and `return` are all optional** — you can write a
+complete program in the bare "simplified" surface, or use the explicit forms.
 
 ```quanta
 // FULL form (explicit fn / let / return)
@@ -33,7 +33,7 @@ fn main() {
     return x + y
 }
 
-// SIMPLIFIED form (no fn, no let, implicit return) — byte-for-byte equivalent
+// SIMPLIFIED form (no fn, no let, no return — implicit) — byte-for-byte equivalent
 main() {
     x = 10
     y = 20
@@ -41,7 +41,28 @@ main() {
 }
 ```
 
-Accessing globals vs locals is explicit via sigils:
+The simplified surface is bash-like and extremely low-ceremony:
+
+| Surface | Optional keyword | What's implicit |
+|---------|-----------------|----------------|
+| Function def | `fn` | `name(params) { }` at top level already defines a function |
+| Local binding | `let` | `name = expr` inside a function = a local |
+| Return | `return` | the last expression of a block is the return value |
+| Condition parens | `( )` | `if x > 0 { }` — no parens needed around the condition |
+
+Bare `main()` / `init()` work with or without `fn`. Example with optional
+parens:
+
+```quanta
+// all three are equivalent
+if number % 2 == 0 { prints("even\n") }
+if (number % 2 == 0) { prints("even\n") }
+if number % 2 == 0 prints("even\n")
+```
+
+Accessing globals vs locals is explicit via **sigils** (this is the one place
+Quanta is not "bare" — it borrows bash's `${}`/`$[]` idea so there is never
+ambiguity about scope):
 
 ```quanta
 global user = "admin"          // writable global (or: const for read-only)
@@ -52,6 +73,14 @@ greet() {                       // bare function (no fn)
     print("hi ${user}, welcome $[who]!")        // same sigils inside strings
 }
 ```
+
+Sigil rules:
+- `${name}` → **global** (read from the global slot; `${name} = x` writes it).
+- `$[]` → **local** (read a local; used inside strings for interpolation).
+- Inside a string, `${global}` and `$[local]` interpolate directly — no
+  concatenation needed.
+- A bare `name` with no sigil resolves by normal scoping (local if inside a
+  function, otherwise global).
 
 Compile and run (native AOT):
 
@@ -353,7 +382,7 @@ Every change is gated by:
 cd compiler/0.0.55/src/x86
 SEED=../../../../compiler/0.0.53/bin/x86/qc
 $SEED main.quanta qc_boot && ./qc_boot main.quanta qc_self && ./qc_self main.quanta qc
-# self-host fixed point (qc_boot == qc_self == qc) + 88/88 regression
+# self-host fixed point (qc_boot == qc_self == qc) + 91/91 regression
 bash test_suites/scripts/run_tests.sh
 ```
 

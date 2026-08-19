@@ -17,7 +17,7 @@ Last updated: 2026-08-16. Compiler version: 0.0.53.
 | **Valgrind** (memcheck) | compiler own memory safety (leaks/UB) | Active; 0 errors on self-compile + crash-repros |
 | **CodeRabbit** | PR review of `main.quanta` (entry point) | Active; module-file review blocked until grammar landed |
 | **tree-sitter-quanta** | parse/static-analysis surface for all 15 modules | **Active v0.0.53 — 0 errors on every module** |
-| **81-test gate** | functional regression (81/81 + 6 sec + 3 perf) | Active (LANGUAGE_DESIGN.md) |
+| **91-test gate** | functional regression (91/91 + 8 sec + 3 perf) | Active (LANGUAGE_DESIGN.md) |
 | **Self-host invariant** | qc_boot==qc_self==qc fixed-point | Active (INVARIANTS #1) |
 
 Gap: Valgrind is the ONLY dynamic analyzer; no fuzzing, no static

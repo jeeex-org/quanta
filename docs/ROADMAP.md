@@ -1,8 +1,12 @@
 # Quanta ROADMAP — consolidated single source of truth
 
-> **Last updated: 2026-08-17. Current compiler: 0.0.55** (x86-64 + AArch64
+> **Last updated: 2026-08-19. Current compiler: 0.0.57** (x86-64 + AArch64
 > ELF emitters, multi-file tree, Valgrind-clean, self-host `fp=YES`).
 >
+> Version sequence: each feature lands in its own directory. 0.0.55 = P2
+> builtins + grammar/bug-fix window; **0.0.56 = simplified surface** (optional
+> `fn`/`let`/`return`, `${}`/`$[]` sigils); **0.0.57 = `$$(cmd)` external
+> command substitution** (built on 0.0.56).
 > This document consolidates what was previously spread across the stale
 > `ROADMAP.md` (removed — claimed current=0.0.46), `QUANTA_ROADMAP.md`
 > (vision), `FEATURES.md` (build order), and `LANGUAGE_DESIGN.md` (stages).
@@ -121,7 +125,7 @@ SEQUENCING is the contract, not the literal numbers.
 |-------|----------|-------|
 | Debt window | 0.0.43–0.0.50 | Core correctness (aliasing, `?` propagation, MAP_FAILED guard, cyclic-struct reject). **CLOSED.** |
 | Grammar + bug-fix | 0.0.51–0.0.55 | tree-sitter grammar (done 0.0.53), residual compiler bugs. **0.0.53 shipped.** |
-| SIMPLE-SURFACE | 0.0.55 | **Simplified syntax landed**: `fn` keyword optional (bare `name(){}` works everywhere, `init()`/`main()` bare OK), `let` optional (bare `name = expr` = local/global), `return` optional (last-expr auto-returns), condition parens optional, `${name}` global / `$[]` local explicit sigils (bare + inside-string interpolation). Goal: bash-like, extremely simple surface. Docs (README/SYNTAX/SPEC) + test_suites + security script synced. |
+| SIMPLE-SURFACE | 0.0.56 | **Simplified syntax landed**: `fn` keyword optional (bare `name(){}` works everywhere, `init()`/`main()` bare OK), `let` optional (bare `name = expr` = local/global), `return` optional (last-expr auto-returns), condition parens optional, `${name}` global / `$[]` local explicit sigils (bare + inside-string interpolation). Goal: bash-like, extremely simple surface. Docs (README/SYNTAX/SPEC) + test_suites + security script synced. |
 | P2 builtins | 0.0.55–0.0.60 | float cmp ✅(0.0.55), proc/env ✅(0.0.55), stdin ✅(0.0.55), fs meta ✅(0.0.55 — path-string remap fixed), string ops, math ✅(sqrt/floor/ceil/abs; sin/cos/tan/pow/log/min/max TODO), atomics, net, introspection ✅(abort/debugbreak), random ✅(getrandom), **`$$(cmd)` external-command substitution (0.0.57)** — `unsafe`-gated runtime `fork`/`execve`/`pipe`/`wait4` via the raw `syscall()` builtin (no libc); `$$(str)`→`/bin/sh -c`, `$$(arr)`→direct `execve` (no shell, injection-safe). Returns `CmdResult{stdout,stderr,status}`. |
 | P3 language | 0.0.61–0.0.71 | float literals, user enums, tuples, generics, traits, modules, real char/byte/string/bool, ref/mut/move, op-overload, closure literals, and/or/not/true/false/global |
 | **P4 tooling** | **0.0.72** | **Quanta-native code-writing tool** (edit Quanta source reliably without external scripting — the user's stated goal) |
@@ -160,7 +164,7 @@ Why post-1.0: the ARM64 backend is a new backend; shipping it while x86 debt
 remains would violate the debt-first rule and split correctness effort.
 Qualification evidence is gathered AFTER the core is complete, not before.
 
-### Current status (0.0.55)
+### Current status (0.0.57)
 
 Shipped + verified: x86-64 + AArch64 ELF emitters, self-host fixed-point;
 fail-closed memory model (overflow/bounds→SIGILL 132, MAP_FAILED→rc=1,
@@ -169,7 +173,7 @@ paren bug fixed; fail-closed fuzzer (20K iters, 0 crashes); differential
 vs seed (5/5 parity); Valgrind-clean. Standards docs: SPEC/SAFETY_MANUAL/
 SECURITY_TOOLING/MEMORY_SAFETY_ARGUMENT.
 
-P2 builtins landed in 0.0.55 (gate green, 88/88): float comparisons
+P2 builtins landed through 0.0.57 (gate green, 91/91): float comparisons
 (`feq/flt/fgt/fle/fge/fisnan/fisinf`), float math (`sqrt/floor/ceil/abs`),
 float arith (`fadd/fsub/fmul/fdiv` take int args → int), process/env
 (`getpid/getppid/arg_count/environ`; `getenv` is a stub returning 0),

@@ -27,7 +27,7 @@ but only the native AOT backend is built.
 
 ## INVARIANTS (never break these)
 1. Self-host: `cd compiler/0.0.55/src/x86; SEED=../../../../compiler/0.0.53/bin/x86/qc; $SEED main.quanta qc_boot && ./qc_boot main.quanta qc_self && ./qc_self main.quanta qc` must produce byte-identical qc_boot==qc_self==qc (`fp=YES`).
-2. 88/88 test_suites must pass after any change (plus security 6/6, perf 3/3).
+2. 91/91 test_suites must pass after any change (plus security 8/8, perf 3/3).
 3. No ARM emitter code in the x86-only source (ARM is a SEPARATE future
    backend, built from scratch). The x86 emitter was de-duplicated in 0.0.46
    (the entire emitter had been copy-pasted as two blocks; only the second
@@ -57,7 +57,7 @@ is the STABILITY BOUNDARY every backend agrees on. See docs/LANGUAGE_DESIGN.md.
 ## HOW TO RESUME
 1. Read docs/ARCHITECTURE.md (this file), docs/LANGUAGE_DESIGN.md, docs/SYNTAX.md, docs/FEATURES.md.
 2. Re-establish green state: run `bash test_suites/scripts/run_tests.sh` (expect
-   81/81 functional + 6/6 security + 3/3 perf, exit 0). Self-host: see INVARIANTS #1.
+   91/91 functional + 8/8 security + 3/3 perf, exit 0). Self-host: see INVARIANTS #1.
 3. Next concrete task = Stage 1 interpreter. Mirror emit_bltn builtin
    semantics (src/x86/emitter.quanta) in a register VM. Wire
    `--interp` in main() to bypass ci_func/write_elf and run the IR directly.

@@ -92,7 +92,7 @@ safe". Staged hardening:
     docs/        ARCHITECTURE.md (SME handoff), LANGUAGE.md, SYNTAX.md
   NOTE: no folder is named "frontend" or "backend". Domain libs are under
   lib/<domain>. The compiler now lives as a MULTI-FILE tree at
-  `compiler/0.0.46/src/x86/` (main.quanta + helpers/lexer/parse/codegen/
+  `compiler/0.0.55/src/x86/` (main.quanta + helpers/lexer/parse/codegen/
   emitter/elf/globals/features.quanta) — the modular migration is DONE.
 
 ## Staged roadmap (effort = rough engineer-months)
@@ -104,6 +104,6 @@ safe". Staged hardening:
   Stage 6  IR-level borrow checking               ~3-4
   Stage 7  Managed GC mode + std libs (AI/web)    ~6-12
   Stage 8  Blockchain/web/AI stdlib + package mgr ~12+
-Each stage gates on: recompile + 3-stage self-host (fp=YES) + 81/81 tests
-(existing gate: functional 81 + security 6 + perf 3),
+Each stage gates on: recompile + 3-stage self-host (fp=YES) + 91/91 tests
+(existing gate: functional 91 + security 8 + perf 3),
 plus new tests for the mode. Green state is the invariant.
