@@ -977,9 +977,14 @@ fn ci_func(fi, is_main) {
             // sources are distinct memory locations and destinations are distinct
             // registers -- no aliasing hazard (matches the Python oracle).
             let arg_start = a2; let arg_cnt = a1
+            // 0.0.55: qc_sys_cmd ($$(cmd)) carries the cmd vreg in a1 (NOT an arg
+            // count) with a2=0. Skip the generic arg-loader — emit_bltn loads the
+            // cmd itself from the lit_addr map. Detect the name by its bytes at
+            // src+a0 (the name "qc_sys_cmd" is 10 chars, null-terminated).
+            let is_syscmd = 0
+            if r8(src+a0)=='q' && r8(src+a0+1)=='c' && r8(src+a0+2)=='_' && r8(src+a0+3)=='s' && r8(src+a0+4)=='y' && r8(src+a0+5)=='s' && r8(src+a0+6)=='_' && r8(src+a0+7)=='c' && r8(src+a0+8)=='m' && r8(src+a0+9)=='d' && r8(src+a0+10)==0 { is_syscmd = 1 }
+            if is_syscmd==1 { arg_cnt = 0 }
             // args 6+ go on the stack (SysV). Push them highest-index-first so
-            // arg6 ends up on top -> lands at [rbp+16] in the callee. Keep rsp
-            // 16-byte aligned across the call; caller cleans up afterwards.
             let nstack=0
             if arg_cnt>6 { nstack=arg_cnt-6 }
             let pad=0
@@ -1195,6 +1200,9 @@ fn ci_func(fi, is_main) {
             // live AFTER all global slots: GDATA + (INTERNAL_GLOBAL_COUNT+gvarc)*8 + data_off.
             let gdata_size = (INTERNAL_GLOBAL_COUNT + gvarc)*8
             let str_addr = GDATA + gdata_size + data_off
+            // 0.0.55: record this literal's data-section address keyed by its
+            // result vreg, so qc_sys_cmd's emit_bltn can load the cmd directly.
+            w64(lit_addr + res*8, str_addr)
             let rd=aphys(res)
             if emit_obj == 1 {
                 // OBJECT mode: RIP-relative lea rd, [rip+disp32]; disp32 patched by an

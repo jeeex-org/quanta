@@ -119,6 +119,12 @@ let dot_guard = 0   // DBG: guards against runaway dot-chain recursion
 // IR: 40 bytes each [op,res,a0,a1,a2]
 let ir = mmap(1073741824); let irc = 0
 let ir_dbg = mmap(64)
+// 0.0.55: literal-address map. Keyed by the literal's result vreg (vreg*8).
+// Populated during IR_STR codegen (str_addr is known there); read by emit_bltn
+// for qc_sys_cmd to load the cmd string's data-section address directly into
+// rdi. This sidesteps the fragile arg-record/vreg-copy path that caused every
+// $$(cmd) after the first to read a stale cmd (the previous call's command).
+let lit_addr = mmap(1073741824)
 // G2: per-IR-record "inside unsafe{}" flag (1 byte per record). Set in iremit
 // from unsafe_depth; read at emit so `unsafe {}` opts OUT of the overflow trap.
 // Parallel to `ir` (record i -> ir_unsafe[i]) because the IR record is full.

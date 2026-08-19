@@ -577,7 +577,14 @@ fn parse_primary() {
         let cnm = srclen
         w8(src+cnm, 113); w8(src+cnm+1, 99); w8(src+cnm+2, 95); w8(src+cnm+3, 115); w8(src+cnm+4, 121); w8(src+cnm+5, 115); w8(src+cnm+6, 95); w8(src+cnm+7, 99); w8(src+cnm+8, 109); w8(src+cnm+9, 100); w8(src+cnm+10, 0)
         srclen = cnm + 11
-        iremit(IR_CALL, vr, cnm, 1, cmd)
+        // FIX (0.0.55): pass the cmd vreg directly in the IR_CALL record's a1
+        // slot. emit_bltn for qc_sys_cmd loads the cmd's data-section address from
+        // the lit_addr map (populated by IR_STR codegen, keyed by the literal's
+        // result vreg). This is bulletproof against vreg recycling: each $$ call
+        // carries its OWN cmd vreg, and the map holds that call's literal address
+        // at emit time (codegen runs IR_STR -> IR_CALL per call in order). a2=0.
+        let vr = nv()
+        iremit(IR_CALL, vr, cnm, cmd, 0)
         // Tag result vreg as CmdResult struct so .out/.code/.err field access
         // resolves via the struct table. Struct is already registered by
         // scanstructs at startup; inject its name here (parse time, safe).

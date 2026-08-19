@@ -1165,6 +1165,11 @@ fn emit_bltn2(nmi,nl,ii) {
     //   [24] = err_ptr (0; stderr not captured in this minimal impl)
     if nl==10&&r8(nm)=='q'&&r8(nm+1)=='c'&&r8(nm+2)=='_'&&r8(nm+3)=='s'&&r8(nm+4)=='y'&&r8(nm+5)=='s'&&r8(nm+6)=='_'&&r8(nm+7)=='c'&&r8(nm+8)=='m'&&r8(nm+9)=='d' {
         flush_all()
+        // 0.0.55: load the cmd's data-section address directly from the lit_addr
+        // map (keyed by the cmd vreg carried in the IR_CALL record's a1). This is
+        // robust against vreg recycling: every $$ call carries its OWN cmd vreg,
+        // and lit_addr holds that call's literal address at emit time.
+        ri64(7, r64(lit_addr + ira1(ii)*8))
         let l_parent=nl(); let l_rdbrk=nl()
         // Preserve callee-saved regs (r12-r15) per x86-64 ABI — this builtin
         // clobbers them, so save/restore to avoid corrupting caller state (e.g.
@@ -1242,8 +1247,8 @@ fn emit_bltn2(nmi,nl,ii) {
         stx(12,16,6)      // [r12+16] = code
         stx(12,8,15)      // [r12+8] = out_buf (out_ptr)
         stx(12,24,0)      // [r12+24] = 0 (err_ptr)
-        // munmap S (4096)
-        ra(6,13); ri(8,4096); ri(2,4096); ri(10,0); ri(8,-1); rxor(9,9); ri(0,9); sysc()
+        // munmap S (4096): rdi=S, rsi=4096, rax=11
+        rr(7,13); ri(8,4096); ri(0,11); sysc()
         rr(0,12)           // rax = result struct ptr
         // restore callee-saved regs
         eb(65); eb(95)   // pop r15  (41 5F)
