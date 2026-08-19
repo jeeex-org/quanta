@@ -251,6 +251,12 @@ fn tokenize() {
             let nl2=p-sp2
             stok(tokc,TT_LOCAL,sp2,l,sc2,nl2); tokc=tokc+1
             p=p+1; c=c+1   // skip ]
+        } else if ch==36&&p+1<srclen&&r8(src+p+1)==36&&p+2<srclen&&r8(src+p+2)==40 {
+            // $$( : external command substitution (bash-like $(cmd) but with '$$'
+            // sigil). We emit a SINGLE token TT_SHCMD that includes the opening paren.
+            // The parser will parse the command expression until the matching ')' delimiter.
+            p=p+3; c=c+3   // skip $$(
+            stok(tokc,TT_SHCMD,0,l,c,0); tokc=tokc+1
         } else if ch==36&&p+1<srclen&&r8(src+p+1)==40&&p+2<srclen&&ialpha(r8(src+p+2)) {
             // $(name) or $(name(args)): explicit EXTERNAL / GLOBAL function call.
             // Tokenized as TT_CALL (distinct from TT_ID, so a bare `name)` in

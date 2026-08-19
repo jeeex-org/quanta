@@ -1,1 +1,32 @@
-fn main() { unsafe { return 42 } }
+// unsafe{} block gating + $$(cmd) external command substitution (freestanding ELF).
+// $$(str) runs /bin/sh -c str via raw fork/execve/pipe/wait4 and returns
+// CmdResult{ out: String, code: i32, err: String }. Requires unsafe{} per
+// secure-by-default policy. Each call is exercised in its own scope.
+fn run_out() {
+    unsafe {
+        let o = $$("echo hello world")
+        print(o.out)          // "hello world\n"
+        if o.code != 0 { return 1 }
+    }
+    return 0
+}
+fn run_code7() {
+    unsafe {
+        let e = $$("exit 7")
+        if e.code != 7 { return 1 }
+    }
+    return 0
+}
+fn run_true() {
+    unsafe {
+        let n = $$("true")
+        if n.code != 0 { return 1 }
+    }
+    return 0
+}
+fn main() {
+    if run_out() != 0 { return 1 }
+    if run_code7() != 0 { return 2 }
+    if run_true() != 0 { return 3 }
+    return 0
+}

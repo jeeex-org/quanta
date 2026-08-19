@@ -39,6 +39,16 @@ fn rcmp(r1,r2) { rw(r2,r1); eb(57); mr(3,r2%8,r1%8) }
 fn rtest(r1,r2) { rw(r1,r2); eb(133); mr(3,r1%8,r2%8) }
 fn rcqo() { eb(72); eb(153) }
 fn smov(memreg, srcreg) { rw(srcreg, memreg); eb(137); mr(0, srcreg%8, memreg%8) }  // mov [memreg], srcreg
+// stx(base, disp, src): mov [base+disp], src   (stages base into r11; use src!=r11)
+fn stx(base, disp, src) {
+    rr(11, base)   // r11 = base
+    wbase(disp, src)
+}
+// ldx(dst, base, disp): mov dst, [base+disp]   (stages base into r11; use dst!=r11)
+fn ldx(dst, base, disp) {
+    rr(11, base)   // r11 = base
+    lbase(disp, dst)
+}
 fn rneg(r) { if r>=8 { eb(73) } else { eb(72) }; eb(247); mr(3,3,r%8) }
 fn rnot(r) { if r>=8 { eb(73) } else { eb(72) }; eb(247); mr(3,2,r%8) }
 fn ridiv(r) { if r>=8 { eb(73) } else { eb(72) }; eb(247); mr(3,7,r%8) }
@@ -1147,7 +1157,101 @@ fn emit_bltn2(nmi,nl,ii) {
         rr(0,12)           // rax = new
         return 1
     }
-    // push(v,e): append byte e to v (byte-oriented, matches str). v=rdi, e=rsi. returns new header ptr.
+    // qc_sys_cmd(cmd): run external command, return CmdResult{out,code,err} struct.
+    // cmd=rdi = header ptr (len at [cmd], bytes at cmd+8). Returns heap struct:
+    //   [0]  = len (24)
+    //   [8]  = out_ptr (string header ptr, or 0 if empty)
+    //   [16] = code    (i64, exit status)
+    //   [24] = err_ptr (0; stderr not captured in this minimal impl)
+    if nl==10&&r8(nm)=='q'&&r8(nm+1)=='c'&&r8(nm+2)=='_'&&r8(nm+3)=='s'&&r8(nm+4)=='y'&&r8(nm+5)=='s'&&r8(nm+6)=='_'&&r8(nm+7)=='c'&&r8(nm+8)=='m'&&r8(nm+9)=='d' {
+        flush_all()
+        let l_parent=nl(); let l_rdbrk=nl()
+        // Preserve callee-saved regs (r12-r15) per x86-64 ABI — this builtin
+        // clobbers them, so save/restore to avoid corrupting caller state (e.g.
+        // the result struct ptr held in r12 by the caller).
+        eb(65); eb(84)   // push r12  (41 54)
+        eb(65); eb(85)   // push r13  (41 55)
+        eb(65); eb(86)   // push r14  (41 56)
+        eb(65); eb(87)   // push r15  (41 57)
+        // SAVE cmd (rdi) FIRST — every syscall below clobbers rdi. r14 = cmd+8 (bytes ptr).
+        rr(14,7); ri(8,8); ra(14,8)
+        // Allocate result struct: mmap(0, 32, RW, ANON|PRIVATE, -1, 0)
+        ri(6,32); ri(7,0); ri(2,3); ri(10,0x22); ri(8,-1); rxor(9,9); ri(0,9); sysc()
+        rr(12,0)           // r12 = result struct ptr (rax)
+        // struct field access uses IR_IDX => load [base + idx*8 + 8].
+        // So fields live at out@8, code@16, err@24; [0] is a len header.
+        ri(0,24); stx(12,0,0)   // [r12+0] = 24 (len)
+        stx(12,8,0)        // [r12+8] = 0 (out_ptr)
+        stx(12,16,0)       // [r12+16] = 0 (code)
+        stx(12,24,0)       // [r12+24] = 0 (err_ptr)
+        // output string buffer (header + 4096 bytes): mmap(0, 4104, ...)
+        ri(6,4104); ri(7,0); ri(2,3); ri(10,0x22); ri(8,-1); rxor(9,9); ri(0,9); sysc()
+        rr(15,0)           // r15 = out_buf (rax)
+        // scratch S for argv/envp (4096 bytes)
+        ri(6,4096); ri(7,0); ri(2,3); ri(10,0x22); ri(8,-1); rxor(9,9); ri(0,9); sysc()
+        rr(13,0)           // r13 = S
+        // [S+16] = "/bin/sh\0"  (two 32-bit stores; ri is 32-bit so split the 8-byte literal)
+        wmi(13,16,0x6e69622f)   // low:  "/bin"
+        wmi(13,20,0x0068732f)   // high: "/sh\0"
+        // [S+32] = "-c\0\0\0\0"
+        wmi(13,32,0x0000632d)   // "-c\0\0"
+        // r14 already = cmd+8 (saved at builtin entry before rdi was clobbered)
+        // argv array at S+1024: [S+1024]=S+16, [S+1032]=S+32, [S+1040]=r14, [S+1048]=0
+        rr(10,13); ri(8,16); ra(10,8); stx(13,1024,10)   // [S+1024] = S+16
+        rr(10,13); ri(8,32); ra(10,8); stx(13,1032,10)   // [S+1032] = S+32
+        stx(13,1040,14)                     // [S+1040] = r14
+        ri(10,0);  stx(13,1048,10)          // [S+1048] = 0
+        // pipe(S+2048): rdi = S+2048 (pipefd array; [S+2048]=read, [S+2052]=write)
+        rr(7,13); ri(8,2048); ra(7,8); ri(0,22); sysc()   // pipe(S+2048)
+        // fork() -> rax (0=child, >0=parent). fork = rax=57, rdi=0
+        ri(0,57); ri(7,0); sysc()
+        rtest(0,0); let pj=codelen; jcc32(3,0); emit_patch(pj, l_parent, 1)   // jg -> parent (rax>0)
+        // ===== CHILD (rax==0) =====
+        // dup2(write_fd=[S+2052], 1): rdi=[S+2052], rsi=1
+        ldx(7,13,2052); ri(6,1); ri(0,33); sysc()     // dup2(write_fd, 1)
+        // execve("/bin/sh", argv_array, 0): rdi = S+16 (path), rsi = S+1024 (argv), rdx = 0
+        rr(7,13); ri(8,16); ra(7,8)      // rdi = S+16
+        rr(6,13); ri(8,1024); ra(6,8)    // rsi = S+1024 (argv array)
+        ri(2,0); ri(0,59); sysc()        // execve (rdx/envp=0)
+        ri(7,127); ri(0,60); sysc()          // execve failed -> exit(127)
+        // ===== PARENT =====
+        lbladd(l_parent, codelen)
+        // close write end so EOF propagates when child exits
+        ldx(7,13,2052); ri(0,3); sysc()     // close(write_fd)
+        // read loop: accumulate child output into out_buf+8, total len in r9
+        rxor(9,9)                            // r9 = total = 0
+        let l_rd=nl()
+        lbladd(l_rd, codelen)
+        ldx(7,13,2048)                       // rdi = read_fd
+        rr(6,15); ri(8,8); ra(6,9); ra(6,8)  // rsi = out_buf + 8 + total
+        ri(10,4096); rs(10,9)            // rdx = 4096 - total
+        ri(0,0); sysc()                      // read -> rax = n
+        rtest(0,0); let pj2=codelen; jcc32(4,0); emit_patch(pj2, l_rdbrk, 1)  // jle -> break (n<=0)
+        ra(9,0)                              // total += n (rax=n)
+        let pj3=codelen; jmp32(0); emit_patch(pj3, l_rd, 0)
+        lbladd(l_rdbrk, codelen)
+        // set output string header: [out_buf] = total (len). rax is 0 here (n<=0).
+        rr(7,15); stx(7,0,9)  // [out_buf+0] = total (r9)
+        // wait4(-1, &status@S+2064, 0, 0): rdi=-1, rsi=S+2064 (ADDRESS, not value)
+        rr(6,13); ri(8,2064); ra(6,8)    // rsi = S+2064
+        ri(7,-1); ri(2,0); ri(10,0); ri(0,61); sysc()   // rdi=-1, rdx=0, r10=0, wait4
+        // extract exit code: code = (status >> 8) & 0xff  (WEXITSTATUS)
+        ldx(6,13,2064)                    // r6 = status (low 32)
+        eb(72); eb(193); eb(238); eb(8)   // shr r6, 8   (48 C1 EE 08)
+        eb(72); eb(131); eb(230); eb(255) // and r6, 0xff (48 83 E6 FF)
+        stx(12,16,6)      // [r12+16] = code
+        stx(12,8,15)      // [r12+8] = out_buf (out_ptr)
+        stx(12,24,0)      // [r12+24] = 0 (err_ptr)
+        // munmap S (4096)
+        ra(6,13); ri(8,4096); ri(2,4096); ri(10,0); ri(8,-1); rxor(9,9); ri(0,9); sysc()
+        rr(0,12)           // rax = result struct ptr
+        // restore callee-saved regs
+        eb(65); eb(95)   // pop r15  (41 5F)
+        eb(65); eb(94)   // pop r14  (41 5E)
+        eb(65); eb(93)   // pop r13  (41 5D)
+        eb(65); eb(92)   // pop r12  (41 5C)
+        return 1
+    }
     // NOTE: a user-defined fn push(...) MUST win over this builtin. If a user fn
     // named "push" exists, this is not the builtin -> return 0 so the IR_CALL
     // handler emits a real (patched) call to the user function instead.

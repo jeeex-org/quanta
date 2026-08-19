@@ -561,6 +561,33 @@ fn parse_primary() {
         let nm = pval(); let nl = plen(); adv()
         return parse_call(nm, nl, FI_GLOBAL)
     }
+    if peek()==TT_SHCMD {
+        // $$(cmd) : external command substitution (bash-like $(cmd) but with '$$'
+        // sigil). Gates behind unsafe{} at codegen time.
+        // TT_SHCMD already consumed the opening '(', so parse expr until matching ')'.
+        adv()  // consume TT_SHCMD
+        let cmd = parse_expr()
+        if !(peek()==TT_PNCT && pval()==41) {
+            let mn = "error: expected ')' after $$ cmd\\n"; file_write(2, mn+8, len(mn)); exit(1)
+        }
+        adv()  // consume ')'
+        let vr = nv()
+        // Emit IR_CALL to builtin qc_sys_cmd (1 arg: cmd string). Name injected
+        // into src arena past srclen (tokenization is done, never re-scanned).
+        let cnm = srclen
+        w8(src+cnm, 113); w8(src+cnm+1, 99); w8(src+cnm+2, 95); w8(src+cnm+3, 115); w8(src+cnm+4, 121); w8(src+cnm+5, 115); w8(src+cnm+6, 95); w8(src+cnm+7, 99); w8(src+cnm+8, 109); w8(src+cnm+9, 100); w8(src+cnm+10, 0)
+        srclen = cnm + 11
+        iremit(IR_CALL, vr, cnm, 1, cmd)
+        // Tag result vreg as CmdResult struct so .out/.code/.err field access
+        // resolves via the struct table. Struct is already registered by
+        // scanstructs at startup; inject its name here (parse time, safe).
+        let cnm2 = srclen
+        w8(src+cnm2, 67); w8(src+cnm2+1, 109); w8(src+cnm2+2, 100); w8(src+cnm2+3, 82); w8(src+cnm2+4, 101); w8(src+cnm2+5, 115); w8(src+cnm2+6, 117); w8(src+cnm2+7, 108); w8(src+cnm2+8, 116); w8(src+cnm2+9, 0)
+        srclen = cnm2 + 10
+        let crsi = findstruct(cnm2, 9)
+        if crsi>=0 { w64(vreg_struct + vr*8, crsi); w64(vreg_is_str + vr*8, 0-1) }  // tag struct, clear any stale string tag
+        return vr
+    }
     if peek()==TT_ID {
             // Check for struct constructor: StructName(args) - MUST BE FIRST before enum lookahead
             let nm = pval(); let nl = plen()
@@ -951,6 +978,7 @@ fn parse_primary() {
                         // tag result with field's struct type (enables next chain link)
                         let ftype=r64(sfldtyp + (fb+fidx)*8)
                         if ftype>=0 { w64(vreg_struct + vr*8, ftype) }
+                        if ftype==0-2 { w64(vreg_is_str + vr*8, 1) }  // string field (out)
                         selfv=vr
                     } else {
                         adv(); return parse_method_call(selfv, mnm, ml)
