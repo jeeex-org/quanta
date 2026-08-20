@@ -1034,9 +1034,24 @@ fn emit_bltn2(nmi,nl,ii) {
         abi(32)
         return 1
     }
-    // println(i): print integer i (decimal) followed by a newline to stdout.
+    // println(x): print x followed by a newline. x may be an integer (decimal) or
+    // a string (auto-detected via vreg_is_str), mirroring print()/echo() behavior.
     if nl==7&&r8(nm)=='p'&&r8(nm+1)=='r'&&r8(nm+2)=='i'&&r8(nm+3)=='n'&&r8(nm+4)=='t'&&r8(nm+5)=='l'&&r8(nm+6)=='n' {
         flush_all()
+        // String auto-detect (mirror print/echo): arg0 vreg = irres(ira2(ii)).
+        let _av = irres(ira2(ii))
+        let _aop = irop(ira2(ii))
+        let _isstr = r64(vreg_is_str + _av*8)
+        if _isstr!=1 && _aop==IR_MOV { let _sv=ira0(ira2(ii)); if r64(vreg_is_str + _sv*8)==1 { _isstr = 1 } }
+        if _isstr!=1 && _aop==IR_STR { _isstr = 1 }
+        if _isstr==1 {
+            // write the string bytes (header ptr in rdi), then a newline
+            rr(6,7); eb(72); eb(129); eb(198); ei(8); eb(72); eb(139); eb(23); ri(7,1); ri(0,1); sysc()  // writes(s)
+            sbi(8); lesp(10,0); eb(178); eb(10); eb(65); eb(136); eb(18)                                  // newline
+            rr(6,10); ri(2,1); ri(7,1); ri(0,1); sysc(); abi(8)
+            return 1
+        }
+        // integer path
         let lp_pos=nl(); let lp_zero=nl(); let lp_loop=nl(); let lp_done=nl(); let lp_signprep=nl(); let lp_write=nl()
         rr(0,7)                          // rax = rdi (value)
         sbi(32)                          // sub rsp, 32
