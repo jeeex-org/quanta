@@ -329,13 +329,13 @@ fn main() {
 
 ### Floating-point math
 
-> Float *literals* (`3.14`) are not parsed yet. Use the `i2f`/`f2i` bit-pattern
-> builtins and the comparison/math builtins instead.
->
-> `println` auto-detects a float result (from `i2f` or a float builtin) and prints it
-> as a fixed 6-decimal string, e.g. `println(i2f(3))` prints `3.000000`.
-> (The float *arithmetic* builtins `fmul`/`fdiv`/`fadd`/`fsub` return integer results,
-> so `println(fmul(3,4))` prints `12`.)
+> **Float literals are now parsed** (since 0.0.61): `3.14`, `-0.5`, `123.456` compile to float
+> values and `println(3.14)` prints `3.140000`. They flow through `i2f`/`f2i` and the
+> `println` float path like any other float. Known gap: passing a float-literal (or any
+> float vreg) directly as the argument to a float-consuming builtin such as `f2i(3.14)`
+> still mis-reads the bits (builtin arg loading reads the integer spill home, not the
+> float spill home) — use `f2i(i2f(...))` or `let x = 3.14; f2i(x)` as a workaround
+> until that float-arg loading is fixed.
 
 ```quanta
 fn main() {
