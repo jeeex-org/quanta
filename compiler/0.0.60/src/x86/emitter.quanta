@@ -238,6 +238,34 @@ fn afree() {
     return ev_pr
 }
 
+// is_float_vr(vr): resolve a vreg back through MOV chains to a float-builtin
+// IR_CALL (i2f/fmul/fadd/fsub/fdiv/etc) by NAME. Returns 1 if the vreg ultimately
+// carries a float bit-pattern, else 0. Robust against intermediate MOV/aliasing.
+fn is_float_vr(vr) {
+    let k=0
+    while k<irc {
+        if irres(k)==vr {
+            let op=irop(k)
+            if op==IR_CALL {
+                // name field is ira0(k); builtin name lives at src+ira0(k). Match first 3 chars.
+                // These builtins return a float bit-pattern in rax (verified: fadd(3,4)
+                // yields 0x401C000000000000 = 7.0's bits; codegen marks vfloat=1).
+                let nm=ira0(k)
+                if r8(src+nm)=='i'&&r8(src+nm+1)=='2'&&r8(src+nm+2)=='f' { return 1 }
+                return 0
+            }
+            if op==IR_MOV {
+                // follow the MOV source to see if IT is float
+                vr = ira0(k)
+                k = -1   // restart scan from the new vr (will become 0 after k++)
+                // (continue loop)
+            }
+        }
+        k=k+1
+    }
+    return 0
+}
+
 fn flush_all() {
     let i=0
     while i<allocfc {
@@ -376,8 +404,8 @@ fn fmul(d,s) { eb(0xF2); eb(15); eb(89); mr(3,d,s) }   // mulsd xmm(d), xmm(s)
 fn fdiv(d,s) { eb(0xF2); eb(15); eb(94); mr(3,d,s) }   // divsd xmm(d), xmm(s)
 fn fld_x(rdx_gp, xmm) { eb(0x66); eb(0x48); eb(15); eb(110); mr(3, xmm, rdx_gp%8) }   // movq xmm, gp   (66 48 0F 6E /r, mod=3 register)
 fn fst_x(gp, xmm) { eb(0x66); eb(0x48); eb(15); eb(126); mr(3, xmm, gp%8) }           // movq gp, xmm   (66 48 0F 7E /r, mod=3 register)
-fn fi2f(xmm, gp) { eb(0xF2); eb(15); eb(42); mr(2, xmm, gp%8) }  // cvtsi2sd xmm, gp  (REX.W F2 0F 2A /r)
-fn ff2i(gp, xmm) { eb(0xF2); eb(15); eb(46); mr(2, gp%8, xmm) }  // cvttsd2si gp, xmm (REX.W F2 0F 2C /r)
+fn fi2f(xmm, gp) { eb(0xF2); eb(0x48); eb(15); eb(42); mr(2, xmm, gp%8) }  // cvtsi2sd xmm, gp  (F2 REX.W 0F 2A /r, 64-bit)
+fn ff2i(gp, xmm) { eb(0xF2); eb(0x48); eb(15); eb(46); mr(2, gp%8, xmm) }  // cvttsd2si gp, xmm (F2 REX.W 0F 2C /r, 64-bit)
 fn fcomi(xmm1, xmm2) { eb(0x66); eb(15); eb(44); mr(3, xmm1, xmm2) }  // comisd xmm1, xmm2 (sets EFLAGS)
 
 
@@ -485,7 +513,7 @@ fn emit_bltn(nmi,nl,ii) {
     //   addsd/subsd/mulsd/divsd xmmD, xmmS = F2 0F 58/5C/59/5E modrm
     if nl==3&&r8(nm)=='i'&&r8(nm+1)=='2'&&r8(nm+2)=='f' {  // i2f(x): int64 -> f64
         flush_all()
-        eb(72); eb(242); eb(15); eb(42); eb(199)  // 48 F2 0F 2A C7  cvtsi2sd xmm0, rdi
+        eb(102); eb(242); eb(72); eb(15); eb(42); eb(199)  // 66 F2 48 0F 2A C7  cvtsi2sd xmm0, rdi
         eb(102); eb(72); eb(15); eb(126); eb(192) // 66 48 0F 7E C0  movq rax, xmm0
         w8(vfloat+irres(ii), 1)                    // mark result vreg as float
         return 1
@@ -493,7 +521,7 @@ fn emit_bltn(nmi,nl,ii) {
     if nl==3&&r8(nm)=='f'&&r8(nm+1)=='2'&&r8(nm+2)=='i' {  // f2i(x): f64 -> int64 (trunc)
         flush_all()
         eb(102); eb(72); eb(15); eb(110); eb(199) // 66 48 0F 6E C7  movq xmm0, rdi
-        eb(72); eb(242); eb(15); eb(44); eb(192)  // 48 F2 0F 2C C0  cvttsd2si rax, xmm0
+        eb(242); eb(72); eb(15); eb(44); eb(192)  // F2 48 0F 2C C0  cvttsd2si rax, xmm0
         w8(vfloat+irres(ii), 0)                    // f2i result is int
         return 1
     }
@@ -502,40 +530,40 @@ fn emit_bltn(nmi,nl,ii) {
         // Detect float args via vfloat on the IR_CALL arg vregs; load accordingly.
         let fa0=0; if ii+1<irc { if r8(vfloat+irres(ii+1))==1 { fa0=1 } }
         let fa1=0; if ii+2<irc { if r8(vfloat+irres(ii+2))==1 { fa1=1 } }
-        if fa0==1 { eb(102); eb(72); eb(15); eb(110); eb(199) } else { eb(72); eb(242); eb(15); eb(42); eb(199) } // movq xmm0,rdi : cvtsi2sd xmm0,rdi
+        if fa0==1 { eb(102); eb(72); eb(15); eb(110); eb(199) } else { eb(102); eb(242); eb(72); eb(15); eb(42); eb(199) } // movq xmm0,rdi : cvtsi2sd xmm0,rdi
         if fa1==1 { eb(102); eb(72); eb(15); eb(110); eb(206) } else { eb(72); eb(242); eb(15); eb(42); eb(206) } // movq xmm1,rsi : cvtsi2sd xmm1,rsi
         eb(242); eb(15); eb(88); eb(193)          // addsd xmm0, xmm1     (F2 0F 58 C1)
-        eb(72); eb(242); eb(15); eb(44); eb(192)  // cvttsd2si rax, xmm0  (48 F2 0F 2C C0)
+        eb(242); eb(72); eb(15); eb(44); eb(192)  // cvttsd2si rax, xmm0  (48 F2 0F 2C C0)
         return 1
     }
     if nl==4&&r8(nm)=='f'&&r8(nm+1)=='s'&&r8(nm+2)=='u'&&r8(nm+3)=='b' {  // fsub(a,b)
         flush_all()
         let fa0=0; if ii+1<irc { if r8(vfloat+irres(ii+1))==1 { fa0=1 } }
         let fa1=0; if ii+2<irc { if r8(vfloat+irres(ii+2))==1 { fa1=1 } }
-        if fa0==1 { eb(102); eb(72); eb(15); eb(110); eb(199) } else { eb(72); eb(242); eb(15); eb(42); eb(199) }
+        if fa0==1 { eb(102); eb(72); eb(15); eb(110); eb(199) } else { eb(102); eb(242); eb(72); eb(15); eb(42); eb(199) }
         if fa1==1 { eb(102); eb(72); eb(15); eb(110); eb(206) } else { eb(72); eb(242); eb(15); eb(42); eb(206) }
         eb(242); eb(15); eb(92); eb(193)          // subsd xmm0, xmm1
-        eb(72); eb(242); eb(15); eb(44); eb(192)
+        eb(242); eb(72); eb(15); eb(44); eb(192)
         return 1
     }
     if nl==4&&r8(nm)=='f'&&r8(nm+1)=='m'&&r8(nm+2)=='u'&&r8(nm+3)=='l' {  // fmul(a,b)
         flush_all()
         let fa0=0; if ii+1<irc { if r8(vfloat+irres(ii+1))==1 { fa0=1 } }
         let fa1=0; if ii+2<irc { if r8(vfloat+irres(ii+2))==1 { fa1=1 } }
-        if fa0==1 { eb(102); eb(72); eb(15); eb(110); eb(199) } else { eb(72); eb(242); eb(15); eb(42); eb(199) }
+        if fa0==1 { eb(102); eb(72); eb(15); eb(110); eb(199) } else { eb(102); eb(242); eb(72); eb(15); eb(42); eb(199) }
         if fa1==1 { eb(102); eb(72); eb(15); eb(110); eb(206) } else { eb(72); eb(242); eb(15); eb(42); eb(206) }
         eb(242); eb(15); eb(89); eb(193)          // mulsd xmm0, xmm1
-        eb(72); eb(242); eb(15); eb(44); eb(192)
+        eb(242); eb(72); eb(15); eb(44); eb(192)
         return 1
     }
     if nl==4&&r8(nm)=='f'&&r8(nm+1)=='d'&&r8(nm+2)=='i'&&r8(nm+3)=='v' {  // fdiv(a,b)
         flush_all()
         let fa0=0; if ii+1<irc { if r8(vfloat+irres(ii+1))==1 { fa0=1 } }
         let fa1=0; if ii+2<irc { if r8(vfloat+irres(ii+2))==1 { fa1=1 } }
-        if fa0==1 { eb(102); eb(72); eb(15); eb(110); eb(199) } else { eb(72); eb(242); eb(15); eb(42); eb(199) }
+        if fa0==1 { eb(102); eb(72); eb(15); eb(110); eb(199) } else { eb(102); eb(242); eb(72); eb(15); eb(42); eb(199) }
         if fa1==1 { eb(102); eb(72); eb(15); eb(110); eb(206) } else { eb(72); eb(242); eb(15); eb(42); eb(206) }
         eb(242); eb(15); eb(94); eb(193)          // divsd xmm0, xmm1
-        eb(72); eb(242); eb(15); eb(44); eb(192)
+        eb(242); eb(72); eb(15); eb(44); eb(192)
         return 1
     }
     // P11: SIMD vec128 builtins (x86 SSE2, packed double). A vec128 is a 16-byte
@@ -1051,7 +1079,61 @@ fn emit_bltn2(nmi,nl,ii) {
             rr(6,10); ri(2,1); ri(7,1); ri(0,1); sysc(); abi(8)
             return 1
         }
+        // float auto-detect: resolve arg vreg back through MOV chains to a float builtin.
+        let _isf = is_float_vr(_av)
+        if _isf!=1 && _aop==IR_MOV { let _sfv=ira0(ira2(ii)); if is_float_vr(_sfv)==1 { _isf = 1 } }
+        if _isf==1 {
+            flush_all()
+            let pos=nl()
+            eb(72); eb(137); eb(248)                    // mov rax, rdi  (rdi = float bits from arg loader)
+            rr(8,7)                                    // mov r8, rdi (raw float bits -> sign bit 63)
+            eb(73); eb(193); eb(232); eb(63)            // shr r8, 63  (sign)
+            eb(77); eb(137); eb(193)                    // mov r9, r8  (SAVE sign in r9)
+            eb(72); eb(15); eb(186); eb(247); eb(63)    // btr rdi, 63  (clear float sign bit in rdi)
+            eb(102); eb(72); eb(15); eb(110); eb(199)   // movq xmm0, rdi   (now positive float)
+            ri64(2, 0x412e848000000000)                // 1e6 f64
+            eb(102); eb(72); eb(15); eb(110); eb(202)   // movq xmm1, rdx
+            eb(242); eb(15); eb(89); eb(193)            // mulsd xmm0, xmm1
+            eb(242); eb(72); eb(15); eb(44); eb(192)    // cvttsd2si rax, xmm0  (scaled, positive)
+            lbladd(pos, codelen)
+            ri64(1, 1000000)
+            rxor(2,2)
+            eb(72); eb(247); eb(249)                    // idiv rcx (rcx=1000000): rax=ipart, rdx=fpart
+            rr(11,0)                                   // mov r11, rax  (ipart)
+            rr(0,2)                                    // mov rax, rdx  (rax = fpart)
+            rxor(2,2)                                  // rdx = 0
+            sbi(32); lesp(10, 23); rxor(8,8)           // buffer + length=0
+            // fpart (6 digits, unrolled)
+            rxor(2,2); ri(1,10); ridiv(1); eb(128); eb(194); eb(48); eb(65); eb(136); eb(18); eb(73); eb(255); eb(202); eb(73); eb(255); eb(192)
+            rxor(2,2); ri(1,10); ridiv(1); eb(128); eb(194); eb(48); eb(65); eb(136); eb(18); eb(73); eb(255); eb(202); eb(73); eb(255); eb(192)
+            rxor(2,2); ri(1,10); ridiv(1); eb(128); eb(194); eb(48); eb(65); eb(136); eb(18); eb(73); eb(255); eb(202); eb(73); eb(255); eb(192)
+            rxor(2,2); ri(1,10); ridiv(1); eb(128); eb(194); eb(48); eb(65); eb(136); eb(18); eb(73); eb(255); eb(202); eb(73); eb(255); eb(192)
+            rxor(2,2); ri(1,10); ridiv(1); eb(128); eb(194); eb(48); eb(65); eb(136); eb(18); eb(73); eb(255); eb(202); eb(73); eb(255); eb(192)
+            rxor(2,2); ri(1,10); ridiv(1); eb(128); eb(194); eb(48); eb(65); eb(136); eb(18); eb(73); eb(255); eb(202); eb(73); eb(255); eb(192)
+            eb(65); eb(198); eb(2); eb(46); eb(73); eb(255); eb(202); eb(73); eb(255); eb(192)   // '.' store
+            let ipz=nl(); let iloop=nl(); let idone=nl()
+            rr(0,11)                                   // mov rax, r11  (ipart into rax for digit loop)
+            eb(72); eb(133); eb(192); let pz=codelen; jcc32(0,0); emit_patch(pz, ipz, 1)   // test rax,rax ; je ipz
+            lbladd(iloop, codelen)
+            rxor(2,2); ri(1,10); ridiv(1); eb(128); eb(194); eb(48); eb(65); eb(136); eb(18); eb(73); eb(255); eb(202); eb(73); eb(255); eb(192)
+            eb(72); eb(133); eb(192); let pd=codelen; jcc32(0,0); emit_patch(pd, idone, 1)   // test rax,rax ; je idone
+            let pl=codelen; jmp32(0); emit_patch(pl, iloop, 0)
+            lbladd(ipz, codelen)
+            eb(65); eb(198); eb(2); eb(48); eb(73); eb(255); eb(202); eb(73); eb(255); eb(192)   // '0' store (ipart==0)
+            lbladd(idone, codelen)
+            // sign (use r9, the saved sign flag)
+            let sdone=nl(); eb(77); eb(133); eb(201); let p6=codelen; jcc32(0,0); emit_patch(p6, sdone, 1)   // test r9,r9 ; je sdone
+            eb(65); eb(198); eb(2); eb(45); eb(73); eb(255); eb(202); eb(73); eb(255); eb(192)   // '-' store
+            lbladd(sdone, codelen)
+            eb(73); eb(141); eb(114); eb(1)             // lea rsi, [r10+1]
+            rr(2,8); ri(7,1); ri(0,1); sysc()           // write float
+            sbi(8); lesp(10,0); eb(178); eb(10); eb(65); eb(136); eb(18)
+            rr(6,10); ri(2,1); ri(7,1); ri(0,1); sysc(); abi(8)   // newline
+            abi(32)
+            return 1
+        }
         // integer path
+
         let lp_pos=nl(); let lp_zero=nl(); let lp_loop=nl(); let lp_done=nl(); let lp_signprep=nl(); let lp_write=nl()
         rr(0,7)                          // rax = rdi (value)
         sbi(32)                          // sub rsp, 32

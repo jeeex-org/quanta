@@ -331,6 +331,11 @@ fn main() {
 
 > Float *literals* (`3.14`) are not parsed yet. Use the `i2f`/`f2i` bit-pattern
 > builtins and the comparison/math builtins instead.
+>
+> `println` auto-detects a float result (from `i2f` or a float builtin) and prints it
+> as a fixed 6-decimal string, e.g. `println(i2f(3))` prints `3.000000`.
+> (The float *arithmetic* builtins `fmul`/`fdiv`/`fadd`/`fsub` return integer results,
+> so `println(fmul(3,4))` prints `12`.)
 
 ```quanta
 fn main() {
