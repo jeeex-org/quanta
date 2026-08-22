@@ -81,16 +81,18 @@ jobs:
             --current compiler/0.0.64/src/x86/qc \
             --seed compiler/0.0.63/bin/x86/qc
 
-      - name: DIAG commit combined log to repo (debug only, remove later)
+      - name: DIAG push combined log to gist (debug only, remove later)
         if: always()
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           {
             echo "# CI DIAG $(date -u)"
             echo "## gate"; cat /tmp/gate.log 2>/dev/null
             echo "## valgrind"; cat /tmp/vg.log 2>/dev/null
-          } > CI_DIAG.md
-          git config user.email "ci-diag@noreply"
-          git config user.name "CI DIAG"
-          git add -f CI_DIAG.md
-          git commit -m "DIAG $(date +%s)" || echo "nothing"
-          git push "https://x-access-token:${GITHUB_TOKEN}@github.com/jeeex-org/quanta.git" HEAD:main || echo "push failed"
+          } > /tmp/CI_DIAG.md
+          GIST=$(curl -s -X POST "https://api.github.com/gists" \
+            -H "Authorization: Bearer $GITHUB_TOKEN" \
+            -H "Content-Type: application/json" \
+            -d "$(python3 -c "import json; print(json.dumps({'public':True,'files':{'cidialog.md':{'content':open('/tmp/CI_DIAG.md').read()[:8000]}}}))")")
+          echo "$GIST" | python3 -c "import sys,json; d=json.load(sys.stdin); print('GIST_URL', d.get('html_url','?'))" 2>/dev/null || echo "gist post failed"
