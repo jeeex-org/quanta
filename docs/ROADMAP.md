@@ -1,6 +1,6 @@
 # Quanta ROADMAP — consolidated single source of truth
 
-> **Last updated: 2026-08-22. Current compiler: 0.0.63** (x86-64 ELF emitter,
+> **Last updated: 2026-08-22. Current compiler: 0.0.64** (x86-64 ELF emitter,
 > multi-file tree, Valgrind-clean, self-host `fp=YES`). ARM64 (AArch64) backend
 > is DEFERRED POST-1.0 (see #2 schedule below); the working compiler is x86-64 only.
 >
@@ -130,7 +130,7 @@ SEQUENCING is the contract, not the literal numbers.
 | Grammar + bug-fix | 0.0.51–0.0.55 | tree-sitter grammar (done 0.0.53), residual compiler bugs. **0.0.53 shipped.** |
 | SIMPLE-SURFACE | 0.0.56 | **Simplified syntax landed**: `fn` keyword optional (bare `name(){}` works everywhere, `init()`/`main()` bare OK), `let` optional (bare `name = expr` = local/global), `return` optional (last-expr auto-returns), condition parens optional, `${name}` global / `$[]` local explicit sigils (bare + inside-string interpolation). Goal: bash-like, extremely simple surface. Docs (README/SYNTAX/SPEC) + test_suites + security script synced. |
 | P2 builtins | 0.0.55–0.0.60 | float cmp ✅(0.0.55), proc/env ✅(0.0.55), stdin ✅(0.0.55), fs meta ✅(0.0.55 — path-string remap fixed), string ops, math ✅(sqrt/floor/ceil/abs; sin/cos/tan/pow/log/min/max TODO), atomics, net, introspection ✅(abort/debugbreak), random ✅(getrandom), **`$$(cmd)` external-command substitution (0.0.57)** — `unsafe`-gated runtime `fork`/`execve`/`pipe`/`wait4` via the raw `syscall()` builtin (no libc); `$$(str)`→`/bin/sh -c`, `$$(arr)`→direct `execve` (no shell, injection-safe). Returns `CmdResult{stdout,stderr,status}`. |
-| P3 language | 0.0.61–0.0.71 | **float literals ✅(0.0.61)**, **float-arg-to-builtin ✅(0.0.62: f2i/fadd/fsub/fmul/fdiv read float vregs correctly)**, **user enums ✅(0.0.63: qualified+bare variant resolution, explicit tags, match)**; remaining: tuples, generics, traits, modules, real char/byte/string/bool, ref/mut/move, op-overload, closure literals, and/or/not/true/false/global |
+| P3 language | 0.0.61–0.0.71 | **float literals ✅(0.0.61)**, **float-arg-to-builtin ✅(0.0.62: f2i/fadd/fsub/fmul/fdiv read float vregs correctly)**, **user enums ✅(0.0.63: qualified+bare variant resolution, explicit tags, match)**, **modules ✅(0.0.64: mod Name { fn ... } + Mod.fn() qualified calls)**; remaining: tuples, generics, traits, real char/byte/string/bool, ref/mut/move, op-overload, closure literals, and/or/not/true/false/global |
 | **P4 tooling** | **0.0.72** | **Quanta-native code-writing tool** (edit Quanta source reliably without external scripting — the user's stated goal) |
 | **1.0** | 1.0.0 | Core + builtins complete → std/lib resumes; borrow-checking target for #1 green |
 
@@ -193,6 +193,10 @@ in 0.0.61). Verified: `f2i(3.14)`→3, `fadd(1.5,2.5)`→4, `fmul(2.5,4.0)`→10
 variant resolution; both usable in `match` arms (integer-tag comparison). Variants
 are heap-allocated tagged values (Rust-style sum types) — use `match` for value
 comparison, not `==`. Gate: 93/93 functional, 8/8 security, 3/3 performance.
+**0.0.64** modules: `mod Name { fn ... }` registers functions with `Name.fn` names;
+qualified calls `Mod.fn()` resolve via a module registry. Nested modules
+supported. Basic trait/struct/impl compatibility verified. Gate: 94/94 functional,
+8/8 security, 3/3 performance.
 
 Known gap: `getenv` is a stub; string ops (concat via `..` and `${}`/`$[]`
 interpolation) work. See FEATURES.md §I.
