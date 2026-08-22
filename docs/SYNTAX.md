@@ -2,7 +2,10 @@
 
 Quanta is designed to be simple and supports multiple modes—interpreter, WASM, JIT, pre‑compiler (e.g., `quanta run`), and native compilation to binary (`qc`).
 
-This document describes the language as implemented in the current stable compiler (`src/qc-0.0.13.quanta`; WIP `src/qc-0.0.14-wip.quanta` with P10 for-in).
+This document describes the language as implemented in the current compiler,
+`compiler/0.0.65/src/x86/` (multi-file x86-64 tree; AArch64 deferred POST-1.0).
+Gate: 96/96 functional + 8/8 security + 3/3 performance, 2-stage self-host
+byte-identical fixed point.
 
 ---
 
@@ -78,7 +81,10 @@ All runtime values are 64‑bit words.  Types are *compile‑time* annotations t
 - **Struct**: `struct Name { f0: T0, f1: T1, … }` – named fields, layout‑compatible with tuple; field access `obj.field`.
 - **Enum (sum type)**: `enum Name { V0, V1(T), V2(T,U), … }` – discriminant stored in first word, payload follows.
 - **Function pointer**: `fnptr(FNAME)` – code pointer, callable via `closure_call`.
-- **Closure**: Created implicitly when a function captures environment; invoked with `closure_call(fnb, args…)`.
+- **Closure**: a closure literal `|params| { body }` (0.0.65) evaluates to a
+  16-byte `[codeptr, env]` value. Call it directly by name, pass it to an
+  fn-typed parameter, or invoke a hand-built one with `closure_call(fnb, args…)`.
+  See §Closure literals below.
 
 ### Type Aliases
 `alias NewName = ExistingType;` – creates a compile‑time synonym.
@@ -152,6 +158,58 @@ main() {                            // bare main
   - Multiple values can be returned via a tuple: `return a, b, c;` → caller can destructure with `let x, y = f()`.
 - **Extern linkage** (C ABI): `extern "C" fn name(...) -> Rt;` – see §9.
 - **Function attributes** (via tokens): `unsafe`, `alias`, etc.
+
+### Closure literals (0.0.65)
+
+A closure literal is an anonymous function value written `|params| { body }`.
+The braces are required.
+
+```quanta
+fn main() {
+    let f = |x| { x + 1 }
+    return f(5)                  // 6
+}
+```
+
+Multiple parameters are comma-separated:
+
+```quanta
+let g = |x, y| { x + y }
+g(3, 4)                          // 7
+```
+
+A closure can be passed to a function whose parameter carries an **fn type
+annotation** — the annotation is what makes the callee dispatch indirectly
+instead of resolving a direct symbol:
+
+```quanta
+fn apply(f: fn(i64) i64, x) { return f(x) }
+
+fn main() {
+    let doubler = |x| { x * 2 }
+    return apply(doubler, 21)    // 42
+}
+```
+
+**Representation.** A closure literal evaluates to a 16-byte value laid out as
+`[codeptr, env]` — the same layout `fnptr`/`mk_any` produce — so a closure is
+interchangeable with a hand-built function value and may also be invoked with
+`closure_call(fnb, args…)`. Calls use the standard SysV argument registers, with
+`env` passed in `r10`. Up to 5 arguments are supported.
+
+**Not yet implemented: captures.** `env` is currently always 0, so a closure
+body may only reference its own parameters. Referring to a local from the
+enclosing scope is a compile error:
+
+```quanta
+fn main() {
+    let y = 10
+    let f = |x| { x + y }        // error: undeclared variable: y
+    return f(5)
+}
+```
+
+Capturing closures are the next planned increment (see ROADMAP §P3).
 
 ---
 

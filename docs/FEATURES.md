@@ -114,7 +114,7 @@ Test legend (the **Test?** column):
 | unsigned arith | ✅ done | ✅ gate | unsigned_ops (udiv/umod/ult/ugt/ulte/ugte) |
 | operator overloading | ❌ todo | ❌ none | |
 | range `..` expression | ❌ todo | ❌ none | needed by for-range |
-| closure literals `|a| a+1` | ❌ todo | 🟡 file-only | closure_test NOT in gate (no lambda syntax) |
+| closure literals `\|a\| { a+1 }` | ✅ done (0.0.65) | ✅ gate | closure_basic rc=6, closure_multi_param rc=7, closure_higher_order rc=42; braces required; captures NOT yet supported (env=0) |
 
 ## E. Memory & Runtime
 | Feature | Status | Test? | Notes |
@@ -141,7 +141,7 @@ Test legend (the **Test?** column):
 | print | print, printi, println, prints, printsp, newline | ✅ gate (prints_family) |
 | container | len, str, push, pop, vec_get, vec_set, vec_load, vec_store, vec_add, vec_sub, vec_mul, vec_div | ✅ gate (array_test, etc.) |
 | variadic / any | arg, mk_any | ✅ gate (arg_or rc=1, arg_test rc=40) |
-| closures | fnptr, closure_call | ✅ gate (fnptr_test rc=7, closure_test rc=7) |
+| closures | closure literal `\|a\| { … }`, fnptr, closure_call | ✅ gate (closure_basic rc=6, closure_multi_param rc=7, closure_higher_order rc=42, fnptr_test rc=7) |
 | float arith | fadd, fsub, fmul, fdiv (int args → int result), i2f, f2i | ✅ gate (float_test rc=159, simple_fadd rc=7) |
 | float compare | feq, flt, fgt, fle, fge, fisnan, fisinf (f64 bit-pattern args → 0/1) | ✅ gate (float_test rc=159) |
 | float math | sqrt, floor, ceil, abs (f64 bit-pattern in/out) | ✅ gate (float_test rc=159) |
