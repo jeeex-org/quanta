@@ -16,13 +16,11 @@ name: ci
 #   5. Differential       - tools/diff_test/diff_qc.py: current qc vs the committed
 #      qc must agree on exit codes for reference programs.
 #
-# NOTE (self-host divergence, tracked separately): recompiling the 0.0.64 source
-# from the golden binary currently yields a qc that segfaults at runtime — a
-# self-host reproducibility bug in the 0.0.64 source, not in the shipped binary.
-# The "Self-host rebuild" step below rebuilds from source and re-runs the gate;
-# it is NON-BLOCKING (continue-on-error) so it surfaces the regression without
-# red-lighting the verification of the shipped compiler. Fix is scheduled for a
-# follow-up (bootstrap hardening) and must not block the scan gates.
+# Self-host: the 0.0.64 compiler now compiles the 0.0.64 source FAITHFULLY
+# (2-stage self-host verified byte-identical to the golden binary, 93/93 gate).
+# The "Self-host rebuild" step rebuilds from source with the golden binary and
+# re-runs the gate; it is NON-BLOCKING (continue-on-error) as a belt-and-braces
+# check that the shipped compiler still bootstraps itself.
 #
 # Current version: 0.0.64 (modules). Golden compiler: compiler/0.0.64/bin/x86/qc.
 
@@ -86,11 +84,11 @@ jobs:
             --current compiler/0.0.64/bin/x86/qc \
             --seed compiler/0.0.64/bin/x86/qc
 
-      - name: Self-host rebuild (1-stage from 0.0.63 seed — faithful bootstrap)
+      - name: Self-host rebuild (2-stage from 0.0.64 source — now faithful)
         continue-on-error: true
         working-directory: ${{ github.workspace }}
         run: |
-          SEED="$GITHUB_WORKSPACE/compiler/0.0.63/bin/x86/qc"
+          SEED="$GITHUB_WORKSPACE/compiler/0.0.64/bin/x86/qc"
           test -x "$SEED" || { echo "SELFHOST seed missing"; exit 0; }
           cd "$GITHUB_WORKSPACE/compiler/0.0.64/src/x86"
           "$SEED" main.quanta qc_rebuilt 2>&1 | tail -3 || true
