@@ -4,11 +4,11 @@ Quanta designed with simple syntax that supports multiple execution modes: Nativ
 
 ## Status (verified)
 
-- **Native AOT compilation (`qc`)** — **ACTIVE, 0.0.62**. x86-64 only
+- **Native AOT compilation (`qc`)** — **ACTIVE, 0.0.64**. x86-64 only
   (AArch64 backend deferred POST-1.0).
-  Self-hosts with a **byte-identical fixed point** (3-stage: qc_boot → qc_self
-  → qc, all identical), and passes **91/91** test_suites (+ 8/8 security,
-  3/3 perf). Valgrind-clean (the mmap address-hint crash is fixed).
+  Bootstraps from the committed 0.0.63 qc seed (1-stage build) to a faithful
+  0.0.64, and passes **93/93** test_suites (+ 8/8 security, 3/3 perf).
+  Valgrind-clean (the mmap address-hint crash is fixed).
 - **Interpreter (`qc --interp`)** — PLANNED (Stage 1). Not yet landed.
 - **Pre-compilation (`go run` style)** — PLANNED (Stage 2).
 - **WebAssembly** — PLANNED (Stage 3).

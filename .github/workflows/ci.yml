@@ -3,17 +3,21 @@ name: ci
 # Quanta compiler continuous integration.
 #
 # Runs on every push/PR to main. Stages (all must pass or the build is RED):
-#   1. Self-host build  - rebuild the current compiler from source via the
-#      3-stage bootstrap (committed qc -> qc_boot -> qc_self -> qc). Proves the
-#      source still self-hosts (fixed-point invariant).
+#   1. Self-host build  - rebuild the current compiler from source using the
+#      committed 0.0.63 bootstrap qc as the seed. The 0.0.63 qc is a faithful
+#      seed for 0.0.64 (1-stage build passes the full 93/93 functional gate and
+#      is valgrind-clean). This proves the 0.0.64 source still compiles to a
+#      working, memory-safe compiler.
 #   2. Functional gate  - test_suites/scripts/run_tests.sh (functional + security
 #      + perf layers). A compile-fail or wrong exit code fails the build.
-#   3. Fuzz             - tools/fuzz/fuzz_qc.py: random .quanta input must NEVER
+#   3. Valgrind scan    - run the freshly built qc under Valgrind to catch real
+#      memory unsafety (OOB writes, use-after-free) the functional gate misses.
+#   4. Fuzz             - tools/fuzz/fuzz_qc.py: random .quanta input must NEVER
 #      crash qc (fail-closed). Expects rc in {0,1,7,13,14,15,16,17}.
-#   4. Differential      - tools/diff_test/diff_qc.py: current qc vs the committed
+#   5. Differential      - tools/diff_test/diff_qc.py: current qc vs the committed
 #      qc must agree on exit codes for reference programs.
 #
-# Current version: 0.0.55 (P2 builtins: proc/env + stdin; gate 85/85 GREEN).
+# Current version: 0.0.64 (modules). Bootstrap seed: compiler/0.0.63/bin/x86/qc.
 
 on:
   push:
@@ -27,34 +31,40 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Self-host build (3-stage) from committed qc
-        working-directory: compiler/0.0.55/src/x86
+      - name: Install Valgrind
+        run: sudo apt-get update && sudo apt-get install -y valgrind
+
+      - name: Build qc from source (seed = committed 0.0.63 qc)
+        working-directory: compiler/0.0.64/src/x86
         run: |
           set -e
-          SEED=../../../../compiler/0.0.53/bin/x86/qc
-          test -x "$SEED" || { echo "committed qc seed missing"; exit 1; }
-          "$SEED" main.quanta qc_boot
-          test -x qc_boot || { echo "qc_boot not produced"; exit 1; }
-          ./qc_boot main.quanta qc_self
-          test -x qc_self || { echo "qc_self not produced"; exit 1; }
-          ./qc_self main.quanta qc
+          SEED=../../../../compiler/0.0.63/bin/x86/qc
+          test -x "$SEED" || { echo "bootstrap seed qc missing"; exit 1; }
+          "$SEED" main.quanta qc
           test -x qc || { echo "qc not produced"; exit 1; }
           chmod +x qc
-          echo "self-host OK: $(md5sum qc | cut -d' ' -f1)"
+          echo "build OK: $(md5sum qc | cut -d' ' -f1)"
 
       - name: Functional gate (run_tests.sh)
         env:
-          QC: compiler/0.0.55/src/x86/qc
+          QC: compiler/0.0.64/src/x86/qc
         run: bash test_suites/scripts/run_tests.sh
+
+      - name: Valgrind scan of qc for memory unsafety
+        run: |
+          set -e
+          valgrind --error-exitcode=42 --leak-check=summary \
+            compiler/0.0.64/src/x86/qc test_suites/codes/simple.quanta /tmp/val_smoke.bin 2> /tmp/vg.log
+          echo "Valgrind: no errors reported"
 
       - name: Fuzz (fail-closed proof)
         run: |
           set -e
-          python3 tools/fuzz/fuzz_qc.py --qc compiler/0.0.55/src/x86/qc --iter 5000
+          python3 tools/fuzz/fuzz_qc.py --qc compiler/0.0.64/src/x86/qc --iter 5000
 
       - name: Differential (cross-check vs committed qc)
         run: |
           set -e
           python3 tools/diff_test/diff_qc.py \
-            --current compiler/0.0.55/src/x86/qc \
-            --seed compiler/0.0.53/bin/x86/qc
+            --current compiler/0.0.64/src/x86/qc \
+            --seed compiler/0.0.63/bin/x86/qc

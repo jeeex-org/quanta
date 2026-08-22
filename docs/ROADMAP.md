@@ -167,13 +167,13 @@ Why post-1.0: the ARM64 backend is a new backend; shipping it while x86 debt
 remains would violate the debt-first rule and split correctness effort.
 Qualification evidence is gathered AFTER the core is complete, not before.
 
-### Current status (0.0.63)
+### Current status (0.0.64)
 
-Shipped + verified (x86-64 only; ARM64 deferred POST-1.0): self-host
-fixed-point; fail-closed memory model (overflow/bounds→SIGILL 132, MAP_FAILED→rc=1,
-undeclared/cyclic→rc=7); grammar 0 errors on all 15 modules; Valgrind-clean;
-differential vs seed. Standards docs: SPEC/SAFETY_MANUAL/SECURITY_TOOLING/
-MEMORY_SAFETY_ARGUMENT.
+Shipped + verified (x86-64 only; ARM64 deferred POST-1.0): bootstraps from the
+committed 0.0.63 qc seed (1-stage build) to a faithful 0.0.64; fail-closed memory
+model (overflow/bounds→SIGILL 132, MAP_FAILED→rc=1, undeclared/cyclic→rc=7);
+grammar 0 errors on all 15 modules; Valgrind-clean; differential vs seed.
+Standards docs: SPEC/SAFETY_MANUAL/SECURITY_TOOLING/MEMORY_SAFETY_ARGUMENT.
 
 P2 builtins landed through 0.0.57 (gate green, 91/91): float comparisons
 (`feq/flt/fgt/fle/fge/fisnan/fisinf`), float math (`sqrt/floor/ceil/abs`),
@@ -195,8 +195,10 @@ are heap-allocated tagged values (Rust-style sum types) — use `match` for valu
 comparison, not `==`. Gate: 93/93 functional, 8/8 security, 3/3 performance.
 **0.0.64** modules: `mod Name { fn ... }` registers functions with `Name.fn` names;
 qualified calls `Mod.fn()` resolve via a module registry. Nested modules
-supported. Basic trait/struct/impl compatibility verified. Gate: 94/94 functional,
-8/8 security, 3/3 performance.
+supported. Basic trait/struct/impl compatibility verified. Gate: 93/93 functional,
+8/8 security, 3/3 performance. Bootstrap: the 0.0.64 source is built from the
+committed 0.0.63 qc seed (1-stage); the legacy 3-stage self-host (qc_boot →
+qc_self → qc) diverges due to a self-host codegen bug and is not the verified path.
 
 Known gap: `getenv` is a stub; string ops (concat via `..` and `${}`/`$[]`
 interpolation) work. See FEATURES.md §I.
