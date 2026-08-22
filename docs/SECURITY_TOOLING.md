@@ -2,7 +2,7 @@
 
 > Companion to `docs/SAFETY_MANUAL.md` (§6 gaps) and `docs/SPEC.md`.
 > Maps reputable security/verification tools onto Quanta's actual architecture
-> (self-hosting compiler, bootstrap seed, x86-64 + AArch64 ELF emitters,
+> (self-hosting compiler, bootstrap seed, x86-64 ELF emitter; AArch64 backend planned POST-1.0,
 > tree-sitter grammar). Records what is in place, what is planned, and the
 > gap each tool closes.
 

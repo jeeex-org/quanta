@@ -1,13 +1,13 @@
 # Quanta Language Specification (v0.0.55)
 
 > Status: DRAFT / WORKING SPECIFICATION. Derived from the self-hosting
-> compiler source at `compiler/0.0.55/` (x86-64 + AArch64 native AOT).
+> compiler source at `compiler/0.0.55/` (x86-64 native AOT; AArch64 backend planned POST-1.0).
 > This document is the authoritative definition of Quanta semantics for
 > the purpose of tool qualification (ISO/IEC 26262-8, IEC 61508-3).
 > Where the prose and the compiler diverge, the compiler is currently
 > authoritative and the discrepancy is a SPEC BUG to be filed.
 
-Last updated: 2026-08-16. Scope: native AOT backend (x86-64, AArch64).
+Last updated: 2026-08-22. Scope: native AOT backend (x86-64; AArch64 backend planned POST-1.0).
 Interpreter/JIT/WASM backends are NOT specified here (see LANGUAGE_DESIGN.md
 Stages 1/3/5 — not yet built).
 

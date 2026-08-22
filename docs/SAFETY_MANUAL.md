@@ -12,7 +12,7 @@ Last updated: 2026-08-16. Compiler version: 0.0.53.
 
 ## 1. Scope & intended use
 
-Quanta's native AOT backend (x86-64, AArch64) compiles Quanta source to
+Quanta's native AOT backend (x86-64; AArch64 backend planned POST-1.0) compiles Quanta source to
 standalone ELF executables. This manual covers the **compiler toolchain**
 only. It does NOT cover:
 - Application logic written in Quanta (that is the integrator's safety case).

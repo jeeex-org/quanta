@@ -1,12 +1,15 @@
 # Quanta ROADMAP — consolidated single source of truth
 
-> **Last updated: 2026-08-19. Current compiler: 0.0.57** (x86-64 + AArch64
-> ELF emitters, multi-file tree, Valgrind-clean, self-host `fp=YES`).
+> **Last updated: 2026-08-22. Current compiler: 0.0.62** (x86-64 ELF emitter,
+> multi-file tree, Valgrind-clean, self-host `fp=YES`). ARM64 (AArch64) backend
+> is DEFERRED POST-1.0 (see #2 schedule below); the working compiler is x86-64 only.
 >
 > Version sequence: each feature lands in its own directory. 0.0.55 = P2
 > builtins + grammar/bug-fix window; **0.0.56 = simplified surface** (optional
 > `fn`/`let`/`return`, `${}`/`$[]` sigils); **0.0.57 = `$$(cmd)` external
-> command substitution** (built on 0.0.56).
+> command substitution** (built on 0.0.56); **0.0.61 = float literals**
+> (parse + print); **0.0.62 = float literals fully consumable by float builtins**
+> (f2i/fadd/fsub/fmul/fdiv read float args correctly).
 > This document consolidates what was previously spread across the stale
 > `ROADMAP.md` (removed — claimed current=0.0.46), `QUANTA_ROADMAP.md`
 > (vision), `FEATURES.md` (build order), and `LANGUAGE_DESIGN.md` (stages).
@@ -127,7 +130,7 @@ SEQUENCING is the contract, not the literal numbers.
 | Grammar + bug-fix | 0.0.51–0.0.55 | tree-sitter grammar (done 0.0.53), residual compiler bugs. **0.0.53 shipped.** |
 | SIMPLE-SURFACE | 0.0.56 | **Simplified syntax landed**: `fn` keyword optional (bare `name(){}` works everywhere, `init()`/`main()` bare OK), `let` optional (bare `name = expr` = local/global), `return` optional (last-expr auto-returns), condition parens optional, `${name}` global / `$[]` local explicit sigils (bare + inside-string interpolation). Goal: bash-like, extremely simple surface. Docs (README/SYNTAX/SPEC) + test_suites + security script synced. |
 | P2 builtins | 0.0.55–0.0.60 | float cmp ✅(0.0.55), proc/env ✅(0.0.55), stdin ✅(0.0.55), fs meta ✅(0.0.55 — path-string remap fixed), string ops, math ✅(sqrt/floor/ceil/abs; sin/cos/tan/pow/log/min/max TODO), atomics, net, introspection ✅(abort/debugbreak), random ✅(getrandom), **`$$(cmd)` external-command substitution (0.0.57)** — `unsafe`-gated runtime `fork`/`execve`/`pipe`/`wait4` via the raw `syscall()` builtin (no libc); `$$(str)`→`/bin/sh -c`, `$$(arr)`→direct `execve` (no shell, injection-safe). Returns `CmdResult{stdout,stderr,status}`. |
-| P3 language | 0.0.61–0.0.71 | float literals, user enums, tuples, generics, traits, modules, real char/byte/string/bool, ref/mut/move, op-overload, closure literals, and/or/not/true/false/global |
+| P3 language | 0.0.61–0.0.71 | **float literals ✅(0.0.61)**, **user enums ✅(0.0.63)**, float-arg-to-builtin ✅(0.0.62: f2i/fadd/fsub/fmul/fdiv read float vregs correctly); remaining: tuples, generics, traits, modules, real char/byte/string/bool, ref/mut/move, op-overload, closure literals, and/or/not/true/false/global |
 | **P4 tooling** | **0.0.72** | **Quanta-native code-writing tool** (edit Quanta source reliably without external scripting — the user's stated goal) |
 | **1.0** | 1.0.0 | Core + builtins complete → std/lib resumes; borrow-checking target for #1 green |
 
@@ -164,24 +167,28 @@ Why post-1.0: the ARM64 backend is a new backend; shipping it while x86 debt
 remains would violate the debt-first rule and split correctness effort.
 Qualification evidence is gathered AFTER the core is complete, not before.
 
-### Current status (0.0.57)
+### Current status (0.0.62)
 
-Shipped + verified: x86-64 + AArch64 ELF emitters, self-host fixed-point;
-fail-closed memory model (overflow/bounds→SIGILL 132, MAP_FAILED→rc=1,
-undeclared/cyclic→rc=7); grammar 0 errors on all 15 modules; keyword-hash
-paren bug fixed; fail-closed fuzzer (20K iters, 0 crashes); differential
-vs seed (5/5 parity); Valgrind-clean. Standards docs: SPEC/SAFETY_MANUAL/
-SECURITY_TOOLING/MEMORY_SAFETY_ARGUMENT.
+Shipped + verified (x86-64 only; ARM64 deferred POST-1.0): self-host
+fixed-point; fail-closed memory model (overflow/bounds→SIGILL 132, MAP_FAILED→rc=1,
+undeclared/cyclic→rc=7); grammar 0 errors on all 15 modules; Valgrind-clean;
+differential vs seed. Standards docs: SPEC/SAFETY_MANUAL/SECURITY_TOOLING/
+MEMORY_SAFETY_ARGUMENT.
 
 P2 builtins landed through 0.0.57 (gate green, 91/91): float comparisons
 (`feq/flt/fgt/fle/fge/fisnan/fisinf`), float math (`sqrt/floor/ceil/abs`),
-float arith (`fadd/fsub/fmul/fdiv` take int args → int), process/env
-(`getpid/getppid/arg_count/environ`; `getenv` is a stub returning 0),
-stdin (`getc`), random (`getrandom`), introspection (`abort`/`debugbreak`).
-**fs meta fixed**: `stat/unlink/mkdir/chdir/rename` now return correct rc
-(path-string remap bug resolved). **Simplified surface landed**: `fn`/`let`/
-`return` optional, no-parens conditions, `${name}`/`$[]` global/local sigils.
+float arith (`fadd/fsub/fmul/fdiv`), process/env (`getpid/getppid/arg_count/environ`;
+`getenv` is a stub returning 0), stdin (`getc`), random (`getrandom`),
+introspection (`abort`/`debugbreak`). Simplified surface: `fn`/`let`/`return`
+optional, no-parens conditions, `${name}`/`$[]` global/local sigils.
 
-Known gap: `getenv` is a stub; `fstat`/`lseek` work; string ops (concat via
-`..` and `${}`/`$[]` interpolation) work. See FEATURES.md §I.
+**0.0.61** float literals: `3.14`/`-0.5`/`123.456` parse and `println(3.14)`
+prints `3.140000`.
+**0.0.62** float-arg fix: the float builtins (`f2i`, `fadd`, `fsub`, `fmul`,
+`fdiv`) now read float-literal / float-vreg arguments correctly (was a known gap
+in 0.0.61). Verified: `f2i(3.14)`→3, `fadd(1.5,2.5)`→4, `fmul(2.5,4.0)`→10,
+`fdiv(10.0,4.0)`→2, `fsub(5.0,2.0)`→3; int args still work (`fadd(3,4)`→7).
+
+Known gap: `getenv` is a stub; string ops (concat via `..` and `${}`/`$[]`
+interpolation) work. See FEATURES.md §I.
 
