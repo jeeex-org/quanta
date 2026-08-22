@@ -120,7 +120,7 @@ lives in docs/FEATURES.md).
 
 ### Build order to 1.0 (single source of truth)
 
-Convention: one feature per WIP version; each self-hosts (3-stage) and
+Convention: one feature per WIP version; each self-hosts (2-stage, byte-identical fixed point) and
 passes the gate green before promotion. Version numbers are MUTABLE — the
 SEQUENCING is the contract, not the literal numbers.
 
@@ -169,8 +169,9 @@ Qualification evidence is gathered AFTER the core is complete, not before.
 
 ### Current status (0.0.64)
 
-Shipped + verified (x86-64 only; ARM64 deferred POST-1.0): bootstraps from the
-committed 0.0.63 qc seed (1-stage build) to a faithful 0.0.64; fail-closed memory
+Shipped + verified (x86-64 only; ARM64 deferred POST-1.0): **true 2-stage self-host** —
+the committed `bin/x86/qc` compiles the 0.0.64 source to a faithful `qc`, verified
+byte-identical to the golden binary (and to a 2nd-stage rebuild); fail-closed memory
 model (overflow/bounds→SIGILL 132, MAP_FAILED→rc=1, undeclared/cyclic→rc=7);
 grammar 0 errors on all 15 modules; Valgrind-clean; differential vs seed.
 Standards docs: SPEC/SAFETY_MANUAL/SECURITY_TOOLING/MEMORY_SAFETY_ARGUMENT.
@@ -196,9 +197,13 @@ comparison, not `==`. Gate: 93/93 functional, 8/8 security, 3/3 performance.
 **0.0.64** modules: `mod Name { fn ... }` registers functions with `Name.fn` names;
 qualified calls `Mod.fn()` resolve via a module registry. Nested modules
 supported. Basic trait/struct/impl compatibility verified. Gate: 93/93 functional,
-8/8 security, 3/3 performance. Bootstrap: the 0.0.64 source is built from the
-committed 0.0.63 qc seed (1-stage); the legacy 3-stage self-host (qc_boot →
-qc_self → qc) diverges due to a self-host codegen bug and is not the verified path.
+8/8 security, 3/3 performance. Bootstrap: **true 2-stage self-host** — the
+committed `bin/x86/qc` compiles the 0.0.64 source to a faithful `qc` (verified
+byte-identical to a 2nd-stage rebuild, 93/93 gate). Previously the self-host was
+broken by two parameter/global name collisions in `emitter.quanta`
+(`mr(mod,…)` vs global `IR_MOD`; `stx(base,disp,src)` vs global `src`), which
+corrupted `mr`'s modrm byte ordering and made every emitted program segfault.
+Both renamed (`mod`→`mmod`, `src`→`sreg`) — self-host is now faithful.
 
 Known gap: `getenv` is a stub; string ops (concat via `..` and `${}`/`$[]`
 interpolation) work. See FEATURES.md §I.

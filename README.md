@@ -6,9 +6,11 @@ Quanta designed with simple syntax that supports multiple execution modes: Nativ
 
 - **Native AOT compilation (`qc`)** — **ACTIVE, 0.0.64**. x86-64 only
   (AArch64 backend deferred POST-1.0).
-  Bootstraps from the committed 0.0.63 qc seed (1-stage build) to a faithful
-  0.0.64, and passes **93/93** test_suites (+ 8/8 security, 3/3 perf).
-  Valgrind-clean (the mmap address-hint crash is fixed).
+  Bootstraps via a **true 2-stage self-host**: the committed `bin/x86/qc`
+  compiles the 0.0.64 source to a faithful `qc` (verified byte-identical to
+  the golden binary, 93/93 gate). Passes **93/93** test_suites
+  (+ 8/8 security, 3/3 perf). Valgrind-clean (the mmap address-hint crash
+  is fixed).
 - **Interpreter (`qc --interp`)** — PLANNED (Stage 1). Not yet landed.
 - **Pre-compilation (`go run` style)** — PLANNED (Stage 2).
 - **WebAssembly** — PLANNED (Stage 3).
@@ -374,7 +376,7 @@ source.quanta → core/scan/parse → IR → opt/ → backend (codegen/x86_64 | 
 ```
 
 Current source form: a multi-file self-hosting tree at
-`compiler/0.0.55/src/x86/` (`main.quanta` + `helpers`/`lexer`/`parse`/
+`compiler/0.0.64/src/x86/` (`main.quanta` + `helpers`/`lexer`/`parse`/
 `codegen`/`emitter`/`elf`/`globals`/`features.quanta`). The modular split
 is DONE. `#import` is still not functional (a future stage).
 
@@ -383,11 +385,11 @@ is DONE. `#import` is still not functional (a future stage).
 Every change is gated by:
 
 ```bash
-# recompile the compiler with the bootstrap seed (3-stage self-host)
-cd compiler/0.0.55/src/x86
-SEED=../../../../compiler/0.0.53/bin/x86/qc
-$SEED main.quanta qc_boot && ./qc_boot main.quanta qc_self && ./qc_self main.quanta qc
-# self-host fixed point (qc_boot == qc_self == qc) + 91/91 regression
+# 2-stage self-host: committed bin/x86/qc compiles the 0.0.64 source to a faithful qc
+cd compiler/0.0.64/src/x86
+SEED=../../../../compiler/0.0.64/bin/x86/qc
+$SEED main.quanta qc && ./qc main.quanta qc2   # qc == qc2 (fixed point)
+# full gate
 bash test_suites/scripts/run_tests.sh
 ```
 

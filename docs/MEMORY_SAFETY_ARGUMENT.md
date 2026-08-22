@@ -71,8 +71,9 @@ writes) are correct. These are the single trusted computing base for all
 emission; a bug here would undermine C1/C2. (No sanitizer currently
 instruments them — see §6.)
 
-**A3.** The bootstrap seed `qc-bootstrap-0.0.45` is trusted. The
-self-host fixed-point (qc_boot==qc_self==qc) shows the CURRENT compiler
+**A3.** The golden `bin/x86/qc` is trusted. The
+self-host fixed-point (committed bin/x86/qc → 0.0.64 source → qc, byte-identical,
+and to a 2nd-stage rebuild) shows the CURRENT compiler
 reproduces itself; it does not independently prove A2 (that needs #2).
 
 ---

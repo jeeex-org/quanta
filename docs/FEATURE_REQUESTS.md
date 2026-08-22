@@ -88,7 +88,7 @@ permitting interactive commands (ssh, vi, …) with direct terminal access.
 - [ ] `let c = “rm x”; $$(c)` → runtime denied: code sentinel, err message,
       NO exec.
 - [ ] Full gate stays GREEN (no bootstrap regression like `boot=7`).
-- [ ] Self-hosting fixed point preserved (qc_boot == qc_self == qc).
+- [ ] Self-hosting fixed point preserved (committed bin/x86/qc → source → qc, byte-identical; and 2nd-stage rebuild).
 
 ---
 
