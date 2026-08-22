@@ -1,6 +1,6 @@
 # Quanta ROADMAP — consolidated single source of truth
 
-> **Last updated: 2026-08-22. Current compiler: 0.0.62** (x86-64 ELF emitter,
+> **Last updated: 2026-08-22. Current compiler: 0.0.63** (x86-64 ELF emitter,
 > multi-file tree, Valgrind-clean, self-host `fp=YES`). ARM64 (AArch64) backend
 > is DEFERRED POST-1.0 (see #2 schedule below); the working compiler is x86-64 only.
 >
@@ -167,7 +167,7 @@ Why post-1.0: the ARM64 backend is a new backend; shipping it while x86 debt
 remains would violate the debt-first rule and split correctness effort.
 Qualification evidence is gathered AFTER the core is complete, not before.
 
-### Current status (0.0.62)
+### Current status (0.0.63)
 
 Shipped + verified (x86-64 only; ARM64 deferred POST-1.0): self-host
 fixed-point; fail-closed memory model (overflow/bounds→SIGILL 132, MAP_FAILED→rc=1,
@@ -188,6 +188,11 @@ prints `3.140000`.
 `fdiv`) now read float-literal / float-vreg arguments correctly (was a known gap
 in 0.0.61). Verified: `f2i(3.14)`→3, `fadd(1.5,2.5)`→4, `fmul(2.5,4.0)`→10,
 `fdiv(10.0,4.0)`→2, `fsub(5.0,2.0)`→3; int args still work (`fadd(3,4)`→7).
+**0.0.63** user enums: `enum Name { A, B, C }` and explicit tags
+(`enum Pri { Low=1, Mid=5, High=9 }`); qualified (`Color.Red`) and bare (`Green`)
+variant resolution; both usable in `match` arms (integer-tag comparison). Variants
+are heap-allocated tagged values (Rust-style sum types) — use `match` for value
+comparison, not `==`. Gate: 93/93 functional, 8/8 security, 3/3 performance.
 
 Known gap: `getenv` is a stub; string ops (concat via `..` and `${}`/`$[]`
 interpolation) work. See FEATURES.md §I.
