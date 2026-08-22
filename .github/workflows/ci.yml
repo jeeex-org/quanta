@@ -56,11 +56,12 @@ jobs:
           QC: compiler/0.0.64/src/x86/qc
           PERF_BASELINE_MS: "60000"
         run: |
+          echo "GATE_CWD=$(pwd)"
+          echo "QC=[$QC] exists=$(test -x "$QC" && echo yes || echo no)"
+          echo "script exists=$(test -x test_suites/scripts/run_tests.sh && echo yes || echo no)"
+          echo "::error::DIAG cwd=$(pwd) qc_exists=$(test -x "$QC" && echo yes || echo no) script_exists=$(test -x test_suites/scripts/run_tests.sh && echo yes || echo no)"
           bash test_suites/scripts/run_tests.sh 2>&1 | tee /tmp/gate.log
-          # Surface any FAIL lines as workflow annotations (readable via API).
-          grep -E "FAIL|RED|Error|error" /tmp/gate.log | head -40 | while IFS= read -r line; do
-            echo "::error::GATE $line"
-          done
+          echo "::error::DIAG gate_tail=$(tail -5 /tmp/gate.log | tr '\n' '|')"
           grep -qE "functional : RED|FAIL \(compile\)|FAIL [a-z]" /tmp/gate.log && exit 1 || true
 
       - name: Valgrind scan of qc for memory unsafety
