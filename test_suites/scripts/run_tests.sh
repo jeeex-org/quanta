@@ -32,10 +32,11 @@ while IFS=$'\t' read -r name expected; do
   if $QC -O "$src" "$out" 2>/tmp/compile_stderr.txt; then
     echo "  OK  $name"
   else
+    rc=$?
     if echo "$KNOWN_COMPILE" | tr ' ' '\n' | grep -qx "$name"; then
-      echo "  KNOWN (compile) $name  [qc builtin codegen, env-dependent; see KNOWN-ISSUES]"
+      echo "  KNOWN (compile) $name  rc=$rc  [qc builtin codegen, env-dependent; see KNOWN-ISSUES]"
     else
-      echo "  FAIL (compile) $name"
+      echo "  FAIL (compile) $name  rc=$rc"
       echo "    stderr: $(cat /tmp/compile_stderr.txt)"
       COMPILE_FAIL=$((COMPILE_FAIL + 1))
     fi
