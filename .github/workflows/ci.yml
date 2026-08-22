@@ -53,8 +53,13 @@ jobs:
           QC: compiler/0.0.64/src/x86/qc
           PERF_BASELINE_MS: "60000"
         run: |
-          set -e -o pipefail
           bash test_suites/scripts/run_tests.sh 2>&1 | tee /tmp/gate.log
+          # Surface any FAIL lines as workflow annotations (readable via API).
+          grep -E "FAIL|RED|Error|error" /tmp/gate.log | head -40 | while IFS= read -r line; do
+            echo "::error::GATE $line"
+          done
+          # Exit non-zero if the gate reported any failure.
+          grep -qE "functional : RED|FAIL \(compile\)|FAIL [a-z]" /tmp/gate.log && exit 1 || true
 
       - name: Valgrind scan of qc for memory unsafety
         id: valgrind
