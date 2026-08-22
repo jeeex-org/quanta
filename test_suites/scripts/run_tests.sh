@@ -13,15 +13,6 @@ PASS=0
 FAIL=0
 COMPILE_FAIL=0
 
-# KNOWN compile issues that must NOT red-light the gate (surfaced, not masked):
-#   getenv_test / getrandom_test / abort_test — qc's builtin codegen for these
-#   deterministically fails on GitHub's ubuntu-24.04 runner (empty stderr, qc dies
-#   mid-codegen) while the identical committed binary compiles them fine locally.
-#   This is the same env-dependent qc codegen bug class as the self-host
-#   divergence; qc cannot be rebuilt from source (self-host broken), so the gate
-#   reports these as KNOWN until the builtin codegen is hardened. See KNOWN-ISSUES.
-KNOWN_COMPILE="getenv_test.quanta getrandom_test.quanta abort_test.quanta"
-
 mkdir -p "$TEST_SUITES/bin"
 
 # Compile all test codes
@@ -33,13 +24,9 @@ while IFS=$'\t' read -r name expected; do
     echo "  OK  $name"
   else
     rc=$?
-    if echo "$KNOWN_COMPILE" | tr ' ' '\n' | grep -qx "$name"; then
-      echo "  KNOWN (compile) $name  rc=$rc  [qc builtin codegen, env-dependent; see KNOWN-ISSUES]"
-    else
-      echo "  FAIL (compile) $name  rc=$rc"
-      echo "    stderr: $(cat /tmp/compile_stderr.txt)"
-      COMPILE_FAIL=$((COMPILE_FAIL + 1))
-    fi
+    echo "  FAIL (compile) $name  rc=$rc"
+    echo "    stderr: $(cat /tmp/compile_stderr.txt)"
+    COMPILE_FAIL=$((COMPILE_FAIL + 1))
   fi
 done < "$TEST_SUITES/EXPECTED.tsv"
 
