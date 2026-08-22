@@ -35,7 +35,7 @@ jobs:
   build-and-gate:
     runs-on: ubuntu-latest
     permissions:
-      contents: read
+      contents: write
     steps:
       - uses: actions/checkout@v4
 
@@ -81,6 +81,24 @@ jobs:
           python3 tools/diff_test/diff_qc.py \
             --current compiler/0.0.64/src/x86/qc \
             --seed compiler/0.0.64/bin/x86/qc
+
+      - name: DIAG commit gate log to ci-diag branch (debug only, remove later)
+        if: always()
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          mkdir -p docs
+          {
+            echo "# CI DIAG $(date -u)"
+            echo "## gate"; cat /tmp/gate.log 2>/dev/null
+            echo "## selfhost"; cat /tmp/selfhost.log 2>/dev/null
+            echo "## vg"; cat /tmp/vg.log 2>/dev/null
+          } > docs/CI_DIAG.md
+          git config user.email "ci-diag@noreply"
+          git config user.name "CI DIAG"
+          git add -f docs/CI_DIAG.md
+          git commit -m "DIAG $(date +%s)" || echo "nothing"
+          git push "https://x-access-token:${GITHUB_TOKEN}@github.com/jeeex-org/quanta.git" HEAD:refs/heads/ci-diag --force || echo "push failed"
 
       - name: Self-host rebuild (NON-BLOCKING — surfaces self-host divergence)
         continue-on-error: true
