@@ -20,10 +20,11 @@ echo "=== Compiling test suite ==="
 while IFS=$'\t' read -r name expected; do
   src="$TEST_SUITES/codes/$name"
   out="$TEST_SUITES/bin/${name%.quanta}"
-  if $QC -O "$src" "$out" 2>/dev/null; then
+  if $QC -O "$src" "$out" 2>/tmp/compile_stderr.txt; then
     echo "  OK  $name"
   else
     echo "  FAIL (compile) $name"
+    echo "    stderr: $(cat /tmp/compile_stderr.txt)"
     COMPILE_FAIL=$((COMPILE_FAIL + 1))
   fi
 done < "$TEST_SUITES/EXPECTED.tsv"
