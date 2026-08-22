@@ -331,11 +331,10 @@ fn main() {
 
 > **Float literals are now parsed** (since 0.0.61): `3.14`, `-0.5`, `123.456` compile to float
 > values and `println(3.14)` prints `3.140000`. They flow through `i2f`/`f2i` and the
-> `println` float path like any other float. Known gap: passing a float-literal (or any
-> float vreg) directly as the argument to a float-consuming builtin such as `f2i(3.14)`
-> still mis-reads the bits (builtin arg loading reads the integer spill home, not the
-> float spill home) — use `f2i(i2f(...))` or `let x = 3.14; f2i(x)` as a workaround
-> until that float-arg loading is fixed.
+> `println` float path like any other float. As of 0.0.62, float literals (and any float
+> vreg) are correctly consumed by the float builtins directly — `f2i(3.14)` prints `3`,
+> `fadd(1.5, 2.5)` prints `4`, `fmul(2.5, 4.0)` prints `10`, etc. (int args to those
+> builtins still work, e.g. `fadd(3, 4)` prints `7`).
 
 ```quanta
 fn main() {
