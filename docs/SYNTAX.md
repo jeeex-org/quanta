@@ -2,10 +2,12 @@
 
 Quanta is designed to be simple and supports multiple modes—interpreter, WASM, JIT, pre‑compiler (e.g., `quanta run`), and native compilation to binary (`qc`).
 
-This document describes the language as implemented in the current compiler,
-`compiler/0.0.65/src/x86/` (multi-file x86-64 tree; AArch64 deferred POST-1.0).
-Gate: 96/96 functional + 8/8 security + 3/3 performance, 2-stage self-host
-byte-identical fixed point.
+This document describes the language as implemented by the current compiler in
+`compiler/` (x86-64; AArch64 deferred POST-1.0). It is a description of the
+language surface only — it carries no version or gate numbers, because those
+rot. For what landed when, and the current gate status, see `docs/ROADMAP.md`;
+for per-feature implementation status and the tests covering each, see
+`docs/FEATURES.md`.
 
 ---
 
@@ -28,10 +30,10 @@ Reserved tokens (cannot be used as identifiers):
 
 ```
 fn   let   if   else   loop   while   for   break   continue   return
-unsafe   extern   alias   global   // (see below for P6 keywords)
+unsafe   extern   alias   global   // (see additional keywords below)
 ```
 
-**P6‑phase keywords** (recognized; enum and match now implemented):
+**Additional keywords** (recognized; enum and match are implemented):
 ```
 enum   match   type   interface   impl   where   Option   Some   None   Result   Ok   Err   ref   mut   move   String
 ```
@@ -41,7 +43,7 @@ enum   match   type   interface   impl   where   Option   Some   None   Result  
 | Kind   | Syntax                              | Notes |
 |--------|-------------------------------------|-------|
 | Integer| `42`, `-7`, `0xFF` (hex)            | Signed 64‑bit two’s complement |
-| Float  | `3.14`                              | IEEE‑754 binary64 (WIP) |
+| Float  | `3.14`                              | IEEE‑754 binary64 |
 | Char   | Not a distinct type; use `u8` values| – |
 | String | `"hello\n"`                         | UTF‑8 bytes with a length prefix (see §4) |
 | Boolean| `true`, `false`                     | Stored as `1` / `0` |
@@ -81,7 +83,7 @@ All runtime values are 64‑bit words.  Types are *compile‑time* annotations t
 - **Struct**: `struct Name { f0: T0, f1: T1, … }` – named fields, layout‑compatible with tuple; field access `obj.field`.
 - **Enum (sum type)**: `enum Name { V0, V1(T), V2(T,U), … }` – discriminant stored in first word, payload follows.
 - **Function pointer**: `fnptr(FNAME)` – code pointer, callable via `closure_call`.
-- **Closure**: a closure literal `|params| { body }` (0.0.65) evaluates to a
+- **Closure**: a closure literal `|params| { body }` evaluates to a
   16-byte `[codeptr, env]` value. Call it directly by name, pass it to an
   fn-typed parameter, or invoke a hand-built one with `closure_call(fnb, args…)`.
   See §Closure literals below.
@@ -152,14 +154,14 @@ main() {                            // bare main
   - Positional, separated by commas.
   - Optional default value after `=` (only for trailing parameters).
   - Named‑argument call: `f(b: 2, a: 1)` – order does not matter.
-  - Variadic: `fn f(a, b, ...)` – inside the function use `arg(i)` to access extra arguments (`argc()` is not implemented).
+  - Variadic: `fn f(a, b, ...)` – inside the function use `arg(i)` to access extra arguments. There is no `argc()`; for the process argument count use the `arg_count()` builtin (`argc()` compiles but always returns 0).
 - **Return type**
   - If omitted, defaults to `i64` (but treated as advisory).
   - Multiple values can be returned via a tuple: `return a, b, c;` → caller can destructure with `let x, y = f()`.
 - **Extern linkage** (C ABI): `extern "C" fn name(...) -> Rt;` – see §9.
 - **Function attributes** (via tokens): `unsafe`, `alias`, etc.
 
-### Closure literals (0.0.65)
+### Closure literals
 
 A closure literal is an anonymous function value written `|params| { body }`.
 The braces are required.
@@ -209,7 +211,7 @@ fn main() {
 }
 ```
 
-Capturing closures are the next planned increment (see ROADMAP §P3).
+Capturing closures are a planned increment (see ROADMAP).
 
 ---
 
@@ -251,7 +253,7 @@ Capturing closures are the next planned increment (see ROADMAP §P3).
 - `loop { … }` – infinite loop; use `break` to exit with a value: `break expr`.
 - `while cond { … }`
 - `for i = start; cond; step { … }` – classic C‑style loop.
-- `for x in arr { … }` – iterates over an array (implemented, P10); elements are 0‑indexed, and `arr[-1]` is the array length.
+- `for x in arr { … }` – iterates over an array (implemented); elements are 0‑indexed. Use `len(arr)` for the element count.
 - `match disc { pat => expr, … }` – pattern‑matching expression (see §7).
 
 ---
@@ -359,7 +361,9 @@ All builtins are emitted inline; they have no call overhead.
 | `[pat, …, pat]` | Slice/array pattern (fixed length). |
 
 ### Guards
-Not yet implemented in the WIP compiler.
+**Not implemented.** A guarded arm (`n if n > 3 => …`) is *parsed* but the guard
+is not honoured: the `match` falls through every arm and yields `0` rather than
+raising a diagnostic. Do not use guards; test the condition with an `if` instead.
 
 ```
 let x = Some(5);
@@ -375,8 +379,7 @@ match x {
 
 ### Structs
 ```
-// P4.3 struct feature test. Declares a struct, constructs it, reads both
-// fields. Verifies the ARM struct base-pointer / field-stride codegen.
+// Declares a struct, constructs it, and reads both fields.
 struct Point { x y }
 
 fn make(a, b) {
@@ -390,7 +393,7 @@ fn main() {
 ```
 - Constructor can also be positional: `Point(1,2)`.
 - Fields may have a `: Type` annotation; if omitted, the type is inferred from the initializer (if any) or left generic.
-- Struct literal syntax `Point { x: 3, y: 4 }` is also supported (P9, qc-0.0.13; rewritten to a constructor call).
+- Struct literal syntax `Point { x: 3, y: 4 }` is also supported (rewritten to a constructor call).
 
 ### Enums (implemented)
 
@@ -414,7 +417,7 @@ fn main() {
 - Discriminant is stored in the first word (0‑based variant index).
 - Payload follows the discriminant, laid out as a tuple.
 
-### Option & Result (built‑in enums; constructors + match implemented on x86_64 and ARM64, P7)
+### Option & Result (built‑in enums; constructors + match implemented)
 
 ```quanta
 enum Option<T> { None, Some(T) }
@@ -426,7 +429,7 @@ Constructors:
 - `err(expr)` → `Result::Err(expr)`
 - `ok(expr)` → `Result::Ok(expr)`
 
-**Note**: Bare `Some(val)`, `None`, `Ok(val)`, `Err(val)` expressions and `match` on them work on **both** x86_64 and ARM64 (P7, qc-0.0.11). The earlier ARM64 register‑emission bug (bare variant matches returning 0) was fixed in qc-0.0.11.
+**Note**: Bare `Some(val)`, `None`, `Ok(val)`, `Err(val)` expressions and `match` on them are supported.
 
 ```quanta
 let some_val = Some(42)
@@ -461,7 +464,7 @@ fn main() {
 }
 ```
 - Tuple elements accessed via `.0`, `.1`, … (or by destructuring).
-- Array length is part of the type; indexing uses `a[i]` (bounds‑checked by default, traps on out‑of‑range).  `a[-1]` yields the array length (implemented, P10).
+- Array length is part of the type; indexing uses `a[i]` (bounds‑checked by default, traps on out‑of‑range).  Use `len(a)` for the element count — a negative index such as `a[-1]` is out of range and **traps** (SIGILL, rc=132), it is not a length shorthand.
 
 ---
 
@@ -475,7 +478,7 @@ extern "C" fn putchar(c: i64) -> i64;
 - The function can then be called like any other Quanta function.
 
 ### Calling from C
-Exported symbols are not yet implemented in the WIP; the focus is on importing C functions.
+Exported symbols are not yet implemented; the focus is on importing C functions.
 
 ---
 
@@ -494,7 +497,7 @@ include std/io          // bare name: searches ./std, ./, /usr/local/quanta/std,
 
 ## 11. Generics, Traits, and Implementations
 
-Generic type parameters `<T>` are **not implemented** (a generic signature fails to compile).  Traits, impls, and struct literals **are** implemented (P9, qc-0.0.13).
+Generic type parameters `<T>` are **not usable** (parsed, but silently produce wrong results — see §Generic Functions).  Traits, impls, and struct literals **are** implemented.
 
 ### Generic Functions
 ```
@@ -516,11 +519,16 @@ fn main() {
     return doubled[0] + doubled[1] + doubled[2]
 }
 ```
-- **Not implemented** — the example above does not compile with the current compiler (type parameters are not yet supported).
+- **Not usable.** Type parameters are *parsed* — the example above compiles
+  without error — but they are not implemented semantically: it returns `0`
+  instead of `12`. A generic signature is accepted and then produces wrong
+  results rather than a diagnostic, so do not rely on generics. Trivial cases
+  where the parameter is only passed through (e.g. `fn id<T>(x: T) -> T`) do
+  happen to work, which makes the gap easy to miss.
 
 ### Traits (interfaces)
 
-Implemented (P9, qc-0.0.13): trait declarations, `impl Trait for Struct` blocks, and dispatch through trait‑typed parameters.
+Implemented: trait declarations, `impl Trait for Struct` blocks, and dispatch through trait‑typed parameters.
 
 ```
 
@@ -558,7 +566,7 @@ impl Drawable for Circle {
     }
 }
 ```
-- Instances of `Circle` can be passed wherever a `Drawable` trait‑typed parameter is expected; dispatch resolves the (single) impl method.  Multi‑impl vtable dispatch is not yet implemented.
+- Instances of `Circle` can be passed wherever a `Drawable` trait‑typed parameter is expected; dispatch resolves the (single) impl method.  Multi‑impl vtable dispatch is not yet implemented — a second `impl Trait for OtherStruct` declaring the same method name is rejected at compile time with `error: duplicate function definition`.
 
 ### Associated Types & Where Clauses
 Not yet implemented.
@@ -579,9 +587,8 @@ Not yet implemented.
 ## Minimal “Hello, World”
 
 ```quanta
-// prints_family: output builtins prints(str), printsp(int), println(int),
-// newline(), print(buf,len), printi(int). Golden stdout captured from x86 and
-// asserted equal on ARM.
+// output builtins: prints(str), printsp(int), println(int),
+// newline(), print(buf,len), printi(int).
 fn main() {
   prints("AB")      // string bytes: "AB"
   printi(42)        // "42"
@@ -626,8 +633,7 @@ fn main() {
 ## Break and Continue
 
 ```quanta
-// break_continue: break/continue in while and for, nested loops.
-// Golden values captured from verified 1.1.9-lineage x86 output; ARM must match.
+// break/continue in while and for, including nested loops.
 fn main() {
   let s=0 let i=0
   while i<10 { i=i+1; if i%2==0 { continue }; s=s+i }
