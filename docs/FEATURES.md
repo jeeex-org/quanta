@@ -175,7 +175,7 @@ Test legend (the **Test?** column):
   remap). Quanta strings are length-prefixed `[8-byte len][null-term data]`; the
   syscall ABI needs `base + 8`. `file_open` works only when called as
   `file_open(path + 8, flags)` (see `file_open_test.quanta`). Fix: correct the
-  path-pointer offset / remap in `emit_bltn2` (compiler/0.0.64/src/x86/emitter.quanta).
+  path-pointer offset / remap in `emit_bltn2` (compiler/0.0.65/src/x86/emitter.quanta).
 - **`getenv(name)` is a STUB** — returns `0` unconditionally (environment parsing
   not yet implemented). Documented as such; `getenv_test.quanta` pins the stub
   behaviour so a future real implementation is caught by the gate.

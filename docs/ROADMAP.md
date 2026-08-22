@@ -1,6 +1,6 @@
 # Quanta ROADMAP — consolidated single source of truth
 
-> **Last updated: 2026-08-22. Current compiler: 0.0.64** (x86-64 ELF emitter,
+> **Last updated: 2026-08-22. Current compiler: 0.0.65** (x86-64 ELF emitter,
 > multi-file tree, Valgrind-clean, self-host `fp=YES`). ARM64 (AArch64) backend
 > is DEFERRED POST-1.0 (see #2 schedule below); the working compiler is x86-64 only.
 >
@@ -130,7 +130,7 @@ SEQUENCING is the contract, not the literal numbers.
 | Grammar + bug-fix | 0.0.51–0.0.55 | tree-sitter grammar (done 0.0.53), residual compiler bugs. **0.0.53 shipped.** |
 | SIMPLE-SURFACE | 0.0.56 | **Simplified syntax landed**: `fn` keyword optional (bare `name(){}` works everywhere, `init()`/`main()` bare OK), `let` optional (bare `name = expr` = local/global), `return` optional (last-expr auto-returns), condition parens optional, `${name}` global / `$[]` local explicit sigils (bare + inside-string interpolation). Goal: bash-like, extremely simple surface. Docs (README/SYNTAX/SPEC) + test_suites + security script synced. |
 | P2 builtins | 0.0.55–0.0.60 | float cmp ✅(0.0.55), proc/env ✅(0.0.55), stdin ✅(0.0.55), fs meta ✅(0.0.55 — path-string remap fixed), string ops, math ✅(sqrt/floor/ceil/abs; sin/cos/tan/pow/log/min/max TODO), atomics, net, introspection ✅(abort/debugbreak), random ✅(getrandom), **`$$(cmd)` external-command substitution (0.0.57)** — `unsafe`-gated runtime `fork`/`execve`/`pipe`/`wait4` via the raw `syscall()` builtin (no libc); `$$(str)`→`/bin/sh -c`, `$$(arr)`→direct `execve` (no shell, injection-safe). Returns `CmdResult{stdout,stderr,status}`. |
-| P3 language | 0.0.61–0.0.71 | **float literals ✅(0.0.61)**, **float-arg-to-builtin ✅(0.0.62: f2i/fadd/fsub/fmul/fdiv read float vregs correctly)**, **user enums ✅(0.0.63: qualified+bare variant resolution, explicit tags, match)**, **modules ✅(0.0.64: mod Name { fn ... } + Mod.fn() qualified calls)**; remaining: tuples, generics, traits, real char/byte/string/bool, ref/mut/move, op-overload, closure literals, and/or/not/true/false/global |
+| P3 language | 0.0.61–0.0.71 | **float literals ✅(0.0.61)**, **float-arg-to-builtin ✅(0.0.62: f2i/fadd/fsub/fmul/fdiv read float vregs correctly)**, **user enums ✅(0.0.63: qualified+bare variant resolution, explicit tags, match)**, **modules ✅(0.0.64: mod Name { fn ... } + Mod.fn() qualified calls)**, **closure literals ✅(0.0.65: `|x,y| { expr }` → [codeptr, env] tuple, callable directly or via fn-typed param)**; remaining: tuples, generics, traits, real char/byte/string/bool, ref/mut/move, op-overload, closure captures, and/or/not/true/false/global |
 | **P4 tooling** | **0.0.72** | **Quanta-native code-writing tool** (edit Quanta source reliably without external scripting — the user's stated goal) |
 | **1.0** | 1.0.0 | Core + builtins complete → std/lib resumes; borrow-checking target for #1 green |
 
@@ -167,10 +167,10 @@ Why post-1.0: the ARM64 backend is a new backend; shipping it while x86 debt
 remains would violate the debt-first rule and split correctness effort.
 Qualification evidence is gathered AFTER the core is complete, not before.
 
-### Current status (0.0.64)
+### Current status (0.0.65)
 
 Shipped + verified (x86-64 only; ARM64 deferred POST-1.0): **true 2-stage self-host** —
-the committed `bin/x86/qc` compiles the 0.0.64 source to a faithful `qc`, verified
+the committed `bin/x86/qc` compiles the 0.0.65 source to a faithful `qc`, verified
 byte-identical to the golden binary (and to a 2nd-stage rebuild); fail-closed memory
 model (overflow/bounds→SIGILL 132, MAP_FAILED→rc=1, undeclared/cyclic→rc=7);
 grammar 0 errors on all 15 modules; Valgrind-clean; differential vs seed.
@@ -204,6 +204,23 @@ broken by two parameter/global name collisions in `emitter.quanta`
 (`mr(mod,…)` vs global `IR_MOD`; `stx(base,disp,src)` vs global `src`), which
 corrupted `mr`'s modrm byte ordering and made every emitted program segfault.
 Both renamed (`mod`→`mmod`, `src`→`sreg`) — self-host is now faithful.
+**0.0.65** closure literals: `|x, y| { expr }` parses as an anonymous function
+value and lowers to a 16-byte `[codeptr, env]` tuple (the same layout `IR_FNVAL` /
+`mk_any` use), emitted by the new `IR_CLOSURE` opcode. The body is registered as a
+synthetic top-level function (`reg_closure`) so the main compile loop emits it with
+its own parameters bound; calls route through the existing `IR_CLOSURE_CALL` ABI
+(args in the standard SysV registers, env in `r10`). Both direct invocation
+(`let f = |x| { x + 1 }` then `f(5)`) and passing a closure to an fn-typed
+parameter (`fn apply(f: fn(i64) i64, x) { return f(x) }`) work.
+Lexer note: single `|` is emitted as `TT_OP` value 124 for closure syntax while
+`||` remains a distinct multi-char token (31868), so logical-OR is unaffected.
+Gate: 96/96 functional (3 new closure tests), 8/8 security, 3/3 performance,
+optimizer differential fuzz 120/120 clean. Bootstrap: **true 2-stage self-host** —
+golden `0.0.64/bin/x86/qc` → 0.0.65 source → `qc`, and a 3rd stage rebuild is
+byte-identical (fixed point, md5 `feca334f…`).
+Known gap: closures do NOT yet capture enclosing locals (`env` is 0); a free
+variable in a closure body is an "undeclared variable" error. Captures are the
+next increment.
 
 Known gap: `getenv` is a stub; string ops (concat via `..` and `${}`/`$[]`
 interpolation) work. See FEATURES.md §I.
