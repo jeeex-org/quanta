@@ -57,15 +57,15 @@ jobs:
           set -e -o pipefail
           bash test_suites/scripts/run_tests.sh 2>&1 | tee /tmp/gate.log
 
-      - name: DIAG post gate log to public issue (debug only, remove later)
+      - name: DIAG commit gate log to repo (debug only, remove later)
         if: failure()
-        env:
-          GH_REPO: jeeex-org/quanta
         run: |
-          curl -s -X POST "https://api.github.com/repos/jeeex-org/quanta/issues" \
-            -H "Content-Type: application/json" \
-            -d "$(python3 -c "import json,pathlib; print(json.dumps({'title':'CI gate log DIAG '+'$(date +%s)','body':pathlib.Path('/tmp/gate.log').read_text()[:6000]}))")" \
-            || echo "issue post failed"
+          cp /tmp/gate.log CI_DIAG.md
+          git config user.email "ci-diag@noreply"
+          git config user.name "CI DIAG"
+          git add -f CI_DIAG.md
+          git commit -m "DIAG gate log $(date +%s)" || echo "nothing to commit"
+          git push || echo "push failed"
 
       - name: Valgrind scan of qc for memory unsafety
         run: |
