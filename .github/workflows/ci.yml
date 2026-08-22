@@ -48,7 +48,20 @@ jobs:
       - name: Functional gate (run_tests.sh)
         env:
           QC: compiler/0.0.64/src/x86/qc
-        run: bash test_suites/scripts/run_tests.sh
+          # Generous regression-guard baseline. CI runners are shared/throttled
+          # vCPUs, so the perf kernel can run far slower than a dev box; the
+          # baseline exists to catch gross optimizer regressions, not runner noise.
+          PERF_BASELINE_MS: "60000"
+        run: |
+          set -e -o pipefail
+          bash test_suites/scripts/run_tests.sh 2>&1 | tee /tmp/gate.log
+
+      - name: Upload gate log on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ci-gate-log
+          path: /tmp/gate.log
 
       - name: Valgrind scan of qc for memory unsafety
         run: |
