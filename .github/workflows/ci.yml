@@ -90,13 +90,13 @@ jobs:
         continue-on-error: true
         working-directory: ${{ github.workspace }}
         run: |
-          SEED=compiler/0.0.63/bin/x86/qc
+          SEED="$GITHUB_WORKSPACE/compiler/0.0.63/bin/x86/qc"
           test -x "$SEED" || { echo "SELFHOST seed missing"; exit 0; }
-          cd compiler/0.0.64/src/x86
+          cd "$GITHUB_WORKSPACE/compiler/0.0.64/src/x86"
           "$SEED" main.quanta qc_rebuilt 2>&1 | tail -3 || true
           if [ -x qc_rebuilt ]; then
             cd "$GITHUB_WORKSPACE"
-            QC=$(pwd)/compiler/0.0.64/src/x86/qc_rebuilt PERF_BASELINE_MS=60000 bash test_suites/scripts/run_tests.sh > /tmp/selfhost.log 2>&1 || true
+            QC="$GITHUB_WORKSPACE/compiler/0.0.64/src/x86/qc_rebuilt" PERF_BASELINE_MS=60000 bash test_suites/scripts/run_tests.sh > /tmp/selfhost.log 2>&1 || true
             echo "SELFHOST $(grep -E 'Results:|functional :' /tmp/selfhost.log | head -3)"
           else
             echo "SELFHOST qc_rebuilt not produced"
