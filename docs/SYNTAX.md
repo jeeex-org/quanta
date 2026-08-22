@@ -465,6 +465,17 @@ fn main() {
 ```
 - Tuple elements accessed via `.0`, `.1`, … (or by destructuring).
 - Array length is part of the type; indexing uses `a[i]` (bounds‑checked by default, traps on out‑of‑range).  Use `len(a)` for the element count — a negative index such as `a[-1]` is out of range and **traps** (SIGILL, rc=132), it is not a length shorthand.
+- Append with the method form `a.push(v)`, which grows the array in place (qword
+  stride) and rebinds `a`:
+
+```quanta
+let a = [9]
+a.push(7)
+a[1]        // 7
+```
+
+  The bare-function form `push(v, e)` is the **byte-stride string** push used with
+  `str(...)`, not an array append — `push(arr, x)` will not do what you want.
 
 ---
 
@@ -497,7 +508,7 @@ include std/io          // bare name: searches ./std, ./, /usr/local/quanta/std,
 
 ## 11. Generics, Traits, and Implementations
 
-Generic type parameters `<T>` are **not usable** (parsed, but silently produce wrong results — see §Generic Functions).  Traits, impls, and struct literals **are** implemented.
+Generic type parameters `<T>` are **implemented** (type-erased, not monomorphised — see §Generic Functions).  Traits, impls, and struct literals **are** implemented.
 
 ### Generic Functions
 ```
@@ -519,12 +530,11 @@ fn main() {
     return doubled[0] + doubled[1] + doubled[2]
 }
 ```
-- **Not usable.** Type parameters are *parsed* — the example above compiles
-  without error — but they are not implemented semantically: it returns `0`
-  instead of `12`. A generic signature is accepted and then produces wrong
-  results rather than a diagnostic, so do not rely on generics. Trivial cases
-  where the parameter is only passed through (e.g. `fn id<T>(x: T) -> T`) do
-  happen to work, which makes the gap easy to miss.
+- **Implemented.** The example above compiles and returns `12`. Type parameters
+  are accepted on functions and erased at codegen (no monomorphisation): they
+  constrain nothing at compile time, so a generic signature is documentation
+  plus a pass-through, not a checked contract. Associated types and `where`
+  clauses are not implemented.
 
 ### Traits (interfaces)
 

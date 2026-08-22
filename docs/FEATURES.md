@@ -114,6 +114,9 @@ Test legend (the **Test?** column):
 | unsigned arith | ✅ done | ✅ gate | unsigned_ops (udiv/umod/ult/ugt/ulte/ugte) |
 | operator overloading | ❌ todo | ❌ none | |
 | range `..` expression | ❌ todo | ❌ none | needed by for-range |
+| array push `a.push(v)` | ✅ done | ✅ gate | array_push_method rc=7, array_push_empty_annot rc=7, array_push_closure_mix rc=35. Method form only — bare `push(v,e)` is the byte-stride STRING push. Silently returned 0 in 0.0.65 (IR_CLOSURE/IR_APUSH both = opcode 72); fixed 0.0.66 |
+| generics `<T>` | 🟡 type-erased | ✅ gate | generics_test rc=42; `map<T,U>` example returns 12. Parsed and erased at codegen — no monomorphisation, no compile-time constraint checking |
+| match guards `n if n>3 =>` | ❌ todo | ❌ none | PARSES then silently takes NO arm and yields 0 — silent wrong answer, not a diagnostic |
 | closure literals `\|a\| { a+1 }` | ✅ done (0.0.65) | ✅ gate | closure_basic rc=6, closure_multi_param rc=7, closure_higher_order rc=42; braces required; captures NOT yet supported (env=0) |
 
 ## E. Memory & Runtime
@@ -175,7 +178,7 @@ Test legend (the **Test?** column):
   remap). Quanta strings are length-prefixed `[8-byte len][null-term data]`; the
   syscall ABI needs `base + 8`. `file_open` works only when called as
   `file_open(path + 8, flags)` (see `file_open_test.quanta`). Fix: correct the
-  path-pointer offset / remap in `emit_bltn2` (compiler/0.0.65/src/x86/emitter.quanta).
+  path-pointer offset / remap in `emit_bltn2` (compiler/0.0.66/src/x86/emitter.quanta).
 - **`getenv(name)` is a STUB** — returns `0` unconditionally (environment parsing
   not yet implemented). Documented as such; `getenv_test.quanta` pins the stub
   behaviour so a future real implementation is caught by the gate.
