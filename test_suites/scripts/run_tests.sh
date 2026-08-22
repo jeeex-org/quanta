@@ -2,8 +2,10 @@
 # Quanta test runner — run from quanta project root
 set -e
 
-# NEVER let qemu crashes dump 148GB core files into the repo CWD
-ulimit -c 0
+# NEVER let qemu crashes dump 148GB core files into the repo CWD.
+# Non-fatal: some CI/sandbox runners deny ulimit changes (Operation not permitted);
+# that must not abort the gate.
+ulimit -c 0 2>/dev/null || true
 
 QC="${QC:-./bin/qc}"
 TEST_SUITES="./test_suites"
