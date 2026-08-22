@@ -2,9 +2,10 @@ name: ci
 
 # Quanta compiler continuous integration.
 #
-# Runs on every push/PR to main. The committed compiler under test is the
+# Runs on every push/PR to main. The compiler under test is the committed
 # golden self-hosting binary at compiler/0.0.64/bin/x86/qc (built and verified
-# at the 0.0.64 feature release). Every stage must pass or the build is RED:
+# at the 0.0.64 feature release; valgrind-clean). Every stage must pass or the
+# build is RED:
 #   1. Compiler present  - the golden bin/x86/qc exists and is executable.
 #   2. Functional gate   - test_suites/scripts/run_tests.sh (functional +
 #      security + perf layers). A compile-fail or wrong exit code fails the build.
@@ -35,7 +36,7 @@ jobs:
   build-and-gate:
     runs-on: ubuntu-latest
     permissions:
-      contents: write
+      contents: read
     steps:
       - uses: actions/checkout@v4
 
@@ -43,73 +44,56 @@ jobs:
         run: sudo apt-get update && sudo apt-get install -y valgrind
 
       - name: Verify golden compiler present
+        working-directory: ${{ github.workspace }}
         run: |
           set -e
           QC=compiler/0.0.64/bin/x86/qc
           test -x "$QC" || { echo "golden compiler bin/x86/qc missing"; exit 1; }
           echo "golden qc: $(md5sum $QC | cut -d' ' -f1)"
-          # Use the golden binary as the compiler under test for all stages.
-          cp "$QC" compiler/0.0.64/src/x86/qc
 
       - name: Functional gate (run_tests.sh)
+        working-directory: ${{ github.workspace }}
         env:
-          QC: compiler/0.0.64/src/x86/qc
+          QC: compiler/0.0.64/bin/x86/qc
           PERF_BASELINE_MS: "60000"
         run: |
-          echo "GATE_CWD=$(pwd)"
-          echo "QC=[$QC] exists=$(test -x "$QC" && echo yes || echo no)"
-          echo "script exists=$(test -x test_suites/scripts/run_tests.sh && echo yes || echo no)"
-          echo "::error::DIAG cwd=$(pwd) qc_exists=$(test -x "$QC" && echo yes || echo no) script_exists=$(test -x test_suites/scripts/run_tests.sh && echo yes || echo no)"
-          bash test_suites/scripts/run_tests.sh 2>&1 | tee /tmp/gate.log
-          echo "::error::DIAG gate_tail=$(tail -5 /tmp/gate.log | tr '\n' '|')"
+          set -e
+          bash test_suites/scripts/run_tests.sh > /tmp/gate.log 2>&1
+          cat /tmp/gate.log
           grep -qE "functional : RED|FAIL \(compile\)|FAIL [a-z]" /tmp/gate.log && exit 1 || true
 
       - name: Valgrind scan of qc for memory unsafety
+        working-directory: ${{ github.workspace }}
         run: |
           set -e
           valgrind --error-exitcode=42 --leak-check=summary \
-            compiler/0.0.64/src/x86/qc test_suites/codes/simple.quanta /tmp/val_smoke.bin 2> /tmp/vg.log
+            compiler/0.0.64/bin/x86/qc test_suites/codes/simple.quanta /tmp/val_smoke.bin 2> /tmp/vg.log
           echo "Valgrind: no errors reported"
 
       - name: Fuzz (fail-closed proof)
+        working-directory: ${{ github.workspace }}
         run: |
           set -e
-          python3 tools/fuzz/fuzz_qc.py --qc compiler/0.0.64/src/x86/qc --iter 5000
+          python3 tools/fuzz/fuzz_qc.py --qc compiler/0.0.64/bin/x86/qc --iter 5000
 
       - name: Differential (cross-check vs committed qc)
+        working-directory: ${{ github.workspace }}
         run: |
           set -e
           python3 tools/diff_test/diff_qc.py \
-            --current compiler/0.0.64/src/x86/qc \
+            --current compiler/0.0.64/bin/x86/qc \
             --seed compiler/0.0.64/bin/x86/qc
-
-      - name: DIAG commit gate log to ci-diag branch (debug only, remove later)
-        if: always()
-        env:
-          GITHUB_TOKEN: ${{ github.token }}
-        run: |
-          mkdir -p docs
-          {
-            echo "# CI DIAG $(date -u)"
-            echo "## gate"; cat /tmp/gate.log 2>/dev/null
-            echo "## selfhost"; cat /tmp/selfhost.log 2>/dev/null
-            echo "## vg"; cat /tmp/vg.log 2>/dev/null
-          } > docs/CI_DIAG.md
-          git config user.email "ci-diag@noreply"
-          git config user.name "CI DIAG"
-          git add -f docs/CI_DIAG.md
-          git commit -m "DIAG $(date +%s)" || echo "nothing"
-          git push "https://x-access-token:${GITHUB_TOKEN}@github.com/jeeex-org/quanta.git" HEAD:refs/heads/ci-diag --force || echo "push failed"
 
       - name: Self-host rebuild (NON-BLOCKING — surfaces self-host divergence)
         continue-on-error: true
+        working-directory: ${{ github.workspace }}
         run: |
           SEED=compiler/0.0.64/bin/x86/qc
           cd compiler/0.0.64/src/x86
           "$SEED" main.quanta qc_rebuilt 2>&1 | tail -3 || true
           if [ -x qc_rebuilt ]; then
-            QC=$(pwd)/qc_rebuilt PERF_BASELINE_MS=60000 bash $GITHUB_WORKSPACE/test_suites/scripts/run_tests.sh 2>&1 | tee /tmp/selfhost.log || true
-            echo "::warning::SELFHOST $(grep -E 'Results:|functional :' /tmp/selfhost.log | head -3)"
+            QC=$(pwd)/qc_rebuilt PERF_BASELINE_MS=60000 bash "$GITHUB_WORKSPACE/test_suites/scripts/run_tests.sh" > /tmp/selfhost.log 2>&1 || true
+            echo "SELFHOST $(grep -E 'Results:|functional :' /tmp/selfhost.log | head -3)"
           else
-            echo "::warning::SELFHOST qc_rebuilt not produced (self-host divergence)"
+            echo "SELFHOST qc_rebuilt not produced (self-host divergence)"
           fi
