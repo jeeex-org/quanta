@@ -60,13 +60,13 @@ Test legend (the **Test?** column):
 | u16 | 45 | ❌ todo | ❌ none | lexed, unparsed |
 | u32 | 46 | 🟡 partial | ✅ gate | u32 mask builtin exists |
 | u64 | 47 | 🟡 partial | ✅ gate | u64 mask builtin exists |
-| bool | 49 | ❌ todo | ❌ none | lexed, unparsed |
-| char | 50 | ❌ todo | ❌ none | lexed, unparsed |
-| byte | 51 | ❌ todo | ❌ none | lexed, unparsed |
-| int | 55 | ❌ todo | ✅ gate | signed default alias; bare literal type |
-| and / or / not | 13/14/15 | ❌ todo | ❌ none | lexed, NOT parsed (use && / \|\| / !) |
-| true / false | 10/11 | ❌ todo | ❌ none | lexed, NOT parsed (use 1/0) |
-| global | 20 | ❌ todo | ❌ none | lexed, NOT parsed (use extern/let) |
+| bool | 49 | ✅ done | ✅ gate | bool type works (true=1, false=0) |
+| char | 50 | ✅ done | ✅ gate | char_test rc=65. `'A'` = ASCII 65 |
+| byte | 51 | ✅ done | ✅ gate | byte literal syntax works |
+| int | 55 | ✅ done | ✅ gate | signed default alias; bare literal type |
+| and / or / not | 13/14/15 | ✅ done (0.0.70) | ✅ gate | logical_keywords rc=4 (was 0), logical_keywords_shortcircuit rc=2. `and`/`or` keywords behave exactly like `&&`/`||` including short-circuit |
+| true / false | 10/11 | ✅ done | ✅ gate | true returns 1, false returns 0 |
+| global | 20 | ✅ done | ✅ gate | globals_test rc=42. Top-level `name = value` = global |
 
 ## B. Core — Types
 | Type | Status | Test? | Notes |
