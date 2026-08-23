@@ -1,6 +1,6 @@
 # Quanta ROADMAP — consolidated single source of truth
 
-> **Last updated: 2026-08-24. Current compiler: 0.0.79** (x86-64 ELF emitter,
+> **Last updated: 2026-08-24. Current compiler: 0.0.80** (x86-64 ELF emitter,
 > multi-file tree, Valgrind-clean, self-host `fp=YES`). ARM64 (AArch64) backend
 > is DEFERRED POST-0.1.0 (see #2 schedule below); the working compiler is x86-64 only.
 >
@@ -200,20 +200,31 @@ verbatim fixes it: self-host fixpoint `bc3094d7` is restored and `loopd`
 (Σ i/3) = 12. Verified that the bootstrap choice is NOT the cause — `0.0.77` and
 the committed `0.0.78/bin/qc` both converge to the same `bc3094d7` fixpoint.
 
-INTEGER `/` and `%` therefore remain **truncating (C-style)** in 0.0.79 (same as
-0.0.78). Floor division/modulo is a tracked 0.0.80 item.
+INTEGER `/` and `%` are now **floor division + Python-style modulo** (0.0.80),
+verified against Python for all sign combinations including 64-bit
+boundary cases (`-2534951700636970 % 987654 = 935558`, etc.). Implementation:
+uniform `idiv` + a branchless floor-correction (`adj = ((r^b)<0?-1:0) &
+((r|-r)<0?-1:0)`; `q+=adj`, `r+=(adj&b)`), allocator-safe (only `res`'s own spill
+home is written). The `compute_magic` strength-reduction path was dropped in favor
+of the uniform `idiv` emit (the fixpoint is preserved and the compiler source has
+no division hot-loops where magic mattered).
 
-Regression: core programs (fib, loop-sum, large multiply), plain add, and runtime
-division (loop `i/3` = 12) all verified; the self-host fixpoint is byte-identical.
-Pending feature tests (bswap/popcount/defer/generics/import/memcpy) are
-unimplemented intrinsics, not regressions.
+Regression: core programs (fib, loop-sum, large multiply), plain add,
+runtime division (loop `i/3` = 12), and 13 sign-combination floor/mod cases all
+verified; the self-host fixpoint is byte-identical (`qc` compiled by itself
+reproduces itself). Pending feature tests (bswap/popcount/defer/generics/
+import/memcpy) are unimplemented intrinsics, not regressions.
 
-Next: 0.0.80 — (a) floor division + Python-style modulo, layered on top of the
-restored `compute_magic` handler (add the floor correction only on the `idiv`
-paths: variable divisor and power-of-2 constant; the magic path already produces
-trunc q and needs a remainder-sign adjustment); (b) `int` widened to i4096 (64
-limbs) so 250-digit literals + PQC/Kademlia key arithmetic are representable
-without overflow; `big` (heap bignum) opt-in later.
+Next: **(b) `int` widened to i4096 (64 limbs)** so 250-digit literals + PQC/
+Kademlia key arithmetic are representable without overflow; `big` (heap bignum)
+opt-in later. HONEST SCOPE: this is a large, distinct feature. The current
+`int` is a single 64-bit qword (8-byte spill slots, `rax`/`add`/`imul`/`idiv`
+arithmetic, no limb model, no `big` type). i4096 requires: a 64-limb in-memory
+representation + a `big`/arbitrary-precision type; rewriting ADD/SUB/MUL/DIV/
+MOD/NEG/SHL/SHR/comparisons to multi-precision (ADC/SBB/`mulx`/`divq` chains);
+widening vreg/stack slots 8→512 bytes; and updating the call ABI, array/struct
+strides, and global layout. This is staged compiler work, not a one-pass fix, and
+must preserve the self-host fixpoint. Not faked in 0.0.80.
 
 ### Current status (0.0.78)
 
