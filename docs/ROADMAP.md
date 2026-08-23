@@ -1,6 +1,6 @@
 # Quanta ROADMAP — consolidated single source of truth
 
-> **Last updated: 2026-08-23. Current compiler: 0.0.67** (x86-64 ELF emitter,
+> **Last updated: 2026-08-23. Current compiler: 0.0.68** (x86-64 ELF emitter,
 > multi-file tree, Valgrind-clean, self-host `fp=YES`). ARM64 (AArch64) backend
 > is DEFERRED POST-1.0 (see #2 schedule below); the working compiler is x86-64 only.
 >
@@ -130,7 +130,7 @@ SEQUENCING is the contract, not the literal numbers.
 | Grammar + bug-fix | 0.0.51–0.0.55 | tree-sitter grammar (done 0.0.53), residual compiler bugs. **0.0.53 shipped.** |
 | SIMPLE-SURFACE | 0.0.56 | **Simplified syntax landed**: `fn` keyword optional (bare `name(){}` works everywhere, `init()`/`main()` bare OK), `let` optional (bare `name = expr` = local/global), `return` optional (last-expr auto-returns), condition parens optional, `${name}` global / `$[]` local explicit sigils (bare + inside-string interpolation). Goal: bash-like, extremely simple surface. Docs (README/SYNTAX/SPEC) + test_suites + security script synced. |
 | P2 builtins | 0.0.55–0.0.60 | float cmp ✅(0.0.55), proc/env ✅(0.0.55), stdin ✅(0.0.55), fs meta ✅(0.0.55 — path-string remap fixed), string ops, math ✅(sqrt/floor/ceil/abs; sin/cos/tan/pow/log/min/max TODO), atomics, net, introspection ✅(abort/debugbreak), random ✅(getrandom), **`$$(cmd)` external-command substitution (0.0.57)** — `unsafe`-gated runtime `fork`/`execve`/`pipe`/`wait4` via the raw `syscall()` builtin (no libc); `$$(str)`→`/bin/sh -c`, `$$(arr)`→direct `execve` (no shell, injection-safe). Returns `CmdResult{stdout,stderr,status}`. |
-| P3 language | 0.0.61–0.0.71 | **float literals ✅(0.0.61)**, **float-arg-to-builtin ✅(0.0.62: f2i/fadd/fsub/fmul/fdiv read float vregs correctly)**, **user enums ✅(0.0.63: qualified+bare variant resolution, explicit tags, match)**, **modules ✅(0.0.64: mod Name { fn ... } + Mod.fn() qualified calls)**, **closure literals ✅(0.0.65: `|x,y| { expr }` → [codeptr, env] tuple, callable directly or via fn-typed param)**, **array push fix ✅(0.0.66: IR_CLOSURE/IR_APUSH opcode collision silently zeroed every pushed element)**, **closure captures ✅(0.0.67: free vars of the enclosing fn captured by value into a heap env array)**; remaining: tuples, real char/byte/string/bool, ref/mut/move, op-overload, match guards, generic monomorphisation (type params are erased today), and/or/not/true/false/global |
+| P3 language | 0.0.61–0.0.71 | **float literals ✅(0.0.61)**, **float-arg-to-builtin ✅(0.0.62: f2i/fadd/fsub/fmul/fdiv read float vregs correctly)**, **user enums ✅(0.0.63: qualified+bare variant resolution, explicit tags, match)**, **modules ✅(0.0.64: mod Name { fn ... } + Mod.fn() qualified calls)**, **closure literals ✅(0.0.65: `|x,y| { expr }` → [codeptr, env] tuple, callable directly or via fn-typed param)**, **array push fix ✅(0.0.66: IR_CLOSURE/IR_APUSH opcode collision silently zeroed every pushed element)**, **closure captures ✅(0.0.67: free vars of the enclosing fn captured by value into a heap env array)**, **user-fn-beats-builtin ✅(0.0.68: was enforced in only 2 of 86 builtin branches, so a user `fn abs` was silently hijacked)**; remaining: tuples, real char/byte/string/bool, ref/mut/move, op-overload, match guards, generic monomorphisation (type params are erased today), and/or/not/true/false/global |
 | **P4 tooling** | **0.0.72** | **Quanta-native code-writing tool** (edit Quanta source reliably without external scripting — the user's stated goal) |
 | **1.0** | 1.0.0 | Core + builtins complete → std/lib resumes; borrow-checking target for #1 green |
 
@@ -167,10 +167,10 @@ Why post-1.0: the ARM64 backend is a new backend; shipping it while x86 debt
 remains would violate the debt-first rule and split correctness effort.
 Qualification evidence is gathered AFTER the core is complete, not before.
 
-### Current status (0.0.67)
+### Current status (0.0.68)
 
 Shipped + verified (x86-64 only; ARM64 deferred POST-1.0): **true 2-stage self-host** —
-the committed `bin/x86/qc` compiles the 0.0.67 source to a faithful `qc`, verified
+the committed `bin/x86/qc` compiles the 0.0.68 source to a faithful `qc`, verified
 byte-identical to the golden binary (and to a 2nd-stage rebuild); fail-closed memory
 model (overflow/bounds→SIGILL 132, MAP_FAILED→rc=1, undeclared/cyclic→rc=7);
 grammar 0 errors on all 15 modules; Valgrind-clean; differential vs seed.
@@ -267,6 +267,41 @@ Gate: 102/102 functional (3 new capture tests, each failing on 0.0.66), 8/8
 security, 3/3 performance, differential fuzz 120/120, compiler fuzz 5000/0
 crashes, Valgrind 0 errors, differential 5/5 vs 0.0.66. Self-host fixed point
 md5 `62b2e0cd…` across stages 1/2/3.
+**0.0.68** user functions win over builtins (silent-hijack fix).
+The documented rule "a user-defined fn MUST win over this builtin" was enforced
+in exactly **2** of **86** builtin branches (`push`/`pop`). Every other builtin
+silently hijacked a same-named user function, with no diagnostic:
+`fn abs(x){ if x<0 { return 0-x }; return x }` then `abs(-42)` returned **0**,
+because the FPU builtin `abs` read the integer bits as a double. `pow` likewise
+(it is `exp(b·ln a)`), and `gcd`/`lcm` cascaded because they call `abs`.
+Fixed with ONE guard at the top of `emit_bltn`/`emit_bltn2` instead of 86 ad-hoc
+checks; the two per-branch checks are now redundant. Returning 0 makes codegen
+emit a normal patched call to the user's function.
+**Deliberate exception — primitive intrinsics are NOT overridable:**
+`mem_load`/`mem_store`/`mem_load8`/`mem_store8` and `fadd`/`fsub`/`fmul`/`fdiv`
+(`is_prim_intrin`). A blanket guard **broke the self-host**: the compiler defines
+its own same-named wrappers in `helpers.quanta` (`fn w64(p,v) { mem_store(p,v) }`
+alongside `fn mem_store(p,v) { … w64(p,v) }` — mutually recursive, with the
+builtin breaking the cycle), so honouring user-wins there is infinite recursion.
+Observed failure was itself silent: stage 2 exited rc=0 while writing NO output
+file, and stage1 ≠ stage2. Caught only by the fixpoint check, which is exactly
+why that gate exists.
+Gate: 105/105 functional (3 new tests), 8/8 security, 3/3 performance,
+differential fuzz 120/120, compiler fuzz 5000/0 crashes, Valgrind 0 errors,
+differential 5/5 vs 0.0.67, 0 duplicate opcodes. Self-host fixed point md5
+`308cf0c0…` across stages 1/2/3.
+New tests, each wrong on 0.0.67: `user_fn_beats_builtin` (42, was 0),
+`user_fn_beats_builtin_chain` (38, was a SIGILL trap 132),
+`builtin_still_inline` (3 — proves un-shadowed builtins and the primitive
+intrinsics still work inline).
+NOTE: `lib/std/*` is deferred POST-0.1.0 and is deliberately NOT in the gate,
+but this core fix repaired it as a side effect: `std_math_test` self-reports
+"expect 19" and returned **9** on 0.0.67 — it returns **19** on 0.0.68, because
+all four of its failures (`abs`, `pow`, `gcd`, `lcm`) were this same builtin
+hijack, not library bugs (`lib/std/math.quanta` was always correct). Verified
+against their self-reported expectations on 0.0.68: std_math 19, std_str 13,
+std_fs 9, std_vec 8, std_map 6 — all matching. They stay ungated until after
+0.1.0 per the release plan.
 
 Known gap: `getenv` is a stub; string ops (concat via `..` and `${}`/`$[]`
 interpolation) work. See FEATURES.md §I.

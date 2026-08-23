@@ -32,7 +32,7 @@ ISO 26262 ASIL A–B, contingent on closing the gaps in §6. Higher levels
 |--------|-------------|---------------|
 | TCL assessment | Tool Confidence Level from impact + error detection | Partially: impact = high (codegen), detection = low → would require qualification |
 | Documentation | Tool spec + safety manual | **SPEC.md (v0.0.53) + this manual exist** |
-| Validation | Demonstrate correct behavior | Partial: self-host fixed-point (2-stage, byte-identical) + 102-test gate + fail-closed tests (§4) |
+| Validation | Demonstrate correct behavior | Partial: self-host fixed-point (2-stage, byte-identical) + 105-test gate + fail-closed tests (§4) |
 | Configuration mgmt | Version-controlled, reproducible | **Yes**: per-version `compiler/0.0.XX/` dirs, git-tagged |
 | Independent implementation | Cross-check tool | **PARTIAL** — differential vs bootstrap-SEED qc (5/5 parity, 0.0.53); full x86↔ARM64 differential tracked at 0.0.72+ (ROADMAP §Standards) |
 | Formal proof | Mathematical correctness | **NO** — semantics defined by emitter behavior (§6.1) |
@@ -70,7 +70,7 @@ All evidence below was produced this session (2026-08-16) against
 `compiler/0.0.53/`:
 
 1. **Self-host fixed point**: 2-stage bootstrap
-   `committed bin/x86/qc → 0.0.67 source → qc`, all rc=0,
+   `committed bin/x86/qc → 0.0.68 source → qc`, all rc=0,
    rebuilt `qc` byte-identical to committed `qc` (and to a 2nd-stage rebuild). (A miscompiling
    compiler almost always fails to bootstrap — this is a strong
    end-to-end correctness signal.)
@@ -137,7 +137,7 @@ Stage 6, NOT yet built).
 ### 6.4 Process artifacts (MED)
 - No requirements traceability matrix (each IR op / builtin → requirement
   → test).
-- No documented verification plan beyond the 102-test gate.
+- No documented verification plan beyond the 105-test gate.
 - No change-impact analysis procedure.
 - No tool-version qualification record per ISO 26262-8 §11.4.
 

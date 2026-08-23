@@ -173,9 +173,9 @@ properties, so every backend inherits them by construction.
 ## 6. Compilation & execution model
 
 - **Self-hosting**: the compiler is written in Quanta and bootstraps via a
-  2-stage self-host: the committed `bin/x86/qc` compiles the 0.0.67 source to
+  2-stage self-host: the committed `bin/x86/qc` compiles the 0.0.68 source to
   a faithful `qc`, verified byte-identical to a 2nd-stage rebuild
-  (102/102 gate). Two parameter/global name collisions in the emitter
+  (105/105 gate). Two parameter/global name collisions in the emitter
   (`mr(mod,…)`/`IR_MOD`, `stx(…,src)`/`src`) were fixed to make self-host faithful.
 - **Output**: ELF (x86-64 / AArch64) emitted with mode `0755` (executable)
   via `file_open(path, O_WRONLY|O_CREAT|O_TRUNC, 0755)`.

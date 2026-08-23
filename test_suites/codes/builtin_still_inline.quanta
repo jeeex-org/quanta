@@ -1,0 +1,16 @@
+// Builtins must STILL work inline when no user fn shadows them, and the
+// primitive intrinsics (mem_load/mem_store, fadd/fsub/fmul/fdiv) must remain
+// non-overridable -- the compiler's own w64 <-> mem_store wrappers are mutually
+// recursive with the builtin breaking the cycle, so making those user-winnable
+// is infinite recursion and the self-host stops bootstrapping.
+fn main() {
+    let ok = 0
+    if len("hello") == 5 { ok = ok + 1 }        // string builtin intact
+    let p = mem_alloc(8)
+    mem_store(p, 41)
+    if mem_load(p) == 41 { ok = ok + 1 }        // primitive intrinsic intact
+    let a = [9]
+    a.push(7)
+    if a[1] == 7 { ok = ok + 1 }                // array push still routed right
+    return ok                                   // 3
+}

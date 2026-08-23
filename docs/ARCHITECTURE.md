@@ -5,10 +5,10 @@ native AOT compiler verified + hardened; multi-mode architecture designed
 but only the native AOT backend is built.
 
 ## WHAT IS REAL (verified, not claimed)
-- `compiler/0.0.67/src/x86/` — multi-file x86-64 Quanta compiler (AArch64 backend planned POST-1.0)
+- `compiler/0.0.68/src/x86/` — multi-file x86-64 Quanta compiler (AArch64 backend planned POST-1.0)
   (main.quanta + helpers/lexer/parse/codegen/emitter/elf/globals/quanta).
   Self-hosts (2-stage: `bin/x86/qc` -> source -> `qc`, byte-identical fixed point).
-- `compiler/0.0.67/bin/x86/qc` is the golden compiler; it compiles the 0.0.67
+- `compiler/0.0.68/bin/x86/qc` is the golden compiler; it compiles the 0.0.68
   source to a faithful `qc` (the verified self-host path). See README verification block.
 - Security (fail-closed): overflow trap (ud2 -> SIGILL rc=132), bounds trap,
   `unsafe{}` opt-out; MAP_FAILED -> abort rc=1 (NOT SIGSEGV 139, fixed 0.0.49);
@@ -26,8 +26,8 @@ but only the native AOT backend is built.
   independent implementation, manual memory model).
 
 ## INVARIANTS (never break these)
-1. Self-host: `cd compiler/0.0.67/src/x86; SEED=../../../../compiler/0.0.67/bin/x86/qc; $SEED main.quanta qc && ./qc main.quanta qc2` must produce byte-identical qc==qc2 (2-stage fixed point).
-2. 102/102 test_suites must pass after any change (plus security 8/8, perf 3/3).
+1. Self-host: `cd compiler/0.0.68/src/x86; SEED=../../../../compiler/0.0.68/bin/x86/qc; $SEED main.quanta qc && ./qc main.quanta qc2` must produce byte-identical qc==qc2 (2-stage fixed point).
+2. 105/105 test_suites must pass after any change (plus security 8/8, perf 3/3).
 3. No ARM emitter code in the x86-only source (ARM is a SEPARATE future
    backend, built from scratch). The x86 emitter was de-duplicated in 0.0.46
    (the entire emitter had been copy-pasted as two blocks; only the second
@@ -57,7 +57,7 @@ is the STABILITY BOUNDARY every backend agrees on. See docs/LANGUAGE_DESIGN.md.
 ## HOW TO RESUME
 1. Read docs/ARCHITECTURE.md (this file), docs/LANGUAGE_DESIGN.md, docs/SYNTAX.md, docs/FEATURES.md.
 2. Re-establish green state: run `bash test_suites/scripts/run_tests.sh` (expect
-   102/102 functional + 8/8 security + 3/3 perf, exit 0). Self-host: see INVARIANTS #1.
+   105/105 functional + 8/8 security + 3/3 perf, exit 0). Self-host: see INVARIANTS #1.
 3. Next concrete task = Stage 1 interpreter. Mirror emit_bltn builtin
    semantics (src/x86/emitter.quanta) in a register VM. Wire
    `--interp` in main() to bypass ci_func/write_elf and run the IR directly.

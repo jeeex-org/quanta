@@ -160,6 +160,12 @@ main() {                            // bare main
   - Multiple values can be returned via a tuple: `return a, b, c;` → caller can destructure with `let x, y = f()`.
 - **Extern linkage** (C ABI): `extern "C" fn name(...) -> Rt;` – see §9.
 - **Function attributes** (via tokens): `unsafe`, `alias`, etc.
+- **Shadowing a builtin.** Defining a function with the same name as a builtin
+  (`abs`, `pow`, `min`, `len`, …) is allowed: your function wins and the builtin
+  is not used. The exceptions are the primitive intrinsics
+  `mem_load`/`mem_store`/`mem_load8`/`mem_store8` and
+  `fadd`/`fsub`/`fmul`/`fdiv`, which are always emitted inline and cannot be
+  overridden.
 
 ### Closure literals
 
