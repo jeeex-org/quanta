@@ -32,7 +32,7 @@ Test legend (the **Test?** column):
 | continue | 9 | ✅ done | ✅ gate | |
 | return | 16 | ✅ done | ✅ gate | |
 | unsafe | 18 | ✅ done | ✅ gate | unsafe_block |
-| match | 22 | 🟡 partial | ✅ gate | match_test rc=132 (gate GREEN); expression arms only (block arms TODO) |
+| match | 22 | ✅ done | ✅ gate | match_test rc=132 (gate GREEN); expression + block arms (match block arms `1 => { }` done) |
 | const | 57 | ✅ done | ✅ gate | const_test |
 | defer | token | ✅ done | ✅ gate | defer_test |
 | in | token | ✅ done | ✅ gate | for-in |
