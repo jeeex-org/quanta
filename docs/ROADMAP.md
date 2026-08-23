@@ -205,11 +205,18 @@ Regression: core programs (fib, loop-sum, large multiply) and a plain add verifi
 the self-host fixpoint is byte-identical. Pending feature tests (bswap/popcount/
 defer/generics/import/memcpy) are unimplemented intrinsics, not regressions.
 
-Next: 0.0.80 — (a) floor division + Python-style modulo, implemented with a
-self-host-safe scratch strategy (study the allocator's spill-home aliasing rules
-first, or route the correction through allocator-owned temporaries); (b) `int`
-widened to i4096 (64 limbs) so 250-digit literals + PQC/Kademlia key arithmetic
-are representable without overflow; `big` (heap bignum) opt-in later.
+Next: 0.0.80 — (a) floor division + Python-style modulo, self-host-safe. The
+breakage is NOT in the x86 bytes (validated in C) and NOT `ovf_trap` (ruled out);
+it is an allocator/state invariant in the IR_DIV emit block. To pin it without
+self-host noise: (i) build a test harness that FORCES runtime division (loop
+counter / IO, which the optimizer cannot fold) and disassembles the emitted idiv
+sequence; (ii) bisect the emit block statement-by-statement (the trunc helper
+`flush_clob; rbp; rbp; rcqo; ridiv; sdef` self-hosts — each added `wbp`/`rr`/`rxor`/
+`rneg`/`ra`/`eb` must be checked for allocator-state side effects via `rw`); (iii)
+prefer routing the floor correction through `adistinct`/`flush_clob`-reclaimed
+temporaries rather than `wbp`/`rbp` on spill homes. (b) `int` widened to i4096 (64
+limbs) so 250-digit literals + PQC/Kademlia key arithmetic are representable
+without overflow; `big` (heap bignum) opt-in later.
 
 ### Current status (0.0.78)
 
