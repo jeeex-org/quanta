@@ -16,7 +16,7 @@ let opt_on = 1
 // the ops they contain (so low-level primitives / compiler internals opt out).
 // The flag `--no-overflow-trap` turns it OFF if a program deliberately relies on
 // two's-complement wraparound and hasn't been ported.
-let ovf_trap = 1   // default ON: signed add/sub/mul trap on overflow (fail-closed). Opt OUT with -nowrap / --no-overflow-trap.
+let ovf_trap = 1
 let cur_fnname = 0
 let cur_fnnlen = 0
 // P10: index of the function currently being compiled (for fn-param lookup).
@@ -85,13 +85,9 @@ fn constfold(i, op, r0, a0, a1) {
         if op==IR_ADD { f=v0+v1 }
         else if op==IR_SUB { f=v0-v1 }
         else if op==IR_MUL { f=v0*v1 }
-        else if op==IR_DIV { f=v0/v1 }
-        else if op==IR_MOD { f=v0%v1 }
-        else if op==IR_SHL { f=v0<<v1 }
-        else if op==IR_SHR { f=v0>>v1 }
         else if op==IR_BAND { f=v0&v1 }
-        else if op==IR_BOR { f=(v0|v1) }
-        else if op==IR_BXOR { f=(v0^v1) }
+        else if op==IR_BOR { f=v0|v1 }
+        else if op==IR_BXOR { f=v0^v1 }
         else if op==IR_OR { if v0!=0||v1!=0 { f=1 } else { f=0 } }
         else if op==IR_AND { if v0!=0&&v1!=0 { f=1 } else { f=0 } }
         else if op==IR_EQ { if v0==v1 { f=1 } else { f=0 } }
@@ -156,9 +152,9 @@ fn opt_func() {
                 else if (op==IR_ADD||op==IR_SUB||op==IR_BOR||op==IR_BXOR) && v1==0 { w64(ir+opt_i*IRS,IR_MOV); w64(ir+opt_i*IRS+8,r0); w64(ir+opt_i*IRS+16,a0); w64(ir+opt_i*IRS+24,0); w64(ir+opt_i*IRS+32,0) }
                 else if op==IR_DIV && v1==1 { w64(ir+opt_i*IRS,IR_MOV); w64(ir+opt_i*IRS+8,r0); w64(ir+opt_i*IRS+16,a0); w64(ir+opt_i*IRS+24,0); w64(ir+opt_i*IRS+32,0) }
                 else if (op==IR_SHL||op==IR_SHR) && v1==0 { w64(ir+opt_i*IRS,IR_MOV); w64(ir+opt_i*IRS+8,r0); w64(ir+opt_i*IRS+16,a0); w64(ir+opt_i*IRS+24,0); w64(ir+opt_i*IRS+32,0) }
-                else if (op==IR_SHL||op==IR_SHR) && v1>0 {
+                else if (op==IR_SHL||op==IR_SHR) && v1>0 && v1<64 {
                     let va0 = a0; if op_is_const(a0)==1 { va0 = op_const_val(a0) }
-                    let f=0; if v1>=64 { f=0 } else { if op==IR_SHL { f=va0<<v1 } else { f=va0>>v1 } }
+                    let f=0; if op==IR_SHL { f=va0<<v1 } else { f=va0>>v1 }
                     w64(ir+opt_i*IRS,IR_CONST); w64(ir+opt_i*IRS+8,r0); w64(ir+opt_i*IRS+16,f); w64(ir+opt_i*IRS+24,0); w64(ir+opt_i*IRS+32,0)
                 }
             }
@@ -639,15 +635,41 @@ fn ci_func(fi, is_main) {
             fst_x(rd, 0)                         // movq rd, xmm0 (raw float bits)
             sdef(res, rd); w8(vfloat+res, 1)
           } else {
-          // Integer division (truncating, C-style). Floor division/modulo is a
-          // tracked 0.0.80 item; see ROADMAP (self-host-safe design required).
-          flush_clob(0,1,2); rbp(0, spill_home(a0)); rbp(1, spill_home(a1)); rcqo(); ridiv(1); let rd=aphys(res); if rd!=0 { rr(rd,0) }; sdef(res, rd)
+          opt_i = ii+1
+          let dv_isconst = op_is_const(a1)
+          if dv_isconst==1 {
+            let dv = op_const_val(a1)
+            if dv!=0 && ((dv & (dv-1)) != 0) {
+              compute_magic(dv)
+              let M = magicM; let sh = magicSh
+              flush_clob(0,1,2)
+              let rd = aphys(res)
+              // adjustment (q+=n / q-=n) only needed for some signs; spare
+              // rbx unless actually required, so loop-live regs stay resident.
+              let need_adj = 0
+              if dv>0 && M<0 { need_adj = 1 }
+              if dv<0 && M>0 { need_adj = 1 }
+              if need_adj==1 { flush_clob(3,3,3); rbp(3, spill_home(a0)) }
+              rbp(0, spill_home(a0))
+              ri64(1, M)
+              eb(72); eb(247); eb(233)
+              rr(rd, 2)
+              if need_adj==1 {
+                if dv>0 && M<0 { ra(rd, 3) }
+                if dv<0 && M>0 { rs(rd, 3) }
+              }
+              if sh>0 { ri(1, sh); eb(72); eb(211); eb(248 + (rd%8)) }
+              rr(2, rd); ri(1, 63); eb(72); eb(211); eb(234); ra(rd, 2)
+              sdef(res, rd)
+            } else {
+              flush_clob(0,1,2); rbp(0, spill_home(a0)); rbp(1, spill_home(a1)); rcqo(); ridiv(1); let rd=aphys(res); if rd!=0 { rr(rd,0) }; sdef(res, rd)
+            }
+          } else {
+            flush_clob(0,1,2); rbp(0, spill_home(a0)); rbp(1, spill_home(a1)); rcqo(); ridiv(1); let rd=aphys(res); if rd!=0 { rr(rd,0) }; sdef(res, rd)
+          }
           }
         }
-        else if op==IR_MOD {
-            // Integer modulo (truncating, C-style / sign-of-a). Tracked with DIV.
-            flush_clob(0,1,2); rbp(0, spill_home(a0)); rbp(1, spill_home(a1)); rcqo(); ridiv(1); let rd=aphys(res); if rd!=2 { rr(rd,2) }; sdef(res, rd)
-        }
+        else if op==IR_MOD { flush_clob(0,1,2); rbp(0, spill_home(a0)); rbp(1, spill_home(a1)); rcqo(); ridiv(1); let rd=aphys(res); if rd!=2 { rr(rd,2) }; sdef(res, rd) }
         else if op==IR_EQ { let r1=aphys(a0); let r2=aphys(a1); let rd=adistinct(res,r1,r2); rxor(rd,rd); rcmp(r1,r2); rsetc(0,rd); rzx(rd,rd); sdef(res, rd) }
         else if op==IR_NE { let r1=aphys(a0); let r2=aphys(a1); let rd=adistinct(res,r1,r2); rxor(rd,rd); rcmp(r1,r2); rsetc(1,rd); rzx(rd,rd); sdef(res, rd) }
         else if op==IR_LT { let r1=aphys(a0); let r2=aphys(a1); let rd=adistinct(res,r1,r2); rxor(rd,rd); rcmp(r1,r2); rsetc(2,rd); rzx(rd,rd); sdef(res, rd) }

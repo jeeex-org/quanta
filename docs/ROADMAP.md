@@ -183,38 +183,35 @@ Qualification evidence is gathered AFTER the core is complete, not before.
 Shipped (x86-64 only; ARM64 deferred POST-0.1.0): a **documentation and
 version-consistency release** — every "1.0" version reference across the docs was
 corrected to **0.1.0** to match the established convention (`0.1.0` = where std/lib
-resumes; ARM64 backend lands POST-0.1.0). Codegen is unchanged from 0.0.78; the
-self-host fixpoint is verified byte-identical (`qc` compiled by itself reproduces
-itself).
+resumes; ARM64 backend lands POST-0.1.0). Codegen is restored to the verified
+0.0.78 baseline; the self-host fixpoint is byte-identical
+(`bc3094d7…`, `qc` compiled by itself reproduces itself, and compiles runtime
+division correctly).
 
-**Floor division / modulo INVESTIGATED and DEFERRED (not a naive fix).** Three
-independent attempts were made and each broke the self-host invariant (the
-2nd/3rd-stage compiler either diverged from its input or emitted crashing user
-programs), so it is pulled pending a self-host-safe design:
-- branch-based correction (jcc32/lbladd) — segfaults at stage 2;
-- branchless correction using `a0`'s spill slot as scratch — corrupts the compiler;
-- branchless correction using `a1`'s spill slot as scratch — still breaks self-host
-  globally (even `println(a+b)` crashes), confirming the allocator's spill-slot
-  contract is violated by the correction's need for a 4th scratch register beyond
-  rax/rcx/rdx. The root cause is NOT `ovf_trap` (that was ruled out: `ovf_trap=0`
-  alone also breaks the fixpoint; `ovf_trap=1` is required and already avoids the
-  compiler SIGILLing during constant folding under the trap).
-INTEGER `/` and `%` therefore remain **truncating (C-style)** in 0.0.79.
+**Real root cause of the 0.0.79 build breakage found and fixed:** an earlier
+"revert to baseline" pass had **deleted the `compute_magic` division handler** from
+`codegen.quanta` (the division-by-multiplication strength reduction for constant
+non-power-of-2 divisors, plus the `opt_i = ii+1` optimization cursor and the
+`ri64`/`magicM`/`magicSh` machinery) and replaced it with a naive `idiv`. That
+naive version made the self-hosted compiler emit broken runtime-division code
+(stage-2 compiler segfaulted on `a/b` programs) — which masqueraded as a
+floor-division self-host problem. Restoring the original `compute_magic` handler
+verbatim fixes it: self-host fixpoint `bc3094d7` is restored and `loopd`
+(Σ i/3) = 12. Verified that the bootstrap choice is NOT the cause — `0.0.77` and
+the committed `0.0.78/bin/qc` both converge to the same `bc3094d7` fixpoint.
 
-Regression: core programs (fib, loop-sum, large multiply) and a plain add verified;
-the self-host fixpoint is byte-identical. Pending feature tests (bswap/popcount/
-defer/generics/import/memcpy) are unimplemented intrinsics, not regressions.
+INTEGER `/` and `%` therefore remain **truncating (C-style)** in 0.0.79 (same as
+0.0.78). Floor division/modulo is a tracked 0.0.80 item.
 
-Next: 0.0.80 — (a) floor division + Python-style modulo, self-host-safe. The
-breakage is NOT in the x86 bytes (validated in C) and NOT `ovf_trap` (ruled out);
-it is an allocator/state invariant in the IR_DIV emit block. To pin it without
-self-host noise: (i) build a test harness that FORCES runtime division (loop
-counter / IO, which the optimizer cannot fold) and disassembles the emitted idiv
-sequence; (ii) bisect the emit block statement-by-statement (the trunc helper
-`flush_clob; rbp; rbp; rcqo; ridiv; sdef` self-hosts — each added `wbp`/`rr`/`rxor`/
-`rneg`/`ra`/`eb` must be checked for allocator-state side effects via `rw`); (iii)
-prefer routing the floor correction through `adistinct`/`flush_clob`-reclaimed
-temporaries rather than `wbp`/`rbp` on spill homes. (b) `int` widened to i4096 (64
+Regression: core programs (fib, loop-sum, large multiply), plain add, and runtime
+division (loop `i/3` = 12) all verified; the self-host fixpoint is byte-identical.
+Pending feature tests (bswap/popcount/defer/generics/import/memcpy) are
+unimplemented intrinsics, not regressions.
+
+Next: 0.0.80 — (a) floor division + Python-style modulo, layered on top of the
+restored `compute_magic` handler (add the floor correction only on the `idiv`
+paths: variable divisor and power-of-2 constant; the magic path already produces
+trunc q and needs a remainder-sign adjustment); (b) `int` widened to i4096 (64
 limbs) so 250-digit literals + PQC/Kademlia key arithmetic are representable
 without overflow; `big` (heap bignum) opt-in later.
 
