@@ -40,7 +40,7 @@ Test legend (the **Test?** column):
 | extern "C" | 19 | 🟡 partial | 🟡 file-only | funcscan extern; syscall_test exercises |
 | struct | token | ✅ done | ✅ gate | struct_test, struct_methods_test, struct_literal_test (literal coverage present) |
 | enum | 21 | ✅ done | ✅ gate | enum_test rc=42; Some/None match arms exercised |
-| type | 23 | ❌ todo | ❌ none | lexed, unparsed |
+| type | 23 | ✅ done (0.0.77) | ✅ gate | type_alias rc=42. `type MyInt = int` then `let x: MyInt` |
 | interface | 24 | 🟡 partial | ✅ gate | trait_test/trait_test2/trait_min rc=10 in gate; dispatch via trait methods |
 | impl | 25 | 🟡 partial | ✅ gate | trait methods exercised (struct_methods_test rc=151) |
 | trait | 26 | 🟡 partial | ✅ gate | trait_test rc=10 in gate; method dispatch works |
