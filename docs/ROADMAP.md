@@ -1,6 +1,6 @@
 # Quanta ROADMAP — consolidated single source of truth
 
-> **Last updated: 2026-08-24. Current compiler: 0.0.81** (x86-64 ELF emitter,
+> **Last updated: 2026-08-24. Current compiler: 0.0.82** (x86-64 ELF emitter,
 > multi-file tree, Valgrind-clean, self-host `fp=YES`). ARM64 (AArch64) backend
 > is DEFERRED POST-0.1.0 (see #2 schedule below); the working compiler is x86-64 only.
 >
@@ -214,6 +214,23 @@ runtime division (loop `i/3` = 12), and 13 sign-combination floor/mod cases all
 verified; the self-host fixpoint is byte-identical (`qc` compiled by itself
 reproduces itself). Pending feature tests (bswap/popcount/defer/generics/
 import/memcpy) are unimplemented intrinsics, not regressions.
+
+### Current status (0.0.82) — big-int Stage 2 (DIV/MOD) shipped
+
+Big-int DIV/MOD landed in `lib/std/big.quanta` (pure stdlib, zero codegen
+changes, self-host fixpoint untouched). Signed floor division + modulo with
+Python semantics (mod takes the sign of the divisor), binary restoring division
+(shift-subtract, ovf_trap-safe) over 16-bit limbs. Verified against Python for:
+all 16 signed sign-combos of small operands, and 128/256-bit operands
+(incl. `(2^128-1)/7`, `2^128-1 mod 13`, `(2^128-1)*(2^64-1)/(2^128-1)`).
+
+Root-cause bugs fixed during Stage 2 (all in `lib/std/big.quanta`):
+- `big_add` carry detection was dead (`if s < x`, always false) -> carries
+  never propagated; rewrote to `carry = s >> 16` with masked store.
+- `big_mul` old split low/high form double-counted the carry into one limb;
+  rewrote in standard schoolbook form (single 32-bit cell product).
+- Sign stored in a dedicated slot (a[1]), not bit 63 of the header, because the
+  compiler cannot represent the INT64_MIN literal (0x8000000000000000).
 
 ### Current status (0.0.81) — big-int Stage 1 (ADD/SUB/MUL) shipped
 
