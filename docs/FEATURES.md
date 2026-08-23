@@ -50,7 +50,7 @@ Test legend (the **Test?** column):
 | ref | 34 | ❌ todo | ❌ none | lexed, unparsed |
 | mut | 35 | ✅ done (0.0.76) | ✅ gate | mut_basic rc=10. Mutable local binding |
 | move | 36 | ❌ todo | ❌ none | lexed, unparsed |
-| String | 37 | ❌ todo | ❌ none | lexed, unparsed |
+| String | 37 | ❌ todo | ❌ none | lexed, unparsed. **Keyword is case-insensitive since 0.0.78** (`string` == `String`, simplicity) |
 | as | 41 | ❌ todo | ❌ none | lexed, unparsed |
 | raw | 38/52 | ❌ todo | ❌ none | lexed, unparsed |
 | asm | 40/53 | ❌ todo | 🟡 file-only | asm_test exists but NOT in gate |
