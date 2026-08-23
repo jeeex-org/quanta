@@ -334,6 +334,13 @@ differential 5/5 vs 0.0.68, 0 duplicate opcodes. Self-host fixed point md5
 New tests, each returning 0 on 0.0.68: `match_guard` (111),
 `match_guard_false` (222), `match_guard_order` (4 — ordering, fallthrough, and a guard body using the bound name).
 **0.0.74** `$$(identifier)` shorthand — a single bare identifier inside `$$()` is stringified, so `$$(ls)` == `$$("ls")`. Multi-token commands still require quotes: `$$(echo hello)` is a parse error (the shorthand only fires for `TT_ID` immediately followed by `)`).
+**0.0.75** const redefinition fix — `const x = 5; const x = 10;` silently took the second value (10) before; now the first value wins (5) and the duplicate is skipped. The scanner phase (`features.quanta:scan_globals`) registers consts before the parser runs, so the dup check had to go there.
+Also: coverage audit of all documented-but-untested surface. Findings:
+- `a[-2]` traps (SIGILL) — **intentional**, SYNTAX.md documents this
+- Closure mutating captured var — **intentional**, by-value capture semantics
+- `isnan`/`isinf` — missing (not yet built)
+- All P2 float builtins verified working: sin, cos, tan, pow, log (roadmap was stale)
+- `std/net` and atomics — never built
 **0.0.72** fnptr/closure_call segfault fix — `fnptr(FNAME)` now returns a [codeptr, env=0] tuple (same layout as IR_FNVAL), so it can be passed directly to `closure_call`. Before 0.0.72, `fnptr` emitted a raw code pointer (`lea rax,[rip+disp]`), but `closure_call` expects a tuple and dereferences its argument as `mov rdx,[rax]` then `call r11`. Feeding it a raw pointer read garbage and jumped to a bogus address → SEGFAULT (rc=139). No gated test covered `fnptr`, so the crash survived since 0.0.67. The `fnptr_test.quanta` test was rewritten: it previously wrapped the result in `mk_any(p,0)` as a workaround for the raw-pointer behavior, which is no longer needed.
 Gate: 110/110 functional (rewritten fnptr_test), 8/8 security, 3/3 performance,
 differential fuzz 120/120, compiler fuzz 5000/0 crashes, Valgrind 0 errors,
