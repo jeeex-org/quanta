@@ -333,17 +333,7 @@ differential 5/5 vs 0.0.68, 0 duplicate opcodes. Self-host fixed point md5
 `5f23f927…` across stages 1/2/3.
 New tests, each returning 0 on 0.0.68: `match_guard` (111),
 `match_guard_false` (222), `match_guard_order` (4 — ordering, fallthrough, and a guard body using the bound name).
-**0.0.73** `$$(...)` no-quote form — `$$ ls -l ~/ ` now works as a convenience
-shorthand for `$$("ls -l /")`. The lexer captures the rest of the line as a
-raw command string, wraps it in quotes at srclen, and emits TT_SHCMD + TT_STR +
-`)` so the existing `$$` handler runs unchanged. Before 0.0.73 only the quoted
-form `$$("...")` and array form `$$([...])` worked; the no-quote form was
-documented but silently failed (`parse_expr` treated `ls`, `-l`, `~/` as
-identifiers → "undeclared variable: ls").
-Gate: 110/110 functional, 8/8 security, 3/3 performance, differential fuzz
-120/120, compiler fuzz 5000/0 crashes, Valgrind 0 errors, differential 5/5 vs
-0.0.72, 0 duplicate opcodes. Self-host fixed point md5 `7a010540…` across
-stages 1/2/3.
+**0.0.73** No-quote form `$$(...)` reverted — the no-quote form was added in 0.0.73 but reverted because the user clarified that `$$ ls -l ~/ ` is not the intended syntax; only `$$(commands)` (parenthesized) is correct. The string form `$$("...")` and array form `$$([...])` remain.
 **0.0.72** fnptr/closure_call segfault fix — `fnptr(FNAME)` now returns a [codeptr, env=0] tuple (same layout as IR_FNVAL), so it can be passed directly to `closure_call`. Before 0.0.72, `fnptr` emitted a raw code pointer (`lea rax,[rip+disp]`), but `closure_call` expects a tuple and dereferences its argument as `mov rdx,[rax]` then `call r11`. Feeding it a raw pointer read garbage and jumped to a bogus address → SEGFAULT (rc=139). No gated test covered `fnptr`, so the crash survived since 0.0.67. The `fnptr_test.quanta` test was rewritten: it previously wrapped the result in `mk_any(p,0)` as a workaround for the raw-pointer behavior, which is no longer needed.
 Gate: 110/110 functional (rewritten fnptr_test), 8/8 security, 3/3 performance,
 differential fuzz 120/120, compiler fuzz 5000/0 crashes, Valgrind 0 errors,

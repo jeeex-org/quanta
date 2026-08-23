@@ -260,28 +260,6 @@ fn tokenize() {
             // The parser will parse the command expression until the matching ')' delimiter.
             p=p+3; c=c+3   // skip $$(
             stok(tokc,TT_SHCMD,0,l,c,0); tokc=tokc+1
-        } else if ch==36&&p+1<srclen&&r8(src+p+1)==36&&p+2<srclen&&r8(src+p+2)==32 {
-            // $$(cmd) no-quote form: $$ followed by space. Capture the rest of the
-            // line as a raw command string (no quotes, no parens needed). The
-            // result is equivalent to $$("ls -l /"). We emit TT_SHCMD (so the
-            // existing $$ handler runs), then a TT_STR with the command text,
-            // then a ')' so the handler's closing-paren expectation is met.
-            p=p+3; c=c+3   // skip $$ and the space
-            let cmd_start = p
-            while p<srclen && r8(src+p)!=10 { p=p+1; c=c+1 }
-            let cmd_len = p - cmd_start
-            // Write the command text as a quoted string at srclen.
-            let str_at = srclen
-            w8(src+str_at, 34)  // opening quote
-            let i = 0
-            while i < cmd_len { w8(src+str_at+1+i, r8(src+cmd_start+i)); i = i+1 }
-            w8(src+str_at+1+cmd_len, 34)  // closing quote
-            srclen = str_at + cmd_len + 2
-            // Emit TT_SHCMD, then TT_STR (the command), then ')' so the existing
-            // $$ handler's parse_expr() + closing-paren expectation work unchanged.
-            stok(tokc,TT_SHCMD,0,l,c,0); tokc=tokc+1
-            stok(tokc,TT_STR,str_at,l,sc,cmd_len+2); tokc=tokc+1
-            stok(tokc,TT_PNCT,41,l,c,1); tokc=tokc+1
         } else if ch==36&&p+1<srclen&&r8(src+p+1)==40&&p+2<srclen&&ialpha(r8(src+p+2)) {
             // $(name) or $(name(args)): explicit EXTERNAL / GLOBAL function call.
             // Tokenized as TT_CALL (distinct from TT_ID, so a bare `name)` in
