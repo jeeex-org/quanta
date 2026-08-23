@@ -1,6 +1,6 @@
 # Quanta ROADMAP — consolidated single source of truth
 
-> **Last updated: 2026-08-23. Current compiler: 0.0.68** (x86-64 ELF emitter,
+> **Last updated: 2026-08-23. Current compiler: 0.0.69** (x86-64 ELF emitter,
 > multi-file tree, Valgrind-clean, self-host `fp=YES`). ARM64 (AArch64) backend
 > is DEFERRED POST-1.0 (see #2 schedule below); the working compiler is x86-64 only.
 >
@@ -130,7 +130,7 @@ SEQUENCING is the contract, not the literal numbers.
 | Grammar + bug-fix | 0.0.51–0.0.55 | tree-sitter grammar (done 0.0.53), residual compiler bugs. **0.0.53 shipped.** |
 | SIMPLE-SURFACE | 0.0.56 | **Simplified syntax landed**: `fn` keyword optional (bare `name(){}` works everywhere, `init()`/`main()` bare OK), `let` optional (bare `name = expr` = local/global), `return` optional (last-expr auto-returns), condition parens optional, `${name}` global / `$[]` local explicit sigils (bare + inside-string interpolation). Goal: bash-like, extremely simple surface. Docs (README/SYNTAX/SPEC) + test_suites + security script synced. |
 | P2 builtins | 0.0.55–0.0.60 | float cmp ✅(0.0.55), proc/env ✅(0.0.55), stdin ✅(0.0.55), fs meta ✅(0.0.55 — path-string remap fixed), string ops, math ✅(sqrt/floor/ceil/abs; sin/cos/tan/pow/log/min/max TODO), atomics, net, introspection ✅(abort/debugbreak), random ✅(getrandom), **`$$(cmd)` external-command substitution (0.0.57)** — `unsafe`-gated runtime `fork`/`execve`/`pipe`/`wait4` via the raw `syscall()` builtin (no libc); `$$(str)`→`/bin/sh -c`, `$$(arr)`→direct `execve` (no shell, injection-safe). Returns `CmdResult{stdout,stderr,status}`. |
-| P3 language | 0.0.61–0.0.71 | **float literals ✅(0.0.61)**, **float-arg-to-builtin ✅(0.0.62: f2i/fadd/fsub/fmul/fdiv read float vregs correctly)**, **user enums ✅(0.0.63: qualified+bare variant resolution, explicit tags, match)**, **modules ✅(0.0.64: mod Name { fn ... } + Mod.fn() qualified calls)**, **closure literals ✅(0.0.65: `|x,y| { expr }` → [codeptr, env] tuple, callable directly or via fn-typed param)**, **array push fix ✅(0.0.66: IR_CLOSURE/IR_APUSH opcode collision silently zeroed every pushed element)**, **closure captures ✅(0.0.67: free vars of the enclosing fn captured by value into a heap env array)**, **user-fn-beats-builtin ✅(0.0.68: was enforced in only 2 of 86 builtin branches, so a user `fn abs` was silently hijacked)**; remaining: tuples, real char/byte/string/bool, ref/mut/move, op-overload, match guards, generic monomorphisation (type params are erased today), and/or/not/true/false/global |
+| P3 language | 0.0.61–0.0.71 | **float literals ✅(0.0.61)**, **float-arg-to-builtin ✅(0.0.62: f2i/fadd/fsub/fmul/fdiv read float vregs correctly)**, **user enums ✅(0.0.63: qualified+bare variant resolution, explicit tags, match)**, **modules ✅(0.0.64: mod Name { fn ... } + Mod.fn() qualified calls)**, **closure literals ✅(0.0.65: `|x,y| { expr }` → [codeptr, env] tuple, callable directly or via fn-typed param)**, **array push fix ✅(0.0.66: IR_CLOSURE/IR_APUSH opcode collision silently zeroed every pushed element)**, **closure captures ✅(0.0.67: free vars of the enclosing fn captured by value into a heap env array)**, **user-fn-beats-builtin ✅(0.0.68: was enforced in only 2 of 86 builtin branches, so a user `fn abs` was silently hijacked)**, **match guards ✅(0.0.69: `n if cond => expr` — the `if` was never consumed, so guarded arms silently yielded 0)**; remaining: tuples, real char/byte/string/bool, ref/mut/move, op-overload, generic monomorphisation (type params are erased today), and/or/not/true/false/global |
 | **P4 tooling** | **0.0.72** | **Quanta-native code-writing tool** (edit Quanta source reliably without external scripting — the user's stated goal) |
 | **1.0** | 1.0.0 | Core + builtins complete → std/lib resumes; borrow-checking target for #1 green |
 
@@ -167,10 +167,10 @@ Why post-1.0: the ARM64 backend is a new backend; shipping it while x86 debt
 remains would violate the debt-first rule and split correctness effort.
 Qualification evidence is gathered AFTER the core is complete, not before.
 
-### Current status (0.0.68)
+### Current status (0.0.69)
 
 Shipped + verified (x86-64 only; ARM64 deferred POST-1.0): **true 2-stage self-host** —
-the committed `bin/x86/qc` compiles the 0.0.68 source to a faithful `qc`, verified
+the committed `bin/x86/qc` compiles the 0.0.69 source to a faithful `qc`, verified
 byte-identical to the golden binary (and to a 2nd-stage rebuild); fail-closed memory
 model (overflow/bounds→SIGILL 132, MAP_FAILED→rc=1, undeclared/cyclic→rc=7);
 grammar 0 errors on all 15 modules; Valgrind-clean; differential vs seed.
@@ -302,6 +302,27 @@ hijack, not library bugs (`lib/std/math.quanta` was always correct). Verified
 against their self-reported expectations on 0.0.68: std_math 19, std_str 13,
 std_fs 9, std_vec 8, std_map 6 — all matching. They stay ungated until after
 0.1.0 per the release plan.
+**0.0.69** match guards — the last known silent-wrong-answer in core.
+`match x { n if n > 3 => 111, _ => 222 }` compiled clean and returned **0**,
+taking NO arm. Root cause: the identifier-binding arm consumed the binder `n` and
+then called `mop('=>')`, but `mop` returns 0 **without advancing** when the token
+does not match — so the `if` was never consumed, the arm's IR came out malformed,
+and the whole match produced 0 with no diagnostic.
+Fix (parse.quanta, identifier-binding arm): after binding the pattern name,
+accept an optional `if <cond>` and emit `IR_BR cond -> arm_skip`. `IR_BR` lowers
+to `je`, i.e. it branches when the condition is FALSE, which is exactly
+skip-this-arm-on-guard-false. The binder is `vadd`-ed before the guard is parsed,
+so the condition may use it (`n if n > 3 => n * 2` works).
+Semantics verified: guard true takes the arm; guard false falls through to the
+next arm; multiple guarded arms are tried in order (first match wins); the
+wildcard runs when no guard matches; unguarded arms are unaffected.
+Gate: 108/108 functional (3 new tests), 8/8 security, 3/3 performance,
+differential fuzz 120/120, compiler fuzz 5000/0 crashes, Valgrind 0 errors,
+differential 5/5 vs 0.0.68, 0 duplicate opcodes. Self-host fixed point md5
+`5f23f927…` across stages 1/2/3.
+New tests, each returning 0 on 0.0.68: `match_guard` (111),
+`match_guard_false` (222), `match_guard_order` (4 — ordering, fallthrough, and a
+guard body using the bound name).
 
 Known gap: `getenv` is a stub; string ops (concat via `..` and `${}`/`$[]`
 interpolation) work. See FEATURES.md §I.

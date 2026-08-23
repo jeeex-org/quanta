@@ -1,0 +1,19 @@
+// Multiple guarded arms must be tried in order, and the guard may USE the
+// binder it introduced. First matching guard wins; if none match, the wildcard
+// arm runs.
+fn main() {
+    let ok = 0
+    // first guard wins
+    let a = match 9 { n if n > 5 => 1, n if n > 2 => 2, _ => 3 }
+    if a == 1 { ok = ok + 1 }
+    // second guard wins (first is false)
+    let b = match 4 { n if n > 5 => 1, n if n > 2 => 2, _ => 3 }
+    if b == 2 { ok = ok + 1 }
+    // no guard matches -> wildcard
+    let c = match 1 { n if n > 5 => 1, n if n > 2 => 2, _ => 3 }
+    if c == 3 { ok = ok + 1 }
+    // guard body uses the bound name
+    let d = match 7 { n if n > 3 => n * 2, _ => 0 }
+    if d == 14 { ok = ok + 1 }
+    return ok       // 4
+}

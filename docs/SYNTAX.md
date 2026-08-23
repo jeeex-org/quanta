@@ -379,9 +379,18 @@ All builtins are emitted inline; they have no call overhead.
 | `[pat, …, pat]` | Slice/array pattern (fixed length). |
 
 ### Guards
-**Not implemented.** A guarded arm (`n if n > 3 => …`) is *parsed* but the guard
-is not honoured: the `match` falls through every arm and yields `0` rather than
-raising a diagnostic. Do not use guards; test the condition with an `if` instead.
+A pattern that binds a name may carry a guard: `n if <cond> => expr`. The binder
+is in scope inside the condition. If the guard is false the arm is skipped and
+the next arm is tried; arms are evaluated in order, so the first arm whose
+pattern and guard both hold wins.
+
+```quanta
+match x {
+  n if n > 5 => 1,
+  n if n > 2 => 2,
+  _          => 3
+}
+```
 
 ```
 let x = Some(5);
