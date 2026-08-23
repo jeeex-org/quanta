@@ -154,7 +154,7 @@ Test legend (the **Test?** column):
 | closures | closure literal `\|a\| { … }`, fnptr, closure_call | ✅ gate (closure_basic rc=6, closure_multi_param rc=7, closure_higher_order rc=42, fnptr_test rc=7) |
 | float arith | fadd, fsub, fmul, fdiv (int args → int result), i2f, f2i | ✅ gate (float_test rc=159, simple_fadd rc=7) |
 | float compare | feq, flt, fgt, fle, fge, fisnan, fisinf (f64 bit-pattern args → 0/1) | ✅ gate (float_test rc=159) |
-| float math | sqrt, floor, ceil, abs (f64 bit-pattern in/out) | ✅ gate (float_test rc=159) |
+| float math | sqrt, floor, ceil, abs, sin, cos, tan, pow, log (f64 bit-pattern in/out) | ✅ gate (float_test rc=159) |
 | process / env | getpid, getppid, arg_count, environ (getenv is a STUB: returns 0) | ✅ gate (getpid_test, getppid_test, argc_test) |
 | stdin I/O | getc (getline untested-in-gate) | ✅ gate (getc_test) |
 | fs metadata | stat, fstat, lseek, unlink, mkdir, chdir, rename | 🟡 PARTIAL — fstat/lseek work; stat/unlink/mkdir/chdir/rename BROKEN (path-string remap returns -ENOENT, see §I) |
