@@ -178,7 +178,7 @@ Why post-1.0: the ARM64 backend is a new backend; shipping it while x86 debt
 remains would violate the debt-first rule and split correctness effort.
 Qualification evidence is gathered AFTER the core is complete, not before.
 
-### Current status (0.0.75)
+### Current status (0.0.76)
 
 Shipped + verified (x86-64 only; ARM64 deferred POST-1.0): **true 2-stage self-host** —
 the committed `bin/x86/qc` compiles the 0.0.74 source to a faithful `qc`, verified
