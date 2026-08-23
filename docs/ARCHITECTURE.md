@@ -1,11 +1,11 @@
 # Quanta — SME HANDOFF (read this first when taking over)
 
-Last updated: 2026-08-22. Author: JEEEX.ORG. Status: x86-64 (AArch64 backend planned POST-1.0)
+Last updated: 2026-08-22. Author: JEEEX.ORG. Status: x86-64 (AArch64 backend planned POST-0.1.0)
 native AOT compiler verified + hardened; multi-mode architecture designed
 but only the native AOT backend is built.
 
 ## WHAT IS REAL (verified, not claimed)
-- `compiler/0.0.74/src/x86/` — multi-file x86-64 Quanta compiler (AArch64 backend planned POST-1.0)
+- `compiler/0.0.74/src/x86/` — multi-file x86-64 Quanta compiler (AArch64 backend planned POST-0.1.0)
   (main.quanta + helpers/lexer/parse/codegen/emitter/elf/globals/quanta).
   Self-hosts (2-stage: `bin/x86/qc` -> source -> `qc`, byte-identical fixed point).
 - `compiler/0.0.74/bin/x86/qc` is the golden compiler; it compiles the 0.0.74

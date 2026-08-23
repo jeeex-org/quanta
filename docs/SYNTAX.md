@@ -3,7 +3,7 @@
 Quanta is designed to be simple and supports multiple modes—interpreter, WASM, JIT, pre‑compiler (e.g., `quanta run`), and native compilation to binary (`qc`).
 
 This document describes the language as implemented by the current compiler in
-`compiler/` (x86-64; AArch64 deferred POST-1.0). It is a description of the
+`compiler/` (x86-64; AArch64 deferred POST-0.1.0). It is a description of the
 language surface only — it carries no version or gate numbers, because those
 rot. For what landed when, and the current gate status, see `docs/ROADMAP.md`;
 for per-feature implementation status and the tests covering each, see

@@ -8,11 +8,11 @@ every row maps to a real token/builtin in source.
 Status legend:
 - ✅ done — implemented and exercised
 - 🟡 partial — works in a limited form, or has a known bug/limitation, or lexed-but-not-parsed
-- ❌ todo — not implemented (on the build-order queue to 1.0)
+- ❌ todo — not implemented (on the build-order queue to 0.1.0)
 
 Test legend (the **Test?** column):
 - ✅ gate — a test_suite in the gate (EXPECTED.tsv, 85 core tests) covers it
-- 🟡 file-only — a test file exists but is NOT in the gate (e.g. std_* removed per rule "core only until 1.0", or feature unimplemented)
+- 🟡 file-only — a test file exists but is NOT in the gate (e.g. std_* removed per rule "core only until 0.1.0", or feature unimplemented)
 - ❌ none — no test exists
 
 "Core" = the language itself. "Builtins" = inline-code primitives emitted by the compiler.
@@ -223,13 +223,13 @@ Test legend (the **Test?** column):
 
 ## Build order & sequencing
 
-The authoritative build order to 1.0 (debt window → P2 builtins → P3
-language → P4 tooling → 1.0) now lives in **`docs/ROADMAP.md` §3** (single
+The authoritative build order to 0.1.0 (debt window → P2 builtins → P3
+language → P4 tooling → 0.1.0) now lives in **`docs/ROADMAP.md` §3** (single
 source of truth, consolidated 2026-08-17). It is no longer duplicated here
 to prevent version-number drift.
 
 Key invariants (unchanged): one feature per WIP version; debt window
 (0.0.43–0.0.50) closed before new features; gate green before promotion;
 0.0.90 reserved for the Quanta-native code-writing tool; ARM64 backend
-deferred to POST-1.0.
+deferred to POST-0.1.0.
 

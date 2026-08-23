@@ -1,7 +1,7 @@
 # Feature Requests (post-stdlib)
 
 Tracked hardening/feature work that is **NOT in the 0.0.43–0.50 core-debt window**
-and is **deferred to after stdlib (1.0)**. These are defense-in-depth on top of
+and is **deferred to after stdlib (0.1.0)**. These are defense-in-depth on top of
 already-working features, not correctness blockers.
 
 ---
@@ -117,5 +117,5 @@ stdout pipe) into `o.err`. Buffer also capped at 4096B.
 
 ---
 
-*Added 2026-08-19. Deferred to post-stdlib (1.0+). Core `$$(cmd)` work
+*Added 2026-08-19. Deferred to post-stdlib (0.1.0+). Core `$$(cmd)` work
 (5 bug fixes) shipped in `0f133eb`.*

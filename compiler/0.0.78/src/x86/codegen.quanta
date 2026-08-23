@@ -16,7 +16,7 @@ let opt_on = 1
 // the ops they contain (so low-level primitives / compiler internals opt out).
 // The flag `--no-overflow-trap` turns it OFF if a program deliberately relies on
 // two's-complement wraparound and hasn't been ported.
-let ovf_trap = 0   // default OFF: two's-complement wrap (fast-math safe, no SIGILL). Opt in with -ovf / --overflow-trap.
+let ovf_trap = 1   // default ON: signed add/sub/mul trap on overflow (fail-closed). Opt OUT with -nowrap / --no-overflow-trap.
 let cur_fnname = 0
 let cur_fnnlen = 0
 // P10: index of the function currently being compiled (for fn-param lookup).
@@ -82,30 +82,13 @@ fn constfold(i, op, r0, a0, a1) {
     let c0 = op_is_const(a0); let c1 = op_is_const(a1)
     if c0==1 && c1==1 {
         let v0 = op_const_val(a0); let v1 = op_const_val(a1); let f=0
-        // Overflow-safe fold: ADD/SUB/MUL can wrap/overflow i64. The compiler
-        // binary itself may trap on overflow (bootstrap ovf_trap=1), so we must
-        // never EXECUTE an overflowing arithmetic op during folding — that would
-        // crash the compiler. Detect overflow with non-trapping comparisons and
-        // only compute f when safe; otherwise decline to fold (return 0) and let
-        // the emit path emit a runtime op that wraps cleanly (ovf_trap=0).
-        let overflow=0
-        let hi = 9223372036854775807; let lo = -9223372036854775807 - 1
-        if op==IR_ADD {
-            if v0>0 && v1>0 { if v0 > hi - v1 { overflow=1 } }
-            else if v0<0 && v1<0 { if v0 < lo - v1 { overflow=1 } }
-            if overflow==0 { f=v0+v1 }
-        }
-        else if op==IR_SUB {
-            if v0>0 && v1<0 { if v0 > hi + v1 { overflow=1 } }
-            else if v0<0 && v1>0 { if v0 < lo + v1 { overflow=1 } }
-            if overflow==0 { f=v0-v1 }
-        }
-        else if op==IR_MUL {
-            if v0!=0 && v1!=0 {
-                if v0 > hi / v1 || v0 < lo / v1 { overflow=1 }
-            }
-            if overflow==0 { f=v0*v1 }
-        }
+        if op==IR_ADD { f=v0+v1 }
+        else if op==IR_SUB { f=v0-v1 }
+        else if op==IR_MUL { f=v0*v1 }
+        else if op==IR_DIV { f=v0/v1 }
+        else if op==IR_MOD { f=v0%v1 }
+        else if op==IR_SHL { f=v0<<v1 }
+        else if op==IR_SHR { f=v0>>v1 }
         else if op==IR_BAND { f=v0&v1 }
         else if op==IR_BOR { f=(v0|v1) }
         else if op==IR_BXOR { f=(v0^v1) }
@@ -117,7 +100,6 @@ fn constfold(i, op, r0, a0, a1) {
         else if op==IR_GT { if v0>v1 { f=1 } else { f=0 } }
         else if op==IR_LE { if v0<=v1 { f=1 } else { f=0 } }
         else if op==IR_GE { if v0>=v1 { f=1 } else { f=0 } }
-        if overflow==1 { return 0 }
         w64(ir+opt_i*IRS, IR_CONST); w64(ir+opt_i*IRS+8,r0); w64(ir+opt_i*IRS+16,f); w64(ir+opt_i*IRS+24,0); w64(ir+opt_i*IRS+32,0)
         return 1
     }
@@ -657,75 +639,16 @@ fn ci_func(fi, is_main) {
             fst_x(rd, 0)                         // movq rd, xmm0 (raw float bits)
             sdef(res, rd); w8(vfloat+res, 1)
           } else {
-          // Integer floor division (Python-style): q = floor(a / b).
-          // x86 idiv truncates toward zero; correct when the true remainder r
-          // has opposite sign to the divisor.
+          // Integer division (truncating, C-style) for 0.0.79; floor division
+          // (Python-style) deferred to 0.0.80 pending self-host-safe emit.
           opt_i = ii+1
-          flush_clob(0,1,2)
-          rbp(0, spill_home(a0))   // rax = a
-          rbp(1, spill_home(a1))   // rcx = b
-          rcqo(); ridiv(1)         // rax=q(trunc), rdx=r(trunc, sign of a)
-          wbp(spill_home(res), 0)  // store truncated q at res home
-          // if r == 0 -> q is already correct
-          eb(72); eb(133); eb(210) // test rdx, rdx
-          let L_done = nl()
-          jcc32(0, 0)              // je L_done
-          w64(patches+patchc*PCS, codelen-6); w64(patches+patchc*PCS+8, L_done); w64(patches+patchc*PCS+16, 1); patchc=patchc+1
-          // if (r ^ b) < 0 (signs differ) -> q = q - 1
-          rr(0, 2)                 // rax = r
-          rxor(0, 1)                // rax = r ^ b
-          eb(72); eb(131); eb(248); eb(0)   // cmp rax, 0
-          let L_adj = nl()
-          jcc32(2, 0)              // jl L_adj
-          w64(patches+patchc*PCS, codelen-6); w64(patches+patchc*PCS+8, L_adj); w64(patches+patchc*PCS+16, 1); patchc=patchc+1
-          // signs same: final q = truncated q (already in home)
-          rbp(0, spill_home(res))   // rax = q
-          jmp32(0)                  // jmp L_done
-          w64(patches+patchc*PCS, codelen-5); w64(patches+patchc*PCS+8, L_done); w64(patches+patchc*PCS+16, 0); patchc=patchc+1
-          lbladd(L_adj, codelen)
-          rbp(0, spill_home(res))   // rax = q
-          eb(72); eb(255); eb(200)  // dec rax  -> q - 1
-          wbp(spill_home(res), 0)   // store q-1 at home
-          lbladd(L_done, codelen)
-          rbp(0, spill_home(res))   // rax = final q
-          let rd=aphys(res); if rd!=0 { rr(rd,0) }; sdef(res, rd)
+          flush_clob(0,1,2); rbp(0, spill_home(a0)); rbp(1, spill_home(a1)); rcqo(); ridiv(1); let rd=aphys(res); if rd!=0 { rr(rd,0) }; sdef(res, rd)
           }
         }
         else if op==IR_MOD {
-            // Python-style modulo: result has the SAME sign as the divisor b
-            // (a % b in [0, |b|) for b>0). x86 idiv gives a remainder with the
-            // sign of a; we correct it with branches (allocator-safe).
-            // r_true = 0 if r==0 ; r + b if signs(a,b) differ ; r otherwise.
-            flush_clob(0,1,2)
-            rbp(0, spill_home(a0))   // rax = a
-            rbp(1, spill_home(a1))   // rcx = b
-            rcqo(); ridiv(1)         // rax=q(trunc), rdx=r(trunc, sign of a)
-            // if r == 0 -> result 0
-            eb(72); eb(133); eb(210) // test rdx, rdx
-            let L_zero = nl()
-            jcc32(0, 0)              // je L_zero
-            w64(patches+patchc*PCS, codelen-6); w64(patches+patchc*PCS+8, L_zero); w64(patches+patchc*PCS+16, 1); patchc=patchc+1
-            // if (r ^ b) < 0 (signs differ) -> r_true = r + b
-            rr(0, 2)                 // rax = r
-            rxor(0, 1)                // rax = r ^ b
-            eb(72); eb(131); eb(248); eb(0)   // cmp rax, 0
-            let L_add = nl()
-            jcc32(2, 0)              // jl L_add
-            w64(patches+patchc*PCS, codelen-6); w64(patches+patchc*PCS+8, L_add); w64(patches+patchc*PCS+16, 1); patchc=patchc+1
-            // signs same: r_true = r
-            rr(0, 2)                 // rax = r
-            let L_done = nl()
-            jmp32(0)                  // jmp L_done
-            w64(patches+patchc*PCS, codelen-5); w64(patches+patchc*PCS+8, L_done); w64(patches+patchc*PCS+16, 0); patchc=patchc+1
-            lbladd(L_add, codelen)
-            rr(0, 2)                 // rax = r
-            ra(0, 1)                 // rax = r + rcx(b)
-            jmp32(0)                  // jmp L_done
-            w64(patches+patchc*PCS, codelen-5); w64(patches+patchc*PCS+8, L_done); w64(patches+patchc*PCS+16, 0); patchc=patchc+1
-            lbladd(L_zero, codelen)
-            rxor(0, 0)               // rax = 0
-            lbladd(L_done, codelen)
-            let rd=aphys(res); if rd!=0 { rr(rd,0) }; sdef(res, rd)
+            // Integer modulo (truncating, C-style / sign-of-a) for 0.0.79;
+            // Python-style non-negative modulo deferred to 0.0.80.
+            flush_clob(0,1,2); rbp(0, spill_home(a0)); rbp(1, spill_home(a1)); rcqo(); ridiv(1); let rd=aphys(res); if rd!=2 { rr(rd,2) }; sdef(res, rd)
         }
         else if op==IR_EQ { let r1=aphys(a0); let r2=aphys(a1); let rd=adistinct(res,r1,r2); rxor(rd,rd); rcmp(r1,r2); rsetc(0,rd); rzx(rd,rd); sdef(res, rd) }
         else if op==IR_NE { let r1=aphys(a0); let r2=aphys(a1); let rd=adistinct(res,r1,r2); rxor(rd,rd); rcmp(r1,r2); rsetc(1,rd); rzx(rd,rd); sdef(res, rd) }
@@ -749,33 +672,8 @@ fn ci_func(fi, is_main) {
         else if op==IR_BOR { let r1=aphys(a0); let r2=aphys(a1); let rd=adistinct(res,r1,r2); if rd!=r1 { rr(rd,r1) }; ror(rd,r2); sdef(res, rd) }
         else if op==IR_BXOR { let r1=aphys(a0); let r2=aphys(a1); let rd=adistinct(res,r1,r2); if rd!=r1 { rr(rd,r1) }; rxor(rd,r2); sdef(res, rd) }
         else if op==IR_BNOT { let r1=aphys(a0); let rd=adistinct(res,r1,r1); if rd!=r1 { rr(rd,r1) }; rnot(rd); sdef(res, rd) }
-        else if op==IR_SHL {
-            // Fixed-width (i64 interim) logical left shift. x << n with n>=64 -> 0.
-            // Operands are materialized into rax(operand) and rcx(count); a branchless
-            // guard zeroes the result when count>=64. Const operands are loaded via
-            // ri64 to avoid the register allocator collapsing both IR_CONSTs onto rax.
-            flush_clob(0,1,2)
-            if op_is_const(a1)==1 { ri64(1, op_const_val(a1)) } else { let r2=aphys(a1); rr(1,r2) }   // rcx = count
-            if op_is_const(a0)==1 { ri64(0, op_const_val(a0)) } else { let r1=aphys(a0); rr(0,r1) }   // rax = operand
-            eb(72); eb(137); eb(202)        // mov rdx, rcx
-            eb(72); eb(131); eb(250); eb(64) // cmp rdx, 64
-            eb(72); eb(25); eb(210)         // sbb rdx, rdx   (rdx = (count>=64)?0:-1)
-            eb(72); eb(33); eb(208)         // and rax, rdx   (rax = (count>=64)?0:rax)
-            rshl(0,1)
-            let rd=aphys(res); if rd!=0 { rr(rd,0) }; sdef(res, rd)
-        }
-        else if op==IR_SHR {
-            // Fixed-width (i64 interim) right shift. n>=64 -> 0 (branchless guard).
-            flush_clob(0,1,2)
-            if op_is_const(a1)==1 { ri64(1, op_const_val(a1)) } else { let r2=aphys(a1); rr(1,r2) }   // rcx = count
-            if op_is_const(a0)==1 { ri64(0, op_const_val(a0)) } else { let r1=aphys(a0); rr(0,r1) }   // rax = operand
-            eb(72); eb(137); eb(202)        // mov rdx, rcx
-            eb(72); eb(131); eb(250); eb(64) // cmp rdx, 64
-            eb(72); eb(25); eb(210)         // sbb rdx, rdx   (rdx = (count>=64)?0:-1)
-            eb(72); eb(33); eb(208)         // and rax, rdx   (rax = (count>=64)?0:rax)
-            rsar(0,1)
-            let rd=aphys(res); if rd!=0 { rr(rd,0) }; sdef(res, rd)
-        }
+        else if op==IR_SHL { flush_clob(0,1,2); rbp(0, spill_home(a0)); rbp(1, spill_home(a1)); shl_trap_emit(ii); rshl(0,1); let rd=aphys(res); if rd!=0 { rr(rd,0) }; sdef(res, rd) }
+        else if op==IR_SHR { flush_clob(0,1,2); rbp(0, spill_home(a0)); rbp(1, spill_home(a1)); shl_trap_emit(ii); rshr(0,1); let rd=aphys(res); if rd!=0 { rr(rd,0) }; sdef(res, rd) }
         else if op==IR_LOADG {
             // Uniform RIP-relative load: mov rd, [rip+disp32]; patched in patch_globals.
             let rd=aphys(res)

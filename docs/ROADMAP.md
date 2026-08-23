@@ -2,7 +2,7 @@
 
 > **Last updated: 2026-08-24. Current compiler: 0.0.79** (x86-64 ELF emitter,
 > multi-file tree, Valgrind-clean, self-host `fp=YES`). ARM64 (AArch64) backend
-> is DEFERRED POST-1.0 (see #2 schedule below); the working compiler is x86-64 only.
+> is DEFERRED POST-0.1.0 (see #2 schedule below); the working compiler is x86-64 only.
 >
 > Version sequence: each feature lands in its own directory. 0.0.55 = P2
 > builtins + grammar/bug-fix window; **0.0.56 = simplified surface** (optional
@@ -118,7 +118,7 @@ This file is now the SINGLE consolidated roadmap (the old stale
 `ROADMAP.md` was removed 2026-08-17; its source-derived completeness audit
 lives in docs/FEATURES.md).
 
-### Build order to 1.0 (single source of truth)
+### Build order to 0.1.0 (single source of truth)
 
 Convention: one feature per WIP version; each self-hosts (2-stage, byte-identical fixed point) and
 passes the gate green before promotion. Version numbers are MUTABLE — the
@@ -130,9 +130,9 @@ SEQUENCING is the contract, not the literal numbers.
 | Grammar + bug-fix | 0.0.51–0.0.55 | tree-sitter grammar (done 0.0.53), residual compiler bugs. **0.0.53 shipped.** |
 | SIMPLE-SURFACE | 0.0.56 | **Simplified syntax landed**: `fn` keyword optional (bare `name(){}` works everywhere, `init()`/`main()` bare OK), `let` optional (bare `name = expr` = local/global), `return` optional (last-expr auto-returns), condition parens optional, `${name}` global / `$[]` local explicit sigils (bare + inside-string interpolation). Goal: bash-like, extremely simple surface. Docs (README/SYNTAX/SPEC) + test_suites + security script synced. |
 | P2 builtins | 0.0.55–0.0.60 | float cmp ✅(0.0.55), proc/env ✅(0.0.55), stdin ✅(0.0.55), fs meta ✅(0.0.55 — path-string remap fixed), string ops, math ✅(sqrt/floor/ceil/abs; sin/cos/tan/pow/log/min/max TODO), atomics, net, introspection ✅(abort/debugbreak), random ✅(getrandom), **`$$(cmd)` external-command substitution (0.0.57)** — `unsafe`-gated runtime `fork`/`execve`/`pipe`/`wait4` via the raw `syscall()` builtin (no libc); `$$(str)`→`/bin/sh -c`, `$$(arr)`→direct `execve` (no shell, injection-safe). Returns `CmdResult{stdout,stderr,status}`. |
-| P3 language | 0.0.61–0.0.85 | **float literals ✅(0.0.61)**, **float-arg-to-builtin ✅(0.0.62: f2i/fadd/fsub/fmul/fdiv read float vregs correctly)**, **user enums ✅(0.0.63: qualified+bare variant resolution, explicit tags, match)**, **modules ✅(0.0.64: mod Name { fn ... } + Mod.fn() qualified calls)**, **closure literals ✅(0.0.65: `|x,y| { expr }` → [codeptr, env] tuple, callable directly or via fn-typed param)**, **array push fix ✅(0.0.66: IR_CLOSURE/IR_APUSH opcode collision silently zeroed every pushed element)**, **closure captures ✅(0.0.67: free vars of the enclosing fn captured by value into a heap env array)**, **user-fn-beats-builtin ✅(0.0.68: was enforced in only 2 of 86 builtin branches, so a user `fn abs` was silently hijacked)**, **match guards ✅(0.0.69: `n if cond => expr` — the `if` was never consumed, so guarded arms silently yielded 0)**; remaining: generic monomorphisation (type params are erased today), ref/ref-return/borrow (needs borrow-checking), and op-overload (needs trait vtable dispatch) — all 1.0 type-system work |
+| P3 language | 0.0.61–0.0.85 | **float literals ✅(0.0.61)**, **float-arg-to-builtin ✅(0.0.62: f2i/fadd/fsub/fmul/fdiv read float vregs correctly)**, **user enums ✅(0.0.63: qualified+bare variant resolution, explicit tags, match)**, **modules ✅(0.0.64: mod Name { fn ... } + Mod.fn() qualified calls)**, **closure literals ✅(0.0.65: `|x,y| { expr }` → [codeptr, env] tuple, callable directly or via fn-typed param)**, **array push fix ✅(0.0.66: IR_CLOSURE/IR_APUSH opcode collision silently zeroed every pushed element)**, **closure captures ✅(0.0.67: free vars of the enclosing fn captured by value into a heap env array)**, **user-fn-beats-builtin ✅(0.0.68: was enforced in only 2 of 86 builtin branches, so a user `fn abs` was silently hijacked)**, **match guards ✅(0.0.69: `n if cond => expr` — the `if` was never consumed, so guarded arms silently yielded 0)**; remaining: generic monomorphisation (type params are erased today), ref/ref-return/borrow (needs borrow-checking), and op-overload (needs trait vtable dispatch) — all 0.1.0 type-system work |
 | **P4 tooling** | **0.0.90** | **Quanta-native code-writing tool** (edit Quanta source reliably without external scripting — the user's stated goal) |
-| **1.0** | 1.0.0 | Core + builtins complete → std/lib resumes; borrow-checking target for #1 green; **PTY layer for interactive `$$()` (vi/ssh/top)** |
+| **0.1.0** | 0.1.0 | Core + builtins complete → std/lib resumes; borrow-checking target for #1 green; **PTY layer for interactive `$$()` (vi/ssh/top)** |
 
 **0.0.90 is RESERVED for the code-writing tool.** Nothing else takes it.
 
@@ -155,53 +155,57 @@ SEQUENCING is the contract, not the literal numbers.
 | #3 Formal spec | ✅ SPEC.md |
 | #4 Safety manual + process | ✅ SAFETY_MANUAL.md |
 | #1 Memory/UB safety | 🟡 hardened (fail-closed, Valgrind-clean, fuzz-proven); not compile-time-proven |
-| #2 Independent implementation | 🟡 differential vs seed (0.0.53); full POST-1.0 when ARM64 backend lands |
+| #2 Independent implementation | 🟡 differential vs seed (0.0.53); full POST-0.1.0 when ARM64 backend lands |
 
-**#2 schedule (ARM64 DEFERRED POST-1.0 — not before):**
+**#2 schedule (ARM64 DEFERRED POST-0.1.0 — not before):**
 Per debt-first discipline, a second backend must NOT start while x86 core +
 builtins still have open items (float literals, generics, traits, real
 allocator, etc. — see FEATURES.md audit). The ARM64 backend lands only
-AFTER 1.0 core completion.
-- **POST-1.0** ARM64 (AArch64) backend (LANGUAGE_DESIGN.md Stage 4): a SECOND,
+AFTER 0.1.0 core completion.
+- **POST-0.1.0** ARM64 (AArch64) backend (LANGUAGE_DESIGN.md Stage 4): a SECOND,
   independently-written emitter over the shared IR — the real ISO 26262-8
   §11 independent-implementation route. (Does NOT take 0.0.90.)
-- **POST-1.0** x86↔ARM64 differential harness: compile same program on both
+- **POST-0.1.0** x86↔ARM64 differential harness: compile same program on both
   backends, assert identical exit codes. Extends tools/diff_test/diff_qc.py
   (currently current-vs-seed, weak evidence — seed is same lineage). This is
   what closes #2 for real.
 - (dependent) once a 2nd backend/C path exists, build `qc` under
   ASan+UBSan+MSan, require 0 errors → sanitizer-clean confirmation of the
   memory-safety argument.
-- **1.0** Stage-6 borrow checking (compile-time memory safety) → moves #1 to ✅.
+- **0.1.0** Stage-6 borrow checking (compile-time memory safety) → moves #1 to ✅.
 
-Why post-1.0: the ARM64 backend is a new backend; shipping it while x86 debt
+Why post-0.1.0: the ARM64 backend is a new backend; shipping it while x86 debt
 remains would violate the debt-first rule and split correctness effort.
 Qualification evidence is gathered AFTER the core is complete, not before.
 
 ### Current status (0.0.79)
 
-Shipped + verified (x86-64 only; ARM64 deferred POST-1.0): builds on 0.0.78 —
-**arithmetic correctness foundation for crypto/Kademlia**:
-- **Overflow-safe constant folding**: the compiler no longer SIGILLs when folding a
-  large product (e.g. `123456789012345678 * 987654321098765432`); it declines to fold
-  when the result would wrap and emits a runtime op instead (wrap-by-default).
-- **Floor division + Python-style modulo** (`/`, `%` match Python `//`, `%`): correct for
-  all sign combinations; required for non-negative modular residues in RSA/PQC.
-  Verified 1433/1433 cases in the numeric differential harness (Python oracle).
-- **Shift guard**: `x << n` / `x >> n` zero out when `n >= 64` (fixed-width semantics);
-  `>>` is arithmetic (sign-preserving). Literal shifts (`1 << 3`) and variable shifts both correct.
-- **No compiler crashes** on constant-fold overflow (was a SIGILL in the bootstrap trap).
+Shipped (x86-64 only; ARM64 deferred POST-0.1.0): a **documentation and
+version-consistency release** — every "1.0" version reference across the docs
+(ROADMAP, FEATURES, SYNTAX, ARCHITECTURE, SPEC, SAFETY_MANUAL, SECURITY_TOOLING,
+FEATURE_REQUESTS, README) was corrected to **0.1.0** to match the established
+convention (`0.1.0` = where std/lib resumes; ARM64 backend lands POST-0.1.0).
 
-Regression: full numeric harness 1433/1433 (floor) and core programs (fib(20), loop-sum,
-large multiply, shifts) verified. Pending feature tests (bswap/popcount/defer/generics/
-import/memcpy) are unimplemented intrinsics, not regressions.
+Codegen is unchanged from 0.0.78 (self-host fixpoint verified byte-identical:
+`qc` compiled by itself reproduces itself). A planned 0.0.79 arithmetic pass
+(overflow-safe fold, floor division/modulo, shift guard) was **reverted** after
+finding that `ovf_trap=0` (wrap-by-default) broke self-host idempotence; the
+original `ovf_trap=1` is required for a stable fixpoint, and already avoids the
+compiler SIGILLing during constant folding (ADD/SUB/MUL do not fold under the
+trap). Those arithmetic improvements are deferred to 0.0.80 where they will be
+implemented self-host-safely.
 
-Next: 0.0.80 — `int` widened to i4096 (64 limbs) so 250-digit literals + PQC/Kademlia
-key arithmetic are representable without overflow; `big` (heap bignum) opt-in later.
+Regression: core programs (fib, loop-sum, large multiply) verified; full numeric
+harness and functional gate pass. Pending feature tests (bswap/popcount/defer/
+generics/import/memcpy) are unimplemented intrinsics, not regressions.
+
+Next: 0.0.80 — (a) floor division + Python-style modulo, self-host-safe;
+(b) `int` widened to i4096 (64 limbs) so 250-digit literals + PQC/Kademlia key
+arithmetic are representable without overflow; `big` (heap bignum) opt-in later.
 
 ### Current status (0.0.78)
 
-Shipped + verified (x86-64 only; ARM64 deferred POST-1.0): **true 2-stage self-host** —
+Shipped + verified (x86-64 only; ARM64 deferred POST-0.1.0): **true 2-stage self-host** —
 the committed `bin/x86/qc` compiles the 0.0.74 source to a faithful `qc`, verified
 byte-identical to the golden binary (and to a 2nd-stage rebuild); fail-closed memory
 model (overflow/bounds→SIGILL 132, MAP_FAILED→rc=1, undeclared/cyclic→rc=7);

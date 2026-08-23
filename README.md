@@ -5,7 +5,7 @@ Quanta designed with simple syntax that supports multiple execution modes: Nativ
 ## Status (verified)
 
 - **Native AOT compilation (`qc`)** — **ACTIVE, 0.0.74**. x86-64 only
-  (AArch64 backend deferred POST-1.0).
+  (AArch64 backend deferred POST-0.1.0).
   Bootstraps via a **true 2-stage self-host**: the committed `bin/x86/qc`
   compiles the 0.0.74 source to a faithful `qc` (verified byte-identical to
   the golden binary, 110/110 gate). Passes **110/110** test_suites
