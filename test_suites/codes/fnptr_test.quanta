@@ -1,14 +1,17 @@
-// fnptr(FNAME) -> code pointer as a runtime value, then CALL it through the
-// closure_call ABI (same path closure_test exercises). Verifies fnptr() both
-// constructs AND invokes correctly: add(3,4) == 7.
-// (Was a no-op: only checked fnptr() didn't error, returned 0.)
+// fnptr(FNAME) -> [codeptr, env] tuple as a runtime value, then CALL it
+// through the closure_call ABI. Verifies fnptr() both constructs AND invokes
+// correctly: add(3,4) == 7.
+//
+// 0.0.72: fnptr now returns a [codeptr, env=0] tuple directly (same layout as
+// IR_FNVAL), so it can be passed straight to closure_call — the mk_any(p,0)
+// wrapper was a workaround for the pre-0.0.72 behavior (raw pointer) and is no
+// longer needed.
 fn add(a, b) {
     return a + b
 }
 
 fn main() {
     let p = fnptr(add)
-    let f = mk_any(p, 0)
-    let r = closure_call(f, 3, 4)
+    let r = closure_call(p, 3, 4)
     return r   // 3 + 4 = 7
 }

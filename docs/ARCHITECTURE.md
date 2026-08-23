@@ -5,10 +5,10 @@ native AOT compiler verified + hardened; multi-mode architecture designed
 but only the native AOT backend is built.
 
 ## WHAT IS REAL (verified, not claimed)
-- `compiler/0.0.71/src/x86/` — multi-file x86-64 Quanta compiler (AArch64 backend planned POST-1.0)
+- `compiler/0.0.72/src/x86/` — multi-file x86-64 Quanta compiler (AArch64 backend planned POST-1.0)
   (main.quanta + helpers/lexer/parse/codegen/emitter/elf/globals/quanta).
   Self-hosts (2-stage: `bin/x86/qc` -> source -> `qc`, byte-identical fixed point).
-- `compiler/0.0.71/bin/x86/qc` is the golden compiler; it compiles the 0.0.71
+- `compiler/0.0.72/bin/x86/qc` is the golden compiler; it compiles the 0.0.72
   source to a faithful `qc` (the verified self-host path). See README verification block.
 - Security (fail-closed): overflow trap (ud2 -> SIGILL rc=132), bounds trap,
   `unsafe{}` opt-out; MAP_FAILED -> abort rc=1 (NOT SIGSEGV 139, fixed 0.0.49);
@@ -26,7 +26,7 @@ but only the native AOT backend is built.
   independent implementation, manual memory model).
 
 ## INVARIANTS (never break these)
-1. Self-host: `cd compiler/0.0.71/src/x86; SEED=../../../../compiler/0.0.71/bin/x86/qc; $SEED main.quanta qc && ./qc main.quanta qc2` must produce byte-identical qc==qc2 (2-stage fixed point).
+1. Self-host: `cd compiler/0.0.72/src/x86; SEED=../../../../compiler/0.0.72/bin/x86/qc; $SEED main.quanta qc && ./qc main.quanta qc2` must produce byte-identical qc==qc2 (2-stage fixed point).
 2. 110/110 test_suites must pass after any change (plus security 8/8, perf 3/3).
 3. No ARM emitter code in the x86-only source (ARM is a SEPARATE future
    backend, built from scratch). The x86 emitter was de-duplicated in 0.0.46

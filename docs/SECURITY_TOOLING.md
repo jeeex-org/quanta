@@ -63,7 +63,7 @@ valuable security investment: it proves fail-closed behavior on the
 UNTESTED input space (SAFETY_MANUAL §6.5).
 
 ### 3.1 What is fuzzed
-The `qc` binary (x86-64, from `compiler/0.0.71/bin/x86/qc`) invoked as:
+The `qc` binary (x86-64, from `compiler/0.0.72/bin/x86/qc`) invoked as:
 `qc -O <fuzz_input.quanta> /tmp/fuzz_out`
 The fuzzer mutates `.quanta` text; we assert the process NEVER crashes
 with a signal (SIGSEGV/SIGILL/SIGABRT) and ALWAYS exits with a defined
