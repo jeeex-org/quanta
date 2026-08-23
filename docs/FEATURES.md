@@ -27,7 +27,7 @@ Test legend (the **Test?** column):
 | if | 3 | ✅ done | ✅ gate | elseif_test |
 | loop | 5 | ✅ done | ✅ gate | loop_test, parse_loop |
 | while | 6 | ✅ done | ✅ gate | break_continue |
-| for | 7 | ✅ done | ✅ gate | for-in (array) + C-style `for i=1;i<=n;i=i+1`; range `..` NOT parsed |
+| for | 7 | ✅ done | ✅ gate | for-in (array) + C-style `for i=1;i<=n;i=i=1`; for-range `for i in 0..n` (0.0.76) |
 | break | 8 | ✅ done | ✅ gate | |
 | continue | 9 | ✅ done | ✅ gate | |
 | return | 16 | ✅ done | ✅ gate | |
@@ -48,7 +48,7 @@ Test legend (the **Test?** column):
 | Option/Some/None | 28/29/30 | ✅ done | ✅ gate | option_test/option_simple/option_ctor/option_tuple rc=42 in gate |
 | Result/Ok/Err | 31/32/33 | ✅ done | ✅ gate | result_test rc=49 in gate |
 | ref | 34 | ❌ todo | ❌ none | lexed, unparsed |
-| mut | 35 | ❌ todo | ❌ none | lexed, unparsed |
+| mut | 35 | ✅ done (0.0.76) | ✅ gate | mut_basic rc=10. Mutable local binding |
 | move | 36 | ❌ todo | ❌ none | lexed, unparsed |
 | String | 37 | ❌ todo | ❌ none | lexed, unparsed |
 | as | 41 | ❌ todo | ❌ none | lexed, unparsed |
@@ -96,10 +96,10 @@ Test legend (the **Test?** column):
 | match (expr arms) | ✅ done | ✅ gate | match_test rc=132 |
 | break / continue | ✅ done | ✅ gate | |
 | return / defer | ✅ done | ✅ gate | defer_test |
-| for-range `for i in 0..n` | ❌ todo | ❌ none | `..` operator NOT parsed (verified) |
+| for-range `for i in 0..n` | ✅ done (0.0.76) | ✅ gate | for_range_basic rc=3 |
 | match block arms `1 => { }` | ✅ done | ✅ gate | match_test covers block arms |
 | `?` early-return propagation | ✅ done | ✅ gate | question_mark rc=0, option_test/result_test in gate |
-| loop expressions / labeled break w/ value | ❌ todo | ❌ none | |
+| loop expressions / labeled break w/ value | ✅ done (0.0.76) | ✅ gate | loop_expr_test rc=42. `let x = loop { break 42 }` |
 | try/catch | ❌ todo | ❌ none | only panic + `?` unwrap |
 
 ## D. Core — Expressions & Operators
