@@ -49,6 +49,30 @@ jobs:
           test -x "$QC" || { echo "golden compiler bin/x86/qc missing"; exit 1; }
           echo "golden qc: $(md5sum $QC | cut -d' ' -f1)"
 
+      - name: IR opcode uniqueness (structural guard)
+        working-directory: ${{ github.workspace }}
+        run: |
+          set -e
+          # 0.0.65 shipped `let IR_CLOSURE = 72` while 72 was already IR_APUSH.
+          # parse_let tags fn-value RHS via irop(lr)==IR_CLOSURE, so every array
+          # push was misread as a closure and its result vreg corrupted: the
+          # array grew but the pushed element read back as 0. Silent wrong data,
+          # no diagnostic, and the whole functional gate stayed green because no
+          # test pushed onto an array. Fail the build on ANY duplicate opcode so
+          # this class cannot recur by convention alone.
+          G=compiler/0.0.66/src/x86/globals.quanta
+          DUPS=$(grep -oE '^let IR_[A-Z_0-9]+ = [0-9]+' "$G" \
+                   | awk '{print $4}' | sort -n | uniq -d)
+          if [ -n "$DUPS" ]; then
+            echo "FAIL: duplicate IR opcode value(s): $DUPS"
+            for v in $DUPS; do
+              echo "  value $v is used by:"
+              grep -nE "^let IR_[A-Z_0-9]+ = $v\$" "$G" | sed 's/^/    /'
+            done
+            exit 1
+          fi
+          echo "OK: all IR opcode values unique ($(grep -cE '^let IR_[A-Z_0-9]+ = [0-9]+' "$G") opcodes)"
+
       - name: Functional gate (run_tests.sh)
         working-directory: ${{ github.workspace }}
         env:
