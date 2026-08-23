@@ -72,7 +72,7 @@ emission; a bug here would undermine C1/C2. (No sanitizer currently
 instruments them — see §6.)
 
 **A3.** The golden `bin/x86/qc` is trusted. The
-self-host fixed-point (committed bin/x86/qc → 0.0.66 source → qc, byte-identical,
+self-host fixed-point (committed bin/x86/qc → 0.0.67 source → qc, byte-identical,
 and to a 2nd-stage rebuild) shows the CURRENT compiler
 reproduces itself; it does not independently prove A2 (that needs #2).
 

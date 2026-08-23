@@ -17,7 +17,7 @@ Last updated: 2026-08-16. Compiler version: 0.0.53.
 | **Valgrind** (memcheck) | compiler own memory safety (leaks/UB) | Active; 0 errors on self-compile + crash-repros |
 | **CodeRabbit** | PR review of `main.quanta` (entry point) | Active; module-file review blocked until grammar landed |
 | **tree-sitter-quanta** | parse/static-analysis surface for all 15 modules | **Active v0.0.53 — 0 errors on every module** |
-| **99-test gate** | functional regression (99/99 + 8 sec + 3 perf) | Active (LANGUAGE_DESIGN.md) |
+| **102-test gate** | functional regression (102/102 + 8 sec + 3 perf) | Active (LANGUAGE_DESIGN.md) |
 | **Self-host invariant** | committed bin/x86/qc → source → qc, byte-identical fixed point | Active (ARCHITECTURE.md INVARIANTS #1) |
 
 Gap: Valgrind is the ONLY dynamic analyzer; no fuzzing, no static
@@ -63,7 +63,7 @@ valuable security investment: it proves fail-closed behavior on the
 UNTESTED input space (SAFETY_MANUAL §6.5).
 
 ### 3.1 What is fuzzed
-The `qc` binary (x86-64, from `compiler/0.0.66/bin/x86/qc`) invoked as:
+The `qc` binary (x86-64, from `compiler/0.0.67/bin/x86/qc`) invoked as:
 `qc -O <fuzz_input.quanta> /tmp/fuzz_out`
 The fuzzer mutates `.quanta` text; we assert the process NEVER crashes
 with a signal (SIGSEGV/SIGILL/SIGABRT) and ALWAYS exits with a defined

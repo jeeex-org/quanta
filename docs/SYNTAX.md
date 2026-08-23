@@ -199,19 +199,31 @@ interchangeable with a hand-built function value and may also be invoked with
 `closure_call(fnb, args…)`. Calls use the standard SysV argument registers, with
 `env` passed in `r10`. Up to 5 arguments are supported.
 
-**Not yet implemented: captures.** `env` is currently always 0, so a closure
-body may only reference its own parameters. Referring to a local from the
-enclosing scope is a compile error:
+**Captures.** A closure body may reference locals of the enclosing function.
+They are captured **by value**, snapshotted when the closure is constructed:
 
 ```quanta
 fn main() {
     let y = 10
-    let f = |x| { x + y }        // error: undeclared variable: y
-    return f(5)
+    let f = |x| { x + y }
+    return f(5)                  // 15
 }
 ```
 
-Capturing closures are a planned increment (see ROADMAP).
+Because the capture is a snapshot, reassigning the variable afterwards does not
+change what the closure sees:
+
+```quanta
+let y = 10
+let f = |x| { x + y }
+y = 99
+f(1)                             // 11, not 100
+```
+
+Each captured value is copied into a small heap array (the closure's `env`) at
+construction; referencing the same variable several times uses one slot. A
+closure may capture at most 32 variables. Captures are by value only — there is
+no by-reference capture, so a closure cannot mutate an enclosing local.
 
 ---
 
