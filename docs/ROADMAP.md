@@ -181,27 +181,35 @@ Qualification evidence is gathered AFTER the core is complete, not before.
 ### Current status (0.0.79)
 
 Shipped (x86-64 only; ARM64 deferred POST-0.1.0): a **documentation and
-version-consistency release** — every "1.0" version reference across the docs
-(ROADMAP, FEATURES, SYNTAX, ARCHITECTURE, SPEC, SAFETY_MANUAL, SECURITY_TOOLING,
-FEATURE_REQUESTS, README) was corrected to **0.1.0** to match the established
-convention (`0.1.0` = where std/lib resumes; ARM64 backend lands POST-0.1.0).
+version-consistency release** — every "1.0" version reference across the docs was
+corrected to **0.1.0** to match the established convention (`0.1.0` = where std/lib
+resumes; ARM64 backend lands POST-0.1.0). Codegen is unchanged from 0.0.78; the
+self-host fixpoint is verified byte-identical (`qc` compiled by itself reproduces
+itself).
 
-Codegen is unchanged from 0.0.78 (self-host fixpoint verified byte-identical:
-`qc` compiled by itself reproduces itself). A planned 0.0.79 arithmetic pass
-(overflow-safe fold, floor division/modulo, shift guard) was **reverted** after
-finding that `ovf_trap=0` (wrap-by-default) broke self-host idempotence; the
-original `ovf_trap=1` is required for a stable fixpoint, and already avoids the
-compiler SIGILLing during constant folding (ADD/SUB/MUL do not fold under the
-trap). Those arithmetic improvements are deferred to 0.0.80 where they will be
-implemented self-host-safely.
+**Floor division / modulo INVESTIGATED and DEFERRED (not a naive fix).** Three
+independent attempts were made and each broke the self-host invariant (the
+2nd/3rd-stage compiler either diverged from its input or emitted crashing user
+programs), so it is pulled pending a self-host-safe design:
+- branch-based correction (jcc32/lbladd) — segfaults at stage 2;
+- branchless correction using `a0`'s spill slot as scratch — corrupts the compiler;
+- branchless correction using `a1`'s spill slot as scratch — still breaks self-host
+  globally (even `println(a+b)` crashes), confirming the allocator's spill-slot
+  contract is violated by the correction's need for a 4th scratch register beyond
+  rax/rcx/rdx. The root cause is NOT `ovf_trap` (that was ruled out: `ovf_trap=0`
+  alone also breaks the fixpoint; `ovf_trap=1` is required and already avoids the
+  compiler SIGILLing during constant folding under the trap).
+INTEGER `/` and `%` therefore remain **truncating (C-style)** in 0.0.79.
 
-Regression: core programs (fib, loop-sum, large multiply) verified; full numeric
-harness and functional gate pass. Pending feature tests (bswap/popcount/defer/
-generics/import/memcpy) are unimplemented intrinsics, not regressions.
+Regression: core programs (fib, loop-sum, large multiply) and a plain add verified;
+the self-host fixpoint is byte-identical. Pending feature tests (bswap/popcount/
+defer/generics/import/memcpy) are unimplemented intrinsics, not regressions.
 
-Next: 0.0.80 — (a) floor division + Python-style modulo, self-host-safe;
-(b) `int` widened to i4096 (64 limbs) so 250-digit literals + PQC/Kademlia key
-arithmetic are representable without overflow; `big` (heap bignum) opt-in later.
+Next: 0.0.80 — (a) floor division + Python-style modulo, implemented with a
+self-host-safe scratch strategy (study the allocator's spill-home aliasing rules
+first, or route the correction through allocator-owned temporaries); (b) `int`
+widened to i4096 (64 limbs) so 250-digit literals + PQC/Kademlia key arithmetic
+are representable without overflow; `big` (heap bignum) opt-in later.
 
 ### Current status (0.0.78)
 

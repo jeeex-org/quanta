@@ -639,15 +639,14 @@ fn ci_func(fi, is_main) {
             fst_x(rd, 0)                         // movq rd, xmm0 (raw float bits)
             sdef(res, rd); w8(vfloat+res, 1)
           } else {
-          // Integer division (truncating, C-style) for 0.0.79; floor division
-          // (Python-style) deferred to 0.0.80 pending self-host-safe emit.
-          opt_i = ii+1
+          // Integer division (truncating, C-style) — floor division/modulo deferred
+          // to 0.0.80 (self-host-safe implementation required; this allocator's
+          // spill-slot contract is violated by the correction's scratch usage).
           flush_clob(0,1,2); rbp(0, spill_home(a0)); rbp(1, spill_home(a1)); rcqo(); ridiv(1); let rd=aphys(res); if rd!=0 { rr(rd,0) }; sdef(res, rd)
           }
         }
         else if op==IR_MOD {
-            // Integer modulo (truncating, C-style / sign-of-a) for 0.0.79;
-            // Python-style non-negative modulo deferred to 0.0.80.
+            // Integer modulo (truncating, C-style / sign-of-a) — deferred with DIV.
             flush_clob(0,1,2); rbp(0, spill_home(a0)); rbp(1, spill_home(a1)); rcqo(); ridiv(1); let rd=aphys(res); if rd!=2 { rr(rd,2) }; sdef(res, rd)
         }
         else if op==IR_EQ { let r1=aphys(a0); let r2=aphys(a1); let rd=adistinct(res,r1,r2); rxor(rd,rd); rcmp(r1,r2); rsetc(0,rd); rzx(rd,rd); sdef(res, rd) }
