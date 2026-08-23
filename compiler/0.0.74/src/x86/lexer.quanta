@@ -255,11 +255,39 @@ fn tokenize() {
             stok(tokc,TT_LOCAL,sp2,l,sc2,nl2); tokc=tokc+1
             p=p+1; c=c+1   // skip ]
         } else if ch==36&&p+1<srclen&&r8(src+p+1)==36&&p+2<srclen&&r8(src+p+2)==40 {
-            // $$( : external command substitution (bash-like $(cmd) but with '$$'
-            // sigil). We emit a SINGLE token TT_SHCMD that includes the opening paren.
-            // The parser will parse the command expression until the matching ')' delimiter.
-            p=p+3; c=c+3   // skip $$(
-            stok(tokc,TT_SHCMD,0,l,c,0); tokc=tokc+1
+            // $$(cmd) external command substitution. If the next char is NOT a
+            // quote or bracket, capture everything until ')' as a raw command
+            // string. This handles $$(ls -l ~/) by treating "ls -l ~/" as the
+            // command. If it IS a quote/bracket, emit TT_SHCMD so the parser's
+            // existing string/array handling works.
+            let next_ch = r8(src+p+3)
+            if next_ch==34 || next_ch==91 {
+                // String literal or array form: let parser handle it
+                p=p+3; c=c+3   // skip $$(
+                stok(tokc,TT_SHCMD,0,l,c,0); tokc=tokc+1
+            } else {
+                // Raw command form: scan to matching ')' and capture as string
+                p=p+3; c=c+3   // skip $$(
+                let cmd_start = p
+                let depth = 1
+                while p<srclen && depth>0 {
+                    let ch2 = r8(src+p)
+                    if ch2==40 { depth = depth+1 }
+                    else if ch2==41 { depth = depth-1 }
+                    if depth>0 { p=p+1; c=c+1 }
+                }
+                let cmd_len = p - cmd_start
+                // Write the raw command as a quoted string at srclen
+                let str_at = srclen
+                w8(src+str_at, 34)  // opening quote
+                let i = 0
+                while i < cmd_len { w8(src+str_at+1+i, r8(src+cmd_start+i)); i = i+1 }
+                w8(src+str_at+1+cmd_len, 34)  // closing quote
+                srclen = str_at + cmd_len + 2
+                // Emit TT_SHCMD_RAW with the string location
+                stok(tokc,TT_SHCMD_RAW,str_at,l,sc,cmd_len+2); tokc=tokc+1
+                p=p+1; c=c+1  // skip the closing ')'
+            }
         } else if ch==36&&p+1<srclen&&r8(src+p+1)==40&&p+2<srclen&&ialpha(r8(src+p+2)) {
             // $(name) or $(name(args)): explicit EXTERNAL / GLOBAL function call.
             // Tokenized as TT_CALL (distinct from TT_ID, so a bare `name)` in

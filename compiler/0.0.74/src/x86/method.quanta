@@ -655,6 +655,31 @@ fn parse_primary() {
         let nm = pval(); let nl = plen(); adv()
         return parse_call(nm, nl, FI_GLOBAL)
     }
+    if peek()==TT_SHCMD_RAW {
+        // Raw command form: the lexer already captured the command as a quoted
+        // string at srclen. We just need to emit IR_STR for it, then the
+        // qc_sys_cmd call.
+        if unsafe_depth==0 {
+            let mn = "error: $$(cmd) requires unsafe{} (runs an external command)\n"
+            file_write(2, mn+8, len(mn)); had_error=1; return 0
+        }
+        let str_at = pval(); let str_len = plen(); adv()  // consume TT_SHCMD_RAW
+        // Emit IR_STR for the captured string.
+        let vr = nv(); iremit(IR_STR, vr, str_at, 0, 0)
+        w64(vreg_is_str + vr*8, 1)
+        // Emit the qc_sys_cmd call.
+        let cnm = srclen
+        w8(src+cnm, 113); w8(src+cnm+1, 99); w8(src+cnm+2, 95); w8(src+cnm+3, 115); w8(src+cnm+4, 121); w8(src+cnm+5, 115); w8(src+cnm+6, 95); w8(src+cnm+7, 99); w8(src+cnm+8, 109); w8(src+cnm+9, 100); w8(src+cnm+10, 0)
+        srclen = cnm + 11
+        let vr2 = nv()
+        iremit(IR_CALL, vr2, cnm, vr, 0)
+        let cnm2 = srclen
+        w8(src+cnm2, 67); w8(src+cnm2+1, 109); w8(src+cnm2+2, 100); w8(src+cnm2+3, 82); w8(src+cnm2+4, 101); w8(src+cnm2+5, 115); w8(src+cnm2+6, 117); w8(src+cnm2+7, 108); w8(src+cnm2+8, 116); w8(src+cnm2+9, 0)
+        srclen = cnm2 + 10
+        let crsi = findstruct(cnm2, 9)
+        if crsi>=0 { w64(vreg_struct + vr2*8, crsi); w64(vreg_is_str + vr2*8, 0-1) }
+        return vr2
+    }
     if peek()==TT_SHCMD {
         // $$(cmd) runs an EXTERNAL command via fork/execve — a privileged
         // escape from the memory-safe language. Secure-by-default: require it
@@ -664,35 +689,6 @@ fn parse_primary() {
             file_write(2, mn+8, len(mn)); had_error=1; return 0
         }
         adv()  // consume TT_SHCMD
-        // 0.0.74: $$(identifier) shorthand — a single bare identifier inside $$
-        // is stringified. $$(ls) == $$("ls"). Detect TT_ID followed by ')'
-        // and inject a string literal at srclen.
-        if peek()==TT_ID && tokp+1<tokc && tokt(tokp+1)==TT_PNCT && tokv(tokp+1)==41 {
-            let idnm=pval(); let idnl=plen(); adv()  // consume ID
-            // Write the identifier text as a quoted string at srclen.
-            let str_at = srclen
-            w8(src+str_at, 34)  // opening quote
-            let i = 0
-            while i < idnl { w8(src+str_at+1+i, r8(src+idnm+i)); i = i+1 }
-            w8(src+str_at+1+idnl, 34)  // closing quote
-            srclen = str_at + idnl + 2
-            // Emit IR_STR for the string, then expect ')'.
-            let vr = nv(); iremit(IR_STR, vr, str_at, 0, 0)
-            w64(vreg_is_str + vr*8, 1)
-            mpnct(41)  // consume ')'
-            // Now emit the qc_sys_cmd call with this string vreg.
-            let cnm = srclen
-            w8(src+cnm, 113); w8(src+cnm+1, 99); w8(src+cnm+2, 95); w8(src+cnm+3, 115); w8(src+cnm+4, 121); w8(src+cnm+5, 115); w8(src+cnm+6, 95); w8(src+cnm+7, 99); w8(src+cnm+8, 109); w8(src+cnm+9, 100); w8(src+cnm+10, 0)
-            srclen = cnm + 11
-            let vr2 = nv()
-            iremit(IR_CALL, vr2, cnm, vr, 0)
-            let cnm2 = srclen
-            w8(src+cnm2, 67); w8(src+cnm2+1, 109); w8(src+cnm2+2, 100); w8(src+cnm2+3, 82); w8(src+cnm2+4, 101); w8(src+cnm2+5, 115); w8(src+cnm2+6, 117); w8(src+cnm2+7, 108); w8(src+cnm2+8, 116); w8(src+cnm2+9, 0)
-            srclen = cnm2 + 10
-            let crsi = findstruct(cnm2, 9)
-            if crsi>=0 { w64(vreg_struct + vr2*8, crsi); w64(vreg_is_str + vr2*8, 0-1) }
-            return vr2
-        }
         let cmd = parse_expr()
         if !(peek()==TT_PNCT && pval()==41) {
             let mn = "error: expected ')' after $$ cmd\\n"; file_write(2, mn+8, len(mn)); exit(1)
