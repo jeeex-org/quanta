@@ -4,10 +4,10 @@ Quanta designed with simple syntax that supports multiple execution modes: Nativ
 
 ## Status (verified)
 
-- **Native AOT compilation (`qc`)** — **ACTIVE, 0.0.72**. x86-64 only
+- **Native AOT compilation (`qc`)** — **ACTIVE, 0.0.73**. x86-64 only
   (AArch64 backend deferred POST-1.0).
   Bootstraps via a **true 2-stage self-host**: the committed `bin/x86/qc`
-  compiles the 0.0.72 source to a faithful `qc` (verified byte-identical to
+  compiles the 0.0.73 source to a faithful `qc` (verified byte-identical to
   the golden binary, 110/110 gate). Passes **110/110** test_suites
   (+ 8/8 security, 3/3 perf). Valgrind-clean (the mmap address-hint crash
   is fixed).
@@ -376,7 +376,7 @@ source.quanta → core/scan/parse → IR → opt/ → backend (codegen/x86_64 | 
 ```
 
 Current source form: a multi-file self-hosting tree at
-`compiler/0.0.72/src/x86/` (`main.quanta` + `helpers`/`lexer`/`parse`/
+`compiler/0.0.73/src/x86/` (`main.quanta` + `helpers`/`lexer`/`parse`/
 `codegen`/`emitter`/`elf`/`globals`/`features.quanta`). The modular split
 is DONE. `#import` is still not functional (a future stage).
 
@@ -385,9 +385,9 @@ is DONE. `#import` is still not functional (a future stage).
 Every change is gated by:
 
 ```bash
-# 2-stage self-host: committed bin/x86/qc compiles the 0.0.72 source to a faithful qc
-cd compiler/0.0.72/src/x86
-SEED=../../../../compiler/0.0.72/bin/x86/qc
+# 2-stage self-host: committed bin/x86/qc compiles the 0.0.73 source to a faithful qc
+cd compiler/0.0.73/src/x86
+SEED=../../../../compiler/0.0.73/bin/x86/qc
 $SEED main.quanta qc && ./qc main.quanta qc2   # qc == qc2 (fixed point)
 # full gate
 bash test_suites/scripts/run_tests.sh
