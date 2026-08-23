@@ -130,11 +130,22 @@ SEQUENCING is the contract, not the literal numbers.
 | Grammar + bug-fix | 0.0.51–0.0.55 | tree-sitter grammar (done 0.0.53), residual compiler bugs. **0.0.53 shipped.** |
 | SIMPLE-SURFACE | 0.0.56 | **Simplified syntax landed**: `fn` keyword optional (bare `name(){}` works everywhere, `init()`/`main()` bare OK), `let` optional (bare `name = expr` = local/global), `return` optional (last-expr auto-returns), condition parens optional, `${name}` global / `$[]` local explicit sigils (bare + inside-string interpolation). Goal: bash-like, extremely simple surface. Docs (README/SYNTAX/SPEC) + test_suites + security script synced. |
 | P2 builtins | 0.0.55–0.0.60 | float cmp ✅(0.0.55), proc/env ✅(0.0.55), stdin ✅(0.0.55), fs meta ✅(0.0.55 — path-string remap fixed), string ops, math ✅(sqrt/floor/ceil/abs; sin/cos/tan/pow/log/min/max TODO), atomics, net, introspection ✅(abort/debugbreak), random ✅(getrandom), **`$$(cmd)` external-command substitution (0.0.57)** — `unsafe`-gated runtime `fork`/`execve`/`pipe`/`wait4` via the raw `syscall()` builtin (no libc); `$$(str)`→`/bin/sh -c`, `$$(arr)`→direct `execve` (no shell, injection-safe). Returns `CmdResult{stdout,stderr,status}`. |
-| P3 language | 0.0.61–0.0.71 | **float literals ✅(0.0.61)**, **float-arg-to-builtin ✅(0.0.62: f2i/fadd/fsub/fmul/fdiv read float vregs correctly)**, **user enums ✅(0.0.63: qualified+bare variant resolution, explicit tags, match)**, **modules ✅(0.0.64: mod Name { fn ... } + Mod.fn() qualified calls)**, **closure literals ✅(0.0.65: `|x,y| { expr }` → [codeptr, env] tuple, callable directly or via fn-typed param)**, **array push fix ✅(0.0.66: IR_CLOSURE/IR_APUSH opcode collision silently zeroed every pushed element)**, **closure captures ✅(0.0.67: free vars of the enclosing fn captured by value into a heap env array)**, **user-fn-beats-builtin ✅(0.0.68: was enforced in only 2 of 86 builtin branches, so a user `fn abs` was silently hijacked)**, **match guards ✅(0.0.69: `n if cond => expr` — the `if` was never consumed, so guarded arms silently yielded 0)**; remaining: tuples, real char/byte/string/bool, ref/mut/move, op-overload, generic monomorphisation (type params are erased today), and/or/not/true/false/global |
-| **P4 tooling** | **0.0.72** | **Quanta-native code-writing tool** (edit Quanta source reliably without external scripting — the user's stated goal) |
+| P3 language | 0.0.61–0.0.85 | **float literals ✅(0.0.61)**, **float-arg-to-builtin ✅(0.0.62: f2i/fadd/fsub/fmul/fdiv read float vregs correctly)**, **user enums ✅(0.0.63: qualified+bare variant resolution, explicit tags, match)**, **modules ✅(0.0.64: mod Name { fn ... } + Mod.fn() qualified calls)**, **closure literals ✅(0.0.65: `|x,y| { expr }` → [codeptr, env] tuple, callable directly or via fn-typed param)**, **array push fix ✅(0.0.66: IR_CLOSURE/IR_APUSH opcode collision silently zeroed every pushed element)**, **closure captures ✅(0.0.67: free vars of the enclosing fn captured by value into a heap env array)**, **user-fn-beats-builtin ✅(0.0.68: was enforced in only 2 of 86 builtin branches, so a user `fn abs` was silently hijacked)**, **match guards ✅(0.0.69: `n if cond => expr` — the `if` was never consumed, so guarded arms silently yielded 0)**; remaining, ONE PER VERSION from 0.0.70: tuples, real char/byte/string/bool, ref/mut/move, op-overload, generic monomorphisation (type params are erased today), and/or/not/true/false/global |
+| **P4 tooling** | **0.0.90** | **Quanta-native code-writing tool** (edit Quanta source reliably without external scripting — the user's stated goal) |
 | **1.0** | 1.0.0 | Core + builtins complete → std/lib resumes; borrow-checking target for #1 green |
 
-**0.0.72 is RESERVED for the code-writing tool.** Nothing else takes it.
+**0.0.90 is RESERVED for the code-writing tool.** Nothing else takes it.
+
+> **Re-baselined 2026-08-23.** P3 was 0.0.61–0.0.71 with P4 tooling at 0.0.72,
+> but 6 features remained and only 2 slots were left (0.0.70–0.0.71) — six
+> features cannot fit in two versions under one-feature-per-version. The overrun
+> is real work, not slippage: **0.0.66** (array push) and **0.0.68**
+> (user-fn-beats-builtin) were UNPLANNED core-correctness fixes, taken because a
+> silent-wrong-answer in the core is never deferred. Version numbers are
+> unbounded, so the window was widened rather than the features compressed:
+> P3 → 0.0.61–0.0.85 (6 remaining features at 0.0.70+, plus slack for the
+> correctness fixes that keep surfacing), P4 tooling → 0.0.90. The SEQUENCING is
+> unchanged, which is the actual contract.
 
 ### #1 / #2 standards status
 
@@ -153,7 +164,7 @@ allocator, etc. — see FEATURES.md audit). The ARM64 backend lands only
 AFTER 1.0 core completion.
 - **POST-1.0** ARM64 (AArch64) backend (LANGUAGE_DESIGN.md Stage 4): a SECOND,
   independently-written emitter over the shared IR — the real ISO 26262-8
-  §11 independent-implementation route. (Does NOT take 0.0.72.)
+  §11 independent-implementation route. (Does NOT take 0.0.90.)
 - **POST-1.0** x86↔ARM64 differential harness: compile same program on both
   backends, assert identical exit codes. Extends tools/diff_test/diff_qc.py
   (currently current-vs-seed, weak evidence — seed is same lineage). This is

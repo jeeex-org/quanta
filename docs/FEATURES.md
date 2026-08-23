@@ -225,6 +225,6 @@ to prevent version-number drift.
 
 Key invariants (unchanged): one feature per WIP version; debt window
 (0.0.43–0.0.50) closed before new features; gate green before promotion;
-0.0.72 reserved for the Quanta-native code-writing tool; ARM64 backend
+0.0.90 reserved for the Quanta-native code-writing tool; ARM64 backend
 deferred to POST-1.0.
 

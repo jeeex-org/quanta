@@ -34,7 +34,7 @@ ISO 26262 ASIL A–B, contingent on closing the gaps in §6. Higher levels
 | Documentation | Tool spec + safety manual | **SPEC.md (v0.0.53) + this manual exist** |
 | Validation | Demonstrate correct behavior | Partial: self-host fixed-point (2-stage, byte-identical) + 108-test gate + fail-closed tests (§4) |
 | Configuration mgmt | Version-controlled, reproducible | **Yes**: per-version `compiler/0.0.XX/` dirs, git-tagged |
-| Independent implementation | Cross-check tool | **PARTIAL** — differential vs bootstrap-SEED qc (5/5 parity, 0.0.53); full x86↔ARM64 differential tracked at 0.0.72+ (ROADMAP §Standards) |
+| Independent implementation | Cross-check tool | **PARTIAL** — differential vs bootstrap-SEED qc (5/5 parity, 0.0.53); full x86↔ARM64 differential is POST-1.0 (ROADMAP §Standards) |
 | Formal proof | Mathematical correctness | **NO** — semantics defined by emitter behavior (§6.1) |
 
 See also `docs/MEMORY_SAFETY_ARGUMENT.md` (the structured safety argument:
