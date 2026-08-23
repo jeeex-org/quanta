@@ -1,6 +1,6 @@
 # Quanta ROADMAP — consolidated single source of truth
 
-> **Last updated: 2026-08-24. Current compiler: 0.0.78** (x86-64 ELF emitter,
+> **Last updated: 2026-08-24. Current compiler: 0.0.79** (x86-64 ELF emitter,
 > multi-file tree, Valgrind-clean, self-host `fp=YES`). ARM64 (AArch64) backend
 > is DEFERRED POST-1.0 (see #2 schedule below); the working compiler is x86-64 only.
 >
@@ -177,6 +177,27 @@ AFTER 1.0 core completion.
 Why post-1.0: the ARM64 backend is a new backend; shipping it while x86 debt
 remains would violate the debt-first rule and split correctness effort.
 Qualification evidence is gathered AFTER the core is complete, not before.
+
+### Current status (0.0.79)
+
+Shipped + verified (x86-64 only; ARM64 deferred POST-1.0): builds on 0.0.78 —
+**arithmetic correctness foundation for crypto/Kademlia**:
+- **Overflow-safe constant folding**: the compiler no longer SIGILLs when folding a
+  large product (e.g. `123456789012345678 * 987654321098765432`); it declines to fold
+  when the result would wrap and emits a runtime op instead (wrap-by-default).
+- **Floor division + Python-style modulo** (`/`, `%` match Python `//`, `%`): correct for
+  all sign combinations; required for non-negative modular residues in RSA/PQC.
+  Verified 1433/1433 cases in the numeric differential harness (Python oracle).
+- **Shift guard**: `x << n` / `x >> n` zero out when `n >= 64` (fixed-width semantics);
+  `>>` is arithmetic (sign-preserving). Literal shifts (`1 << 3`) and variable shifts both correct.
+- **No compiler crashes** on constant-fold overflow (was a SIGILL in the bootstrap trap).
+
+Regression: full numeric harness 1433/1433 (floor) and core programs (fib(20), loop-sum,
+large multiply, shifts) verified. Pending feature tests (bswap/popcount/defer/generics/
+import/memcpy) are unimplemented intrinsics, not regressions.
+
+Next: 0.0.80 — `int` widened to i4096 (64 limbs) so 250-digit literals + PQC/Kademlia
+key arithmetic are representable without overflow; `big` (heap bignum) opt-in later.
 
 ### Current status (0.0.78)
 
