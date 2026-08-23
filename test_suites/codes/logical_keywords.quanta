@@ -1,0 +1,19 @@
+// Keyword logical operators `and` / `or` must behave exactly like `&&` / `||`,
+// including short-circuit and the FULL truth table.
+// Before 0.0.70 the keywords were accepted by the tokenizer but never consumed
+// by parse_and/parse_or, so only the FIRST operand was evaluated and the rest
+// was silently discarded: `1==1 and 2==3` wrongly took the true branch.
+fn main() {
+    let ok = 0
+    // and
+    if 1 == 1 and 2 == 2 { ok = ok + 1 }        // T and T -> taken
+    if 1 == 1 and 2 == 3 { ok = ok + 100 }      // T and F -> NOT taken
+    if 1 == 2 and 2 == 2 { ok = ok + 100 }      // F and T -> NOT taken
+    // or
+    if 1 == 2 or 2 == 2 { ok = ok + 1 }         // F or T -> taken
+    if 1 == 1 or 2 == 3 { ok = ok + 1 }         // T or F -> taken
+    if 1 == 2 or 2 == 3 { ok = ok + 100 }       // F or F -> NOT taken
+    // mixed precedence: `or` binds looser than `and`
+    if 1 == 2 or 1 == 1 and 2 == 2 { ok = ok + 1 }
+    return ok      // 4
+}

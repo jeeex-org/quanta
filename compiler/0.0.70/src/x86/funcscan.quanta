@@ -1,0 +1,513 @@
+// === FUNCTION SCANNER ===
+fn scanfns() {
+    fnc=0; let p=0
+    let encl = 0-1          // enclosing scope for the dup check; -1 = top-level
+    // P3: module tracking. cur_mod/cur_mod_len = active `mod X` name; cur_mod_close
+    // = token index of the `}` that closes the module block (so we clear cur_mod
+    // when the scanner passes it). Nested mods re-set these.
+    let cur_mod = 0; let cur_mod_len = 0; let cur_mod_close = 0-1
+    while p<tokc {
+        // P9: skip trait/interface blocks entirely (their `fn`s are body-less
+        // method declarations, not top-level functions).
+        if tokt(p)==TT_TRAIT || tokt(p)==TT_INTERFACE {
+            let sd=0; let sj=p
+            while sj<tokc {
+                if tokt(sj)==TT_PNCT {
+                    if tokv(sj)==123 { sd=sd+1 }
+                    else if tokv(sj)==125 { sd=sd-1; if sd==0 { sj=sj+1; break } }
+                }
+                sj=sj+1
+            }
+            p=sj
+            continue
+        }
+        // P3: clear active module when we pass its closing '}'.
+        if cur_mod_close >= 0 && p >= cur_mod_close {
+            cur_mod = 0; cur_mod_len = 0; cur_mod_close = 0-1
+        }
+        // P3: detect `mod X {` — open a module namespace. Find the matching '}'
+        // and record it so fns inside are registered with an `X.` name prefix.
+        if tokt(p)==TT_KEY && ktext(tokv(p),tokln(p))==58 {
+            let nx = p+1
+            if nx<tokc && tokt(nx)==TT_ID && nx+1<tokc && tokt(nx+1)==TT_PNCT && tokv(nx+1)==123 {
+                cur_mod = tokv(nx); cur_mod_len = tokln(nx)
+                // scan forward for the matching '}' (track {} depth)
+                let md=0; let mj=nx+1
+                while mj<tokc {
+                    if tokt(mj)==TT_PNCT {
+                        if tokv(mj)==123 { md=md+1 }
+                        else if tokv(mj)==125 { md=md-1; if md==0 { mj=mj+1; break } }
+                    }
+                    mj=mj+1
+                }
+                cur_mod_close = mj
+                // register the module name in modtab
+                w64(modtab + modc*16, cur_mod); w64(modtab + modc*16 + 8, cur_mod_len); modc = modc + 1
+                p = nx+2   // continue scanning inside the module block
+                continue
+            }
+        }
+        // P3: check for extern "C" fn
+        let is_extern = 0
+        if tokt(p)==TT_KEY&&ktext(tokv(p),tokln(p))==19 {
+            // extern keyword found - check for "C"
+            // The string literal "C" is a SINGLE STR token (no separate quote
+            // tokens), so it sits at p+1. Advance p to p+2 to land on the next
+            // keyword. ONLY treat it as a function extern if that keyword is
+            // `fn` (ktext 1); `extern "C" global NAME` is a DATA import and is
+            // handled by scan_globals, not here.
+            let np = p+1
+            if np<tokc && tokt(np)==TT_STR {
+                let nk = p+2
+                if nk<tokc && tokt(nk)==TT_KEY && ktext(tokv(nk),tokln(nk))==1 {
+                    // Found `extern "C" fn` - advance past extern + the "C" token.
+                    is_extern = 1
+                    p = np + 1
+                }
+            }
+        }
+        // DISABLED: closure scanner (can't see inside function bodies)
+        // if tokt(p)==TT_OP && tokv(p)==124 { ... }
+        
+        if tokt(p)==TT_KEY&&ktext(tokv(p),tokln(p))==1 {
+            let nt=p+1
+            // Capture the signature-scan start IMMEDIATELY, before any other
+            // local assignment can alias the slot qc-1.0.1 places `nt` in.
+            let kstart = nt + 1
+            if nt<tokc&&tokt(nt)==TT_ID {
+                let nm=tokv(nt); let nl=tokln(nt)
+                // P3: if inside `mod X`, register this fn as `X.<base>` so calls use `X.fn()`.
+                // Compute the registered name/src-ptr here so both the dup-check and sfn use it.
+                let reg_nm = nm; let reg_nl = nl
+                if cur_mod != 0 {
+                    reg_nm = mod_synth_name(cur_mod, cur_mod_len, nm, nl)
+                    reg_nl = cur_mod_len + 1 + nl
+                }
+                let d=0; let bp=0; let j=nt+1
+                // P10: Parse generic parameters <T, U> after function name.
+                // State lives in globals (gscan_*) — nested-block locals in
+                // scanfns reuse register slots and would clobber each other.
+                gscan_gcount = 0
+                gscan_gpoff = 0
+                gscan_isgen = 0
+                if kstart<tokc && tokt(kstart)==TT_OP && tokv(kstart)==60 {
+                    gscan_isgen = 1
+                    let gk = kstart + 1
+                    while gk<tokc {
+                        let gtk = tokt(gk)
+                        if gtk==TT_OP && tokv(gk)==62 { gk=gk+1; break }
+                        if gtk==TT_ID || gtk==TT_KEY {
+                            w64(fn_genparam_names + gscan_gpoff, tokv(gk)); gscan_gpoff=gscan_gpoff+8
+                            w64(fn_genparam_names + gscan_gpoff, tokln(gk)); gscan_gpoff=gscan_gpoff+8
+                            gscan_gcount=gscan_gcount+1
+                            gk=gk+1
+                            // skip optional comma
+                            if gk<tokc && tokt(gk)==TT_PNCT && tokv(gk)==44 { gk=gk+1 }
+                        } else {
+                            gk=gk+1
+                        }
+                    }
+                    kstart = gk  // continue from after '>'
+                }
+                // Scan signature: count fixed params + detect trailing ...
+                let pcnt=0; let isvar=0; let depth=0; let k=kstart
+                let pnbase = fn_poff   // capture START offset BEFORE storing params
+                let saw_param = 0
+                let last_param_tok = -1   // t5: token index of the most recent param ID
+                let pdfixed = 0           // t5: count of leading params with NO default
+                let in_default = 0        // t5: 1 while scanning a '= expr' (skip its IDs/...)
+                while k<tokc {
+                    let tk=tokt(k)
+                    // t5: a default expression ends at the param terminator.
+                    if in_default==1 && tk==TT_PNCT {
+                        let tv=tokv(k)
+                        if tv==44 { in_default=0 }       // ',' -> next param starts
+                        else if tv==41 { in_default=0 }   // ')' -> end of signature
+                        else if tv==46 && k+2<tokc && tokt(k+1)==TT_PNCT && tokv(k+1)==46 && tokt(k+2)==TT_PNCT && tokv(k+2)==46 { in_default=0 }  // '...' -> next param
+                    }
+                    if tk==TT_PNCT {
+                        let tv=tokv(k)
+                        if tv==40 { depth=depth+1 }       // '('
+                        else if tv==41 { break }          // ')'
+                        else if depth==1 && tv==44 { pcnt=pcnt+1 }  // top-level ','
+                        // detect '...' = three consecutive '.' puncts (value 46)
+                        else if depth==1 && in_default==0 && tv==46 && k+2<tokc && tokt(k+1)==TT_PNCT && tokv(k+1)==46 && tokt(k+2)==TT_PNCT && tokv(k+2)==46 {
+                            isvar=1; k=k+2   // skip the next two dots
+                        }
+                    }
+                    // t5: detect '= default' for the current param.
+                    // NOTE: '=' is TT_OP (value 61), not TT_PNCT.
+                    if tk==TT_OP && tokv(k)==61 && last_param_tok>=0 {
+                        // default expr spans [k+1 .. end of this param].
+                        // end = next ',' / ')' / '...' at depth 1, or tokc.
+                        let de=k+1; let dend=de
+                        while dend<tokc {
+                            let dtk=tokt(dend); let dtv=tokv(dend)
+                            if dtk==TT_PNCT {
+                                if dtv==44 { dend=dend+1; break }       // ','
+                                if dtv==41 { dend=dend+1; break }       // ')'
+                                if dtv==46 && dend+2<tokc && tokt(dend+1)==TT_PNCT && tokv(dend+1)==46 && tokt(dend+2)==TT_PNCT && tokv(dend+2)==46 { dend=dend+1; break }  // '...'
+                            }
+                            dend=dend+1
+                        }
+                        w64(fn_defargs + (fnc*64 + saw_param - 1)*16, de)
+                        w64(fn_defargs + (fnc*64 + saw_param - 1)*16 + 8, dend)
+                        in_default = 1   // t5: skip the default expr's IDs/... until terminator
+                    }
+                    if depth==1 && in_default==0 && tk==TT_ID {
+                        w64(fn_pnames + fn_poff, tokv(k)); fn_poff=fn_poff+8; w64(fn_pnames + fn_poff, tokln(k)); fn_poff=fn_poff+8
+                        saw_param=saw_param+1
+                        last_param_tok=k
+                        // Skip optional type annotation — BOTH `: Type` (colon form)
+                        // AND ` Type` (space form, e.g. `a i64`). Without this, the
+                        // type-name ID (e.g. `i64`) is counted as a phantom parameter,
+                        // breaking arity for every function call (P0 bug).
+                        {
+                          let nk = k+1
+                          if nk<tokc && tokt(nk)==TT_PNCT && tokv(nk)==58 { nk=nk+1 }  // skip ':'
+                          if nk<tokc && (tokt(nk)==TT_ID || tokt(nk)==TT_KEY || (tokt(nk)==TT_PNCT && (tokv(nk)==91 || tokv(nk)==40))) {
+                            // P10: flag fn-pointer params (f: fn(...) -> ...)
+                            if ktext(tokv(nk), tokln(nk))==1 { w64(fn_parfn + (fnc*200 + saw_param-1)*8, 1) }
+                            // Consume the full type expression, tracking [] and ()
+                            // nesting; stop at a top-level ',' or ')' (param boundary).
+                            let td = 0
+                            let kk = nk
+                            let done = 0
+                            while kk<tokc && done==0 {
+                                let ttk=tokt(kk); let ttv=tokv(kk)
+                                if ttk==TT_PNCT {
+                                    if ttv==91 { td=td+1 }        // '['
+                                    else if ttv==93 { td=td-1 }   // ']'
+                                    else if ttv==40 { td=td+1 }   // '('
+                                    else if ttv==41 { if td==0 { done=1 } else { td=td-1 } }  // ')' closes fn-type paren
+                                    else if td==0 && ttv==44 { done=1 }  // ',' ends type at top level
+                                    else if td==0 && ttv==46 && kk+2<tokc && tokt(kk+1)==TT_PNCT && tokv(kk+1)==46 && tokt(kk+2)==TT_PNCT && tokv(kk+2)==46 { done=1 }  // '...'
+                                }
+                                if done==1 { break }
+                                kk=kk+1
+                            }
+                            k = kk-1   // outer k=k+1 moves past the terminator
+                          }
+                        }
+                    }
+                    k=k+1
+                }
+                // t4: store param names into fn_pnames (flat [ptr,len] per param).
+                // Use saw_param (direct param-ID count) for the true param count,
+                // not the comma count (comma count = N-1 and is fragile here).
+                w64(fn_pcount + fnc*8, saw_param)
+                w64(fn_pbase + fnc*8, pnbase)
+                // P10: Store generic parameter info (from global scratch)
+                w64(fn_generic + fnc*8, gscan_isgen)
+                w64(fn_genparams + fnc*8, gscan_gcount)
+                w64(fn_genparam_base + fnc*8, gscan_gpoff - gscan_gcount*16)
+                // t5: count leading params (from index 0) that have NO default ->
+                // the mandatory minimum arg count at the call site.
+                let pfz=0
+                while pfz<saw_param {
+                    let dr = r64(fn_defargs + (fnc*64 + pfz)*16)
+                    if dr==0 { pfz=pfz+1 } else { break }
+                }
+                w64(fn_pdfixed + fnc*8, pfz)
+                // Re-init d/bp here: the generic-param and signature blocks above
+                // clobber the slot aliasing `d`/`bp` (bootstrap register reuse).
+                d=0; bp=0
+                while j<tokc {
+                    if tokt(j)==TT_PNCT {
+                        if tokv(j)==123 { if d==0&&bp==0 { bp=j }; d=d+1 }
+                        if tokv(j)==125 { d=d-1; if d<=0 { j=j+1; break } }
+                        // extern "C" fn decl has no body; terminate at ';'
+                        if is_extern==1 && tokv(j)==59 { j=j+1; break }
+                    }
+                    j=j+1
+                }
+                // ret_type_name/len intentionally NOT captured (return-type checking
+                // deferred — see STATE.md F3 note). Pass 0 so sfn records "inferred".
+                let ret_type_name = 0; let ret_type_len = 0
+                // Same-scope duplicate function name is a HARD ERROR (not silent
+                // first-wins). Only flag if an already-registered fn in the SAME
+                // scope (same parent) has the same name; nested scopes may reuse
+                // names freely (lexical scoping).
+                let dup = 0; let di = 0
+                while di < fnc {
+                    if r64(fn_parent + di*8)==encl && fn_nlen(di) == reg_nl {
+                        let ok = 1; let k = 0
+                        while k < reg_nl { if r8(src+fn_name(di)+k) != r8(src+reg_nm+k) { ok = 0; break }; k = k+1 }
+                        if ok == 1 { dup = 1; break }
+                    }
+                    di = di + 1
+                }
+                if dup == 1 {
+                    let me = "error: duplicate function definition: "
+                    file_write(2, me+8, len(me))
+                    file_write(2, reg_nm, reg_nl)
+                    let mn = "\n"; file_write(2, mn+8, 1)
+                    exit(1)
+                }
+                // Record this fn with its enclosing scope as parent (-1 = top-level
+                // for the flat model; fn_parent is used by resolve_call/findfn_global).
+                w64(fn_parent + fnc*8, encl)
+                sfn(fnc,reg_nm,reg_nl,bp,0,saw_param,ret_type_name,ret_type_len)
+            w64(fn_extern + fnc*8, is_extern)
+            fnc=fnc+1; p=j
+            } else { p=p+1 }
+        } else { p=p+1 }
+    }
+}
+
+fn scan_aliases() {
+    let p=0
+    while p<tokc {
+        if tokt(p)==TT_KEY && ktext(tokv(p),tokln(p))==17 {
+            if p+3<tokc && tokt(p+1)==TT_ID && tokt(p+2)==TT_OP && tokv(p+2)==61 && tokt(p+3)==TT_ID {
+                let anm=tokv(p+1); let anl=tokln(p+1)
+                let tnm=tokv(p+3); let tnl=tokln(p+3)
+                let tfi=findfn(tnm, tnl)
+                if tfi>=0 {
+                    w64(alias_tab + alias_c*24, anm); w64(alias_tab + alias_c*24 + 8, anl)
+                    w64(alias_tab + alias_c*24 + 16, tfi)
+                    alias_c=alias_c+1
+                }
+            }
+        }
+        p=p+1
+    }
+}
+
+// P9: Scan for trait declarations (trait Name { fn method(...) ... })
+fn scantraits() {
+  let p = 0
+  while p < tokc {
+    if tokt(p) == TT_TRAIT {
+      let nt = p+1
+      if nt<tokc && tokt(nt)==TT_ID {
+        let onm = tokv(nt); let onl = tokln(nt)
+        let bp = nt+1
+        while bp<tokc && !(tokt(bp)==TT_PNCT && tokv(bp)==123) { bp = bp+1 }
+        if bp<tokc {
+          let ti = g_traitc; g_traitc = ti + 1
+          w64(tdefs + ti*80, onm); w64(tdefs + ti*80 + 8, onl)
+          w64(tdefs + ti*80 + 24, ti*32)   // method base = ti*32 (32 method slots/trait)
+          let mc = 0; let cp = bp+1
+          while cp<tokc && !(tokt(cp)==TT_PNCT && tokv(cp)==125) {
+            if tokt(cp)==TT_KEY && ktext(tokv(cp),tokln(cp))==1 {  // fn keyword
+              let mnm = tokv(cp+1); let mnl = tokln(cp+1)
+              if mc < 32 {  // bounds check
+                let slot = (ti*32 + mc)*24
+                w64(tmethods + slot, mnm); w64(tmethods + slot + 8, mnl)
+                // count params and check return type (simplified for now)
+                let pc = 0; let rp = cp+2
+                let depth = 0
+                while rp<tokc {
+                  let tk = tokt(rp); let tv = tokv(rp)
+                  if tk==TT_PNCT {
+                    if tv==40 { depth = depth+1 }
+                    else if tv==41 { depth = depth-1; if depth==0 { break } }
+                    else if depth==1 && tv==44 { pc = pc+1 }
+                  }
+                  rp = rp+1
+                }
+                w64(tmethods + slot + 16, pc)  // param count
+                w64(tmethods + slot + 24, 0-1) // ret struct (simplified)
+                mc = mc+1
+              }
+              cp = rp
+            }
+            cp = cp+1
+          }
+          w64(tdefs + ti*80 + 16, mc)
+        }
+      }
+    }
+    p = p+1
+  }
+}
+
+// P9: Scan for impl blocks (impl Trait for Struct { fn method(...) ... })
+fn scanimpls() {
+  let p = 0
+  while p < tokc {
+    if tokt(p) == TT_IMPL {
+      let nt = p+1
+      if nt<tokc && tokt(nt)==TT_ID {  // trait name is an ID, not TT_TRAIT
+        let tnm = tokv(nt); let tnl = tokln(nt)
+        let nf = nt+1
+        if nf<tokc && ktext(tokv(nf),tokln(nf))==7 {  // "for" keyword (ktext=7)
+          let snm = tokv(nf+1); let snl = tokln(nf+1)
+          let bp = nf+2
+          while bp<tokc && !(tokt(bp)==TT_PNCT && tokv(bp)==123) { bp = bp+1 }
+          if bp<tokc {
+            // find trait index
+            let ti = 0; let found_t = 0
+            let tcv = g_traitc
+            while ti < tcv {
+              let onm = r64(tdefs + ti*80); let onl = r64(tdefs + ti*80 + 8)
+              if onl == tnl {
+                let ok = 1; let k = 0
+                while k < tnl { if r8(src+onm+k) != r8(src+tnm+k) { ok = 0; break }; k = k+1 }
+                if ok == 1 { found_t = 1; break }
+              }
+              ti = ti+1
+            }
+            // find struct index
+            let si = 0; let found_s = 0
+            while si < structc {
+              let onm = r64(sdefs + si*64); let onl = r64(sdefs + si*64 + 8)
+              if onl == snl {
+                let ok = 1; let k = 0
+                while k < snl { if r8(src+onm+k) != r8(src+snm+k) { ok = 0; break }; k = k+1 }
+                if ok == 1 { found_s = 1; break }
+              }
+              si = si+1
+            }
+            if found_t == 1 && found_s == 1 {
+              let ii = g_implc; g_implc = ii + 1
+              w64(idefs + ii*96, ti); w64(idefs + ii*96 + 8, si)
+              w64(idefs + ii*96 + 24, ii*32)   // method base = ii*32
+              let mc = 0; let cp = bp+1
+              while cp<tokc && !(tokt(cp)==TT_PNCT && tokv(cp)==125) {
+                if tokt(cp)==TT_KEY && ktext(tokv(cp),tokln(cp))==1 {  // fn keyword
+                  let mnm = tokv(cp+1); let mnl = tokln(cp+1)
+                  let slot = (ii*32 + mc)*32
+                  // find matching trait method index
+                  let tmi = 0; let found_tm = 0
+                  while tmi < r64(tdefs + ti*80 + 16) {
+                    let tmnm = r64(tmethods + (ti*32 + tmi)*24)
+                    let tmnl = r64(tmethods + (ti*32 + tmi)*24 + 8)
+                    if tmnl == mnl {
+                      let ok = 1; let k = 0
+                      while k < mnl { if r8(src+tmnm+k) != r8(src+mnm+k) { ok = 0; break }; k = k+1 }
+                      if ok == 1 { found_tm = 1; break }
+                    }
+                    tmi = tmi+1
+                  }
+                  if found_tm == 1 {
+                    if mc < 32 {  // bounds check
+                      w64(imethods + slot, tmi)  // trait method index
+                      // find function index
+                      let fi = 0; let found_f = 0
+                      while fi < fnc {
+                        if fn_nlen(fi) == mnl {
+                          let fnm = fn_name(fi)
+                          let ok = 1; let k = 0
+                          while k < mnl { if r8(src+fnm+k) != r8(src+mnm+k) { ok = 0; break }; k = k+1 }
+                          if ok == 1 { found_f = 1; break }
+                        }
+                        fi = fi+1
+                      }
+                      w64(imethods + slot + 8, fi)
+                      // P9: tag impl method `self` (param 0) with the struct
+                      w64(fn_partype + (fi*200 + 0)*8, si)
+                      mc = mc+1
+                    }
+                  }
+                  cp = cp+1
+                }
+                cp = cp+1
+              }
+              w64(idefs + ii*96 + 16, mc)
+            }
+          }
+        }
+      }
+    }
+    p = p+1
+  }
+}
+
+// P9: struct literal `Name { f: e, ... }` -> rewrite to `Name(e, ...)`
+// constructor-call tokens IN PLACE, so parse_primary (which only understands
+// `Name(...)`) never sees the new syntax. Runs after scanstructs so struct
+// names are known. The parser then treats it exactly like a constructor call.
+fn rewrite_struct_literals() {
+    let p = 0
+    while p < tokc {
+        if tokt(p)==TT_ID {
+            // inline findstruct(tokv(p), tokln(p)) — no user-fn calls (clobber)
+            let nm = tokv(p); let nl = tokln(p)
+            let si = 0-1
+            let su = 0
+            while su < structc {
+                if r64(sdefs + su*64 + 8)==nl {
+                    let sp = r64(sdefs + su*64); let sm = 0; let smatch = 1
+                    while sm < nl { if r8(src+sp+sm)!=r8(src+nm+sm) { smatch=0; break }; sm=sm+1 }
+                    if smatch==1 { si = su; break }
+                }
+                su = su+1
+            }
+            // skip declaration contexts: `struct Name {`, `impl ... for Name {`,
+            // `trait Name {` — only rewrite in EXPRESSION position.
+            let prev_ok = 1
+            if p>=1 {
+                let pv = tokv(p-1); let pl = tokln(p-1)
+                // byte-compare regardless of token type (struct/impl/trait/for
+                // are TT_ID here)
+                if pl==6 && r8(src+pv)=='s'&&r8(src+pv+1)=='t'&&r8(src+pv+2)=='r'&&r8(src+pv+3)=='u'&&r8(src+pv+4)=='c'&&r8(src+pv+5)=='t' { prev_ok = 0 }  // struct
+                if pl==4 && r8(src+pv)=='i'&&r8(src+pv+1)=='m'&&r8(src+pv+2)=='p'&&r8(src+pv+3)=='l' { prev_ok = 0 }  // impl
+                if pl==5 && r8(src+pv)=='t'&&r8(src+pv+1)=='r'&&r8(src+pv+2)=='a'&&r8(src+pv+3)=='i'&&r8(src+pv+4)=='t' { prev_ok = 0 }  // trait
+                if pl==3 && r8(src+pv)=='f'&&r8(src+pv+1)=='o'&&r8(src+pv+2)=='r' { prev_ok = 0 }  // for (impl Trait for Struct)
+                if pl==9 && r8(src+pv)=='i'&&r8(src+pv+1)=='n'&&r8(src+pv+2)=='t'&&r8(src+pv+3)=='e'&&r8(src+pv+4)=='r'&&r8(src+pv+5)=='f'&&r8(src+pv+6)=='a'&&r8(src+pv+7)=='c'&&r8(src+pv+8)=='e' { prev_ok = 0 }  // interface
+            }
+            if si>=0 && prev_ok==1 && p+1<tokc && tokt(p+1)==TT_PNCT && tokv(p+1)==123 {
+                // scan to matching '}' (depth-tracked, skip nested)
+                let depth = 1
+                let end = 0-1
+                let q = p+2
+                while q<tokc {
+                    if tokt(q)==TT_PNCT {
+                        if tokv(q)==123 { depth = depth+1 }
+                        else if tokv(q)==125 { depth = depth-1; if depth==0 { end = q; break } }
+                    }
+                    q = q+1
+                }
+                if end>=0 {
+                    // rewrite '{' -> '(' and '}' -> ')'
+                    w64(toks + (p+1)*TKS, TT_PNCT); w64(toks + (p+1)*TKS + 8, 40)
+                    w64(toks + end*TKS, TT_PNCT); w64(toks + end*TKS + 8, 41)
+                    // drop field-name + ':' token pairs inside the braces.
+                    // Pattern: TT_ID followed by ':' (58) is a field name.
+                    let w = p+2
+                    let r = p+2
+                    while r < end {
+                        if tokt(r)==TT_ID && r+1<end && tokt(r+1)==TT_PNCT && tokv(r+1)==58 {
+                            r = r+2   // skip the field name and ':'
+                        } else {
+                            if w != r {
+                                // copy token r -> w (5 qwords)
+                                w64(toks + w*TKS,     tokt(r))
+                                w64(toks + w*TKS + 8,  tokv(r))
+                                w64(toks + w*TKS + 16, tokl(r))
+                                w64(toks + w*TKS + 24, tokc(r))
+                                w64(toks + w*TKS + 32, tokln(r))
+                            }
+                            w = w+1
+                            r = r+1
+                        }
+                    }
+                    // move the rewritten ')' token to position w
+                    if w != end {
+                        w64(toks + w*TKS,     TT_PNCT)
+                        w64(toks + w*TKS + 8,  41)
+                        w64(toks + w*TKS + 16, tokl(end))
+                        w64(toks + w*TKS + 24, tokc(end))
+                        w64(toks + w*TKS + 32, tokln(end))
+                        // shift everything after end down by (end - w)
+                        let gap = end - w
+                        let s = end + 1
+                        while s < tokc {
+                            w64(toks + (s-gap)*TKS,     tokt(s))
+                            w64(toks + (s-gap)*TKS + 8,  tokv(s))
+                            w64(toks + (s-gap)*TKS + 16, tokl(s))
+                            w64(toks + (s-gap)*TKS + 24, tokc(s))
+                            w64(toks + (s-gap)*TKS + 32, tokln(s))
+                            s = s+1
+                        }
+                        tokc = tokc - gap
+                    }
+                }
+            }
+        }
+        p = p+1
+    }
+}
+
