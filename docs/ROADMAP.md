@@ -1,6 +1,6 @@
 # Quanta ROADMAP — consolidated single source of truth
 
-> **Last updated: 2026-08-23. Current compiler: 0.0.73** (x86-64 ELF emitter,
+> **Last updated: 2026-08-23. Current compiler: 0.0.74** (x86-64 ELF emitter,
 > multi-file tree, Valgrind-clean, self-host `fp=YES`). ARM64 (AArch64) backend
 > is DEFERRED POST-1.0 (see #2 schedule below); the working compiler is x86-64 only.
 >
@@ -178,10 +178,10 @@ Why post-1.0: the ARM64 backend is a new backend; shipping it while x86 debt
 remains would violate the debt-first rule and split correctness effort.
 Qualification evidence is gathered AFTER the core is complete, not before.
 
-### Current status (0.0.73)
+### Current status (0.0.74)
 
 Shipped + verified (x86-64 only; ARM64 deferred POST-1.0): **true 2-stage self-host** —
-the committed `bin/x86/qc` compiles the 0.0.73 source to a faithful `qc`, verified
+the committed `bin/x86/qc` compiles the 0.0.74 source to a faithful `qc`, verified
 byte-identical to the golden binary (and to a 2nd-stage rebuild); fail-closed memory
 model (overflow/bounds→SIGILL 132, MAP_FAILED→rc=1, undeclared/cyclic→rc=7);
 grammar 0 errors on all 15 modules; Valgrind-clean; differential vs seed.
@@ -333,7 +333,7 @@ differential 5/5 vs 0.0.68, 0 duplicate opcodes. Self-host fixed point md5
 `5f23f927…` across stages 1/2/3.
 New tests, each returning 0 on 0.0.68: `match_guard` (111),
 `match_guard_false` (222), `match_guard_order` (4 — ordering, fallthrough, and a guard body using the bound name).
-**0.0.73** No-quote form `$$(...)` reverted — the no-quote form was added in 0.0.73 but reverted because the user clarified that `$$ ls -l ~/ ` is not the intended syntax; only `$$(commands)` (parenthesized) is correct. The string form `$$("...")` and array form `$$([...])` remain.
+**0.0.74** `$$(identifier)` shorthand — a single bare identifier inside `$$()` is stringified, so `$$(ls)` == `$$("ls")`. Multi-token commands still require quotes: `$$(echo hello)` is a parse error (the shorthand only fires for `TT_ID` immediately followed by `)`).
 **0.0.72** fnptr/closure_call segfault fix — `fnptr(FNAME)` now returns a [codeptr, env=0] tuple (same layout as IR_FNVAL), so it can be passed directly to `closure_call`. Before 0.0.72, `fnptr` emitted a raw code pointer (`lea rax,[rip+disp]`), but `closure_call` expects a tuple and dereferences its argument as `mov rdx,[rax]` then `call r11`. Feeding it a raw pointer read garbage and jumped to a bogus address → SEGFAULT (rc=139). No gated test covered `fnptr`, so the crash survived since 0.0.67. The `fnptr_test.quanta` test was rewritten: it previously wrapped the result in `mk_any(p,0)` as a workaround for the raw-pointer behavior, which is no longer needed.
 Gate: 110/110 functional (rewritten fnptr_test), 8/8 security, 3/3 performance,
 differential fuzz 120/120, compiler fuzz 5000/0 crashes, Valgrind 0 errors,

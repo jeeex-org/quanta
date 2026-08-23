@@ -123,7 +123,7 @@ Test legend (the **Test?** column):
 | closure literals `\|a\| { a+1 }` | ✅ done (0.0.65) | ✅ gate | closure_basic rc=6, closure_multi_param rc=7, closure_higher_order rc=42; braces required |
 | user fn overrides builtin | ✅ done (0.0.68) | ✅ gate | user_fn_beats_builtin rc=42 (was 0), user_fn_beats_builtin_chain rc=38 (was SIGILL 132), builtin_still_inline rc=3. One guard in emit_bltn/emit_bltn2 (was enforced in only 2 of 86 branches). EXCEPTION: mem_load/mem_store/mem_load8/mem_store8 + fadd/fsub/fmul/fdiv are primitive intrinsics and NOT overridable — the compiler's own w64↔mem_store wrappers are mutually recursive, so user-wins there is infinite recursion and breaks the self-host |
 | fnptr + closure_call | ✅ done (0.0.72) | ✅ gate | fnptr_test rc=7. fnptr now returns a [codeptr, env=0] tuple (same layout as IR_FNVAL), so it can be passed directly to closure_call. Before 0.0.72 fnptr emitted a raw pointer and feeding it to closure_call dereferenced it as a tuple → SEGFAULT |
-| `$$(cmd)` external command | ✅ done | 🟡 no gate | string form `$$("echo hi")` and array form `$$(["/bin/echo","hi"])`. Returns CmdResult{out, code, err}. Gated behind `unsafe {}` |
+| `$$(cmd)` external command | ✅ done (0.0.74) | 🟡 1 test | string form `$$("echo hi")`, array form `$$(["/bin/echo","hi"])`, and identifier shorthand `$$(ls)` == `$$("ls")`. Returns CmdResult{out, code, err}. Gated behind `unsafe {}` |
 | closure captures | ✅ done (0.0.67) | ✅ gate | closure_capture rc=15, closure_capture_multi rc=11, closure_capture_byvalue rc=11. Free variables of the enclosing fn captured BY VALUE into a heap env array at construction; body reads them via IR_CAPREAD from env in r10. Repeat references share one slot; max 32 captures |
 
 ## E. Memory & Runtime

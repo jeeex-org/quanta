@@ -70,7 +70,7 @@ All evidence below was produced this session (2026-08-16) against
 `compiler/0.0.53/`:
 
 1. **Self-host fixed point**: 2-stage bootstrap
-   `committed bin/x86/qc → 0.0.73 source → qc`, all rc=0,
+   `committed bin/x86/qc → 0.0.74 source → qc`, all rc=0,
    rebuilt `qc` byte-identical to committed `qc` (and to a 2nd-stage rebuild). (A miscompiling
    compiler almost always fails to bootstrap — this is a strong
    end-to-end correctness signal.)
