@@ -1,0 +1,196 @@
+// std/big — arbitrary-precision unsigned integers (Stage 1: ADD/SUB/MUL).
+//
+// A `big` is a header-pointer to a little-endian array of 16-bit limbs:
+//   [base]      = nlimbs (i64; element 0 is the header, NOT a limb)
+//   [base+8]    = limb[0]  (least significant 16 bits; stored as i64 0..65535)
+//   [base+16]   = limb[1]
+//   ...
+//
+// WHY 16-BIT LIMBS: Quanta's `*` is a signed 64-bit multiply with ovf_trap=1.
+// A 32-bit limb squared (~1.8e19) overflows i64 and trips the trap. With 16-bit
+// limbs every a[i]*b[j] < 2^32 < 2^63, never traps, and the split into
+//   low  = prod & 0xFFFF
+//   high = prod >> 16        (prod < 2^32 so always non-negative -> logical)
+// is exact. 4096-bit numbers use 256 limbs.
+//
+// Stage 1 is MAGNITUDE-ONLY (unsigned). Sign handling arrives with DIV/MOD
+// (Stage 2). Callers pass non-negative operands; results are non-negative.
+//
+// Import with:  import std/big
+
+// Allocate a big with `n` 16-bit limbs. mem_alloc(k) gives k qword slots
+// (indices 0..k-1) with [base]=k; index 0 is the limb-count header, limbs at
+// indices 1..n, so allocate n+1 slots and set the header to n.
+fn big_alloc(n) {
+  let r = mem_alloc(n + 1)
+  r[0] = n
+  return r
+}
+
+fn big_len(a) { return a[0] }
+fn big_limb(a, i) { return a[i + 1] }
+fn big_set(a, i, v) { a[i + 1] = v }
+
+// Strip leading zero limbs; never reduce below 1.
+fn big_norm(r) {
+  let m = big_len(r)
+  while m > 1 {
+    if big_limb(r, m - 1) == 0 { m = m - 1 }
+    else { break }
+  }
+  r[0] = m
+  return r
+}
+
+// Unsigned addition: r = a + b.
+fn big_add(a, b) {
+  let na = big_len(a)
+  let nb = big_len(b)
+  let n = na
+  if nb > n { n = nb }
+  let r = big_alloc(n + 1)
+  let carry = 0
+  let i = 0
+  while i < n {
+    let x = 0
+    let y = 0
+    if i < na { x = big_limb(a, i) }
+    if i < nb { y = big_limb(b, i) }
+    let s = x + y + carry
+    let c = 0
+    if s < x { c = 1 }            // unsigned overflow iff sum wrapped below x
+    big_set(r, i, s)
+    carry = c
+    i = i + 1
+  }
+  if carry == 1 { big_set(r, n, 1); n = n + 1 }
+  r[0] = n
+  return r
+}
+
+// Unsigned subtraction: r = |a - b| (magnitude difference).
+fn big_sub(a, b) {
+  let na = big_len(a)
+  let nb = big_len(b)
+  let swap = 0
+  if na < nb { swap = 1 }
+  else if na == nb {
+    let k = na - 1
+    while k >= 0 {
+      let xa = big_limb(a, k)
+      let xb = big_limb(b, k)
+      if xa < xb { swap = 1; k = -1 }
+      else if xa > xb { k = -1 }
+      else { k = k - 1 }
+    }
+  }
+  let hi = a
+  let lo = b
+  if swap == 1 { hi = b; lo = a }
+  let nh = big_len(hi)
+  let nl = big_len(lo)
+  let r = big_alloc(nh)
+  let borrow = 0
+  let i = 0
+  while i < nh {
+    let x = big_limb(hi, i)
+    let y = 0
+    if i < nl { y = big_limb(lo, i) }
+    let d = x - y - borrow
+    let b2 = 0
+    if d < 0 { b2 = 1; d = d + 65536 }   // wrap to u16 (i64 mod 2^16)
+    big_set(r, i, d)
+    borrow = b2
+    i = i + 1
+  }
+  return big_norm(r)
+}
+
+// Unsigned multiplication: r = a * b (schoolbook, 16-bit limbs).
+fn big_mul(a, b) {
+  let na = big_len(a)
+  let nb = big_len(b)
+  let nr = na + nb
+  let r = big_alloc(nr)
+  let i = 0
+  while i < nr { big_set(r, i, 0); i = i + 1 }
+  let i0 = 0
+  while i0 < na {
+    let ai = big_limb(a, i0)
+    let carry = 0
+    let j = 0
+    while j < nb {
+      let bj = big_limb(b, j)
+      let rij = big_limb(r, i0 + j)
+      let prod = ai * bj                  // < 2^32, never traps
+      let low = prod & 65535
+      let high = prod >> 16              // prod < 2^32 -> non-negative
+      // low column: existing limb + low + incoming carry
+      let acc = rij + low + carry
+      big_set(r, i0 + j, acc & 65535)
+      let c_out = acc >> 16
+      // high column: next limb += high + carry-out from low column
+      let acc2 = big_limb(r, i0 + j + 1) + high + c_out
+      big_set(r, i0 + j + 1, acc2 & 65535)
+      carry = acc2 >> 16
+      j = j + 1
+    }
+    big_set(r, i0 + nb, big_limb(r, i0 + nb) + carry)
+    i0 = i0 + 1
+  }
+  return big_norm(r)
+}
+
+// Build a big from a single non-negative i64.
+fn big_from_i64(x) {
+  let r = big_alloc(4)
+  big_set(r, 0, x & 65535)
+  big_set(r, 1, (x >> 16) & 65535)
+  big_set(r, 2, (x >> 32) & 65535)
+  big_set(r, 3, (x >> 48) & 65535)
+  return big_norm(r)
+}
+
+// Build a big from two 64-bit values (lo64, hi64), each split into four 16-bit
+// limbs (little-endian). Useful for tests; e.g. big_from_2x64(-1, 0) = 2^64-1.
+fn big_from_2x64(lo64, hi64) {
+  let r = big_alloc(8)
+  big_set(r, 0, lo64 & 65535)
+  big_set(r, 1, (lo64 >> 16) & 65535)
+  big_set(r, 2, (lo64 >> 32) & 65535)
+  big_set(r, 3, (lo64 >> 48) & 65535)
+  big_set(r, 4, hi64 & 65535)
+  big_set(r, 5, (hi64 >> 16) & 65535)
+  big_set(r, 6, (hi64 >> 32) & 65535)
+  big_set(r, 7, (hi64 >> 48) & 65535)
+  return big_norm(r)
+}
+
+// Return the value as an i64, valid only when it fits in 64 bits (len <= 4).
+fn big_to_i64(a) {
+  let v = 0
+  let i = 0
+  while i < big_len(a) {
+    v = v + (big_limb(a, i) << (16 * i))
+    i = i + 1
+  }
+  return v
+}
+
+// Print a big in hexadecimal (exact, limb-by-limb). Each 16-bit limb is 4 hex
+// digits, most-significant limb printed first. Cross-checks against Python.
+fn big_print_hex(a) {
+  let n = big_len(a)
+  let k = n - 1
+  while k >= 0 {
+    let limb = big_limb(a, k)
+    let sh = 12
+    while sh >= 0 {
+      let nib = (limb >> sh) & 15
+      print(nib)
+      sh = sh - 4
+    }
+    k = k - 1
+  }
+  return 0
+}

@@ -1,6 +1,6 @@
 # Quanta ROADMAP — consolidated single source of truth
 
-> **Last updated: 2026-08-24. Current compiler: 0.0.80** (x86-64 ELF emitter,
+> **Last updated: 2026-08-24. Current compiler: 0.0.81** (x86-64 ELF emitter,
 > multi-file tree, Valgrind-clean, self-host `fp=YES`). ARM64 (AArch64) backend
 > is DEFERRED POST-0.1.0 (see #2 schedule below); the working compiler is x86-64 only.
 >
@@ -215,16 +215,39 @@ verified; the self-host fixpoint is byte-identical (`qc` compiled by itself
 reproduces itself). Pending feature tests (bswap/popcount/defer/generics/
 import/memcpy) are unimplemented intrinsics, not regressions.
 
-Next: **(b) `int` widened to i4096 (64 limbs)** so 250-digit literals + PQC/
-Kademlia key arithmetic are representable without overflow; `big` (heap bignum)
-opt-in later. HONEST SCOPE: this is a large, distinct feature. The current
-`int` is a single 64-bit qword (8-byte spill slots, `rax`/`add`/`imul`/`idiv`
-arithmetic, no limb model, no `big` type). i4096 requires: a 64-limb in-memory
-representation + a `big`/arbitrary-precision type; rewriting ADD/SUB/MUL/DIV/
-MOD/NEG/SHL/SHR/comparisons to multi-precision (ADC/SBB/`mulx`/`divq` chains);
-widening vreg/stack slots 8→512 bytes; and updating the call ABI, array/struct
-strides, and global layout. This is staged compiler work, not a one-pass fix, and
-must preserve the self-host fixpoint. Not faked in 0.0.80.
+### Current status (0.0.81) — big-int Stage 1 (ADD/SUB/MUL) shipped
+
+Big-int landed as a **pure-Quanta stdlib** (`lib/std/big.quanta`) — no compiler
+codegen changes, so the self-host fixpoint is completely untouched (the compiler
+never imports `std/big`). Import with `import std/big`.
+
+**Design (pointer-in-vreg, fixpoint-safe):** a `big` is a header-pointer to a
+little-endian limb array (`[base]=nlimbs`, limbs at `base+8+i*8`), exactly like
+the existing `mem_alloc` array model. The vreg holds an 8-byte pointer, so spill
+slots, call ABI, and frame layout are unchanged.
+
+**Limb width = 16 bits.** This is deliberate: Quanta's `*` is a signed 64-bit
+multiply with `ovf_trap=1`; a 32-bit limb squared (~1.8e19) overflows i64 and
+trips the trap, and a 64-bit limb loses the high half of the 128-bit product
+entirely. 16-bit limbs keep every `a[i]*b[j]` < 2^32 (never traps), and the
+split `low=prod&0xFFFF; high=prod>>16` is exact. 4096-bit numbers = 256 limbs.
+
+**Verified against Python** (all match):
+- `123456789+987654321=1111111110`, `|123456789−987654321|=864197532`,
+  `123456789×987654321=121932631112635269`
+- `(2^64−1)² = 0xfffffffffffffffe0000000000000001` (128-bit, exact hex)
+- `(10^12+7)×(10^12+13) = 0xd3c21bcedf1e3de5405b` (large, exact hex)
+- Schoolbook ADD (carry), SUB (borrow + magnitude-swap), MUL (two-column carry).
+
+**Self-host verified:** `bin/qc` compiled by itself reproduces itself
+byte-identical (`bin==sh2==sh3`); a normal `import std/big` program compiles and
+runs; a non-big program is unaffected.
+
+**Not in 0.0.81 (deferred to 0.0.82):** DIV/MOD (Stage 2 per ROADMAP), SHL/SHR,
+sign/magnitude (signed arithmetic), decimal printing, `>64-bit` literals +
+auto-promotion, and a `big` *keyword/type* (currently `big` is a library
+convention, not a language type). Stage 2 div/mod will extend this same stdlib
+with sign handling on top of the magnitude ops.
 
 ### Current status (0.0.78)
 
