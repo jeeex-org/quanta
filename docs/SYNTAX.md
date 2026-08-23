@@ -265,21 +265,13 @@ no by-reference capture, so a closure cannot mutate an enclosing local.
 | 9     | `=` (assignment) | Right |
 | 10    | `,` (sequence, tuple element separator) | Left |
 
-> **`!` / `not`: KNOWN INCONSISTENCY — avoid in new code.** On a *constant*
-> operand the compiler folds bitwise (`!0` → `-1`, `!1` → `-2`, `!!7` → `7`),
-> which is what `test_suites/codes/bitwise_not.quanta` asserts and what the
-> compiler's own sources rely on. On a *runtime* operand the emitted code is
-> logical instead (`let a = 0; !a` → `1`, not `-1`). The same expression therefore
-> means different things depending on whether the operand folds, which is a real
-> defect scheduled for its own version — not a documented feature. Until it is
-> resolved, invert a condition by comparing explicitly (`x == 0`, `a != b`) and
-> use `~` when you want bitwise-not.
+> **`!` / `not` is LOGICAL not (0/1).** `~` is BITWISE not. They are different
+> operators -- use `~` when you want bitwise-not. `!`/`not` short-circuits are
+> not needed since they're unary, but note: `!` binds at level 2 (tighter than
+> `==`), so `not a == b` parses as `(not a) == b`; write `not (a == b)` for the
+> other reading.
 >
-> `and` / `or` are keyword aliases for `&&` / `||` and short-circuit identically:
-> the right operand is not evaluated when the left already decides the result.
-> Note the precedence — `!`/`not` binds at level 2 (tighter than `==`), so
-> `not a == b` parses as `(not a) == b`; write `not (a == b)` for the other
-> reading.
+> `and` / `or` are keyword aliases for `&&` / `||` and short-circuit identically.
 
 *Note*: Bitwise operators (`&`, `|`, `^`, `~`, `<<`, `>>`) are exposed as surface syntax (parsed to `IR_BAND`/`IR_BOR`/`IR_BXOR`/`IR_BNOT`/`IR_SHL`/`IR_SHR`).  Logical `&&`/`||` (also `and`/`or`) are short‑circuit.
 

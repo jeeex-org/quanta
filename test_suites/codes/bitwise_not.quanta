@@ -1,18 +1,69 @@
-// bitwise_not: `!` is BITWISE NOT in Quanta (not logical). Regression for the
-// ARM IR_NOT encoding (must match x86 orn/NOT semantics exactly).
-fn r8x(p) { unsafe { return mem_load8(p) } }
-fn w8x(p,v) { unsafe { mem_store8(p,v) } }
+// `!` / `not` is LOGICAL not (0/1). `~` is BITWISE not. They are different
+// operators and must not be confused.
+//
+// This test previously asserted `!0 == -1`, `!1 == -2`, `!!7 == 7` -- i.e. it
+// asserted that `!` was BITWISE. It only ever passed because every operand in it
+// was a CONSTANT, so it exercised the constant folder alone, and the folder was
+// the buggy path: it folded `!` as `~`. The runtime lowering has always been
+// logical, so the same expression meant different things depending on whether its
+// operand happened to fold. Fixed in 0.0.71 by making the folder logical to match
+// the runtime; this test now pins BOTH paths so the two can never drift again.
+fn ident(x) { return x }        // defeats constant folding
+
 fn main() {
-  if !0 != (0-1) { return 1 }      // ~0 = -1
-  if !1 != (0-2) { return 2 }      // ~1 = -2
-  if !(0-1) != 0 { return 3 }      // ~(-1) = 0
-  if !!7 != 7 { return 4 }         // double bitwise-not is identity
-  // scan loop: find "*/" using == && == (the expand_includes pattern)
-  let buf = mmap(64)
-  w8x(buf+0,97) w8x(buf+1,98) w8x(buf+2,47) w8x(buf+3,42)
-  w8x(buf+4,99) w8x(buf+5,100) w8x(buf+6,42) w8x(buf+7,47) w8x(buf+8,101)
-  let ln=9 let k=2
-  while k+1<ln && (r8x(buf+k)==42 && r8x(buf+k+1)==47)==0 { k=k+1 }
-  if k!=6 { return 5 }
-  return 0
+    // --- logical ! : CONSTANT operands (folder path) ---
+    if !0 != 1 { return 1 }
+    if !1 != 0 { return 2 }
+    if !7 != 0 { return 3 }
+    if !(0 - 1) != 0 { return 4 }       // -1 is truthy -> 0
+    if !!7 != 1 { return 5 }            // !7 = 0, !0 = 1
+
+    // --- logical ! : RUNTIME operands (codegen path) -- must AGREE ---
+    let z = ident(0)
+    let o = ident(1)
+    let s = ident(7)
+    let n = ident(0 - 1)
+    if !z != 1 { return 6 }
+    if !o != 0 { return 7 }
+    if !s != 0 { return 8 }
+    if !n != 0 { return 9 }
+    if !!s != 1 { return 10 }
+
+    // --- `not` keyword is an alias for `!` : both paths ---
+    if not 0 != 1 { return 11 }
+    if not 1 != 0 { return 12 }
+    if not z != 1 { return 13 }
+    if not o != 0 { return 14 }
+
+    // --- bitwise ~ is UNCHANGED : constant and runtime ---
+    if ~0 != (0 - 1) { return 15 }      // ~0  = -1
+    if ~1 != (0 - 2) { return 16 }      // ~1  = -2
+    if ~(0 - 1) != 0 { return 17 }      // ~-1 = 0
+    if ~~7 != 7 { return 18 }           // double bitwise-not is identity
+    if ~z != (0 - 1) { return 19 }
+    if ~o != (0 - 2) { return 20 }
+    if ~~s != 7 { return 21 }
+
+    // --- the scan-loop pattern from expand_includes (uses ! as a boolean) ---
+    let buf = mmap(64)
+    unsafe { mem_store8(buf + 0, 97) }
+    unsafe { mem_store8(buf + 1, 98) }
+    unsafe { mem_store8(buf + 2, 47) }
+    unsafe { mem_store8(buf + 3, 42) }
+    unsafe { mem_store8(buf + 4, 99) }
+    unsafe { mem_store8(buf + 5, 100) }
+    unsafe { mem_store8(buf + 6, 42) }
+    unsafe { mem_store8(buf + 7, 47) }
+    unsafe { mem_store8(buf + 8, 101) }
+    let ln = 9
+    let k = 2
+    while k + 1 < ln {
+        let hit = 0
+        unsafe { if mem_load8(buf + k) == 42 && mem_load8(buf + k + 1) == 47 { hit = 1 } }
+        if !(hit == 0) { break }
+        k = k + 1
+    }
+    if k != 6 { return 22 }
+
+    return 0
 }

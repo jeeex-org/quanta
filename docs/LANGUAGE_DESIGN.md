@@ -92,7 +92,7 @@ safe". Staged hardening:
     docs/        ARCHITECTURE.md (SME handoff), LANGUAGE.md, SYNTAX.md
   NOTE: no folder is named "frontend" or "backend". Domain libs are under
   lib/<domain>. The compiler now lives as a MULTI-FILE tree at
-  `compiler/0.0.70/src/x86/` (main.quanta + helpers/lexer/parse/codegen/
+  `compiler/0.0.71/src/x86/` (main.quanta + helpers/lexer/parse/codegen/
   emitter/elf/globals/features.quanta) — the modular migration is DONE.
 
 ## Staged roadmap (effort = rough engineer-months)

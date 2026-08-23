@@ -1,6 +1,6 @@
 # Quanta ROADMAP — consolidated single source of truth
 
-> **Last updated: 2026-08-23. Current compiler: 0.0.70** (x86-64 ELF emitter,
+> **Last updated: 2026-08-23. Current compiler: 0.0.71** (x86-64 ELF emitter,
 > multi-file tree, Valgrind-clean, self-host `fp=YES`). ARM64 (AArch64) backend
 > is DEFERRED POST-1.0 (see #2 schedule below); the working compiler is x86-64 only.
 >
@@ -178,10 +178,10 @@ Why post-1.0: the ARM64 backend is a new backend; shipping it while x86 debt
 remains would violate the debt-first rule and split correctness effort.
 Qualification evidence is gathered AFTER the core is complete, not before.
 
-### Current status (0.0.70)
+### Current status (0.0.71)
 
 Shipped + verified (x86-64 only; ARM64 deferred POST-1.0): **true 2-stage self-host** —
-the committed `bin/x86/qc` compiles the 0.0.70 source to a faithful `qc`, verified
+the committed `bin/x86/qc` compiles the 0.0.71 source to a faithful `qc`, verified
 byte-identical to the golden binary (and to a 2nd-stage rebuild); fail-closed memory
 model (overflow/bounds→SIGILL 132, MAP_FAILED→rc=1, undeclared/cyclic→rc=7);
 grammar 0 errors on all 15 modules; Valgrind-clean; differential vs seed.
@@ -368,10 +368,23 @@ sources that rely on `!`), or the runtime lowering is wrong (make it bitwise), o
 the two readings should be split into separate operators. Recorded in FEATURES.md
 as ⚠️ INCONSISTENT and flagged in SYNTAX.md as avoid-in-new-code rather than
 documented as a feature.
-Gate: 110/110 functional (2 new tests), 8/8 security, 3/3 performance,
+**0.0.71** `!` / `not` is now LOGICAL not (0/1) on BOTH the constant and runtime
+paths -- the inconsistency is fixed. Before 0.0.71 `!` meant two different things
+depending on whether its operand was a constant:
+    println(!0)            -> -1    (constant path: bitwise)
+    let a=0; println(!a)   ->  1    (runtime path: logical)
+The runtime lowering was the correct one: all 36 unary-`!` sites in the
+compiler's own sources are boolean tests (`if !(tokt(p)==X)`, `while !(...)`,
+`if !is_novf && !is_arm`) and NONE uses `!` for bitwise arithmetic. So the
+constant folder was changed to match: `IR_NOT` now folds to 0/1, while `IR_BNOT`
+(`~`) still folds to `~x`. They are different operators and fold differently.
+`bitwise_not.quanta` was rewritten to pin both paths so they can never drift
+again: logical `!`/`not` return 0/1 on both const and runtime operands, bitwise
+`~` returns `~x` on both, and the double-negation identities hold for each.
+Gate: 110/110 functional (rewritten test), 8/8 security, 3/3 performance,
 differential fuzz 120/120, compiler fuzz 5000/0 crashes, Valgrind 0 errors,
-differential 5/5 vs 0.0.69, 0 duplicate opcodes. Self-host fixed point md5
-`21328781…` across stages 1/2/3.
+differential 5/5 vs 0.0.70 (consistent -- the change is self-consistent), 0
+duplicate opcodes. Self-host fixed point md5 `7466753b…` across stages 1/2/3.
 New tests, both returning 0 on 0.0.69: `logical_keywords` (4 — full truth table
 for `and`/`or` plus mixed precedence), `logical_keywords_shortcircuit` (2 — the
 right operand is a trapping call that must never be evaluated).
