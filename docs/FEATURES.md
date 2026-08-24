@@ -38,7 +38,7 @@ Test legend (the **Test?** column):
 | defer | token | ✅ done | ✅ gate | defer_test.quanta |
 | in | token | ✅ done | ✅ gate | forin_basic.quanta (for-in array iteration) |
 | alias | 17 | ✅ done | ✅ gate | alias_test.quanta (function alias newname=existingfn) |
-| extern "C" | 19 | 🟡 partial | 🟡 file-only | funcscan extern; syscall_test exercises |
+| extern "C" | 19 | 🟡 partial | ✅ gate | external_call.quanta (extern fn decls) rc=0; syscall_test.quanta (syscall path) rc=3 |
 | struct | token | ✅ done | ✅ gate | struct_test.quanta, struct_methods_test.quanta, struct_literal_test.quanta (literal coverage present) |
 | enum | 21 | ✅ done | ✅ gate | enum_test.quanta rc=42; Some/None match arms exercised |
 | type | 23 | ✅ done (0.0.77) | ✅ gate | type_alias.quanta rc=42. `type MyInt = int` then `let x: MyInt` |
