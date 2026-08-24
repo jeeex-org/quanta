@@ -21,7 +21,7 @@
 | # | Design Pillar | Quanta 0.0.86 State | Gap |
 |---|---|---|---|
 | 1 | **Intent-first / zero ceremony** | ✅ Strong. `fn`, `let`, inferred calls, short syntax already minimal. | *Minor.* `println` is the builtin (not `show`); top-level `name=val`=global already matches. |
-| 2 | **Precision Ladder (5 rungs)** | 🟡 Partial. Rung 0–2 present (untyped + optional annotations). | **Rung 3 (refinement/dependent types) absent. Rung 4 (ownership) absent.** |
+| 2 | **Precision Ladder (5 rungs)** | 🟡 Partial. Untyped today (Rung 0–1); Rung-2 annotations are *parsed and recorded* for codegen width but **not enforced** — there is no type checker. | **Rung 3 (refinement/dependent types) absent. Rung 4 (ownership) absent. No compile-time type errors exist yet — a type mismatch is not caught.** |
 | 3 | **One language, every machine** | 🔴 Native x86 only. | **WASM, GPU, MCU backends absent.** Doc claims "interpreter/JIT/WASM modes" but 0.0.86 source is native-only. |
 | 4 | **Regions-first memory** | 🔴 None. Bump mmap allocator; `real allocator` is ❌ todo. | Region inference not started. Leak/double-free still possible. |
 | 5 | **Safety by construction** | 🟡 Partial. Bounds/overflow *not* auto-checked; `unsafe`/`raw` exist but aren't a safety boundary. | No automatic bounds/overflow proofs. |
