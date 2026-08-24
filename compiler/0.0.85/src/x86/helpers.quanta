@@ -24,7 +24,7 @@ fn tokln(i) { return r64(toks + i*TKS + 32) }
 // page -> SIGSEGV (a crafted ≤16MB source with very high token density could
 // trigger this). As of 1.1.0 each emitter bounds its counter and aborts with a
 // clean error (exit 17) instead of corrupting memory.
-let TOK_CAP = 4000000      // toks arena 160MB / 40B per token
+let TOK_CAP = 8000000      // toks arena 320MB / 40B per token
 let IR_CAP  = 26000000     // ir arena 1024MB / 40B per record
 let VAR_CAP = 250000       // vars arena 2MB / 24B (VRS=24? keep headroom)
 let FN_CAP  = 250000       // fns arena 2MB / 40B (FNS=40)
@@ -129,6 +129,11 @@ fn ktext(sv, ln) {
     if ln==5 && r8(src+sv)==100 && r8(src+sv+1)==101 && r8(src+sv+2)==102 && r8(src+sv+3)==101 && r8(src+sv+4)==114 { return 56 } // defer
     if ln==5 && r8(src+sv)==99 && r8(src+sv+1)==111 && r8(src+sv+2)==110 && r8(src+sv+3)==115 && r8(src+sv+4)==116 { return 57 } // const
     if ln==3 && r8(src+sv)==109 && r8(src+sv+1)==111 && r8(src+sv+2)==100 { return 58 } // mod
+    // 0.0.78: case-insensitive ADT keyword — simplicity: String/string both OK.
+    // Only String gets a lowercase alias. some/ok/err/option/result are left
+    // UPPERCASE-ONLY because 'ok'/'some'/'err' are common variable names
+    // (e.g. logical_keywords.quanta uses `let ok = 0`) and would collide.
+    if ln==6 && r8(src+sv)==115 && r8(src+sv+1)==116 && r8(src+sv+2)==114 && r8(src+sv+3)==105 && r8(src+sv+4)==110 && r8(src+sv+5)==103 { return 37 } // string/String
     return 0
 }
 

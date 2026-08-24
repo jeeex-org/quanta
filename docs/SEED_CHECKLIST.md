@@ -65,10 +65,19 @@ cp compiler/<NEXT>/bin/x86/qc bootstrap/qc-bootstrap-<NEXT>      # seed for <NEX
 - [ ] New `bootstrap/qc-bootstrap-<NEXT>` written; <NEXT+1> tree scaffolds; VERSION bumped.
 - [ ] Re-run §2 drift check against the NEW seed before declaring done.
 
-## 7. Doc/rule sync (§8)
+## 8. Doc/rule sync (§8)
 - [ ] Every status/root-cause/known-issue block the green gate disproves is deleted
       or rewritten. No stale "BLOCKED" notes.
 - [ ] PROJECT_RULES §9/§10 reflect the promotion just performed.
+- [ ] **CI pin**: `.github/workflows/ci.yml` golden must be `compiler/<RELEASED>/bin/x86/qc`
+      where `<RELEASED>` == `cat VERSION`. A stale CI pin (e.g. 0.0.76 while released
+      is 0.0.85) is a divergence-in-waiting — fix it on every release.
+- [ ] **Golden layout**: the committed golden is `compiler/<VER>/bin/x86/qc` (a binary).
+      There is NEVER a `qc` inside `src/` (that path is gitignored). NOTE: the
+      skill's `verify-release.sh` stage-4 checks `src/x86/qc` — that is a broken
+      assumption for this repo's layout; ignore its "binary drift" FAIL when
+      `bin/x86/qc` matches the fixpoint md5. The real identity check is
+      `bin/x86/qc` == 3-stage fixpoint (§3), which is what matters.
 
 ---
 Failure protocol: on ANY non-pass, ROLL BACK to the last known-good source and

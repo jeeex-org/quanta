@@ -36,7 +36,8 @@ fn parse_block() {
         if peek()==TT_PNCT&&pval()==125 { break }
         if peek()==TT_PNCT&&pval()==59 { adv(); continue }
         let t=peek(); let v=pval(); let ln=plen()
-        if t==TT_MUT {
+        if t==TT_TYPE { parse_type() }       // 0.0.77: type MyInt = int
+        else if t==TT_MUT {
             // 0.0.76: `mut x = expr` — mutable local binding
             adv(); parse_mut_flag = 1; parse_let()
         } else if t==TT_KEY {
@@ -68,6 +69,7 @@ fn parse_block() {
                 if lbl_stk>0 { owned_pop_to(r64(loop_scope_stk+(loop_scope_top-1)*8)); let lb=r64(lbl_cont+(lbl_stk-1)*8); iremit(IR_JMP,0,lb,0,0) }
             } else if h==17 { adv(); adv(); adv(); adv() }   // t6: alias NAME = FNNAME (skip; registered by scan_aliases)
             else if h==18 { parse_unsafe() }   // G1: unsafe { ... } block (safe-by-default fence)
+            else if h==H_TYPE { parse_type() }   // 0.0.77: type MyInt = int
             else if h==22 { 
                 let mv = parse_match()
                 // P7: implicit return — if this match is the last statement of a
@@ -266,6 +268,45 @@ fn parse_const() {
   }
 }
 
+fn parse_type() {
+    adv()                                  // consume 'type'
+    let nm=pval(); let nl=plen(); adv()    // NAME
+    mop(61)                                // '='
+    if peek()==TT_KEY {
+        let hk=ktext(pval(),plen())
+        // Map type keyword → vtype code
+        let vt = 0
+        if hk==44 { vt=1 } else if hk==45 { vt=2 } else if hk==46 { vt=3 }
+        else if hk==47 { vt=4 } else if hk==48 { vt=5 } else if hk==49 { vt=6 }
+        else if hk==50 { vt=7 } else if hk==51 { vt=8 } else if hk==52 { vt=9 }
+        else if hk==53 { vt=10 } else if hk==54 { vt=11 } else if hk==55 { vt=0 }
+        else { vt = 0 }
+        // 0.0.77: register alias NAME -> vt
+        w64(type_aliases + type_aliasc*24, nm)
+        w64(type_aliases + type_aliasc*24 + 8, nl)
+        w64(type_aliases + type_aliasc*24 + 16, vt)
+        type_aliasc = type_aliasc + 1
+        adv()  // consume type keyword
+    } else {
+        adv()
+    }
+}
+
+fn find_type_alias(nm,nl) {
+    let i = type_aliasc-1
+    while i>=0 {
+        let anm = r64(type_aliases + i*24)
+        let anl = r64(type_aliases + i*24 + 8)
+        if anl==nl {
+            let ok=1; let j=0
+            while j<nl { if r8(src+anm+j)!=r8(src+nm+j) { ok=0; break }; j=j+1 }
+            if ok==1 { return r64(type_aliases + i*24 + 16) }
+        }
+        i = i-1
+    }
+    return -1
+}
+
 fn parse_let() {
     // 0.0.76: handle `let x = 5` and `mut x = 5`
     let is_mut = parse_mut_flag
@@ -317,7 +358,7 @@ fn parse_let() {
                 }
             }
             adv()  // consume pointee type keyword
-        } else if peek()==TT_KEY {
+        } else if peek()==TT_KEY || peek()==TT_ID {
             let hk = ktext(pval(), plen())
             // ktext returns small keyword IDs: u8=44, u16=45, u32=46, u64=47, usize=48, bool=49, char=50, byte=51, mut=35
             if hk==44 { vtype = 1 }
@@ -330,7 +371,11 @@ fn parse_let() {
             else if hk==51 { vtype = 8 }
             else if hk==35 { vtype = 9 }  // mut
             else if hk==55 { vtype = 0 }  // int -> signed default (vtype 0)
-            else { vtype = 0 }
+            else {
+                // 0.0.77: check if it's a type alias
+                let ai = find_type_alias(pval(), plen())
+                if ai>=0 { vtype = ai } else { vtype = 0 }
+            }
             adv()  // consume type keyword
         }
     }

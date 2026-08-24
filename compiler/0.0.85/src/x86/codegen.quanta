@@ -636,40 +636,55 @@ fn ci_func(fi, is_main) {
             sdef(res, rd); w8(vfloat+res, 1)
           } else {
           opt_i = ii+1
-          let dv_isconst = op_is_const(a1)
-          if dv_isconst==1 {
-            let dv = op_const_val(a1)
-            if dv!=0 && ((dv & (dv-1)) != 0) {
-              compute_magic(dv)
-              let M = magicM; let sh = magicSh
-              flush_clob(0,1,2)
-              let rd = aphys(res)
-              // adjustment (q+=n / q-=n) only needed for some signs; spare
-              // rbx unless actually required, so loop-live regs stay resident.
-              let need_adj = 0
-              if dv>0 && M<0 { need_adj = 1 }
-              if dv<0 && M>0 { need_adj = 1 }
-              if need_adj==1 { flush_clob(3,3,3); rbp(3, spill_home(a0)) }
-              rbp(0, spill_home(a0))
-              ri64(1, M)
-              eb(72); eb(247); eb(233)
-              rr(rd, 2)
-              if need_adj==1 {
-                if dv>0 && M<0 { ra(rd, 3) }
-                if dv<0 && M>0 { rs(rd, 3) }
-              }
-              if sh>0 { ri(1, sh); eb(72); eb(211); eb(248 + (rd%8)) }
-              rr(2, rd); ri(1, 63); eb(72); eb(211); eb(234); ra(rd, 2)
-              sdef(res, rd)
-            } else {
-              flush_clob(0,1,2); rbp(0, spill_home(a0)); rbp(1, spill_home(a1)); rcqo(); ridiv(1); let rd=aphys(res); if rd!=0 { rr(rd,0) }; sdef(res, rd)
-            }
-          } else {
-            flush_clob(0,1,2); rbp(0, spill_home(a0)); rbp(1, spill_home(a1)); rcqo(); ridiv(1); let rd=aphys(res); if rd!=0 { rr(rd,0) }; sdef(res, rd)
-          }
+          // Integer floor division (Python-style): q = floor(a/b).
+          // Uniform idiv + floor correction, correct for all sign combos
+          // (verified against Python: q differs from trunc only when the
+          // truncated remainder r has opposite sign to b). Allocator-safe:
+          // only res's own spill home is written.
+          let rd = aphys(res)
+          flush_clob(0,1,2)
+          rbp(0, spill_home(a0)); rbp(1, spill_home(a1))   // rax=a, rcx=b
+          rcqo(); ridiv(1)                                  // rax=q_trunc, rdx=r, rcx=b
+          wbp(spill_home(res), 0)                           // res home = q
+          rr(0, 2)                                          // rax = r
+          rxor(0, 1)                                        // rax = r ^ b
+          eb(72); eb(193); eb(248); eb(63)                  // sar rax, 63 -> adj_raw (0 / -1)
+          rr(1, 2)                                          // rcx = r
+          rneg(1)                                           // rcx = -r
+          rxor(2, 1)                                        // rdx = r ^ -r
+          eb(72); eb(193); eb(250); eb(63)                  // sar rdx, 63 -> rmask (0 / -1)
+          eb(72); eb(33); eb(194)                           // and rdx, rax -> rdx = adj (rmask & adj_raw)
+          rbp(0, spill_home(res))                           // rax = q
+          ra(0, 2)                                          // rax = q + adj
+          rr(rd, 0)                                         // rd = rax
+          sdef(res, rd)
           }
         }
-        else if op==IR_MOD { flush_clob(0,1,2); rbp(0, spill_home(a0)); rbp(1, spill_home(a1)); rcqo(); ridiv(1); let rd=aphys(res); if rd!=2 { rr(rd,2) }; sdef(res, rd) }
+        else if op==IR_MOD {
+          // Python-style modulo: result has the SAME sign as the divisor b
+          // (a % b in [0, |b|) for b>0). x86 idiv gives remainder r (sign of a).
+          // r_true = r + (adj & b), where adj is the floor gate above.
+          let rd = aphys(res)
+          flush_clob(0,1,2)
+          rbp(0, spill_home(a0)); rbp(1, spill_home(a1))   // rax=a, rcx=b
+          rcqo(); ridiv(1)                                  // rax=q, rdx=r, rcx=b
+          rr(0, 2)                                          // rax = r
+          wbp(spill_home(res), 0)                           // res home = r
+          rr(0, 2)                                          // rax = r
+          rxor(0, 1)                                        // rax = r ^ b
+          eb(72); eb(193); eb(248); eb(63)                  // sar rax, 63 -> adj_raw
+          rr(1, 2)                                          // rcx = r
+          rneg(1)                                           // rcx = -r
+          rxor(2, 1)                                        // rdx = r ^ -r
+          eb(72); eb(193); eb(250); eb(63)                  // sar rdx, 63 -> rmask
+          eb(72); eb(33); eb(194)                           // and rdx, rax -> rdx = adj
+          rbp(1, spill_home(a1))                             // rcx = b (reload; was clobbered to -r)
+          eb(72); eb(33); eb(202)                           // and rdx, rcx -> rdx = corr = adj & b
+          rbp(0, spill_home(res))                           // rax = r
+          ra(0, 2)                                          // rax = r + corr
+          rr(rd, 0)                                         // rd = rax
+          sdef(res, rd)
+        }
         else if op==IR_EQ { let r1=aphys(a0); let r2=aphys(a1); let rd=adistinct(res,r1,r2); rxor(rd,rd); rcmp(r1,r2); rsetc(0,rd); rzx(rd,rd); sdef(res, rd) }
         else if op==IR_NE { let r1=aphys(a0); let r2=aphys(a1); let rd=adistinct(res,r1,r2); rxor(rd,rd); rcmp(r1,r2); rsetc(1,rd); rzx(rd,rd); sdef(res, rd) }
         else if op==IR_LT { let r1=aphys(a0); let r2=aphys(a1); let rd=adistinct(res,r1,r2); rxor(rd,rd); rcmp(r1,r2); rsetc(2,rd); rzx(rd,rd); sdef(res, rd) }
