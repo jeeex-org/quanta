@@ -23,15 +23,15 @@ Test legend (the **Test?** column):
 ## A. Core — Keywords & Syntax (lexer `ktext` codes 1–57)
 | Keyword | ktext | Status | Test? | Notes |
 |---|---|---|---|---|
-| fn | 1 | ✅ done | ✅ gate | func defs |
-| let | 2 | ✅ done | ✅ gate | variable binding |
+| fn | 1 | ✅ done | ✅ gate | func_call_args.quanta / simplified_syntax.quanta |
+| let | 2 | ✅ done | ✅ gate | simplified_syntax.quanta / mut_basic.quanta |
 | if | 3 | ✅ done | ✅ gate | elseif_test |
 | loop | 5 | ✅ done | ✅ gate | loop_test, parse_loop |
 | while | 6 | ✅ done | ✅ gate | break_continue |
 | for | 7 | ✅ done | ✅ gate | for-in (array) + C-style `for i=1;i<=n;i=i=1`; for-range `for i in 0..n` (0.0.76) |
-| break | 8 | ✅ done | ✅ gate | |
-| continue | 9 | ✅ done | ✅ gate | |
-| return | 16 | ✅ done | ✅ gate | |
+| break | 8 | ✅ done | ✅ gate | break_continue.quanta |
+| continue | 9 | ✅ done | ✅ gate | break_continue.quanta |
+| return | 16 | ✅ done | ✅ gate | exit_test.quanta / func_call_args.quanta |
 | unsafe | 18 | ✅ done | ✅ gate | unsafe_block |
 | match | 22 | ✅ done | ✅ gate | match_test rc=132 (gate GREEN); expression + block arms (match block arms `1 => { }` done) |
 | const | 57 | ✅ done | ✅ gate | const_test |
@@ -61,18 +61,18 @@ Test legend (the **Test?** column):
 | u16 | 45 | ❌ todo | ❌ none | lexed, unparsed |
 | u32 | 46 | 🟡 partial | ✅ gate | u32 mask builtin exists |
 | u64 | 47 | 🟡 partial | ✅ gate | u64 mask builtin exists |
-| bool | 49 | ✅ done | ✅ gate | bool type works (true=1, false=0) |
+| bool | 49 | ✅ done | ✅ gate | logical_keywords.quanta (true=1, false=0) |
 | char | 50 | ✅ done | ✅ gate | char_test rc=65. `'A'` = ASCII 65 |
-| byte | 51 | ✅ done | ✅ gate | byte literal syntax works |
-| int | 55 | ✅ done | ✅ gate | signed default alias; bare literal type |
+| byte | 51 | ✅ done | ✅ gate | memops_test.quanta (byte literal) |
+| int | 55 | ✅ done | ✅ gate | arithmetic.quanta / int_keyword_test.quanta |
 | and / or / not | 13/14/15 | ✅ done (0.0.70) | ✅ gate | logical_keywords rc=4 (was 0), logical_keywords_shortcircuit rc=2. `and`/`or` keywords behave exactly like `&&`/`||` including short-circuit |
-| true / false | 10/11 | ✅ done | ✅ gate | true returns 1, false returns 0 |
+| true / false | 10/11 | ✅ done | ✅ gate | logical_keywords.quanta (true=1, false=0) |
 | global | 20 | ✅ done | ✅ gate | globals_test rc=42. Top-level `name = value` = global |
 
 ## B. Core — Types
 | Type | Status | Test? | Notes |
 |---|---|---|---|
-| i64 (default integer) | ✅ done | ✅ gate | arithmetic, param* |
+| i64 (default integer) | ✅ done | ✅ gate | arithmetic.quanta / param8.quanta |
 | f64 | ✅ done | ✅ gate | float_test rc=159, simple_fadd rc=7 |
 | usize | 🟡 partial | ✅ gate | lexed; used as size type |
 | u32 / u64 (masks) | 🟡 partial | ✅ gate | u32/u64 builtins; no native type keyword |
@@ -95,7 +95,7 @@ Test legend (the **Test?** column):
 | loop | ✅ done | ✅ gate | parse_loop |
 | for-in (array) | ✅ done | ✅ gate | forin_basic/break/nested/sum |
 | match (expr arms) | ✅ done | ✅ gate | match_test rc=132 |
-| break / continue | ✅ done | ✅ gate | |
+| break / continue | ✅ done | ✅ gate | break_continue.quanta |
 | return / defer | ✅ done | ✅ gate | defer_test |
 | for-range `for i in 0..n` | ✅ done (0.0.76) | ✅ gate | for_range_basic rc=3 |
 | match block arms `1 => { }` | ✅ done | ✅ gate | match_test covers block arms |
@@ -108,9 +108,9 @@ Test legend (the **Test?** column):
 |---|---|---|---|
 | arithmetic (+ - * / %) | ✅ done | ✅ gate | arithmetic |
 | bitwise (& | ^ ~ << >>) | ✅ done | ✅ gate | bitwise_not |
-| comparisons (== != < > <= >=) | ✅ done | ✅ gate | |
-| logical (&& \|\| !) | ✅ done | ✅ gate | (and/or/not keywords unparsed; use symbols) |
-| ternary | ✅ done | ✅ gate | |
+| comparisons (== != < > <= >=) | ✅ done | ✅ gate | arithmetic.quanta |
+| logical (&& \|\| !) | ✅ done | ✅ gate | logical_keywords.quanta (and/or/not); &&/\|\| in arithmetic.quanta |
+| ternary | ✅ done | ✅ gate | simplified_syntax.quanta |
 | field access / index | ✅ done | ✅ gate | struct_test, array_test |
 | unsigned arith | ✅ done | ✅ gate | unsigned_ops (udiv/umod/ult/ugt/ulte/ugte) |
 | operator overloading | ❌ todo | ❌ none | |
