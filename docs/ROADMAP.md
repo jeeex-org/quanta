@@ -154,9 +154,15 @@ verified; the self-host fixpoint is byte-identical (`qc` compiled by itself
 reproduces itself). Pending feature tests (bswap/popcount/defer/generics/
 import/memcpy) are unimplemented intrinsics, not regressions.
 
-### Current status (0.0.85) — int literals auto-promote to big-int
+### Current status (0.0.86) — verified stable seed
 
-Over-sized decimal literals (those exceeding i64 range) are now auto-promoted to
+0.0.86 is the **promoted stable version** (replaces 0.0.85 as the seed for all
+future work). Its feature content is the int→big auto-promotion from 0.0.85 plus
+full release-gate verification: 117/117 suite green, self-host fixpoint
+byte-identical (`a85aeacb…`), valgrind 0, fuzz clean, CI pinned (derived from
+`cat VERSION`).
+
+Over-sized decimal literals (those exceeding i64 range) are auto-promoted to
 `big` at compile time — no `big_from_*` call needed. A 30- or 250-digit literal
 like `123456789012345678901234567890` parses directly into a `big`.
 
