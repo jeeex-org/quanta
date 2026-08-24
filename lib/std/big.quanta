@@ -367,3 +367,59 @@ fn big_mod(a, b) {
   return r
 }
 
+// ============================================================================
+// Stage 3 (SHIFTS): shift a magnitude left/right by n bits (n >= 0). Negative n
+// shifts the opposite direction. Implemented by splitting n into a whole-limb
+// shift (n/16) plus a sub-limb bit shift (n%16); only shifts + masks are used,
+// so it never trips ovf_trap.
+// ============================================================================
+
+// r = |x| << n  (n >= 0). If n < 0, shifts right instead.
+fn big_shl(x, n) {
+  if n < 0 { return big_shr(x, -n) }
+  if n == 0 { return x }
+  let limb_shift = n / 16
+  let rem = n - limb_shift * 16
+  let na = big_len(x)
+  let nr = na + limb_shift + 1
+  let r = big_alloc(nr)
+  let i = 0
+  while i < nr { big_set(r, i, 0); i = i + 1 }
+  i = 0
+  while i < na {
+    let v = big_limb(x, i)
+    let cur = big_limb(r, limb_shift + i) + (v << rem)   // < 2^31, no trap
+    big_set(r, limb_shift + i, cur & 65535)
+    let hi = (v << rem) >> 16                            // spill to next limb
+    if hi > 0 { big_set(r, limb_shift + i + 1, big_limb(r, limb_shift + i + 1) + hi) }
+    i = i + 1
+  }
+  return big_norm(r)
+}
+
+// r = |x| >> n  (n >= 0). If n < 0, shifts left instead.
+fn big_shr(x, n) {
+  if n < 0 { return big_shl(x, -n) }
+  if n == 0 { return x }
+  let limb_shift = n / 16
+  let rem = n - limb_shift * 16
+  let na = big_len(x)
+  if limb_shift >= na { return big_from_i64(0) }
+  let nr = na - limb_shift
+  let r = big_alloc(nr)
+  let i = 0
+  while i < nr { big_set(r, i, 0); i = i + 1 }
+  i = 0
+  while i < nr {
+    let src = i + limb_shift
+    let v = big_limb(x, src) >> rem
+    if src + 1 < na {
+      let vn = big_limb(x, src + 1)
+      v = v + ((vn & ((1 << rem) - 1)) << (16 - rem))   // low rem bits -> high rem bits
+    }
+    big_set(r, i, v & 65535)
+    i = i + 1
+  }
+  return big_norm(r)
+}
+

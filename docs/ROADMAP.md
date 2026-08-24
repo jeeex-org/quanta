@@ -1,6 +1,6 @@
 # Quanta ROADMAP — consolidated single source of truth
 
-> **Last updated: 2026-08-24. Current compiler: 0.0.82** (x86-64 ELF emitter,
+> **Last updated: 2026-08-24. Current compiler: 0.0.83** (x86-64 ELF emitter,
 > multi-file tree, Valgrind-clean, self-host `fp=YES`). ARM64 (AArch64) backend
 > is DEFERRED POST-0.1.0 (see #2 schedule below); the working compiler is x86-64 only.
 >
@@ -214,6 +214,16 @@ runtime division (loop `i/3` = 12), and 13 sign-combination floor/mod cases all
 verified; the self-host fixpoint is byte-identical (`qc` compiled by itself
 reproduces itself). Pending feature tests (bswap/popcount/defer/generics/
 import/memcpy) are unimplemented intrinsics, not regressions.
+
+### Current status (0.0.83) — big-int Stage 3 (SHIFTS) shipped
+
+Arbitrary-count magnitude shifts `big_shl(x, n)` / `big_shr(x, n)` added to
+lib/std/big.quanta (pure stdlib, zero codegen changes, self-host fixpoint
+untouched). Split n into a whole-limb shift (n/16) plus a sub-limb bit shift
+(n%16); spill bits handled via shift+mask only, so it never trips ovf_trap.
+Negative n shifts the opposite direction. Verified against Python for n in
+{0,1,7,10,32,50,64} on 128-bit operands, plus round-trip identities
+shr(shl(x,n),n)==x.
 
 ### Current status (0.0.82) — big-int Stage 2 (DIV/MOD) shipped
 
