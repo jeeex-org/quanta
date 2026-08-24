@@ -27,29 +27,29 @@ Test legend (the **Test?** column):
 | let | 2 | ✅ done | ✅ gate | simplified_syntax.quanta / mut_basic.quanta |
 | if | 3 | ✅ done | ✅ gate | elseif_test.quanta |
 | loop | 5 | ✅ done | ✅ gate | loop_test.quanta |
-| while | 6 | ✅ done | ✅ gate | break_continue |
-| for | 7 | ✅ done | ✅ gate | for-in (array) + C-style `for i=1;i<=n;i=i=1`; for-range `for i in 0..n` (0.0.76) |
+| while | 6 | ✅ done | ✅ gate | break_continue.quanta |
+| for | 7 | ✅ done | ✅ gate | forin_basic.quanta/forin_break.quanta/forin_nested.quanta/forin_sum.quanta + C-style `for i=1;i<=n;i=i=1`; for-range `for i in 0..n` (for_range_basic.quanta rc=3, 0.0.76) |
 | break | 8 | ✅ done | ✅ gate | break_continue.quanta |
 | continue | 9 | ✅ done | ✅ gate | break_continue.quanta |
 | return | 16 | ✅ done | ✅ gate | exit_test.quanta / func_call_args.quanta |
-| unsafe | 18 | ✅ done | ✅ gate | unsafe_block |
-| match | 22 | ✅ done | ✅ gate | match_test rc=132 (gate GREEN); expression + block arms (match block arms `1 => { }` done) |
-| const | 57 | ✅ done | ✅ gate | const_test |
-| defer | token | ✅ done | ✅ gate | defer_test |
-| in | token | ✅ done | ✅ gate | for-in |
-| alias | 17 | ✅ done | ✅ gate | alias_test (function alias newname=existingfn) |
+| unsafe | 18 | ✅ done | ✅ gate | unsafe_block.quanta |
+| match | 22 | ✅ done | ✅ gate | match_test.quanta rc=132 (gate GREEN); expression + block arms (match block arms `1 => { }` done) |
+| const | 57 | ✅ done | ✅ gate | const_test.quanta |
+| defer | token | ✅ done | ✅ gate | defer_test.quanta |
+| in | token | ✅ done | ✅ gate | forin_basic.quanta (for-in array iteration) |
+| alias | 17 | ✅ done | ✅ gate | alias_test.quanta (function alias newname=existingfn) |
 | extern "C" | 19 | 🟡 partial | 🟡 file-only | funcscan extern; syscall_test exercises |
-| struct | token | ✅ done | ✅ gate | struct_test, struct_methods_test, struct_literal_test (literal coverage present) |
-| enum | 21 | ✅ done | ✅ gate | enum_test rc=42; Some/None match arms exercised |
-| type | 23 | ✅ done (0.0.77) | ✅ gate | type_alias rc=42. `type MyInt = int` then `let x: MyInt` |
+| struct | token | ✅ done | ✅ gate | struct_test.quanta, struct_methods_test.quanta, struct_literal_test.quanta (literal coverage present) |
+| enum | 21 | ✅ done | ✅ gate | enum_test.quanta rc=42; Some/None match arms exercised |
+| type | 23 | ✅ done (0.0.77) | ✅ gate | type_alias.quanta rc=42. `type MyInt = int` then `let x: MyInt` |
 | interface | 24 | 🟡 partial | ✅ gate | trait_test/trait_test2/trait_min rc=10 in gate; dispatch via trait methods |
-| impl | 25 | 🟡 partial | ✅ gate | trait methods exercised (struct_methods_test rc=151) |
+| impl | 25 | 🟡 partial | ✅ gate | trait methods exercised (struct_methods_test.quanta rc=151) |
 | trait | 26 | 🟡 partial | ✅ gate | trait_test rc=10 in gate; method dispatch works |
 | where | 27 | ❌ todo | ❌ none | lexed, unparsed |
-| Option/Some/None | 28/29/30 | ✅ done | ✅ gate | option_test/option_simple/option_ctor/option_tuple rc=42 in gate |
-| Result/Ok/Err | 31/32/33 | ✅ done | ✅ gate | result_test rc=49 in gate |
+| Option/Some/None | 28/29/30 | ✅ done | ✅ gate | option_test.quanta/option_simple.quanta/option_ctor.quanta/option_tuple.quanta rc=42 in gate |
+| Result/Ok/Err | 31/32/33 | ✅ done | ✅ gate | result_test.quanta rc=49 in gate |
 | ref | 34 | ❌ todo | ❌ none | lexed, unparsed |
-| mut | 35 | ✅ done (0.0.76) | ✅ gate | mut_basic rc=10. Mutable local binding |
+| mut | 35 | ✅ done (0.0.76) | ✅ gate | mut_basic.quanta rc=10. Mutable local binding |
 | move | 36 | ❌ todo | ❌ none | lexed, unparsed |
 | String | 37 | ❌ todo | ❌ none | lexed, unparsed. **Keyword is case-insensitive since 0.0.78** (`string` == `String`, simplicity) |
 | as | 41 | ❌ todo | ❌ none | lexed, unparsed |
@@ -65,7 +65,7 @@ Test legend (the **Test?** column):
 | char | 50 | ✅ done | ✅ gate | memops_test.quanta (char/byte ops) |
 | byte | 51 | ✅ done | ✅ gate | memops_test.quanta (byte literal) |
 | int | 55 | ✅ done | ✅ gate | arithmetic.quanta / int_keyword_test.quanta |
-| and / or / not | 13/14/15 | ✅ done (0.0.70) | ✅ gate | logical_keywords rc=4 (was 0), logical_keywords_shortcircuit rc=2. `and`/`or` keywords behave exactly like `&&`/`||` including short-circuit |
+| and / or / not | 13/14/15 | ✅ done (0.0.70) | ✅ gate | logical_keywords.quanta rc=4 (was 0), logical_keywords_shortcircuit.quanta rc=2. `and`/`or` keywords behave exactly like `&&`/`||` including short-circuit |
 | true / false | 10/11 | ✅ done | ✅ gate | logical_keywords.quanta (true=1, false=0) |
 | global | 20 | ✅ done | ✅ gate | test_many_globals.quanta rc=42. Top-level `name = value` = global |
 
@@ -73,70 +73,70 @@ Test legend (the **Test?** column):
 | Type | Status | Test? | Notes |
 |---|---|---|---|
 | i64 (default integer) | ✅ done | ✅ gate | arithmetic.quanta / param8.quanta |
-| f64 | ✅ done | ✅ gate | float_test rc=159, simple_fadd rc=7 |
+| f64 | ✅ done | ✅ gate | float_test.quanta rc=159, simple_fadd.quanta rc=7 |
 | usize | 🟡 partial | ✅ gate | lexed; used as size type |
 | u32 / u64 (masks) | 🟡 partial | ✅ gate | u32/u64 builtins; no native type keyword |
 | u8 / u16 | ❌ todo | ❌ none | only mask builtins conceptually |
 | bool | ❌ todo | ❌ none | lexed, unparsed |
 | char | ❌ todo | ❌ none | lexed, unparsed |
 | byte | ❌ todo | ❌ none | lexed, unparsed |
-| float literals (`3.14`) | ✅ done (0.0.61) | ✅ gate | lexer disambiguates float vs field-access `.`; parser emits fconst(M,scale)->IEEE754; f2i/fadd/... consume float vregs (0.0.62). Verified: `println(3.14)`->`3.140000`, `fadd(1.5,2.5)`->4. |
+| float literals (`3.14`) | ✅ done (0.0.61) | ✅ gate | float_test.quanta (`println(3.14)`->`3.140000`); f2i/fadd/... consume float vregs (0.0.62). Verified: `fadd(1.5,2.5)`->4. |
 | string (real type) | ❌ todo | ❌ none | TT_STRING reserved; byte-buffer + print only |
-| struct | ✅ done | ✅ gate | fields + `obj.method` + literal (struct_literal_test in gate) |
-| enum (user-defined) | ✅ done | ✅ gate | enum_test rc=42 in gate |
-| tuple `(T,U)` | ✅ done | ✅ gate | tuple_test rc=40 in gate (mk_any-based tuples) |
-| typed array/slice | ❌ todo | ✅ gate | array_test/forin_* cover untyped `[...]` |
+| struct | ✅ done | ✅ gate | fields + `obj.method` + literal (struct_literal_test.quanta in gate) |
+| enum (user-defined) | ✅ done | ✅ gate | enum_test.quanta rc=42 in gate |
+| tuple `(T,U)` | ✅ done | ✅ gate | tuple_test.quanta rc=40 in gate (mk_any-based tuples) |
+| typed array/slice | ❌ todo | ✅ gate | array_test.quanta/forin_* cover untyped `[...]` |
 
 ## C. Core — Control Flow
 | Feature | Status | Test? | Notes |
 |---|---|---|---|
 | if/else | ✅ done | ✅ gate | elseif_test.quanta |
-| while | ✅ done | ✅ gate | break_continue |
+| while | ✅ done | ✅ gate | break_continue.quanta |
 | loop | ✅ done | ✅ gate | loop_test.quanta |
-| for-in (array) | ✅ done | ✅ gate | forin_basic/break/nested/sum |
-| match (expr arms) | ✅ done | ✅ gate | match_test rc=132 |
+| for-in (array) | ✅ done | ✅ gate | forin_basic.quanta/break/nested/sum |
+| match (expr arms) | ✅ done | ✅ gate | match_test.quanta rc=132 |
 | break / continue | ✅ done | ✅ gate | break_continue.quanta |
-| return / defer | ✅ done | ✅ gate | defer_test |
-| for-range `for i in 0..n` | ✅ done (0.0.76) | ✅ gate | for_range_basic rc=3 |
-| match block arms `1 => { }` | ✅ done | ✅ gate | match_test covers block arms |
-| `?` early-return propagation | ✅ done | ✅ gate | question_mark rc=0, option_test/result_test in gate |
+| return / defer | ✅ done | ✅ gate | defer_test.quanta |
+| for-range `for i in 0..n` | ✅ done (0.0.76) | ✅ gate | for_range_basic.quanta rc=3 |
+| match block arms `1 => { }` | ✅ done | ✅ gate | match_test.quanta covers block arms |
+| `?` early-return propagation | ✅ done | ✅ gate | question_mark.quanta rc=0, option_test.quanta/result_test.quanta in gate |
 | loop expressions / labeled break w/ value | ✅ done (0.0.76) | ✅ gate | loop_test.quanta (`loop { break N }` value-return) |
 | try/catch | ❌ todo | ❌ none | only panic + `?` unwrap |
 
 ## D. Core — Expressions & Operators
 | Feature | Status | Test? | Notes |
 |---|---|---|---|
-| arithmetic (+ - * / %) | ✅ done | ✅ gate | arithmetic |
-| bitwise (& | ^ ~ << >>) | ✅ done | ✅ gate | bitwise_not |
+| arithmetic.quanta (+ - * / %) | ✅ done | ✅ gate | arithmetic.quanta |
+| bitwise (& | ^ ~ << >>) | ✅ done | ✅ gate | bitwise_not.quanta |
 | comparisons (== != < > <= >=) | ✅ done | ✅ gate | arithmetic.quanta |
 | logical (&& \|\| !) | ✅ done | ✅ gate | logical_keywords.quanta (and/or/not); &&/\|\| in arithmetic.quanta |
 | ternary | ✅ done | ✅ gate | simplified_syntax.quanta |
-| field access / index | ✅ done | ✅ gate | struct_test, array_test |
-| unsigned arith | ✅ done | ✅ gate | unsigned_ops (udiv/umod/ult/ugt/ulte/ugte) |
+| field access / index | ✅ done | ✅ gate | struct_test.quanta, array_test.quanta |
+| unsigned arith | ✅ done | ✅ gate | unsigned_ops.quanta (udiv/umod/ult/ugt/ulte/ugte) |
 | operator overloading | ❌ todo | ❌ none | |
 | range `..` expression | ❌ todo | ❌ none | needed by for-range |
-| array push `a.push(v)` | ✅ done | ✅ gate | array_push_method rc=7, array_push_empty_annot rc=7, array_push_closure_mix rc=35. Method form only — bare `push(v,e)` is the byte-stride STRING push. Silently returned 0 in 0.0.65 (IR_CLOSURE/IR_APUSH both = opcode 72); fixed 0.0.66 |
+| array push `a.push(v)` | ✅ done | ✅ gate | array_push_method.quanta rc=7, array_push_empty_annot.quanta rc=7, array_push_closure_mix.quanta rc=35. Method form only — bare `push(v,e)` is the byte-stride STRING push. Silently returned 0 in 0.0.65 (IR_CLOSURE/IR_APUSH both = opcode 72); fixed 0.0.66 |
 | generics `<T>` | 🟡 type-erased | ✅ gate | generics_test rc=42; `map<T,U>` example returns 12. Parsed and erased at codegen — no monomorphisation, no compile-time constraint checking |
-| tuples `(a,b)` | ✅ done | ✅ gate | tuple_test rc=40, option_tuple rc=42. Literals, N-tuples, nested access `t.0.1`, tuple-valued returns, element reassign, tuple in array, destructuring `let x,y = f()`. Was listed as "remaining" in ROADMAP until a 0.0.70 audit found 13/13 probes already passing |
-| `and` / `or` keywords | ✅ done (0.0.70) | ✅ gate | logical_keywords rc=4, logical_keywords_shortcircuit rc=2. Exact aliases of `&&`/`\|\|` incl. short-circuit. Before 0.0.70 the keyword was tokenized but never consumed, so only the FIRST operand was evaluated and the rest silently discarded |
+| tuples `(a,b)` | ✅ done | ✅ gate | tuple_test.quanta rc=40, option_tuple.quanta rc=42. Literals, N-tuples, nested access `t.0.1`, tuple-valued returns, element reassign, tuple in array, destructuring `let x,y = f()`. Was listed as "remaining" in ROADMAP until a 0.0.70 audit found 13/13 probes already passing |
+| `and` / `or` keywords | ✅ done (0.0.70) | ✅ gate | logical_keywords.quanta rc=4, logical_keywords_shortcircuit.quanta rc=2. Exact aliases of `&&`/`\|\|` incl. short-circuit. Before 0.0.70 the keyword was tokenized but never consumed, so only the FIRST operand was evaluated and the rest silently discarded |
 | `!` / `not` | ✅ done (0.0.71) | ✅ gate | logical not -> 0/1. Const and runtime paths now agree (both logical); `~`/`~~` is separate bitwise-not. Before 0.0.71 they silently disagreed. `bitwise_not.quanta` rewritten to pin both |
-| match guards `n if n>3 =>` | ✅ done (0.0.69) | ✅ gate | match_guard rc=111, match_guard_false rc=222, match_guard_order rc=4. Guard may use the bound name; false guard falls through to the next arm; arms tried in order. Silently yielded 0 before 0.0.69 (the `if` was never consumed) |
-| closure literals `\|a\| { a+1 }` | ✅ done (0.0.65) | ✅ gate | closure_basic rc=6, closure_multi_param rc=7, closure_higher_order rc=42; braces required |
-| user fn overrides builtin | ✅ done (0.0.68) | ✅ gate | user_fn_beats_builtin rc=42 (was 0), user_fn_beats_builtin_chain rc=38 (was SIGILL 132), builtin_still_inline rc=3. One guard in emit_bltn/emit_bltn2 (was enforced in only 2 of 86 branches). EXCEPTION: mem_load/mem_store/mem_load8/mem_store8 + fadd/fsub/fmul/fdiv are primitive intrinsics and NOT overridable — the compiler's own w64↔mem_store wrappers are mutually recursive, so user-wins there is infinite recursion and breaks the self-host |
-| fnptr + closure_call | ✅ done (0.0.72) | ✅ gate | fnptr_test rc=7. fnptr now returns a [codeptr, env=0] tuple (same layout as IR_FNVAL), so it can be passed directly to closure_call. Before 0.0.72 fnptr emitted a raw pointer and feeding it to closure_call dereferenced it as a tuple → SEGFAULT |
-| const redefinition | ✅ done (0.0.75) | ✅ gate | const_redefine rc=5 (was 10). First value wins; duplicate silently skipped. Scanner phase (`features.quanta:scan_globals`) registers consts before the parser runs, so the dup check had to go there |
-| closure captures | ✅ done (0.0.67) | ✅ gate | closure_capture rc=15, closure_capture_multi rc=11, closure_capture_byvalue rc=11. Free variables of the enclosing fn captured BY VALUE into a heap env array at construction; body reads them via IR_CAPREAD from env in r10. Repeat references share one slot; max 32 captures |
+| match guards `n if n>3 =>` | ✅ done (0.0.69) | ✅ gate | match_guard.quanta rc=111, match_guard_false.quanta rc=222, match_guard_order.quanta rc=4. Guard may use the bound name; false guard falls through to the next arm; arms tried in order. Silently yielded 0 before 0.0.69 (the `if` was never consumed) |
+| closure literals `\|a\| { a+1 }` | ✅ done (0.0.65) | ✅ gate | closure_basic.quanta rc=6, closure_multi_param.quanta rc=7, closure_higher_order.quanta rc=42; braces required |
+| user fn overrides builtin | ✅ done (0.0.68) | ✅ gate | user_fn_beats_builtin.quanta rc=42 (was 0), user_fn_beats_builtin_chain.quanta rc=38 (was SIGILL 132), builtin_still_inline.quanta rc=3. One guard in emit_bltn/emit_bltn2 (was enforced in only 2 of 86 branches). EXCEPTION: mem_load/mem_store/mem_load8/mem_store8 + fadd/fsub/fmul/fdiv are primitive intrinsics and NOT overridable — the compiler's own w64↔mem_store wrappers are mutually recursive, so user-wins there is infinite recursion and breaks the self-host |
+| fnptr + closure_call | ✅ done (0.0.72) | ✅ gate | fnptr_test.quanta rc=7. fnptr now returns a [codeptr, env=0] tuple (same layout as IR_FNVAL), so it can be passed directly to closure_call. Before 0.0.72 fnptr emitted a raw pointer and feeding it to closure_call dereferenced it as a tuple → SEGFAULT |
+| const redefinition | ✅ done (0.0.75) | ✅ gate | const_redefine.quanta rc=5 (was 10). First value wins; duplicate silently skipped. Scanner phase (`features.quanta:scan_globals`) registers consts before the parser runs, so the dup check had to go there |
+| closure captures | ✅ done (0.0.67) | ✅ gate | closure_capture.quanta rc=15, closure_capture_multi.quanta rc=11, closure_capture_byvalue.quanta rc=11. Free variables of the enclosing fn captured BY VALUE into a heap env array at construction; body reads them via IR_CAPREAD from env in r10. Repeat references share one slot; max 32 captures |
 
 ## E. Memory & Runtime
 | Feature | Status | Test? | Notes |
 |---|---|---|---|
-| mem_alloc/free/mmap/realloc | ✅ done | ✅ gate | mem_test, test_mmap |
-| memcpy/memcmp/memmove | ✅ done | ✅ gate | memops_test |
-| mem_load/mem_store(+8) | ✅ done | ✅ gate | raw_ptr_test |
-| defer (LIFO replay) | ✅ done | ✅ gate | defer_test |
-| unsafe blocks | ✅ done | ✅ gate | unsafe_block |
+| mem_alloc/free/mmap/realloc | ✅ done | ✅ gate | mem_test.quanta, test_mmap.quanta |
+| memcpy/memcmp/memmove | ✅ done | ✅ gate | memops_test.quanta |
+| mem_load/mem_store(+8) | ✅ done | ✅ gate | raw_ptr_test.quanta |
+| defer (LIFO replay) | ✅ done | ✅ gate | defer_test.quanta |
+| unsafe blocks | ✅ done | ✅ gate | unsafe_block.quanta |
 | real allocator (free-list/GC) | ❌ todo | ❌ none | bump mmap only |
-| callee load-store-to-same-addr aliasing | ✅ done | ✅ gate | reg_alias/alias_derive_loop/alias_loadstore_loop pass (fixed in 0.0.43–0.0.46 debt window) |
+| callee load-store-to-same-addr aliasing | ✅ done | ✅ gate | reg_alias.quanta/alias_derive_loop.quanta/alias_loadstore_loop.quanta pass (fixed in 0.0.43–0.0.46 debt window) |
 | stack unwind / destructors / RAII | ❌ todo | ❌ none | defer is manual |
 | ref/mut/move (ownership) | ❌ todo | ❌ none | tokens reserved |
 
@@ -145,23 +145,23 @@ Test legend (the **Test?** column):
 |---|---|---|
 | syscall family | syscall(1–6) | ✅ gate (syscall_test) |
 | exit / panic | exit, panic | ✅ gate (exit_test) |
-| memory map | mmap | ✅ gate (test_mmap) |
-| heap | mem_alloc/free/realloc | ✅ gate (mem_test) |
-| mem ops | memcpy, memcmp, memmove, mem_load, mem_store(+8) | ✅ gate (memops_test, raw_ptr_test) |
+| memory map | mmap | ✅ gate (test_mmap.quanta) |
+| heap | mem_alloc/free/realloc | ✅ gate (mem_test.quanta) |
+| mem ops | memcpy, memcmp, memmove, mem_load, mem_store(+8) | ✅ gate (memops_test.quanta, raw_ptr_test.quanta) |
 | file I/O | file_open, file_read, file_write, file_close | ✅ gate (file_open_test rc=3, file_io, file_write_test) |
 | print | print, printi, println, prints, printsp, newline | ✅ gate (prints_family) |
-| container | len, str, push, pop, vec_get, vec_set, vec_load, vec_store, vec_add, vec_sub, vec_mul, vec_div | ✅ gate (array_test, etc.) |
+| container | len, str, push, pop, vec_get, vec_set, vec_load, vec_store, vec_add, vec_sub, vec_mul, vec_div | ✅ gate (array_test.quanta, etc.) |
 | variadic / any | arg, mk_any | ✅ gate (arg_or rc=1, arg_test rc=40) |
-| closures | closure literal `\|a\| { … }`, fnptr, closure_call | ✅ gate (closure_basic rc=6, closure_multi_param rc=7, closure_higher_order rc=42, fnptr_test rc=7) |
-| float arith | fadd, fsub, fmul, fdiv (int args → int result), i2f, f2i | ✅ gate (float_test rc=159, simple_fadd rc=7) |
-| float compare | feq, flt, fgt, fle, fge, fisnan, fisinf (f64 bit-pattern args → 0/1) | ✅ gate (float_test rc=159) |
-| float math | sqrt, floor, ceil, abs, sin, cos, tan, pow, log (f64 bit-pattern in/out) | ✅ gate (float_test rc=159) |
+| closures | closure literal `\|a\| { … }`, fnptr, closure_call | ✅ gate (closure_basic.quanta rc=6, closure_multi_param.quanta rc=7, closure_higher_order.quanta rc=42, fnptr_test.quanta rc=7) |
+| float arith | fadd, fsub, fmul, fdiv (int args → int result), i2f, f2i | ✅ gate (float_test.quanta rc=159, simple_fadd.quanta rc=7) |
+| float compare | feq, flt, fgt, fle, fge, fisnan, fisinf (f64 bit-pattern args → 0/1) | ✅ gate (float_test.quanta rc=159) |
+| float math | sqrt, floor, ceil, abs, sin, cos, tan, pow, log (f64 bit-pattern in/out) | ✅ gate (float_test.quanta rc=159) |
 | process / env | getpid, getppid, arg_count, environ (getenv is a STUB: returns 0) | ✅ gate (getpid_test, getppid_test, argc_test) |
 | stdin I/O | getc (getline untested-in-gate) | ✅ gate (getc_test) |
 | fs metadata | stat, fstat, lseek, unlink, mkdir, chdir, rename | 🟡 PARTIAL — fstat/lseek work; stat/unlink/mkdir/chdir/rename BROKEN (path-string remap returns -ENOENT, see §I) |
 | introspection | abort, debugbreak | ✅ gate (abort_test rc=134; debugbreak = int3 → rc=133) |
 | random | getrandom | ✅ gate (getrandom_test rc=1) |
-| unsigned arith | udiv, umod, ult, ugt, ulte, ugte, u8, u32, u64 | ✅ gate (unsigned_ops) |
+| unsigned arith | udiv, umod, ult, ugt, ulte, ugte, u8, u32, u64 | ✅ gate (unsigned_ops.quanta) |
 | byte/endianness | bswap, popcount, clz, ctz, rotl, rotr | ✅ gate (bits_test) |
 | time | gettimeofday, nanosleep, sleep | ✅ gate (time_test) |
 
@@ -219,7 +219,7 @@ Test legend (the **Test?** column):
   wins, confirmed via a printi sentinel that fired once). Block 1 removed (430 lines dead code).
 - **Test framework note:** tests `return`/`exit` a *computed value* (not just 0); EXPECTED.tsv's
   `expected_rc` is that computed answer. So non-zero expected_rc entries are correct results, not
-  hidden failures. Verified by reading test bodies (e.g. array_test returns 200 = a.1; simple_fadd
+  hidden failures. Verified by reading test bodies (e.g. array_test.quanta returns 200 = a.1; simple_fadd.quanta
   returns 7 = 3.0+4.0). The gate is genuinely green.
 
 ## Build order & sequencing
