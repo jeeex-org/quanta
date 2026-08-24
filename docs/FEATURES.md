@@ -25,7 +25,7 @@ Test legend (the **Test?** column):
 |---|---|---|---|---|
 | fn | 1 | ✅ done | ✅ gate | func_call_args.quanta / simplified_syntax.quanta |
 | let | 2 | ✅ done | ✅ gate | simplified_syntax.quanta / mut_basic.quanta |
-| if | 3 | ✅ done | ✅ gate | elseif_test |
+| if | 3 | ✅ done | ✅ gate | elseif_test.quanta |
 | loop | 5 | ✅ done | ✅ gate | loop_test.quanta |
 | while | 6 | ✅ done | ✅ gate | break_continue |
 | for | 7 | ✅ done | ✅ gate | for-in (array) + C-style `for i=1;i<=n;i=i=1`; for-range `for i in 0..n` (0.0.76) |
@@ -90,7 +90,7 @@ Test legend (the **Test?** column):
 ## C. Core — Control Flow
 | Feature | Status | Test? | Notes |
 |---|---|---|---|
-| if/else | ✅ done | ✅ gate | elseif_test |
+| if/else | ✅ done | ✅ gate | elseif_test.quanta |
 | while | ✅ done | ✅ gate | break_continue |
 | loop | ✅ done | ✅ gate | loop_test.quanta |
 | for-in (array) | ✅ done | ✅ gate | forin_basic/break/nested/sum |
