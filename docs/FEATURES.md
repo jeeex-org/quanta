@@ -211,16 +211,16 @@ test program exists in `test_suites/codes/` (gate status per section E/H).
 
 | Library | Status | Test? | Notes / test file |
 |---|---|---|---|
-| `big` (arbitrary-precision int) | ✅ done | ❌ none | 4 stages shipped (ADD/SUB/MUL, DIV/MOD, SHL/SHR, decimal print) + literal auto-promotion. `lib/std/big.quanta`. **No dedicated gate test** (verified ad-hoc vs Python; needs `big_test.quanta`). `big` is a library convention (pointer-in-vreg), NOT yet a first-class `big` keyword/type. |
-| `crypto` (SHA-256/HMAC/AES/CSPRNG) | ✅ done | ✅ gate | `std_crypto_test.quanta`. 643 lines, 21 fns. |
-| `quantum` (Keccak/SHA3/SHAKE) | ✅ done | ❌ none | `lib/std/quantum.quanta` (240 lines, 8 fns). **No dedicated gate test.** |
-| `linalg` (matmul/transpose/det/inverse/vectors) | ✅ done | ❌ none | `lib/std/linalg.quanta` (363 lines, 25 fns). **No dedicated gate test.** |
-| `math` (sqrt/floor/ceil/abs/sin/cos/tan/pow/log/min/max) | 🟡 partial | ✅ gate | `std_math_test.quanta`. sin/cos/tan/pow/log/min/max listed as TODO in ROADMAP P2 row. |
-| `map` | ✅ done | ✅ gate | `std_map_test.quanta` / `test_mmap.quanta` / `mmap1.quanta`. |
-| `str` (string ops) | ✅ done | ✅ gate | `std_str_test.quanta` / `string_keyword_case.quanta`. |
-| `vec` | ✅ done | ✅ gate | `std_vec_test.quanta`. |
-| `fs` (file system) | ✅ done | ✅ gate | `std_fs_test.quanta`. |
-| `io` (file IO) | ✅ done | ✅ gate | `file_io.quanta`. |
+|| `big` (arbitrary-precision int) | ✅ done | ❌ none | 4 stages shipped (ADD/SUB/MUL, DIV/MOD, SHL/SHR, decimal print) + literal auto-promotion. `lib/std/big.quanta`. **No dedicated gate** (verified ad-hoc vs Python; `big_test.quanta` NOT yet written). `big` is a library convention (pointer-in-vreg), NOT yet a first-class `big` keyword/type. |
+| `crypto` (SHA-256/HMAC/AES/CSPRNG) | ✅ done | 🟡 file-only | `std_crypto_test.quanta` exists on disk but is NOT in the gate (EXPECTED.tsv). 643 lines, 21 fns. |
+| `quantum` (Keccak/SHA3/SHAKE) | ✅ done | ❌ none | `lib/std/quantum.quanta` (240 lines, 8 fns). **No dedicated test file.** |
+| `linalg` (matmul/transpose/det/inverse/vectors) | ✅ done | ❌ none | `lib/std/linalg.quanta` (363 lines, 25 fns). **No dedicated test file.** |
+| `math` (sqrt/floor/ceil/abs/sin/cos/tan/pow/log/min/max) | 🟡 partial | 🟡 file-only | `std_math_test.quanta` exists on disk but NOT in gate. sin/cos/tan/pow/log/min/max listed as TODO in ROADMAP P2 row. |
+| `map` | ✅ done | ✅ gate | `test_mmap.quanta` / `mmap1.quanta` (both gated). Note: `std_map_test.quanta` also exists on disk but is NOT in the gate. |
+| `str` (string ops) | ✅ done | ✅ gate | `string_keyword_case.quanta` (gated). Note: `std_str_test.quanta` also exists on disk but is NOT in the gate. |
+| `vec` | ✅ done | 🟡 file-only | `std_vec_test.quanta` exists on disk but NOT in gate. |
+| `fs` (file system) | ✅ done | 🟡 file-only | `std_fs_test.quanta` exists on disk but NOT in gate. |
+| `io` (file IO) | ✅ done | ✅ gate | `file_io.quanta` (in gate). |
 | `chain` (blockchain: Merkle/signed-tx/UTXO/Block) | ❌ todo | ❌ none | Not in code. Part of the differentiation mandate (math/physics/crypto/blockchain/quantum/AI). |
 | `secure` (capability I/O, constant-time) | ❌ todo | ❌ none | Not in code. |
 | `ai` (tensor ops + inference) | ❌ todo | ❌ none | Not in code. |
