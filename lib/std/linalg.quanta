@@ -1,0 +1,363 @@
+// lib/std/linalg — NATIVE numerical linear algebra for Quanta.
+// Pure-Quanta implementation over mem_alloc; no external runtime.
+// This is Quanta's answer to NumPy's core: dense matrices with int64 and
+// f64 (IEEE-754 double) elements, matmul, transpose, determinant, inverse,
+// and vector ops — the substrate that physics solvers, ML inference, and
+// finite-field crypto all build on.
+//
+// Layout (header pointer, like vec/big):
+//   [0]  = rows
+//   [8]  = cols
+//   [16] = element (0,0)
+//   element (r,c) at  [16 + (r*cols + c)*8]
+// An element is an i64 slot; for f64 matrices it holds the double's bit-pattern.
+// Import with:  import std/linalg
+// Floats use the builtins i2f, f2i, fadd, fsub, fmul, fdiv, sqrt.
+
+// ---------------- core ----------------
+fn mat_new(r, c) {
+  let p = mem_alloc(r * c + 2)     // 2 header qwords + r*c element qwords
+  mem_store(p, r)
+  mem_store(p + 8, c)
+  return p
+}
+
+fn mat_rows(m) { return mem_load(m) }
+fn mat_cols(m) { return mem_load(m + 8) }
+
+fn mat_get(m, r, c) {
+  let cols = mem_load(m + 8)
+  return mem_load(m + 16 + (r * cols + c) * 8)
+}
+fn mat_set(m, r, c, v) {
+  let cols = mem_load(m + 8)
+  mem_store(m + 16 + (r * cols + c) * 8, v)
+}
+
+fn mat_zeros(r, c) {
+  let m = mat_new(r, c)
+  let i = 0
+  while i < r * c { mat_set(m, i / c, i % c, 0); i = i + 1 }
+  return m
+}
+
+fn mat_identity(n) {
+  let m = mat_zeros(n, n)
+  let i = 0
+  while i < n { mat_set(m, i, i, 1); i = i + 1 }
+  return m
+}
+
+// Build a matrix from a flat i64 array `arr` (length r*c) row-major.
+fn mat_from_flat(arr, r, c) {
+  let m = mat_new(r, c)
+  let i = 0
+  while i < r * c { mat_set(m, i / c, i % c, mem_load(arr + 16 + i * 8)); i = i + 1 }
+  return m
+}
+
+fn mat_transpose(m) {
+  let r = mat_rows(m); let c = mat_cols(m)
+  let t = mat_new(c, r)
+  let i = 0
+  while i < r {
+    let j = 0
+    while j < c { mat_set(t, j, i, mat_get(m, i, j)); j = j + 1 }
+    i = i + 1
+  }
+  return t
+}
+
+// ---------------- int arithmetic ----------------
+fn mat_add(a, b) {
+  let r = mat_rows(a); let c = mat_cols(a)
+  let o = mat_new(r, c)
+  let i = 0
+  while i < r * c { mat_set(o, i / c, i % c, mat_get(a, i / c, i % c) + mat_get(b, i / c, i % c)); i = i + 1 }
+  return o
+}
+fn mat_sub(a, b) {
+  let r = mat_rows(a); let c = mat_cols(a)
+  let o = mat_new(r, c)
+  let i = 0
+  while i < r * c { mat_set(o, i / c, i % c, mat_get(a, i / c, i % c) - mat_get(b, i / c, i % c)); i = i + 1 }
+  return o
+}
+fn mat_scal_i(m, s) {
+  let r = mat_rows(m); let c = mat_cols(m)
+  let o = mat_new(r, c)
+  let i = 0
+  while i < r * c { mat_set(o, i / c, i % c, mat_get(m, i / c, i % c) * s); i = i + 1 }
+  return o
+}
+
+// ---------------- float (f64) arithmetic ----------------
+fn mat_add_f(a, b) {
+  let r = mat_rows(a); let c = mat_cols(a)
+  let o = mat_new(r, c)
+  let i = 0
+  while i < r * c {
+    let rr = i / c; let cc = i % c
+    mat_set(o, rr, cc, fadd(mat_get(a, rr, cc), mat_get(b, rr, cc)))
+    i = i + 1
+  }
+  return o
+}
+fn mat_sub_f(a, b) {
+  let r = mat_rows(a); let c = mat_cols(a)
+  let o = mat_new(r, c)
+  let i = 0
+  while i < r * c {
+    let rr = i / c; let cc = i % c
+    mat_set(o, rr, cc, fsub(mat_get(a, rr, cc), mat_get(b, rr, cc)))
+    i = i + 1
+  }
+  return o
+}
+fn mat_scal_f(m, s) {
+  let r = mat_rows(m); let c = mat_cols(m)
+  let o = mat_new(r, c)
+  let i = 0
+  while i < r * c { mat_set(o, i / c, i % c, fmul(mat_get(m, i / c, i % c), s)); i = i + 1 }
+  return o
+}
+
+// ---------------- matmul ----------------
+// int matmul  (O(n^3) schoolbook; exact, fixpoint-safe)
+fn mat_mul(a, b) {
+  let r = mat_rows(a); let n = mat_cols(a); let c = mat_cols(b)
+  let o = mat_new(r, c)
+  let i = 0
+  while i < r {
+    let j = 0
+    while j < c {
+      let acc = 0
+      let k = 0
+      while k < n {
+        acc = acc + mat_get(a, i, k) * mat_get(b, k, j)
+        k = k + 1
+      }
+      mat_set(o, i, j, acc)
+      j = j + 1
+    }
+    i = i + 1
+  }
+  return o
+}
+
+// float matmul (O(n^3) schoolbook; f64 accumulation)
+fn mat_mul_f(a, b) {
+  let r = mat_rows(a); let n = mat_cols(a); let c = mat_cols(b)
+  let o = mat_new(r, c)
+  let i = 0
+  while i < r {
+    let j = 0
+    while j < c {
+      let acc = i2f(0)
+      let k = 0
+      while k < n {
+        acc = fadd(acc, fmul(mat_get(a, i, k), mat_get(b, k, j)))
+        k = k + 1
+      }
+      mat_set(o, i, j, acc)
+      j = j + 1
+    }
+    i = i + 1
+  }
+  return o
+}
+
+// ---------------- vector ops (flattened) ----------------
+fn vdot(a, b) {               // sum_i a_i * b_i over all elements
+  let r = mat_rows(a); let c = mat_cols(a)
+  let acc = i2f(0)
+  let i = 0
+  while i < r * c { acc = fadd(acc, fmul(mat_get(a, i / c, i % c), mat_get(b, i / c, i % c))); i = i + 1 }
+  return acc
+}
+fn vnorm(a) { return sqrt(vdot(a, a)) }     // Euclidean norm (f64)
+
+// ---------------- determinant (int, Gaussian elimination w/ partial pivot) ----------------
+fn mat_det(a) {
+  let n = mat_rows(a)
+  // copy a into a flat working buffer
+  let buf = mem_alloc(n * n + 2)
+  mem_store(buf, n); mem_store(buf + 8, n)
+  let i = 0
+  while i < n * n { mem_store(buf + 16 + i * 8, mat_get(a, i / n, i % n)); i = i + 1 }
+  let det = 1
+  let col = 0
+  while col < n {
+    // find pivot row >= col with largest |val|
+    let piv = col; let best = 0; let prow = col
+    while prow < n {
+      let v = mem_load(buf + 16 + (prow * n + col) * 8)
+      if v < 0 { v = -v }
+      if v > best { best = v; piv = prow }
+      prow = prow + 1
+    }
+    if best == 0 { return 0 }    // singular
+    // swap pivot row into position `col`
+    if piv != col {
+      let cc = 0
+      while cc < n {
+        let t1 = mem_load(buf + 16 + (col * n + cc) * 8)
+        let t2 = mem_load(buf + 16 + (piv * n + cc) * 8)
+        mem_store(buf + 16 + (col * n + cc) * 8, t2)
+        mem_store(buf + 16 + (piv * n + cc) * 8, t1)
+        cc = cc + 1
+      }
+      det = -det
+    }
+    // eliminate below
+    let row = col + 1
+    while row < n {
+      let f = mem_load(buf + 16 + (row * n + col) * 8) / mem_load(buf + 16 + (col * n + col) * 8)
+      let cc = col
+      while cc < n {
+        let nv = mem_load(buf + 16 + (row * n + cc) * 8) - f * mem_load(buf + 16 + (col * n + cc) * 8)
+        mem_store(buf + 16 + (row * n + cc) * 8, nv)
+        cc = cc + 1
+      }
+      row = row + 1
+    }
+    det = det * mem_load(buf + 16 + (col * n + col) * 8)
+    col = col + 1
+  }
+  return det
+}
+
+// ---------------- inverse (f64, Gauss-Jordan) ----------------
+// Returns a float matrix A^-1, or 0 (null) if singular.
+fn mat_inv_f(a) {
+  let n = mat_rows(a)
+  // augmented [A | I]
+  let aug = mem_alloc(n * (2 * n) + 2)
+  mem_store(aug, n); mem_store(aug + 8, 2 * n)
+  let i = 0
+  while i < n {
+    let j = 0
+    while j < n {
+      mem_store(aug + 16 + (i * (2 * n) + j) * 8, mat_get(a, i, j))
+      mem_store(aug + 16 + (i * (2 * n) + n + j) * 8, i2f(0))
+      j = j + 1
+    }
+    mem_store(aug + 16 + (i * (2 * n) + n + i) * 8, i2f(1))
+    i = i + 1
+  }
+  // forward elimination
+  let col = 0
+  while col < n {
+    // partial pivot
+    let piv = col; let best = i2f(0); let prow = col
+    while prow < n {
+      let v = mem_load(aug + 16 + (prow * (2 * n) + col) * 8)
+      if f2i(v) < 0 { v = fsub(i2f(0), v) }
+      if f2i(fsub(v, best)) > 0 { best = v; piv = prow }
+      prow = prow + 1
+    }
+    if f2i(best) == 0 { return 0 }    // singular
+    if piv != col {
+      let cc = 0
+      while cc < 2 * n {
+        let t1 = mem_load(aug + 16 + (col * (2 * n) + cc) * 8)
+        let t2 = mem_load(aug + 16 + (piv * (2 * n) + cc) * 8)
+        mem_store(aug + 16 + (col * (2 * n) + cc) * 8, t2)
+        mem_store(aug + 16 + (piv * (2 * n) + cc) * 8, t1)
+        cc = cc + 1
+      }
+    }
+    // normalize pivot row
+    let pv = mem_load(aug + 16 + (col * (2 * n) + col) * 8)
+    let cc2 = 0
+    while cc2 < 2 * n {
+      mem_store(aug + 16 + (col * (2 * n) + cc2) * 8, fdiv(mem_load(aug + 16 + (col * (2 * n) + cc2) * 8), pv))
+      cc2 = cc2 + 1
+    }
+    // eliminate other rows
+    let row = 0
+    while row < n {
+      if row != col {
+        let f = mem_load(aug + 16 + (row * (2 * n) + col) * 8)
+        let cc3 = 0
+        while cc3 < 2 * n {
+          let nv = fsub(mem_load(aug + 16 + (row * (2 * n) + cc3) * 8), fmul(f, mem_load(aug + 16 + (col * (2 * n) + cc3) * 8)))
+          mem_store(aug + 16 + (row * (2 * n) + cc3) * 8, nv)
+          cc3 = cc3 + 1
+        }
+      }
+      row = row + 1
+    }
+    col = col + 1
+  }
+  // extract right block
+  let inv = mat_new(n, n)
+  let i2 = 0
+  while i2 < n {
+    let j2 = 0
+    while j2 < n {
+      mat_set(inv, i2, j2, mem_load(aug + 16 + (i2 * (2 * n) + n + j2) * 8))
+      j2 = j2 + 1
+    }
+    i2 = i2 + 1
+  }
+  return inv
+}
+
+// ---------------- printing ----------------
+// Print an i64 (handles negatives via leading '-').
+fn print_i64(x) {
+  if x < 0 { print(45); x = -x }
+  // print digits high-to-low
+  let div = 1
+  let t = x
+  while t >= 10 { div = div * 10; t = t / 10 }
+  while div >= 1 {
+    print(x / div)
+    x = x - (x / div) * div
+    div = div / 10
+  }
+}
+
+// Print an f64 with `dec` decimal places.
+fn fprint(x, dec) {
+  let isneg = 0
+  if f2i(x) < 0 { isneg = 1; x = fsub(i2f(0), x) }
+  let ip = f2i(x)
+  let frac = fsub(x, i2f(ip))
+  if isneg == 1 { print(45) }       // '-'
+  print_i64(ip)
+  if dec > 0 {
+    print(46)                        // '.'
+    let k = 0
+    while k < dec {
+      frac = fmul(frac, i2f(10))
+      let d = f2i(frac)
+      print_i64(d)
+      frac = fsub(frac, i2f(d))
+      k = k + 1
+    }
+  }
+}
+
+fn mat_print(m) {
+  let r = mat_rows(m); let c = mat_cols(m)
+  let i = 0
+  while i < r {
+    let j = 0
+    while j < c { print_i64(mat_get(m, i, j)); print(32); j = j + 1 }
+    println(0)
+    i = i + 1
+  }
+}
+
+fn mat_print_f(m, dec) {
+  let r = mat_rows(m); let c = mat_cols(m)
+  let i = 0
+  while i < r {
+    let j = 0
+    while j < c { fprint(mat_get(m, i, j), dec); print(32); j = j + 1 }
+    println(0)
+    i = i + 1
+  }
+}

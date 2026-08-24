@@ -1,6 +1,6 @@
 # Quanta ROADMAP — consolidated single source of truth
 
-> **Last updated: 2026-08-24. Current compiler: 0.0.83** (x86-64 ELF emitter,
+> **Last updated: 2026-08-24. Current compiler: 0.0.84** (x86-64 ELF emitter,
 > multi-file tree, Valgrind-clean, self-host `fp=YES`). ARM64 (AArch64) backend
 > is DEFERRED POST-0.1.0 (see #2 schedule below); the working compiler is x86-64 only.
 >
@@ -214,6 +214,35 @@ runtime division (loop `i/3` = 12), and 13 sign-combination floor/mod cases all
 verified; the self-host fixpoint is byte-identical (`qc` compiled by itself
 reproduces itself). Pending feature tests (bswap/popcount/defer/generics/
 import/memcpy) are unimplemented intrinsics, not regressions.
+
+### Current status (0.0.84) — 24-bit limbs + decimal printing + Karatsuba shipped
+
+Performance + usability pass on `lib/std/big.quanta` (pure stdlib, zero codegen
+changes, self-host fixpoint **byte-identical and verified**: bin==sh2==sh3).
+
+- **24-bit limbs** (was 16-bit): every `a[i]*b[j] < 2^48 < 2^63`, so the signed
+  `*` with `ovf_trap=1` never trips, and carry = `prod >> 24` / `prod & 16777215`
+  is exact. 4096-bit = 171 limbs; 1M bits = 41,667 limbs (vs 62,500 at 16-bit
+  → ~1.5× less RAM and ~1.5× fewer loop iterations). Sign lives in a dedicated
+  slot (a[1]); limbs are 0..16777215.
+- **Karatsuba multiply** (`big_mul` dispatches to `big_mul_base` schoolbook for
+  ≤32-limb operands, Karatsuba above → O(n^1.585)). Two bugs found and fixed
+  during bring-up: (1) midpoint was `half=(na+nb)/2`, which equals `na` when
+  `na==nb` and made `big_hi(a, lo)` empty → **infinite recursion / stack
+  overflow** at ~220 digits; now `half = min(na,nb)/2` so the split is always
+  strictly below both lengths. (2) `big_mul_kara` allocated `nr = na+nb` limbs
+  but placed `z2` at offset `2*lo = na+nb`, writing **past the end of `r`**
+  (heap corruption / segfault); allocation is now `2*(na+nb)`.
+- **Decimal printing** (`big_print` / `big_println`, signed-aware): iterative
+  divide-by-10 building digits into a buffer, emitted via a `putc` byte writer
+  (`write(1,&b,1)` syscall) — no per-digit recursion (which overflowed the
+  runtime stack at scale) and no `print(n)` integer-formatter misuse (which
+  emitted the digit *value* rather than an ASCII byte). Verified exact vs Python
+  for 252-digit numbers.
+- **Verified vs Python** (all reconstruct / match): mul, div (reconstruction
+  `p/a==b`), mod (`p mod a == 0`), sub, signed div, shl/shr round-trips, and
+  decimal rendering at 150–400-digit and 252-digit scale. 256-bit mul/div,
+  2^80/2^64, and signed edge cases (`-17//5==-4`, `-17%5==3`) all exact.
 
 ### Current status (0.0.83) — big-int Stage 3 (SHIFTS) shipped
 

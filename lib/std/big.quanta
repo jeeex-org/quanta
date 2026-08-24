@@ -1,18 +1,21 @@
-// std/big — arbitrary-precision unsigned integers (Stage 1: ADD/SUB/MUL).
+// std/big — arbitrary-precision signed big integers.
+// Stages: ADD/SUB/MUL (0.0.81), DIV/MOD (0.0.82), SHL/SHR (0.0.83),
+// decimal printing + 24-bit limbs + Karatsuba multiply (0.0.84).
 //
-// A `big` is a header-pointer to a little-endian array of 16-bit limbs:
+// A `big` is a header-pointer to a little-endian array of 24-bit limbs:
 //   [base]      = nlimbs (i64; element 0 is the header, NOT a limb)
-//   [base+8]    = limb[0]  (least significant 16 bits; stored as i64 0..65535)
-//   [base+16]   = limb[1]
+//   [base+8]    = sign    (0 = non-negative, 1 = negative)
+//   [base+16]   = limb[0]  (least significant 24 bits; stored as i64 0..16777215)
+//   [base+24]   = limb[1]
 //   ...
 //
-// WHY 16-BIT LIMBS: Quanta's `*` is a signed 64-bit multiply with ovf_trap=1.
-// A 32-bit limb squared (~1.8e19) overflows i64 and trips the trap. With 16-bit
-// limbs every a[i]*b[j] < 2^32 < 2^63, never traps, and the split into
-//   low  = prod & 0xFFFF
-//   high = prod >> 16        (prod < 2^32 so always non-negative -> logical)
-// is exact. 4096-bit numbers use 256 limbs.
-//
+// WHY 24-BIT LIMBS: Quanta's `*` is a signed 64-bit multiply with ovf_trap=1.
+// A 32-bit limb squared (~1.8e19) overflows i64 and trips the trap, and a 64-bit
+// limb loses the high half of the 128-bit product entirely. 24-bit limbs keep
+// every a[i]*b[j] < 2^48 < 2^63 (never traps), and carry = prod >> 24 with
+// prod & 16777215 exact. 4096-bit numbers use 171 limbs; 1M bits = 41,667 limbs.
+// Signed arithmetic is handled by sign/magnitude on top of the magnitude ops.
+
 // Stage 1 is MAGNITUDE-ONLY (unsigned). Sign handling arrives with DIV/MOD
 // (Stage 2). Callers pass non-negative operands; results are non-negative.
 //
@@ -25,7 +28,7 @@
 // cannot represent. All Stage-1 magnitude ops use big_len(a)=a[0] and access
 // limbs via big_limb/big_set, so they are unaffected by the sign slot.
 
-// Allocate a big with `n` 16-bit limbs. Layout: a[0]=nlimbs, a[1]=sign(0/1),
+// Allocate a big with `n` 24-bit limbs. Layout: a[0]=nlimbs, a[1]=sign(0/1),
 // a[2..]=limbs. mem_alloc(k) gives k qword slots (indices 0..k-1) with [base]=k;
 // we need n+2 slots (count + sign + n limbs).
 fn big_alloc(n) {
@@ -67,9 +70,9 @@ fn big_add(a, b) {
     let y = 0
     if i < na { x = big_limb(a, i) }
     if i < nb { y = big_limb(b, i) }
-    let s = x + y + carry            // < 3*65536 < 2^17, never traps
-    big_set(r, i, s & 65535)        // store low 16 bits
-    carry = s >> 16                 // carry = high bits (0, 1, or 2)
+    let s = x + y + carry            // < 3*16777216 < 2^26, never traps
+    big_set(r, i, s & 16777215)        // store low 24 bits
+    carry = s >> 24                 // carry = high bits (0, 1, or 2)
     i = i + 1
   }
   if carry > 0 { big_set(r, n, carry); n = n + 1 }
@@ -107,7 +110,7 @@ fn big_sub(a, b) {
     if i < nl { y = big_limb(lo, i) }
     let d = x - y - borrow
     let b2 = 0
-    if d < 0 { b2 = 1; d = d + 65536 }   // wrap to u16 (i64 mod 2^16)
+    if d < 0 { b2 = 1; d = d + 16777216 }   // wrap to u24 (i64 mod 2^24)
     big_set(r, i, d)
     borrow = b2
     i = i + 1
@@ -115,8 +118,17 @@ fn big_sub(a, b) {
   return big_norm(r)
 }
 
-// Unsigned multiplication: r = a * b (schoolbook, 16-bit limbs).
+// Unsigned multiplication: r = a * b. Dispatches to Karatsuba for large inputs
+// (O(n^1.585)) and schoolbook (big_mul_base) for small ones.
 fn big_mul(a, b) {
+  let na = big_len(a)
+  let nb = big_len(b)
+  if na < 32 && nb < 32 { return big_mul_base(a, b) }
+  return big_mul_kara(a, b)
+}
+
+// Schoolbook multiplication (24-bit limbs). Used directly for small inputs.
+fn big_mul_base(a, b) {
   let na = big_len(a)
   let nb = big_len(b)
   let nr = na + nb
@@ -133,8 +145,8 @@ fn big_mul(a, b) {
       let rij = big_limb(r, i0 + j)
       // ai*bj < 2^32, rij < 2^16, carry < 2^17 -> prod < 2^33, never traps
       let prod = ai * bj + rij + carry
-      big_set(r, i0 + j, prod & 65535)
-      carry = prod >> 16
+      big_set(r, i0 + j, prod & 16777215)
+      carry = prod >> 24
       j = j + 1
     }
     big_set(r, i0 + nb, big_limb(r, i0 + nb) + carry)
@@ -143,48 +155,149 @@ fn big_mul(a, b) {
   return big_norm(r)
 }
 
+// r[off..] += x (term-by-term add with carry), used by Karatsuba combine.
+fn big_add_off(r, off, x) {
+  let n = big_len(x)
+  let carry = 0
+  let i = 0
+  while i < n {
+    let cur = big_limb(r, off + i) + big_limb(x, i) + carry
+    big_set(r, off + i, cur & 16777215)
+    carry = cur >> 24
+    i = i + 1
+  }
+  // propagate carry into higher limbs of r
+  let k = off + n
+  while carry > 0 {
+    let cur = big_limb(r, k) + carry
+    big_set(r, k, cur & 16777215)
+    carry = cur >> 24
+    k = k + 1
+  }
+  return 0
+}
+
+// r[off..] -= x (assumes r[off..] >= x term-by-term after borrow); magnitude sub.
+fn big_sub_off(r, off, x) {
+  let n = big_len(x)
+  let borrow = 0
+  let i = 0
+  while i < n {
+    let cur = big_limb(r, off + i) - big_limb(x, i) - borrow
+    if cur < 0 { cur = cur + 16777216; borrow = 1 } else { borrow = 0 }
+    big_set(r, off + i, cur & 16777215)
+    i = i + 1
+  }
+  // propagate borrow into higher limbs
+  let k = off + n
+  while borrow > 0 {
+    let cur = big_limb(r, k) - borrow
+    if cur < 0 { cur = cur + 16777216; borrow = 1 } else { borrow = 0 }
+    big_set(r, k, cur & 16777215)
+    k = k + 1
+  }
+  return 0
+}
+
+// Karatsuba multiply (magnitude). Splits each operand at a midpoint strictly
+// less than both lengths, so the recursion actually reduces in size.
+fn big_mul_kara(a, b) {
+  let na = big_len(a)
+  let nb = big_len(b)
+  let half = na
+  if nb < half { half = nb }
+  half = half / 2                       // midpoint < min(na,nb) -> recursion shrinks
+  if half < 16 { return big_mul_base(a, b) }
+  let lo = half
+  // a = a1 * B^lo + a0 ; b = b1 * B^lo + b0  (B = 2^(24*lo))
+  let a0 = big_lo(a, lo)
+  let a1 = big_hi(a, lo)
+  let b0 = big_lo(b, lo)
+  let b1 = big_hi(b, lo)
+  let z0 = big_mul(a0, b0)
+  let z2 = big_mul(a1, b1)
+  let sa = big_add(a0, a1)
+  let sb = big_add(b0, b1)
+  let z1 = big_mul(sa, sb)
+  z1 = big_sub(z1, z0)
+  z1 = big_sub(z1, z2)
+  // result = z2*B^(2lo) + z1*B^lo + z0
+  // z2 is placed at offset 2*lo, so the result span can reach ~1.5*(na+nb);
+  // allocate 2*(na+nb) limbs to avoid writing past the end of r.
+  let nr = (na + nb) * 2
+  let r = big_alloc(nr)
+  let i = 0
+  while i < nr { big_set(r, i, 0); i = i + 1 }
+  big_add_off(r, 0, z0)
+  big_add_off(r, lo, z1)
+  big_add_off(r, 2 * lo, z2)
+  return big_norm(r)
+}
+
+// low `n` limbs of x (x mod B^n)
+fn big_lo(x, n) {
+  let nx = big_len(x)
+  let m = n
+  if m > nx { m = nx }
+  let r = big_alloc(m)
+  let i = 0
+  while i < m { big_set(r, i, big_limb(x, i)); i = i + 1 }
+  return big_norm(r)
+}
+
+// high limbs of x (x div B^n); returns 0 if x < B^n
+fn big_hi(x, n) {
+  let nx = big_len(x)
+  if n >= nx { return big_from_i64(0) }
+  let m = nx - n
+  let r = big_alloc(m)
+  let i = 0
+  while i < m { big_set(r, i, big_limb(x, n + i)); i = i + 1 }
+  return big_norm(r)
+}
+
 // Build a big from a single i64 (handles negatives via the sign slot).
 fn big_from_i64(x) {
   let neg = 0
   let m = x
   if x < 0 { neg = 1; m = -x }          // m = |x| (positive, < 2^63)
-  let r = big_alloc(4)
-  big_set(r, 0, m & 65535)
-  big_set(r, 1, (m >> 16) & 65535)
-  big_set(r, 2, (m >> 32) & 65535)
-  big_set(r, 3, (m >> 48) & 65535)
+  let r = big_alloc(3)                   // 64 bits -> 3 x 24-bit limbs
+  big_set(r, 0, m & 16777215)
+  big_set(r, 1, (m >> 24) & 16777215)
+  big_set(r, 2, (m >> 48) & 16777215)
   big_set_neg(r, neg)
   return big_norm(r)
 }
 
-// Build a big from two 64-bit values (lo64, hi64), each split into four 16-bit
-// limbs (little-endian). Useful for tests; e.g. big_from_2x64(-1, 0) = 2^64-1.
+// Build a big from two 64-bit values (lo64, hi64), each split into three 24-bit
+// limbs (little-endian, 8 limbs total). Useful for tests; e.g.
+// big_from_2x64(-1, 0) = 2^64-1.
 fn big_from_2x64(lo64, hi64) {
-  let r = big_alloc(8)
-  big_set(r, 0, lo64 & 65535)
-  big_set(r, 1, (lo64 >> 16) & 65535)
-  big_set(r, 2, (lo64 >> 32) & 65535)
-  big_set(r, 3, (lo64 >> 48) & 65535)
-  big_set(r, 4, hi64 & 65535)
-  big_set(r, 5, (hi64 >> 16) & 65535)
-  big_set(r, 6, (hi64 >> 32) & 65535)
-  big_set(r, 7, (hi64 >> 48) & 65535)
+  let r = big_alloc(6)
+  big_set(r, 0, lo64 & 16777215)
+  big_set(r, 1, (lo64 >> 24) & 16777215)
+  big_set(r, 2, (lo64 >> 48) & 16777215)
+  big_set(r, 3, hi64 & 16777215)
+  big_set(r, 4, (hi64 >> 24) & 16777215)
+  big_set(r, 5, (hi64 >> 48) & 16777215)
   return big_norm(r)
 }
 
-// Return the value as an i64, valid only when it fits in 64 bits (len <= 4).
+// Return the value as an i64, valid only when it fits in signed 64 bits
+// (value < 2^63; i.e. len <= 3 for 24-bit limbs). Reconstructs from the
+// non-overlapping limb fields so no intermediate shift overflows i64.
 fn big_to_i64(a) {
-  let v = 0
-  let i = 0
-  while i < big_len(a) {
-    v = v + (big_limb(a, i) << (16 * i))
-    i = i + 1
-  }
+  let lo = big_limb(a, 0)
+  let mid = 0
+  let hi = 0
+  if big_len(a) > 1 { mid = big_limb(a, 1) }
+  if big_len(a) > 2 { hi = big_limb(a, 2) & 65535 }   // only low 16 bits matter (value < 2^63)
+  let v = lo | (mid << 24) | (hi << 48)
   if big_is_neg(a) == 1 { v = -v }
   return v
 }
 
-// Print a big in hexadecimal (exact, limb-by-limb). Each 16-bit limb is 4 hex
+// Print a big in hexadecimal (exact, limb-by-limb). Each 24-bit limb is 6 hex
 // digits, most-significant limb printed first. Cross-checks against Python.
 // Each nibble is printed followed by a comma (unambiguous parsing).
 fn big_print_hex(a) {
@@ -192,7 +305,7 @@ fn big_print_hex(a) {
   let k = n - 1
   while k >= 0 {
     let limb = big_limb(a, k)
-    let sh = 12
+    let sh = 20
     while sh >= 0 {
       let nib = (limb >> sh) & 15
       print(nib); print(44)   // 44 = ','
@@ -231,7 +344,7 @@ fn big_shl1(x) {
     let v = big_limb(x, i)
     let nv = (v << 1) | carry
     let c = 0
-    if nv > 65535 { c = 1; nv = nv & 65535 }
+    if nv > 16777215 { c = 1; nv = nv & 16777215 }
     big_set(r, i, nv)
     carry = c
     i = i + 1
@@ -250,7 +363,7 @@ fn big_shr1(x) {
     let v = big_limb(x, i)
     let nv = (v >> 1) | carry
     big_set(r, i, nv)
-    if (v & 1) == 1 { carry = 32768 } else { carry = 0 }
+    if (v & 1) == 1 { carry = 8388608 } else { carry = 0 }   // bit 23 -> next limb's LSB
     i = i - 1
   }
   return big_norm(r)
@@ -308,13 +421,13 @@ fn big_udiv(x, y) {
     }
     let z = big_alloc(1); big_set(z, 0, 0); z[0] = 1; return z   // x < y -> 0
   }
-  // nbits = bit length of x = (n-1)*16 + (bit count of top limb)
+  // nbits = bit length of x = (n-1)*24 + (bit count of top limb)
   let n = big_len(x)
   let top = big_limb(x, n - 1)
   let bp = 0
   let t = top
   while t > 0 { t = t >> 1; bp = bp + 1 }
-  let nbits = (n - 1) * 16 + bp
+  let nbits = (n - 1) * 24 + bp
 
   let ONE = big_from_i64(1)
   let q = big_alloc(1); big_set(q, 0, 0); q[0] = 1
@@ -322,8 +435,8 @@ fn big_udiv(x, y) {
   let i = nbits - 1
   while i >= 0 {
     r = big_shl1(r)                                     // r = r << 1
-    let bl = i / 16                                       // extract bit i of x
-    let bb = i - bl * 16
+    let bl = i / 24                                       // extract bit i of x
+    let bb = i - bl * 24
     let bit = (big_limb(x, bl) >> bb) & 1
     if bit == 1 { r = big_add(r, ONE) }                  // r = r | 1 (r is even here)
     q = big_shl1(q)                                      // q = q << 1
@@ -378,8 +491,8 @@ fn big_mod(a, b) {
 fn big_shl(x, n) {
   if n < 0 { return big_shr(x, -n) }
   if n == 0 { return x }
-  let limb_shift = n / 16
-  let rem = n - limb_shift * 16
+  let limb_shift = n / 24
+  let rem = n - limb_shift * 24
   let na = big_len(x)
   let nr = na + limb_shift + 1
   let r = big_alloc(nr)
@@ -389,8 +502,8 @@ fn big_shl(x, n) {
   while i < na {
     let v = big_limb(x, i)
     let cur = big_limb(r, limb_shift + i) + (v << rem)   // < 2^31, no trap
-    big_set(r, limb_shift + i, cur & 65535)
-    let hi = (v << rem) >> 16                            // spill to next limb
+    big_set(r, limb_shift + i, cur & 16777215)
+    let hi = (v << rem) >> 24                            // spill to next limb
     if hi > 0 { big_set(r, limb_shift + i + 1, big_limb(r, limb_shift + i + 1) + hi) }
     i = i + 1
   }
@@ -401,8 +514,8 @@ fn big_shl(x, n) {
 fn big_shr(x, n) {
   if n < 0 { return big_shl(x, -n) }
   if n == 0 { return x }
-  let limb_shift = n / 16
-  let rem = n - limb_shift * 16
+  let limb_shift = n / 24
+  let rem = n - limb_shift * 24
   let na = big_len(x)
   if limb_shift >= na { return big_from_i64(0) }
   let nr = na - limb_shift
@@ -415,11 +528,78 @@ fn big_shr(x, n) {
     let v = big_limb(x, src) >> rem
     if src + 1 < na {
       let vn = big_limb(x, src + 1)
-      v = v + ((vn & ((1 << rem) - 1)) << (16 - rem))   // low rem bits -> high rem bits
+      v = v + ((vn & ((1 << rem) - 1)) << (24 - rem))   // low rem bits -> high rem bits
     }
-    big_set(r, i, v & 65535)
+    big_set(r, i, v & 16777215)
     i = i + 1
   }
   return big_norm(r)
+}
+
+// ============================================================================
+// DECIMAL PRINTING: big -> base-10 string, printed via recursive divide-by-10.
+// Signed-aware (prints '-' for negatives). Pure stdlib, fixpoint-safe.
+// ============================================================================
+
+// Emit a single byte to stdout via write(1, &b, 1). Reuses one 8-byte buffer.
+let _putc_buf = mem_alloc(1)
+fn putc(b) {
+  mem_store(_putc_buf, b)
+  syscall(1, 1, _putc_buf, 1)
+  return 0
+}
+
+// Print the decimal digits of |a| (magnitude), iteratively.
+// Builds digits into a fixed buffer, tracking a real write count, then emits
+// exactly that many ASCII bytes.
+fn big_print_dec_mag(a) {
+  let ten = big_from_i64(10)
+  // count digits
+  let dcount = 0
+  let t = a
+  while big_ge(t, ten) == 1 { t = big_udiv(t, ten); dcount = dcount + 1 }
+  let ndig = dcount + 1
+  let buf = mem_alloc(2048)              // big scratch; digit i at buf+8+i*8
+  let w = 0                             // number of digits written
+  let k = ndig - 1
+  let v = a
+  while k >= 0 {
+    let q = big_udiv(v, ten)
+    let r = big_sub(v, big_mul(q, ten))   // r = v mod 10, 0..9
+    mem_store(buf + 8 + w * 8, big_to_i64(r))
+    w = w + 1
+    v = q
+    k = k - 1
+  }
+  let i = w - 1
+  while i >= 0 { putc(48 + mem_load(buf + 8 + i * 8)); i = i - 1 }
+  return 0
+}
+
+// Print a big as a signed decimal integer followed by a newline.
+fn big_println(a) {
+  big_print(a)
+  putc(10)                               // '\n'
+  return 0
+}
+
+// Print a big as a signed decimal integer.
+fn big_print(a) {
+  let neg = big_is_neg(a)
+  if neg == 1 { putc(45) }              // '-'
+  // magnitude copy of a (strip sign by leaving the copy's sign slot 0)
+  let n = big_len(a)
+  let mag = big_alloc(n)
+  let i = 0
+  while i < n {
+    big_set(mag, i, big_limb(a, i))
+    i = i + 1
+  }
+  if big_ge(mag, big_from_i64(1)) == 1 {
+    big_print_dec_mag(mag)
+  } else {
+    putc(48)                            // '0'
+  }
+  return 0
 }
 
