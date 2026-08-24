@@ -26,7 +26,7 @@ Test legend (the **Test?** column):
 | fn | 1 | ✅ done | ✅ gate | func_call_args.quanta / simplified_syntax.quanta |
 | let | 2 | ✅ done | ✅ gate | simplified_syntax.quanta / mut_basic.quanta |
 | if | 3 | ✅ done | ✅ gate | elseif_test |
-| loop | 5 | ✅ done | ✅ gate | loop_test, parse_loop |
+| loop | 5 | ✅ done | ✅ gate | loop_test.quanta |
 | while | 6 | ✅ done | ✅ gate | break_continue |
 | for | 7 | ✅ done | ✅ gate | for-in (array) + C-style `for i=1;i<=n;i=i=1`; for-range `for i in 0..n` (0.0.76) |
 | break | 8 | ✅ done | ✅ gate | break_continue.quanta |
@@ -62,12 +62,12 @@ Test legend (the **Test?** column):
 | u32 | 46 | 🟡 partial | ✅ gate | u32 mask builtin exists |
 | u64 | 47 | 🟡 partial | ✅ gate | u64 mask builtin exists |
 | bool | 49 | ✅ done | ✅ gate | logical_keywords.quanta (true=1, false=0) |
-| char | 50 | ✅ done | ✅ gate | char_test rc=65. `'A'` = ASCII 65 |
+| char | 50 | ✅ done | ✅ gate | memops_test.quanta (char/byte ops) |
 | byte | 51 | ✅ done | ✅ gate | memops_test.quanta (byte literal) |
 | int | 55 | ✅ done | ✅ gate | arithmetic.quanta / int_keyword_test.quanta |
 | and / or / not | 13/14/15 | ✅ done (0.0.70) | ✅ gate | logical_keywords rc=4 (was 0), logical_keywords_shortcircuit rc=2. `and`/`or` keywords behave exactly like `&&`/`||` including short-circuit |
 | true / false | 10/11 | ✅ done | ✅ gate | logical_keywords.quanta (true=1, false=0) |
-| global | 20 | ✅ done | ✅ gate | globals_test rc=42. Top-level `name = value` = global |
+| global | 20 | ✅ done | ✅ gate | test_many_globals.quanta rc=42. Top-level `name = value` = global |
 
 ## B. Core — Types
 | Type | Status | Test? | Notes |
@@ -92,7 +92,7 @@ Test legend (the **Test?** column):
 |---|---|---|---|
 | if/else | ✅ done | ✅ gate | elseif_test |
 | while | ✅ done | ✅ gate | break_continue |
-| loop | ✅ done | ✅ gate | parse_loop |
+| loop | ✅ done | ✅ gate | loop_test.quanta |
 | for-in (array) | ✅ done | ✅ gate | forin_basic/break/nested/sum |
 | match (expr arms) | ✅ done | ✅ gate | match_test rc=132 |
 | break / continue | ✅ done | ✅ gate | break_continue.quanta |
@@ -100,7 +100,7 @@ Test legend (the **Test?** column):
 | for-range `for i in 0..n` | ✅ done (0.0.76) | ✅ gate | for_range_basic rc=3 |
 | match block arms `1 => { }` | ✅ done | ✅ gate | match_test covers block arms |
 | `?` early-return propagation | ✅ done | ✅ gate | question_mark rc=0, option_test/result_test in gate |
-| loop expressions / labeled break w/ value | ✅ done (0.0.76) | ✅ gate | loop_expr_test rc=42. `let x = loop { break 42 }` |
+| loop expressions / labeled break w/ value | ✅ done (0.0.76) | ✅ gate | loop_test.quanta (`loop { break N }` value-return) |
 | try/catch | ❌ todo | ❌ none | only panic + `?` unwrap |
 
 ## D. Core — Expressions & Operators
