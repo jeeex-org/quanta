@@ -54,7 +54,7 @@ Test legend (the **Test?** column):
 | String | 37 | ❌ todo | ❌ none | lexed, unparsed. **Keyword is case-insensitive since 0.0.78** (`string` == `String`, simplicity) |
 | as | 41 | ❌ todo | ❌ none | lexed, unparsed |
 | raw | 38/52 | ❌ todo | ❌ none | lexed, unparsed |
-| asm | 40/53 | ✅ done | 🟡 file-only | asm!(\"hex bytes\") -> IR_ASM raw machine-code emit (method.quanta L261). asm_test exists but NOT in gate. |
+| asm | 40/53 | ✅ done | ✅ gate | asm!("hex bytes") -> IR_ASM raw machine-code emit (method.quanta L261); asm_test.quanta rc=42 |
 | volatile | 39/54 | ❌ todo | ❌ none | lexed, unparsed |
 | usize | 42/48 | 🟡 partial | ✅ gate | lexed; used as size type |
 | u8 | 44 | ❌ todo | ❌ none | lexed, unparsed (mask builtin u8 exists) |
