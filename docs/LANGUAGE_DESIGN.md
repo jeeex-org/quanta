@@ -1,10 +1,9 @@
 # Quanta — Language Design
 
-> *If I were to design a programming language from scratch, for every human, so
+> *Quanta a programming language from scratch, for every human, so
 > that anyone — regardless of background — could build anything with software:
 > this is how Quanta is designed. There are no limits here. The only constraint
-> is that it must actually work. Quanta is that design, made real version by
-> version.*
+> is that it must actually work.*
 
 ---
 
@@ -37,15 +36,25 @@ The single design decision that drives everything else:
 > until the moment you actually need to.**
 
 The barrier to software is not syntax. It is the *mismatch* between how humans
-think — in **intent**, in **context**, in **gradually increasing precision** —
-and how machines demand we think: in exact types, explicit ownership, manual
-builds, from day one.
+think — in **intent**, in **context**, in their own discipline's vocabulary — and
+how machines demand we think: in exact types, explicit ownership, manual builds,
+from day one.
 
-Quanta collapses that mismatch with a **gradient of precision**. The same program
-can begin as near-pseudocode and end as hard real-time embedded code, using the
-*identical* syntax. Precision is something you *add*, never something you are
-*required* to supply. A child's first program and a kernel hacker's fifteenth
-revision are written in the same language, at different points on the ladder.
+Quanta collapses that mismatch with a **gradient of precision** — but the key
+point is *whose* gradient it is:
+
+> **The precision ladder is the compiler's ladder, not the human's. The human
+> always writes at the intent level, in their own field's terms. The system
+> elaborates downward — inferring types, proving bounds, scheduling the GPU,
+> tracking ownership — on the user's behalf, invisibly. Specialization stays in
+> the user's domain; it never leaks into Quanta.**
+
+A child's first program and a kernel hacker's fifteenth revision are written in
+the *same language, at the same plain level*. They differ only in what the
+*compiler* must elaborate to satisfy the machine — not in what the *person* must
+know. Specializing in biology does not mean you must specialize in Quanta.
+Specializing in drivers does not mean you must study linear types. You write your
+field; the compiler carries the apparatus.
 
 This is the opposite of "batteries-included" and the opposite of "you must
 understand the borrow checker." It is: **start human, become machine only on
@@ -90,51 +99,63 @@ Expressions read left-to-right and top-to-bottom. Side effects are explicit via
 verb-like builtins (`println`, `write`, `send`) so that pure computation is
 visibly distinct from action.
 
-### 3.2 The Precision Ladder
+### 3.2 The Precision Ladder (the compiler's, not yours)
 
-This is the heart of the design. Five rungs. You climb only as far as you need.
+This is the heart of the design. Five levels of elaboration the *compiler*
+performs — **not five things the user must learn**. You write at the top; the
+system descends only as far as the machine requires. You never climb.
 
-**Rung 0 — Intent (pseudocode that runs):**
-```
+**Rung 0 — Intent (pseudocode that runs):** what you write.
+```quanta
 double(x) = x * 2
 println double(21)        # 42
 ```
 No types. No return. No `def`/`fn`. The compiler infers `x: Int`, infers the
-return, infers everything. This is valid and shipped.
+return, infers everything. This is valid and shipped. *This is where everyone
+starts — Ada, Okafor, and Ravi alike.*
 
-**Rung 1 — A little structure:**
-```
+**Rung 1 — A little structure:** inferred by the compiler when you name things.
+```quanta
 ages = ["Ada": 36, "Alan": 41]
 println ages["Ada"]
 ```
-Maps, lists, strings — all inferred. You name a thing; the compiler figures out
-what kind of container it is.
+Maps, lists, strings — all inferred by the system. You name a container; the
+compiler figures out what kind.
 
-**Rung 2 — Named types when *you* want clarity:**
-```
+**Rung 2 — Named types when *you* want clarity:** optional, because sometimes
+*writing* the type helps *you* read your own code.
+```quanta
 type Person = { name: Text, age: Int }
 celebrate(p: Person) = println "Happy birthday, {p.name}!"
 ```
-Annotations appear the moment they *help you*, not because the language demands
-them.
+Annotations appear because they help the human, not because the language demands
+them. The compiler would infer them regardless.
 
-**Rung 3 — Proof when it matters (refinement types):**
-```
+**The crucial point:** Runds 3 and 4 below are *also* done by the compiler on your
+behalf — you do not study them. They are shown so you can see what the system
+elaborates when your *task* needs it, not so you learn a second subject.
+
+**Rung 3 — Proof when the task needs it (refinement types), done for you:**
+```quanta
 type Adult = Int where it >= 18
 serve(alcohol: Bool, age: Adult) = ...
-# Calling serve(true, 15) is a compile error, not a runtime bug.
 ```
-Dependent/refinement types are available to anyone who needs the compiler to
-*prove* a property — but you only pay for them on the functions where you write
-the `where`.
+If you write domain logic where a bound matters, the compiler can *prove* it and
+turn a runtime crash into a compile error — without you ever reading a type
+theory paper. This is the system carrying the apparatus.
 
-**Rung 4 — Machine control (opt-in ownership):**
-```
+**Rung 4 — Machine control, only when the task demands it (ownership):**
+```quanta
 own buffer: Bytes = alloc(4096)
-send(socket, buffer)   # buffer is MOVED; use after send is a compile error
+send(socket, buffer)
 ```
-Here, and only here, you descend to explicit memory ownership. Beginners never
-see this. Systems programmers opt in deliberately.
+A device driver needs the system to *guarantee* the buffer isn't freed twice.
+The compiler tracks that ownership and warns you on conflict. You specialize in
+*drivers*, not in Quanta's ownership model — the system specializes there for
+you.
+
+Everyone writes at Rung 0. The compiler descends as far as the *machine* (not the
+human) requires. That is the whole design.
 
 ### 3.3 The Type System: Gradual, Then Deep
 
@@ -321,33 +342,45 @@ worth it.
 
 ## 8. Three People, One Language
 
+All three start at the *same* plain level — they write their field, in their
+field's words. None of them studies Quanta. The difference between them is not
+*their* skill; it is what the *compiler* must elaborate to satisfy the machine.
+That is the whole point of §1 and §3.2.
+
 **Ada, age 11, has never coded:**
-```
+```quanta
 draw circle at (100,100) size 40 color blue
 when clicked: color = random_color
 ```
-She learns cause and effect. No types, no build, instant feedback.
+She writes what she means. The compiler handles types, memory, and build.
 
 **Dr. Okafor, a biologist, models a cell:**
+```quanta
+concentration = [1, 2, 3, 2, 1]
+smoothed = average_neighbors(concentration)
+println smoothed
 ```
-diffusion = D * laplace(concentration) - uptake(concentration)
-simulate diffusion for 10 seconds
-plot concentration
-```
-She writes in her discipline's notation. The compiler proves bounds and runs it
-natively on her laptop's GPU.
+She writes biology in plain words — no Quanta concepts, no types, no GPU jargon.
+When she later writes `diffusion = D * laplace(concentration) - uptake(concentration)`
+and asks to simulate it, the *compiler* proves the bounds and schedules the GPU.
+She never learns linear algebra machinery or parallelism — the system does.
 
 **Ravi, a systems engineer, writes a device driver:**
+```quanta
+buf = device.alloc(256)
+on irq: process(buf)
 ```
-own buf: Bytes = device.alloc(256)
-own irq: Irq = device.bind(INT0)
-on irq: process(buf)        # linear types guarantee no double-free
-```
-He opts into ownership and target-specific code. The same `process` function
-Ada and Okafor might use is reused here, at a different rung.
+He writes drivers, in driver words. He does *not* study ownership: the compiler
+sees `buf` is used by the interrupt handler and infers it must be owned and
+single-use, warning him only if he conflicts. The linear-type machinery is the
+system's concern, not his.
 
-Three humans. One language. From "what is a program" to "lock-free interrupt
-handler." That is the design goal made concrete.
+The same `process` function Ada might call, Okafor might call, and Ravi calls —
+all three write it (or use it) at the same plain level. What differs is the
+*machine work the compiler performs behind each*, never the human's burden.
+
+Three humans. One language. One starting level. The ladder is the compiler's, not
+theirs. That is the design goal made concrete.
 
 ---
 
