@@ -19,20 +19,36 @@ Every mainstream language was designed for experts. Its safety depends on the
 expert writing correct types, correct bounds, correct ownership, correct
 cryptographic constants. Safety was *outsourced to the user's skill*.
 
-Vibe coding makes this acute. The human is vague; an LLM guesses the code; and
-the safety that was the expert's job is now *also* guessed. The result is a
-security nightmare — not because the model is bad, but because the language was
-never safe without an expert driving it.
+Vibe coding — generating code from vague intent, usually via an LLM — exposes
+where that outsourcing actually breaks. The real failure is not the memory or
+crash layer: on modern languages (managed runtimes, Rust's ownership, even
+careful C) an LLM usually produces code that does not segfault or overflow. The
+nightmare begins when the program is **public**: no session control, no
+authentication, no authorization, no input validation, no tenant isolation.
+Broken access control, account takeover, IDOR, and data leaks are what destroy
+vibe-coded services — and they are *application-logic* failures, not memory
+failures.
 
-**Quanta inverts the premise.** Safety is not a property the programmer supplies.
-It is a property the *compiler endeavors to enforce* when lowering to machine
-code. Therefore vibe coding on Quanta is *intended* to be far safer than elsewhere
-— not because the human became careful, but because the substrate is built to
-enforce safety.
+This is the honest baseline: **vibe coding is usually acceptable at the memory
+layer and a nightmare at the application-security layer, once the thing is
+public.**
 
-> Vibe coding is a nightmare on languages designed for expertise. On Quanta it is
-> *designed* to be safe, because Quanta pursues safety by construction rather than
-> relying on the programmer.
+**Quanta's position is narrower and honest, not a cure-all.** Quanta pursues
+execution-layer safety (memory, bounds, races, side channels) at the compiler
+level, so it does not *rely* on the programmer supplying that safety. But it does
+**not** assure application security — a vibe-coded Quanta service with no login,
+no session control, and no authorization is, like any other language's, wide open
+the moment it is public. Quanta is explicit about this limit.
+
+> Quanta pursues safety the compiler can enforce. It does not — and no language
+> can — supply the application-security design (auth, sessions, authorization)
+> that a public service requires. That remains the human's responsibility.
+
+The one place Quanta *could* genuinely help beyond other languages is a
+**web/secure dialect that refuses to compile an unauthenticated public route** —
+baking session control and access checks into the vocabulary so they cannot be
+forgotten. That is a stated design aim, pursued where enforceable, not a guarantee
+and not yet implemented.
 
 ---
 
