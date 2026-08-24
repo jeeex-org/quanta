@@ -35,8 +35,6 @@ jobs:
     runs-on: ubuntu-latest
     permissions:
       contents: read
-    env:
-      V: ${{ steps.ver.outputs.version }}
     steps:
       - uses: actions/checkout@v4
 
@@ -101,6 +99,7 @@ jobs:
         working-directory: ${{ github.workspace }}
         run: |
           set -e
+          V=${{ steps.ver.outputs.version }}
           valgrind --error-exitcode=42 --leak-check=summary \
             compiler/$V/bin/x86/qc test_suites/codes/simple.quanta /tmp/val_smoke.bin 2> /tmp/vg.log
           echo "Valgrind: no errors reported"
@@ -109,12 +108,14 @@ jobs:
         working-directory: ${{ github.workspace }}
         run: |
           set -e
+          V=${{ steps.ver.outputs.version }}
           python3 tools/fuzz/fuzz_qc.py --qc compiler/$V/bin/x86/qc --iter 5000
 
       - name: Differential (cross-check vs committed qc)
         working-directory: ${{ github.workspace }}
         run: |
           set -e
+          V=${{ steps.ver.outputs.version }}
           python3 tools/diff_test/diff_qc.py \
             --current compiler/$V/bin/x86/qc \
             --seed compiler/$V/bin/x86/qc
@@ -123,6 +124,7 @@ jobs:
         continue-on-error: true
         working-directory: ${{ github.workspace }}
         run: |
+          V=${{ steps.ver.outputs.version }}
           SEED="$GITHUB_WORKSPACE/compiler/$V/bin/x86/qc"
           test -x "$SEED" || { echo "SELFHOST seed missing"; exit 0; }
           cd "$GITHUB_WORKSPACE/compiler/$V/src/x86"
