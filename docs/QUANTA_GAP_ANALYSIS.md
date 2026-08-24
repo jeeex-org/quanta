@@ -1,15 +1,11 @@
-# Lumen (the design of Quanta) → Quanta (reality): Gap Analysis
+# Quanta Design → Quanta Reality: Gap Analysis
 
-> **Clarity first:** *Lumen is the design of Quanta — its principles and goals.
-> Quanta is that design made real at 0.0.86. There is exactly one language and one
-> project: Quanta. This document compares the design (Lumen) to the current
-> implementation (Quanta) so we know what to build next.*
-
-> Companion to `docs/LANGUAGE_DESIGN.md`. This maps every pillar of the Lumen
-> vision against what Quanta *actually* implements at 0.0.86 (verified against
-> the source tree, the gate, and `lib/std/`). Each gap is rated by size and
-> sequenced against the existing ROADMAP. The goal: a concrete, honest bridge
-> from "where Quanta is" to "where the design points."
+> **Scope:** *This document compares Quanta's full design (see
+> `docs/LANGUAGE_DESIGN.md`) against what Quanta actually implements at 0.0.86.
+> There is exactly one language and one project: Quanta. The design and the
+> implementation are the same thing at different points in time. This is the
+> honest "what's built vs what the design calls for" map, so we know what to
+> build next.*
 
 **Verification baseline (2026-08-25, 0.0.86):**
 - Single backend: `compiler/0.0.86/src/x86/` only. No `wasm/`, `gpu/`, or `mcu/` tree exists.
@@ -20,16 +16,16 @@
 
 ---
 
-## 1. Gap Matrix (Pillar by Pillar)
+## 1. Gap Matrix (Design Pillar by Pillar)
 
-| # | Lumen Pillar | Quanta 0.0.86 State | Gap |
+| # | Design Pillar | Quanta 0.0.86 State | Gap |
 |---|---|---|---|
-| 1 | **Intent-first / zero ceremony** | ✅ Strong. `fn`, `let`, inferred calls, short syntax already minimal. | *Minor.* `show` not a builtin (use `println`); top-level `name=val`=global already matches. |
+| 1 | **Intent-first / zero ceremony** | ✅ Strong. `fn`, `let`, inferred calls, short syntax already minimal. | *Minor.* `println` is the builtin (not `show`); top-level `name=val`=global already matches. |
 | 2 | **Precision Ladder (5 rungs)** | 🟡 Partial. Rung 0–2 present (untyped + optional annotations). | **Rung 3 (refinement/dependent types) absent. Rung 4 (ownership) absent.** |
 | 3 | **One language, every machine** | 🔴 Native x86 only. | **WASM, GPU, MCU backends absent.** Doc claims "interpreter/JIT/WASM modes" but 0.0.86 source is native-only. |
 | 4 | **Regions-first memory** | 🔴 None. Bump mmap allocator; `real allocator` is ❌ todo. | Region inference not started. Leak/double-free still possible. |
 | 5 | **Safety by construction** | 🟡 Partial. Bounds/overflow *not* auto-checked; `unsafe`/`raw` exist but aren't a safety boundary. | No automatic bounds/overflow proofs. |
-| 6 | **Compiler as tutor** | 🔴 Errors are raw `rc=` codes + aborts. No explanatory layer. | No `lumen explain`, no cause/fix/hint. |
+| 6 | **Compiler as tutor** | 🔴 Errors are raw `rc=` codes + aborts. No explanatory layer. | No `quanta explain`, no cause/fix/hint. |
 | 7 | **Literacy: examples=tests=docs** | 🟡 FEATURES.md now synced, but docs not *executed* as tests. | Doc-example-as-test enforcement absent. |
 | 8 | **Domain dialects** | 🔴 None registered. `crypto/quantum/linalg/math` are plain libs, no notation sugar. | No dialect registry; `laplace`, music, bio notation absent. |
 | 9 | **Accessibility / multilingual** | 🔴 English keywords only; no i18n keyword layer; no voice/visual entry. | Full gap. |
@@ -39,11 +35,11 @@
 
 ---
 
-## 2. What Quanta Already Has That Lumen Needs (Don't Rebuild)
+## 2. What Quanta Already Has That the Design Needs (Don't Rebuild)
 
-These are **assets**, not gaps — the vision's foundation already partly exists:
+These are **assets**, not gaps — the design's foundation already partly exists:
 
-- **Self-hosting native compiler** (0.0.86 fixpoint byte-identical) — the trust anchor Lumen's tutor/AI-editing needs.
+- **Self-hosting native compiler** (0.0.86 fixpoint byte-identical) — the trust anchor the tutor/AI-editing layer needs.
 - **Multiple *declared* execution modes** (native/interpreted/JIT/WASM per Quanta's own description) — even if 0.0.86 only ships native, the *concept* of mode selection exists to extend.
 - **Inferred, low-ceremony syntax** — Rung 0–2 of the ladder already real.
 - **Solid primitive layer**: syscalls, mmap, file I/O, floats, closures, generics (type-erased), big-int *library*, crypto/quantum/linalg/math stdlib.
@@ -59,10 +55,10 @@ These are **assets**, not gaps — the vision's foundation already partly exists
    system hook, refinement types (Rung 3) and dialect value-types can't sit on top.
    *Already tracked in ROADMAP remaining list; sequenced ~0.0.88–0.1.0.*
 2. **Region / ownership memory model** (Rung 4 + region inference). This is the
-   single biggest architectural gap vs the vision. Today: bump mmap, manual.
+   single biggest architectural gap vs the design. Today: bump mmap, manual.
    *Not yet started; 0.1.0+ work.*
-3. **Multi-backend codegen** (WASM first, then MCU, then GPU). The "one language
-   every machine" pillar is impossible until codegen is backend-pluggable.
+3. **Multi-backend codegen** (WASM first, then MCU, then GPU/cluster). The "one
+   language every machine" pillar is impossible until codegen is backend-pluggable.
    *0.0.86 source is x86-only; needs an IR → backend split.*
 
 ### Tier B — Differentiating (the "exceptional at math/physics/crypto/quantum/AI" mandate)
@@ -89,7 +85,7 @@ These are **assets**, not gaps — the vision's foundation already partly exists
 ## 4. Sequencing Against the Existing ROADMAP
 
 The current ROADMAP's "remaining to 0.1.0" lists: generics monomorphisation,
-borrow-checking, operator overloading. The Lumen gaps **extend and re-rank** that:
+borrow-checking, operator overloading. The design gaps **extend and re-rank** that:
 
 - **0.0.87–0.0.91 (already planned):** types as real types (`big`, u8/u16/bool/
   char/byte), `as`, `where`/`raw`/`ref`/`move`, range, operator overloading,
@@ -105,11 +101,11 @@ borrow-checking, operator overloading. The Lumen gaps **extend and re-rank** tha
 - **POST-0.1.0 (explicitly deferred per ROADMAP):** ARM64 backend, then GPU/MCU,
   structured concurrency, full accessibility entry.
 
-The honest takeaway: **Quanta is ~30% of the way to Lumen's foundation** (it has
-the syntax ladder base, the self-host, the primitive layer, and the
-differentiation *content* as libs). The missing 70% is architectural — region/ownership
-memory, multi-backend codegen, dialect notation, package management, and the
-tutor/accessibility experience layer.
+The honest takeaway: **Quanta is ~30% of the way to its own full design
+foundation** (it has the syntax ladder base, the self-host, the primitive layer,
+and the differentiation *content* as libs). The missing 70% is architectural —
+region/ownership memory, multi-backend codegen, dialect notation, package
+management, and the tutor/accessibility experience layer.
 
 ---
 
@@ -118,7 +114,7 @@ tutor/accessibility experience layer.
 > Quanta can already *express intent simply and compile itself natively*; it
 > cannot yet *infer memory safety, target other machines, speak domain notation,
 > manage its own packages, or teach the programmer* — and those four are exactly
-> what make Lumen "for every human."
+> what make the design "for every human."
 
 ---
 
