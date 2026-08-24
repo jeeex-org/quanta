@@ -1,9 +1,10 @@
 # Quanta — Features: Shipped vs. To-Do
 
 Source-of-truth feature inventory for the Quanta x86 self-hosting compiler.
-**Derived directly from the 0.0.55 source** (keyword table `ktext` in helpers.quanta,
-87 builtins in `is_bltn`, parser dispatch in parse.quanta, 2026-08-17). No guesswork:
-every row maps to a real token/builtin in source.
+Originally derived from the 0.0.55 source (keyword table `ktext` in helpers.quanta,
+87 builtins in `is_bltn`, parser dispatch in parse.quanta, 2026-08-17), since
+extended through 0.0.86 (float literals, big-int stages, literal auto-promotion,
+inline asm). Every row maps to a real token/builtin in source.
 
 Status legend:
 - ✅ done — implemented and exercised
@@ -53,7 +54,7 @@ Test legend (the **Test?** column):
 | String | 37 | ❌ todo | ❌ none | lexed, unparsed. **Keyword is case-insensitive since 0.0.78** (`string` == `String`, simplicity) |
 | as | 41 | ❌ todo | ❌ none | lexed, unparsed |
 | raw | 38/52 | ❌ todo | ❌ none | lexed, unparsed |
-| asm | 40/53 | ❌ todo | 🟡 file-only | asm_test exists but NOT in gate |
+| asm | 40/53 | ✅ done | 🟡 file-only | asm!(\"hex bytes\") -> IR_ASM raw machine-code emit (method.quanta L261). asm_test exists but NOT in gate. |
 | volatile | 39/54 | ❌ todo | ❌ none | lexed, unparsed |
 | usize | 42/48 | 🟡 partial | ✅ gate | lexed; used as size type |
 | u8 | 44 | ❌ todo | ❌ none | lexed, unparsed (mask builtin u8 exists) |
@@ -79,7 +80,7 @@ Test legend (the **Test?** column):
 | bool | ❌ todo | ❌ none | lexed, unparsed |
 | char | ❌ todo | ❌ none | lexed, unparsed |
 | byte | ❌ todo | ❌ none | lexed, unparsed |
-| float literals (`3.14`) | ❌ todo | ❌ none | lexer hard-errors "not supported" |
+| float literals (`3.14`) | ✅ done (0.0.61) | ✅ gate | lexer disambiguates float vs field-access `.`; parser emits fconst(M,scale)->IEEE754; f2i/fadd/... consume float vregs (0.0.62). Verified: `println(3.14)`->`3.140000`, `fadd(1.5,2.5)`->4. |
 | string (real type) | ❌ todo | ❌ none | TT_STRING reserved; byte-buffer + print only |
 | struct | ✅ done | ✅ gate | fields + `obj.method` + literal (struct_literal_test in gate) |
 | enum (user-defined) | ✅ done | ✅ gate | enum_test rc=42 in gate |
