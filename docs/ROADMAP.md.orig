@@ -1,6 +1,6 @@
 # Quanta ROADMAP — consolidated single source of truth
 
-> **Last updated: 2026-08-24. Current compiler: 0.0.85** (x86-64 ELF emitter,
+> **Last updated: 2026-08-24. Current compiler: 0.0.84** (x86-64 ELF emitter,
 > multi-file tree, Valgrind-clean, self-host `fp=YES`). ARM64 (AArch64) backend
 > is DEFERRED POST-0.1.0 (see #2 schedule below); the working compiler is x86-64 only.
 >
@@ -215,32 +215,7 @@ verified; the self-host fixpoint is byte-identical (`qc` compiled by itself
 reproduces itself). Pending feature tests (bswap/popcount/defer/generics/
 import/memcpy) are unimplemented intrinsics, not regressions.
 
-### Current status (0.0.85) — int literals auto-promote to big-int
-
-Over-sized decimal literals (those exceeding i64 range) are now auto-promoted to
-`big` at compile time — no `big_from_*` call needed. A 30- or 250-digit literal
-like `123456789012345678901234567890` parses directly into a `big`.
-
-- **Lexer** (`lexer.quanta`): the i64-overflow guard no longer rejects the
-  literal; instead it emits a new `TT_BIGNUM` token carrying the source offset
-  (`val`) and digit count (`len`). The digit text is left in `src` untouched.
-- **Parser** (`method.quanta parse_primary`): on `TT_BIGNUM` it builds a runtime
-  string from the digit bytes (writing `"digits"` into the source buffer at
-  `srclen`, reusing the proven `IR_STR` path), registers `big_from_dec` in the
-  global call table (`resolve_fn(..., FI_GLOBAL)`), loads the string into the
-  call-arg stack, and lowers to `big_from_dec(str)`. The result vreg flows as a
-  `big` like any other.
-- **stdlib** (`big.quanta`): `big_from_dec(s)` parses an ASCII decimal string →
-  `big` (corrected the runtime-string layout: length lives at `s+0`, packed
-  bytes at `s+8+i` read via `mem_load8`, NOT 8-byte limb slots — a layout
-  mismatch that previously crashed on print).
-- **Verified**: 250-digit literal round-trips (`a*a/a == a`); `big_eq` matches
-  `big_from_i64`; doubles match Python exactly. Normal i64 literals (`42`,
-  `999999999999`) unaffected. Self-host fixpoint **byte-identical** (lex/parse
-  edits are never taken on the compiler's own i64-only source).
-
 ### Current status (0.0.84) — 24-bit limbs + decimal printing + Karatsuba shipped
-
 
 Performance + usability pass on `lib/std/big.quanta` (pure stdlib, zero codegen
 changes, self-host fixpoint **byte-identical and verified**: bin==sh2==sh3).

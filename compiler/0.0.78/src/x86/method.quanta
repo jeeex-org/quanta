@@ -312,6 +312,36 @@ fn parse_primary() {
         }
     }
     if peek()==TT_NUM { let v=pval(); adv(); let vr=nv(); iremit(IR_CONST,vr,v,0,0); return vr }
+    if peek()==TT_BIGNUM {
+        // Over-sized decimal literal: build a runtime string from the digit text
+        // held in src[val..val+len], then lower to big_from_dec(string).
+        let soff = pval(); let dlen = plen(); adv()
+        // runtime string "digits" written at srclen
+        let base = srclen
+        w8(src+base, 34)                                   // opening quote
+        let di = 0
+        while di < dlen { w8(src+base+1+di, r8(src+soff+di)); di = di + 1 }
+        w8(src+base+1+dlen, 34)                            // closing quote
+        srclen = base + 2 + dlen
+        let svr = nv(); iremit(IR_STR, svr, base, 0, 0); w64(vreg_is_str + svr*8, 1)
+        // callee name "big_from_dec" written at srclen
+        let nmoff = srclen
+        w8(src+nmoff+0, 98); w8(src+nmoff+1,105); w8(src+nmoff+2,103); w8(src+nmoff+3,95)   // "big_"
+        w8(src+nmoff+4,102); w8(src+nmoff+5,114); w8(src+nmoff+6,111); w8(src+nmoff+7,109)  // "from"
+        w8(src+nmoff+8, 95); w8(src+nmoff+9,100); w8(src+nmoff+10,101); w8(src+nmoff+11,99)  // "_dec"
+        w8(src+nmoff+12, 0)                                // "big_from_dec\0"
+        srclen = nmoff + 13
+        // Register the callee in the global call table (imported from std/big).
+        let fi = resolve_fn(nmoff, 12, FI_GLOBAL)
+        if fi < 0 { compile_error(0, nmoff, 12) }
+        // Load the single argument (svr) into the call arg stack, then emit the call.
+        let cavs = argsp
+        w64(argstack + argsp*8, svr)
+        w64(arg_tgt + cavs*8, 0)
+        argsp = argsp + 1
+        let bvr = nv(); iremit(IR_CALL, bvr, nmoff, 1, cavs)
+        return bvr
+    }
     if peek()==TT_FNUM {
         let v=pval(); adv()
         // Float value encoded by lexer as (M << 8) | frac_digits

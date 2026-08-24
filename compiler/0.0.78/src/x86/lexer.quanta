@@ -135,8 +135,14 @@ fn tokenize() {
                     if idigit(dch)==0 { break }
                     let d = dch-48
                     if val > IMAXD || (val == IMAXD && d > 7) {
-                        let mh = "error: integer literal overflows i64 range\n"
-                        file_write(2, mh+8, len(mh)); exit(1)
+                        // Over-sized decimal literal: don't reject — emit a
+                        // TT_BIGNUM token carrying the SOURCE OFFSET (sp) and the
+                        // digit count (nlen) so the parser can build a big via
+                        // big_from_dec. Keep scanning the remaining digits so the
+                        // whole literal is consumed as one token.
+                        while p<srclen && idigit(r8(src+p))==1 { p=p+1; c=c+1 }
+                        stok(tokc, TT_BIGNUM, sp, l, sc, p-sp); tokc = tokc + 1
+                        continue
                     }
                     val = val*10 + d
                     p=p+1; c=c+1

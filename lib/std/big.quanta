@@ -269,8 +269,28 @@ fn big_from_i64(x) {
   return big_norm(r)
 }
 
+// Build a big from an ASCII decimal string `s` (Quanta runtime string layout:
+// [8:len][packed bytes, 1 byte each]). Returns 0 (null) on empty / non-digit.
+// Algorithm: acc = 0; for each char c: acc = acc*10 + (c - '0').
+fn big_from_dec(s) {
+  let slen = mem_load(s)                 // string length (bytes) at s+0
+  if slen == 0 { return 0 }
+  let acc = big_from_i64(0)
+  let ten = big_from_i64(10)
+  let i = 0
+  while i < slen {
+    let c = mem_load8(s + 8 + i)         // packed byte at position i
+    if c < 48 || c > 57 { return 0 }      // not a digit
+    let d = big_from_i64(c - 48)
+    acc = big_mul(acc, ten)
+    acc = big_add(acc, d)
+    i = i + 1
+  }
+  return acc
+}
+
 // Build a big from two 64-bit values (lo64, hi64), each split into three 24-bit
-// limbs (little-endian, 8 limbs total). Useful for tests; e.g.
+// limbs (little-endian, 6 limbs total). Useful for tests; e.g.
 // big_from_2x64(-1, 0) = 2^64-1.
 fn big_from_2x64(lo64, hi64) {
   let r = big_alloc(6)
