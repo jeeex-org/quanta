@@ -72,8 +72,8 @@ QC=compiler/<NEXT>/bin/x86/qc bash test_suites/scripts/run_tests.sh   # want 62/
 
 ## 7. CI pin (must match released version)
 - [ ] `.github/workflows/ci.yml` golden == `compiler/<VER>/bin/x86/qc` where
-      <VER> == `cat VERSION`. A stale CI pin (e.g. 0.0.76 while released is 0.0.85)
-      is a divergence-in-waiting — fix on every release.
+      <VER> == `cat VERSION`. A stale CI pin (golden points at an older version than
+      `cat VERSION`) is a divergence-in-waiting — fix it on every release.
 
 ## 8. Doc/rule sync (§8)
 - [ ] ROADMAP.md header "Current compiler: <VER>" matches VERSION; status blocks

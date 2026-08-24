@@ -51,7 +51,7 @@ analyzer beyond CodeRabbit, no sanitizers, no differential backend test.
 | Tool | Buys |
 |------|------|
 | **Dependabot / Renovate** | pin + alert `tree-sitter-quanta` npm deps |
-| **SLSA / in-toto** | provenance for `compiler/0.0.85/bin/x86/qc` seed (current trust anchor = hand-placed binary) |
+| **SLSA / in-toto** | provenance for the seed `compiler/<VER>/bin/x86/qc` (the prior stable version's committed golden; current trust anchor = hand-placed binary) |
 | **Reproducible builds** | byte-identical `qc` from seed on clean machine |
 
 ---
@@ -167,8 +167,8 @@ Interim, runnable cross-check delivered:
 
 ### 7.1 Differential test (tools/diff_test/diff_qc.py)
 Compiles reference programs with BOTH:
-- **CURRENT** qc (rebuilt from v0.0.53 source), and
-- **SEED** compiler/0.0.85/bin/x86/qc (an INDEPENDENT artifact from a different
+- **CURRENT** qc (`compiler/<VER>/bin/x86/qc`, rebuilt from `compiler/<VER>/src/x86/main.quanta`), and
+- **SEED** `compiler/<VER>/bin/x86/qc` (the prior stable version's committed golden — an INDEPENDENT artifact from a different
   point in history — a genuine second implementation instance).
 
 Asserts behavioral parity (same runtime exit code) and reports binary
