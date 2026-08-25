@@ -1,63 +1,60 @@
-# Quanta — Language Design
+# Quanta — What It Is
 
-Quanta is a programming language you can pick up quickly. You write what you want
-in short, plain code, and Quanta catches mistakes before they break anything. It
-reads your program as structure it can check from the first line, and it speaks
-the language of many fields — a scientist writes `laplace(potential)`, a musician
-writes notes, a cryptographer writes ciphers — in the words each already uses.
+Imagine you want to tell a computer to do something. Today, you usually have to
+learn a lot of complicated rules first — weird words, curly brackets, and ways to
+say where the computer should put its memory. Most languages make you learn all
+that before you can do anything fun.
 
-The goal: a complete language where you rarely think about memory or safety
-because Quanta handles it; where every field has its own natural notation; and
-where your program is something the compiler checks as you write, so mistakes are
-caught early instead of at runtime.
+Quanta is a programming language that starts the other way around.
 
----
-
-## 1. What Quanta Is
-
-- **Safe to change.** Quanta reads your program as structure, not plain text, so
-  a small edit can't quietly break it. It checks your work as you go.
-- **Short and regular.** Programs are small and read top to bottom. There is no
-  setup file to learn — one command and you are running.
-- **Builds itself.** The Quanta compiler is written in Quanta. The same language
-  that builds your app builds the tools around it.
-- **One program, many places.** Write it once; Quanta packs the same program to
-  run on your laptop, in a web page, or on a small device.
-- **Speaks many fields.** Science, music, finance, and cryptography each get their
-  own natural way of writing, in words their experts already use.
-- **Looks after memory.** Quanta handles memory and safety for you; if you truly
-  need raw access, that is an explicit, separate choice — not the normal path.
+**You write what you want, in short and plain words. Quanta takes care of the
+hard stuff.**
 
 ---
 
-## 2. What Quanta Does
+## What makes Quanta nice
 
-- **Gets out of your way at the start.** Your first hour is spent saying what you
-  want, not wiring up tools.
-- **Carries the hard parts.** Types, memory, and build targets are figured out by
-  Quanta, not written down by you.
-- **Lets experts write naturally.** A scientist writes `laplace(potential)`
-  instead of `matrix_multiply(...)`.
-- **Explains its errors.** When something is wrong, Quanta says what, why, and
-  how to fix it.
-- **Catches mistakes as you type.** It checks after every change, so you know
-  immediately.
-- **Stays manageable at scale.** Small programs and large ones are written the
-  same way.
-- **Keeps sensitive code honest.** In the cryptography and blockchain dialects,
-  the unsafe forms — timing leaks, replay, bad randomness — simply will not
+- **You can learn it fast.** You write things like `draw circle` or
+  `println "hi"`. No big setup. You just start.
+- **It catches your mistakes early.** While you write, Quanta checks your work.
+  If something is wrong, it tells you what and how to fix it — before the program
+  breaks.
+- **You don't worry about memory.** The computer needs to remember things, and
+  in most languages you have to say exactly how. Quanta figures that out for you.
+- **One program, many places.** Write it once; Quanta packs it to run on your
+  laptop, in a web page, or on a small device.
+- **Different people can write in their own words.** A scientist can write
+  science stuff like `laplace(potential)`. A musician can write music notes. A
+  cryptographer can write ciphers. Each uses the words they already know.
+- **It builds itself.** The Quanta tool that turns your words into a running
+  program is itself written in Quanta.
+
+---
+
+## What Quanta does for you
+
+- **Gets you started right away.** Your first hour is spent making things, not
+  fighting settings.
+- **Carries the boring hard parts.** Quanta works out the types, the memory, and
+  the building — you don't write those down.
+- **Talks back kindly.** When something is wrong, it explains, instead of just
+  failing.
+- **Keeps your work safe.** In the cryptography and blockchain parts, the unsafe
+  kinds of code — the ones that leak secrets or replay attacks — simply will not
   compile.
-- **Keeps its own docs true.** Every example in the documentation is run as a
-  test; a broken example fails the build.
+- **Keeps its own examples true.** Every example in Quanta's instructions is
+  actually run as a test, so the docs can't lie about how things work.
 
 ---
 
-## 3. Why It Works
+## Why it works
 
-One idea holds it together: **Quanta treats your program as something it can
-check, from the very first line.** Because the structure is knowable, writing
-stays simple, mistakes are caught early, and the same code runs everywhere. The
-things that make other languages heavy — setup, packaging, fragile text,
-guessing whether code is right — are handled at the foundation, not left to you.
+Here is the one big idea: **Quanta reads your program as something it can check,
+from the very first line.** Because it understands the shape of what you wrote, it
+can catch mistakes early, keep things safe, and move your program to different
+devices without you rewriting it.
 
-Quanta is the language that results.
+The things that make other languages feel heavy — setup, fragile text, guessing
+if your code is right — are handled at the start, not left for you to worry about.
+
+That is Quanta.
