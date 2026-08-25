@@ -1,205 +1,178 @@
-# Quanta — Language Design
+# Quanta — Language Design (Research-Grounded Revision)
 
-Quanta is a programming language whose design goal is that safety should not
-depend on the programmer's expertise. A program written by anyone — expert or
-novice, precise or vague — is intended to compile to machine code that is
-memory-safe, bounds-checked, race-free, and, in security-critical domains, free
-of the side-channel and invariant violations that make naive code dangerous.
+*Revision basis: how humans learn and use languages, how AI agents consume code,
+and the documented strengths and weaknesses of existing languages — studied so
+Quanta can absorb the strengths and avoid the weaknesses. Cross-checked against
+Quanta's actual state (self-hosting compiler 0.0.86; single x86 backend; untyped;
+117-test gate; no package manager; no dialects). Research drawn from established
+knowledge of PL design, programming-education research, and 2024–2025
+AI-coding-agent behavior.*
 
-This document specifies what Quanta is and how it pursues that goal. It is grounded
-in what is technically achievable, not aspiration. **No software can guarantee
-safety; Quanta is designed to achieve it to the greatest extent the state of the
-art allows, and is explicit about what it does not achieve.**
-
----
-
-## 1. The Problem Quanta Addresses
-
-Every mainstream language was designed for experts. Its safety depends on the
-expert writing correct types, correct bounds, correct ownership, correct
-cryptographic constants. Safety was *outsourced to the user's skill*.
-
-Vibe coding — generating code from vague intent, usually via an LLM — exposes
-where that outsourcing actually breaks. The real failure is not the memory or
-crash layer: on modern languages (managed runtimes, Rust's ownership, even
-careful C) an LLM usually produces code that does not segfault or overflow. The
-nightmare begins when the program is **public**: no session control, no
-authentication, no authorization, no input validation, no tenant isolation.
-Broken access control, account takeover, IDOR, and data leaks are what destroy
-vibe-coded services — and they are *application-logic* failures, not memory
-failures.
-
-This is the honest baseline: **vibe coding is usually acceptable at the memory
-layer and a nightmare at the application-security layer, once the thing is
-public.**
-
-**Quanta's position is narrower and honest, not a cure-all.** Quanta pursues
-execution-layer safety (memory, bounds, races, side channels) at the compiler
-level, so it does not *rely* on the programmer supplying that safety. But it does
-**not** assure application security — a vibe-coded Quanta service with no login,
-no session control, and no authorization is, like any other language's, wide open
-the moment it is public. Quanta is explicit about this limit.
-
-> Quanta pursues safety the compiler can enforce. It does not — and no language
-> can — supply the application-security design (auth, sessions, authorization)
-> that a public service requires. That remains the human's responsibility.
-
-The one place Quanta *could* genuinely help beyond other languages is a
-**web/secure dialect that refuses to compile an unauthenticated public route** —
-baking session control and access checks into the vocabulary so they cannot be
-forgotten. That is a stated design aim, pursued where enforceable, not a guarantee
-and not yet implemented.
+No language can guarantee safety or correctness. Quanta is designed to *pursue*
+specific, achievable properties, and to be explicit about what it does not
+achieve.
 
 ---
 
-## 2. What Can Be Abstracted
+## 1. What the Evidence Says
 
-The safety substrate can be substantially abstracted away from the writer. These
-are solved or well-understood problems in programming-language engineering;
-Quanta applies them so the human rarely confronts them:
+### 1.1 How humans learn and use languages
+- **The barrier is ceremony, not logic.** Education research (Ko & Myers;
+  Guzdial) consistently shows novices lose most time to *syntax errors* and
+  *environment setup*, not to algorithmic thinking. The machine's scaffolding —
+  not the problem — is what blocks them.
+- **Every required concept is a tax.** Types, ownership models, build configs:
+  each is paid by everyone, every time, even when the task doesn't need it.
+- **Experts think in their own notation.** A biologist, a quant, a musician
+  already have precise notation. Forcing them through general-purpose syntax is
+  translation overhead they should not pay.
 
-- **Memory.** Manual `alloc`/`free` is replaced by region inference. The compiler
-  *aims* to prove when memory is allocated and released; use-after-free and leaks
-  are *intended* to be structurally prevented in normal code.
-- **Bounds & overflow.** Index arithmetic and integer overflow are handled by the
-  compiler — proven where possible, checked where not. The writer never writes a
-  bounds check by hand.
-- **Ownership.** Aliasing and double-free are tracked by the compiler. The writer
-  does not annotate lifetimes; the system *endeavors to enforce* them where the
-  task demands.
-- **Concurrency.** Threads and shared state are replaced by structured `parallel`
-  blocks the compiler *works to prove* cannot leak or race.
-- **Domain invariants.** Cryptographic and blockchain rules are encoded in
-  dialects the compiler enforces — constant-time execution, correct modular
-  reduction, no replay, deterministic RNG — so a writer cannot easily emit a
-  variable-time cipher or an unreduced field operation.
-- **Build & supply chain.** No Makefiles; content-addressed, hash-pinned imports
-  *mitigate* name-typosquatting and dependency hijack by construction.
+**Strength to absorb:** languages that make the common case terse and the
+environment invisible (scripting languages' fast start).
+**Weakness to avoid:** languages that require apparatus the task doesn't need
+(manual memory, build files, type ceremony).
 
-What remains for the human is *intent* — what the program should do. Everything
-that makes intent *safe to run* is the compiler's responsibility to pursue.
+### 1.2 How AI agents consume code
+- **Context exhaustion.** Agents degrade on large codebases/files; they lose
+  structure. Retrieval helps but is lossy.
+- **Token cost and latency.** Every file read and retry burns tokens. Verbose
+  sources are expensive to operate in.
+- **Fragile string edits.** Agents edit raw text; a one-character slip breaks
+  compilation silently; the agent cannot see the structure.
+- **Verification blindness.** Agents assert code works without running/testing
+  it; hallucinated APIs are common.
+- **No semantic anchor.** Treating code as strings means refactors drift and
+  types are guessed.
 
----
+**Strength to absorb:** languages with small, regular, parseable surfaces that
+agents can manipulate reliably.
+**Weakness to avoid:** languages where correctness is textual and unverifiable
+without a heavy external toolchain.
 
-## 3. What Cannot Be Abstracted (Honest Limits)
-
-- **Intent is the human's.** The compiler cannot decide what your program should
-  do. It can only endeavor to make whatever you wrote *safe to execute*. A Quanta
-  program is *designed to be* safe; it is not automatically *correct*.
-- **Functional and application security is not assured.** Quanta pursues memory,
-  type, concurrency, and side-channel safety. It does **not** assure your
-  algorithm is right, your authentication is sound, your sessions are controlled,
-  or your authorization rules are complete. A Quanta program with no login check
-  is memory-safe and *still wide open*. Application security — auth, sessions,
-  authorization, input-validation against business rules — remains the human's
-  design responsibility.
-- **Raw access is a deliberate escape.** Some code — a device driver, a hot inner
-  loop — needs `unsafe`. That is an auditable opt-in, not a leak of unsafety into
-  the default path.
-
-These limits are why Quanta is trustworthy as a *design goal*, not why it is weak:
-it pursues the things that are *provably achievable in principle*, and is explicit
-about the rest. **Quanta makes no warranty, express or implied, of safety,
-security, or correctness.**
-
----
-
-## 4. The Security Objective
-
-Quanta's objective is stated precisely:
-
-> **Any program, regardless of who wrote it or how vaguely, is intended to lower
-> to machine code that is memory-safe, bounds-checked, race-free, and — within a
-> security dialect — invariant-preserving. Residual insecurity is possible and may
-> be reached through the explicit, auditable `unsafe` escape or through compiler
-> defect.**
-
-This objective is what makes non-expert and AI-generated code *safer* on Quanta
-than on languages that outsource safety to the user. It is an engineering aim,
-not a guarantee.
+### 1.3 Strengths and weaknesses observed in existing languages
+- **Memory safety done well** (ownership/borrow models) is a real strength —
+  Quanta absorbs the *safety outcome* but should avoid the *per-line cognitive
+  tax* that model imposes.
+- **Packaging that "just works"** is rare; dependency and environment management
+  is a recurring weakness Quanta should design out from the start.
+- **Fast feedback** (interpreted edit-run loops) is a strength Quanta keeps;
+  **slow compiles / heavy build graphs** are a weakness to avoid.
+- **Domain-specific notation** (array/matrix languages, SQL, shaders) shows
+  experts are dramatically more effective in their own vocabulary — a strength
+  Quanta generalizes via dialects.
+- **Verifiability** is the through-line: the languages that age best are those
+  where a machine can check a claim cheaply. That is the property to maximize.
 
 ---
 
-## 5. Language Surface
+## 2. Quanta: Built for Human and Machine, From the First Token
 
-The syntax is minimal and intent-first. No boilerplate earns the right to print;
-the top of a file is a program.
+Quanta is designed so the **same source serves both a human and an AI agent**,
+and serves each better than the status quo by learning from what works and what
+hurts.
 
-```
-# Complete, runnable.
-println "Hello, world"
-```
+> **Quanta is a machine-readable, verifiable artifact from the first token.
+> Both humans and AI agents operate on something that can be *checked*, not
+> guessed.** The compiler is the shared verifier — for the novice, the expert,
+> and the machine.**
 
-Indentation defines structure; the lexer rejects mixed tabs/spaces at parse time.
-Side effects are explicit via verb-like builtins (`println`, `write`, `send`) so
-pure computation is visibly distinct from action.
+This single design decision resolves the weaknesses above for both audiences at
+once:
 
-The human writes at one level — intent. The compiler descends the precision ladder
-(inferring types, checking bounds, scheduling targets, tracking ownership) on the
-human's behalf. The writer never climbs it.
+| Observed weakness | Quanta's response |
+|---|---|
+| Fragile agent string edits | Source is an AST; agents edit the verified tree, not text. |
+| Agent verification blindness | `quanta check` runs cheaply after every edit; real signal, not assertion. |
+| Agent token cost | Concise surface → fewer tokens per program. |
+| Human ceremony tax | No required types/build config; apparatus inferred. |
+| Packaging/environment pain | Content-addressed, hash-pinned modules; one command, no venv. |
+| Memory unsafety | Region/ownership pursued at compile; `unsafe` is explicit, auditable. |
+| Domain translation overhead | First-class dialects let experts write their notation. |
 
----
-
-## 6. Domain Dialects Enforce Invariants
-
-Safety in hard domains is not a suggestion; it is the dialect's rule.
-
-- **Blockchain.** No replay, deterministic RNG, correct modular arithmetic,
-  verified Merkle construction. A transaction violating these is *rejected* by the
-  dialect where the enforcement is sound.
-- **Post-quantum cryptography.** Constant-time execution, no secret-dependent
-  branches, correct lattice/field arithmetic. A variable-time or unreduced
-  operation is a compile error in the `secure` dialect where enforceable.
-
-The human writes `state |= round_key` and it *means* the safe thing, because the
-dialect is built to refuse the unsafe thing. Precision is set by the domain, not
-the writer's caution.
+Quanta self-hosts — the compiler *is* Quanta. The same language that writes an
+app also compiles itself and is the natural target for AI tooling. No second
+language for tooling. (Verified this session: 0.0.86 has a byte-identical
+self-host fixpoint.)
 
 ---
 
-## 7. One Language, Every Machine
+## 3. How Quanta Helps Humans
 
-```
-quanta build --target native
-quanta build --target wasm
-quanta build --target gpu
-quanta build --target mcu
-quanta build --target cluster
-```
-
-The program is unchanged; the runtime adapts — region allocator for native,
-static allocator for MCU, sandbox for WASM, distributed runtime for cluster.
-The safety objective is pursued across all targets; the safety substrate is
-portable.
-
----
-
-## 8. Tooling
-
-- **No build files.** Content-addressed modules; hash-pinned imports.
-- **The compiler is the tutor.** Errors explain the cause and the fix.
-- **AI-native.** The AST is the source of truth; machine edits operate on the
-  verified tree. This is what makes AI-generated (vibe) code *safer* to integrate
-  — the model edits a structure the compiler then re-checks.
-- **Docs are code.** Examples are executed as tests; a broken example fails the
-  build.
+1. **Setup is not a gate.** One command, no build file, no venv. The first hour
+   is spent expressing intent, not fighting tooling.
+2. **Lower concept tax.** Types, allocators, build targets are inferred by the
+   compiler. The human meets the machine at intent level; the apparatus is the
+   compiler's job to pursue.
+3. **Meets experts in their notation.** Dialects let a domain expert write
+   `laplace(potential)` instead of `matrix_multiply(...)`. Translation overhead
+   moves from human to compiler.
+4. **Teaches as it fails.** Compile errors explain cause, rule, and fix — failure
+   becomes learning, not a cryptic abort.
+5. **One language, every machine.** Native, WASM, GPU, MCU, cluster from one
+   source.
 
 ---
 
-## 9. Current State
+## 4. How Quanta Helps AI Agents
 
-Quanta does not yet implement all of this; that is by design, not accident. It
-is built incrementally, gate-green before promotion. The current state (0.0.86)
-and the sequenced plan live in `docs/ROADMAP.md` and
-`docs/QUANTA_GAP_ANALYSIS.md`.
+1. **AST-native source.** The canonical artifact is the syntax tree, not text. An
+   agent editing the tree cannot produce a syntactically broken program;
+   structure is invariant under edit. This removes the largest source of agent
+   errors.
+2. **Cheap verification in the loop.** `quanta check` is fast and local; an agent
+   verifies after *every* change instead of asserting success.
+3. **Smaller programs, lower cost.** A concise surface means fewer tokens per
+   feature, lower latency, lower bill — a dominant advantage at agent scale.
+4. **Scoped generation via dialects.** An agent can be constrained to a dialect's
+   grammar — a small, safe generation surface, fewer hallucinated APIs.
+5. **Self-hosted tooling.** Agent tooling is written in the same language it
+   produces; no second toolchain to load.
 
-Already real: a self-hosting native compiler with a byte-identical fixpoint; an
-intent-level syntax; a primitive layer (syscalls, mmap, file I/O, floats,
-closures, generics, big-int); and differentiating stdlib seeds (`crypto`,
-`quantum`, `linalg`, `math`). The safety substrate — region/ownership memory,
-bounds/overflow checking, multi-backend codegen, dialect-invariant enforcement,
-package management — is the remaining architectural work.
+---
 
-The direction is fixed: **safety is the compiler's job to pursue. The human
-supplies intent; Quanta endeavors to supply correctness of execution — without
-warranty.**
+## 5. Beyond the Status Quo — Resolutions to Named Weaknesses
+
+Each resolves a specific observed weakness, not a dream feature.
+
+- **Packaging/environment pain:** content-addressed, hash-pinned imports. No
+  name-typosquatting, no dependency sprawl, no venv. Build = one command.
+- **Build-system hostility:** no separate build system; dependencies resolved by
+  content hash.
+- **Memory unsafety:** region inference pursued at compile; `unsafe` is explicit.
+- **Per-line cognitive tax (borrow models):** ownership inferred where possible,
+  required only where the task demands.
+- **Verification blindness:** the compiler is a fast, scriptable verifier;
+  checking is a primitive.
+- **Translation overhead:** dialects make the discipline's notation first-class.
+- **Docs/code drift:** examples executed as tests; a broken example fails build.
+
+---
+
+## 6. Honest Limits
+
+- **No guarantee.** Quanta pursues these properties; it warrants none. Compiler
+  defects, proof assumptions, and dialect holes exist.
+- **Application security is the human's.** Auth, sessions, authorization, tenant
+  isolation for public services remain design responsibilities. A service with no
+  login is, like any language's, exposed once public. The real failure mode for
+  AI-generated public code is here — the application layer — not the memory layer.
+- **Intent is the human's.** The compiler cannot decide what a program should
+  do; it can only pursue making it safe to execute.
+- **Raw access is a deliberate escape.** Drivers and hot loops may need `unsafe`.
+- **Current state (0.0.86, verified):** single x86 backend; untyped (type
+  inference/checking not yet implemented); no package manager; no dialects; 117
+  gated tests; self-hosting with byte-identical fixpoint. The properties above
+  are the *design target*, reached incrementally — most are not yet implemented.
+
+---
+
+## 7. Positioning
+
+Quanta is engineered so the artifact it produces is **checkable from the first
+token** — by a novice via clear errors, by an expert via dialects, and by an AI
+agent via a verifiable AST and a fast checker. That single property — *code as a
+machine-verifiable artifact* — lets Quanta reduce the ceremony tax for humans and
+the failure rate for agents at the same time. It absorbs the proven strengths of
+existing languages (safety outcomes, fast feedback, domain notation,
+verifiability) while designing out their recurring weaknesses (ceremony,
+packaging, fragile text, unverifiable claims). Everything else follows from it.
