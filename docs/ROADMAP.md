@@ -1,6 +1,6 @@
 # Quanta ROADMAP — consolidated single source of truth
 
-> **Last updated: 2026-08-25. Current compiler: 0.0.93** (x86-64 ELF emitter,
+> **Last updated: 2026-08-25. Current compiler: 0.0.94** (x86-64 ELF emitter,
 > multi-file tree, Valgrind-clean, self-host `fp=YES`). ARM64 (AArch64) backend
 > is DEFERRED POST-0.1.0 (see #2 schedule below); the working compiler is x86-64 only.
 >
@@ -86,9 +86,8 @@ Every item below is one WIP version: self-hosts (2-stage byte-identical fixed po
 | 0.0.91 | Lang | `usize`/`u32`/`u64` full type keywords | ✅ done | Type annotations `let x: usize/u32/u64` parsed (vtype 5/3/4) since 0.0.89; verified full semantics: u32 wraps at 2^32, u64/usize are full 64-bit (no 2^32 wrap), `as` casts to/from all three behave correctly. usize_u32_u64_types_test.quanta gates it. No code change vs 0.0.90 — prior ROADMAP row marked these lexed-only was stale; this release confirms + locks them with a dedicated regression test. |
 | 0.0.92 | Lang | `raw`/`volatile` qualifiers | ✅ done | `raw` (`*u64`,`*mut u64`) type annotations + deref/store already worked (verified). `volatile` was a SILENT NO-OP: lexed TT_VOLATILE (34) but parse guarded on `TT_KEY&&ktext==39` (never matched) → dropped the binding AND following control flow; also IR_VOLATILE_LOAD/STORE codegen was missing the MOV opcode byte (just ModRM) and the store used a reversed a0/a1. Fixed all three; volatile load+store+if verified, 129/129 gate + valgrind/fuzz green. |
 | 0.0.107 | Lang | typed array/slice `T[]` | ❌ untyped only | Parse `let a: i64[]`; bound-checked access. |
-| 0.0.94 | Lang | range `..` expression | ❌ | Standalone `a..b` range value; feed `for-range`. |
-| 0.0.93 | Lang | `where` clause | ✅ done | `fn f<T>(x:T) where T: Trait` parsed and ELIDED (constraints not yet enforced — function compiles/runs normally). Verified with `->` return type, multiple comma predicates `where A: Num, A: Copy`, without return type, and trait bounds used in body. where_clause_test.quanta gates it. |
-| 0.0.95 | Lang | `move` / `ref` / `mut` | ❌ tokens reserved | Parse ownership sigils; track in symbol table (enforce at 0.1.0 borrow-check). |
+| 0.0.94 | Lang | `move` / `ref` / `mut` | ✅ done | `mut` (rebindable, since 0.0.76), `ref r = &x` (borrow alias; `*r` reads through), `move x` (ownership-transfer prefix). All parsed; ownership tag (0=plain,1=mut,2=ref,3=moved) recorded per symbol in a parallel `vars_own` array (`vown`/`set_vown` accessors). Enforce (reject illegal aliasing / post-move use) lands at 0.1.0 borrow-check. ownership_sigils_test.quanta (rc=7) gates it. |
+| 0.0.95 | Lang | range `..` expression | ❌ | Standalone `a..b` range value; feed `for-range`. |
 | 0.0.96 | Lang | `String` real type | ❌ byte-buffer only | Promote `string` to first-class type with length-aware ops. |
 | 0.0.97 | Lang | try/catch | ❌ panic+`?` only | Parse `try/catch`; unwind to handler. |
 | 0.0.98 | Lang | operator overloading | ❌ | Trait-vtable dispatch for `op` fns (needs trait dispatch from P3). |
@@ -163,15 +162,20 @@ Why post-0.1.0: the ARM64 backend is a new backend; shipping it while x86 debt
 remains would violate the debt-first rule and split correctness effort.
 Qualification evidence is gathered AFTER the core is complete, not before.
 
-### Current status (0.0.93)
+### Current status (0.0.94)
 
-**0.0.93 (promoted stable seed):** Lang — `where` clause.
-- `fn f<T>(x:T) where T: Trait` is parsed and ELIDED: the constraint predicates are consumed and ignored (not yet enforced at 0.1.0 borrow-check/monomorph). The function compiles and runs normally with the `where` clause present.
-- Verified shapes: `->` return type (`where T: Num`), multiple comma predicates (`where A: Num, A: Copy`), no return type (`where T: Copy`), and trait bounds actually used in the body (`where T: Ord` with `<`/`>` comparisons). All reach exit(7).
-- Regression: `where_clause_test.quanta` (rc=7) covers all four shapes.
-- No compiler-code change vs 0.0.92 (the `where` keyword was already lexed TT_WHERE and the signature scanner already tolerated it — the prior ROADMAP row marking it lexed-only was stale). Suite 129 → 130, all GREEN. Extra CI green: valgrind clean, 100-iter fuzz 0 crashes. Fixpoint A==B==C byte-identical (md5 `448bf5ff…`). The 0.0.93 golden (`compiler/0.0.92/bin/x86/qc`) is the stable seed for 0.0.94.
+**0.0.94 (promoted stable seed):** Lang — `move`/`ref`/`mut` ownership sigils (symbol-table track).
+- `mut x = ...` — rebindable local (since 0.0.76).
+- `ref r = &x` — borrow alias; `r` holds a pointer to `x`, `*r` reads through; mutating `x` reflects in `*r`.
+- `move x` — ownership-transfer prefix; produces `x`'s value and tags the symbol as moved (3) in the symbol table.
+- All three parsed and recorded: a parallel `vars_own` array (indexed by symbol index `i`) holds the ownership tag (0=plain,1=mut,2=ref,3=moved), with `vown(nm,nl)`/`set_vown(nm,nl,tag)` accessors. Enforce (reject illegal aliasing / post-move use) lands at 0.1.0 borrow-check.
+- Fix: `ktext` for `ref` had a wrong length guard (`ln==4` vs the 3-char word) so it silently fell through to TT_ID ("undeclared variable: ref"). Corrected to `ln==3`. `mut`/`move` were already correct.
+- Regression: `ownership_sigils_test.quanta` (rc=7) covers mut rebind, ref alias + deref, move, and the composition. Suite 130 → 131, all GREEN. Extra CI green: valgrind clean, fixpoint A==B==C byte-identical (md5 `6a6b2de7…`). The 0.0.94 golden (`compiler/0.0.93/bin/x86/qc`) is the stable seed for 0.0.95.
+- `raw` pointers (`*u64`,`*mut u64`): still verified working (0.0.90).
+- `volatile` qualifier: still verified working (0.0.92).
+- `where` clause: still verified working (0.0.93).
 
-**0.0.90 (prior stable seed):** Core B — `as` width cast.
+**0.0.93 (prior stable seed):** Lang — `where` clause.
 type keywords. Fixed silent-wrong mask bug (REX.B for r8-r15 + const-fold wrap).
 `mixed_width_mask_test.quanta` (rc=7) gates it. Suite 124 → 125, all GREEN.
 

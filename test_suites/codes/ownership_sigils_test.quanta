@@ -1,0 +1,47 @@
+// 0.0.94 regression: `mut` / `ref` / `move` ownership sigils — parsed and
+// recorded in the symbol table (ownership tag), with correct run-time semantics.
+//   - mut: rebindable local (reassignment works)
+//   - ref: borrow alias of a local; `ref r = &x` makes r a pointer, `*r` reads x
+//   - move: ownership-transfer prefix (no-op semantics today; recorded for later)
+// Enforcement (rejecting illegal aliasing / post-move use) is a 0.1.0 borrow-check
+// job; here we lock that the syntax is accepted and the programs run correctly.
+//
+// Exit code contract: must end at exit(7). Any accepted-but-wrong parse would
+// drop control flow (the class of bug fixed for `as`/`volatile`) and we'd diverge.
+
+fn make() -> u64 {
+    return 42
+}
+
+fn main() {
+    // --- mut: rebindable local ---
+    mut a = 10
+    a = a + 5
+    if a != 15 { exit(1) }
+
+    // --- ref: borrow alias of a mutable local (deref reads through) ---
+    mut base = 100
+    ref r = &base
+    if *r != 100 { exit(2) }      // r reads through to base
+    base = 250
+    if *r != 250 { exit(3) }      // alias reflects the mutation
+
+    // --- move: ownership transfer prefix (no-op semantics today) ---
+    let v = 7
+    let w = move v
+    if w != 7 { exit(4) }
+
+    // --- composition: mut + ref + move in one scope ---
+    mut m = 1
+    m = m + 1
+    ref mr = &m
+    if *mr != 2 { exit(5) }
+    let taken = move m
+    if taken != 2 { exit(6) }
+
+    // --- function via ref-style indirection still works ---
+    let g = make()
+    if g != 42 { exit(7) }
+
+    exit(7)
+}

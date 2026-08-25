@@ -53,9 +53,9 @@ exist as files but are excluded from the gate per the "core only until 0.1.0" ru
 | where | 27 | ✅ done (0.0.93) | ✅ gate | `fn f<T>(x:T) where T: Trait` parsed + ELIDED (constraints not yet enforced). Verified: `->` ret type, multi-predicate `where A: Num, A: Copy`, without ret type, trait bounds in body. where_clause_test.quanta (rc=7) gates it. |
 | Option/Some/None | 28/29/30 | ✅ done | ✅ gate | option_test.quanta / option_simple.quanta / option_ctor.quanta / option_tuple.quanta (rc=42, in gate) |
 | Result/Ok/Err | 31/32/33 | ✅ done | ✅ gate | result_test.quanta (rc=49, in gate) |
-| ref | 34 | ❌ todo | ❌ none | lexed, unparsed |
-| mut | 35 | ✅ done (0.0.76) | ✅ gate | mut_basic.quanta (rc=10). Mutable local binding |
-| move | 36 | ❌ todo | ❌ none | lexed, unparsed |
+| ref | 34 | ✅ done (0.0.94) | ✅ gate | `ref r = &x` borrow alias (pointer; `*r` reads through). ownership_sigils_test.quanta gates it. |
+| mut | 35 | ✅ done (0.0.76/0.0.94) | ✅ gate | `mut x = e` rebindable local; ownership tag recorded. mut_basic.quanta + ownership_sigils_test.quanta. |
+| move | 36 | ✅ done (0.0.94) | ✅ gate | `move x` ownership-transfer prefix; tags symbol moved (3). ownership_sigils_test.quanta gates it. |
 | String | 37 | ❌ todo | ❌ none | lexed, unparsed. Keyword is case-insensitive since 0.0.78 (`string` == `String`) |
 | as | 41 | ✅ done (0.0.90) | ✅ gate | `x as T` width cast (IR_BAND mask); usize/signed identity. as_cast_test.quanta gates it. |
 | raw | 38/52 | ✅ done (0.0.90) | ✅ gate | `*u64`/`*mut u64` type annotation + deref/store; raw_ptr_test(s) gate it. |
@@ -153,7 +153,7 @@ native type keyword parsing). `as` width casts (`x as T`) are done (0.0.90).
 | real allocator (free-list/GC) | ❌ todo | ❌ none | bump mmap only |
 | callee load-store-to-same-addr aliasing | ✅ done | ✅ gate | reg_alias.quanta / alias_derive_loop.quanta / alias_loadstore_loop.quanta (fixed 0.0.43–0.0.46) |
 | stack unwind / destructors / RAII | ❌ todo | ❌ none | defer is manual |
-| ref/mut/move (ownership) | ❌ todo | ❌ none | tokens reserved |
+| ref/mut/move (ownership) | ✅ done (0.0.94) | ✅ gate | `mut` rebindable, `ref` borrow alias, `move` transfer prefix; ownership tag tracked in symbol table (`vars_own`, `vown`/`set_vown`). Enforce at 0.1.0. ownership_sigils_test.quanta gates it. |
 
 ## F. Builtins — Already Shipped (87 registered, prefixes expanded)
 
