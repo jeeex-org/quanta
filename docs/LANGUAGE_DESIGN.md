@@ -1,9 +1,11 @@
 # Quanta — Language Design
 
-Quanta is a programming language engineered to be secure, fast, and flexible,
-with a simple syntax that is easy to learn and remember. Its source is a syntax
-tree — a machine-verifiable artifact from the first token, with the compiler as a
-local, scriptable verifier.
+Quanta is a programming language whose source is a syntax tree the compiler
+verifies from the first token. You write in a minimal, memorable syntax; the
+compiler handles memory, bounds, races, and side channels, with `unsafe` as an
+explicit escape. Physics, music, biology, finance, and cryptography are
+first-class dialects, and one source builds to native, WASM, GPU,
+microcontroller, and cluster with a single command.
 
 The goal: a complete, self-hosting language where memory, bounds, races, and side
 channels are handled by the compiler with `unsafe` as an explicit escape;
