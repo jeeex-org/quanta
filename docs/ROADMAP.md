@@ -1,6 +1,6 @@
 # Quanta ROADMAP — consolidated single source of truth
 
-> **Last updated: 2026-08-25. Current compiler: 0.0.86** (x86-64 ELF emitter,
+> **Last updated: 2026-08-25. Current compiler: 0.0.91** (x86-64 ELF emitter,
 > multi-file tree, Valgrind-clean, self-host `fp=YES`). ARM64 (AArch64) backend
 > is DEFERRED POST-0.1.0 (see #2 schedule below); the working compiler is x86-64 only.
 >
@@ -82,8 +82,9 @@ Every item below is one WIP version: self-hosts (2-stage byte-identical fixed po
 | 0.0.87 | Lang | Gate the std libs | ✅ done | Add `std_crypto_test`, `std_quantum_test`, `std_linalg_test`, `std_vec_test`, `std_fs_test`, `std_math_test` to EXPECTED.tsv; verify green. |
 | 0.0.88 | Lang | `u8`/`u16` type keywords | ✅ done | `let x: u8`/`u16` parsed + width_mask codegen. Fixed silent-wrong mask bug: REX.B for r8-r15 result regs + const-fold wrap. mixed_width_mask_test.quanta gates it. |
 | 0.0.89 | Lang | `bool`/`char`/`byte` as types | ✅ done | `let x: bool`/`char`/`byte` parsed (vtype 6/7/8) + width_mask codegen. char/byte wrap 0..255 (REX.B-correct); bool arithmetic is plain integer (true+true==2). bool_char_byte_types_test.quanta gates it. |
-| 0.0.90 | Lang | `as` cast | ❌ lexed-only | Parse `x as T`; emit width conversion. |
-| 0.0.91 | Lang | `raw` / `volatile` | ❌ lexed-only | Parse pointer/volatile qualifiers; codegen. |
+| 0.0.90 | Lang | `as` cast | ✅ done | `x as T` width cast. Root cause: `as` is lexed TT_AS (36), not TT_KEY, so the old parse_as loop (`peek()==TT_KEY`) NEVER fired — the cast was a silent no-op (rc=112 / dropped control flow). Fixed to loop on `peek()==TT_AS`; truncation emitted as IR_BAND with the width mask (IR_MOV+tag alone got copy-propagated away, losing the mask). Covers u8/u16/u32/char/byte/usize; usize/signed are identity. as_cast_test.quanta gates it. |
+| 0.0.91 | Lang | `usize`/`u32`/`u64` full type keywords | ✅ done | Type annotations `let x: usize/u32/u64` parsed (vtype 5/3/4) since 0.0.89; verified full semantics: u32 wraps at 2^32, u64/usize are full 64-bit (no 2^32 wrap), `as` casts to/from all three behave correctly. usize_u32_u64_types_test.quanta gates it. No code change vs 0.0.90 — prior ROADMAP row marked these lexed-only was stale; this release confirms + locks them with a dedicated regression test. |
+| 0.0.92 | Lang | `raw` / `volatile` | ❌ lexed-only | Parse pointer/volatile qualifiers; codegen. |
 | 0.0.92 | Lang | typed array/slice `T[]` | ❌ untyped only | Parse `let a: i64[]`; bound-checked access. |
 | 0.0.93 | Lang | range `..` expression | ❌ | Standalone `a..b` range value; feed `for-range`. |
 | 0.0.94 | Lang | `where` clause | ❌ lexed-only | Parse `fn f<T>(x:T) where T: Num`; elide today, hook for 0.1.0. |
@@ -162,18 +163,20 @@ Why post-0.1.0: the ARM64 backend is a new backend; shipping it while x86 debt
 remains would violate the debt-first rule and split correctness effort.
 Qualification evidence is gathered AFTER the core is complete, not before.
 
-### Current status (0.0.89)
+### Current status (0.0.91)
 
-**0.0.89 (promoted stable seed):** Core B — `bool`/`char`/`byte` as type annotations.
-`let x: bool`/`char`/`byte` are parsed (vtype 6/7/8 in parse_let) and width-masked in
-codegen. char/byte are byte-width and wrap 0..255 (REX.B-correct for r8–r15 result
-regs, same class of fix as 0.0.88); bool is a logical 0/1 type whose arithmetic is
-plain integer (true+true==2, not width-masked). `bool_char_byte_types_test.quanta`
-(rc=7) gates it. Suite 125 → 126, all GREEN (functional + security + performance).
-Self-host fixpoint preserved (B==C byte-identical, A==C drift-identical). The 0.0.89
-golden (`compiler/0.0.89/bin/x86/qc`) is the stable seed for 0.0.90.
+**0.0.91 (promoted stable seed):** Core B — `usize`/`u32`/`u64` full type keywords.
+`let x: usize/u32/u64` are parsed (vtype 5/3/4) and carry correct width semantics:
+`u32` wraps at 2^32, `u64`/`usize` are full 64-bit (no 2^32 wrap), and `as` casts to/from
+all three behave correctly (verified: `5e9 as u32` → 705032704; `as u64`/`as usize` identity).
+The prior ROADMAP row marked these "lexed-only" — that was stale; the code already
+implemented them. This release confirms and locks them with `usize_u32_u64_types_test.quanta`
+(rc=7). No compiler-code change vs 0.0.90 (byte-identical fixpoint). Suite 127 → 128, all
+GREEN (functional + security + performance). Extra CI green: valgrind clean, 150-iter fuzz
+0 crashes. Self-host fixpoint preserved (A==B==C byte-identical). The 0.0.91 golden
+(`compiler/0.0.90/bin/x86/qc`, rebuilt and re-promoted) is the stable seed for 0.0.92.
 
-**0.0.88 (prior stable seed):** first real core-feature — `u8`/`u16` as width-tagged
+**0.0.90 (prior stable seed):** Core B — `as` width cast.
 type keywords. Fixed silent-wrong mask bug (REX.B for r8-r15 + const-fold wrap).
 `mixed_width_mask_test.quanta` (rc=7) gates it. Suite 124 → 125, all GREEN.
 

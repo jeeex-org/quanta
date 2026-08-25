@@ -61,14 +61,14 @@ exist as files but are excluded from the gate per the "core only until 0.1.0" ru
 | raw | 38/52 | ❌ todo | ❌ none | lexed, unparsed |
 | asm | 40/53 | ✅ done | ✅ gate | asm!("hex bytes") -> IR_ASM raw machine-code emit (method.quanta:261); asm_test.quanta (rc=42, in gate) |
 | volatile | 39/54 | ❌ todo | ❌ none | lexed, unparsed |
-| usize | 42/48 | 🟡 partial | ✅ gate | lexed; used as size type |
+| usize | 42/48 | ✅ done (0.0.91) | ✅ gate | type annotation parsed (vtype 5); full 64-bit, no 2^32 wrap; `as usize` is identity |
 | u8 | 44 | ✅ done | ✅ gate | width-tagged type; add/sub/mul wrap via vreg_type + width_mask (REX.B-correct for r8-r15) |
 | u16 | 45 | ✅ done | ✅ gate | width-tagged type; add/sub/mul wrap via vreg_type + width_mask (REX.B-correct for r8-r15) |
-| u32 | 46 | 🟡 partial | ✅ gate | u32 mask builtin exists |
-| u64 | 47 | 🟡 partial | ✅ gate | u64 mask builtin exists |
-| bool | 49 | ✅ done | ✅ gate | logical_keywords.quanta (true=1, false=0). NOTE: this is the *keyword + true/false values*; using `bool` as a *type annotation* (`let x: bool`) is not yet parsed — see §B |
-| char | 50 | ✅ done | ✅ gate | memops_test.quanta (char/byte ops). NOTE: *keyword* done; `char` as a *type annotation* not yet parsed — see §B |
-| byte | 51 | ✅ done | ✅ gate | memops_test.quanta (byte literal). NOTE: *keyword* done; `byte` as a *type annotation* not yet parsed — see §B |
+| u32 | 46 | ✅ done (0.0.91) | ✅ gate | type annotation parsed (vtype 3); wraps at 2^32 via width_mask; `as u32` truncates |
+| u64 | 47 | ✅ done (0.0.91) | ✅ gate | type annotation parsed (vtype 4); full 64-bit; `as u64` is identity |
+| bool | 49 | ✅ done | ✅ gate | logical_keywords.quanta (true=1, false=0). `bool` as a *type annotation* (`let x: bool`) parsed since 0.0.89 (vtype 6) |
+| char | 50 | ✅ done | ✅ gate | memops_test.quanta (char/byte ops). `char` as a *type annotation* (`let x: char`) parsed since 0.0.89 (vtype 7) |
+| byte | 51 | ✅ done | ✅ gate | memops_test.quanta (byte literal). `byte` as a *type annotation* (`let x: byte`) parsed since 0.0.89 (vtype 8) |
 | int | 55 | ✅ done | ✅ gate | arithmetic.quanta, int_keyword_test.quanta |
 | and / or / not | 13/14/15 | ✅ done (0.0.70) | ✅ gate | logical_keywords.quanta (rc=4), logical_keywords_shortcircuit.quanta (rc=2). Exact aliases of `&&`/`\|\|` incl. short-circuit |
 | true / false | 10/11 | ✅ done | ✅ gate | logical_keywords.quanta (true=1, false=0) |
@@ -78,20 +78,20 @@ exist as files but are excluded from the gate per the "core only until 0.1.0" ru
 
 NOTE: A type is "done" only if it can be written as a *type annotation* (`let x: T`)
 and parsed by the type system. The `bool`/`char`/`byte` *keywords* and their values
-are done (§A); their use as *type annotations* is not yet parsed (marked ❌ below to
-avoid double-counting). `usize`/`u32`/`u64` are partial (mask builtins exist; no full
-native type keyword parsing).
+are done (§A) **and** their use as type annotations is now parsed (`let x: bool`/`char`/`byte`, vtype 6/7/8, landed 0.0.89). `usize`/`u32`/`u64` are partial (mask builtins exist; no full
+native type keyword parsing). `as` width casts (`x as T`) are done (0.0.90).
 
 | Type | Status | Test? | Notes |
 |---|---|---|---|
 | i64 (default integer) | ✅ done | ✅ gate | arithmetic.quanta, param8.quanta |
 | f64 | ✅ done | ✅ gate | float_test.quanta (rc=159), simple_fadd.quanta (rc=7) |
-| usize | 🟡 partial | ✅ gate | lexed; used as size type |
-| u32 / u64 (masks) | 🟡 partial | ✅ gate | u32/u64 builtins; no native type keyword |
+| usize | ✅ done (0.0.91) | ✅ gate | type annotation parsed (vtype 5); full 64-bit |
+| u32 / u64 | ✅ done (0.0.91) | ✅ gate | type annotation parsed (vtype 3/4); u32 wraps at 2^32, u64 full 64-bit; `as` casts work |
 | u8 / u16 | ✅ done | ✅ gate | `let x: u8`/`u16` parsed (parse_let width tag) + width_mask codegen; mixed-width + const-fold wrap verified |
 | bool (as type) | ✅ done | ✅ gate | `let x: bool` parsed (vtype 6); stored/compared as 0/1; arithmetic is plain integer (true+true==2, not masked) |
 | char (as type) | ✅ done | ✅ gate | `let x: char` parsed (vtype 7); byte-width, wraps 0..255 on arithmetic (REX.B-correct) |
 | byte (as type) | ✅ done | ✅ gate | `let x: byte` parsed (vtype 8); byte-width, wraps 0..255 on arithmetic (REX.B-correct) |
+| `as` width cast (`x as T`) | ✅ done (0.0.90) | ✅ gate | `x as u8/u16/u32/char/byte/usize`. Truncation emitted as IR_BAND with width mask; usize/signed are identity. `as_cast_test.quanta` (rc=7) gates it; diff-checked vs `x & mask`. |
 | float literals (`3.14`) | ✅ done (0.0.61) | ✅ gate | float_test.quanta (`println(3.14)`->`3.140000`); f2i/fadd/... consume float vregs (0.0.62). Verified: `fadd(1.5,2.5)`->4 |
 | string (real type) | ❌ todo | ❌ none | TT_STRING reserved; byte-buffer + print only |
 | struct | ✅ done | ✅ gate | fields + `obj.method` + literal (struct_literal_test.quanta, in gate) |
