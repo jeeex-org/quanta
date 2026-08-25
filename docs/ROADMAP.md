@@ -1,6 +1,6 @@
 # Quanta ROADMAP — consolidated single source of truth
 
-> **Last updated: 2026-08-25. Current compiler: 0.0.94** (x86-64 ELF emitter,
+> **Last updated: 2026-08-25. Current compiler: 0.0.95** (x86-64 ELF emitter,
 > multi-file tree, Valgrind-clean, self-host `fp=YES`). ARM64 (AArch64) backend
 > is DEFERRED POST-0.1.0 (see #2 schedule below); the working compiler is x86-64 only.
 >
@@ -87,11 +87,11 @@ Every item below is one WIP version: self-hosts (2-stage byte-identical fixed po
 | 0.0.92 | Lang | `raw`/`volatile` qualifiers | ✅ done | `raw` (`*u64`,`*mut u64`) type annotations + deref/store already worked (verified). `volatile` was a SILENT NO-OP: lexed TT_VOLATILE (34) but parse guarded on `TT_KEY&&ktext==39` (never matched) → dropped the binding AND following control flow; also IR_VOLATILE_LOAD/STORE codegen was missing the MOV opcode byte (just ModRM) and the store used a reversed a0/a1. Fixed all three; volatile load+store+if verified, 129/129 gate + valgrind/fuzz green. |
 | 0.0.107 | Lang | typed array/slice `T[]` | ❌ untyped only | Parse `let a: i64[]`; bound-checked access. |
 | 0.0.94 | Lang | `move` / `ref` / `mut` | ✅ done | `mut` (rebindable, since 0.0.76), `ref r = &x` (borrow alias; `*r` reads through), `move x` (ownership-transfer prefix). All parsed; ownership tag (0=plain,1=mut,2=ref,3=moved) recorded per symbol in a parallel `vars_own` array (`vown`/`set_vown` accessors). Enforce (reject illegal aliasing / post-move use) lands at 0.1.0 borrow-check. ownership_sigils_test.quanta (rc=7) gates it. |
-| 0.0.95 | Lang | range `..` expression | ❌ | Standalone `a..b` range value; feed `for-range`. |
-| 0.0.96 | Lang | `String` real type | ❌ byte-buffer only | Promote `string` to first-class type with length-aware ops. |
-| 0.0.97 | Lang | try/catch | ❌ panic+`?` only | Parse `try/catch`; unwind to handler. |
-| 0.0.98 | Lang | operator overloading | ❌ | Trait-vtable dispatch for `op` fns (needs trait dispatch from P3). |
-| 0.0.99 | Lang | generics monomorphisation | 🟡 type-erased | Instantiate `map<T,U>` per type-args; compile-time checks. |
+| 0.0.95 | Lang | `String` real type | ✅ done | First-class `String` with length-aware ops (header `[ptr]=len`, bytes at `ptr+8`). `==`/`!=` desugar to `str_eq`/`str_ne` builtins (manual byte-loop; Quanta's `repe cmpsb` is broken — `memcmp` also returns 0 for differing equal-length strings). Concat `..`, `len()`, `print()` all length-aware. Regression: `string_compare_test.quanta` (rc=0) + 24-case compare suite, valgrind-clean, fixpoint A==B==C byte-identical (md5 `0560a3c9…`). |
+| 0.0.96 | Lang | try/catch | ❌ panic+`?` only | Parse `try/catch`; unwind to handler. |
+| 0.0.97 | Lang | range `..` + operator overloading | ❌ | `a..b` range value feeds `for`; trait-vtable dispatch for `op` fns. |
+| 0.0.98 | Lang | generics monomorphisation | 🟡 type-erased | Instantiate `map<T,U>` per type-args; compile-time checks. |
+| 0.0.99 | Lang | float math + string ops + `rand` | ❌ | Float builtins; `substr`/`split`/utf8; getrandom-based `rand`. |
 | 0.100 | Builtins | float math (sin/cos/tan/pow/log/min/max) | ❌ | Add builtins; gate `std_math_test`. |
 | 0.101 | Builtins | string ops (strcat/substr/strcmp/str_split/utf8) | ❌ | Add builtins; gate `std_str_test`. |
 | 0.102 | Builtins | atomics (load/store/add/cmpxchg+futex) | ❌ | Add builtins; gate `atomic_test`. |
@@ -162,9 +162,15 @@ Why post-0.1.0: the ARM64 backend is a new backend; shipping it while x86 debt
 remains would violate the debt-first rule and split correctness effort.
 Qualification evidence is gathered AFTER the core is complete, not before.
 
-### Current status (0.0.94)
+### Current status (0.0.95)
 
-**0.0.94 (promoted stable seed):** Lang — `move`/`ref`/`mut` ownership sigils (symbol-table track).
+**0.0.95 (promoted stable seed):** Lang — `String` real type (length-aware).
+- `let s: String = "..."` — first-class `String`; header `[ptr]=len` (i64 at offset 0), bytes at `ptr+8`.
+- `==` / `!=` on `String` desugar to `str_eq` / `str_ne` builtins (manual byte-loop; Quanta's `repe cmpsb` is defective — `memcmp` also returns 0 for differing equal-length strings, so a hand-written load/compare loop is used).
+- Concat `..`, `len()`, `print()` all length-aware (concat uses `rep movsb`; compares skip the 8-byte length header via `add rdi,8`/`add rsi,8`).
+- Regression: `string_compare_test.quanta` (rc=0) + 24-case compare suite (equal/differ/prefix/length-mismatch, direct + desugar + annotated + concat); valgrind-clean; fixpoint A==B==C byte-identical (md5 `0560a3c9…`). The 0.0.95 golden (`compiler/0.0.95/bin/x86/qc`) is the stable seed for 0.0.96.
+
+**0.0.94 (prior stable seed):** Lang — `move`/`ref`/`mut` ownership sigils (symbol-table track).
 - `mut x = ...` — rebindable local (since 0.0.76).
 - `ref r = &x` — borrow alias; `r` holds a pointer to `x`, `*r` reads through; mutating `x` reflects in `*r`.
 - `move x` — ownership-transfer prefix; produces `x`'s value and tags the symbol as moved (3) in the symbol table.

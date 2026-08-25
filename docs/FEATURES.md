@@ -56,7 +56,7 @@ exist as files but are excluded from the gate per the "core only until 0.1.0" ru
 | ref | 34 | ✅ done (0.0.94) | ✅ gate | `ref r = &x` borrow alias (pointer; `*r` reads through). ownership_sigils_test.quanta gates it. |
 | mut | 35 | ✅ done (0.0.76/0.0.94) | ✅ gate | `mut x = e` rebindable local; ownership tag recorded. mut_basic.quanta + ownership_sigils_test.quanta. |
 | move | 36 | ✅ done (0.0.94) | ✅ gate | `move x` ownership-transfer prefix; tags symbol moved (3). ownership_sigils_test.quanta gates it. |
-| String | 37 | ❌ todo | ❌ none | lexed, unparsed. Keyword is case-insensitive since 0.0.78 (`string` == `String`) |
+| String | 37 | ✅ done (0.0.95) | ✅ gate | `let s: String = "..."` first-class; length-aware header `[ptr]=len`, bytes at `ptr+8`. `==`/`!=` → `str_eq`/`str_ne` (manual byte-loop; `repe cmpsb` + `memcmp` are defective in Quanta). `..` concat, `len()`, `print()` all length-aware. string_compare_test.quanta (rc=0) + 24-case compare suite gate it. |
 | as | 41 | ✅ done (0.0.90) | ✅ gate | `x as T` width cast (IR_BAND mask); usize/signed identity. as_cast_test.quanta gates it. |
 | raw | 38/52 | ✅ done (0.0.90) | ✅ gate | `*u64`/`*mut u64` type annotation + deref/store; raw_ptr_test(s) gate it. |
 | asm | 40/53 | ✅ done | ✅ gate | asm!("hex bytes") -> IR_ASM raw machine-code emit (method.quanta:261); asm_test.quanta (rc=42, in gate) |
@@ -245,7 +245,7 @@ it; 🟡 file-only = a test file exists on disk but is NOT in the gate; ❌ none
 ## Summary counts (source-derived)
 - **Keywords (ktext): 57 codes defined; ~19 parsed, ~13 lexed-only gaps, rest partial.**
 - **Builtins registered: 87 (prefixes expanded).**
-- **Core tests in gate: 117** (EXPECTED.tsv, 117 rows). `std_*` tests exist as files but
+- **Core tests in gate: 132** (EXPECTED.tsv, 132 rows). `std_*` tests exist as files but
   removed from gate (core-only rule); `mtu_*` multi-translation-unit experiments are
   also file-only. So ~12 code files are file-only (not in the gate count).
 - **Test framework note:** tests `return`/`exit` a *computed value* (not just 0); EXPECTED.tsv's
