@@ -70,7 +70,7 @@ SEQUENCING is the contract, not the literal numbers.
 | SIMPLE-SURFACE | 0.0.56 | **Simplified syntax landed**: `fn` keyword optional (bare `name(){}` works everywhere, `init()`/`main()` bare OK), `let` optional (bare `name = expr` = local/global), `return` optional (last-expr auto-returns), condition parens optional, `${name}` global / `$[]` local explicit sigils (bare + inside-string interpolation). Goal: bash-like, extremely simple surface. Docs (README/SYNTAX/SPEC) + test_suites + security script synced. |
 | P2 builtins | 0.0.55–0.0.60 | float cmp ✅(0.0.55), proc/env ✅(0.0.55), stdin ✅(0.0.55), fs meta ✅(0.0.55 — path-string remap fixed), string ops, math ✅(sqrt/floor/ceil/abs; sin/cos/tan/pow/log/min/max TODO), atomics, net, introspection ✅(abort/debugbreak), random ✅(getrandom), **`$$(cmd)` external-command substitution (0.0.57)** — `unsafe`-gated runtime `fork`/`execve`/`pipe`/`wait4` via the raw `syscall()` builtin (no libc); `$$(str)`→`/bin/sh -c`, `$$(arr)`→direct `execve` (no shell, injection-safe). Returns `CmdResult{stdout,stderr,status}`. |
 | P3 language | 0.0.61–0.0.85 | **float literals ✅(0.0.61)**, **float-arg-to-builtin ✅(0.0.62: f2i/fadd/fsub/fmul/fdiv read float vregs correctly)**, **user enums ✅(0.0.63: qualified+bare variant resolution, explicit tags, match)**, **modules ✅(0.0.64: mod Name { fn ... } + Mod.fn() qualified calls)**, **closure literals ✅(0.0.65: `|x,y| { expr }` → [codeptr, env] tuple, callable directly or via fn-typed param)**, **array push fix ✅(0.0.66: IR_CLOSURE/IR_APUSH opcode collision silently zeroed every pushed element)**, **closure captures ✅(0.0.67: free vars of the enclosing fn captured by value into a heap env array)**, **user-fn-beats-builtin ✅(0.0.68: was enforced in only 2 of 86 builtin branches, so a user `fn abs` was silently hijacked)**, **match guards ✅(0.0.69: `n if cond => expr` — the `if` was never consumed, so guarded arms silently yielded 0)**; remaining: **`big` keyword/type** (library convention today; needs `TT_BIG` + op-overload), generic monomorphisation (type params are erased today), ref/ref-return/borrow (needs borrow-checking), and op-overload (needs trait vtable dispatch) — all 0.1.0 type-system work. **Differentiation libs (math/physics/crypto/blockchain/quantum/AI mandate):** `crypto`/`quantum`/`linalg`/`math` shipped but lack dedicated gate tests (`big_test`/`quantum_test`/`linalg_test` needed); `chain`/`secure`/`ai`/`physics` not yet in code (native lib track, post-0.0.86). |
-| **P4 tooling** | **POST-0.1.0** | **Quanta-native code-writing tool** (edit Quanta source reliably without external scripting — the user's stated goal; deferred POST-0.1.0, no version reserved) |
+| **P4 tooling** | **0.114** | **Quanta-native code-writing tool** (edit Quanta source reliably without external scripting — the user's stated goal; last core item, sequenced immediately before 0.1.0) |
 | **0.1.0** | 0.1.0 | Core + builtins complete → std/lib resumes; borrow-checking target for #1 green; **PTY layer for interactive `$$()` (vi/ssh/top)** |
 
 ### Outstanding cores — per-version sequencing (0.0.87 → 0.1.0+)
@@ -106,17 +106,17 @@ Every item below is one WIP version: self-hosts (2-stage byte-identical fixed po
 | 0.111 | FFI | extern "C" PLT/GOT | 🟡 partial | Full dynamic-link symbol resolution. |
 | 0.112 | Lang | trait/impl dispatch completion | 🟡 partial | Complete vtable dispatch for interface/impl/trait. |
 | 0.113 | Lang | `big` keyword/type | 🟡 lib convention | `TT_BIG` + op-overload routing `a+b`→`big_add`; gate `big_test`. |
+| 0.114 | P4 tooling | **Quanta-native code-writing tool** | ❌ | LAST core item — sequenced right before 0.1.0 (where std/libs resume). Edit Quanta source reliably without external scripting. |
 | — | POST-0.1.0 | borrow-checking (ref/mut/move enforce) | ❌ | Compile-time memory safety (#1 green). |
 | — | POST-0.1.0 | `chain` lib (Merkle/signed-tx/UTXO/Block) | ❌ not in code | Differentiation mandate. |
 | — | POST-0.1.0 | `secure` lib (capability I/O, constant-time) | ❌ not in code | Differentiation mandate. |
 | — | POST-0.1.0 | `ai` lib (tensor ops + inference) | ❌ not in code | Differentiation mandate. |
 | — | POST-0.1.0 | `physics` lib (ODE/PDE solvers) | ❌ not in code | Differentiation mandate. |
 | — | POST-0.1.0 | ARM64 (AArch64) backend | ❌ x86 only | Second backend (independent impl route). |
-| — | POST-0.1.0 | **Quanta-native code-writing tool** | ❌ | Last — after all cores closed. Edit Quanta source reliably without external scripting. |
 
-**Version-number rule:** literal numbers above are the plan; the SEQUENCING (order + one-feature-per-version + fixpoint-verified) is the contract. If a version needs splitting, the number increments — never skipped, never reused. 0.0.90 is **not reserved**; it is simply the `as`/`raw`/`volatile` cluster above. The code-writing tool is sequenced last, after every core item.
+**Version-number rule:** literal numbers above are the plan; the SEQUENCING (order + one-feature-per-version + fixpoint-verified) is the contract. If a version needs splitting, the number increments — never skipped, never reused. 0.0.90 is **not reserved**; it is simply the `as`/`raw`/`volatile` cluster above. The code-writing tool is **0.114 — the last core item, sequenced immediately before 0.1.0** (where std/libs resume); ARM64 and the deep-systems items remain POST-0.1.0.
 
-**POST-0.1.0 (no version reserved for any):** borrow-checking; `chain`/`secure`/`ai`/`physics` libs; ARM64 backend; Quanta-native code-writing tool (last).
+**POST-0.1.0 (no version reserved for any):** borrow-checking; `chain`/`secure`/`ai`/`physics` libs; ARM64 backend.
 
 
 
