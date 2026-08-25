@@ -1,0 +1,38 @@
+// 0.0.92 regression: `volatile` qualifier — load AND store through raw pointers,
+// with following control flow intact (the 0.0.90-class bug silently dropped the
+// binding + the `if` that followed it). `volatile` is lexed TT_VOLATILE (34),
+// not TT_KEY, so it must be parsed on the token type and routed at statement level.
+//
+// main() runs every scenario and only reaches `exit(7)` if all hold. Any failure
+// exits with a distinct non-7 code, so the harness gate (rc==7) catches regressions.
+fn main() {
+    // --- volatile LOAD, followed by an `if` (the historically-dropped case) ---
+    let x: u64 = 42
+    let p: *u64 = &x
+    let v: u64 = volatile *p
+    if v != 42 { exit(1) }
+
+    // --- volatile STORE then read back through a normal deref ---
+    let a: u64 = 0
+    let q: *u64 = &a
+    volatile *q = 99
+    let r: u64 = *q
+    if r != 99 { exit(2) }
+
+    // --- volatile STORE where the stored value comes from another var ---
+    let seven: u64 = 7
+    let b: u64 = 0
+    let s: *u64 = &b
+    volatile *s = seven
+    let r2: u64 = *s
+    if r2 != 7 { exit(3) }
+
+    // --- volatile LOAD returning the value (implicit return path) ---
+    let c: u64 = 123
+    let t: *u64 = &c
+    let r3: u64 = volatile *t
+    if r3 != 123 { exit(4) }
+
+    // all scenarios passed
+    exit(7)
+}
