@@ -5,13 +5,11 @@ with a simple syntax that is easy to learn and remember. Its source is a syntax
 tree — a machine-verifiable artifact from the first token, with the compiler as a
 local, scriptable verifier.
 
-*Status note: this is the design target. Quanta's current implementation is
-0.0.86 — a self-hosting native compiler (byte-identical fixpoint) with an
-intent-level syntax, a primitive layer (syscalls, mmap, file I/O, floats,
-closures, generics, big-int), and stdlib seeds for crypto, quantum, linalg, and
-math. The properties below are reached incrementally, gate-green before each
-promotion. The sequenced plan lives in `docs/ROADMAP.md` and
-`docs/QUANTA_GAP_ANALYSIS.md`.*
+The goal: a complete, self-hosting language where memory, bounds, races, and side
+channels are handled by the compiler with `unsafe` as an explicit escape;
+physics, music, biology, finance, and cryptography are first-class dialects; and
+one source builds to native, WASM, GPU, microcontroller, and cluster with a
+single command and hash-pinned dependencies.
 
 ---
 
