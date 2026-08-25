@@ -1,6 +1,6 @@
 # Quanta ROADMAP — consolidated single source of truth
 
-> **Last updated: 2026-08-25. Current compiler: 0.0.92** (x86-64 ELF emitter,
+> **Last updated: 2026-08-25. Current compiler: 0.0.93** (x86-64 ELF emitter,
 > multi-file tree, Valgrind-clean, self-host `fp=YES`). ARM64 (AArch64) backend
 > is DEFERRED POST-0.1.0 (see #2 schedule below); the working compiler is x86-64 only.
 >
