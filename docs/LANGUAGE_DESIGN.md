@@ -1,74 +1,62 @@
 # Quanta — Language Design
 
-Quanta is a programming language whose source is a syntax tree the compiler
-verifies from the first token. You write in a minimal, memorable syntax; the
-compiler handles memory, bounds, races, and side channels, with `unsafe` as an
-explicit escape. Physics, music, biology, finance, and cryptography are
-first-class dialects, and one source builds to native, WASM, GPU,
-microcontroller, and cluster with a single command.
+Quanta is a programming language you can pick up quickly. You write what you want
+in short, plain code, and Quanta catches mistakes before they break anything. It
+speaks the language of many fields — science, music, finance,
+cryptography — and the same program runs on your laptop, in a browser, on a small
+device, or across many machines, with one command.
 
-The goal: a complete, self-hosting language where memory, bounds, races, and side
-channels are handled by the compiler with `unsafe` as an explicit escape;
-physics, music, biology, finance, and cryptography are first-class dialects; and
-one source builds to native, WASM, GPU, microcontroller, and cluster with a
-single command and hash-pinned dependencies.
+The goal: a complete language where you rarely think about memory or safety
+because Quanta handles it; where every field has its own natural notation; and
+where one piece of code runs everywhere without rewrites.
 
 ---
 
 ## 1. What Quanta Is
 
-- **A verifiable artifact.** The source is a syntax tree, not text. Structure is
-  invariant under edit — a change cannot produce a syntactically broken program.
-  The compiler is a fast, local verifier available after every change.
-- **Concise.** The surface is small and regular; programs are short. The common
-  case is terse and the environment is invisible — one command, no build file,
-  no venv.
-- **Self-hosting.** The compiler is written in Quanta. The same language that
-  builds an application compiles itself and is the substrate for the tooling
-  around it.
-- **One language across machines.** Native, WASM, GPU, microcontroller, and
-  cluster from a single source; the runtime adapts, the program does not change.
-- **Dialect-rich.** Physics, music, biology, finance, and cryptography ship as
-  first-class vocabularies with real notation, desugaring to core forms anyone
-  can read.
-- **Memory-safe by construction.** Region and ownership memory, bounds, races,
-  and side channels are handled by the compiler; `unsafe` is an explicit,
-  auditable escape, not the default path.
+- **Safe to change.** Quanta reads your program as structure, not plain text, so
+  a small edit can't quietly break it. It checks your work as you go.
+- **Short and regular.** Programs are small and read top to bottom. There is no
+  setup file to learn — one command and you are running.
+- **Builds itself.** The Quanta compiler is written in Quanta. The same language
+  that builds your app builds the tools around it.
+- **Runs anywhere.** One program works on your computer, in a browser, on a tiny
+  device, or spread across many machines — you don't rewrite it for each.
+- **Speaks many fields.** Science, music, finance, and cryptography each get their
+  own natural way of writing, in words their experts already use.
+- **Looks after memory.** Quanta handles memory and safety for you; if you truly
+  need raw access, that is an explicit, separate choice — not the normal path.
 
 ---
 
 ## 2. What Quanta Does
 
-- **Removes setup as a gate.** The first hour is spent expressing intent, not
-  fighting tooling.
-- **Lowers the concept tax.** Types, allocators, and build targets are inferred;
-  apparatus is pursued by the compiler, not supplied by the writer.
-- **Meets experts in their notation.** `laplace(potential)` instead of
-  `matrix_multiply(...)`; the discipline's vocabulary is first-class.
-- **Teaches as it fails.** Errors explain cause, rule, and fix.
-- **Edits without breaking.** Structure is invariant under edit.
-- **Verifies in the loop.** `quanta check` runs after every change; the signal is
-  real, not asserted.
-- **Scales to large code.** A concise surface and verifiable structure keep
-  processing cost and context load low.
-- **Secures the execution layer.** Memory, bounds, races, and side channels are
-  pursued by the compiler; `unsafe` is explicit and auditable.
-- **Enforces domain invariants.** A `secure` dialect refuses variable-time or
-  unreduced cryptographic operations; a blockchain dialect rejects replay and
-  non-deterministic RNG. The unsafe form cannot be compiled where the dialect
-  governs.
-- **Keeps docs honest.** Examples are executed as tests; a broken example fails
-  the build.
+- **Gets out of your way at the start.** Your first hour is spent saying what you
+  want, not wiring up tools.
+- **Carries the hard parts.** Types, memory, and build targets are figured out by
+  Quanta, not written down by you.
+- **Lets experts write naturally.** A scientist writes `laplace(potential)`
+  instead of `matrix_multiply(...)`.
+- **Explains its errors.** When something is wrong, Quanta says what, why, and
+  how to fix it.
+- **Catches mistakes as you type.** It checks after every change, so you know
+  immediately.
+- **Stays manageable at scale.** Small programs and large ones are written the
+  same way.
+- **Keeps sensitive code honest.** In the cryptography and blockchain dialects,
+  the unsafe forms — timing leaks, replay, bad randomness — simply will not
+  compile.
+- **Keeps its own docs true.** Every example in the documentation is run as a
+  test; a broken example fails the build.
 
 ---
 
-## 3. Why It Holds Together
+## 3. Why It Works
 
-One property drives all of it: **code as a machine-verifiable artifact.** Because
-the source is a checkable tree from token one, the writer gets clarity, the
-processor gets reliability, the surface stays small, and the compiler stays the
-single source of truth. The strengths reinforce each other instead of competing
-for attention, and the recurring friction of traditional toolchains — ceremony,
-packaging, fragile text, unverifiable claims — is designed out at the foundation.
+One idea holds it together: **Quanta treats your program as something it can
+check, from the very first line.** Because the structure is knowable, writing
+stays simple, mistakes are caught early, and the same code runs everywhere. The
+things that make other languages heavy — setup, packaging, fragile text,
+guessing whether code is right — are handled at the foundation, not left to you.
 
 Quanta is the language that results.
