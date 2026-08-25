@@ -1,0 +1,39 @@
+// 0.0.93 regression: `where` clause — parsed and elided (constraint predicates
+// are not yet enforced; the function compiles and runs normally). Covers the
+// shapes that must not break parsing:
+//   1. `fn f<T>(...) -> R where T: Trait`
+//   2. multiple comma-separated predicates `where A: Num, A: Copy`
+//   3. `where` WITHOUT a `->` return type
+//   4. trait bounds used inside the body (Ord comparison)
+// All scenarios must reach exit(7); any failure exits with a distinct code.
+fn max<T>(a: T, b: T) -> T where T: Num {
+    if a > b { return a } else { return b }
+}
+
+fn add3<A>(a: A, b: A, c: A) where A: Num, A: Copy {
+    return a + b + c
+}
+
+fn id<T>(x: T) where T: Copy {
+    return x
+}
+
+fn pair_min<T>(a: T, b: T) -> T where T: Ord {
+    if a < b { return a } else { return b }
+}
+
+fn main() {
+    let m = max(3, 7)
+    if m != 7 { exit(1) }
+
+    let s = add3(1, 2, 3)
+    if s != 6 { exit(2) }
+
+    let v = id(42)
+    if v != 42 { exit(3) }
+
+    let p = pair_min(9, 4)
+    if p != 4 { exit(4) }
+
+    exit(7)
+}

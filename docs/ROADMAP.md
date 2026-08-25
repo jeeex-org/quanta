@@ -1,6 +1,6 @@
 # Quanta ROADMAP — consolidated single source of truth
 
-> **Last updated: 2026-08-25. Current compiler: 0.0.91** (x86-64 ELF emitter,
+> **Last updated: 2026-08-25. Current compiler: 0.0.92** (x86-64 ELF emitter,
 > multi-file tree, Valgrind-clean, self-host `fp=YES`). ARM64 (AArch64) backend
 > is DEFERRED POST-0.1.0 (see #2 schedule below); the working compiler is x86-64 only.
 >
@@ -84,10 +84,10 @@ Every item below is one WIP version: self-hosts (2-stage byte-identical fixed po
 | 0.0.89 | Lang | `bool`/`char`/`byte` as types | ✅ done | `let x: bool`/`char`/`byte` parsed (vtype 6/7/8) + width_mask codegen. char/byte wrap 0..255 (REX.B-correct); bool arithmetic is plain integer (true+true==2). bool_char_byte_types_test.quanta gates it. |
 | 0.0.90 | Lang | `as` cast | ✅ done | `x as T` width cast. Root cause: `as` is lexed TT_AS (36), not TT_KEY, so the old parse_as loop (`peek()==TT_KEY`) NEVER fired — the cast was a silent no-op (rc=112 / dropped control flow). Fixed to loop on `peek()==TT_AS`; truncation emitted as IR_BAND with the width mask (IR_MOV+tag alone got copy-propagated away, losing the mask). Covers u8/u16/u32/char/byte/usize; usize/signed are identity. as_cast_test.quanta gates it. |
 | 0.0.91 | Lang | `usize`/`u32`/`u64` full type keywords | ✅ done | Type annotations `let x: usize/u32/u64` parsed (vtype 5/3/4) since 0.0.89; verified full semantics: u32 wraps at 2^32, u64/usize are full 64-bit (no 2^32 wrap), `as` casts to/from all three behave correctly. usize_u32_u64_types_test.quanta gates it. No code change vs 0.0.90 — prior ROADMAP row marked these lexed-only was stale; this release confirms + locks them with a dedicated regression test. |
-| 0.0.92 | Lang | `raw` / `volatile` | ❌ lexed-only | Parse pointer/volatile qualifiers; codegen. |
-| 0.0.92 | Lang | typed array/slice `T[]` | ❌ untyped only | Parse `let a: i64[]`; bound-checked access. |
-| 0.0.93 | Lang | range `..` expression | ❌ | Standalone `a..b` range value; feed `for-range`. |
-| 0.0.94 | Lang | `where` clause | ❌ lexed-only | Parse `fn f<T>(x:T) where T: Num`; elide today, hook for 0.1.0. |
+| 0.0.92 | Lang | `raw`/`volatile` qualifiers | ✅ done | `raw` (`*u64`,`*mut u64`) type annotations + deref/store already worked (verified). `volatile` was a SILENT NO-OP: lexed TT_VOLATILE (34) but parse guarded on `TT_KEY&&ktext==39` (never matched) → dropped the binding AND following control flow; also IR_VOLATILE_LOAD/STORE codegen was missing the MOV opcode byte (just ModRM) and the store used a reversed a0/a1. Fixed all three; volatile load+store+if verified, 129/129 gate + valgrind/fuzz green. |
+| 0.0.107 | Lang | typed array/slice `T[]` | ❌ untyped only | Parse `let a: i64[]`; bound-checked access. |
+| 0.0.94 | Lang | range `..` expression | ❌ | Standalone `a..b` range value; feed `for-range`. |
+| 0.0.93 | Lang | `where` clause | ✅ done | `fn f<T>(x:T) where T: Trait` parsed and ELIDED (constraints not yet enforced — function compiles/runs normally). Verified with `->` return type, multiple comma predicates `where A: Num, A: Copy`, without return type, and trait bounds used in body. where_clause_test.quanta gates it. |
 | 0.0.95 | Lang | `move` / `ref` / `mut` | ❌ tokens reserved | Parse ownership sigils; track in symbol table (enforce at 0.1.0 borrow-check). |
 | 0.0.96 | Lang | `String` real type | ❌ byte-buffer only | Promote `string` to first-class type with length-aware ops. |
 | 0.0.97 | Lang | try/catch | ❌ panic+`?` only | Parse `try/catch`; unwind to handler. |
@@ -163,18 +163,13 @@ Why post-0.1.0: the ARM64 backend is a new backend; shipping it while x86 debt
 remains would violate the debt-first rule and split correctness effort.
 Qualification evidence is gathered AFTER the core is complete, not before.
 
-### Current status (0.0.91)
+### Current status (0.0.93)
 
-**0.0.91 (promoted stable seed):** Core B — `usize`/`u32`/`u64` full type keywords.
-`let x: usize/u32/u64` are parsed (vtype 5/3/4) and carry correct width semantics:
-`u32` wraps at 2^32, `u64`/`usize` are full 64-bit (no 2^32 wrap), and `as` casts to/from
-all three behave correctly (verified: `5e9 as u32` → 705032704; `as u64`/`as usize` identity).
-The prior ROADMAP row marked these "lexed-only" — that was stale; the code already
-implemented them. This release confirms and locks them with `usize_u32_u64_types_test.quanta`
-(rc=7). No compiler-code change vs 0.0.90 (byte-identical fixpoint). Suite 127 → 128, all
-GREEN (functional + security + performance). Extra CI green: valgrind clean, 150-iter fuzz
-0 crashes. Self-host fixpoint preserved (A==B==C byte-identical). The 0.0.91 golden
-(`compiler/0.0.90/bin/x86/qc`, rebuilt and re-promoted) is the stable seed for 0.0.92.
+**0.0.93 (promoted stable seed):** Lang — `where` clause.
+- `fn f<T>(x:T) where T: Trait` is parsed and ELIDED: the constraint predicates are consumed and ignored (not yet enforced at 0.1.0 borrow-check/monomorph). The function compiles and runs normally with the `where` clause present.
+- Verified shapes: `->` return type (`where T: Num`), multiple comma predicates (`where A: Num, A: Copy`), no return type (`where T: Copy`), and trait bounds actually used in the body (`where T: Ord` with `<`/`>` comparisons). All reach exit(7).
+- Regression: `where_clause_test.quanta` (rc=7) covers all four shapes.
+- No compiler-code change vs 0.0.92 (the `where` keyword was already lexed TT_WHERE and the signature scanner already tolerated it — the prior ROADMAP row marking it lexed-only was stale). Suite 129 → 130, all GREEN. Extra CI green: valgrind clean, 100-iter fuzz 0 crashes. Fixpoint A==B==C byte-identical (md5 `448bf5ff…`). The 0.0.93 golden (`compiler/0.0.92/bin/x86/qc`) is the stable seed for 0.0.94.
 
 **0.0.90 (prior stable seed):** Core B — `as` width cast.
 type keywords. Fixed silent-wrong mask bug (REX.B for r8-r15 + const-fold wrap).

@@ -50,17 +50,17 @@ exist as files but are excluded from the gate per the "core only until 0.1.0" ru
 | interface | 24 | 🟡 partial | ✅ gate | trait_test.quanta / trait_test2.quanta / trait_min.quanta (rc=10, in gate); dispatch via trait methods |
 | impl | 25 | 🟡 partial | ✅ gate | trait methods exercised (struct_methods_test.quanta, rc=151) |
 | trait | 26 | 🟡 partial | ✅ gate | trait_test.quanta (rc=10, in gate); method dispatch works |
-| where | 27 | ❌ todo | ❌ none | lexed, unparsed |
+| where | 27 | ✅ done (0.0.93) | ✅ gate | `fn f<T>(x:T) where T: Trait` parsed + ELIDED (constraints not yet enforced). Verified: `->` ret type, multi-predicate `where A: Num, A: Copy`, without ret type, trait bounds in body. where_clause_test.quanta (rc=7) gates it. |
 | Option/Some/None | 28/29/30 | ✅ done | ✅ gate | option_test.quanta / option_simple.quanta / option_ctor.quanta / option_tuple.quanta (rc=42, in gate) |
 | Result/Ok/Err | 31/32/33 | ✅ done | ✅ gate | result_test.quanta (rc=49, in gate) |
 | ref | 34 | ❌ todo | ❌ none | lexed, unparsed |
 | mut | 35 | ✅ done (0.0.76) | ✅ gate | mut_basic.quanta (rc=10). Mutable local binding |
 | move | 36 | ❌ todo | ❌ none | lexed, unparsed |
 | String | 37 | ❌ todo | ❌ none | lexed, unparsed. Keyword is case-insensitive since 0.0.78 (`string` == `String`) |
-| as | 41 | ❌ todo | ❌ none | lexed, unparsed |
-| raw | 38/52 | ❌ todo | ❌ none | lexed, unparsed |
+| as | 41 | ✅ done (0.0.90) | ✅ gate | `x as T` width cast (IR_BAND mask); usize/signed identity. as_cast_test.quanta gates it. |
+| raw | 38/52 | ✅ done (0.0.90) | ✅ gate | `*u64`/`*mut u64` type annotation + deref/store; raw_ptr_test(s) gate it. |
 | asm | 40/53 | ✅ done | ✅ gate | asm!("hex bytes") -> IR_ASM raw machine-code emit (method.quanta:261); asm_test.quanta (rc=42, in gate) |
-| volatile | 39/54 | ❌ todo | ❌ none | lexed, unparsed |
+| volatile | 39/54 | ✅ done (0.0.92) | ✅ gate | `volatile *p` (load) and `volatile *p = v` (store) through raw pointers. Was a SILENT NO-OP (lexed TT_VOLATILE 34, parse guarded on TT_KEY — never matched → dropped binding + following control flow); fixed to parse on token type + route at statement level; IR_VOLATILE_LOAD/STORE codegen fixed (MOV opcode + a0/a1 order). volatile_ptr_test.quanta (rc=7) gates it. |
 | usize | 42/48 | ✅ done (0.0.91) | ✅ gate | type annotation parsed (vtype 5); full 64-bit, no 2^32 wrap; `as usize` is identity |
 | u8 | 44 | ✅ done | ✅ gate | width-tagged type; add/sub/mul wrap via vreg_type + width_mask (REX.B-correct for r8-r15) |
 | u16 | 45 | ✅ done | ✅ gate | width-tagged type; add/sub/mul wrap via vreg_type + width_mask (REX.B-correct for r8-r15) |
