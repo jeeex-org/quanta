@@ -70,10 +70,55 @@ SEQUENCING is the contract, not the literal numbers.
 | SIMPLE-SURFACE | 0.0.56 | **Simplified syntax landed**: `fn` keyword optional (bare `name(){}` works everywhere, `init()`/`main()` bare OK), `let` optional (bare `name = expr` = local/global), `return` optional (last-expr auto-returns), condition parens optional, `${name}` global / `$[]` local explicit sigils (bare + inside-string interpolation). Goal: bash-like, extremely simple surface. Docs (README/SYNTAX/SPEC) + test_suites + security script synced. |
 | P2 builtins | 0.0.55–0.0.60 | float cmp ✅(0.0.55), proc/env ✅(0.0.55), stdin ✅(0.0.55), fs meta ✅(0.0.55 — path-string remap fixed), string ops, math ✅(sqrt/floor/ceil/abs; sin/cos/tan/pow/log/min/max TODO), atomics, net, introspection ✅(abort/debugbreak), random ✅(getrandom), **`$$(cmd)` external-command substitution (0.0.57)** — `unsafe`-gated runtime `fork`/`execve`/`pipe`/`wait4` via the raw `syscall()` builtin (no libc); `$$(str)`→`/bin/sh -c`, `$$(arr)`→direct `execve` (no shell, injection-safe). Returns `CmdResult{stdout,stderr,status}`. |
 | P3 language | 0.0.61–0.0.85 | **float literals ✅(0.0.61)**, **float-arg-to-builtin ✅(0.0.62: f2i/fadd/fsub/fmul/fdiv read float vregs correctly)**, **user enums ✅(0.0.63: qualified+bare variant resolution, explicit tags, match)**, **modules ✅(0.0.64: mod Name { fn ... } + Mod.fn() qualified calls)**, **closure literals ✅(0.0.65: `|x,y| { expr }` → [codeptr, env] tuple, callable directly or via fn-typed param)**, **array push fix ✅(0.0.66: IR_CLOSURE/IR_APUSH opcode collision silently zeroed every pushed element)**, **closure captures ✅(0.0.67: free vars of the enclosing fn captured by value into a heap env array)**, **user-fn-beats-builtin ✅(0.0.68: was enforced in only 2 of 86 builtin branches, so a user `fn abs` was silently hijacked)**, **match guards ✅(0.0.69: `n if cond => expr` — the `if` was never consumed, so guarded arms silently yielded 0)**; remaining: **`big` keyword/type** (library convention today; needs `TT_BIG` + op-overload), generic monomorphisation (type params are erased today), ref/ref-return/borrow (needs borrow-checking), and op-overload (needs trait vtable dispatch) — all 0.1.0 type-system work. **Differentiation libs (math/physics/crypto/blockchain/quantum/AI mandate):** `crypto`/`quantum`/`linalg`/`math` shipped but lack dedicated gate tests (`big_test`/`quantum_test`/`linalg_test` needed); `chain`/`secure`/`ai`/`physics` not yet in code (native lib track, post-0.0.86). |
-| **P4 tooling** | **0.0.90** | **Quanta-native code-writing tool** (edit Quanta source reliably without external scripting — the user's stated goal) |
+| **P4 tooling** | **POST-0.1.0** | **Quanta-native code-writing tool** (edit Quanta source reliably without external scripting — the user's stated goal; deferred POST-0.1.0, no version reserved) |
 | **0.1.0** | 0.1.0 | Core + builtins complete → std/lib resumes; borrow-checking target for #1 green; **PTY layer for interactive `$$()` (vi/ssh/top)** |
 
-**0.0.90 is RESERVED for the code-writing tool.** Nothing else takes it.
+### Outstanding cores — per-version sequencing (0.0.87 → 0.1.0+)
+
+Every item below is one WIP version: self-hosts (2-stage byte-identical fixed point) and gate-green before promotion. Sequence is lowest-risk-first; the code-writing tool is placed last, after all language cores are closed.
+
+| Version | Core | Item | Status today | Work |
+|---------|------|------|--------------|------|
+| 0.0.87 | Lang | Gate the std libs | 🟡 file-only | Add `std_crypto_test`, `std_quantum_test`, `std_linalg_test`, `std_vec_test`, `std_fs_test`, `std_math_test` to EXPECTED.tsv; verify green. |
+| 0.0.88 | Lang | `u8`/`u16` type keywords | ❌ (mask builtins exist) | Parse `let x: u8`/`u16` as width-tagged type; codegen width. |
+| 0.0.89 | Lang | `bool`/`char`/`byte` as types | ❌ (keyword+values done) | Parse `let x: bool`/`char`/`byte` as type annotation. |
+| 0.0.90 | Lang | `as` cast | ❌ lexed-only | Parse `x as T`; emit width conversion. |
+| 0.0.91 | Lang | `raw` / `volatile` | ❌ lexed-only | Parse pointer/volatile qualifiers; codegen. |
+| 0.0.92 | Lang | typed array/slice `T[]` | ❌ untyped only | Parse `let a: i64[]`; bound-checked access. |
+| 0.0.93 | Lang | range `..` expression | ❌ | Standalone `a..b` range value; feed `for-range`. |
+| 0.0.94 | Lang | `where` clause | ❌ lexed-only | Parse `fn f<T>(x:T) where T: Num`; elide today, hook for 0.1.0. |
+| 0.0.95 | Lang | `move` / `ref` / `mut` | ❌ tokens reserved | Parse ownership sigils; track in symbol table (enforce at 0.1.0 borrow-check). |
+| 0.0.96 | Lang | `String` real type | ❌ byte-buffer only | Promote `string` to first-class type with length-aware ops. |
+| 0.0.97 | Lang | try/catch | ❌ panic+`?` only | Parse `try/catch`; unwind to handler. |
+| 0.0.98 | Lang | operator overloading | ❌ | Trait-vtable dispatch for `op` fns (needs trait dispatch from P3). |
+| 0.0.99 | Lang | generics monomorphisation | 🟡 type-erased | Instantiate `map<T,U>` per type-args; compile-time checks. |
+| 0.100 | Builtins | float math (sin/cos/tan/pow/log/min/max) | ❌ | Add builtins; gate `std_math_test`. |
+| 0.101 | Builtins | string ops (strcat/substr/strcmp/str_split/utf8) | ❌ | Add builtins; gate `std_str_test`. |
+| 0.102 | Builtins | atomics (load/store/add/cmpxchg+futex) | ❌ | Add builtins; gate `atomic_test`. |
+| 0.103 | Builtins | networking (socket/connect/bind/listen/accept) | ❌ | Add builtins; gate `net_test`. |
+| 0.104 | Builtins | random `rand` | ❌ getrandom only | Add `rand` builtin; gate `rand_test`. |
+| 0.105 | Builtins | bit/byte extras (parity/bitfield/per-size swap) | ❌ | Add builtins. |
+| 0.106 | Builtins | intrinsics (prefetch/fence/branch hints) | ❌ | Add builtins. |
+| 0.107 | Builtins | fs metadata fix (stat/unlink/mkdir/chdir/rename) | 🟡 BROKEN | Fix path-string remap; gate. |
+| 0.108 | Builtins | introspection stack-trace | ❌ | Add `abort_test` stack trace. |
+| 0.109 | Memory | stack unwind / destructors / RAII | ❌ defer manual | Scope-exit cleanup. |
+| 0.110 | Memory | real allocator (free-list/GC) | ❌ bump mmap only | Free-list allocator replacing raw mmap. |
+| 0.111 | FFI | extern "C" PLT/GOT | 🟡 partial | Full dynamic-link symbol resolution. |
+| 0.112 | Lang | trait/impl dispatch completion | 🟡 partial | Complete vtable dispatch for interface/impl/trait. |
+| 0.113 | Lang | `big` keyword/type | 🟡 lib convention | `TT_BIG` + op-overload routing `a+b`→`big_add`; gate `big_test`. |
+| — | POST-0.1.0 | borrow-checking (ref/mut/move enforce) | ❌ | Compile-time memory safety (#1 green). |
+| — | POST-0.1.0 | `chain` lib (Merkle/signed-tx/UTXO/Block) | ❌ not in code | Differentiation mandate. |
+| — | POST-0.1.0 | `secure` lib (capability I/O, constant-time) | ❌ not in code | Differentiation mandate. |
+| — | POST-0.1.0 | `ai` lib (tensor ops + inference) | ❌ not in code | Differentiation mandate. |
+| — | POST-0.1.0 | `physics` lib (ODE/PDE solvers) | ❌ not in code | Differentiation mandate. |
+| — | POST-0.1.0 | ARM64 (AArch64) backend | ❌ x86 only | Second backend (independent impl route). |
+| — | POST-0.1.0 | **Quanta-native code-writing tool** | ❌ | Last — after all cores closed. Edit Quanta source reliably without external scripting. |
+
+**Version-number rule:** literal numbers above are the plan; the SEQUENCING (order + one-feature-per-version + fixpoint-verified) is the contract. If a version needs splitting, the number increments — never skipped, never reused. 0.0.90 is **not reserved**; it is simply the `as`/`raw`/`volatile` cluster above. The code-writing tool is sequenced last, after every core item.
+
+**POST-0.1.0 (no version reserved for any):** borrow-checking; `chain`/`secure`/`ai`/`physics` libs; ARM64 backend; Quanta-native code-writing tool (last).
+
+
 
 > **Re-baselined 2026-08-23.** P3 was 0.0.61–0.0.71 with P4 tooling at 0.0.72,
 > but 6 features remained and only 2 slots were left (0.0.70–0.0.71) — six
@@ -83,7 +128,7 @@ SEQUENCING is the contract, not the literal numbers.
 > silent-wrong-answer in the core is never deferred. Version numbers are
 > unbounded, so the window was widened rather than the features compressed:
 > P3 → 0.0.61–0.0.85 (6 remaining features at 0.0.70+, plus slack for the
-> correctness fixes that keep surfacing), P4 tooling → 0.0.90. The SEQUENCING is
+> correctness fixes that keep surfacing). The SEQUENCING is
 > unchanged, which is the actual contract.
 
 ### #1 / #2 standards status
