@@ -62,8 +62,8 @@ exist as files but are excluded from the gate per the "core only until 0.1.0" ru
 | asm | 40/53 | ✅ done | ✅ gate | asm!("hex bytes") -> IR_ASM raw machine-code emit (method.quanta:261); asm_test.quanta (rc=42, in gate) |
 | volatile | 39/54 | ❌ todo | ❌ none | lexed, unparsed |
 | usize | 42/48 | 🟡 partial | ✅ gate | lexed; used as size type |
-| u8 | 44 | ❌ todo | ❌ none | lexed, unparsed (mask builtin u8 exists) |
-| u16 | 45 | ❌ todo | ❌ none | lexed, unparsed |
+| u8 | 44 | ✅ done | ✅ gate | width-tagged type; add/sub/mul wrap via vreg_type + width_mask (REX.B-correct for r8-r15) |
+| u16 | 45 | ✅ done | ✅ gate | width-tagged type; add/sub/mul wrap via vreg_type + width_mask (REX.B-correct for r8-r15) |
 | u32 | 46 | 🟡 partial | ✅ gate | u32 mask builtin exists |
 | u64 | 47 | 🟡 partial | ✅ gate | u64 mask builtin exists |
 | bool | 49 | ✅ done | ✅ gate | logical_keywords.quanta (true=1, false=0). NOTE: this is the *keyword + true/false values*; using `bool` as a *type annotation* (`let x: bool`) is not yet parsed — see §B |
@@ -88,7 +88,7 @@ native type keyword parsing).
 | f64 | ✅ done | ✅ gate | float_test.quanta (rc=159), simple_fadd.quanta (rc=7) |
 | usize | 🟡 partial | ✅ gate | lexed; used as size type |
 | u32 / u64 (masks) | 🟡 partial | ✅ gate | u32/u64 builtins; no native type keyword |
-| u8 / u16 | ❌ todo | ❌ none | only mask builtins conceptually; type-annotation parsing not done |
+| u8 / u16 | ✅ done | ✅ gate | `let x: u8`/`u16` parsed (parse_let width tag) + width_mask codegen; mixed-width + const-fold wrap verified |
 | bool (as type) | ❌ todo | ❌ none | keyword + true/false values done (§A); `let x: bool` not yet parsed |
 | char (as type) | ❌ todo | ❌ none | keyword done (§A); `let x: char` not yet parsed |
 | byte (as type) | ❌ todo | ❌ none | keyword done (§A); `let x: byte` not yet parsed |

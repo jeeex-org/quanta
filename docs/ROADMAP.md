@@ -79,8 +79,8 @@ Every item below is one WIP version: self-hosts (2-stage byte-identical fixed po
 
 | Version | Core | Item | Status today | Work |
 |---------|------|------|--------------|------|
-| 0.0.87 | Lang | Gate the std libs | 🟡 file-only | Add `std_crypto_test`, `std_quantum_test`, `std_linalg_test`, `std_vec_test`, `std_fs_test`, `std_math_test` to EXPECTED.tsv; verify green. |
-| 0.0.88 | Lang | `u8`/`u16` type keywords | ❌ (mask builtins exist) | Parse `let x: u8`/`u16` as width-tagged type; codegen width. |
+| 0.0.87 | Lang | Gate the std libs | ✅ done | Add `std_crypto_test`, `std_quantum_test`, `std_linalg_test`, `std_vec_test`, `std_fs_test`, `std_math_test` to EXPECTED.tsv; verify green. |
+| 0.0.88 | Lang | `u8`/`u16` type keywords | ✅ done | `let x: u8`/`u16` parsed + width_mask codegen. Fixed silent-wrong mask bug: REX.B for r8-r15 result regs + const-fold wrap. mixed_width_mask_test.quanta gates it. |
 | 0.0.89 | Lang | `bool`/`char`/`byte` as types | ❌ (keyword+values done) | Parse `let x: bool`/`char`/`byte` as type annotation. |
 | 0.0.90 | Lang | `as` cast | ❌ lexed-only | Parse `x as T`; emit width conversion. |
 | 0.0.91 | Lang | `raw` / `volatile` | ❌ lexed-only | Parse pointer/volatile qualifiers; codegen. |
@@ -164,7 +164,7 @@ Qualification evidence is gathered AFTER the core is complete, not before.
 
 ### Current status (0.0.87)
 
-**0.0.87 (this release):** std-lib gating — the 7 existing `std_*` test files
+**0.0.87 (promoted stable seed):** std-lib gating — the 7 existing `std_*` test files
 (`std_crypto_test`, `std_fs_test`, `std_lib_test`, `std_map_test`,
 `std_math_test`, `std_str_test`, `std_vec_test`) are now in the gate
 (EXPECTED.tsv), raising the suite from 117 → 124 tests, all GREEN (0 compile-fail;
@@ -174,14 +174,23 @@ FEATURES.md §J markers updated (crypto/math/vec/fs/map/str → ✅ gate; quantu
 linalg remain ❌ none — no test file on disk). This closes the "file-only" gap
 for shipped std libs; it is doc/test work, NOT a core-feature implementation.
 
-**0.0.86 (promoted stable seed):** self-hosting native compiler (byte-identical
+**0.0.88 (promoted stable seed):** first real core-feature — `u8`/`u16` as width-tagged
+type keywords (`let x: u8`/`u16` parsed in parse_let, width mask in width_mask).
+Found and FIXED a silent-wrong-answer bug: when a width-typed ADD/SUB/MUL result
+lands in an extended register (r8–r15, which happens once low registers are
+occupied by preceding vars), the mask emit omitted REX.B and silently masked the
+wrong register; const-folded width arithmetic also dropped the wrap. Both fixed;
+`mixed_width_mask_test.quanta` (rc=7) gates it. Suite 124 → 125, all GREEN.
+Self-host fixpoint preserved (B==C byte-identical, A==C drift-identical).
+
+**0.0.86 (prior stable seed):** self-hosting native compiler (byte-identical
 fixpoint), intent-level syntax, primitive layer (syscalls, mmap, file I/O, floats,
 closures, generics, big-int), stdlib seeds for crypto/quantum/linalg/math. Verified
 stable seed for all subsequent work; the prior seed (0.0.85) remains one patch
 behind per §9.
 
-**Next:** 0.0.88 begins real core-feature implementation (Core B: `u8`/`u16` as
-type keywords). See "Outstanding cores — per-version sequencing" below.
+**Next:** 0.0.89 continues Core B (`bool`/`char`/`byte` as type annotations).
+See "Outstanding cores — per-version sequencing" below.
 
 Shipped (x86-64 only; ARM64 deferred POST-0.1.0): a **documentation and
 version-consistency release** — every "1.0" version reference across the docs was

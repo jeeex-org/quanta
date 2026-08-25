@@ -85,6 +85,17 @@ fn constfold(i, op, r0, a0, a1) {
         if op==IR_ADD { f=v0+v1 }
         else if op==IR_SUB { f=v0-v1 }
         else if op==IR_MUL { f=v0*v1 }
+        // P6.1b FIX: width-typed unsigned arithmetic must wrap/truncate even
+        // when const-folded. Without this, e.g. `let p:u16=65000; let q:u16=5000;
+        // p+q` folds to the full 64-bit 70000 (losing the 0xFFFF wrap to 744).
+        if op==IR_ADD || op==IR_SUB || op==IR_MUL {
+            let wvt = 0
+            if a0 < vreg_n { wvt = r64(vreg_type + a0*8) }
+            if wvt < 1 || wvt > 3 { if a1 < vreg_n { wvt = r64(vreg_type + a1*8) } }
+            if wvt == 1 { f = f & 0xFF }
+            else if wvt == 2 { f = f & 0xFFFF }
+            else if wvt == 3 { f = f & 0xFFFFFFFF }
+        }
         else if op==IR_BAND { f=v0&v1 }
         else if op==IR_BOR { f=v0|v1 }
         else if op==IR_BXOR { f=v0^v1 }
@@ -114,9 +125,16 @@ fn width_mask(o0, o1, rd) {
         if o1 < vreg_n { vt = r64(vreg_type + o1*8) }
     }
     if vt >= 1 && vt <= 3 && rd != 0 {
-        if vt == 1 { eb(72); eb(129); eb(224 + (rd%8)); ei(0xFF) }
-        else if vt == 2 { eb(72); eb(129); eb(224 + (rd%8)); ei(0xFFFF) }
-        else if vt == 3 { eb(72); eb(193); eb(224 + (rd%8)); eb(32); eb(72); eb(193); eb(232 + (rd%8)); eb(32) }
+        // modrm: mod=11, reg=100 (AND), rm=result reg. The result may be an
+        // extended register (r8-r15) when low registers are occupied, which
+        // requires REX.B. Without it the mask encodes onto the wrong register
+        // (e.g. rdx instead of r10) and the truncation is silently lost.
+        let rm = 224 + (rd % 8)
+        let rex = 72
+        if rd >= 8 { rex = rex + 1 }
+        if vt == 1 { eb(rex); eb(129); eb(rm); ei(0xFF) }
+        else if vt == 2 { eb(rex); eb(129); eb(rm); ei(0xFFFF) }
+        else if vt == 3 { eb(rex); eb(193); eb(rm); eb(32); eb(rex); eb(193); eb(232 + (rd%8)); eb(32) }
     }
 }
 
