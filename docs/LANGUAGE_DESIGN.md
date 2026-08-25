@@ -2,13 +2,14 @@
 
 Quanta is a programming language you can pick up quickly. You write what you want
 in short, plain code, and Quanta catches mistakes before they break anything. It
-speaks the language of many fields — science, music, finance,
-cryptography — and the same program runs on your laptop, in a browser, on a small
-device, or across many machines, with one command.
+reads your program as structure it can check from the first line, and it speaks
+the language of many fields — a scientist writes `laplace(potential)`, a musician
+writes notes, a cryptographer writes ciphers — in the words each already uses.
 
 The goal: a complete language where you rarely think about memory or safety
 because Quanta handles it; where every field has its own natural notation; and
-where one piece of code runs everywhere without rewrites.
+where your program is something the compiler checks as you write, so mistakes are
+caught early instead of at runtime.
 
 ---
 
@@ -20,8 +21,8 @@ where one piece of code runs everywhere without rewrites.
   setup file to learn — one command and you are running.
 - **Builds itself.** The Quanta compiler is written in Quanta. The same language
   that builds your app builds the tools around it.
-- **Runs anywhere.** One program works on your computer, in a browser, on a tiny
-  device, or spread across many machines — you don't rewrite it for each.
+- **One program, many places.** Write it once; Quanta packs the same program to
+  run on your laptop, in a web page, or on a small device.
 - **Speaks many fields.** Science, music, finance, and cryptography each get their
   own natural way of writing, in words their experts already use.
 - **Looks after memory.** Quanta handles memory and safety for you; if you truly
