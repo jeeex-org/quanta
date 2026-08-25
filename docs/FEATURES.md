@@ -228,14 +228,14 @@ it; 🟡 file-only = a test file exists on disk but is NOT in the gate; ❌ none
 | Library | Status | Test? | Notes / test file |
 |---|---|---|---|
 | `big` (arbitrary-precision int) | ✅ done | ❌ none | 4 stages shipped (ADD/SUB/MUL, DIV/MOD, SHL/SHR, decimal print) + literal auto-promotion. `lib/std/big.quanta`. No dedicated gate test (verified ad-hoc vs Python; `big_test.quanta` NOT yet written). `big` is a library convention (pointer-in-vreg), NOT yet a first-class `big` keyword/type. |
-| `crypto` (SHA-256/HMAC/AES/CSPRNG) | ✅ done | 🟡 file-only | std_crypto_test.quanta exists on disk but is NOT in the gate. 643 lines, 21 fns. |
+| `crypto` (SHA-256/HMAC/AES/CSPRNG) | ✅ done | ✅ gate | std_crypto_test.quanta (rc=3, gated at 0.0.87). 643 lines, 21 fns. |
 | `quantum` (Keccak/SHA3/SHAKE) | ✅ done | ❌ none | lib/std/quantum.quanta (240 lines, 8 fns). No dedicated test file. |
 | `linalg` (matmul/transpose/det/inverse/vectors) | ✅ done | ❌ none | lib/std/linalg.quanta (363 lines, 25 fns). No dedicated test file. |
-| `math` (sqrt/floor/ceil/abs/sin/cos/tan/pow/log/min/max) | 🟡 partial | 🟡 file-only | std_math_test.quanta exists on disk but NOT in gate. sqrt/floor/ceil/abs shipped as builtins (§F); sin/cos/tan/pow/log/min/max TODO. |
-| `map` | ✅ done | ✅ gate | test_mmap.quanta / mmap1.quanta (both gated). std_map_test.quanta also exists on disk but is NOT in the gate. |
-| `str` (string ops) | ✅ done | ✅ gate | string_keyword_case.quanta (gated). std_str_test.quanta also exists on disk but is NOT in the gate. |
-| `vec` | ✅ done | 🟡 file-only | std_vec_test.quanta exists on disk but NOT in gate. |
-| `fs` (file system) | ✅ done | 🟡 file-only | std_fs_test.quanta exists on disk but NOT in gate. |
+| `math` (sqrt/floor/ceil/abs/sin/cos/tan/pow/log/min/max) | 🟡 partial | ✅ gate | std_math_test.quanta (rc=19, gated at 0.0.87; covers sqrt/floor/ceil/abs + pow/log/min/max/gcd/lcm). sin/cos/tan still TODO (builtins row). |
+| `map` | ✅ done | ✅ gate | test_mmap.quanta / mmap1.quanta (both gated); std_map_test.quanta also gated at 0.0.87 (rc=6). |
+| `str` (string ops) | ✅ done | ✅ gate | string_keyword_case.quanta (gated); std_str_test.quanta also gated at 0.0.87 (rc=13). |
+| `vec` | ✅ done | ✅ gate | std_vec_test.quanta (rc=8, gated at 0.0.87). |
+| `fs` (file system) | ✅ done | ✅ gate | std_fs_test.quanta (rc=9, gated at 0.0.87). NOTE: stat/unlink/mkdir/chdir/rename are still BROKEN (0.107); this test covers the working write/read round-trip only. |
 | `io` (file IO) | ✅ done | ✅ gate | file_io.quanta (in gate). |
 | `chain` (blockchain: Merkle/signed-tx/UTXO/Block) | ❌ todo | ❌ none | Not in code. Part of the differentiation mandate (math/physics/crypto/blockchain/quantum/AI). |
 | `secure` (capability I/O, constant-time) | ❌ todo | ❌ none | Not in code. |

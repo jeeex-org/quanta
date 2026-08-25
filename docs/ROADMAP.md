@@ -162,7 +162,26 @@ Why post-0.1.0: the ARM64 backend is a new backend; shipping it while x86 debt
 remains would violate the debt-first rule and split correctness effort.
 Qualification evidence is gathered AFTER the core is complete, not before.
 
-### Current status (0.0.79)
+### Current status (0.0.87)
+
+**0.0.87 (this release):** std-lib gating — the 7 existing `std_*` test files
+(`std_crypto_test`, `std_fs_test`, `std_lib_test`, `std_map_test`,
+`std_math_test`, `std_str_test`, `std_vec_test`) are now in the gate
+(EXPECTED.tsv), raising the suite from 117 → 124 tests, all GREEN (0 compile-fail;
+security + performance GREEN). Compiler source unchanged — the 0.0.87 golden is
+the byte-identical 0.0.86 binary (`a85aeacb…`), self-host fixpoint preserved.
+FEATURES.md §J markers updated (crypto/math/vec/fs/map/str → ✅ gate; quantum/
+linalg remain ❌ none — no test file on disk). This closes the "file-only" gap
+for shipped std libs; it is doc/test work, NOT a core-feature implementation.
+
+**0.0.86 (promoted stable seed):** self-hosting native compiler (byte-identical
+fixpoint), intent-level syntax, primitive layer (syscalls, mmap, file I/O, floats,
+closures, generics, big-int), stdlib seeds for crypto/quantum/linalg/math. Verified
+stable seed for all subsequent work; the prior seed (0.0.85) remains one patch
+behind per §9.
+
+**Next:** 0.0.88 begins real core-feature implementation (Core B: `u8`/`u16` as
+type keywords). See "Outstanding cores — per-version sequencing" below.
 
 Shipped (x86-64 only; ARM64 deferred POST-0.1.0): a **documentation and
 version-consistency release** — every "1.0" version reference across the docs was
