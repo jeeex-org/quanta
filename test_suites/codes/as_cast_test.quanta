@@ -1,0 +1,35 @@
+// 0.0.90 regression: `as` width casts.
+// Verifies that `x as T` truncates to the target width (the cast was
+// previously never parsed — `as` is lexed as TT_AS, not TT_KEY, so the
+// parse_as loop never fired and the cast was a silent no-op).
+fn main() {
+  let big = 70000
+  // u8: 70000 & 0xFF = 112
+  let a = big as u8
+  if a != 112 { exit(201) }
+  // u16: 70000 & 0xFFFF = 4464
+  let b = big as u16
+  if b != 4464 { exit(202) }
+  // u32: 5000000000 mod 2^32 = 705032704
+  let c = 5000000000 as u32
+  if c != 705032704 { exit(203) }
+  // char/byte: byte-width 0..255 (same as u8)
+  let d = big as char
+  if d != 112 { exit(204) }
+  let e = big as byte
+  if e != 112 { exit(205) }
+  // usize / signed: identity (no truncation)
+  let f = big as usize
+  if f != 70000 { exit(206) }
+  // small value, no wrap
+  let g = 300 as u8
+  if g != 44 { exit(207) }
+  // cast of a runtime (non-const) value
+  let h: u32 = 123456
+  let i = h as u16
+  if i != 57920 { exit(208) }   // 123456 & 0xFFFF = 57920
+  // chained cast: u32 -> u8 (double truncation)
+  let j = big as u32 as u8
+  if j != 112 { exit(209) }
+  exit(7)                        // all correct
+}
