@@ -89,9 +89,9 @@ native type keyword parsing).
 | usize | 🟡 partial | ✅ gate | lexed; used as size type |
 | u32 / u64 (masks) | 🟡 partial | ✅ gate | u32/u64 builtins; no native type keyword |
 | u8 / u16 | ✅ done | ✅ gate | `let x: u8`/`u16` parsed (parse_let width tag) + width_mask codegen; mixed-width + const-fold wrap verified |
-| bool (as type) | ❌ todo | ❌ none | keyword + true/false values done (§A); `let x: bool` not yet parsed |
-| char (as type) | ❌ todo | ❌ none | keyword done (§A); `let x: char` not yet parsed |
-| byte (as type) | ❌ todo | ❌ none | keyword done (§A); `let x: byte` not yet parsed |
+| bool (as type) | ✅ done | ✅ gate | `let x: bool` parsed (vtype 6); stored/compared as 0/1; arithmetic is plain integer (true+true==2, not masked) |
+| char (as type) | ✅ done | ✅ gate | `let x: char` parsed (vtype 7); byte-width, wraps 0..255 on arithmetic (REX.B-correct) |
+| byte (as type) | ✅ done | ✅ gate | `let x: byte` parsed (vtype 8); byte-width, wraps 0..255 on arithmetic (REX.B-correct) |
 | float literals (`3.14`) | ✅ done (0.0.61) | ✅ gate | float_test.quanta (`println(3.14)`->`3.140000`); f2i/fadd/... consume float vregs (0.0.62). Verified: `fadd(1.5,2.5)`->4 |
 | string (real type) | ❌ todo | ❌ none | TT_STRING reserved; byte-buffer + print only |
 | struct | ✅ done | ✅ gate | fields + `obj.method` + literal (struct_literal_test.quanta, in gate) |
