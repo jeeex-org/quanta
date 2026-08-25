@@ -1,9 +1,9 @@
 # Quanta — Language Design
 
 Quanta is a programming language engineered to be secure, fast, and flexible,
-with a simple syntax that is easy to learn and remember. Its source is a
-machine-verifiable artifact from the first token, so the same program is clear to
-write, inexpensive to process, and safe to run.
+with a simple syntax that is easy to learn and remember. Its source is a syntax
+tree — a machine-verifiable artifact from the first token, with the compiler as a
+local, scriptable verifier.
 
 *Status note: this is the design target. Quanta's current implementation is
 0.0.86 — a self-hosting native compiler (byte-identical fixpoint) with an
