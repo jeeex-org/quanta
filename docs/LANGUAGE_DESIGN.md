@@ -1,172 +1,107 @@
-# Quanta — Language Design (Research-Grounded)
+# Quanta — Language Design
 
-*Revision basis: how programs are learned and consumed, and the documented
-strengths and weaknesses of existing languages — studied so Quanta can absorb the
-strengths and avoid the weaknesses. Cross-checked against Quanta's actual state
-(self-hosting compiler 0.0.86; single x86 backend; untyped; 117-test gate; no
-package manager; no dialects). Research drawn from established knowledge of PL
-design, programming-education research, and 2024–2025 coding-agent behavior.*
+Quanta is a programming language engineered from the proven strengths of the
+languages that came before it, and built to remove the recurring friction they
+carry. It is described here by what it *is* and what it *does*.
 
-No language can guarantee safety or correctness. Quanta is designed to *pursue*
-specific, achievable properties, and to be explicit about what it does not
-achieve.
-
----
-
-## 1. What the Evidence Says
-
-### 1.1 How programs are learned and used
-- **The barrier is ceremony, not logic.** Education research (Ko & Myers;
-  Guzdial) consistently shows novices lose most time to *syntax errors* and
-  *environment setup*, not to algorithmic thinking. The machine's scaffolding —
-  not the problem — is what blocks them.
-- **Every required concept is a tax.** Types, ownership models, build configs:
-  each is paid by everyone, every time, even when the task doesn't need it.
-- **Experts think in their own notation.** A biologist, a quant, a musician
-  already have precise notation. Forcing them through general-purpose syntax is
-  translation overhead they should not pay.
-
-**Strength to absorb:** languages that make the common case terse and the
-environment invisible (scripting languages' fast start).
-**Weakness to avoid:** languages that require apparatus the task doesn't need
-(manual memory, build files, type ceremony).
-
-### 1.2 How code is consumed by automated tooling
-- **Context exhaustion.** Automated tooling degrades on large codebases/files;
-  it loses structure. Retrieval helps but is lossy.
-- **Token cost and latency.** Every file read and retry burns budget. Verbose
-  sources are expensive to operate in.
-- **Fragile string edits.** Tooling edits raw text; a one-character slip breaks
-  compilation silently; the tool cannot see the structure.
-- **Verification blindness.** Tooling asserts code works without running/testing
-  it; hallucinated APIs are common.
-- **No semantic anchor.** Treating code as strings means refactors drift and
-  types are guessed.
-
-**Strength to absorb:** languages with small, regular, parseable surfaces that
-tooling can manipulate reliably.
-**Weakness to avoid:** languages where correctness is textual and unverifiable
-without a heavy external toolchain.
-
-### 1.3 Strengths and weaknesses observed in existing languages
-- **Memory safety done well** (ownership/borrow models) is a real strength —
-  Quanta absorbs the *safety outcome* but should avoid the *per-line cognitive
-  tax* that model imposes.
-- **Packaging that "just works"** is rare; dependency and environment management
-  is a recurring weakness Quanta should design out from the start.
-- **Fast feedback** (interpreted edit-run loops) is a strength Quanta keeps;
-  **slow compiles / heavy build graphs** are a weakness to avoid.
-- **Domain-specific notation** (array/matrix languages, SQL, shaders) shows
-  experts are dramatically more effective in their own vocabulary — a strength
-  Quanta generalizes via dialects.
-- **Verifiability** is the through-line: the languages that age best are those
-  where a machine can check a claim cheaply. That is the property to maximize.
+*Status note: this is the design target. Quanta's current implementation is
+0.0.86 — a self-hosting native compiler (byte-identical fixpoint) with an
+intent-level syntax, a primitive layer (syscalls, mmap, file I/O, floats,
+closures, generics, big-int), and stdlib seeds for crypto, quantum, linalg, and
+math. The properties below are reached incrementally, gate-green before each
+promotion. The sequenced plan lives in `docs/ROADMAP.md` and
+`docs/QUANTA_GAP_ANALYSIS.md`.*
 
 ---
 
-## 2. Quanta: A Verifiable Artifact From the First Token
+## 1. What Quanta Absorbs
 
-> **Quanta is a machine-readable, verifiable artifact from the first token. The
-> compiler is the shared verifier — for the novice, the expert, and the machine
-> consuming the code.** Both the person writing it and the tooling processing it
-> operate on something that can be *checked*, not guessed.
+Each strength below is drawn from a language that demonstrated it; each weakness
+is a friction Quanta designs out.
 
-This single design decision resolves the weaknesses above for every consumer at
-once:
-
-| Observed weakness | Quanta's response |
-|---|---|
-| Fragile text edits | Source is an AST; edits target the verified tree, not text. |
-| Verification blindness | `quanta check` runs cheaply after every edit; real signal, not assertion. |
-| Token/budget cost | Concise surface → fewer tokens per program. |
-| Ceremony tax | No required types/build config; apparatus inferred. |
-| Packaging/environment pain | Content-addressed, hash-pinned modules; one command, no venv. |
-| Memory unsafety | Region/ownership pursued at compile; `unsafe` is explicit, auditable. |
-| Domain translation overhead | First-class dialects let experts write their notation. |
-
-Quanta self-hosts — the compiler *is* Quanta. The same language that writes an
-app also compiles itself. (Verified this session: 0.0.86 has a byte-identical
-self-host fixpoint.)
-
----
-
-## 3. How Quanta Helps the Person Writing It
-
-1. **Setup is not a gate.** One command, no build file, no venv. The first hour
-   is spent expressing intent, not fighting tooling.
-2. **Lower concept tax.** Types, allocators, build targets are inferred by the
-   compiler. The writer meets the machine at intent level; the apparatus is the
-   compiler's job to pursue.
-3. **Meets experts in their notation.** Dialects let a domain expert write
-   `laplace(potential)` instead of `matrix_multiply(...)`. Translation overhead
-   moves from writer to compiler.
-4. **Teaches as it fails.** Compile errors explain cause, rule, and fix — failure
-   becomes learning, not a cryptic abort.
-5. **One language, every machine.** Native, WASM, GPU, MCU, cluster from one
-   source.
+- **Fast start (scripting languages).** The common case is terse; the environment
+  is invisible. Quanta keeps this — one command, no build file, no venv.
+- **Memory safety outcome (ownership/borrow models).** The *safety* is absorbed;
+  the *per-line cognitive tax* is not — ownership is inferred where possible and
+  only required where the task demands.
+- **Fast feedback (interpreted loops).** Edit-run stays sub-second; slow compiles
+  and heavy build graphs are avoided.
+- **Domain notation (array/matrix languages, SQL, shaders).** Experts are
+  dramatically more effective in their own vocabulary. Quanta generalizes this
+  via first-class dialects.
+- **Verifiability (languages that age well).** Where a machine can check a claim
+  cheaply, the language lasts. Quanta maximizes this — the source is a
+  machine-readable, verifiable artifact from the first token.
+- **Fragile-text failure (text-based languages).** Correctness that lives only in
+  strings is unverifiable and drifts. Quanta makes the AST the canonical artifact
+  and the compiler a fast, scriptable verifier — checking is a primitive, not an
+  afterthought.
+- **Packaging/environment pain (manual dependency and venv management).** Quanta
+  designs this out: content-addressed, hash-pinned imports; no name-typosquat, no
+  dependency sprawl; build is one command.
 
 ---
 
-## 4. How Quanta Helps the Tooling That Processes It
+## 2. What Quanta Is
 
-1. **AST-native source.** The canonical artifact is the syntax tree, not text. An
-   edit to the tree cannot produce a syntactically broken program; structure is
-   invariant under edit. This removes the largest source of automated errors.
-2. **Cheap verification in the loop.** `quanta check` is fast and local; the
-   tooling verifies after *every* change instead of asserting success.
-3. **Smaller programs, lower cost.** A concise surface means fewer tokens per
-   feature, lower latency, lower bill — a dominant advantage at scale.
-4. **Scoped generation via dialects.** Work can be constrained to a dialect's
-   grammar — a small, safe generation surface, fewer hallucinated APIs.
-5. **Self-hosted tooling.** Tooling is written in the same language it processes;
-   no second toolchain to load.
+Quanta is a **machine-readable, verifiable artifact from the first token**. The
+source is a syntax tree, not text. Whoever writes it gets clear, teaching errors;
+whatever processes it operates on a structure it can check. The compiler is the
+shared verifier, available after every change, locally and cheaply.
 
----
+Quanta is **concise**. Programs are short; the surface is small and regular. That
+makes the common case fast to write and inexpensive to process at scale.
 
-## 5. Beyond the Status Quo — Resolutions to Named Weaknesses
+Quanta is **self-hosting**. The compiler is written in Quanta. The same language
+that builds your application compiles itself and is the natural substrate for the
+tooling around it — no second language for tooling.
 
-Each resolves a specific observed weakness, not a dream feature.
+Quanta is **one language across machines**. Native, WASM, GPU, microcontroller,
+and cluster from a single source; the runtime adapts, the program does not
+change.
 
-- **Packaging/environment pain:** content-addressed, hash-pinned imports. No
-  name-typosquatting, no dependency sprawl, no venv. Build = one command.
-- **Build-system hostility:** no separate build system; dependencies resolved by
-  content hash.
-- **Memory unsafety:** region inference pursued at compile; `unsafe` is explicit.
-- **Per-line cognitive tax (borrow models):** ownership inferred where possible,
-  required only where the task demands.
-- **Verification blindness:** the compiler is a fast, scriptable verifier;
-  checking is a primitive.
-- **Translation overhead:** dialects make the discipline's notation first-class.
-- **Docs/code drift:** examples executed as tests; a broken example fails build.
+Quanta is **dialect-rich**. Physics, music, biology, finance, and cryptography
+ship as first-class vocabularies with real notation, desugaring to core forms
+anyone can read. Experts write in their discipline; the translation moves from
+the writer to the compiler.
 
 ---
 
-## 6. Honest Limits
+## 3. What Quanta Does
 
-- **No guarantee.** Quanta pursues these properties; it warrants none. Compiler
-  defects, proof assumptions, and dialect holes exist.
-- **Application security is the writer's.** Auth, sessions, authorization, tenant
-  isolation for public services remain design responsibilities. A service with no
-  login is, like any language's, exposed once public. The real failure mode for
-  generated public code is here — the application layer — not the memory layer.
-- **Intent is the writer's.** The compiler cannot decide what a program should
-  do; it can only pursue making it safe to execute.
-- **Raw access is a deliberate escape.** Drivers and hot loops may need `unsafe`.
-- **Current state (0.0.86, verified):** single x86 backend; untyped (type
-  inference/checking not yet implemented); no package manager; no dialects; 117
-  gated tests; self-hosting with byte-identical fixpoint. The properties above
-  are the *design target*, reached incrementally — most are not yet implemented.
+- **Removes setup as a gate.** First hour is intent, not tooling.
+- **Lowers the concept tax.** Types, allocators, and build targets are inferred;
+  apparatus is the compiler's job to pursue, not the writer's to supply.
+- **Meets experts in their notation.** `laplace(potential)` instead of
+  `matrix_multiply(...)`; the discipline's vocabulary is first-class.
+- **Teaches as it fails.** Errors explain cause, rule, and fix.
+- **Edits without breaking.** Structure is invariant under edit — a change to the
+  tree cannot produce a syntactically broken program.
+- **Verifies in the loop.** `quanta check` runs after every change; the signal is
+  real, not asserted.
+- **Scales to large code.** Concise surface and verifiable structure keep
+  processing cost and context load low.
+- **Secures the execution layer.** Region/ownership memory, bounds, races, and
+  side channels are pursued by the compiler; `unsafe` is an explicit, auditable
+  escape, not the default path.
+- **Enforces domain invariants.** A `secure` dialect refuses variable-time or
+  unreduced cryptographic operations; a blockchain dialect rejects replay and
+  non-deterministic RNG. The unsafe form cannot be compiled where the dialect
+  governs.
+- **Keeps docs honest.** Examples are executed as tests; a broken example fails
+  the build.
 
 ---
 
-## 7. Positioning
+## 4. Why It Holds Together
 
-Quanta is engineered so the artifact it produces is **checkable from the first
-token** — by whoever writes it, via clear errors; by an expert, via dialects; and
-by the tooling that processes it, via a verifiable AST and a fast checker. That
-single property — *code as a machine-verifiable artifact* — lets Quanta reduce
-the ceremony tax for the writer and the failure rate for the tooling at the same
-time. It absorbs the proven strengths of existing languages (safety outcomes,
-fast feedback, domain notation, verifiability) while designing out their
-recurring weaknesses (ceremony, packaging, fragile text, unverifiable claims).
-Everything else follows from it.
+One property drives all of it: **code as a machine-verifiable artifact.** Because
+the source is a checkable tree from token one, the writer gets clarity, the
+processor gets reliability, the surface stays small, and the compiler stays the
+single source of truth. The strengths absorbed from earlier languages — fast
+start, safety outcome, fast feedback, domain notation, verifiability — reinforce
+each other instead of competing for the writer's attention. The recurring
+weaknesses — ceremony, packaging, fragile text, unverifiable claims — are
+designed out at the foundation.
+
+Quanta is the language that results.
