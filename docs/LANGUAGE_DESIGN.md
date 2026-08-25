@@ -1,12 +1,11 @@
-# Quanta — Language Design (Research-Grounded Revision)
+# Quanta — Language Design (Research-Grounded)
 
-*Revision basis: how humans learn and use languages, how AI agents consume code,
-and the documented strengths and weaknesses of existing languages — studied so
-Quanta can absorb the strengths and avoid the weaknesses. Cross-checked against
-Quanta's actual state (self-hosting compiler 0.0.86; single x86 backend; untyped;
-117-test gate; no package manager; no dialects). Research drawn from established
-knowledge of PL design, programming-education research, and 2024–2025
-AI-coding-agent behavior.*
+*Revision basis: how programs are learned and consumed, and the documented
+strengths and weaknesses of existing languages — studied so Quanta can absorb the
+strengths and avoid the weaknesses. Cross-checked against Quanta's actual state
+(self-hosting compiler 0.0.86; single x86 backend; untyped; 117-test gate; no
+package manager; no dialects). Research drawn from established knowledge of PL
+design, programming-education research, and 2024–2025 coding-agent behavior.*
 
 No language can guarantee safety or correctness. Quanta is designed to *pursue*
 specific, achievable properties, and to be explicit about what it does not
@@ -16,7 +15,7 @@ achieve.
 
 ## 1. What the Evidence Says
 
-### 1.1 How humans learn and use languages
+### 1.1 How programs are learned and used
 - **The barrier is ceremony, not logic.** Education research (Ko & Myers;
   Guzdial) consistently shows novices lose most time to *syntax errors* and
   *environment setup*, not to algorithmic thinking. The machine's scaffolding —
@@ -32,20 +31,20 @@ environment invisible (scripting languages' fast start).
 **Weakness to avoid:** languages that require apparatus the task doesn't need
 (manual memory, build files, type ceremony).
 
-### 1.2 How AI agents consume code
-- **Context exhaustion.** Agents degrade on large codebases/files; they lose
-  structure. Retrieval helps but is lossy.
-- **Token cost and latency.** Every file read and retry burns tokens. Verbose
+### 1.2 How code is consumed by automated tooling
+- **Context exhaustion.** Automated tooling degrades on large codebases/files;
+  it loses structure. Retrieval helps but is lossy.
+- **Token cost and latency.** Every file read and retry burns budget. Verbose
   sources are expensive to operate in.
-- **Fragile string edits.** Agents edit raw text; a one-character slip breaks
-  compilation silently; the agent cannot see the structure.
-- **Verification blindness.** Agents assert code works without running/testing
+- **Fragile string edits.** Tooling edits raw text; a one-character slip breaks
+  compilation silently; the tool cannot see the structure.
+- **Verification blindness.** Tooling asserts code works without running/testing
   it; hallucinated APIs are common.
 - **No semantic anchor.** Treating code as strings means refactors drift and
   types are guessed.
 
 **Strength to absorb:** languages with small, regular, parseable surfaces that
-agents can manipulate reliably.
+tooling can manipulate reliably.
 **Weakness to avoid:** languages where correctness is textual and unverifiable
 without a heavy external toolchain.
 
@@ -65,47 +64,42 @@ without a heavy external toolchain.
 
 ---
 
-## 2. Quanta: Built for Human and Machine, From the First Token
+## 2. Quanta: A Verifiable Artifact From the First Token
 
-Quanta is designed so the **same source serves both a human and an AI agent**,
-and serves each better than the status quo by learning from what works and what
-hurts.
+> **Quanta is a machine-readable, verifiable artifact from the first token. The
+> compiler is the shared verifier — for the novice, the expert, and the machine
+> consuming the code.** Both the person writing it and the tooling processing it
+> operate on something that can be *checked*, not guessed.
 
-> **Quanta is a machine-readable, verifiable artifact from the first token.
-> Both humans and AI agents operate on something that can be *checked*, not
-> guessed.** The compiler is the shared verifier — for the novice, the expert,
-> and the machine.**
-
-This single design decision resolves the weaknesses above for both audiences at
+This single design decision resolves the weaknesses above for every consumer at
 once:
 
 | Observed weakness | Quanta's response |
 |---|---|
-| Fragile agent string edits | Source is an AST; agents edit the verified tree, not text. |
-| Agent verification blindness | `quanta check` runs cheaply after every edit; real signal, not assertion. |
-| Agent token cost | Concise surface → fewer tokens per program. |
-| Human ceremony tax | No required types/build config; apparatus inferred. |
+| Fragile text edits | Source is an AST; edits target the verified tree, not text. |
+| Verification blindness | `quanta check` runs cheaply after every edit; real signal, not assertion. |
+| Token/budget cost | Concise surface → fewer tokens per program. |
+| Ceremony tax | No required types/build config; apparatus inferred. |
 | Packaging/environment pain | Content-addressed, hash-pinned modules; one command, no venv. |
 | Memory unsafety | Region/ownership pursued at compile; `unsafe` is explicit, auditable. |
 | Domain translation overhead | First-class dialects let experts write their notation. |
 
 Quanta self-hosts — the compiler *is* Quanta. The same language that writes an
-app also compiles itself and is the natural target for AI tooling. No second
-language for tooling. (Verified this session: 0.0.86 has a byte-identical
+app also compiles itself. (Verified this session: 0.0.86 has a byte-identical
 self-host fixpoint.)
 
 ---
 
-## 3. How Quanta Helps Humans
+## 3. How Quanta Helps the Person Writing It
 
 1. **Setup is not a gate.** One command, no build file, no venv. The first hour
    is spent expressing intent, not fighting tooling.
 2. **Lower concept tax.** Types, allocators, build targets are inferred by the
-   compiler. The human meets the machine at intent level; the apparatus is the
+   compiler. The writer meets the machine at intent level; the apparatus is the
    compiler's job to pursue.
 3. **Meets experts in their notation.** Dialects let a domain expert write
    `laplace(potential)` instead of `matrix_multiply(...)`. Translation overhead
-   moves from human to compiler.
+   moves from writer to compiler.
 4. **Teaches as it fails.** Compile errors explain cause, rule, and fix — failure
    becomes learning, not a cryptic abort.
 5. **One language, every machine.** Native, WASM, GPU, MCU, cluster from one
@@ -113,20 +107,19 @@ self-host fixpoint.)
 
 ---
 
-## 4. How Quanta Helps AI Agents
+## 4. How Quanta Helps the Tooling That Processes It
 
 1. **AST-native source.** The canonical artifact is the syntax tree, not text. An
-   agent editing the tree cannot produce a syntactically broken program;
-   structure is invariant under edit. This removes the largest source of agent
-   errors.
-2. **Cheap verification in the loop.** `quanta check` is fast and local; an agent
-   verifies after *every* change instead of asserting success.
+   edit to the tree cannot produce a syntactically broken program; structure is
+   invariant under edit. This removes the largest source of automated errors.
+2. **Cheap verification in the loop.** `quanta check` is fast and local; the
+   tooling verifies after *every* change instead of asserting success.
 3. **Smaller programs, lower cost.** A concise surface means fewer tokens per
-   feature, lower latency, lower bill — a dominant advantage at agent scale.
-4. **Scoped generation via dialects.** An agent can be constrained to a dialect's
+   feature, lower latency, lower bill — a dominant advantage at scale.
+4. **Scoped generation via dialects.** Work can be constrained to a dialect's
    grammar — a small, safe generation surface, fewer hallucinated APIs.
-5. **Self-hosted tooling.** Agent tooling is written in the same language it
-   produces; no second toolchain to load.
+5. **Self-hosted tooling.** Tooling is written in the same language it processes;
+   no second toolchain to load.
 
 ---
 
@@ -152,11 +145,11 @@ Each resolves a specific observed weakness, not a dream feature.
 
 - **No guarantee.** Quanta pursues these properties; it warrants none. Compiler
   defects, proof assumptions, and dialect holes exist.
-- **Application security is the human's.** Auth, sessions, authorization, tenant
+- **Application security is the writer's.** Auth, sessions, authorization, tenant
   isolation for public services remain design responsibilities. A service with no
   login is, like any language's, exposed once public. The real failure mode for
-  AI-generated public code is here — the application layer — not the memory layer.
-- **Intent is the human's.** The compiler cannot decide what a program should
+  generated public code is here — the application layer — not the memory layer.
+- **Intent is the writer's.** The compiler cannot decide what a program should
   do; it can only pursue making it safe to execute.
 - **Raw access is a deliberate escape.** Drivers and hot loops may need `unsafe`.
 - **Current state (0.0.86, verified):** single x86 backend; untyped (type
@@ -169,10 +162,11 @@ Each resolves a specific observed weakness, not a dream feature.
 ## 7. Positioning
 
 Quanta is engineered so the artifact it produces is **checkable from the first
-token** — by a novice via clear errors, by an expert via dialects, and by an AI
-agent via a verifiable AST and a fast checker. That single property — *code as a
-machine-verifiable artifact* — lets Quanta reduce the ceremony tax for humans and
-the failure rate for agents at the same time. It absorbs the proven strengths of
-existing languages (safety outcomes, fast feedback, domain notation,
-verifiability) while designing out their recurring weaknesses (ceremony,
-packaging, fragile text, unverifiable claims). Everything else follows from it.
+token** — by whoever writes it, via clear errors; by an expert, via dialects; and
+by the tooling that processes it, via a verifiable AST and a fast checker. That
+single property — *code as a machine-verifiable artifact* — lets Quanta reduce
+the ceremony tax for the writer and the failure rate for the tooling at the same
+time. It absorbs the proven strengths of existing languages (safety outcomes,
+fast feedback, domain notation, verifiability) while designing out their
+recurring weaknesses (ceremony, packaging, fragile text, unverifiable claims).
+Everything else follows from it.
