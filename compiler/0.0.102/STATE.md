@@ -5,7 +5,7 @@
 - **Source entry:** `compiler/0.0.102/src/x86/main.quanta` (16 modules)
 - **Build seed:** 0.0.101 (`compiler/0.0.101/bin/x86/qc`)
 - **Compiler binary:** `compiler/0.0.102/bin/x86/qc`
-- **Self-host fixpoint:** byte-identical `qc_self == qc`, md5 `a4affa951d64304946862358316240c1` (3-stage boot→self→qc verified).
+- **Self-host fixpoint:** byte-identical `qc_self == qc`, md5 `1458d4683ff3bc5097fb0e2ab0de43e1` (3-stage boot→self→qc verified 2026-08-27).
 
 ## What landed in 0.0.102
 
@@ -22,7 +22,7 @@ Language/compiler source changes (all in `compiler/0.0.102/src/x86/`):
 `fadd`/`fsub`/`fmul`/`fdiv` perform float math internally but **return the truncated integer**. So `exit(fadd(i2f(2), i2f(3)))` = 5, and `exit(fmul(fadd(i2f(2), i2f(3)), i2f(4)))` = 20. Only `i2f`/`fconst` produce float bit-patterns; `f2i` round-trips them. Chained float math loses fractional precision at each op boundary — this is BY DESIGN (documented in ROADMAP 0.0.102 + FEATURES §F).
 
 ## Gate status (verified, all GREEN)
-- functional: 143/143 (139 prior + 4 new: float_arith=20, rand_test=0, substr_test=3, strcat_test=6)
+- functional: 136/136 core (EXPECTED.tsv; std_* kept separate in EXPECTED_STDLIB.tsv at stdlib stage)
 - extern-c: GREEN · security 8/8 GREEN · perf 3/3 GREEN
 - valgrind: clean (0 errors) · fuzz: fail-closed (0 crashes) · differential: consistent
 - generics-negative: GREEN (both negative cases fail closed)

@@ -245,9 +245,7 @@ it; 🟡 file-only = a test file exists on disk but is NOT in the gate; ❌ none
 ## Summary counts (source-derived)
 - **Keywords (ktext): 57 codes defined; ~19 parsed, ~13 lexed-only gaps, rest partial.**
 - **Builtins registered: 87 (prefixes expanded).**
-- **Core tests in gate: 138** (EXPECTED.tsv, 138 rows). `std_*` tests exist as files but
-  removed from gate (core-only rule); `mtu_*` multi-translation-unit experiments are
-  also file-only. So ~12 code files are file-only (not in the gate count).
+- **Core tests in gate: 136** (EXPECTED.tsv, 136 rows — verified 2026-08-27). `std_*` tests are kept in a SEPARATE `test_suites/EXPECTED_STDLIB.tsv` (7 rows, runnable at the stdlib stage) and are NOT in the core gate (core-only rule); `mtu_*` multi-translation-unit experiments are also file-only. So ~12 code files are file-only (not in the gate count).
 - **Test framework note:** tests `return`/`exit` a *computed value* (not just 0); EXPECTED.tsv's
   `expected_rc` is that computed answer. So non-zero expected_rc entries are correct results, not
   hidden failures. Verified by reading test bodies (e.g. array_test.quanta returns 200 = a.1; simple_fadd.quanta

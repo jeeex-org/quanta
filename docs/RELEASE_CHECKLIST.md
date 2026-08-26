@@ -89,13 +89,22 @@ These are non-negotiable. Violating any of them is a gate failure by itself.
       `objdump -D -b binary -m i386:x86-64 --adjust-vma=0x400000 --start-address=0x400120 FILE`.
     - Compiler `src/` must stay `$$(...)`-free to preserve the bootstrap
       fixpoint.
-    - All scratch/work stays INSIDE `/opt/tali/quanta` (use `compiler/<VER>/debug/`).
-      Never use `/tmp` for compiler work. Delete scratch binaries after each session.
+    - All scratch/work goes in `/tmp` and is **deleted after the problem is solved**
+      (never leave `compiler/<VER>/debug/` in the repo — that folder must not exist).
+      Remove debug artifacts as soon as the issue is closed.
+
+15. **Every version gets its own `compiler/<VER>/` folder — ALWAYS, even gate-only.**
+    Copy the previous stable (`cp -r compiler/<PREV> compiler/<VER>`) and bump `VERSION`
+    for EVERY released version, regardless of whether there is a source change. A
+    gate-only version (no `src/` change) is still a real release: it exists so its
+    ROADMAP ✅ maps to a verifiable on-disk artifact. **Never mark a version ✅ in
+    ROADMAP/docs unless a `compiler/<VER>/` folder exists on disk.** No folder = no
+    release = the ✅ is a lie.
 
 ---
 
 ## Terminology (derive from `VERSION`, never hardcode)
-- `<VER>`   = released/live stable   -> `cat VERSION`        (currently **0.0.102**)
+- `<VER>`   = released/live stable   -> `cat VERSION`        (currently **0.0.103**)
 - `<NEXT>`  = the version being built -> exactly ONE patch above `<VER>`
 - `<PRIOR>` = `<VER>` itself; its committed golden `compiler/<VER>/bin/x86/qc`
   is the seed for `<NEXT>`. There is NO separate `bootstrap/` directory.
