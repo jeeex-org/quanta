@@ -79,25 +79,25 @@ Every item below is one WIP version: self-hosts (2-stage byte-identical fixed po
 
 | Version | Core | Item | Status today | Work |
 |---------|------|------|--------------|------|
-| 0.100 | Lang | test-coverage accuracy + full gate verification (gate-only) | ✅ done | Copy 0.0.99 → 0.0.100; ran ALL gate stages (functional 138/138, extern-c, security 8/8, perf 3/3, valgrind, fuzz fail-closed, differential) + 3-stage self-host fixpoint (byte-identical md5 `52abed5acf470aabc50d6d11e31b0f2d`). Coverage audit: every FEATURES "✅ gate" row maps to a real gated test (no missing core tests); FEATURES count corrected 132→138. No compiler source change → fixpoint auto-preserved. NOTE: stdlib-module tests (big/quantum/linalg) are DEFERRED to the stdlib stage — stdlib is not a released core feature yet. Promoted as new stable seed. |
-| 0.114 | FFI | extern "C" PLT/GOT (full) | ✅ done (0.0.99) | Full dynamic-link symbol resolution for object-mode `--emit-obj` + gcc (string-arg header skip, multi-arg call fix, 16-byte stack alignment, libc-exit stdout flush). Standalone-EXE PLT/GOT (no external `ld`) remains deferred. |
-| 0.115 | Lang | trait/impl dispatch completion | ✅ done (0.0.98) | vtable dispatch for interface/impl/trait landed in 0.0.98; verified via trait_min/trait_test/struct_methods_test. |
-| 0.101 | Lang | generics monomorphisation | 🟡 type-erased | Instantiate `map<T,U>` per type-args; compile-time checks. |
-| 0.102 | Lang | float math + string ops + `rand` | ❌ | Float builtins; `substr`/`split`/utf8; getrandom-based `rand`. |
-| 0.103 | Builtins | float math (sin/cos/tan/pow/log/min/max) | ❌ | Add builtins; gate `std_math_test`. |
-| 0.104 | Builtins | string ops (strcat/substr/strcmp/str_split/utf8) | ❌ | Add builtins; gate `std_str_test`. |
-| 0.105 | Builtins | atomics (load/store/add/cmpxchg+futex) | ❌ | Add builtins; gate `atomic_test`. |
-| 0.106 | Builtins | networking (socket/connect/bind/listen/accept) | ❌ | Add builtins; gate `net_test`. |
-| 0.107 | Builtins | random `rand` | ❌ getrandom only | Add `rand` builtin; gate `rand_test`. |
-| 0.108 | Builtins | bit/byte extras (parity/bitfield/per-size swap) | ❌ | Add builtins. |
-| 0.109 | Builtins | intrinsics (prefetch/fence/branch hints) | ❌ | Add builtins. |
-| 0.110 | Builtins | fs metadata fix (stat/unlink/mkdir/chdir/rename) | 🟡 BROKEN | Fix path-string remap; gate. |
-| 0.111 | Builtins | introspection stack-trace | ❌ | Add `abort_test` stack trace. |
-| 0.112 | Memory | stack unwind / destructors / RAII | ❌ defer manual | Scope-exit cleanup. |
-| 0.113 | Memory | real allocator (free-list/GC) | ❌ bump mmap only | Free-list allocator replacing raw mmap. |
-| 0.116 | Lang | `big` keyword/type | 🟡 lib convention | `TT_BIG` + op-overload routing `a+b`→`big_add`; gate `big_test`. |
-| 0.117 | Lang | typed array/slice `T[]` | ❌ untyped only | Parse `let a: i64[]`; bound-checked access. |
-| 0.118 | P4 tooling | **Quanta-native code-writing tool** | ❌ | LAST core item — sequenced right before 0.1.0 (where std/libs resume). Edit Quanta source reliably without external scripting. |
+| 0.0.100 | Lang | test-coverage accuracy + full gate verification (gate-only) | ✅ done | Copy 0.0.99 → 0.0.100; ran ALL gate stages (functional 138/138, extern-c, security 8/8, perf 3/3, valgrind, fuzz fail-closed, differential) + 3-stage self-host fixpoint (byte-identical md5 `52abed5acf470aabc50d6d11e31b0f2d`). Coverage audit: every FEATURES "✅ gate" row maps to a real gated test (no missing core tests); FEATURES count corrected 132→138. No compiler source change → fixpoint auto-preserved. NOTE: stdlib-module tests (big/quantum/linalg) are DEFERRED to the stdlib stage — stdlib is not a released core feature yet. Promoted as new stable seed. |
+| 0.0.114 | FFI | extern "C" PLT/GOT (full) | ✅ done (0.0.99) | Full dynamic-link symbol resolution for object-mode `--emit-obj` + gcc (string-arg header skip, multi-arg call fix, 16-byte stack alignment, libc-exit stdout flush). Standalone-EXE PLT/GOT (no external `ld`) remains deferred. |
+| 0.0.115 | Lang | trait/impl dispatch completion | ✅ done (0.0.98) | vtable dispatch for interface/impl/trait landed in 0.0.98; verified via trait_min/trait_test/struct_methods_test. |
+| 0.0.101 | Lang | generics monomorphisation | 🟡 type-erased | Instantiate `map<T,U>` per type-args; compile-time checks. |
+| 0.0.102 | Lang | float math + string ops + `rand` | ❌ | Float builtins; `substr`/`split`/utf8; getrandom-based `rand`. |
+| 0.0.103 | Builtins | float math (sin/cos/tan/pow/log/min/max) | ❌ | Add builtins; gate `std_math_test`. |
+| 0.0.104 | Builtins | string ops (strcat/substr/strcmp/str_split/utf8) | ❌ | Add builtins; gate `std_str_test`. |
+| 0.0.105 | Builtins | atomics (load/store/add/cmpxchg+futex) | ❌ | Add builtins; gate `atomic_test`. |
+| 0.0.106 | Builtins | networking (socket/connect/bind/listen/accept) | ❌ | Add builtins; gate `net_test`. |
+| 0.0.107 | Builtins | random `rand` | ❌ getrandom only | Add `rand` builtin; gate `rand_test`. |
+| 0.0.108 | Builtins | bit/byte extras (parity/bitfield/per-size swap) | ❌ | Add builtins. |
+| 0.0.109 | Builtins | intrinsics (prefetch/fence/branch hints) | ❌ | Add builtins. |
+| 0.0.110 | Builtins | fs metadata fix (stat/unlink/mkdir/chdir/rename) | 🟡 BROKEN | Fix path-string remap; gate. |
+| 0.0.111 | Builtins | introspection stack-trace | ❌ | Add `abort_test` stack trace. |
+| 0.0.112 | Memory | stack unwind / destructors / RAII | ❌ defer manual | Scope-exit cleanup. |
+| 0.0.113 | Memory | real allocator (free-list/GC) | ❌ bump mmap only | Free-list allocator replacing raw mmap. |
+| 0.0.116 | Lang | `big` keyword/type | 🟡 lib convention | `TT_BIG` + op-overload routing `a+b`→`big_add`; gate `big_test`. |
+| 0.0.117 | Lang | typed array/slice `T[]` | ❌ untyped only | Parse `let a: i64[]`; bound-checked access. |
+| 0.0.118 | P4 tooling | **Quanta-native code-writing tool** | ❌ | LAST core item — sequenced right before 0.1.0 (where std/libs resume). Edit Quanta source reliably without external scripting. |
 
 **Version-number rule:** literal numbers above are the plan; the SEQUENCING (order + one-feature-per-version + fixpoint-verified) is the contract. If a version needs splitting, the number increments — never skipped, never reused. 0.0.90 is **not reserved**; it is simply the `as`/`raw`/`volatile` cluster above. The code-writing tool is **0.118 — the last core item, sequenced immediately before 0.1.0** (where std/libs resume); ARM64 and the deep-systems items remain POST-0.1.0.
 
