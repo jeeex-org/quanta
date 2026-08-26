@@ -168,6 +168,18 @@ if [ -f tools/diff_test/diff_qc.py ]; then
 fi
 
 echo ""
+echo ""
+
+echo "########## GENERICS NEGATIVE (compile-time type checks) ##########"
+GENERICS_RC=0
+if [ -f "test_suites/scripts/generics_neg_tests.sh" ]; then
+  if ! QC="$QC" bash "test_suites/scripts/generics_neg_tests.sh"; then
+    GENERICS_RC=1
+  fi
+else
+  echo "  SKIP: generics_neg_tests.sh missing"
+fi
+
 echo "=== GATE SUMMARY ==="
 echo "  functional : $([ $FUNCTIONAL_RC = 0 ] && echo GREEN || echo RED)"
 echo "  extern-c  : $([ $EXTERN_RC = 0 ] && echo GREEN || echo RED)  (object-mode + gcc libc link)"
@@ -176,10 +188,12 @@ echo "  performance: $([ $PERF_RC = 0 ] && echo GREEN || echo RED)"
 echo "  valgrind   : $([ $VALGRIND_RC = 0 ] && echo GREEN || echo RED)  (compiler binary leak/error scan)"
 echo "  fuzz       : $([ $FUZZ_RC = 0 ] && echo GREEN || echo RED)  (fail-closed: 0 crashes)"
 echo "  differential: $([ $DIFF_RC = 0 ] && echo GREEN || echo RED)  (opt -O==no-O + vs-seed)"
+echo "  generics    : $([ $GENERICS_RC = 0 ] && echo GREEN || echo RED)  (negative type-arg checks fail closed)"
 # Block promotion on a real functional/security/perf/valgrind/fuzz/diff regression.
 # Security KNOWN issues are surfaced by the script but do not turn the gate red.
 if [ $FUNCTIONAL_RC -ne 0 ] || [ $SECURITY_RC -ne 0 ] || [ $PERF_RC -ne 0 ] \
-   || [ $VALGRIND_RC -ne 0 ] || [ $FUZZ_RC -ne 0 ] || [ $DIFF_RC -ne 0 ]; then
+   || [ $VALGRIND_RC -ne 0 ] || [ $FUZZ_RC -ne 0 ] || [ $DIFF_RC -ne 0 ] \
+   || [ $GENERICS_RC -ne 0 ]; then
   exit 1
 fi
 exit 0
