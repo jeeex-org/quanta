@@ -1,0 +1,574 @@
+// === MAIN ===
+fn main(argc, argv) {
+    kregs(); init_regs(); init_fregs(); init_cs(); 
+    // Phase 4.3: mark all vregs as "not a struct" (-1). mmap zero-fills, which
+    // would collide with struct index 0, so explicitly init to -1.
+    let vsi_init = 0
+    while vsi_init < 8192 { w64(vreg_struct + vsi_init*8, 0-1); w64(vreg_is_str + vsi_init*8, 0-1); vsi_init = vsi_init+1 }
+    if argc<2 { exit(13) }
+    // --- A: optimization is ALWAYS ON (1.0.12). `-O` is accepted as a harmless
+    // no-op flag for backward compatibility; opt_on is already 1 (global default).
+    // Source/output use the simple convention: first non-flag argv = source,
+    // next non-flag argv = output.
+    let out_p = 0
+    let srcp = 0
+    let ai = 1
+    // Android/Termux runs our ET_DYN via the bionic linker, which inserts the
+    // program's own path as an extra argv slot (argc+1, self path at argv[1]).
+    // Detect that by sniffing argv[1] for our own ELF magic and skip it.
+    if argc>=2 {
+        let sfp = r64(argv+1*8)
+        let sfd = file_open(sfp, 0)
+        if sfd>=0 {
+            let magbuf = mmap(16)
+            let mn = file_read(sfd, magbuf, 4)
+            file_close(sfd)
+            if mn==4 && r8(magbuf)==127 && r8(magbuf+1)==69 && r8(magbuf+2)==76 && r8(magbuf+3)==70 { ai = 2 }
+        }
+    }
+    while ai<argc {
+        let ap=r64(argv+ai*8)
+        // ignore any "-O" (and other "-X" flags) when picking source/output
+        if !(r8(ap)==45 && r8(ap+1)==79) {
+            // G2: overflow trap is ON by default (secure by default). Two flags:
+            //   --overflow-trap      : accepted as a no-op (explicit opt-in)
+            //   --no-overflow-trap   : turn the trap OFF (for code that relies on
+            //                          two's-complement wraparound and isn't ported)
+            if r8(ap)==45 && r8(ap+1)==45 {
+                let is_ovf = 1; let ki=0
+                let ovfstr = "overflow-trap"
+                // argv strings are raw (no header); Quanta string literals carry an
+                // 8-byte header, so read ovfstr starting at +8.
+                while ki<13 { if r8(ap+2+ki) != r8(ovfstr+8+ki) { is_ovf=0; break }; ki=ki+1 }
+                if is_ovf==1 { ovf_trap = 1 }
+                else {
+                    // try "--no-overflow-trap" (16 chars)
+                    let is_novf = 1; let kj=0
+                    let novfstr = "no-overflow-trap"
+                    while kj<17 { if r8(ap+2+kj) != r8(novfstr+8+kj) { is_novf=0; break }; kj=kj+1 }
+                    if is_novf==1 { ovf_trap = 0 }
+                    let is_arm = 0   // x86-only build: no ARM target selection
+                    // P5: try "--emit-obj" (relocatable .o + linker, object-format pillar)
+                    let is_obj=1; let oa=0
+                    let emobj = "emit-obj"
+                    while oa<8 { if r8(ap+2+oa) != r8(emobj+8+oa) { is_obj=0; break }; oa=oa+1 }
+                    if is_obj==1 { emit_obj=1 }
+                    // P5.1: try "--no-start" (9 chars) — secondary object TU
+                    let is_nostart=1; let kc=0
+                    let nostr = "no-start"
+                    while kc<9 { if r8(ap+2+kc) != r8(nostr+8+kc) { is_nostart=0; break }; kc=kc+1 }
+                    if is_nostart==1 { no_start=1 }
+                    if !is_novf && !is_arm && !is_obj && !is_nostart {
+                        if srcp==0 { srcp=ap } else if out_p==0 { out_p=ap }
+                    }
+                }
+            } else {
+                if srcp==0 { srcp=ap }
+                else if out_p==0 { out_p=ap }
+            }
+        }
+        ai=ai+1
+    }
+    let fd=file_open(srcp,0)
+    if fd<0 { exit(14) }
+    let mlen = file_read(fd, mainsrc, 16777216); file_close(fd)
+    if mlen<=0 { exit(15) }
+    // Compile-time #import expansion: inline all imported sources into 'src'.
+    // fill include prefix byte-buffers: "std/" and "ext/"
+    w8(imp_std_pfx+0, 115); w8(imp_std_pfx+1, 116); w8(imp_std_pfx+2, 100); w8(imp_std_pfx+3, 47)  // "std/"
+    w8(imp_ext_pfx+0, 101); w8(imp_ext_pfx+1, 120); w8(imp_ext_pfx+2, 116); w8(imp_ext_pfx+3, 47)  // "ext/"
+    w8(imp_lib_pfx+0, 108); w8(imp_lib_pfx+1, 105); w8(imp_lib_pfx+2, 98); w8(imp_lib_pfx+3, 47)  // "lib/"
+    imp_err = 0; imp_seenc = 0
+    srclen = 0
+    // top-level include dir = dirname of the main source path (so a relative
+    // quoted include in the main file resolves next to it).
+    imp_dir_from(srcp, src_strlen(srcp))
+    expand_includes(mainsrc, mlen, 0)
+    // SIMPLE-SURFACE: detect if this looks like a pure script (no top-level
+    // fn/struct/enum/global/const). If so, rewrite bare `name () {` to `fn name () {`
+    // then wrap in `fn main(){...}`. This runs BEFORE final wrap check so
+    // the final wrap sees the rewritten "fn main" and skips.
+    let is_pure_script = 1
+    let si = 0
+    while si < srclen {
+        let prev = 0; if si>0 { prev = r8(src+si-1) }
+        if si==0 || prev==10 || prev==32 || prev==9 || prev==13 {
+            if r8(src+si)==102 && r8(src+si+1)==110 && r8(src+si+2)==32 { is_pure_script=0 }      // "fn "
+            else if r8(src+si)==115 && r8(src+si+1)==116 && r8(src+si+2)==114 && r8(src+si+3)==117 && r8(src+si+4)==99 && r8(src+si+5)==116 && r8(src+si+6)==32 { is_pure_script=0 } // "struct "
+            else if r8(src+si)==101 && r8(src+si+1)==110 && r8(src+si+2)==117 && r8(src+si+3)==109 && r8(src+si+4)==32 { is_pure_script=0 } // "enum "
+            else if r8(src+si)==103 && r8(src+si+1)==108 && r8(src+si+2)==111 && r8(src+si+3)==98 && r8(src+si+4)==97 && r8(src+si+5)==108 && r8(src+si+6)==32 { is_pure_script=0 } // "global "
+            else if r8(src+si)==99 && r8(src+si+1)==111 && r8(src+si+2)==110 && r8(src+si+3)==115 && r8(src+si+4)==116 && r8(src+si+5)==32 { is_pure_script=0 } // "const "
+        }
+        si = si + 1
+    }
+    // Rewrite bare `name () {` -> `fn name () {` for EVERY file (not just pure
+    // scripts). `fn`-prefixed defs are skipped via skip_fn, so a file mixing
+    // `fn main(){}` and bare `helper(){}` compiles. `fn` is now optional.
+    {
+        let bi = 0
+            while bi < srclen {
+                let c0 = r8(src+bi)
+                // Only convert identifiers at statement start (column 0 / start
+                // of file). Excludes indented control flow like `else if (x) {`
+                // which also matches name(){} but is NOT a function definition.
+                if (c0>=65&&c0<=90)||(c0>=97&&c0<=122)||c0==95 {
+                    if bi>0 { let pch=r8(src+bi-1); if !(pch==10||pch==13) { bi = bi + 1; continue } }
+                    // scan identifier
+                    let ie = bi
+                    while ie < srclen {
+                        let cc = r8(src+ie)
+                        if (cc>=65&&cc<=90)||(cc>=97&&cc<=122)||(cc>=48&&cc<=57)||cc==95 { ie = ie + 1 } else { break }
+                    }
+                    // skip if already preceded by "fn "
+                    let skip_fn = 0
+                    if bi>=3 && r8(src+bi-3)==102 && r8(src+bi-2)==110 && r8(src+bi-1)==32 { skip_fn = 1 }
+                    if skip_fn==0 {
+                        // after identifier: optional spaces, then '('
+                        let p = ie; while p<srclen && (r8(src+p)==32||r8(src+p)==9) { p = p + 1 }
+                        if p<srclen && r8(src+p)==40 {
+                            // find matching ')'
+                            let d=1; let q=p+1
+                            while q<srclen && d>0 { let cc=r8(src+q); if cc==40 { d=d+1 } else if cc==41 { d=d-1 }; q=q+1 }
+                            if d==0 && q<srclen {
+                                // optional spaces then '{'
+                                let r2=q; while r2<srclen && (r8(src+r2)==32||r8(src+r2)==9) { r2=r2+1 }
+                                if r2<srclen && r8(src+r2)==123 {
+                                    // insert "fn " before bi: shift [bi..srclen) right by 3
+                                    let e2 = srclen
+                                    while e2 >= bi { w8(src+e2+3, r8(src+e2)); e2 = e2 - 1 }
+                                    w8(src+bi,102); w8(src+bi+1,110); w8(src+bi+2,32) // "fn "
+                                    srclen = srclen + 3
+                                    bi = bi + 3 + (ie - bi) // skip past "fn " + name
+                                } else { bi = ie }
+                            } else { bi = ie }
+                        } else { bi = ie }
+                    } else { bi = ie }
+                } else { bi = bi + 1 }
+            }
+        }
+    // NOW compute wrap_main on the REWRITTEN source
+    let wrap_main = 1
+    let si = 0
+    while si < srclen {
+        let prev = 0; if si>0 { prev = r8(src+si-1) }
+        if si==0 || prev==10 || prev==32 || prev==9 || prev==13 {
+            if r8(src+si)==102 && r8(src+si+1)==110 && r8(src+si+2)==32 { wrap_main=0 }      // "fn "
+            else if r8(src+si)==115 && r8(src+si+1)==116 && r8(src+si+2)==114 && r8(src+si+3)==117 && r8(src+si+4)==99 && r8(src+si+5)==116 && r8(src+si+6)==32 { wrap_main=0 } // "struct "
+            else if r8(src+si)==101 && r8(src+si+1)==110 && r8(src+si+2)==117 && r8(src+si+3)==109 && r8(src+si+4)==32 { wrap_main=0 } // "enum "
+            else if r8(src+si)==103 && r8(src+si+1)==108 && r8(src+si+2)==111 && r8(src+si+3)==98 && r8(src+si+4)==97 && r8(src+si+5)==108 && r8(src+si+6)==32 { wrap_main=0 } // "global "
+            else if r8(src+si)==99 && r8(src+si+1)==111 && r8(src+si+2)==110 && r8(src+si+3)==115 && r8(src+si+4)==116 && r8(src+si+5)==32 { wrap_main=0 } // "const "
+        }
+        si = si + 1
+    }
+    if wrap_main==1 {
+        let shift = 10
+        let e = srclen
+        while e >= 0 { w8(src+e+shift, r8(src+e)); e = e - 1 }
+        w8(src+0,102); w8(src+1,110); w8(src+2,32); w8(src+3,109); w8(src+4,97); w8(src+5,105); w8(src+6,110); w8(src+7,40); w8(src+8,41); w8(src+9,123) // "fn main(){"
+        srclen = srclen + shift
+        w8(src+srclen, 125); srclen = srclen + 1   // "}"
+        w8(src+srclen, 10); srclen = srclen + 1     // newline
+    }
+    if imp_err==1 { exit(16) }
+    // 7.F / NEW-1: detect source truncation. The expanded source must fit the
+    // src buffer; a source that fills it was truncated -> abort immediately.
+    if srclen >= 16777216 {
+        let mt = "error: source exceeds 16MB limit (truncated)\n"
+        file_write(2, mt+8, len(mt)); exit(1)
+    }
+    tokenize()
+    // 7.A part 2: unbalanced-brace check over the token stream. Track depth of
+    // '{' (123) / '}' (125) TT_PNCT tokens; a nonzero end depth (or a negative
+    // dip) means the braces don't balance -> hard compile error, no ELF.
+    let bd=0; let bi=0
+    while bi<tokc {
+        if tokt(bi)==TT_PNCT {
+            let tv=tokv(bi)
+            if tv==123 { bd=bd+1 }
+            if tv==125 { bd=bd-1; if bd<0 { bd=0-999 } }
+        }
+        bi=bi+1
+    }
+    if bd!=0 {
+        let mb = "error: unbalanced braces\n"
+        file_write(2, mb+8, len(mb)); had_error=1
+    }
+    scantraits()
+    scanfns()
+    scanstructs()
+    rewrite_struct_literals()
+    scanimpls()
+    scannenums()
+    scan_retstructs()
+    scan_aliases()
+    scan_globals()
+    // 7.A part 1: require a 'main' function. Without it the startup stub would
+    // patch to the first user fn and emit a binary that silently returns 0.
+    has_main=0; let mmi=0
+    while mmi<fnc {
+        if fn_nlen(mmi)==4 {
+            let mmn=fn_name(mmi)
+            if r8(src+mmn)==109 { if r8(src+mmn+1)==97 { if r8(src+mmn+2)==105 { if r8(src+mmn+3)==110 { has_main=1 } } } }
+        }
+        mmi=mmi+1
+    }
+    if has_main==0 && no_start==0 {
+        let mm = "error: no 'main' function found\n"
+        file_write(2, mm+8, len(mm)); had_error=1
+    }
+    // Startup stub at code offset 0: set up argc/argv, run global initializers,
+    // then call main, then exit(rax). Suppressed in --no-start (secondary TU):
+    // the TU is a library exporting functions; the entry TU's _start calls them.
+    if no_start == 0 {
+        eb(95)                       // pop rdi          (argc)
+        eb(72); eb(137); eb(230)     // mov rsi, rsp     (argv)
+        // Stack relocation: under `setarch -R` (ADDR_NO_RANDOMIZE, used by the
+        // self-host fixpoint test for determinism) the kernel pins the stack
+        // vma at a fixed base with entry rsp only ~123KB above the mapping
+        // floor, and the vma is already the full 8MB RLIMIT — so there is no
+        // room for the kernel to grow the stack, and any frame larger than
+        // ~123KB (e.g. t3's main+try ~2MB) faults permanently. Relocate the
+        // stack to a fresh 8MB mmap'd region with full headroom regardless of
+        // base. argc (rdi)/argv (rsi) are saved in rbx/rbp across the syscall
+        // (callee-saved, syscall-clobber-safe) and restored after, so the
+        // program still sees the original args. Emitted identically for every
+        // program, so the compiler self-host fixpoint is unaffected.
+        eb(72); eb(137); eb(251)                   // mov rbx, rdi      (rbx = argc)  [48 89 FB]
+        eb(72); eb(137); eb(245)                   // mov rbp, rsi      (rbp = argv)  [48 89 F5]
+        // mmap(0, 0x800000, PROT_READ|PROT_WRITE, MAP_PRIVATE|MAP_ANONYMOUS, -1, 0)
+        eb(49); eb(255)                            // xor edi, edi      (addr = 0)
+        eb(190); ei(0x800000)                      // mov esi, 0x800000 (len = 8MB)
+        eb(186); ei(3)                             // mov edx, 3        (PROT_READ|WRITE)
+        eb(65); eb(186); ei(0x22)                  // mov r10d, 0x22    (MAP_PRIVATE|MAP_ANON)
+        eb(65); eb(184); ei(0-1)                   // mov r8d, -1       (fd)
+        eb(69); eb(49); eb(201)                    // xor r9d, r9d      (offset = 0)
+        eb(184); ei(9)                             // mov eax, 9        (mmap)
+        eb(15); eb(5)                              // syscall           (rax = new base)
+        eb(72); eb(137); eb(196)                   // mov rsp, rax
+        eb(72); eb(129); eb(196); ei(0x800000)     // add rsp, 0x800000 (top of region)
+        eb(72); eb(131); eb(236); eb(16)           // sub rsp, 16       (16-byte align)
+        eb(72); eb(137); eb(223)                   // mov rdi, rbx      (restore argc)
+        eb(72); eb(137); eb(238)                   // mov rsi, rbp      (restore argv)
+        // P2: proc/env — capture argc/argv/environ into globals for builtins.
+        // Use the STOREG RIP-relative form and register gpatches so patch_globals()
+        // binds them to the real GDATA addresses (writing to literal 0 would crash).
+        // Store argc -> g_argc  (mov [rip+disp], rdi)
+        eb(72); eb(137); eb(5 + 7*8); ei(0)
+        let pofs=codelen-4
+        w64(gpatches+gpatchc*24, pofs); w64(gpatches+gpatchc*24+8, g_argc); w8(gpatches+gpatchc*24+16, 1)
+        if gpatchc >= GPATCH_CAP { emit_ovf() }; gpatchc=gpatchc+1
+        // Store argv -> g_argv  (mov [rip+disp], rsi)
+        eb(72); eb(137); eb(5 + 6*8); ei(0)
+        let pofs2=codelen-4
+        w64(gpatches+gpatchc*24, pofs2); w64(gpatches+gpatchc*24+8, g_argv); w8(gpatches+gpatchc*24+16, 1)
+        if gpatchc >= GPATCH_CAP { emit_ovf() }; gpatchc=gpatchc+1
+        // Compute environ = argv + (argc+1)*8  => lea rax,[rsi+rdi*8+8]
+        eb(72); eb(141); eb(68); eb(254); ei(8)
+        // Store environ -> g_environ  (mov [rip+disp], rax)
+        eb(72); eb(137); eb(5 + 0*8); ei(0)
+        let pofs3=codelen-4
+        w64(gpatches+gpatchc*24, pofs3); w64(gpatches+gpatchc*24+8, g_environ); w8(gpatches+gpatchc*24+16, 1)
+        if gpatchc >= GPATCH_CAP { emit_ovf() }; gpatchc=gpatchc+1
+        eb(87)                       // push rdi         (save argc)
+        eb(86)                       // push rsi         (save argv)
+        let init_call = codelen
+        g_init_call_ofs = codelen
+        eb(232); ei(0)               // call __init      (patched below)
+        eb(94)                       // pop rsi          (restore argv)
+        eb(95)                       // pop rdi          (restore argc)
+        let stub_call = codelen
+        g_main_call_ofs = codelen
+        eb(232); ei(0)               // call main        (patched below)
+        eb(72); eb(137); eb(199)     // mov rdi, rax
+        eb(184); ei(60)              // mov eax, 60
+        sysc()                       // syscall (exit)
+    }   // end if no_start==0 (entry stub suppressed in secondary TU)
+
+
+    // Compile __init: evaluate each global's initializer and store it.
+    vclr(); irc=0; lblc=0
+
+    // Write function names into src buffer for IR_CALL lookup
+    let knoff=srclen
+    w8(src+knoff,107); w8(src+knoff+1,114); w8(src+knoff+2,101)
+    w8(src+knoff+3,103); w8(src+knoff+4,115); w8(src+knoff+5,0)
+
+    let irnoff=knoff+6
+    w8(src+irnoff,105); w8(src+irnoff+1,110); w8(src+irnoff+2,105)
+    w8(src+irnoff+3,116); w8(src+irnoff+4,95); w8(src+irnoff+5,114)
+    w8(src+irnoff+6,101); w8(src+irnoff+7,103); w8(src+irnoff+8,115)
+    w8(src+irnoff+9,0)
+
+    let icnoff=irnoff+10
+    w8(src+icnoff,105); w8(src+icnoff+1,110); w8(src+icnoff+2,105)
+    w8(src+icnoff+3,116); w8(src+icnoff+4,95); w8(src+icnoff+5,99)
+    w8(src+icnoff+6,115); w8(src+icnoff+7,0)
+
+    let gi=0
+    while gi<gvarc {
+        // Imported (extern "C" global NAME) globals have no initializer in
+        // THIS TU - they are defined by another TU. Their ginit slot is 0,
+        // so we must NOT call parse_expr() at tokp=0 (file start) or it would
+        // consume the next function's tokens. Detect imported via g_named==2 and
+        // emit a zero-store instead.
+        if r64(g_named + gi*8)==2 {
+            // imported: no initializer in this TU -> emit nothing for this slot
+        } else {
+            tokp = r64(ginit+gi*8)
+            let gv = parse_expr()
+            let initop = irop(irc-1)
+            iremit(IR_STOREG, 0, gv, gi)
+        }
+        flush_all()
+        gi=gi+1
+    }
+    let init_ofs = codelen
+    iremit(IR_RET,0,-1,0,0)
+    g_compiling_init = 1
+    ci_func(0,0)
+    g_compiling_init = 0
+    w64(func_code_starts+0,init_ofs)  // record __init at index 0
+    g_init_ofs = init_ofs
+
+    // For each fn: parse body → IR, then compile IR → code, record offset
+    let fi=0
+    while fi<fnc {
+    // P5.1: extern "C" fns have no body — skip compilation/codegen here;
+    // their UNDEF symbol is emitted by p5_elf_obj and resolved at link time.
+    if r64(fn_extern + fi*8)==1 { fi=fi+1; continue }
+        // Parse params and body
+        tokp=fn_btok(fi)+1  // skip {
+        vclr(); irc=0; lblc=0
+
+        // Bind params from the canonical record (fn_pnames/fn_pcount) written by
+        // scanfns.  Re-scanning the signature tokens here is fragile: a call-valued
+        // default like `b = g(5)` leaks `g` (and nested ids) in as phantom params.
+        let pc=0
+        let pbase=r64(fn_pbase + fi*8)
+        let pcount=r64(fn_pcount + fi*8)
+        let pz=0
+        while pz<pcount {
+            let pnm=r64(fn_pnames + pbase + pz*16)
+            let pnl=r64(fn_pnames + pbase + pz*16 + 8)
+            let vr=nv(); iremit(IR_PARAM,vr,pc,0,0); vadd(pnm,pnl,vr)
+            // Phase 4.3: tag param vreg with its declared struct type (enables `param.field`)
+            let ptyp = r64(fn_partype + (fi*200 + pz)*8)
+            if ptyp>=0 { w64(vreg_struct + vr*8, ptyp) }
+            // P9: tag param vreg with trait type (negative encoding)
+            if ptyp < 0-1 { w64(vreg_trait + vr*8, (ptyp * -1) - 2) }
+            pc=pc+1
+            pz=pz+1
+                    }
+                    // P10: Bind generic type parameters in function body scope
+                    let gen_count = r64(fn_genparams + fi*8)
+                    if gen_count>0 {
+                        let gen_base = r64(fn_genparam_base + fi*8)
+                        let gz = 0
+                        while gz<gen_count {
+                            let gnm = r64(fn_genparam_names + gen_base + gz*16)
+                            let gnl = r64(fn_genparam_names + gen_base + gz*16 + 8)
+                            let vr = nv()
+                            // Create a type marker vreg for this generic parameter
+                            iremit(IR_CONST, vr, gz, 0, 0)
+                            // Tag as generic type parameter
+                            w64(vreg_type + vr*8, 10)
+                            vadd(gnm, gnl, vr)
+                            gz = gz + 1
+                        }
+                    }
+        
+        // P10: cur_fi must be set BEFORE parse_block so that parse_call_impl's
+        // fn-typed-param lookup (findparam(cur_fi, ...)) sees THIS function's
+        // param table while the body is parsed — not the previous fn's (the
+        // register-slot hazard: cross-block state must live in globals).
+        cur_fi=fi
+// P11 (0.0.67): if THIS fn is a closure body (anonymous: name length 0
+        // with a parent), set cur_clo so parse_primary turns a free variable
+        // into a capture instead of a hard error. Also bind each capture already
+        // known for this closure to an IR_CAPREAD vreg, so a name captured on an
+        // earlier parse pass still resolves.
+        cur_clo = 0 - 1
+        if fn_nlen(fi)==0 && r64(fn_parent + fi*8)>=0 {
+            cur_clo = fi
+            let kk = 0
+            let kn = r64(cap_count + fi*8)
+            while kk < kn {
+                let knm = r64(cap_name + (fi*CAP_MAX + kk)*8)
+                let knl = r64(cap_nlen + (fi*CAP_MAX + kk)*8)
+                let kvr = nv(); iremit(IR_CAPREAD, kvr, kk, 0, 0); vadd(knm, knl, kvr)
+                kk = kk + 1
+            }
+        }
+        // 0.0.97: operator-overload suppression. Inside an operator-named fn
+        // body (e.g. `fn +(a,b)`), the same operator must resolve to the BUILTIN
+        // primitive — otherwise `fn +(a,b){ return a + b }` would infinitely
+        // recurse through the overload. So set overload_suppressed when the fn
+        // name's first byte is an operator symbol.
+        overload_suppressed = 0
+        if r64(OPFN_SUPP + fi*8) == 1 {
+            overload_suppressed = 1
+        }
+        // Push this function onto the scope stack so that local-first call
+        // resolution (resolve_call -> fn_curscope) is scoped to THIS function's
+        // body. Popped after the body is parsed.
+        fn_push(fi)
+
+                    parse_block()
+        iremit(IR_RET,0,-1,0,0)
+        fn_pop()
+        // P11 (0.0.67): snapshot this function's locals so any closure body
+        // compiled LATER (closures always get a higher fn index) can resolve a
+        // captured name to the vreg that held it in THIS frame.
+        clo_scope_save(fi)
+        cur_clo = 0 - 1
+
+        // Save IR start and param count
+        sfn(fi,fn_name(fi),fn_nlen(fi),fn_btok(fi),0,pc,0,0)
+        cur_fnname=fn_name(fi); cur_fnnlen=fn_nlen(fi)
+
+        // Compile IR to code.  fn_cofs must be the START offset of the code.
+        let cstart=codelen
+        w64(func_code_starts+(fi+1)*8,cstart)
+        // P4: record main's code offset for the startup-stub bl patch (global, unshadowable)
+        if fn_nlen(fi)==4 && r8(src+fn_name(fi))==109 && r8(src+fn_name(fi)+1)==97 && r8(src+fn_name(fi)+2)==105 && r8(src+fn_name(fi)+3)==110 { g_main_ofs = cstart }
+        opt_func()      // Tier-1 IR opt (constant folding). No-op when opt_on==0.
+        cur_fnname=fn_name(fi); cur_fnnlen=fn_nlen(fi)
+        ci_func(fi,0)
+        sfn(fi,fn_name(fi),fn_nlen(fi),fn_btok(fi),cstart,pc,0,0)
+
+        fi=fi+1
+    }
+
+    // Resolve function-call patches (ty==2) now that all offsets are known.
+    // In object mode (emit_obj==1) these are NOT resolved here — p5_elf_obj
+    // emits R_X86_64_PC32 relocations against the function symbols instead.
+    if emit_obj == 0 {
+    let pi=0
+    while pi<patchc {
+        if r64(patches+pi*PCS+16)==2 {
+            let po=r64(patches+pi*PCS)
+            let tg=r64(patches+pi*PCS+8)
+            let tg_nl=0
+            while tg_nl<256 {
+                let c0=r8(src+tg+tg_nl)
+                if c0==0||c0==40||c0==41||c0==59||c0==123||c0==125||c0==44||c0==60||c0==62 { break }
+                if c0==32||c0==9||c0==10||c0==13 { break }
+                tg_nl=tg_nl+1
+            }
+            let tfi=findfn(tg,tg_nl)
+            if tfi>=0 {
+                // P3: skip extern functions (resolved at link time, not via internal patching)
+                if r64(fn_extern + tfi*8)==1 {
+                    // extern "C" function - leave as-is for dynamic linker
+                } else {
+                    // func_code_starts[tfi+1] = code start for user function tfi (0=__init, 1=first user fn)
+                    let tofs=r64(func_code_starts+(tfi+1)*8)
+                    w8(code+po,232); w32(code+po+1, tofs-(po+5))
+                }
+            } else { file_write(2, src+tg, tg_nl); file_write(2, 0x100000+0, 1); exit(7) }
+        } else if r64(patches+pi*PCS+16)==5 {
+            // 0.0.97: IR_CALL_IDX — patches+8 carries the fn INDEX directly.
+            // Resolve to that function's code offset (no name lookup).
+            let po5=r64(patches+pi*PCS)
+            let tfi5=r64(patches+pi*PCS+8)
+            let tofs5=r64(func_code_starts+(tfi5+1)*8)
+            w8(code+po5,232); w32(code+po5+1, tofs5-(po5+5))
+        } else if r64(patches+pi*PCS+16)==4 {
+            // fnptr lea (x86 exec mode): patch rip-relative disp. patches+8 = fi.
+            // OFFSETS (same convention as ty==2). The lea is 7 bytes; both cof and the
+            // patch offset are code-buffer offsets, so disp = cof - (po3+7).
+            let po3=r64(patches+pi*PCS)
+            let tfi=r64(patches+pi*PCS+8)
+            let cof=r64(func_code_starts+(tfi+1)*8)
+            let disp=cof-(po3+7)
+            w32(code+po3+3, disp)
+        }
+        pi=pi+1
+    }
+    // ARM64 fnptr patches (exec mode only): resolve the adrp/add PC-relative to
+    // the function's link-time code address. The relocation site and global index
+    // were recorded by the global-access handler. Object mode emits relocations
+    // in p5_elf_obj instead.
+    patch_globals()
+    }   // end if emit_obj==0 (call-patch resolution skipped in object mode)
+
+    // Post-parse arity check (single-pass parser can't check during parse:
+    // forward calls / recursion reference a function whose param count is
+    // only recorded after its body is parsed). Now that all fns are known,
+    // scan IR_CALL instructions (a0=name, a1=arg count) and verify the call
+    // count matches the callee's declared param count.
+    let pi2=0
+    while pi2<irc {
+        if irop(pi2)==17 {
+            let cnm=ira0(pi2); let carc=ira1(pi2)
+            let cnl=len_name(cnm)
+            let cfi=findfn(cnm, cnl)
+            if cfi>=0 {
+                let cpc = fn_pc(cfi)
+                if r64(fn_var + cfi*8)==1 {
+                    if carc < cpc { compile_error(2, cnm, cnl) }  // variadic: need >= fixed
+                } else {
+                    // t5: allow omitting trailing defaulted params.
+                    let cmin = r64(fn_pdfixed + cfi*8)
+                    if carc != cpc && carc < cmin { compile_error(2, cnm, cnl) }
+                }
+            }
+        }
+        pi2=pi2+1
+    }
+
+    // If a hard compile error was recorded (e.g. call to an undeclared
+    // function), abort the compiler here BEFORE writing any ELF output.
+    // Returning N makes the startup stub exit(N); this is the reliable
+    // abort path (exit() builtin is unreliable inside the compiler).
+    if had_error==1 { exit(7) }
+
+    // G1: secure-by-default audit report (stderr, non-intrusive). A CI gate can
+    // parse this line; a non-zero count on stdlib/app-core is actionable. The
+    // compiler's own source uses zero unsafe (verified), so WIP self-host keeps it 0.
+    if unsafe_count > 0 {
+        let ua = "note: "
+        let ub = " 'unsafe' block(s) parsed (secure-by-default audit)\n"
+        file_write(2, ua+8, len(ua))
+        // write unsafe_count as decimal to stderr (no itoa builtin available)
+        let n = unsafe_count; let buf = mmap(32); let bi = 0
+        if n == 0 { w8(buf, 48); bi = 1 }
+        else {
+            while n > 0 { w8(buf+bi, 48 + (n - (n/10)*10)); bi=bi+1; n=n/10 }
+        }
+        // digits were stored least-significant-first; write them most-significant-first
+        let wi = 0
+        while wi < bi { file_write(2, buf + (bi-1-wi), 1); wi = wi+1 }
+        file_write(2, ub+8, len(ub))
+    }
+
+    // Patch the startup stub's call to __init and main's code offset.
+    let mfi=0; let mk=0
+    while mk<fnc {
+        if fn_nlen(mk)==4 {
+            let mnm=fn_name(mk)
+            if r8(src+mnm)==109&&r8(src+mnm+1)==97&&r8(src+mnm+2)==105&&r8(src+mnm+3)==110 { mfi=mk }
+        }
+        mk=mk+1
+    }
+    g_main_fi = mfi
+    // ARM64: object mode -> emit .o with relocations (defer to p5_elf_obj,
+    // which emits R_AARCH64_CALL26 relocs + EM_AARCH64). Otherwise patch the
+    // startup stub's bl __init / bl main to absolute offsets and emit a
+    // whole-program static-PIE ELF.
+    // x86-64: object mode -> emit .o with relocations; else whole-program ELF.
+    if emit_obj == 1 {
+        p5_elf_obj(out_p)
+        exit(0)
+    }
+    w32(code+init_call+1, r64(func_code_starts+0)-(init_call+5))
+    w32(code+stub_call+1, r64(func_code_starts+(mfi+1)*8)-(stub_call+5))
+    write_elf(out_p)
+    exit(0)
+}
+
+// Quick init
+fn kregs() {
+    return 0
+}
+

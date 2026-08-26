@@ -1,6 +1,6 @@
 # Quanta ROADMAP — consolidated single source of truth
 
-> **Last updated: 2026-08-26. Current compiler: 0.0.96** (x86-64 ELF emitter,
+> **Last updated: 2026-08-26. Current compiler: 0.0.98** (x86-64 ELF emitter,
 > multi-file tree, Valgrind-clean, self-host `fp=YES`). ARM64 (AArch64) backend
 > is DEFERRED POST-0.1.0 (see #2 schedule below); the working compiler is x86-64 only.
 >
@@ -90,23 +90,25 @@ Every item below is one WIP version: self-hosts (2-stage byte-identical fixed po
 | 0.0.95 | Lang | `String` real type | ✅ done | First-class `String` with length-aware ops (header `[ptr]=len`, bytes at `ptr+8`). `==`/`!=` desugar to `str_eq`/`str_ne` builtins (manual byte-loop; Quanta's `repe cmpsb` is broken — `memcmp` also returns 0 for differing equal-length strings). Concat `..`, `len()`, `print()` all length-aware. Regression: `string_compare_test.quanta` (rc=0) + 24-case compare suite, valgrind-clean, fixpoint A==B==C byte-identical (md5 `0560a3c9…`). |
 | 0.0.96 | Lang | try/catch | ✅ done | Parse `try/catch`; unwind to handler. Root cause of the 0.0.95-seed self-host break was a stale-`v`/`ln` fall-through after `throw`: `parse_block`'s `throw` arm parsed the expr then re-read a stale token and hit `else { adv() }`, which ate the body's closing `}` so the body over-consumed the `catch { ... }` block (IR dump proved `printi(9)` landing before `IR_TRY_END`). Fixed by `continue`-ing the parse loop after `throw`/`try` so the fresh token is re-read and line 36 breaks at `}` correctly. Nested + sequential try verified; self-host fixpoint byte-identical (golden md5 `b87e99cf…`); 132/132 functional, 8/8 security, 3/3 perf, valgrind 0, fuzz 120/120 clean. The 0.0.96 golden is the stable seed for 0.0.97. |
 | 0.0.97 | Lang | range `..` + operator overloading | ✅ done | `a..b` range value feeds `for` (exclusive end, tested 1..4→6). Operator overloading: user `fn +(a,b)` shadows builtin `+`; dispatched via an explicit `OPFN` fn-index table (opcode→fn index) + a new `IR_CALL_IDX` opcode (patch type 5 resolves by index, no src-name injection — corruption-proof). All 11 ops (`+ - * / % == != < > <= >=`) verified; operator fn bodies fall back to BUILTIN for the same operator via `overload_suppressed` (set per-fn from `OPFN_SUPP` table) so `fn +(a,b){return a+b}` does NOT infinitely recurse. Self-host fixpoint byte-identical (golden md5 `18da293e5afdebb8011ee46fdabca10a`); 138/138 functional, 8/8 security, 3/3 perf, all GREEN. The 0.0.97 golden is the stable seed for 0.0.98. |
-| 0.0.98 | Lang | generics monomorphisation | 🟡 type-erased | Instantiate `map<T,U>` per type-args; compile-time checks. |
-| 0.0.99 | Lang | float math + string ops + `rand` | ❌ | Float builtins; `substr`/`split`/utf8; getrandom-based `rand`. |
-| 0.100 | Builtins | float math (sin/cos/tan/pow/log/min/max) | ❌ | Add builtins; gate `std_math_test`. |
-| 0.101 | Builtins | string ops (strcat/substr/strcmp/str_split/utf8) | ❌ | Add builtins; gate `std_str_test`. |
-| 0.102 | Builtins | atomics (load/store/add/cmpxchg+futex) | ❌ | Add builtins; gate `atomic_test`. |
-| 0.103 | Builtins | networking (socket/connect/bind/listen/accept) | ❌ | Add builtins; gate `net_test`. |
-| 0.104 | Builtins | random `rand` | ❌ getrandom only | Add `rand` builtin; gate `rand_test`. |
-| 0.105 | Builtins | bit/byte extras (parity/bitfield/per-size swap) | ❌ | Add builtins. |
-| 0.106 | Builtins | intrinsics (prefetch/fence/branch hints) | ❌ | Add builtins. |
-| 0.107 | Builtins | fs metadata fix (stat/unlink/mkdir/chdir/rename) | 🟡 BROKEN | Fix path-string remap; gate. |
-| 0.108 | Builtins | introspection stack-trace | ❌ | Add `abort_test` stack trace. |
-| 0.109 | Memory | stack unwind / destructors / RAII | ❌ defer manual | Scope-exit cleanup. |
-| 0.110 | Memory | real allocator (free-list/GC) | ❌ bump mmap only | Free-list allocator replacing raw mmap. |
-| 0.111 | FFI | extern "C" PLT/GOT | 🟡 partial | Full dynamic-link symbol resolution. |
-| 0.112 | Lang | trait/impl dispatch completion | 🟡 partial | Complete vtable dispatch for interface/impl/trait. |
-| 0.113 | Lang | `big` keyword/type | 🟡 lib convention | `TT_BIG` + op-overload routing `a+b`→`big_add`; gate `big_test`. |
-| 0.114 | P4 tooling | **Quanta-native code-writing tool** | ❌ | LAST core item — sequenced right before 0.1.0 (where std/libs resume). Edit Quanta source reliably without external scripting. |
+| 0.0.98 | Lang | **Core A: extern "C" + interface/impl/trait (bootstrap capacity fix)** | ✅ done | The compiler's self-host build had hit a `vreg` capacity ceiling (`VREG_CAP` + 13 vreg-indexed arenas raised to 400000 so the compiler can keep compiling itself as features grow). With that fixed, Core A lands: **extern "C"** works via object-mode (`--emit-obj`) + external `ld`/`gcc` — multi-TU cross-call verified (`mtu_main`/`mtu_helper` linked, rc=49 = 7*7); **interface/impl/trait** dispatch via vtable (`trait_min`/`trait_test`/`trait_test2` rc=10, `struct_methods_test` rc=151). Self-host fixpoint byte-identical (golden md5 `ca090d00b91913d23634776db029a89a`); 138/138 functional, 8/8 security, 3/3 perf, all GREEN. EXE-mode PLT/GOT full dynamic-link (no external `ld`) is the 0.0.99 follow-up. The 0.0.98 golden is the stable seed for 0.0.99. |
+| 0.0.99 | FFI/Lang | **A.Core polish: extern "C" EXE-mode PLT/GOT + trait vtable completion** | 🟡 partial | Full standalone-EXE dynamic-link symbol resolution (`write_elf` PT_DYNAMIC/GOT/PLT so `extern "C"` calls work without an external `ld`); finish any vtable edge cases. |
+| 0.100 | Lang | generics monomorphisation | 🟡 type-erased | Instantiate `map<T,U>` per type-args; compile-time checks. |
+| 0.101 | Lang | float math + string ops + `rand` | ❌ | Float builtins; `substr`/`split`/utf8; getrandom-based `rand`. |
+| 0.102 | Builtins | float math (sin/cos/tan/pow/log/min/max) | ❌ | Add builtins; gate `std_math_test`. |
+| 0.103 | Builtins | string ops (strcat/substr/strcmp/str_split/utf8) | ❌ | Add builtins; gate `std_str_test`. |
+| 0.104 | Builtins | atomics (load/store/add/cmpxchg+futex) | ❌ | Add builtins; gate `atomic_test`. |
+| 0.105 | Builtins | networking (socket/connect/bind/listen/accept) | ❌ | Add builtins; gate `net_test`. |
+| 0.106 | Builtins | random `rand` | ❌ getrandom only | Add `rand` builtin; gate `rand_test`. |
+| 0.107 | Builtins | bit/byte extras (parity/bitfield/per-size swap) | ❌ | Add builtins. |
+| 0.108 | Builtins | intrinsics (prefetch/fence/branch hints) | ❌ | Add builtins. |
+| 0.109 | Builtins | fs metadata fix (stat/unlink/mkdir/chdir/rename) | 🟡 BROKEN | Fix path-string remap; gate. |
+| 0.110 | Builtins | introspection stack-trace | ❌ | Add `abort_test` stack trace. |
+| 0.111 | Memory | stack unwind / destructors / RAII | ❌ defer manual | Scope-exit cleanup. |
+| 0.112 | Memory | real allocator (free-list/GC) | ❌ bump mmap only | Free-list allocator replacing raw mmap. |
+| 0.113 | FFI | extern "C" PLT/GOT (full) | 🟡 partial | Full dynamic-link symbol resolution (folded into 0.0.99 Core-A polish). |
+| 0.114 | Lang | trait/impl dispatch completion | 🟡 partial | Complete vtable dispatch for interface/impl/trait (folded into 0.0.98/0.0.99 Core A). |
+| 0.115 | Lang | `big` keyword/type | 🟡 lib convention | `TT_BIG` + op-overload routing `a+b`→`big_add`; gate `big_test`. |
+| 0.116 | P4 tooling | **Quanta-native code-writing tool** | ❌ | LAST core item — sequenced right before 0.1.0 (where std/libs resume). Edit Quanta source reliably without external scripting. |
 | — | POST-0.1.0 | borrow-checking (ref/mut/move enforce) | ❌ | Compile-time memory safety (#1 green). |
 | — | POST-0.1.0 | `chain` lib (Merkle/signed-tx/UTXO/Block) | ❌ not in code | Differentiation mandate. |
 | — | POST-0.1.0 | `secure` lib (capability I/O, constant-time) | ❌ not in code | Differentiation mandate. |

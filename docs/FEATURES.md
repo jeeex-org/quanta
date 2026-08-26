@@ -43,13 +43,13 @@ exist as files but are excluded from the gate per the "core only until 0.1.0" ru
 | defer | token | ✅ done | ✅ gate | defer_test.quanta |
 | in | token | ✅ done | ✅ gate | forin_basic.quanta (for-in array iteration) |
 | alias | 17 | ✅ done | ✅ gate | alias_test.quanta (function alias newname=existingfn) |
-| extern "C" | 19 | 🟡 partial | ✅ gate | external_call.quanta (extern fn decls, rc=0); syscall_test.quanta (syscall path, rc=3). Parsing + call-emission work; full PLT/GOT dynamic-link resolution not yet finished (codegen.quanta:1268). |
+| extern "C" | 19 | ✅ done (0.0.98) | ✅ gate | `extern "C" fn square(x)` declared + called across TUs via `--emit-obj` + external `ld`/`gcc` (mtu_main.quanta/mtu_helper.quanta linked, rc=49 = 7*7). EXE-mode PLT/GOT (no external `ld`) is 0.0.99. Parsing + call-emission + R_X86_64_PLT32 relocation work. |
 | struct | token | ✅ done | ✅ gate | struct_test.quanta, struct_methods_test.quanta, struct_literal_test.quanta |
 | enum | 21 | ✅ done | ✅ gate | enum_test.quanta (rc=42); Some/None match arms exercised |
 | type | 23 | ✅ done (0.0.77) | ✅ gate | type_alias.quanta (rc=42). `type MyInt = int` then `let x: MyInt` |
-| interface | 24 | 🟡 partial | ✅ gate | trait_test.quanta / trait_test2.quanta / trait_min.quanta (rc=10, in gate); dispatch via trait methods |
-| impl | 25 | 🟡 partial | ✅ gate | trait methods exercised (struct_methods_test.quanta, rc=151) |
-| trait | 26 | 🟡 partial | ✅ gate | trait_test.quanta (rc=10, in gate); method dispatch works |
+| interface | 24 | ✅ done (0.0.98) | ✅ gate | trait_test.quanta / trait_test2.quanta / trait_min.quanta (rc=10, in gate); dispatch via vtable (method.quanta desugars `obj.method(args)` → `method(obj,args)`). |
+| impl | 25 | ✅ done (0.0.98) | ✅ gate | trait methods exercised (struct_methods_test.quanta, rc=151). |
+| trait | 26 | ✅ done (0.0.98) | ✅ gate | trait_test.quanta (rc=10, in gate); method dispatch works via vtable. |
 | where | 27 | ✅ done (0.0.93) | ✅ gate | `fn f<T>(x:T) where T: Trait` parsed + ELIDED (constraints not yet enforced). Verified: `->` ret type, multi-predicate `where A: Num, A: Copy`, without ret type, trait bounds in body. where_clause_test.quanta (rc=7) gates it. |
 | Option/Some/None | 28/29/30 | ✅ done | ✅ gate | option_test.quanta / option_simple.quanta / option_ctor.quanta / option_tuple.quanta (rc=42, in gate) |
 | Result/Ok/Err | 31/32/33 | ✅ done | ✅ gate | result_test.quanta (rc=49, in gate) |
