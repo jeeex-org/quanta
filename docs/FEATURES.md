@@ -114,7 +114,7 @@ native type keyword parsing). `as` width casts (`x as T`) are done (0.0.90).
 | match block arms `1 => { }` | ✅ done | ✅ gate | match_test.quanta covers block arms |
 | `?` early-return propagation | ✅ done | ✅ gate | question_mark.quanta (rc=0), option_test.quanta / result_test.quanta (in gate) |
 | loop expressions / labeled break w/ value | ✅ done (0.0.76) | ✅ gate | loop_test.quanta (`loop { break N }` value-return) |
-| try/catch | ❌ todo | ❌ none | only panic + `?` unwrap |
+| try/catch | ✅ done | ✅ gate | try_catch.quanta (rc=9), nested + sequential variants; real unwind to handler (IR_TRY_PUSH/IR_THROW/IR_TRY_END/IR_CATCH/IR_JMP) |
 
 ## D. Core — Expressions & Operators
 

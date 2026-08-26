@@ -1,6 +1,6 @@
 # Quanta ROADMAP — consolidated single source of truth
 
-> **Last updated: 2026-08-25. Current compiler: 0.0.95** (x86-64 ELF emitter,
+> **Last updated: 2026-08-26. Current compiler: 0.0.96** (x86-64 ELF emitter,
 > multi-file tree, Valgrind-clean, self-host `fp=YES`). ARM64 (AArch64) backend
 > is DEFERRED POST-0.1.0 (see #2 schedule below); the working compiler is x86-64 only.
 >
@@ -88,7 +88,7 @@ Every item below is one WIP version: self-hosts (2-stage byte-identical fixed po
 | 0.0.107 | Lang | typed array/slice `T[]` | ❌ untyped only | Parse `let a: i64[]`; bound-checked access. |
 | 0.0.94 | Lang | `move` / `ref` / `mut` | ✅ done | `mut` (rebindable, since 0.0.76), `ref r = &x` (borrow alias; `*r` reads through), `move x` (ownership-transfer prefix). All parsed; ownership tag (0=plain,1=mut,2=ref,3=moved) recorded per symbol in a parallel `vars_own` array (`vown`/`set_vown` accessors). Enforce (reject illegal aliasing / post-move use) lands at 0.1.0 borrow-check. ownership_sigils_test.quanta (rc=7) gates it. |
 | 0.0.95 | Lang | `String` real type | ✅ done | First-class `String` with length-aware ops (header `[ptr]=len`, bytes at `ptr+8`). `==`/`!=` desugar to `str_eq`/`str_ne` builtins (manual byte-loop; Quanta's `repe cmpsb` is broken — `memcmp` also returns 0 for differing equal-length strings). Concat `..`, `len()`, `print()` all length-aware. Regression: `string_compare_test.quanta` (rc=0) + 24-case compare suite, valgrind-clean, fixpoint A==B==C byte-identical (md5 `0560a3c9…`). |
-| 0.0.96 | Lang | try/catch | ❌ panic+`?` only | Parse `try/catch`; unwind to handler. |
+| 0.0.96 | Lang | try/catch | ✅ done | Parse `try/catch`; unwind to handler. Root cause of the 0.0.95-seed self-host break was a stale-`v`/`ln` fall-through after `throw`: `parse_block`'s `throw` arm parsed the expr then re-read a stale token and hit `else { adv() }`, which ate the body's closing `}` so the body over-consumed the `catch { ... }` block (IR dump proved `printi(9)` landing before `IR_TRY_END`). Fixed by `continue`-ing the parse loop after `throw`/`try` so the fresh token is re-read and line 36 breaks at `}` correctly. Nested + sequential try verified; self-host fixpoint byte-identical (golden md5 `b87e99cf…`); 132/132 functional, 8/8 security, 3/3 perf, valgrind 0, fuzz 120/120 clean. The 0.0.96 golden is the stable seed for 0.0.97. |
 | 0.0.97 | Lang | range `..` + operator overloading | ❌ | `a..b` range value feeds `for`; trait-vtable dispatch for `op` fns. |
 | 0.0.98 | Lang | generics monomorphisation | 🟡 type-erased | Instantiate `map<T,U>` per type-args; compile-time checks. |
 | 0.0.99 | Lang | float math + string ops + `rand` | ❌ | Float builtins; `substr`/`split`/utf8; getrandom-based `rand`. |
@@ -162,9 +162,15 @@ Why post-0.1.0: the ARM64 backend is a new backend; shipping it while x86 debt
 remains would violate the debt-first rule and split correctness effort.
 Qualification evidence is gathered AFTER the core is complete, not before.
 
-### Current status (0.0.95)
+### Current status (0.0.96)
 
-**0.0.95 (promoted stable seed):** Lang — `String` real type (length-aware).
+**0.0.96 (promoted stable seed):** Lang — `try`/`catch` real unwind to handler.
+- `try { ... } catch { ... }` parses; the body is wrapped by `IR_TRY_PUSH`/`IR_TRY_END`, a thrown value lands in the `catch` handler (via `IR_THROW` → `IR_CATCH` landing), and control resumes after the try via `IR_JMP` to a `done` label.
+- Nested try (try inside try inside catch) and sequential try (two independent try/catch blocks) both verified correct (`t5f` → `123457`, `t5h` → `1436`).
+- Root-cause fix: in `parse_block`, the `throw` arm parsed its expr, then re-read a **stale** `v`/`ln` (still pointing at `throw`), and since `throw`'s ktext wasn't in the dispatch list, fell into `else { adv() }` which consumed the body's closing `}` — so the body `parse_block` never saw its `}` and over-consumed the `catch { printi(9) }` block. The IR dump was the smoking gun: `printi(9)` was emitted **before** `IR_TRY_END`. Fixed by `continue`-ing the parse loop after `throw`/`try` parse so the fresh current token is re-read and line 36 breaks at `}` correctly.
+- Regression gate: nested + sequential try/catch exercised via `try_catch.quanta` (rc=9), `t5f` (nested, `123457`), `t5h` (sequential, `1436`), plus throw/no-throw variants. Full suite 132/132 green; self-host fixpoint **byte-identical** (golden md5 `b87e99cf…`); valgrind 0 errors/leaks on try/catch binaries; differential fuzz 120/120 clean. The 0.0.96 golden (`compiler/0.0.96/bin/x86/qc`) is the stable seed for 0.0.97.
+
+**0.0.95 (prior stable seed):** Lang — `String` real type (length-aware).
 - `let s: String = "..."` — first-class `String`; header `[ptr]=len` (i64 at offset 0), bytes at `ptr+8`.
 - `==` / `!=` on `String` desugar to `str_eq` / `str_ne` builtins (manual byte-loop; Quanta's `repe cmpsb` is defective — `memcmp` also returns 0 for differing equal-length strings, so a hand-written load/compare loop is used).
 - Concat `..`, `len()`, `print()` all length-aware (concat uses `rep movsb`; compares skip the 8-byte length header via `add rdi,8`/`add rsi,8`).
