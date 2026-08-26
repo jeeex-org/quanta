@@ -11,7 +11,7 @@
 #
 # Usage: QC=<path-to-qc> bash perf_tests.sh
 set -u
-QC="${QC:-./bin/qc}"
+QC="${QC:-./compiler/$(cat VERSION)/bin/x86/qc}"
 TMP="$(mktemp -d)"
 PASS=0; FAIL=0
 

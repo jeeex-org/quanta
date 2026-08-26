@@ -3,11 +3,11 @@ import std/fs
 // Comprehensive coverage of lib/std/fs: open, write_str, read_str, write_raw, read_raw, close.
 fn main() {
   let ok = 0
-  // write_str + read_str round trip
-  let fd = open("rt.txt", 577, 420)
+  // write_str + read_str round trip (use /tmp so the test never pollutes the repo root)
+  let fd = open("/tmp/quanta_rt.txt", 577, 420)
   let wn = write_str(fd, "hello-quanta")
   close(fd)
-  let fd2 = open("rt.txt", 0, 0)
+  let fd2 = open("/tmp/quanta_rt.txt", 0, 0)
   let got = read_str(fd2, 64)
   close(fd2)
   if wn == 12 { ok = ok + 1 }
@@ -15,7 +15,7 @@ fn main() {
   if equals(got, "hello-quanta") == 1 { ok = ok + 1 }
 
   // write_raw + read_raw round trip (raw byte buffer, no string header)
-  let fd3 = open("raw.txt", 577, 420)
+  let fd3 = open("/tmp/quanta_raw.txt", 577, 420)
   let out = mem_alloc(8)
   mem_store8(out + 0, 10)
   mem_store8(out + 1, 20)
@@ -23,7 +23,7 @@ fn main() {
   mem_store8(out + 3, 40)
   let wr = write_raw(fd3, out, 4)
   close(fd3)
-  let fd4 = open("raw.txt", 0, 0)
+  let fd4 = open("/tmp/quanta_raw.txt", 0, 0)
   let inb = mem_alloc(8)
   let rr = read_raw(fd4, inb, 4)
   close(fd4)

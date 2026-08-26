@@ -7,7 +7,7 @@ set -e
 # that must not abort the gate.
 ulimit -c 0 2>/dev/null || true
 
-QC="${QC:-./bin/qc}"
+QC="${QC:-./compiler/$(cat VERSION)/bin/x86/qc}"
 TEST_SUITES="./test_suites"
 PASS=0
 FAIL=0

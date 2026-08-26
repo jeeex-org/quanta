@@ -4,7 +4,7 @@
 # bug. This locks in the optimizer's correctness so future versions can't silently
 # regress it. Exits non-zero on divergence.
 set -u
-QC="${QC:-./bin/qc}"
+QC="${QC:-./compiler/$(cat VERSION)/bin/x86/qc}"
 OUT_DIR="$(mktemp -d)"
 N=120
 SEED=$$
