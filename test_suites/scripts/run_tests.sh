@@ -62,6 +62,39 @@ else
   FUNCTIONAL_RC=0
 fi
 
+# --- Stage 1.5: EXTERN "C" FFI (object mode + gcc link) ----------------------
+# The main loop above compiles in EXEC mode only ($QC -O), where extern "C"
+# cannot resolve libc. This stage actually links a real libc FFI test so the
+# string-header skip, 16B stack alignment, and libc-exit stdout flush paths are
+# exercised by the gate (not just by ad-hoc manual checks).
+echo ""
+echo "########## EXTERN \"C\" FFI LAYER (object mode + gcc) ##########"
+EXTERN_FAIL=0
+while IFS=$'\t' read -r name sentinel; do
+  src="$TEST_SUITES/codes/$name"
+  [ -f "$src" ] || continue
+  obj="$TEST_SUITES/bin/${name%.quanta}.o"
+  bin="$TEST_SUITES/bin/${name%.quanta}_ext"
+  if ! $QC --emit-obj "$src" "$obj" 2>/tmp/extern_stderr.txt; then
+    echo "  FAIL (compile) $name  $(cat /tmp/extern_stderr.txt)"
+    EXTERN_FAIL=$((EXTERN_FAIL + 1)); continue
+  fi
+  if ! gcc -nostartfiles "$obj" -o "$bin" 2>/tmp/extern_ld.txt; then
+    echo "  FAIL (link) $name  $(cat /tmp/extern_ld.txt)"
+    EXTERN_FAIL=$((EXTERN_FAIL + 1)); continue
+  fi
+  got=$("$bin" 2>&1)
+  if echo "$got" | grep -q "$sentinel"; then
+    echo "  PASS extern $name (sentinel '$sentinel' found)"
+  else
+    echo "  FAIL extern $name (expected sentinel '$sentinel', got: '$got')"
+    EXTERN_FAIL=$((EXTERN_FAIL + 1))
+  fi
+done < "$TEST_SUITES/EXTERN_EXPECTED.tsv"
+EXTERN_RC=${EXTERN_RC:-0}
+[ "$EXTERN_FAIL" -eq 0 ] && EXTERN_RC=0 || EXTERN_RC=1
+if [ $EXTERN_RC -ne 0 ]; then FUNCTIONAL_RC=1; fi
+
 # --- Stage 2: SECURITY layer (overflow traps, OOB, malformed/garbage input) ---
 echo ""
 echo "########## SECURITY TEST LAYER ##########"
@@ -77,6 +110,7 @@ PERF_RC=${PERF_RC:-0}
 echo ""
 echo "=== GATE SUMMARY ==="
 echo "  functional : $([ $FUNCTIONAL_RC = 0 ] && echo GREEN || echo RED)"
+echo "  extern-c  : $([ $EXTERN_RC = 0 ] && echo GREEN || echo RED)  (object-mode + gcc libc link)"
 echo "  security   : $([ $SECURITY_RC = 0 ] && echo GREEN || echo RED)  (KNOWN bugs reported by script, not blocking)"
 echo "  performance: $([ $PERF_RC = 0 ] && echo GREEN || echo RED)"
 # Block promotion on a real functional/security/perf regression. Security
