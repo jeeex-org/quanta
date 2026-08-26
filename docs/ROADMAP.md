@@ -80,6 +80,8 @@ Every item below is one WIP version: self-hosts (2-stage byte-identical fixed po
 | Version | Core | Item | Status today | Work |
 |---------|------|------|--------------|------|
 | 0.100 | Lang | test-coverage accuracy + full gate verification (gate-only) | ✅ done | Copy 0.0.99 → 0.0.100; ran ALL gate stages (functional 138/138, extern-c, security 8/8, perf 3/3, valgrind, fuzz fail-closed, differential) + 3-stage self-host fixpoint (byte-identical md5 `52abed5acf470aabc50d6d11e31b0f2d`). Coverage audit: every FEATURES "✅ gate" row maps to a real gated test (no missing core tests); FEATURES count corrected 132→138. No compiler source change → fixpoint auto-preserved. NOTE: stdlib-module tests (big/quantum/linalg) are DEFERRED to the stdlib stage — stdlib is not a released core feature yet. Promoted as new stable seed. |
+| 0.114 | FFI | extern "C" PLT/GOT (full) | ✅ done (0.0.99) | Full dynamic-link symbol resolution for object-mode `--emit-obj` + gcc (string-arg header skip, multi-arg call fix, 16-byte stack alignment, libc-exit stdout flush). Standalone-EXE PLT/GOT (no external `ld`) remains deferred. |
+| 0.115 | Lang | trait/impl dispatch completion | ✅ done (0.0.98) | vtable dispatch for interface/impl/trait landed in 0.0.98; verified via trait_min/trait_test/struct_methods_test. |
 | 0.101 | Lang | generics monomorphisation | 🟡 type-erased | Instantiate `map<T,U>` per type-args; compile-time checks. |
 | 0.102 | Lang | float math + string ops + `rand` | ❌ | Float builtins; `substr`/`split`/utf8; getrandom-based `rand`. |
 | 0.103 | Builtins | float math (sin/cos/tan/pow/log/min/max) | ❌ | Add builtins; gate `std_math_test`. |
@@ -93,8 +95,6 @@ Every item below is one WIP version: self-hosts (2-stage byte-identical fixed po
 | 0.111 | Builtins | introspection stack-trace | ❌ | Add `abort_test` stack trace. |
 | 0.112 | Memory | stack unwind / destructors / RAII | ❌ defer manual | Scope-exit cleanup. |
 | 0.113 | Memory | real allocator (free-list/GC) | ❌ bump mmap only | Free-list allocator replacing raw mmap. |
-| 0.114 | FFI | extern "C" PLT/GOT (full) | ✅ done (0.0.99) | Full dynamic-link symbol resolution for object-mode `--emit-obj` + gcc (string-arg header skip, multi-arg call fix, 16-byte stack alignment, libc-exit stdout flush). Standalone-EXE PLT/GOT (no external `ld`) remains deferred. |
-| 0.115 | Lang | trait/impl dispatch completion | ✅ done (0.0.98) | vtable dispatch for interface/impl/trait landed in 0.0.98; verified via trait_min/trait_test/struct_methods_test. |
 | 0.116 | Lang | `big` keyword/type | 🟡 lib convention | `TT_BIG` + op-overload routing `a+b`→`big_add`; gate `big_test`. |
 | 0.117 | Lang | typed array/slice `T[]` | ❌ untyped only | Parse `let a: i64[]`; bound-checked access. |
 | 0.118 | P4 tooling | **Quanta-native code-writing tool** | ❌ | LAST core item — sequenced right before 0.1.0 (where std/libs resume). Edit Quanta source reliably without external scripting. |
@@ -147,7 +147,7 @@ Why post-0.1.0: the ARM64 backend is a new backend; shipping it while x86 debt
 remains would violate the debt-first rule and split correctness effort.
 Qualification evidence is gathered AFTER the core is complete, not before.
 
-### Current status (0.0.99)
+### Current status (0.0.100)
 
 **0.0.99 (promoted stable seed):** Lang — A.Core extern "C" polish (genuinely working FFI) + test-coverage hardening.
 - Resolved the four real extern-C defects 0.0.98 left open (string-arg header skip `add reg,8`; 16-byte stack alignment via `push r11/call/pop r11`; multi-arg call `arg_start`/`arg_cnt` mapping; libc `exit()` stdout flush in object mode, raw `exit` syscall in exec mode). Gated by `extern_c_ffi.quanta` + `EXTERN_EXPECTED.tsv` (object mode + `gcc -nostartfiles`, asserts `EXTERN_C_OK`).
