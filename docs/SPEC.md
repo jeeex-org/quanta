@@ -173,7 +173,7 @@ properties, so every backend inherits them by construction.
 ## 6. Compilation & execution model
 
 - **Self-hosting**: the compiler is written in Quanta and bootstraps via a
-  2-stage self-host: the committed `bin/x86/qc` compiles the 0.0.74 source to
+  3-stage self-host fixpoint: the committed `compiler/$(cat VERSION)/bin/x86/qc` compiles the $(cat VERSION) source to
   a faithful `qc`, verified byte-identical to a 2nd-stage rebuild
   (110/110 gate). Two parameter/global name collisions in the emitter
   (`mr(mod,…)`/`IR_MOD`, `stx(…,src)`/`src`) were fixed to make self-host faithful.

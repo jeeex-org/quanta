@@ -1,6 +1,6 @@
 # Quanta ROADMAP — consolidated single source of truth
 
-> **Last updated: 2026-08-26. Current compiler: 0.0.98** (x86-64 ELF emitter,
+> **Last updated: 2026-08-26. Current compiler: 0.0.99** (x86-64 ELF emitter,
 > multi-file tree, Valgrind-clean, self-host `fp=YES`). ARM64 (AArch64) backend
 > is DEFERRED POST-0.1.0 (see #2 schedule below); the working compiler is x86-64 only.
 >
@@ -70,7 +70,7 @@ SEQUENCING is the contract, not the literal numbers.
 | SIMPLE-SURFACE | 0.0.56 | **Simplified syntax landed**: `fn` keyword optional (bare `name(){}` works everywhere, `init()`/`main()` bare OK), `let` optional (bare `name = expr` = local/global), `return` optional (last-expr auto-returns), condition parens optional, `${name}` global / `$[]` local explicit sigils (bare + inside-string interpolation). Goal: bash-like, extremely simple surface. Docs (README/SYNTAX/SPEC) + test_suites + security script synced. |
 | P2 builtins | 0.0.55–0.0.60 | float cmp ✅(0.0.55), proc/env ✅(0.0.55), stdin ✅(0.0.55), fs meta ✅(0.0.55 — path-string remap fixed), string ops, math ✅(sqrt/floor/ceil/abs; sin/cos/tan/pow/log/min/max TODO), atomics, net, introspection ✅(abort/debugbreak), random ✅(getrandom), **`$$(cmd)` external-command substitution (0.0.57)** — `unsafe`-gated runtime `fork`/`execve`/`pipe`/`wait4` via the raw `syscall()` builtin (no libc); `$$(str)`→`/bin/sh -c`, `$$(arr)`→direct `execve` (no shell, injection-safe). Returns `CmdResult{stdout,stderr,status}`. |
 | P3 language | 0.0.61–0.0.85 | **float literals ✅(0.0.61)**, **float-arg-to-builtin ✅(0.0.62: f2i/fadd/fsub/fmul/fdiv read float vregs correctly)**, **user enums ✅(0.0.63: qualified+bare variant resolution, explicit tags, match)**, **modules ✅(0.0.64: mod Name { fn ... } + Mod.fn() qualified calls)**, **closure literals ✅(0.0.65: `|x,y| { expr }` → [codeptr, env] tuple, callable directly or via fn-typed param)**, **array push fix ✅(0.0.66: IR_CLOSURE/IR_APUSH opcode collision silently zeroed every pushed element)**, **closure captures ✅(0.0.67: free vars of the enclosing fn captured by value into a heap env array)**, **user-fn-beats-builtin ✅(0.0.68: was enforced in only 2 of 86 builtin branches, so a user `fn abs` was silently hijacked)**, **match guards ✅(0.0.69: `n if cond => expr` — the `if` was never consumed, so guarded arms silently yielded 0)**; remaining: **`big` keyword/type** (library convention today; needs `TT_BIG` + op-overload), generic monomorphisation (type params are erased today), ref/ref-return/borrow (needs borrow-checking), and op-overload (needs trait vtable dispatch) — all 0.1.0 type-system work. **Differentiation libs (math/physics/crypto/blockchain/quantum/AI mandate):** `crypto`/`quantum`/`linalg`/`math` shipped but lack dedicated gate tests (`big_test`/`quantum_test`/`linalg_test` needed); `chain`/`secure`/`ai`/`physics` not yet in code (native lib track, post-0.0.86). |
-| **P4 tooling** | **0.114** | **Quanta-native code-writing tool** (edit Quanta source reliably without external scripting — the user's stated goal; last core item, sequenced immediately before 0.1.0) |
+| **P4 tooling** | **0.118** | **Quanta-native code-writing tool** (edit Quanta source reliably without external scripting — the user's stated goal; last core item, sequenced immediately before 0.1.0) |
 | **0.1.0** | 0.1.0 | Core + builtins complete → std/lib resumes; borrow-checking target for #1 green; **PTY layer for interactive `$$()` (vi/ssh/top)** |
 
 ### Outstanding cores — per-version sequencing (0.0.87 → 0.1.0+)
@@ -79,44 +79,27 @@ Every item below is one WIP version: self-hosts (2-stage byte-identical fixed po
 
 | Version | Core | Item | Status today | Work |
 |---------|------|------|--------------|------|
-| 0.0.87 | Lang | Gate the std libs | ✅ done | Add `std_crypto_test`, `std_quantum_test`, `std_linalg_test`, `std_vec_test`, `std_fs_test`, `std_math_test` to EXPECTED.tsv; verify green. |
-| 0.0.88 | Lang | `u8`/`u16` type keywords | ✅ done | `let x: u8`/`u16` parsed + width_mask codegen. Fixed silent-wrong mask bug: REX.B for r8-r15 result regs + const-fold wrap. mixed_width_mask_test.quanta gates it. |
-| 0.0.89 | Lang | `bool`/`char`/`byte` as types | ✅ done | `let x: bool`/`char`/`byte` parsed (vtype 6/7/8) + width_mask codegen. char/byte wrap 0..255 (REX.B-correct); bool arithmetic is plain integer (true+true==2). bool_char_byte_types_test.quanta gates it. |
-| 0.0.90 | Lang | `as` cast | ✅ done | `x as T` width cast. Root cause: `as` is lexed TT_AS (36), not TT_KEY, so the old parse_as loop (`peek()==TT_KEY`) NEVER fired — the cast was a silent no-op (rc=112 / dropped control flow). Fixed to loop on `peek()==TT_AS`; truncation emitted as IR_BAND with the width mask (IR_MOV+tag alone got copy-propagated away, losing the mask). Covers u8/u16/u32/char/byte/usize; usize/signed are identity. as_cast_test.quanta gates it. |
-| 0.0.91 | Lang | `usize`/`u32`/`u64` full type keywords | ✅ done | Type annotations `let x: usize/u32/u64` parsed (vtype 5/3/4) since 0.0.89; verified full semantics: u32 wraps at 2^32, u64/usize are full 64-bit (no 2^32 wrap), `as` casts to/from all three behave correctly. usize_u32_u64_types_test.quanta gates it. No code change vs 0.0.90 — prior ROADMAP row marked these lexed-only was stale; this release confirms + locks them with a dedicated regression test. |
-| 0.0.92 | Lang | `raw`/`volatile` qualifiers | ✅ done | `raw` (`*u64`,`*mut u64`) type annotations + deref/store already worked (verified). `volatile` was a SILENT NO-OP: lexed TT_VOLATILE (34) but parse guarded on `TT_KEY&&ktext==39` (never matched) → dropped the binding AND following control flow; also IR_VOLATILE_LOAD/STORE codegen was missing the MOV opcode byte (just ModRM) and the store used a reversed a0/a1. Fixed all three; volatile load+store+if verified, 129/129 gate + valgrind/fuzz green. |
-| 0.0.107 | Lang | typed array/slice `T[]` | ❌ untyped only | Parse `let a: i64[]`; bound-checked access. |
-| 0.0.94 | Lang | `move` / `ref` / `mut` | ✅ done | `mut` (rebindable, since 0.0.76), `ref r = &x` (borrow alias; `*r` reads through), `move x` (ownership-transfer prefix). All parsed; ownership tag (0=plain,1=mut,2=ref,3=moved) recorded per symbol in a parallel `vars_own` array (`vown`/`set_vown` accessors). Enforce (reject illegal aliasing / post-move use) lands at 0.1.0 borrow-check. ownership_sigils_test.quanta (rc=7) gates it. |
-| 0.0.95 | Lang | `String` real type | ✅ done | First-class `String` with length-aware ops (header `[ptr]=len`, bytes at `ptr+8`). `==`/`!=` desugar to `str_eq`/`str_ne` builtins (manual byte-loop; Quanta's `repe cmpsb` is broken — `memcmp` also returns 0 for differing equal-length strings). Concat `..`, `len()`, `print()` all length-aware. Regression: `string_compare_test.quanta` (rc=0) + 24-case compare suite, valgrind-clean, fixpoint A==B==C byte-identical (md5 `0560a3c9…`). |
-| 0.0.96 | Lang | try/catch | ✅ done | Parse `try/catch`; unwind to handler. Root cause of the 0.0.95-seed self-host break was a stale-`v`/`ln` fall-through after `throw`: `parse_block`'s `throw` arm parsed the expr then re-read a stale token and hit `else { adv() }`, which ate the body's closing `}` so the body over-consumed the `catch { ... }` block (IR dump proved `printi(9)` landing before `IR_TRY_END`). Fixed by `continue`-ing the parse loop after `throw`/`try` so the fresh token is re-read and line 36 breaks at `}` correctly. Nested + sequential try verified; self-host fixpoint byte-identical (golden md5 `b87e99cf…`); 132/132 functional, 8/8 security, 3/3 perf, valgrind 0, fuzz 120/120 clean. The 0.0.96 golden is the stable seed for 0.0.97. |
-| 0.0.97 | Lang | range `..` + operator overloading | ✅ done | `a..b` range value feeds `for` (exclusive end, tested 1..4→6). Operator overloading: user `fn +(a,b)` shadows builtin `+`; dispatched via an explicit `OPFN` fn-index table (opcode→fn index) + a new `IR_CALL_IDX` opcode (patch type 5 resolves by index, no src-name injection — corruption-proof). All 11 ops (`+ - * / % == != < > <= >=`) verified; operator fn bodies fall back to BUILTIN for the same operator via `overload_suppressed` (set per-fn from `OPFN_SUPP` table) so `fn +(a,b){return a+b}` does NOT infinitely recurse. Self-host fixpoint byte-identical (golden md5 `18da293e5afdebb8011ee46fdabca10a`); 138/138 functional, 8/8 security, 3/3 perf, all GREEN. The 0.0.97 golden is the stable seed for 0.0.98. |
-| 0.0.98 | Lang | **Core A: extern "C" + interface/impl/trait (bootstrap capacity fix)** | ✅ done | The compiler's self-host build had hit a `vreg` capacity ceiling (`VREG_CAP` + 13 vreg-indexed arenas raised to 400000 so the compiler can keep compiling itself as features grow). With that fixed, Core A lands: **extern "C"** works via object-mode (`--emit-obj`) + external `ld`/`gcc`; **interface/impl/trait** dispatch via vtable (`trait_min`/`trait_test`/`trait_test2` rc=10, `struct_methods_test` rc=151). Self-host fixpoint byte-identical (golden md5 `ca090d00b91913d23634776db029a89a`); 138/138 functional, 8/8 security, 3/3 perf, all GREEN. EXE-mode PLT/GOT full dynamic-link (no external `ld`) is the 0.0.99 follow-up. The 0.0.98 golden is the stable seed for 0.0.99. NOTE: the 0.0.98 release note's "multi-TU cross-call verified (mtu_main/mtu_helper, rc=49)" was an UNVERIFIED claim — those fixtures exist (test_suites/codes/mtu_main.quanta etc.) but the gate never compiled/linked them in object mode (run_tests.sh used EXEC mode only, where libc FFI can't resolve), so rc=49 was never actually produced. The genuine extern-C string-arg + flush + alignment fixes landed and are now GATED in 0.0.99 (test_suites/codes/extern_c_ffi.quanta + EXTERN_EXPECTED.tsv). |
-| 0.0.99 | FFI/Lang | **A.Core polish: make extern "C" genuinely work** | ✅ done | Resolved the real extern-C defects that 0.0.98 left broken: (1) **string args** — Quanta strings carry an 8-byte length header `[len][data]`; extern "C" calls now emit `add <reg>,8` to pass a `char*` to C (detected via `vreg_is_str` on the arg vreg + `IR_MOV`/`IR_STR` fallback), so `strlen("hello")`→5, `strcmp`→correct, `write(1,"hi",2)`→"hi". (2) **multi-arg calls** — fixed `arg_start`/`arg_cnt` mapping in the IR_CALL handler (`a2`=arg IR start, `a1`=arg count) which golden had wrong; `add(3,4)`→7. (3) **stack alignment** — extern calls now `push r11 / call / pop r11` to align `rsp` to 16 before the libc call (SysV ABI), fixing SSE faults in `printf`/`puts`. (4) **stdout flush** — entry stub calls libc `exit()` in object mode (flushes stdio) instead of raw `exit` syscall, so `printf`/`puts` output is no longer lost under `-nostartfiles`. EXE-mode keeps the raw syscall (no libc). Scalar extern calls (`abs(-42)`→42) confirmed. Self-host fixpoint byte-identical (B==C md5 `52abed5acf470aabc50d6d11e31b0f2d`); 138/138 functional, 8/8 security, 3/3 perf, fuzz/differential clean. The 0.0.99 golden is the stable seed for 0.1.0. NOTE: full standalone-EXE dynamic-link (write_elf PT_DYNAMIC/GOT/PLT, no external `ld`) is deferred — object-mode + gcc remains the supported extern path. |
-| 0.100 | Lang | generics monomorphisation | 🟡 type-erased | Instantiate `map<T,U>` per type-args; compile-time checks. |
-| 0.101 | Lang | float math + string ops + `rand` | ❌ | Float builtins; `substr`/`split`/utf8; getrandom-based `rand`. |
-| 0.102 | Builtins | float math (sin/cos/tan/pow/log/min/max) | ❌ | Add builtins; gate `std_math_test`. |
-| 0.103 | Builtins | string ops (strcat/substr/strcmp/str_split/utf8) | ❌ | Add builtins; gate `std_str_test`. |
-| 0.104 | Builtins | atomics (load/store/add/cmpxchg+futex) | ❌ | Add builtins; gate `atomic_test`. |
-| 0.105 | Builtins | networking (socket/connect/bind/listen/accept) | ❌ | Add builtins; gate `net_test`. |
-| 0.106 | Builtins | random `rand` | ❌ getrandom only | Add `rand` builtin; gate `rand_test`. |
-| 0.107 | Builtins | bit/byte extras (parity/bitfield/per-size swap) | ❌ | Add builtins. |
-| 0.108 | Builtins | intrinsics (prefetch/fence/branch hints) | ❌ | Add builtins. |
-| 0.109 | Builtins | fs metadata fix (stat/unlink/mkdir/chdir/rename) | 🟡 BROKEN | Fix path-string remap; gate. |
-| 0.110 | Builtins | introspection stack-trace | ❌ | Add `abort_test` stack trace. |
-| 0.111 | Memory | stack unwind / destructors / RAII | ❌ defer manual | Scope-exit cleanup. |
-| 0.112 | Memory | real allocator (free-list/GC) | ❌ bump mmap only | Free-list allocator replacing raw mmap. |
-| 0.113 | FFI | extern "C" PLT/GOT (full) | ✅ done (0.0.99) | Full dynamic-link symbol resolution for object-mode `--emit-obj` + gcc (string-arg header skip, multi-arg call fix, 16-byte stack alignment, libc-exit stdout flush). Standalone-EXE PLT/GOT (no external `ld`) remains deferred. |
-| 0.114 | Lang | trait/impl dispatch completion | ✅ done (0.0.98) | vtable dispatch for interface/impl/trait landed in 0.0.98; verified via trait_min/trait_test/struct_methods_test. |
-| 0.115 | Lang | `big` keyword/type | 🟡 lib convention | `TT_BIG` + op-overload routing `a+b`→`big_add`; gate `big_test`. |
-| 0.116 | P4 tooling | **Quanta-native code-writing tool** | ❌ | LAST core item — sequenced right before 0.1.0 (where std/libs resume). Edit Quanta source reliably without external scripting. |
-| — | POST-0.1.0 | borrow-checking (ref/mut/move enforce) | ❌ | Compile-time memory safety (#1 green). |
-| — | POST-0.1.0 | `chain` lib (Merkle/signed-tx/UTXO/Block) | ❌ not in code | Differentiation mandate. |
-| — | POST-0.1.0 | `secure` lib (capability I/O, constant-time) | ❌ not in code | Differentiation mandate. |
-| — | POST-0.1.0 | `ai` lib (tensor ops + inference) | ❌ not in code | Differentiation mandate. |
-| — | POST-0.1.0 | `physics` lib (ODE/PDE solvers) | ❌ not in code | Differentiation mandate. |
-| — | POST-0.1.0 | ARM64 (AArch64) backend | ❌ x86 only | Second backend (independent impl route). |
+| 0.100 | Lang | test-coverage accuracy + full gate verification (gate-only) | ✅ done | Copy 0.0.99 → 0.0.100; run ALL gate stages (functional 138/138, extern-c, security 8/8, perf 3/3, valgrind, fuzz fail-closed, differential) + 3-stage self-host fixpoint; harden coverage so every GREEN claim is backed by a real test. No compiler source change → fixpoint auto-preserved. Promoted as new stable seed. |
+| 0.101 | Lang | generics monomorphisation | 🟡 type-erased | Instantiate `map<T,U>` per type-args; compile-time checks. |
+| 0.102 | Lang | float math + string ops + `rand` | ❌ | Float builtins; `substr`/`split`/utf8; getrandom-based `rand`. |
+| 0.103 | Builtins | float math (sin/cos/tan/pow/log/min/max) | ❌ | Add builtins; gate `std_math_test`. |
+| 0.104 | Builtins | string ops (strcat/substr/strcmp/str_split/utf8) | ❌ | Add builtins; gate `std_str_test`. |
+| 0.105 | Builtins | atomics (load/store/add/cmpxchg+futex) | ❌ | Add builtins; gate `atomic_test`. |
+| 0.106 | Builtins | networking (socket/connect/bind/listen/accept) | ❌ | Add builtins; gate `net_test`. |
+| 0.107 | Builtins | random `rand` | ❌ getrandom only | Add `rand` builtin; gate `rand_test`. |
+| 0.108 | Builtins | bit/byte extras (parity/bitfield/per-size swap) | ❌ | Add builtins. |
+| 0.109 | Builtins | intrinsics (prefetch/fence/branch hints) | ❌ | Add builtins. |
+| 0.110 | Builtins | fs metadata fix (stat/unlink/mkdir/chdir/rename) | 🟡 BROKEN | Fix path-string remap; gate. |
+| 0.111 | Builtins | introspection stack-trace | ❌ | Add `abort_test` stack trace. |
+| 0.112 | Memory | stack unwind / destructors / RAII | ❌ defer manual | Scope-exit cleanup. |
+| 0.113 | Memory | real allocator (free-list/GC) | ❌ bump mmap only | Free-list allocator replacing raw mmap. |
+| 0.114 | FFI | extern "C" PLT/GOT (full) | ✅ done (0.0.99) | Full dynamic-link symbol resolution for object-mode `--emit-obj` + gcc (string-arg header skip, multi-arg call fix, 16-byte stack alignment, libc-exit stdout flush). Standalone-EXE PLT/GOT (no external `ld`) remains deferred. |
+| 0.115 | Lang | trait/impl dispatch completion | ✅ done (0.0.98) | vtable dispatch for interface/impl/trait landed in 0.0.98; verified via trait_min/trait_test/struct_methods_test. |
+| 0.116 | Lang | `big` keyword/type | 🟡 lib convention | `TT_BIG` + op-overload routing `a+b`→`big_add`; gate `big_test`. |
+| 0.117 | Lang | typed array/slice `T[]` | ❌ untyped only | Parse `let a: i64[]`; bound-checked access. |
+| 0.118 | P4 tooling | **Quanta-native code-writing tool** | ❌ | LAST core item — sequenced right before 0.1.0 (where std/libs resume). Edit Quanta source reliably without external scripting. |
 
-**Version-number rule:** literal numbers above are the plan; the SEQUENCING (order + one-feature-per-version + fixpoint-verified) is the contract. If a version needs splitting, the number increments — never skipped, never reused. 0.0.90 is **not reserved**; it is simply the `as`/`raw`/`volatile` cluster above. The code-writing tool is **0.114 — the last core item, sequenced immediately before 0.1.0** (where std/libs resume); ARM64 and the deep-systems items remain POST-0.1.0.
+**Version-number rule:** literal numbers above are the plan; the SEQUENCING (order + one-feature-per-version + fixpoint-verified) is the contract. If a version needs splitting, the number increments — never skipped, never reused. 0.0.90 is **not reserved**; it is simply the `as`/`raw`/`volatile` cluster above. The code-writing tool is **0.118 — the last core item, sequenced immediately before 0.1.0** (where std/libs resume); ARM64 and the deep-systems items remain POST-0.1.0.
 
 **POST-0.1.0 (no version reserved for any):** borrow-checking; `chain`/`secure`/`ai`/`physics` libs; ARM64 backend.
 
@@ -164,9 +147,14 @@ Why post-0.1.0: the ARM64 backend is a new backend; shipping it while x86 debt
 remains would violate the debt-first rule and split correctness effort.
 Qualification evidence is gathered AFTER the core is complete, not before.
 
-### Current status (0.0.96)
+### Current status (0.0.99)
 
-**0.0.96 (promoted stable seed):** Lang — `try`/`catch` real unwind to handler.
+**0.0.99 (promoted stable seed):** Lang — A.Core extern "C" polish (genuinely working FFI) + test-coverage hardening.
+- Resolved the four real extern-C defects 0.0.98 left open (string-arg header skip `add reg,8`; 16-byte stack alignment via `push r11/call/pop r11`; multi-arg call `arg_start`/`arg_cnt` mapping; libc `exit()` stdout flush in object mode, raw `exit` syscall in exec mode). Gated by `extern_c_ffi.quanta` + `EXTERN_EXPECTED.tsv` (object mode + `gcc -nostartfiles`, asserts `EXTERN_C_OK`).
+- Expanded the gate to cover valgrind (compiler-binary leak/error scan), compiler fuzz (fail-closed, 0 crashes), and differential (-O vs no-O + vs-seed) — matching CI exactly. All seven layers GREEN: functional 138/138, extern-c, security 8/8, perf 3/3, valgrind, fuzz, differential.
+- Self-host fixpoint byte-identical (B==C md5 `52abed5acf470aabc50d6d11e31b0f2d`). The 0.0.99 golden (`compiler/0.0.99/bin/x86/qc`) is the stable seed for 0.0.100.
+
+**0.0.96 (prior stable seed):** Lang — `try`/`catch` real unwind to handler.
 - `try { ... } catch { ... }` parses; the body is wrapped by `IR_TRY_PUSH`/`IR_TRY_END`, a thrown value lands in the `catch` handler (via `IR_THROW` → `IR_CATCH` landing), and control resumes after the try via `IR_JMP` to a `done` label.
 - Nested try (try inside try inside catch) and sequential try (two independent try/catch blocks) both verified correct (`t5f` → `123457`, `t5h` → `1436`).
 - Root-cause fix: in `parse_block`, the `throw` arm parsed its expr, then re-read a **stale** `v`/`ln` (still pointing at `throw`), and since `throw`'s ktext wasn't in the dispatch list, fell into `else { adv() }` which consumed the body's closing `}` — so the body `parse_block` never saw its `}` and over-consumed the `catch { printi(9) }` block. The IR dump was the smoking gun: `printi(9)` was emitted **before** `IR_TRY_END`. Fixed by `continue`-ing the parse loop after `throw`/`try` parse so the fresh current token is re-read and line 36 breaks at `}` correctly.
@@ -361,8 +349,8 @@ token + operator-overload dispatch so `a + b` routes to `big_add`).
 ### Current status (0.0.78)
 
 Shipped + verified (x86-64 only; ARM64 deferred POST-0.1.0): **true 2-stage self-host** —
-the committed `bin/x86/qc` compiles the 0.0.74 source to a faithful `qc`, verified
-byte-identical to the golden binary (and to a 2nd-stage rebuild); fail-closed memory
+the committed `compiler/$(cat VERSION)/bin/x86/qc` compiles the $(cat VERSION) source to a faithful `qc`, verified
+byte-identical to the golden binary (and to a 3-stage rebuild); fail-closed memory
 model (overflow/bounds→SIGILL 132, MAP_FAILED→rc=1, undeclared/cyclic→rc=7);
 grammar 0 errors on all 15 modules; Valgrind-clean; differential vs seed.
 Standards docs: SPEC/SAFETY_MANUAL/SECURITY_TOOLING/MEMORY_SAFETY_ARGUMENT.

@@ -54,9 +54,9 @@ $Q /tmp/sm.quanta /tmp/sm.bin && /tmp/sm.bin   # want 12345678901234567890123456
 
 ## 5. Suite gate (§3 step 4) — full suite on gen2 qc, compile-fail folded in
 ```
-QC=compiler/<NEXT>/bin/x86/qc bash test_suites/scripts/run_tests.sh   # want 62/62, 0 fail
+QC=compiler/<NEXT>/bin/x86/qc bash test_suites/scripts/run_tests.sh   # want 138/138, 0 fail
 ```
-- [ ] 62/62, 0 fail. Compile-fail counts as fail (never a green row).
+- [ ] 138/138, 0 fail. Compile-fail counts as fail (never a green row).
 
 ## 6. Release matrix (from verify-release.sh — run `bash verify-release.sh <NEXT> <VER>`)
 - [ ] cwd inside /opt/tali/quanta; no duplicate IR opcodes (grep collision check empty).
