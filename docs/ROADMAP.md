@@ -1,6 +1,6 @@
 # Quanta ROADMAP — consolidated single source of truth
 
-> **Last updated: 2026-08-26. Current compiler: 0.0.99** (x86-64 ELF emitter,
+> **Last updated: 2026-08-26. Current compiler: 0.0.100** (x86-64 ELF emitter,
 > multi-file tree, Valgrind-clean, self-host `fp=YES`). ARM64 (AArch64) backend
 > is DEFERRED POST-0.1.0 (see #2 schedule below); the working compiler is x86-64 only.
 >
@@ -79,7 +79,7 @@ Every item below is one WIP version: self-hosts (2-stage byte-identical fixed po
 
 | Version | Core | Item | Status today | Work |
 |---------|------|------|--------------|------|
-| 0.100 | Lang | test-coverage accuracy + full gate verification (gate-only) | ✅ done | Copy 0.0.99 → 0.0.100; run ALL gate stages (functional 138/138, extern-c, security 8/8, perf 3/3, valgrind, fuzz fail-closed, differential) + 3-stage self-host fixpoint; harden coverage so every GREEN claim is backed by a real test. No compiler source change → fixpoint auto-preserved. Promoted as new stable seed. |
+| 0.100 | Lang | test-coverage accuracy + full gate verification (gate-only) | ✅ done | Copy 0.0.99 → 0.0.100; ran ALL gate stages (functional 138/138, extern-c, security 8/8, perf 3/3, valgrind, fuzz fail-closed, differential) + 3-stage self-host fixpoint (byte-identical md5 `52abed5acf470aabc50d6d11e31b0f2d`). Coverage audit: every FEATURES "✅ gate" row maps to a real gated test (no missing core tests); FEATURES count corrected 132→138. No compiler source change → fixpoint auto-preserved. NOTE: stdlib-module tests (big/quantum/linalg) are DEFERRED to the stdlib stage — stdlib is not a released core feature yet. Promoted as new stable seed. |
 | 0.101 | Lang | generics monomorphisation | 🟡 type-erased | Instantiate `map<T,U>` per type-args; compile-time checks. |
 | 0.102 | Lang | float math + string ops + `rand` | ❌ | Float builtins; `substr`/`split`/utf8; getrandom-based `rand`. |
 | 0.103 | Builtins | float math (sin/cos/tan/pow/log/min/max) | ❌ | Add builtins; gate `std_math_test`. |
