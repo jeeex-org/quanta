@@ -43,7 +43,7 @@ exist as files but are excluded from the gate per the "core only until 0.1.0" ru
 | defer | token | ✅ done | ✅ gate | defer_test.quanta |
 | in | token | ✅ done | ✅ gate | forin_basic.quanta (for-in array iteration) |
 | alias | 17 | ✅ done | ✅ gate | alias_test.quanta (function alias newname=existingfn) |
-| extern "C" | 19 | ✅ done (0.0.98) | ✅ gate | `extern "C" fn square(x)` declared + called across TUs via `--emit-obj` + external `ld`/`gcc` (mtu_main.quanta/mtu_helper.quanta linked, rc=49 = 7*7). EXE-mode PLT/GOT (no external `ld`) is 0.0.99. Parsing + call-emission + R_X86_64_PLT32 relocation work. |
+| extern "C" | 19 | ✅ done (0.0.98) / fixed (0.0.99) | ✅ gate | `extern "C" fn square(x)` declared + called via `--emit-obj` + external `ld`/`gcc`. 0.0.99 fixed the real defects 0.0.98 left: **string args** get the 8-byte length header skipped (`add reg,8` → `char*`, so `strlen("hello")`→5, `write(1,"hi",2)`→"hi"); **multi-arg calls** fixed (`arg_start`/`arg_cnt` mapping); **stack alignment** (`push r11/call/pop r11`, 16-byte) so `printf`/`puts` don't SSE-fault; **stdout flush** via libc `exit()` in object mode. Scalar calls (`abs(-42)`→42) and trait/interface vtable dispatch all work. EXE-mode standalone-PLT/GOT (no external `ld`) is deferred — object-mode + gcc is the supported path. |
 | struct | token | ✅ done | ✅ gate | struct_test.quanta, struct_methods_test.quanta, struct_literal_test.quanta |
 | enum | 21 | ✅ done | ✅ gate | enum_test.quanta (rc=42); Some/None match arms exercised |
 | type | 23 | ✅ done (0.0.77) | ✅ gate | type_alias.quanta (rc=42). `type MyInt = int` then `let x: MyInt` |

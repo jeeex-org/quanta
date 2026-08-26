@@ -279,9 +279,22 @@ fn main(argc, argv) {
         let stub_call = codelen
         g_main_call_ofs = codelen
         eb(232); ei(0)               // call main        (patched below)
-        eb(72); eb(137); eb(199)     // mov rdi, rax
-        eb(184); ei(60)              // mov eax, 60
-        sysc()                       // syscall (exit)
+        eb(72); eb(137); eb(199)     // mov rdi, rax     (exit code from main)
+        if emit_obj==1 {
+            // Object mode: link with libc (gcc -nostartfiles). Call libc exit()
+            // so stdio buffers (printf/puts) are flushed before process exit.
+            let exit_nm = 0x100000
+            w8(src+exit_nm+0, 101); w8(src+exit_nm+1, 120); w8(src+exit_nm+2, 105)
+            w8(src+exit_nm+3, 116); w8(src+exit_nm+4, 0)
+            let exit_call_ofs = codelen
+            eb(232); ei(0)               // call exit        (patched to PLT32 by objfmt)
+            w64(patches+patchc*PCS, exit_call_ofs); w64(patches+patchc*PCS+8, exit_nm); w64(patches+patchc*PCS+16, 3)
+            patchc=patchc+1
+        } else {
+            // Exec mode: self-contained binary, no libc. Raw exit syscall.
+            eb(184); ei(60)              // mov eax, 60
+            sysc()                       // syscall (exit)
+        }
     }   // end if no_start==0 (entry stub suppressed in secondary TU)
 
 
