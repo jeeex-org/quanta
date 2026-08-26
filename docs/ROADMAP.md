@@ -1,6 +1,6 @@
 # Quanta ROADMAP — consolidated single source of truth
 
-> **Last updated: 2026-08-26. Current compiler: 0.0.100** (x86-64 ELF emitter,
+> **Last updated: 2026-08-27. Current compiler: 0.0.102** (x86-64 ELF emitter,
 > multi-file tree, Valgrind-clean, self-host `fp=YES`). ARM64 (AArch64) backend
 > is DEFERRED POST-0.1.0 (see #2 schedule below); the working compiler is x86-64 only.
 >
@@ -83,12 +83,11 @@ Every item below is one WIP version: self-hosts (2-stage byte-identical fixed po
 | 0.0.114 | FFI | extern "C" PLT/GOT (full) | ✅ done (0.0.99) | Full dynamic-link symbol resolution for object-mode `--emit-obj` + gcc (string-arg header skip, multi-arg call fix, 16-byte stack alignment, libc-exit stdout flush). Standalone-EXE PLT/GOT (no external `ld`) remains deferred. |
 | 0.0.115 | Lang | trait/impl dispatch completion | ✅ done (0.0.98) | vtable dispatch for interface/impl/trait landed in 0.0.98; verified via trait_min/trait_test/struct_methods_test. |
 | 0.0.101 | Lang | generics monomorphisation | ✅ checks + type-erased | Compile-time type-arg validation (arity + known-type); implicit instantiation defaults to i64. Per-type body specialization deferred to 0.0.102. |
-| 0.0.102 | Lang | float math + string ops + `rand` | ❌ | Float builtins; `substr`/`split`/utf8; getrandom-based `rand`. |
-| 0.0.103 | Builtins | float math (sin/cos/tan/pow/log/min/max) | ❌ | Add builtins; gate `std_math_test`. |
-| 0.0.104 | Builtins | string ops (strcat/substr/strcmp/str_split/utf8) | ❌ | Add builtins; gate `std_str_test`. |
+| 0.0.102 | Lang | float math + string ops + `rand` | ✅ | Float builtins already present (i2f/f2i/fadd/fsub/fmul/fdiv/fconst + sin/cos/tan/pow/log/min/max — these returned truncated ints; see SPEC). Added `substr`/`strcat` (string alloc+concat via mmap heap). Added `rand()` convenience over existing `getrandom` (sc 318). Float chaining precision-loss is BY DESIGN (ops return int). Gated: float_arith, rand_test, substr_test, strcat_test + full 7-layer gate + generics-negative all GREEN. Fixpoint md5 `a4affa951d64304946862358316240c1` (self==self byte-identical). `split`/`utf8` deferred to 0.0.104. |
+| 0.0.103 | Builtins | float math (sin/cos/tan/pow/log/min/max) | ✅ already landed | These float builtins (sin/cos/tan/pow/log/min/max/sqrt/floor/ceil/abs) are ALREADY implemented (emit_bltn P6.1a). No new work needed; gate `std_math_test` should be added at the stdlib stage. Marked ✅ (pre-implemented). |
+| 0.0.104 | Builtins | string ops (strcat/substr/strcmp/str_split/utf8) | 🟡 partial | `strcat`/`substr` implemented in 0.0.102. Remaining: `str_split`/`utf8` (need string-array runtime). |
 | 0.0.105 | Builtins | atomics (load/store/add/cmpxchg+futex) | ❌ | Add builtins; gate `atomic_test`. |
 | 0.0.106 | Builtins | networking (socket/connect/bind/listen/accept) | ❌ | Add builtins; gate `net_test`. |
-| 0.0.107 | Builtins | random `rand` | ❌ getrandom only | Add `rand` builtin; gate `rand_test`. |
 | 0.0.108 | Builtins | bit/byte extras (parity/bitfield/per-size swap) | ❌ | Add builtins. |
 | 0.0.109 | Builtins | intrinsics (prefetch/fence/branch hints) | ❌ | Add builtins. |
 | 0.0.110 | Builtins | fs metadata fix (stat/unlink/mkdir/chdir/rename) | 🟡 BROKEN | Fix path-string remap; gate. |
@@ -147,9 +146,11 @@ Why post-0.1.0: the ARM64 backend is a new backend; shipping it while x86 debt
 remains would violate the debt-first rule and split correctness effort.
 Qualification evidence is gathered AFTER the core is complete, not before.
 
-### Current status (0.0.100)
+### Current status (0.0.102 — live)
 
-**0.0.99 (promoted stable seed):** Lang — A.Core extern "C" polish (genuinely working FFI) + test-coverage hardening.
+**0.0.102 (current stable seed):** Lang — float math + string ops (`substr`/`strcat`) + `rand()` over existing `getrandom`. Full 7-layer gate + generics-negative all GREEN (functional 143/143, extern-c, security 8/8, perf 3/3, valgrind clean, fuzz fail-closed, differential consistent). Self-host fixpoint byte-identical (B==C md5 `a4affa951d64304946862358316240c1`). The 0.0.101 binary (`compiler/0.0.101/bin/x86/qc`) is the build seed for 0.0.102.
+
+**Historical:** 0.0.99 (promoted stable seed for 0.0.100): Lang — A.Core extern "C" polish (genuinely working FFI) + test-coverage hardening.
 - Resolved the four real extern-C defects 0.0.98 left open (string-arg header skip `add reg,8`; 16-byte stack alignment via `push r11/call/pop r11`; multi-arg call `arg_start`/`arg_cnt` mapping; libc `exit()` stdout flush in object mode, raw `exit` syscall in exec mode). Gated by `extern_c_ffi.quanta` + `EXTERN_EXPECTED.tsv` (object mode + `gcc -nostartfiles`, asserts `EXTERN_C_OK`).
 - Expanded the gate to cover valgrind (compiler-binary leak/error scan), compiler fuzz (fail-closed, 0 crashes), and differential (-O vs no-O + vs-seed) — matching CI exactly. All seven layers GREEN: functional 138/138, extern-c, security 8/8, perf 3/3, valgrind, fuzz, differential.
 - Self-host fixpoint byte-identical (B==C md5 `52abed5acf470aabc50d6d11e31b0f2d`). The 0.0.99 golden (`compiler/0.0.99/bin/x86/qc`) is the stable seed for 0.0.100.

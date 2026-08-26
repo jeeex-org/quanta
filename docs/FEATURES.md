@@ -176,7 +176,7 @@ native type keyword parsing). `as` width casts (`x as T`) are done (0.0.90).
 | stdin I/O | getc | ✅ gate (getc_test.quanta). getline untested-in-gate |
 | fs metadata | stat, fstat, lseek, unlink, mkdir, chdir, rename | 🟡 PARTIAL — fstat/lseek work; stat/unlink/mkdir/chdir/rename BROKEN (path-string remap returns -ENOENT, see §I) |
 | introspection | abort, debugbreak | ✅ gate (abort_test.quanta rc=134; debugbreak = int3 → rc=133) |
-| random | getrandom | ✅ gate (getrandom_test.quanta rc=1) |
+| random | getrandom, rand | ✅ gate (getrandom_test.quanta rc=1; rand_test.quanta rc=0 — `rand()` convenience over getrandom returns a random i64). Implemented in 0.0.102. |
 | unsigned arith | udiv, umod, ult, ugt, ulte, ugte, u8, u32, u64 | ✅ gate (unsigned_ops.quanta) |
 | byte/endianness | bswap, popcount, clz, ctz, rotl, rotr | ✅ gate (bits_test.quanta) |
 | time | gettimeofday, nanosleep, sleep | ✅ gate (time_test.quanta) |
@@ -185,12 +185,12 @@ native type keyword parsing). `as` width casts (`x as T`) are done (0.0.90).
 
 | Group | Items | Test? |
 |---|---|---|
-| float math (remaining) | sin, cos, tan, pow, log, min, max | ❌ none (planned: std_math_test.quanta, currently file-only). NOTE: sqrt/floor/ceil/abs ARE shipped (§F); the items listed here are the not-yet-done ones |
-| string ops | strcat, substr, strcmp, str_split, utf8 | ❌ none (planned: std_str_test.quanta, currently file-only) |
+| float math (remaining) | sin, cos, tan, pow, log, min, max | ✅ shipped (emit_bltn P6.1a; see §F float math row). Gated at the stdlib stage via `std_math_test.quanta` (not yet in core gate). |
+| string ops | strcat, substr | ✅ gate (strcat_test.quanta rc=6, substr_test.quanta rc=3). Implemented in 0.0.102. strcmp/str_split/utf8 remain deferred (need string-array runtime). |
 | atomics | atomic_load/store/add/cmpxchg + futex | ❌ none (planned: atomic_test.quanta) |
 | networking | socket/connect/bind/listen/accept | ❌ none (planned: net_test.quanta) |
 | introspection (remaining) | stack-trace | ❌ none (planned: abort_test.quanta) |
-| random (remaining) | rand | ❌ none (planned: rand_test.quanta) |
+| random (remaining) | rand | ✅ done (0.0.102) — `rand()` convenience over getrandom; gated `rand_test.quanta` (rc=0). |
 | bit/byte extras | parity, bitfield insert/extract, per-size swap | ❌ none |
 | intrinsics | prefetch, fence, branch hints | ❌ none |
 

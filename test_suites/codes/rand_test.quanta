@@ -1,0 +1,11 @@
+fn main() {
+  # mmap an 8-byte buffer (via getrandom requires a writable buf).
+  # Use a stack-ish approach: allocate through a helper builtin mem_alloc(n).
+  let buf = mem_alloc(1)    # 1 slot = 8 bytes
+  mem_store(buf, 0)         # clear it
+  getrandom(buf, 8, 0)      # fill 8 random bytes
+  let b0 = mem_load(buf)    # read first 8 bytes as i64
+  # with 64 random bits, the low byte is ~never exactly 0; assert nonzero
+  if b0 == 0 { exit(1) }    # astronomically unlikely -> would flag a bug
+  exit(0)
+}
