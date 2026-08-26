@@ -143,9 +143,8 @@ md5sum /tmp/f1.bin /tmp/f2.bin /tmp/f3.bin | awk '{print $1}' | uniq | wc -l   #
 rm -f /tmp/f1.bin /tmp/f2.bin /tmp/f3.bin
 ```
 - [ ] distinct md5 == 1 (all three stages byte-identical). Record the md5 in
-      `compiler/<NEXT>/STATE.md`. (The 0.0.99/0.0.100 line golden was
-      `52abed5acf470aabc50d6d11e31b0f2d`; each version has its OWN fixpoint md5 —
-      what matters is internal B==C, not matching an older golden.)
+      `compiler/<NEXT>/STATE.md`. Each version has its OWN fixpoint md5 — what
+      matters is internal B==C, not matching any older golden.
 
 ## 4. Functional smoke (CORE language only — no stdlib; stdlib is deferred)
 ```bash
