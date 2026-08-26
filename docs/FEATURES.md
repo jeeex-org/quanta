@@ -127,8 +127,8 @@ native type keyword parsing). `as` width casts (`x as T`) are done (0.0.90).
 | ternary | ✅ done | ✅ gate | simplified_syntax.quanta |
 | field access / index | ✅ done | ✅ gate | struct_test.quanta, array_test.quanta |
 | unsigned arith | ✅ done | ✅ gate | unsigned_ops.quanta (udiv/umod/ult/ugt/ulte/ugte) |
-| operator overloading | ❌ todo | ❌ none | needs trait vtable dispatch (0.1.0 type-system work) |
-| range `..` expression | ❌ todo | ❌ none | needed by for-range; `..` not yet a standalone expression |
+| operator overloading | ✅ done (0.0.97) | ✅ gate | op_overload_add.quanta (rc=52), op_overload_mul.quanta (rc=7), op_overload_cmp.quanta (rc=5), op_overload_recur.quanta (rc=7). User `fn +(a,b)` shadows builtin `+`; dispatched via `OPFN` fn-index table + `IR_CALL_IDX` (no src-name injection — corruption-proof). All 11 ops (`+ - * / % == != < > <= >=`) verified; `overload_suppressed` (from `OPFN_SUPP`) makes an operator fn body fall back to BUILTIN for the same op (no infinite recursion). |
+| range `..` expression | ✅ done (0.0.97) | ✅ gate | range_for.quanta (rc=6, 1..4→6); feeds `for i in a..b` (exclusive end). |
 | array push `a.push(v)` | ✅ done | ✅ gate | array_push_method.quanta (rc=7), array_push_empty_annot.quanta (rc=7), array_push_closure_mix.quanta (rc=35). Method form only — bare `push(v,e)` is the byte-stride STRING push. Silently returned 0 in 0.0.65 (IR_CLOSURE/IR_APUSH both = opcode 72); fixed 0.0.66 |
 | generics `<T>` | 🟡 type-erased | ✅ gate | generics_test.quanta (rc=42); `map<T,U>` example returns 12. Parsed and erased at codegen — no monomorphisation, no compile-time constraint checking |
 | tuples `(a,b)` | ✅ done | ✅ gate | tuple_test.quanta (rc=40), option_tuple.quanta (rc=42). Literals, N-tuples, nested access `t.0.1`, tuple-valued returns, element reassign, tuple in array, destructuring `let x,y = f()` |
