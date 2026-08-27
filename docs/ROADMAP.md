@@ -90,7 +90,7 @@ Every item below is one WIP version: self-hosts (2-stage byte-identical fixed po
 | 0.0.106 | Builtins | networking (socket/connect/bind/listen/accept) | ✅ | 5 raw Linux syscalls added (sc 41/42/49/50/43); `net_test.quanta` gates socket+connect+close (rc=11). IR_CALL loads rdi/rsi/rdx; builtins set rax=sc-num + `sysc()`. |
 | 0.0.107 | Builtins | bit/byte extras (parity/bitfield/per-size swap) | ❌ | Add builtins. |
 | 0.0.108 | Builtins | intrinsics (prefetch/fence/branch hints) | ❌ | Add builtins. |
-| 0.0.109 | Builtins | fs metadata fix (stat/unlink/mkdir/chdir/rename) | 🟡 BROKEN | Fix path-string remap; gate. |
+| 0.0.109 | Builtins | fs metadata fix (stat/unlink/mkdir/chdir/rename) | ✅ | Root cause: path-string remap applied +8 twice (unlink/chdir) or not at all (rename new path, stat rsi); `file_open` also mishandled raw argv pointers. Fixed via `argp8` for string literals + `vreg_is_str` detection in `file_open`; `fs_meta_test.quanta` (rc=11) gates mkdir/file_open/stat/rename/chdir/unlink. |
 | 0.0.110 | Builtins | introspection stack-trace | ❌ | Add `abort_test` stack trace. |
 | 0.0.111 | Memory | stack unwind / destructors / RAII | ❌ defer manual | Scope-exit cleanup. |
 | 0.0.112 | Memory | real allocator (free-list/GC) | ❌ bump mmap only | Free-list allocator replacing raw mmap. |

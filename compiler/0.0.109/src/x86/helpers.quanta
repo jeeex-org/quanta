@@ -1,0 +1,264 @@
+// === HELPERS ===
+fn r8(p) { return mem_load8(p) }
+fn r16(p) { return mem_load8(p) | (mem_load8(p+1) << 8) }
+fn r32(p) { return mem_load8(p) | (mem_load8(p+1) << 8) | (mem_load8(p+2) << 16) | (mem_load8(p+3) << 24) }
+fn r64(p) { return mem_load(p) }
+fn w8(p,v) { if p!=0 { mem_store8(p,v) } }
+fn w16(p,v) { if p!=0 { mem_store8(p, v & 255); mem_store8(p+1, (v>>8) & 255) } }
+fn w64(p,v) { mem_store(p,v) }
+// Host runtime intrinsics for compiler's own memory access.
+fn mem_store(p,v) { if p!=0 { w64(p,v) } }
+fn mem_load8(p) { return r8(p) }
+fn mem_load(p) { return r64(p) }
+fn mem_store8(p,v) { if p!=0 { w8(p,v) } }
+
+
+fn tokt(i) { return r64(toks + i*TKS) }
+fn tokv(i) { return r64(toks + i*TKS + 8) }
+fn tokl(i) { return r64(toks + i*TKS + 16) }
+fn tokc(i) { return r64(toks + i*TKS + 24) }
+fn tokln(i) { return r64(toks + i*TKS + 32) }
+// Emitters below (stok/tkemit, iremit, vadd, sfn, aset) were previously
+// UNBOUNDED: their counters (tokc/irc/varc/fnc/allocfc) could run past the
+// fixed mmap arenas, causing an out-of-bounds write into an unmapped guard
+// page -> SIGSEGV (a crafted ≤16MB source with very high token density could
+// trigger this). As of 1.1.0 each emitter bounds its counter and aborts with a
+// clean error (exit 17) instead of corrupting memory.
+let TOK_CAP = 8000000      // toks arena 320MB / 40B per token
+let IR_CAP  = 26000000     // ir arena 1024MB / 40B per record
+let VAR_CAP = 250000       // vars arena 2MB / 24B (VRS=24? keep headroom)
+let FN_CAP  = 250000       // fns arena 2MB / 40B (FNS=40)
+let ALLOC_CAP = 131000     // alloc arena 2MB / 16B
+let GVAR_CAP = 83000       // gvars arena 2MB / 24B (VRS=24), keep headroom
+let VREG_CAP = 400000      // raised 0.0.98 to fit compiler self-build with feature source
+let LBL_CAP  = 124000      // lblmap arena 2MB / 16B (LBS=16), keep headroom
+let PATCH_CAP = 330000     // patches arena 8MB / 24B (PCS=24), keep headroom
+let GPATCH_CAP = 62000     // gpatches arena 2MB / 32B, keep headroom
+let IMPSEEN_CAP = 8100     // imp_seen arena 8192 slots, keep headroom
+
+// Clean abort when an emit arena is exhausted: write a clear message to stderr
+// and exit(17) instead of writing out-of-bounds (which previously SIGSEGV'd).
+fn emit_ovf() {
+    let msg = mmap(64)
+    // "error: source too large to compile (token/IR limit)\n"
+    w8(msg+0,101);w8(msg+1,114);w8(msg+2,114);w8(msg+3,111);w8(msg+4,114);w8(msg+5,58)
+    w8(msg+6,32);w8(msg+7,115);w8(msg+8,111);w8(msg+9,117);w8(msg+10,114);w8(msg+11,99)
+    w8(msg+12,101);w8(msg+13,32);w8(msg+14,116);w8(msg+15,111);w8(msg+16,111);w8(msg+17,32)
+    w8(msg+18,109);w8(msg+19,97);w8(msg+20,110);w8(msg+21,121);w8(msg+22,32);w8(msg+23,116)
+    w8(msg+24,111);w8(msg+25,107);w8(msg+26,101);w8(msg+27,110);w8(msg+28,115);w8(msg+29,47)
+    w8(msg+30,73);w8(msg+31,82);w8(msg+32,32);w8(msg+33,108);w8(msg+34,105);w8(msg+35,109)
+    w8(msg+36,105);w8(msg+37,116);w8(msg+38,10)
+    file_write(2, msg, 39)
+    exit(17)
+}
+
+fn stok(i,t,v,l,c,ln) {
+    if i >= TOK_CAP { emit_ovf() }
+    w64(toks + i*TKS, t); w64(toks + i*TKS + 8, v)
+    w64(toks + i*TKS + 16, l); w64(toks + i*TKS + 24, c)
+    w64(toks + i*TKS + 32, ln)
+}
+
+fn khash(p,ln) {
+    let h = 0; let i = 0
+    while i < ln { h = h*31 + r8(src+p+i); i = i+1 }
+    return h
+}
+
+// Keyword detection by EXACT TEXT (not hash) — hash collisions (e.g. the
+// compiler's own globals H_FN, H_LET, H_RET, ...) must never be mistaken
+// for keywords. Returns 1..15 for a keyword, 0 otherwise.
+fn ktext(sv, ln) {
+    if ln==2 && r8(src+sv)==102 && r8(src+sv+1)==110 { return 1 }            // fn
+    if ln==3 && r8(src+sv)==108 && r8(src+sv+1)==101 && r8(src+sv+2)==116 { return 2 } // let
+    if ln==2 && r8(src+sv)==105 && r8(src+sv+1)==102 { return 3 }            // if
+    if ln==4 && r8(src+sv)==101 && r8(src+sv+1)==108 && r8(src+sv+2)==115 && r8(src+sv+3)==101 { return 4 } // else
+    if ln==4 && r8(src+sv)==108 && r8(src+sv+1)==111 && r8(src+sv+2)==111 && r8(src+sv+3)==112 { return 5 } // loop
+    if ln==5 && r8(src+sv)==119 && r8(src+sv+1)==104 && r8(src+sv+2)==105 && r8(src+sv+3)==108 && r8(src+sv+4)==101 { return 6 } // while
+    if ln==3 && r8(src+sv)==102 && r8(src+sv+1)==111 && r8(src+sv+2)==114 { return 7 } // for
+    if ln==5 && r8(src+sv)==98 && r8(src+sv+1)==114 && r8(src+sv+2)==101 && r8(src+sv+3)==97 && r8(src+sv+4)==107 { return 8 } // break
+    if ln==8 && r8(src+sv)==99 && r8(src+sv+1)==111 && r8(src+sv+2)==110 && r8(src+sv+3)==116 && r8(src+sv+4)==105 && r8(src+sv+5)==110 && r8(src+sv+6)==117 && r8(src+sv+7)==101 { return 9 } // continue
+    if ln==4 && r8(src+sv)==116 && r8(src+sv+1)==114 && r8(src+sv+2)==117 && r8(src+sv+3)==101 { return 10 } // true
+    if ln==5 && r8(src+sv)==102 && r8(src+sv+1)==97 && r8(src+sv+2)==108 && r8(src+sv+3)==115 && r8(src+sv+4)==101 { return 11 } // false
+    if ln==4 && r8(src+sv)==110 && r8(src+sv+1)==111 && r8(src+sv+2)==110 && r8(src+sv+3)==101 { return 12 } // none (value literal; see method.quanta:544)
+    if ln==3 && r8(src+sv)==97 && r8(src+sv+1)==110 && r8(src+sv+2)==100 { return 13 } // and
+    if ln==2 && r8(src+sv)==111 && r8(src+sv+1)==114 { return 14 }            // or
+    if ln==3 && r8(src+sv)==110 && r8(src+sv+1)==111 && r8(src+sv+2)==116 { return 15 } // not
+    if ln==6 && r8(src+sv)==114 && r8(src+sv+1)==101 && r8(src+sv+2)==116 && r8(src+sv+3)==117 && r8(src+sv+4)==114 && r8(src+sv+5)==110 { return 16 } // return
+    if ln==5 && r8(src+sv)==97 && r8(src+sv+1)==108 && r8(src+sv+2)==105 && r8(src+sv+3)==97 && r8(src+sv+4)==115 { return 17 } // alias
+    if ln==6 && r8(src+sv)==117 && r8(src+sv+1)==110 && r8(src+sv+2)==115 && r8(src+sv+3)==97 && r8(src+sv+4)==102 && r8(src+sv+5)==101 { return 18 } // unsafe
+    if ln==6 && r8(src+sv)==101 && r8(src+sv+1)==120 && r8(src+sv+2)==116 && r8(src+sv+3)==101 && r8(src+sv+4)==114 && r8(src+sv+5)==110 { return 19 } // extern
+    if ln==6 && r8(src+sv)==103 && r8(src+sv+1)==108 && r8(src+sv+2)==111 && r8(src+sv+3)==98 && r8(src+sv+4)==97 && r8(src+sv+5)==108 { return 20 } // global
+    // P6.1b: new keywords
+    if ln==4 && r8(src+sv)==101 && r8(src+sv+1)==110 && r8(src+sv+2)==117 && r8(src+sv+3)==109 { return 21 } // enum
+    if ln==5 && r8(src+sv)==109 && r8(src+sv+1)==97 && r8(src+sv+2)==116 && r8(src+sv+3)==99 && r8(src+sv+4)==104 { return 22 } // match
+    if ln==4 && r8(src+sv)==116 && r8(src+sv+1)==121 && r8(src+sv+2)==112 && r8(src+sv+3)==101 { return 23 } // type
+    if ln==9 && r8(src+sv)==105 && r8(src+sv+1)==110 && r8(src+sv+2)==116 && r8(src+sv+3)==101 && r8(src+sv+4)==114 && r8(src+sv+5)==102 && r8(src+sv+6)==97 && r8(src+sv+7)==99 && r8(src+sv+8)==101 { return 24 } // interface
+    if ln==4 && r8(src+sv)==105 && r8(src+sv+1)==109 && r8(src+sv+2)==112 && r8(src+sv+3)==108 { return 25 } // impl
+    if ln==5 && r8(src+sv)==116 && r8(src+sv+1)==114 && r8(src+sv+2)==97 && r8(src+sv+3)==105 && r8(src+sv+4)==116 { return 26 } // trait
+    if ln==5 && r8(src+sv)==119 && r8(src+sv+1)==104 && r8(src+sv+2)==101 && r8(src+sv+3)==114 && r8(src+sv+4)==101 { return 27 } // where
+    if ln==6 && r8(src+sv)==79 && r8(src+sv+1)==112 && r8(src+sv+2)==116 && r8(src+sv+3)==105 && r8(src+sv+4)==111 && r8(src+sv+5)==110 { return 28 } // Option
+    if ln==4 && r8(src+sv)==83 && r8(src+sv+1)==111 && r8(src+sv+2)==109 && r8(src+sv+3)==101 { return 29 } // Some
+    if ln==4 && r8(src+sv)==78 && r8(src+sv+1)==111 && r8(src+sv+2)==110 && r8(src+sv+3)==101 { return 30 } // None (Option ADT variant; distinct from lowercase 'none' ktext 12 = const-0 literal)
+    if ln==6 && r8(src+sv)==82 && r8(src+sv+1)==101 && r8(src+sv+2)==115 && r8(src+sv+3)==117 && r8(src+sv+4)==108 && r8(src+sv+5)==116 { return 31 } // Result
+    if ln==2 && r8(src+sv)==79 && r8(src+sv+1)==107 { return 32 } // Ok
+    if ln==3 && r8(src+sv)==69 && r8(src+sv+1)==114 && r8(src+sv+2)==114 { return 33 } // Err
+    if ln==3 && r8(src+sv)==114 && r8(src+sv+1)==101 && r8(src+sv+2)==102 { return 34 } // ref
+    if ln==3 && r8(src+sv)==109 && r8(src+sv+1)==117 && r8(src+sv+2)==116 { return 35 } // mut
+    if ln==4 && r8(src+sv)==109 && r8(src+sv+1)==111 && r8(src+sv+2)==118 && r8(src+sv+3)==101 { return 36 } // move
+    if ln==6 && r8(src+sv)==83 && r8(src+sv+1)==116 && r8(src+sv+2)==114 && r8(src+sv+3)==105 && r8(src+sv+4)==110 && r8(src+sv+5)==103 { return 37 } // String
+    if ln==2 && r8(src+sv)==97 && r8(src+sv+1)==115 { return 41 } // as
+    // P10: 'in' keyword for for-in loops
+    if ln==2 && r8(src+sv)==105 && r8(src+sv+1)==110 { return 43 } // in
+    if ln==3 && r8(src+sv)==114 && r8(src+sv+1)==97 && r8(src+sv+2)==119 { return 38 } // raw
+    if ln==3 && r8(src+sv)==97 && r8(src+sv+1)==115 && r8(src+sv+2)==109 { return 40 } // asm
+    if ln==5 && r8(src+sv)==117 && r8(src+sv+1)==115 && r8(src+sv+2)==105 && r8(src+sv+3)==122 && r8(src+sv+4)==101 { return 48 } // usize
+    if ln==8 && r8(src+sv)==118 && r8(src+sv+1)==111 && r8(src+sv+2)==108 && r8(src+sv+3)==97 && r8(src+sv+4)==116 && r8(src+sv+5)==105 && r8(src+sv+6)==108 && r8(src+sv+7)==101 { return 39 } // volatile
+    // P6: new unsigned/bool/char/byte/low-level keywords (added after original 43)
+    if ln==2 && r8(src+sv)==117 && r8(src+sv+1)==56 { return 44 }             // u8
+    if ln==3 && r8(src+sv)==117 && r8(src+sv+1)==49 && r8(src+sv+2)==54 { return 45 }  // u16
+    if ln==3 && r8(src+sv)==117 && r8(src+sv+1)==51 && r8(src+sv+2)==50 { return 46 } // u32
+    if ln==3 && r8(src+sv)==117 && r8(src+sv+1)==54 && r8(src+sv+2)==52 { return 47 } // u64
+    if ln==4 && r8(src+sv)==98 && r8(src+sv+1)==111 && r8(src+sv+2)==111 && r8(src+sv+3)==108 { return 49 } // bool
+    if ln==4 && r8(src+sv)==99 && r8(src+sv+1)==104 && r8(src+sv+2)==97 && r8(src+sv+3)==114 { return 50 } // char
+    if ln==4 && r8(src+sv)==98 && r8(src+sv+1)==121 && r8(src+sv+2)==116 && r8(src+sv+3)==101 { return 51 } // byte
+    // removed duplicate 'raw' (was 52) — 38 is canonical
+    // removed duplicate 'asm' (was 53) — 40 is canonical
+    if ln==3 && r8(src+sv)==105 && r8(src+sv+1)==110 && r8(src+sv+2)==116 { return 55 } // int (signed default, alias for bare literal type)
+    // removed duplicate 'volatile' (was 54) — 39 is canonical
+    if ln==5 && r8(src+sv)==100 && r8(src+sv+1)==101 && r8(src+sv+2)==102 && r8(src+sv+3)==101 && r8(src+sv+4)==114 { return 56 } // defer
+    if ln==5 && r8(src+sv)==99 && r8(src+sv+1)==111 && r8(src+sv+2)==110 && r8(src+sv+3)==115 && r8(src+sv+4)==116 { return 57 } // const
+    if ln==3 && r8(src+sv)==109 && r8(src+sv+1)==111 && r8(src+sv+2)==100 { return 58 } // mod
+    // 0.0.96: try/catch/throw exception-handling keywords
+    if ln==3 && r8(src+sv)==116 && r8(src+sv+1)==114 && r8(src+sv+2)==121 { return 59 } // try
+    if ln==5 && r8(src+sv)==99 && r8(src+sv+1)==97 && r8(src+sv+2)==116 && r8(src+sv+3)==99 && r8(src+sv+4)==104 { return 60 } // catch
+    if ln==5 && r8(src+sv)==116 && r8(src+sv+1)==104 && r8(src+sv+2)==114 && r8(src+sv+3)==111 && r8(src+sv+4)==119 { return 61 } // throw
+    // 0.0.78: case-insensitive ADT keyword — simplicity: String/string both OK.
+    // Only String gets a lowercase alias. some/ok/err/option/result are left
+    // UPPERCASE-ONLY because 'ok'/'some'/'err' are common variable names
+    // (e.g. logical_keywords.quanta uses `let ok = 0`) and would collide.
+    if ln==6 && r8(src+sv)==115 && r8(src+sv+1)==116 && r8(src+sv+2)==114 && r8(src+sv+3)==105 && r8(src+sv+4)==110 && r8(src+sv+5)==103 { return 37 } // string/String
+    return 0
+}
+
+fn iremit(op,res,a0,a1,a2) {
+    if irc >= IR_CAP { emit_ovf() }
+    let i = irc; irc = i+1
+    w64(ir + i*IRS, op); w64(ir + i*IRS + 8, res)
+    w64(ir + i*IRS + 16, a0); w64(ir + i*IRS + 24, a1)
+    w64(ir + i*IRS + 32, a2)
+    w8(ir_unsafe + i, unsafe_depth)   // G2: record whether this op is inside `unsafe {}`
+}
+
+fn irop(i) { return r64(ir + i*IRS) }
+fn irres(i) { return r64(ir + i*IRS + 8) }
+fn ira0(i) { return r64(ir + i*IRS + 16) }
+fn ira1(i) { return r64(ir + i*IRS + 24) }
+fn ira2(i) { return r64(ir + i*IRS + 32) }
+
+fn fn_name(i) { return r64(fns + i*FNS) }
+fn fn_nlen(i) { return r64(fns + i*FNS + 8) }
+fn fn_btok(i) { return r64(fns + i*FNS + 16) }
+fn fn_cofs(i) { return r64(fns + i*FNS + 24) }
+fn fn_pc(i) { return r64(fns + i*FNS + 32) }
+fn fn_rettype_name_f(i) { return r64(fns + i*FNS + 40) }
+fn fn_rettype_len_f(i) { return r64(fns + i*FNS + 48) }
+fn sfn(i,nm,nl,bt,co,pc,ret_nm,ret_nl) {
+    if i >= FN_CAP { emit_ovf() }
+    w64(fns + i*FNS, nm); w64(fns + i*FNS + 8, nl)
+    w64(fns + i*FNS + 16, bt); w64(fns + i*FNS + 24, co)
+    w64(fns + i*FNS + 32, pc)
+    w64(fns + i*FNS + 40, ret_nm)
+    w64(fns + i*FNS + 48, ret_nl)
+    w64(fn_rettype_name + i*8, ret_nm)
+    w64(fn_rettype_len + i*8, ret_nl)
+}
+
+// P11: register a closure body as a synthetic function.
+// Closure bodies are registered like regular functions but with:
+// - name = empty (anonymous), length = 0
+// - parent = the enclosing function index (encl)
+// - return type inferred from body
+fn reg_closure(encl, body_tok) {
+    if fnc >= FN_CAP { emit_ovf() }
+    // Empty name for anonymous closure
+    w64(fns + fnc*FNS, 0); w64(fns + fnc*FNS + 8, 0)
+    w64(fns + fnc*FNS + 16, body_tok)  // body_tok = start of body tokens
+    w64(fns + fnc*FNS + 24, 0)  // code_ofs = 0 initially
+    w64(fns + fnc*FNS + 32, 0)  // param_c = 0 initially
+    w64(fns + fnc*FNS + 40, 0)
+    w64(fns + fnc*FNS + 48, 0)
+    w64(fn_rettype_name + fnc*8, 0)
+    w64(fn_rettype_len + fnc*8, 0)
+    // Parent = enclosing function (for capture resolution)
+    w64(fn_parent + fnc*8, encl)
+    w64(fn_extern + fnc*8, 0)
+    w64(fn_pcount + fnc*8, 0)  // params will be filled by parser
+    w64(fn_pbase + fnc*8, 0)
+    let cidx = fnc
+    fnc = fnc + 1
+    return cidx
+}
+
+fn vadd(nm,nl,vr) {
+    if varc >= VAR_CAP { emit_ovf() }
+    let i = varc; varc = i+1
+    w64(vars + i*VRS, nm); w64(vars + i*VRS + 8, vr); w64(vars + i*VRS + 16, nl)
+    // P2 ownership tag: 0=plain, 1=mut, 2=ref, 3=move. Set by the parse site
+    // via set_vown() after vadd returns the new index; default 0 here.
+    w64(vars_own + i*8, 0)
+}
+fn vown(nm,nl) {
+    // Return the ownership tag recorded for a symbol name (0=plain,1=mut,2=ref,3=move).
+    let i = varc-1
+    while i >= 0 {
+        let vnm = r64(vars + i*VRS); let vnl = r64(vars + i*VRS + 16)
+        if vnl == nl {
+            let ok = 1; let j = 0
+            while j < nl { if r8(src+vnm+j) != r8(src+nm+j) { ok=0; break }; j=j+1 }
+            if ok { return r64(vars_own + i*8) }
+        }
+        i = i-1
+    }
+    return 0
+}
+fn set_vown(nm,nl,tag) {
+    // Record the ownership tag for the most recent symbol binding with this name.
+    let i = varc-1
+    while i >= 0 {
+        let vnm = r64(vars + i*VRS); let vnl = r64(vars + i*VRS + 16)
+        if vnl == nl {
+            let ok = 1; let j = 0
+            while j < nl { if r8(src+vnm+j) != r8(src+nm+j) { ok=0; break }; j=j+1 }
+            if ok { w64(vars_own + i*8, tag); return }
+        }
+        i = i-1
+    }
+}
+fn vfind(nm,nl) {
+    // Scan from the NEWEST binding backward so that a re-`let` of the same
+    // name (e.g. `val` reset inside a loop/branch) resolves to the current
+    // scope, not the oldest one.  Scanning oldest-first made
+    // `val = val*10 + d` in the 2nd number write into the 1st number's
+    // vreg (which still held 10), so "20" parsed as 10*100+20 = 1020.
+    let i = varc-1
+    while i >= 0 {
+        let vnm = r64(vars + i*VRS); let vnl = r64(vars + i*VRS + 16)
+        if vnl == nl {
+            let ok = 1; let j = 0
+            while j < nl { if r8(src+vnm+j) != r8(src+nm+j) { ok=0; break }; j=j+1 }
+            if ok { return r64(vars + i*VRS + 8) }
+        }
+        i = i-1
+    }
+    return -1
+}
+fn vclr() {
+    // P10: also clear vreg_type (fn-value tag 11 / generic-marker 10) so a
+    // recycled vreg index can't carry a stale tag into the next function —
+    // a stale 11 would falsely route `f(21)` through IR_CLOSURE_CALL.
+    let vci = 0
+    while vci < vreg_n { w64(vreg_type + vci*8, 0); vci = vci + 1 }
+    varc = 0; vreg_n = 0
+}
+

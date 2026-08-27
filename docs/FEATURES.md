@@ -174,7 +174,7 @@ native type keyword parsing). `as` width casts (`x as T`) are done (0.0.90).
 | float math | sqrt, floor, ceil, abs, sin, cos, tan, pow, log | ✅ gate (float_test.quanta rc=159). min/max are NOT yet implemented (see §G) |
 | process / env | getpid, getppid, arg_count, environ | ✅ gate (getpid_test.quanta, getppid_test.quanta, argc_test.quanta). getenv is a STUB returning 0 (see §I) |
 | stdin I/O | getc | ✅ gate (getc_test.quanta). getline untested-in-gate |
-| fs metadata | stat, fstat, lseek, unlink, mkdir, chdir, rename | 🟡 PARTIAL — fstat/lseek work; stat/unlink/mkdir/chdir/rename BROKEN (path-string remap returns -ENOENT, see §I) |
+| fs metadata | stat, fstat, lseek, unlink, mkdir, chdir, rename | ✅ 7/7 gated (fs_meta_test.quanta rc=11) — root cause: path-string remap applied +8 twice / not at all; fixed via `argp8` for string literals + `vreg_is_str` detection so `file_open` also accepts raw C-string pointers (e.g. argv). See §I. |
 | introspection | abort, debugbreak | ✅ gate (abort_test.quanta rc=134; debugbreak = int3 → rc=133) |
 | random | getrandom, rand | ✅ gate (getrandom_test.quanta rc=1; rand_test.quanta rc=0 — `rand()` convenience over getrandom returns a random i64). Implemented in 0.0.102. |
 | unsigned arith | udiv, umod, ult, ugt, ulte, ugte, u8, u32, u64 | ✅ gate (unsigned_ops.quanta) |

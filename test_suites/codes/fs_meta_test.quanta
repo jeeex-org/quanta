@@ -1,0 +1,19 @@
+// 0.0.109 fs metadata builtins gate: path-string remap fix.
+// mkdir / file_open / stat / rename / chdir / unlink must all resolve
+// the path correctly (header+8), not the mangled header pointer.
+fn main() -> i64 {
+    mkdir("/tmp/fsmeta_test", 493)
+    let fd = file_open("/tmp/fsmeta_test/a.txt", 65, 420)   // O_WRONLY|O_CREAT, 0644
+    if fd < 3 { return 1 }
+    file_close(fd)
+    let st = mmap(128)
+    let s = stat("/tmp/fsmeta_test/a.txt", st)
+    if s != 0 { return 2 }
+    let r = rename("/tmp/fsmeta_test/a.txt", "/tmp/fsmeta_test/b.txt")
+    if r != 0 { return 3 }
+    let ru = unlink("/tmp/fsmeta_test/b.txt")
+    if ru != 0 { return 4 }
+    let rc = chdir("/tmp/fsmeta_test")
+    if rc != 0 { return 5 }
+    return 11
+}
