@@ -1,0 +1,17 @@
+// intrinsic_test.quanta — 0.0.108 CPU intrinsics (prefetch/pause/fence/lfence/sfence)
+// Intrinsics are void; this exercises them and confirms the program runs without
+// faulting. Byte-level emission is asserted by the gate via objdump (see gate note).
+// Early-exit per-check pattern (no live args across calls) to avoid the unrelated
+// pre-existing allocator bug (tracked in ROADMAP Known Issues).
+fn main() {
+    let arr = mem_alloc(8)          // one i64 slot to give prefetch a real address
+    mem_store(arr, 42)
+    prefetch(arr)                   // prefetchnta [rax]
+    pause()                         // spin-wait hint
+    lfence()                        // load fence
+    sfence()                        // store fence
+    fence()                         // full mfence
+    let v = mem_load(arr)
+    if !(v == 42) { exit(1) }       // prefetch must not corrupt the load target
+    exit(0)
+}

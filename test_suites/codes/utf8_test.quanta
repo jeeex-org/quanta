@@ -1,0 +1,44 @@
+// 0.0.104: utf8(s) -> qword array of Unicode scalar values (codepoints).
+// UTF-8 byte-string s (string header: [s]=len, bytes at s+8). Each codepoint
+// decoded to its scalar; result is a qword array [hdr]=n, hdr+8+i*8 = scalar.
+// Edge: empty string -> [] (n=0). Continuation bytes / malformed leads stored
+// as the raw byte value.
+fn main() {
+  let ok = 0
+
+  // "A" (0x41) -> [0x41]
+  let a = mmap(16)
+  mem_store8(a, 1); mem_store8(a+8, 65)
+  let ra = utf8(a)
+  if len(ra) == 1 { if ra[0] == 65 { ok = ok + 1 } }
+
+  // "e-acute" (0xC3 0xA9 = U+00E9) -> [0xE9]
+  let e = mmap(16)
+  mem_store8(e, 2); mem_store8(e+8, 195); mem_store8(e+9, 169)
+  let re = utf8(e)
+  if len(re) == 1 { if re[0] == 233 { ok = ok + 1 } }
+
+  // "smiley" (0xF0 0x9F 0x98 0x80 = U+1F600) -> [0x1F600]
+  let s = mmap(16)
+  mem_store8(s, 4); mem_store8(s+8, 240); mem_store8(s+9, 159); mem_store8(s+10, 152); mem_store8(s+11, 128)
+  let rs = utf8(s)
+  if len(rs) == 1 { if rs[0] == 128512 { ok = ok + 1 } }
+
+  // "Hi<smiley>" -> [0x48, 0x69, 0x1F600]
+  let h = mmap(32)
+  mem_store8(h, 6)
+  mem_store8(h+8, 72); mem_store8(h+9, 105)
+  mem_store8(h+10, 240); mem_store8(h+11, 159); mem_store8(h+12, 152); mem_store8(h+13, 128)
+  let rh = utf8(h)
+  if len(rh) == 3 {
+    if rh[0] == 72 && rh[1] == 105 && rh[2] == 128512 { ok = ok + 1 }
+  }
+
+  // empty -> []
+  let z = mmap(16)
+  mem_store8(z, 0)
+  let rz = utf8(z)
+  if len(rz) == 0 { ok = ok + 1 }
+
+  exit(ok)   // expect 5
+}
