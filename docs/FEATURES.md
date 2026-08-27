@@ -186,7 +186,7 @@ native type keyword parsing). `as` width casts (`x as T`) are done (0.0.90).
 | Group | Items | Test? |
 |---|---|---|
 | float math (remaining) | sin, cos, tan, pow, log, min, max | ✅ shipped (emit_bltn P6.1a; see §F float math row). Gated at the stdlib stage via `std_math_test.quanta` (not yet in core gate). |
-| string ops | strcat, substr | ✅ gate (strcat_test.quanta rc=6, substr_test.quanta rc=3). Implemented in 0.0.102. strcmp/str_split/utf8 remain deferred (need string-array runtime). |
+| string ops | strcat, substr, str_split | ✅ gate (strcat_test rc=6, substr_test rc=3, str_split_test rc=0). strcat/substr in 0.0.102; str_split added in 0.0.104 via `vreg_str_arr` tag (IR_IDX reads each element as a byte-stride string, so `parts[i]` is string-typed → `len(parts[i])` + segment byte access work). strcmp/utf8 remain deferred. |
 | atomics | atomic_load/store/add/cmpxchg + futex | ❌ none (planned: atomic_test.quanta) |
 | networking | socket/connect/bind/listen/accept | ❌ none (planned: net_test.quanta) |
 | introspection (remaining) | stack-trace | ❌ none (planned: abort_test.quanta) |
