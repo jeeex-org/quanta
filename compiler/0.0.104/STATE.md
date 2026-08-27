@@ -35,5 +35,5 @@ store.
 - self-host fixpoint: B==C byte-identical (md5 `dc18d73e1a5218d05f80a13fb9ae8d50`)
 
 ## ROADMAP / FEATURES sync
-ROADMAP 0.0.104 → 🟡 partial: `str_split` GREEN; `utf8` remains deferred.
-FEATURES §string ops: strcat/substr/str_split ✅ gate.
+ROADMAP 0.0.104 → ✅: `str_split` + `utf8` both GREEN (gated + fixpoint-verified).
+FEATURES §string ops: strcat/substr/str_split/utf8 ✅ gate.
