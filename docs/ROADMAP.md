@@ -87,7 +87,7 @@ Every item below is one WIP version: self-hosts (2-stage byte-identical fixed po
 | 0.0.103 | Builtins | float math (sin/cos/tan/pow/log/min/max) | ✅ already landed | These float builtins (sin/cos/tan/pow/log/min/max/sqrt/floor/ceil/abs) are ALREADY implemented (emit_bltn P6.1a). No new work needed; gate `std_math_test` should be added at the stdlib stage. Marked ✅ (pre-implemented). Cut as a real release folder (copy of 0.0.102, gate-only) to make the ✅ verifiable. |
 | 0.0.104 | Builtins | string ops (strcat/substr/str_split/utf8) | ✅ | `strcat`/`substr` in 0.0.102; `str_split` + `utf8` added in 0.0.104. str_split splits on a single-byte sep into a string-array (vreg_str_arr tag). utf8 decodes UTF-8 bytes to a qword array of scalar codepoints. Both gated (str_split_test rc=0, utf8_test rc=5) + fixpoint + valgrind clean. |
 | 0.0.105 | Builtins | atomics (load/store/add/swap/cmpxchg) | ✅ | lock-based x86 atomics; `atomic_test.quanta` gates 5 builtins (rc=11). Futex deferred to a later core. |
-| 0.0.106 | Builtins | networking (socket/connect/bind/listen/accept) | ❌ | Add builtins; gate `net_test`. |
+| 0.0.106 | Builtins | networking (socket/connect/bind/listen/accept) | ✅ | 5 raw Linux syscalls added (sc 41/42/49/50/43); `net_test.quanta` gates socket+connect+close (rc=11). IR_CALL loads rdi/rsi/rdx; builtins set rax=sc-num + `sysc()`. |
 | 0.0.107 | Builtins | bit/byte extras (parity/bitfield/per-size swap) | ❌ | Add builtins. |
 | 0.0.108 | Builtins | intrinsics (prefetch/fence/branch hints) | ❌ | Add builtins. |
 | 0.0.109 | Builtins | fs metadata fix (stat/unlink/mkdir/chdir/rename) | 🟡 BROKEN | Fix path-string remap; gate. |

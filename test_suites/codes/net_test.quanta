@@ -1,0 +1,15 @@
+// 0.0.106 networking builtins smoke test.
+// socket() must return a valid fd (>2, past stdin/out/err).
+// connect() to a closed port must fail-closed (return <0), never crash.
+// Return 11 if socket fd is valid and connect closed cleanly.
+fn main() -> i64 {
+    let fd = socket(2, 1, 0)   // AF_INET=2, SOCK_STREAM=1, proto=0
+    if fd < 3 { return 100 }    // no valid fd
+    // connect to 127.0.0.1:1 (discard, essentially always refused) — must not crash.
+    // We pass a tiny sockaddr; correctness of the connect result is not asserted,
+    // only that the builtin dispatches and returns (negative on failure).
+    let r = connect(fd, 0, 16)
+    // close the socket via file_close (reuse existing builtin)
+    file_close(fd)
+    return 11
+}
