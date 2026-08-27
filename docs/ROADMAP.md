@@ -1,7 +1,8 @@
 # Quanta ROADMAP — consolidated single source of truth
 
-> **Last updated: 2026-08-27. Current compiler: 0.0.112** (x86-64 ELF emitter,
-> multi-file tree, Valgrind-clean, self-host `fp=YES`). ARM64 (AArch64) backend
+> **Last updated: 2026-08-28. Current compiler: 0.0.113** (x86-64 ELF emitter,
+> multi-file tree, Valgrind-clean; self-host fixpoint NOT byte-verified — systemic
+> stage2 SIGSEGV since 0.0.109, see 0.0.111 note). ARM64 (AArch64) backend
 > is DEFERRED POST-0.1.0 (see #2 schedule below); the working compiler is x86-64 only.
 >
 > Version sequence: each feature lands in its own directory. 0.0.55 = P2
@@ -94,13 +95,12 @@ Every item below is one WIP version: self-hosts (2-stage byte-identical fixed po
 | 0.0.110 | Types | typed array/slice `T[]` | ✅ | 0.0.110 — `let a: i64[] = [...]` parses and tags the binding as an array (vtype 11); indexing `a[idx]` + subscript assignment `a[i]=v` already worked via IR_IDX. gated typed_array_test.quanta (rc=0). NOTE: `String` type annotation (`let s: String`) was ALREADY done in 0.0.95 (VT_STRING=10, parse_let) — the FEATURES B-core `string (real type)` row was stale ❌; corrected to ✅ this version. |
 | 0.0.111 | Memory (E) | real allocator (free-list) | ✅ | 0.0.111 — real heap allocator: `mem_alloc` left byte-identical (bump mmap) for fixpoint-safety; NEW builtins `mem_free(ptr)` (free-list push at `HEAP_CTRL=GDATA+1032`) and `mem_realloc(ptr,newn)` (mmap new + `rep movsq` copy min(old_count,newn) qwords, returns new) added in `is_bltn`+`emit_bltn`. gated `mem_free_test.quanta` (rc=0, verifies realloc preserves payload + mem_free no-crash). Full 8-layer gate GREEN. **FIXPOINT: NOT byte-verified** — the canonical self-host fixpoint (stage1 from `bin/x86_64/qc-0.0.18` → stage2) is systemically broken (stage2 SIGSEGV `si_addr=0xfffffffffffffff4` in 0.0.109/0.0.110); affects ALL versions, not just 0.0.111. 0.0.111 feature-complete + functional-gated, but no version currently passes the `B==C` md5 gate. |
 | 0.0.112 | Memory (E) | stack unwind / destructors / RAII | ✅ | 0.0.112 — RAII complete: owned `mem_alloc` bindings are auto-recycled to the free-list at every scope exit (normal + early return) via compiler-inserted `drop()` (replaces the old `munmap` IR_FREE with the 0.0.111 free-list push). NEW user-facing `drop(ptr)` builtin (== mem_free) is the destructor hook and is also auto-invoked for owned bindings. `defer` LIFO replay unchanged. gated `raii_test.quanta` (rc=0: scope-exit recycle, early-return RAII, reusable-after-free, no UAF). Full 8-layer gate GREEN. **FIXPOINT: NOT byte-verified** (systemic stage2 SIGSEGV, same as 0.0.111 — pre-existing in 0.0.109/0.0.110). |
-| 0.0.113 | Builtins (G) | introspection stack-trace | ❌ | `stack_trace()` — pure builtin reading immediate caller return addr from `[rsp]` (no per-call instrumentation, fixpoint-safe). Gated abort_test. |
+| 0.0.113 | Builtins (G) | introspection stack-trace | ✅ | 0.0.113 — `stack_trace()` pure builtin returns the immediate caller's return address (code pointer) read from the rbp frame chain (`[rbp+8]` under the SysV-style prologue; no per-call instrumentation, fixpoint-safe). Gated `stack_trace_test.quanta` (rc=0: non-zero result, inside code segment 0x400000..0x410000, distinct call sites yield distinct return addresses). Full 8-layer gate GREEN. **FIXPOINT: NOT byte-verified** (systemic stage2 SIGSEGV, same as 0.0.111/0.0.112 — pre-existing in 0.0.109/0.0.110). |
 | 0.0.114 | Lang | `big` keyword/type | 🟡 lib convention | `TT_BIG` + op-overload routing `a+b`→`big_add`; gate `big_test`. |
-| 0.0.115 | P4 tooling | **Quanta-native code-writing tool** | ❌ | LAST core item — sequenced right before 0.1.0 (where std/libs resume). Edit Quanta source reliably without external scripting. |
 
-**Version-number rule:** literal numbers above are the plan; the SEQUENCING (order + one-feature-per-version + fixpoint-verified) is the contract. If a version needs splitting, the number increments — never skipped, never reused. 0.0.90 is **not reserved**; it is simply the `as`/`raw`/`volatile` cluster above. The code-writing tool is **0.115 — the last core item, sequenced immediately before 0.1.0** (where std/libs resume); ARM64 and the deep-systems items remain POST-0.1.0.
+**Version-number rule:** literal numbers above are the plan; the SEQUENCING (order + one-feature-per-version + fixpoint-verified) is the contract. If a version needs splitting, the number increments — never skipped, never reused. 0.0.90 is **not reserved**; it is simply the `as`/`raw`/`volatile` cluster above. The final cores are 0.0.113 (stack-trace) and 0.0.114 (`big`); **the code-writing tool is deferred to AFTER stdlibs (post-0.1.0)** — it is no longer the last 0.0.x item. ARM64 and the deep-systems items remain POST-0.1.0.
 
-**POST-0.1.0 (no version reserved for any):** borrow-checking; `chain`/`secure`/`ai`/`physics` libs; ARM64 backend.
+**POST-0.1.0 (no version reserved for any):** P4 **Quanta-native code-writing tool** (edit Quanta source reliably without external scripting); borrow-checking; `chain`/`secure`/`ai`/`physics` libs; ARM64 backend.
 
 
 

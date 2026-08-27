@@ -1,0 +1,25 @@
+// stack_trace_test.quanta — 0.0.113 G-core introspection: stack_trace().
+// stack_trace() returns the immediate caller's return address (the code
+// pointer execution resumes at when the current function returns), read from
+// the rbp frame chain ([rbp+8] under the SysV-style prologue).
+//
+// Gate semantics (address-independent, stable across builds):
+//   1. the result is non-zero,
+//   2. the result lies inside the code segment (0x400000..0x410000),
+//   3. two different call sites observe two DIFFERENT return addresses.
+// Prints 0 on full success; distinct exit codes identify the first failure.
+fn a() -> i64 { return stack_trace() }
+fn b() -> i64 { return stack_trace() }
+fn main() {
+    let ra = a()
+    let rb = b()
+    if ra == 0 { exit(1) }
+    if rb == 0 { exit(2) }
+    if ra < 4194304 { exit(3) }      // 0x400000 code-segment base
+    if ra > 4259840 { exit(4) }      // 0x410000 generous code-segment cap
+    if rb < 4194304 { exit(5) }
+    if rb > 4259840 { exit(6) }
+    if ra == rb { exit(7) }          // distinct call sites -> distinct ret addrs
+    println(0)
+    exit(0)
+}
