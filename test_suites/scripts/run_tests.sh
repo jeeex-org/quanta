@@ -39,7 +39,7 @@ while IFS=$'\t' read -r name expected; do
     continue
   fi
   set +e
-  "$bin" < /dev/null > /dev/null 2>&1
+  ./scripts/quanta_run.sh "$bin" < /dev/null > /dev/null 2>&1
   actual=$?
   set -e
   if [ "$actual" = "$expected" ]; then
