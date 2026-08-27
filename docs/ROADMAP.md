@@ -1,6 +1,6 @@
 # Quanta ROADMAP — consolidated single source of truth
 
-> **Last updated: 2026-08-27. Current compiler: 0.0.109** (x86-64 ELF emitter,
+> **Last updated: 2026-08-27. Current compiler: 0.0.110** (x86-64 ELF emitter,
 > multi-file tree, Valgrind-clean, self-host `fp=YES`). ARM64 (AArch64) backend
 > is DEFERRED POST-0.1.0 (see #2 schedule below); the working compiler is x86-64 only.
 >
@@ -91,11 +91,11 @@ Every item below is one WIP version: self-hosts (2-stage byte-identical fixed po
 | 0.0.107 | Builtins | bit/byte extras (parity/bitfield/bswap16-32-64) | ✅ | parity/bitfield/bswap16/32/64 added (emit_bltn + features.quanta decls). gated bitops_test.quanta (rc=0); fixpoint byte-identical. NOTE: found a PRE-EXISTING allocator bug — a live vreg passed as a builtin/user-fn arg and kept live across a subsequent user-fn call is clobbered (reproduced with existing `popcount` too). Both builtins are correct; tests use the early-exit pattern (no live args across calls) to avoid the unrelated bug. Tracked in Known Issues. |
 | 0.0.108 | Builtins | intrinsics (prefetch/pause/lfence/sfence/fence) | ✅ | 5 void builtins: prefetch(addr)=prefetchnta[rax] (0F 18 08), pause()=F3 90, fence()=mfence (0F AE F0), lfence()=0F AE E8, sfence()=0F AE F8. gated intrinsic_test.quanta (rc=0, byte-emission verified via objdump). Branch-hint intrinsics (likely/unlikely) scoped OUT — conditional jumps emit centrally in IR_BR, not at call sites, so a builtin cannot prefix them. Fixpoint byte-identical (md5 d89cd1e7c44899a01f054f2caec7c4ea, seed 0.0.107). 0.0.108 = 0.0.107 (bitops) + intrinsics; fs-meta fix carried forward. |
 | 0.0.109 | Builtins | fs metadata fix (stat/unlink/mkdir/chdir/rename) | ✅ | Root cause: path-string remap applied +8 twice (unlink/chdir) or not at all (rename new path, stat rsi); `file_open` also mishandled raw argv pointers. Fixed via `argp8` for string literals + `vreg_is_str` detection in `file_open`; `fs_meta_test.quanta` (rc=11) gates mkdir/file_open/stat/rename/chdir/unlink. Rebuilt as 0.0.108 + fs-meta so the SEQUENCE stays intact (0.0.109 now also carries bitops + intrinsics forward; build seed 0.0.108, fixpoint md5 d89cd1e7… identical to 0.0.108 since no new emitter code). |
-| 0.0.110 | Builtins | introspection stack-trace | ❌ | Add `abort_test` stack trace. |
-| 0.0.111 | Memory | stack unwind / destructors / RAII | ❌ defer manual | Scope-exit cleanup. |
-| 0.0.112 | Memory | real allocator (free-list/GC) | ❌ bump mmap only | Free-list allocator replacing raw mmap. |
-| 0.0.113 | Lang | `big` keyword/type | 🟡 lib convention | `TT_BIG` + op-overload routing `a+b`→`big_add`; gate `big_test`. |
-| 0.0.114 | Lang | typed array/slice `T[]` | ❌ untyped only | Parse `let a: i64[]`; bound-checked access. |
+| 0.0.110 | Types | typed array/slice `T[]` | ✅ | 0.0.110 — `let a: i64[] = [...]` parses and tags the binding as an array (vtype 11); indexing `a[idx]` + subscript assignment `a[i]=v` already worked via IR_IDX. gated typed_array_test.quanta (rc=0). NOTE: `String` type annotation (`let s: String`) was ALREADY done in 0.0.95 (VT_STRING=10, parse_let) — the FEATURES B-core `string (real type)` row was stale ❌; corrected to ✅ this version. |
+| 0.0.111 | Builtins | introspection stack-trace | ❌ | Add `abort_test` stack trace (re-sequenced from 0.0.110 to make room for the B-core type work). |
+| 0.0.112 | Memory | stack unwind / destructors / RAII | ❌ defer manual | Scope-exit cleanup. |
+| 0.0.113 | Memory | real allocator (free-list/GC) | ❌ bump mmap only | Free-list allocator replacing raw mmap. |
+| 0.0.114 | Lang | `big` keyword/type | 🟡 lib convention | `TT_BIG` + op-overload routing `a+b`→`big_add`; gate `big_test`. |
 | 0.0.115 | P4 tooling | **Quanta-native code-writing tool** | ❌ | LAST core item — sequenced right before 0.1.0 (where std/libs resume). Edit Quanta source reliably without external scripting. |
 
 **Version-number rule:** literal numbers above are the plan; the SEQUENCING (order + one-feature-per-version + fixpoint-verified) is the contract. If a version needs splitting, the number increments — never skipped, never reused. 0.0.90 is **not reserved**; it is simply the `as`/`raw`/`volatile` cluster above. The code-writing tool is **0.115 — the last core item, sequenced immediately before 0.1.0** (where std/libs resume); ARM64 and the deep-systems items remain POST-0.1.0.

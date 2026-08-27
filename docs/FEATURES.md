@@ -93,11 +93,11 @@ native type keyword parsing). `as` width casts (`x as T`) are done (0.0.90).
 | byte (as type) | ✅ done | ✅ gate | `let x: byte` parsed (vtype 8); byte-width, wraps 0..255 on arithmetic (REX.B-correct) |
 | `as` width cast (`x as T`) | ✅ done (0.0.90) | ✅ gate | `x as u8/u16/u32/char/byte/usize`. Truncation emitted as IR_BAND with width mask; usize/signed are identity. `as_cast_test.quanta` (rc=7) gates it; diff-checked vs `x & mask`. |
 | float literals (`3.14`) | ✅ done (0.0.61) | ✅ gate | float_test.quanta (`println(3.14)`->`3.140000`); f2i/fadd/... consume float vregs (0.0.62). Verified: `fadd(1.5,2.5)`->4 |
-| string (real type) | ❌ todo | ❌ none | TT_STRING reserved; byte-buffer + print only |
+| string (real type) | ✅ done (0.0.95) | ✅ gate | `let s: String` parsed (vtype 10, parse_let); length-aware real type with `==`/`len`/`concat` (str_eq/str_ne/strcat). Verified: `let s: String = "hi"; println(s)` → `hi`. |
 | struct | ✅ done | ✅ gate | fields + `obj.method` + literal (struct_literal_test.quanta, in gate) |
 | enum (user-defined) | ✅ done | ✅ gate | enum_test.quanta (rc=42, in gate) |
 | tuple `(T,U)` | ✅ done | ✅ gate | tuple_test.quanta (rc=40, in gate; mk_any-based tuples) |
-| typed array/slice | ❌ todo | ✅ gate | untyped `[...]` is covered (array_test.quanta / forin_*); no typed `T[]` annotation yet. NOTE: marked ❌ todo because the *typed* form is unimplemented; the underlying untyped array IS tested, hence ✅ gate |
+| typed array/slice | ✅ done (0.0.110) | ✅ gate | `let a: i64[] = [...]` parsed (vtype 11, parse_let `T[]` suffix); indexing `a[idx]` + subscript assignment `a[i]=v` via IR_IDX (header-carrying base, base+8+i*8). gated typed_array_test.quanta (rc=0). Untyped `[...]` was already tested (array_test.quanta / forin_*). |
 
 ## C. Core — Control Flow
 
