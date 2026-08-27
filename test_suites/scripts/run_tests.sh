@@ -41,14 +41,6 @@ while IFS=$'\t' read -r name expected; do
   set +e
   ./scripts/quanta_run.sh "$bin" < /dev/null > /dev/null 2>&1
   actual=$?
-  if [ "$actual" = "127" ]; then
-    echo "    DIAG: exec failed; errno=$(python3 -c "import os,sys;
-try:
-    os.execve('$bin',['$bin'],os.environ)
-except Exception as e:
-    print(type(e).__name__, getattr(e,'errno',None), e)" 2>&1)"
-  fi
-  set -e
   if [ "$actual" = "$expected" ]; then
     echo "  PASS $name (rc=$actual)"
     PASS=$((PASS + 1))
