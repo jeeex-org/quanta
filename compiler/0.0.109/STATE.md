@@ -3,9 +3,9 @@
 - **Version:** 0.0.109
 - **Date:** 2026-08-27
 - **Source entry:** `compiler/0.0.109/src/x86/main.quanta` (16 modules)
-- **Build seed:** 0.0.106 (`compiler/0.0.106/bin/x86/qc`)
-- **Self-host fixpoint:** stage2 == stage3, md5 `814a2724eca60ffa0a6b51f5cb279db8` (byte-identical)
-- **Promoted from:** 0.0.109 (this version; copied from 0.0.106)
+- **Build seed:** 0.0.108 (`compiler/0.0.108/bin/x86/qc`)
+- **Self-host fixpoint:** stage2 == stage3, md5 `d89cd1e7c44899a01f054f2caec7c4ea` (byte-identical, identical to 0.0.108 since no new emitter code beyond 0.0.108)
+- **Promoted from:** 0.0.109 (this version; copied from 0.0.108 = 0.0.107 + intrinsics + fs-meta)
 
 ## What changed
 F core (Built-ins) fs-metadata partial fix. The F-core row in FEATURES/ROADMAP was

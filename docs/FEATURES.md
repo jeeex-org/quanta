@@ -192,7 +192,7 @@ native type keyword parsing). `as` width casts (`x as T`) are done (0.0.90).
 | introspection (remaining) | stack-trace | ❌ none (planned: abort_test.quanta) |
 | random (remaining) | rand | ✅ done (0.0.102) — `rand()` convenience over getrandom; gated `rand_test.quanta` (rc=0). |
 | bit/byte extras | parity, bitfield, per-size swap (bswap16/32/64) | ✅ 0.0.107 — parity(x)=odd-bit-count?1:0; bitfield(x,off,wid)=(x>>off)&((1<<wid)-1); bswap16/32/64. Gated by bitops_test.quanta (rc=0). NOTE: bitfield wid==64 is the documented exception (result 0, mirrors rotl/rotr &63 shift-count behavior). |
-| intrinsics | prefetch, fence, branch hints | ❌ none |
+| intrinsics | prefetch, pause, lfence, sfence, mfence | ✅ 0.0.108 — `prefetch(addr)`=prefetchnta[rax] (0F 18 08); `pause()`=F3 90; `fence()`=mfence (0F AE F0); `lfence()`=0F AE E8; `sfence()`=0F AE F8. All void builtins, gated by intrinsic_test.quanta (rc=0, byte-emission verified via objdump). Branch-hint intrinsics (likely/unlikely) deliberately OUT OF SCOPE — conditional jumps emit centrally in the shared IR_BR backend, not at call sites, so a builtin cannot prefix a following branch. |
 
 ## I. Known issues (tracked, not blocking promotion)
 - **fs-meta path-string remap (stat/unlink/mkdir/chdir/rename): BROKEN.** These
