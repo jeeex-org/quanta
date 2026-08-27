@@ -1,0 +1,23 @@
+// mem_free_test.quanta — 0.0.111 real allocator: mem_free/mem_realloc
+// Verifies realloc preserves payload data across a grow. Stores into the
+// PAYLOAD (ptr+8..), never the count header at ptr+0.
+// Prints 0 on full success, or a 9xx code on the first failed check.
+fn main() {
+    let p = mem_alloc(4)        // header [p]=4, payload p+8..p+32
+    mem_store(p + 8, 11)
+    mem_store(p + 16, 22)
+    mem_store(p + 24, 33)
+    mem_store(p + 32, 44)
+    let q = mem_realloc(p, 8)
+    let v0 = mem_load(q + 8)
+    let v1 = mem_load(q + 16)
+    let v2 = mem_load(q + 24)
+    let v3 = mem_load(q + 32)
+    if v0 != 11 { println(900); return }
+    if v1 != 22 { println(901); return }
+    if v2 != 33 { println(902); exit(903) }
+    if v3 != 44 { println(903); exit(903) }
+    mem_free(q)              // must not crash
+    println(0)               // all checks passed
+    exit(0)
+}

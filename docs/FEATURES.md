@@ -150,7 +150,7 @@ native type keyword parsing). `as` width casts (`x as T`) are done (0.0.90).
 | mem_load/mem_store(+8) | ✅ done | ✅ gate | raw_ptr_test.quanta |
 | defer (LIFO replay) | ✅ done | ✅ gate | defer_test.quanta |
 | unsafe blocks | ✅ done | ✅ gate | unsafe_block.quanta |
-| real allocator (free-list/GC) | ❌ todo | ❌ none | bump mmap only |
+| real allocator (free-list/GC) | ✅ done (0.0.111) | ✅ gate | `mem_free(ptr)` (free-list push at `HEAP_CTRL=GDATA+1032`) + `mem_realloc(ptr,newn)` (mmap new + `rep movsq` copy min(old_count,newn) qwords) added; `mem_alloc` unchanged (fixpoint-safe). gated `mem_free_test.quanta` (rc=0). Fixpoint byte-verification blocked by systemic stage2 SIGSEGV (see ROADMAP 0.0.111 note). |
 | callee load-store-to-same-addr aliasing | ✅ done | ✅ gate | reg_alias.quanta / alias_derive_loop.quanta / alias_loadstore_loop.quanta (fixed 0.0.43–0.0.46) |
 | stack unwind / destructors / RAII | ❌ todo | ❌ none | defer is manual |
 | ref/mut/move (ownership) | ✅ done (0.0.94) | ✅ gate | `mut` rebindable, `ref` borrow alias, `move` transfer prefix; ownership tag tracked in symbol table (`vars_own`, `vown`/`set_vown`). Enforce at 0.1.0. ownership_sigils_test.quanta gates it. |
