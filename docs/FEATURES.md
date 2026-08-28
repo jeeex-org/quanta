@@ -43,7 +43,7 @@ exist as files but are excluded from the gate per the "core only until 0.1.0" ru
 | defer | token | ✅ done | ✅ gate | defer_test.quanta |
 | in | token | ✅ done | ✅ gate | forin_basic.quanta (for-in array iteration) |
 | alias | 17 | ✅ done | ✅ gate | alias_test.quanta (function alias newname=existingfn) |
-| extern "C" | 19 | ✅ done (0.0.98) / fixed (0.0.99) | ✅ gate | `extern "C" fn square(x)` declared + called via `--emit-obj` + external `ld`/`gcc`. 0.0.99 fixed the real defects 0.0.98 left: **string args** get the 8-byte length header skipped (`add reg,8` → `char*`, so `strlen("hello")`→5, `write(1,"hi",2)`→"hi"); **multi-arg calls** fixed (`arg_start`/`arg_cnt` mapping); **stack alignment** (`push r11/call/pop r11`, 16-byte) so `printf`/`puts` don't SSE-fault; **stdout flush** via libc `exit()` in object mode. Scalar calls (`abs(-42)`→42) and trait/interface vtable dispatch all work. EXE-mode standalone-PLT/GOT (no external `ld`) is deferred — object-mode + gcc is the supported path. |
+| extern "C" | 19 | ✅ done (0.0.98) / fixed (0.0.99) | ✅ gate | `extern "C" fn square(x)` declared + called via `--emit-obj` + external `ld`/`gcc`. 0.0.99 fixed the real defects 0.0.98 left: **string args** get the 8-byte length header skipped (`add reg,8` → `char*`, so `strlen("hello")`→5, `write(1,"hi",2)`→"hi"); **multi-arg calls** fixed (`arg_start`/`arg_cnt` mapping); **stack alignment** (`push r11/call/pop r11`, 16-byte) so `printf`/`puts` don't SSE-fault; **stdout flush** via libc `exit()` in object mode. Scalar calls (`abs(-42)`→42) and trait/interface vtable dispatch all work. EXE-mode standalone-PLT/GOT (no external `ld`) scheduled **0.0.122** — object-mode + gcc is the supported path until then. |
 | struct | token | ✅ done | ✅ gate | struct_test.quanta, struct_methods_test.quanta, struct_literal_test.quanta |
 | enum | 21 | ✅ done | ✅ gate | enum_test.quanta (rc=42); Some/None match arms exercised |
 | type | 23 | ✅ done (0.0.77) | ✅ gate | type_alias.quanta (rc=42). `type MyInt = int` then `let x: MyInt` |
@@ -98,7 +98,7 @@ native type keyword parsing). `as` width casts (`x as T`) are done (0.0.90).
 | enum (user-defined) | ✅ done | ✅ gate | enum_test.quanta (rc=42, in gate) |
 | tuple `(T,U)` | ✅ done | ✅ gate | tuple_test.quanta (rc=40, in gate; mk_any-based tuples) |
 | typed array/slice | ✅ done (0.0.110) | ✅ gate | `let a: i64[] = [...]` parsed (vtype 11, parse_let `T[]` suffix); indexing `a[idx]` + subscript assignment `a[i]=v` via IR_IDX (header-carrying base, base+8+i*8). gated typed_array_test.quanta (rc=0). Untyped `[...]` was already tested (array_test.quanta / forin_*). |
-| big (arbitrary-precision int) | ✅ done (0.0.114) | ✅ gate | **First-class core type** (moved from the stdlib track to core in 0.0.114). Context-sensitive type keyword (`ktext` ID 62, stays `TT_ID` so `let big = 70000` still works). `: big` param / `-> big` return annotations; big tag propagates through `let`, reassignment, and call results. Operators `+ - * / % == !=` route to `big_add/sub/mul/div/mod/eq` with automatic int→big promotion (operator operands AND call-site args to `: big` params); ordering compares (`< > <= >=`) rejected at compile time; `println(big)` → `big_println`; overflowing decimal literals lex as a single `TT_BIGNUM` token. Implementation lives in `lib/std/big.quanta` (public API fully annotated: `: big` params, `-> big` returns — raw-int args auto-promote, big-returning calls never double-wrap). Gated `big_test.quanta` (rc=0: 30-digit add/sub/mul/div/mod vs Python reference values, signed equality, println). |
+| big (arbitrary-precision int) | ✅ done (0.0.114) | ✅ gate | **First-class core type** (moved from the stdlib track to core in 0.0.114). Context-sensitive type keyword (`ktext` ID 62, stays `TT_ID` so `let big = 70000` still works). `: big` param / `-> big` return annotations; big tag propagates through `let`, reassignment, and call results. Operators `+ - * / % == !=` route to `big_add/sub/mul/div/mod/eq` with automatic int→big promotion (operator operands AND call-site args to `: big` params); ordering compares (`< > <= >=`) rejected at compile time **until 0.0.117** (scheduled: signed compare routing + bitwise `& | ^ << >>` operator routing); `println(big)` → `big_println`; overflowing decimal literals lex as a single `TT_BIGNUM` token. Implementation lives in `lib/std/big.quanta` (public API fully annotated: `: big` params, `-> big` returns — raw-int args auto-promote, big-returning calls never double-wrap). Gated `big_test.quanta` (rc=0: 30-digit add/sub/mul/div/mod vs Python reference values, signed equality, println). |
 
 ## C. Core — Control Flow
 
@@ -140,7 +140,7 @@ native type keyword parsing). `as` width casts (`x as T`) are done (0.0.90).
 | user fn overrides builtin | ✅ done (0.0.68) | ✅ gate | user_fn_beats_builtin.quanta (rc=42), user_fn_beats_builtin_chain.quanta (rc=38), builtin_still_inline.quanta (rc=3). EXCEPTION: mem_load/mem_store/mem_load8/mem_store8 + fadd/fsub/fmul/fdiv are primitive intrinsics and NOT overridable |
 | fnptr + closure_call | ✅ done (0.0.72) | ✅ gate | fnptr_test.quanta (rc=7). fnptr returns a [codeptr, env=0] tuple; before 0.0.72 feeding it to closure_call SEGFAULTed |
 | const redefinition | ✅ done (0.0.75) | ✅ gate | const_redefine.quanta (rc=5, was 10). First value wins; duplicate skipped |
-| closure captures | ✅ done (0.0.67) | ✅ gate | closure_capture.quanta (rc=15), closure_capture_multi.quanta (rc=11), closure_capture_byvalue.quanta (rc=11). Free vars captured BY VALUE into heap env; IR_CAPREAD from env in r10; max 32 captures |
+| closure captures | ✅ done (0.0.67) | ✅ gate | closure_capture.quanta (rc=15), closure_capture_multi.quanta (rc=11), closure_capture_byvalue.quanta (rc=11). Free vars captured BY VALUE into heap env; IR_CAPREAD from env in r10; max 32 captures. **By-ref capture (mutate enclosing local) scheduled 0.0.121.** |
 
 ## E. Memory & Runtime
 
@@ -172,7 +172,7 @@ native type keyword parsing). `as` width casts (`x as T`) are done (0.0.90).
 | closures | closure literal `\|a\| { … }`, fnptr, closure_call | ✅ gate (closure_basic.quanta rc=6, closure_multi_param.quanta rc=7, closure_higher_order.quanta rc=42, fnptr_test.quanta rc=7) |
 | float arith | fadd, fsub, fmul, fdiv, i2f, f2i | ✅ gate (float_test.quanta rc=159, simple_fadd.quanta rc=7) |
 | float compare | feq, flt, fgt, fle, fge, fisnan, fisinf | ✅ gate (float_test.quanta rc=159) |
-| float math | sqrt, floor, ceil, abs, sin, cos, tan, pow, log | ✅ gate (float_test.quanta rc=159). min/max are NOT yet implemented (see §G) |
+| float math | sqrt, floor, ceil, abs, sin, cos, tan, pow, log | ✅ gate (float_test.quanta rc=159) for sqrt/floor/ceil/abs/pow/log; **sin/cos/tan implemented (x87) but NOT gated** — float_test.quanta has zero trig calls; trig gating scheduled 0.0.116. min/max are NOT yet implemented (see §G) |
 | process / env | getpid, getppid, arg_count, environ | ✅ gate (getpid_test.quanta, getppid_test.quanta, argc_test.quanta). getenv is a STUB returning 0 (see §I) |
 | stdin I/O | getc | ✅ gate (getc_test.quanta). getline untested-in-gate |
 | fs metadata | stat, fstat, lseek, unlink, mkdir, chdir, rename | ✅ 7/7 gated (fs_meta_test.quanta rc=11) — root cause: path-string remap applied +8 twice / not at all; fixed via `argp8` for string literals + `vreg_is_str` detection so `file_open` also accepts raw C-string pointers (e.g. argv). See §I. |
@@ -186,11 +186,11 @@ native type keyword parsing). `as` width casts (`x as T`) are done (0.0.90).
 
 | Group | Items | Test? |
 |---|---|---|
-| float math (remaining) | sin, cos, tan, pow, log, min, max | ✅ shipped (emit_bltn P6.1a; see §F float math row). Gated at the stdlib stage via `std_math_test.quanta` (not yet in core gate). |
+| float math (remaining) | sin, cos, tan, pow, log, min, max | 🟡 sin/cos/tan/pow/log shipped as core builtins (emit_bltn P6.1a, x87) but trig never gated → **trig gate tests in 0.0.116**. min/max are NOT core builtins — implemented in pure Quanta in lib/std/math.quanta (genuine stdlib story, complete, gated via std_math_test rc=19). |
 | string ops | strcat, substr, str_split, utf8 | ✅ gate (strcat_test rc=6, substr_test rc=3, str_split_test rc=0, utf8_test rc=5). strcat/substr in 0.0.102; str_split + utf8 in 0.0.104. utf8 decodes UTF-8 bytes → qword array of scalar codepoints. strcmp is really str_eq/str_ne (already shipped). |
-| atomics | atomic_load/store/add/swap/cmpxchg | ✅ 5/5 gated (atomic_test.rc=11) |
-| networking | socket/connect/bind/listen/accept | ✅ 5/5 gated (net_test.rc=11) |
-| introspection (remaining) | stack-trace + rsp | ✅ done (0.0.113) — `stack_trace()` returns the immediate caller's return address (code pointer) from the rbp frame chain (`[rbp+8]`); no per-call instrumentation, fixpoint-safe. `rsp()` (permanent debug builtin, FIX-0.0.11) returns the current stack pointer (`mov rax, rsp`). Gated `stack_trace_test.quanta` + `rsp_test.quanta` (both rc=0). |
+| atomics | atomic_load/store/add/swap/cmpxchg | ✅ 5/5 gated (atomic_test.rc=11). **futex + thread create/join scheduled 0.0.119** (atomics without blocking/spawn is half a concurrency feature). |
+| networking | socket/connect/bind/listen/accept | ✅ 5/5 gated (net_test.rc=11). **send/recv (sc 44/45) scheduled 0.0.118** — no data transfer today; net_test only exercises socket+connect+close. |
+| introspection (remaining) | stack-trace + rsp | ✅ done (0.0.113) — `stack_trace()` returns the immediate caller's return address (code pointer) from the rbp frame chain (`[rbp+8]`); no per-call instrumentation, fixpoint-safe. `rsp()` (permanent debug builtin, FIX-0.0.11) returns the current stack pointer (`mov rax, rsp`). Gated `stack_trace_test.quanta` + `rsp_test.quanta` (both rc=0). **Full stack unwind (walk whole frame chain) scheduled 0.0.120.** |
 | random (remaining) | rand | ✅ done (0.0.102) — `rand()` convenience over getrandom; gated `rand_test.quanta` (rc=0). |
 | bit/byte extras | parity, bitfield, per-size swap (bswap16/32/64) | ✅ 0.0.107 — parity(x)=odd-bit-count?1:0; bitfield(x,off,wid)=(x>>off)&((1<<wid)-1); bswap16/32/64. Gated by bitops_test.quanta (rc=0). NOTE: bitfield wid==64 is the documented exception (result 0, mirrors rotl/rotr &63 shift-count behavior). |
 | intrinsics | prefetch, pause, lfence, sfence, mfence | ✅ 0.0.108 — `prefetch(addr)`=prefetchnta[rax] (0F 18 08); `pause()`=F3 90; `fence()`=mfence (0F AE F0); `lfence()`=0F AE E8; `sfence()`=0F AE F8. All void builtins, gated by intrinsic_test.quanta (rc=0, byte-emission verified via objdump). Branch-hint intrinsics (likely/unlikely) deliberately OUT OF SCOPE — conditional jumps emit centrally in the shared IR_BR backend, not at call sites, so a builtin cannot prefix a following branch. |
@@ -230,9 +230,9 @@ it; 🟡 file-only = a test file exists on disk but is NOT in the gate; ❌ none
 |---|---|---|---|
 | `big` (arbitrary-precision int) | → **core** (0.0.114) | ✅ gate | **Moved to the core type system in 0.0.114 — see §B Core Types.** `lib/std/big.quanta` remains the implementation (now fully annotated with `: big` / `-> big`); the 4 original stages (ADD/SUB/MUL, DIV/MOD, SHL/SHR, decimal print + Karatsuba) plus first-class keyword, operator routing, and int→big promotion are all core features now. Gated `big_test.quanta` (rc=0). |
 | `crypto` (SHA-256/HMAC/AES/CSPRNG) | ✅ done | ✅ gate | std_crypto_test.quanta (rc=3, gated at 0.0.87). 643 lines, 21 fns. |
-| `quantum` (Keccak/SHA3/SHAKE) | ✅ done | ❌ none | lib/std/quantum.quanta (240 lines, 8 fns). No dedicated test file. |
-| `linalg` (matmul/transpose/det/inverse/vectors) | ✅ done | ❌ none | lib/std/linalg.quanta (363 lines, 25 fns). No dedicated test file. |
-| `math` (sqrt/floor/ceil/abs/sin/cos/tan/pow/log/min/max) | 🟡 partial | ✅ gate | std_math_test.quanta (rc=19, gated at 0.0.87; covers sqrt/floor/ceil/abs + pow/log/min/max/gcd/lcm). sin/cos/tan still TODO (builtins row). |
+| `quantum` (Keccak/SHA3/SHAKE) | ✅ done | 🟡 scheduled 0.0.116 | lib/std/quantum.quanta (240 lines, 8 fns). `quantum_test` gate test scheduled for 0.0.116 (audit close-off #2). |
+| `linalg` (matmul/transpose/det/inverse/vectors) | ✅ done | 🟡 scheduled 0.0.116 | lib/std/linalg.quanta (363 lines, 25 fns). `linalg_test` gate test scheduled for 0.0.116 (audit close-off #2). |
+| `math` (sqrt/floor/ceil/abs/sin/cos/tan/pow/log/min/max) | ✅ done | ✅ gate | std_math_test.quanta (rc=19, gated at 0.0.87; covers sqrt/floor/ceil/abs + pow/log/min/max/gcd/lcm — min/max are pure-Quanta stdlib fns, genuine stdlib story). Core-level sin/cos/tan gating scheduled **0.0.116**. |
 | `map` | ✅ done | ✅ gate | test_mmap.quanta / mmap1.quanta (both gated); std_map_test.quanta also gated at 0.0.87 (rc=6). |
 | `str` (string ops) | ✅ done | ✅ gate | string_keyword_case.quanta (gated); std_str_test.quanta also gated at 0.0.87 (rc=13). |
 | `vec` | ✅ done | ✅ gate | std_vec_test.quanta (rc=8, gated at 0.0.87). |

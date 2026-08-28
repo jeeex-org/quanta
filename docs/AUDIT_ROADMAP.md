@@ -1,10 +1,12 @@
 # AUDIT_ROADMAP — Quanta Compiler Security Fixes
 
-**CLOSE-OFF STATUS: ALL ITEMS CLOSED at 0.0.115 (security hardening release).**
+**ROUND 1 CLOSE-OFF: ALL ITEMS (FIX-0.0.1–30) CLOSED at 0.0.115 (security hardening release).**
 Build seed: 0.0.114 (`compiler/0.0.114/bin/x86/qc`).
 Self-host fixpoint: BYTE-VERIFIED — stage1==stage2==stage3 (md5 `50857425ec4be97ddf971074a6b66d48`).
 Full 9-layer gate: GREEN (functional 148/148 incl. `rsp_test` + `big_test`; stdlib 7/7; extern-c/security/perf/valgrind/fuzz/differential/generics all GREEN).
 `lib/std/big.quanta` runtime fixes applied in 0.0.115 (see appended ⧫-marked `big` findings).
+
+**ROUND 2 (2026-08-28, completeness audit before 0.1.0 — no-deferral policy):** FIX-0.0.31–39 appended below. Scope: full-featuredness of shipped cores (net, atomics, float trig, stack_trace, closures, extern "C", big ops) + gate-hygiene gaps (quantum/linalg/trig tests, multi-TU wiring) + the builtin+live-local miscompile. Scheduled across 0.0.116–0.0.122 per ROADMAP §3. Round 2 closes when 0.0.122 ships and 0.1.0 begins.
 
 Generated from static audit of `compiler/0.0.113` (WIP) vs `0.0.112` (released) at commit `0af9bdc`.
 Scope: x86-64 backend, memory subsystem, include expander, new 0.0.113 builtins (`rsp()`, `stack_trace()`).
@@ -273,7 +275,106 @@ the compiler's own arrays. Verified against source + executed gate at 0.0.115.
 | FIX-0.0.21 | HIGH | ✅ | big_print_dec_mag: allocate ndig+1 (fixed overflow) |
 | FIX-0.0.22…30 | MED | ✅ | compiler-internal arenas bounded (FIX-0.0.4/5/8 + emit_ovf) |
 
-**All AUDIT_ROADMAP items closed. Cores may be promoted to 0.1.0.**
+**All ROUND 1 AUDIT_ROADMAP items closed at 0.0.115.**
 
-*Updated 2026-08-28 — close-off at 0.0.115.*
+*Updated 2026-08-28 — round-1 close-off at 0.0.115.*
+
+---
+
+# ROUND 2 — completeness audit (2026-08-28)
+
+No-deferral policy to 0.1.0 (user directive 2026-08-28): every verified gap gets a version. Findings verified against `compiler/0.0.115` source (grep-level evidence), not ROADMAP claims.
+
+## FIX-0.0.31  HIGH — builtin result + live local arithmetic miscompiles
+
+| | |
+|---|---|
+| **Location** | codegen/expression lowering (exact site TBD in 0.0.116 debug pass) |
+| **Symptom** | `let z = 3; let r = rsp() + z` prints `6` (z+z) instead of stackptr+3. Any builtin whose result feeds an arithmetic expression with a live local miscomputes. |
+| **Provenance** | Pre-existing since ≤0.0.114 (identical on baseline); NOT introduced by 0.0.115 patches. Discovered while writing `rsp_test.quanta`. |
+| **Severity** | HIGH — silent wrong-codegen class; any builtin in an arithmetic expr with a live local is affected, not just `rsp()`. |
+| **Fix** | 0.0.116: root-cause the vreg/register allocation collision between the builtin result and the live local, fix, and add a regression test covering builtin+local arithmetic for several builtins. |
+| **Status** | ❌ open → scheduled **0.0.116** |
+
+## FIX-0.0.32  MED — `quantum` stdlib has no dedicated gate test
+
+| | |
+|---|---|
+| **Evidence** | lib/std/quantum.quanta (240 lines, 8 fns: Keccak/SHA3/SHAKE) shipped 0.0.87; no `quantum_test` in EXPECTED_STDLIB.tsv. ROADMAP line 79 noted the gap. |
+| **Fix** | 0.0.116: add `quantum_test.quanta` with known-answer vectors (SHA3-256 of empty string etc.), wire into stdlib suite. |
+| **Status** | ❌ open → scheduled **0.0.116** |
+
+## FIX-0.0.33  MED — `linalg` stdlib has no dedicated gate test
+
+| | |
+|---|---|
+| **Evidence** | lib/std/linalg.quanta (363 lines, 25 fns) shipped 0.0.87; no `linalg_test` in EXPECTED_STDLIB.tsv. |
+| **Fix** | 0.0.116: add `linalg_test.quanta` (matmul/transpose/det/inverse vs hand-computed values), wire into stdlib suite. |
+| **Status** | ❌ open → scheduled **0.0.116** |
+
+## FIX-0.0.34  MED — float trig builtins implemented but never gated
+
+| | |
+|---|---|
+| **Evidence** | `sin`/`cos`/`tan` present in is_bltn (features.quanta:505-507, x87) since 0.0.103, but `float_test.quanta` contains ZERO trig calls (grep-verified). FEATURES.md line 175 falsely claimed coverage — corrected. |
+| **Fix** | 0.0.116: add trig gate test (sin/cos/tan of known angles vs expected integer-truncated values). |
+| **Status** | ❌ open → scheduled **0.0.116** |
+
+## FIX-0.0.35  LOW — multi-TU fixtures exist but are not wired into the gate
+
+| | |
+|---|---|
+| **Evidence** | `test_suites/codes/mtu_*` fixtures exist; multi-TU linking shipped as a core feature but the fixtures were never added to run_tests.sh (same class of hole as the stdlib suite, FIX-0.0.15). |
+| **Fix** | 0.0.116: wire mtu_* fixtures into the gate as a multi-TU layer. |
+| **Status** | ❌ open → scheduled **0.0.116** |
+
+## FIX-0.0.36  HIGH — `big` ordering + bitwise operators rejected/absent
+
+| | |
+|---|---|
+| **Evidence** | `< > <= >=` on big rejected at compile time (error kind 6); `& | ^ << >>` not operator-routed (`big_shl`/`big_shr` exist as lib calls only; `big_and`/`big_or`/`big_xor` absent from lib/std/big.quanta). A first-class numeric type you can't compare or bit-manipulate is half a type; post-quantum crypto/hash work needs both. |
+| **Fix** | 0.0.117: route ordering to signed big compare; route bitwise to big_and/or/xor/shl/shr (add the three missing lib fns). Compiler delta = operator routing only (core-vs-stdlib line). |
+| **Status** | ❌ open → scheduled **0.0.117** |
+
+## FIX-0.0.37  HIGH — net core has no data transfer (send/recv missing)
+
+| | |
+|---|---|
+| **Evidence** | is_bltn has socket/connect/bind/listen/accept (sc 41/42/49/50/43) but NO send/recv (grep-verified). `net_test` only exercises socket+connect+close. A networking core that can't move bytes is a stub. |
+| **Fix** | 0.0.118: `send(fd,buf,len,flags)` sc 44 + `recv(fd,buf,len,flags)` sc 45; extend net_test to transfer real bytes over a loopback socketpair. |
+| **Status** | ❌ open → scheduled **0.0.118** |
+
+## FIX-0.0.38  HIGH — atomics core has no blocking/spawn (futex + threads missing)
+
+| | |
+|---|---|
+| **Evidence** | 5 lock-prefixed atomic ops gated (atomic_test rc=11) but zero futex matches in features/emitter (grep-verified); no thread_create/join. ROADMAP said "Futex deferred to a later core" with no version — now assigned. |
+| **Fix** | 0.0.119: `futex_wait`/`futex_wake` (sc 202) + `thread_create(fn,arg)`/`thread_join(tid)` (clone sc 56, per-thread stack mmap). Design pass: allocator interaction, stack layout, join semantics. |
+| **Status** | ❌ open → scheduled **0.0.119** |
+
+## FIX-0.0.39  MED — shipped-core feature gaps (stack_trace / closures / extern "C")
+
+| | |
+|---|---|
+| **Evidence** | (a) `stack_trace()` returns ONE frame only (emitter.quanta:839 — immediate caller return address), not a full unwind. (b) closure captures by-value only (0.0.67) — no by-ref capture to mutate an enclosing local. (c) extern "C" works object-mode+gcc only; standalone EXE needs PLT/GOT emission. |
+| **Fix** | (a) 0.0.120: walk the full rbp frame chain. (b) 0.0.121: by-ref capture. (c) 0.0.122: PLT/GOT so a Quanta EXE links libc symbols without gcc. |
+| **Status** | ❌ open → scheduled **0.0.120 / 0.0.121 / 0.0.122** |
+
+---
+
+## Round 2 status table
+
+| ID | Sev | Status | Scheduled |
+|---|---|---|---|
+| FIX-0.0.31 | HIGH | ❌ | 0.0.116 |
+| FIX-0.0.32 | MED  | ❌ | 0.0.116 |
+| FIX-0.0.33 | MED  | ❌ | 0.0.116 |
+| FIX-0.0.34 | MED  | ❌ | 0.0.116 |
+| FIX-0.0.35 | LOW  | ❌ | 0.0.116 |
+| FIX-0.0.36 | HIGH | ❌ | 0.0.117 |
+| FIX-0.0.37 | HIGH | ❌ | 0.0.118 |
+| FIX-0.0.38 | HIGH | ❌ | 0.0.119 |
+| FIX-0.0.39 | MED  | ❌ | 0.0.120–0.0.122 |
+
+**Round 2 closes when 0.0.122 ships; 0.1.0 may then begin.**
 
