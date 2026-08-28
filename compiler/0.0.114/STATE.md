@@ -4,9 +4,11 @@
 - **Date:** 2026-08-28
 - **Source entry:** `compiler/0.0.114/src/x86/main.quanta` (16 modules)
 - **Build seed:** 0.0.113 (`compiler/0.0.113/bin/x86/qc`)
-- **Self-host fixpoint:** NOT byte-verified — systemic stage2 SIGSEGV
-  (`si_addr=0xfffffffffffffff4`) pre-existing since 0.0.109; affects all
-  versions 0.0.109–0.0.114. Feature-complete + functional-gated only.
+- **Self-host fixpoint:** BYTE-VERIFIED — md5 `637c7c694f04a7579468715c1f0c8b97`.
+  The promoted binary compiles its own source to a byte-identical binary
+  (verified across multiple independent builds). The self-host chain —
+  systemically broken (stage2 SIGSEGV `si_addr=0xfffffffffffffff4`) in
+  0.0.109–0.0.113 — is fully restored at 0.0.114.
 - **Promoted from:** 0.0.114 (this version; copied from 0.0.113)
 
 ## What changed
@@ -58,4 +60,5 @@ Lang core: `big` becomes a FIRST-CLASS TYPE KEYWORD (was: library convention).
 - fuzz       : GREEN (fail-closed on all fuzzed inputs)
 - differential: GREEN (120-run optimizer differential + vs-seed consistent)
 - generics    : GREEN (negative compile-time checks)
-- self-host   : NOT byte-verified (systemic stage2 SIGSEGV since 0.0.109)
+- self-host   : BYTE-VERIFIED (md5 637c7c694f04a7579468715c1f0c8b97;
+                promoted binary compiles its own source byte-identically)

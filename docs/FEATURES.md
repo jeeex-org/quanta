@@ -98,6 +98,7 @@ native type keyword parsing). `as` width casts (`x as T`) are done (0.0.90).
 | enum (user-defined) | ✅ done | ✅ gate | enum_test.quanta (rc=42, in gate) |
 | tuple `(T,U)` | ✅ done | ✅ gate | tuple_test.quanta (rc=40, in gate; mk_any-based tuples) |
 | typed array/slice | ✅ done (0.0.110) | ✅ gate | `let a: i64[] = [...]` parsed (vtype 11, parse_let `T[]` suffix); indexing `a[idx]` + subscript assignment `a[i]=v` via IR_IDX (header-carrying base, base+8+i*8). gated typed_array_test.quanta (rc=0). Untyped `[...]` was already tested (array_test.quanta / forin_*). |
+| big (arbitrary-precision int) | ✅ done (0.0.114) | ✅ gate | **First-class core type** (moved from the stdlib track to core in 0.0.114). Context-sensitive type keyword (`ktext` ID 62, stays `TT_ID` so `let big = 70000` still works). `: big` param / `-> big` return annotations; big tag propagates through `let`, reassignment, and call results. Operators `+ - * / % == !=` route to `big_add/sub/mul/div/mod/eq` with automatic int→big promotion (operator operands AND call-site args to `: big` params); ordering compares (`< > <= >=`) rejected at compile time; `println(big)` → `big_println`; overflowing decimal literals lex as a single `TT_BIGNUM` token. Implementation lives in `lib/std/big.quanta` (public API fully annotated: `: big` params, `-> big` returns — raw-int args auto-promote, big-returning calls never double-wrap). Gated `big_test.quanta` (rc=0: 30-digit add/sub/mul/div/mod vs Python reference values, signed equality, println). |
 
 ## C. Core — Control Flow
 
@@ -227,7 +228,7 @@ it; 🟡 file-only = a test file exists on disk but is NOT in the gate; ❌ none
 
 | Library | Status | Test? | Notes / test file |
 |---|---|---|---|
-| `big` (arbitrary-precision int) | ✅ done | ✅ gate | 4 stages shipped (ADD/SUB/MUL, DIV/MOD, SHL/SHR, decimal print) + literal auto-promotion. `lib/std/big.quanta`. **0.0.114: `big` is a first-class type keyword** — `: big` param / `-> big` return annotations, operator routing (`+ - * / % == !=` → `big_add/sub/mul/div/mod/eq`) with automatic int→big promotion (operator operands and call-site args), ordering compares rejected at compile time, `println(big)` → `big_println`, overflowing decimal literals lex as `TT_BIGNUM`. Public stdlib API fully annotated so raw-int args auto-promote and big-returning calls never double-wrap. Gated `big_test.quanta` (rc=0, 30-digit ops vs Python reference values). |
+| `big` (arbitrary-precision int) | → **core** (0.0.114) | ✅ gate | **Moved to the core type system in 0.0.114 — see §B Core Types.** `lib/std/big.quanta` remains the implementation (now fully annotated with `: big` / `-> big`); the 4 original stages (ADD/SUB/MUL, DIV/MOD, SHL/SHR, decimal print + Karatsuba) plus first-class keyword, operator routing, and int→big promotion are all core features now. Gated `big_test.quanta` (rc=0). |
 | `crypto` (SHA-256/HMAC/AES/CSPRNG) | ✅ done | ✅ gate | std_crypto_test.quanta (rc=3, gated at 0.0.87). 643 lines, 21 fns. |
 | `quantum` (Keccak/SHA3/SHAKE) | ✅ done | ❌ none | lib/std/quantum.quanta (240 lines, 8 fns). No dedicated test file. |
 | `linalg` (matmul/transpose/det/inverse/vectors) | ✅ done | ❌ none | lib/std/linalg.quanta (363 lines, 25 fns). No dedicated test file. |
@@ -245,7 +246,7 @@ it; 🟡 file-only = a test file exists on disk but is NOT in the gate; ❌ none
 ## Summary counts (source-derived)
 - **Keywords (ktext): 57 codes defined; ~19 parsed, ~13 lexed-only gaps, rest partial.**
 - **Builtins registered: 87 (prefixes expanded).**
-- **Core tests in gate: 136** (EXPECTED.tsv, 136 rows — verified 2026-08-27). `std_*` tests are kept in a SEPARATE `test_suites/EXPECTED_STDLIB.tsv` (7 rows, runnable at the stdlib stage) and are NOT in the core gate (core-only rule); `mtu_*` multi-translation-unit experiments are also file-only. So ~12 code files are file-only (not in the gate count).
+- **Core tests in gate: 147** (EXPECTED.tsv, 147 rows — verified 2026-08-28, includes `big_test.quanta` landed with 0.0.114). `std_*` tests are kept in a SEPARATE `test_suites/EXPECTED_STDLIB.tsv` (7 rows, runnable at the stdlib stage) and are NOT in the core gate (core-only rule); `mtu_*` multi-translation-unit experiments are also file-only. So ~12 code files are file-only (not in the gate count).
 - **Test framework note:** tests `return`/`exit` a *computed value* (not just 0); EXPECTED.tsv's
   `expected_rc` is that computed answer. So non-zero expected_rc entries are correct results, not
   hidden failures. Verified by reading test bodies (e.g. array_test.quanta returns 200 = a.1; simple_fadd.quanta
@@ -260,5 +261,6 @@ to prevent version-number drift.
 
 Key invariants (unchanged): one feature per WIP version; debt window
 (0.0.43–0.0.50) closed before new features; gate green before promotion;
-Quanta-native code-writing tool is 0.114 (last core, before 0.1.0); ARM64 backend
+Quanta-native code-writing tool is deferred to AFTER the stdlibs stage
+(POST-0.1.0, per user directive 2026-08-28 — no version reserved); ARM64 backend
 deferred to POST-0.1.0 (no version reserved).

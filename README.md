@@ -4,14 +4,14 @@ Quanta designed with simple syntax that supports multiple execution modes: Nativ
 
 ## Status (verified)
 
-- **Native AOT compilation (`qc`)** — **ACTIVE, 0.0.99**. x86-64 only
+- **Native AOT compilation (`qc`)** — **ACTIVE, 0.0.114**. x86-64 only
   (AArch64 backend deferred POST-0.1.0).
-  Bootstraps via a **3-stage self-host fixpoint**: the committed
-  `compiler/${VERSION}/bin/x86/qc` compiles the 0.0.99 source to a faithful
-  `qc` (verified byte-identical fixed point md5 `52abed5acf470aabc50d6d11e31b0f2d`).
-  Full gate (all 7 layers GREEN): functional **138/138** (+ extern-c,
-  security 8/8, perf 3/3, valgrind-clean, fuzz fail-closed 0 crashes,
-  differential -O==no-O + vs-seed consistent).
+  Bootstraps via a **self-host fixpoint**: the committed
+  `compiler/${VERSION}/bin/x86/qc` compiles its own source to a byte-identical
+  `qc` (verified fixed point md5 `637c7c694f04a7579468715c1f0c8b97`).
+  Full gate (all 8 layers GREEN): functional **147/147** (+ extern-c,
+  security, perf 3/3, valgrind-clean, fuzz fail-closed 0 crashes,
+  differential -O==no-O + vs-seed consistent, generics-negative).
 - **Interpreter (`qc --interp`)** — PLANNED (Stage 1). Not yet landed.
 - **Pre-compilation (`go run` style)** — PLANNED (Stage 2).
 - **WebAssembly** — PLANNED (Stage 3).
@@ -386,11 +386,11 @@ is DONE. `#import` is still not functional (a future stage).
 Every change is gated by:
 
 ```bash
-# 3-stage self-host fixpoint: committed compiler/${VERSION}/bin/x86/qc compiles the 0.0.99 source to a faithful qc
+# self-host fixpoint: committed compiler/${VERSION}/bin/x86/qc compiles its own source byte-identically
 cd compiler/$(cat VERSION)/src/x86
 SEED=../../../../compiler/$(cat VERSION)/bin/x86/qc
 $SEED main.quanta qc && ./qc main.quanta qc2 && ./qc2 main.quanta qc3   # qc == qc2 == qc3 (fixed point)
-# full gate (all 7 layers)
+# full gate (all 8 layers)
 bash test_suites/scripts/run_tests.sh
 ```
 
