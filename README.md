@@ -4,14 +4,14 @@ Quanta designed with simple syntax that supports multiple execution modes: Nativ
 
 ## Status (verified)
 
-- **Native AOT compilation (`qc`)** — **ACTIVE, 0.0.114**. x86-64 only
+- **Native AOT compilation (`qc`)** — **ACTIVE, 0.0.115**. x86-64 only
   (AArch64 backend deferred POST-0.1.0).
   Bootstraps via a **self-host fixpoint**: the committed
   `compiler/${VERSION}/bin/x86/qc` compiles its own source to a byte-identical
-  `qc` (verified fixed point md5 `637c7c694f04a7579468715c1f0c8b97`).
-  Full gate (all 8 layers GREEN): functional **147/147** (+ extern-c,
+  `qc` (verified fixed point md5 `50857425ec4be97ddf971074a6b66d48`).
+  Full gate (all 9 layers GREEN): functional **148/148** (+ extern-c,
   security, perf 3/3, valgrind-clean, fuzz fail-closed 0 crashes,
-  differential -O==no-O + vs-seed consistent, generics-negative).
+  differential -O==no-O + vs-seed consistent, generics-negative, stdlib 7/7).
 - **Interpreter (`qc --interp`)** — PLANNED (Stage 1). Not yet landed.
 - **Pre-compilation (`go run` style)** — PLANNED (Stage 2).
 - **WebAssembly** — PLANNED (Stage 3).

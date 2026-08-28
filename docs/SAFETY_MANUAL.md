@@ -64,6 +64,31 @@ than corrupt silently.
 
 ---
 
+## 3b. Pointer & introspection builtins — secure-by-default posture (FIX-0.0.6)
+
+The following builtins expose raw memory / control-flow primitives. Per the audit
+(`AUDIT_ROADMAP.md`, FIX-0.0.6), they are intentionally **callable from safe code**
+(no `unsafe{}` gate) because Quanta is a systems language and these are required for
+the language's own allocator, RAII scope-exit, and FFI. They are documented here as
+**permanent, supported builtins**, not debug probes:
+
+| Builtin | Behavior | Posture |
+|---------|----------|---------|
+| `mem_alloc(n)` / `mem_realloc(p,n)` / `mem_free(p)` | heap control (free-list at `HEAP_CTRL`) | fail-closed on OOM (`exit(1)`, FIX-0.0.1) |
+| `drop(p)` | explicit free | null-guarded (FIX-0.0.3) |
+| `mem_load(p)/mem_store(p,v)` | raw read/write | safe-code available; caller owns provenance |
+| `rsp()` | returns current `rsp` | permanent debug builtin (FIX-0.0.11) |
+| `stack_trace()` | returns caller return address from rbp chain | frame-context guarded (FIX-0.0.7) |
+| `$$(cmd)` | external-command substitution | `unsafe`-gated runtime `fork`/`execve`/`pipe` |
+
+**Design decision (FIX-0.0.6):** raw-pointer primitives are part of the safe-code
+surface. Mitigations are runtime fail-closed (OOM-exit, null-guards, bounds traps),
+not compile-time `unsafe{}` fences — consistent with Quanta's "fail-secure, not
+prove-safe" model (§3). This is acceptable for the target SIL 1–2 envelope; SIL 3–4
+would require borrow checking (Stage 6, not yet built).
+
+---
+
 ## 4. Verification evidence (what was actually run)
 
 All evidence below was produced this session (2026-08-16) against

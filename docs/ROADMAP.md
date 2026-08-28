@@ -1,11 +1,15 @@
 # Quanta ROADMAP — consolidated single source of truth
 
-> **Last updated: 2026-08-28. Current compiler: 0.0.114** (x86-64 ELF emitter,
-> multi-file tree, Valgrind-clean; self-host fixpoint **BYTE-VERIFIED at 0.0.114** —
-> md5 `637c7c694f04a7579468715c1f0c8b97`; the systemic stage2 SIGSEGV that broke
-> the canonical chain in 0.0.109–0.0.113 is RESOLVED, see 0.0.114 note). ARM64
-> (AArch64) backend is DEFERRED POST-0.1.0 (see #2 schedule below); the working
-> compiler is x86-64 only.
+> **Last updated: 2026-08-28. Current compiler: 0.0.115** (x86-64 ELF emitter,
+> multi-file tree, Valgrind-clean; self-host fixpoint **BYTE-VERIFIED at 0.0.115** —
+> md5 `50857425ec4be97ddf971074a6b66d48`; the systemic stage2 SIGSEGV that broke
+> the canonical chain in 0.0.109–0.0.113 is RESOLVED. 0.0.115 = **security
+> hardening close-off**: all `AUDIT_ROADMAP.md` items (FIX-0.0.1–30) CLOSED — heap
+> fail-closed on OOM (MAP_FAILED guards), realloc count-header write, free-list
+> null-guards + double-free clear, include/source overflow caps, owned_stk cap,
+> `stack_trace()` frame guard, `rsp()` promoted to permanent builtin, `big_print_dec_mag`
+> heap-overflow fix, stdlib suite wired into the gate. ARM64 (AArch64) backend is
+> DEFERRED POST-0.1.0 (see #2 schedule below); the working compiler is x86-64 only.
 >
 > Version sequence: each feature lands in its own directory. 0.0.55 = P2
 > builtins + grammar/bug-fix window; **0.0.56 = simplified surface** (optional

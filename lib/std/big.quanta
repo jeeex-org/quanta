@@ -582,7 +582,10 @@ fn big_print_dec_mag(a: big) {
   let t = a
   while big_ge(t, ten) == 1 { t = big_udiv(t, ten); dcount = dcount + 1 }
   let ndig = dcount + 1
-  let buf = mem_alloc(2048)              // big scratch; digit i at buf+8+i*8
+  // FIX-0.0.21: allocate exactly ndig qwords (digit i stored at buf+8+i*8 needs
+  // indices 0..ndig -> ndig+1 qwords incl. header). The old fixed 2048-qword
+  // buffer overflowed into adjacent heap for numbers with >256 decimal digits.
+  let buf = mem_alloc(ndig + 1)          // big scratch; digit i at buf+8+i*8
   let w = 0                             // number of digits written
   let k = ndig - 1
   let v = a

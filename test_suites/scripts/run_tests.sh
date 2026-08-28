@@ -179,6 +179,35 @@ else
   echo "  SKIP: generics_neg_tests.sh missing"
 fi
 
+echo "########## STDLIB SUITE (lib/std/* via import) ##########"
+STDLIB_RC=0
+if [ -f "$TEST_SUITES/EXPECTED_STDLIB.tsv" ]; then
+  STDLIB_PASS=0; STDLIB_FAIL=0
+  while IFS=$'\t' read -r name expected; do
+    src="$TEST_SUITES/codes/$name"
+    bin="$TEST_SUITES/bin/${name%.quanta}"
+    if ! $QC "$src" "$bin" 2>/tmp/stdlib_stderr.txt; then
+      echo "  FAIL (compile) $name  stderr: $(cat /tmp/stdlib_stderr.txt | head -1)"
+      STDLIB_FAIL=$((STDLIB_FAIL + 1)); continue
+    fi
+    set +e
+    ./scripts/quanta_run.sh "$bin" < /dev/null > /dev/null 2>&1
+    actual=$?
+    set -e
+    if [ "$actual" = "$expected" ]; then
+      echo "  PASS $name (rc=$actual)"
+      STDLIB_PASS=$((STDLIB_PASS + 1))
+    else
+      echo "  FAIL $name (expected rc=$expected, got rc=$actual)"
+      STDLIB_FAIL=$((STDLIB_FAIL + 1))
+    fi
+  done < "$TEST_SUITES/EXPECTED_STDLIB.tsv"
+  echo "  STDLIB: $STDLIB_PASS/$((STDLIB_PASS + STDLIB_FAIL)) GREEN"
+  if [ $STDLIB_FAIL -gt 0 ]; then STDLIB_RC=1; fi
+else
+  echo "  SKIP: EXPECTED_STDLIB.tsv missing"
+fi
+
 echo "=== GATE SUMMARY ==="
 echo "  functional : $([ $FUNCTIONAL_RC = 0 ] && echo GREEN || echo RED)"
 echo "  extern-c  : $([ $EXTERN_RC = 0 ] && echo GREEN || echo RED)  (object-mode + gcc libc link)"
@@ -188,11 +217,12 @@ echo "  valgrind   : $([ $VALGRIND_RC = 0 ] && echo GREEN || echo RED)  (compile
 echo "  fuzz       : $([ $FUZZ_RC = 0 ] && echo GREEN || echo RED)  (fail-closed: 0 crashes)"
 echo "  differential: $([ $DIFF_RC = 0 ] && echo GREEN || echo RED)  (opt -O==no-O + vs-seed)"
 echo "  generics    : $([ $GENERICS_RC = 0 ] && echo GREEN || echo RED)  (negative type-arg checks fail closed)"
-# Block promotion on a real functional/security/perf/valgrind/fuzz/diff regression.
+echo "  stdlib      : $([ $STDLIB_RC = 0 ] && echo GREEN || echo RED)  (lib/std/* via import, EXPECTED_STDLIB.tsv)"
+# Block promotion on a real functional/security/perf/valgrind/fuzz/diff/stdlib regression.
 # Security KNOWN issues are surfaced by the script but do not turn the gate red.
 if [ $FUNCTIONAL_RC -ne 0 ] || [ $SECURITY_RC -ne 0 ] || [ $PERF_RC -ne 0 ] \
    || [ $VALGRIND_RC -ne 0 ] || [ $FUZZ_RC -ne 0 ] || [ $DIFF_RC -ne 0 ] \
-   || [ $GENERICS_RC -ne 0 ]; then
+   || [ $GENERICS_RC -ne 0 ] || [ $STDLIB_RC -ne 0 ]; then
   exit 1
 fi
 exit 0
