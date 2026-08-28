@@ -1,15 +1,25 @@
-// 0.0.106 networking builtins smoke test.
-// socket() must return a valid fd (>2, past stdin/out/err).
-// connect() to a closed port must fail-closed (return <0), never crash.
-// Return 11 if socket fd is valid and connect closed cleanly.
 fn main() -> i64 {
-    let fd = socket(2, 1, 0)   // AF_INET=2, SOCK_STREAM=1, proto=0
-    if fd < 3 { return 100 }    // no valid fd
-    // connect to 127.0.0.1:1 (discard, essentially always refused) — must not crash.
-    // We pass a tiny sockaddr; correctness of the connect result is not asserted,
-    // only that the builtin dispatches and returns (negative on failure).
-    let r = connect(fd, 0, 16)
-    // close the socket via file_close (reuse existing builtin)
-    file_close(fd)
-    return 11
+    // 0.0.118: net send/recv builtins (sc sendto=44 / recvfrom=45 on x86-64).
+    // Use socketpair for a hermetic connected channel (no bind/port/TIME_WAIT).
+    let fds = mem_alloc(8)
+    let r = syscall(53, 1, 1, 0, fds, 0, 0)   // socketpair(AF_UNIX, SOCK_STREAM, 0, fds)
+    if r != 0 { return 100 }
+    let fd0 = mem_load8(fds + 0)
+    let fd1 = mem_load8(fds + 4)
+    let msg = mem_alloc(8)
+    mem_store8(msg+0, 65); mem_store8(msg+1, 66); mem_store8(msg+2, 67); mem_store8(msg+3, 68)
+    mem_store8(msg+4, 69); mem_store8(msg+5, 70); mem_store8(msg+6, 71); mem_store8(msg+7, 72)
+    // send(fd, buf, len, flags) -> bytes
+    let sent = send(fd0, msg, 8, 0)
+    if sent != 8 { return 101 }
+    let rbuf = mem_alloc(8)
+    // recv(fd, buf, len, flags) -> bytes
+    let got = recv(fd1, rbuf, 8, 0)
+    if got != 8 { return 102 }
+    let i = 0
+    while i < 8 {
+        if mem_load8(rbuf+i) != mem_load8(msg+i) { return 40 + i }
+        i = i + 1
+    }
+    return 0
 }

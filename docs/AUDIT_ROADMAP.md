@@ -342,8 +342,8 @@ No-deferral policy to 0.1.0 (user directive 2026-08-28): every verified gap gets
 | | |
 |---|---|
 | **Evidence** | is_bltn has socket/connect/bind/listen/accept (sc 41/42/49/50/43) but NO send/recv (grep-verified). `net_test` only exercises socket+connect+close. A networking core that can't move bytes is a stub. |
-| **Fix** | 0.0.118: `send(fd,buf,len,flags)` sc 44 + `recv(fd,buf,len,flags)` sc 45; extend net_test to transfer real bytes over a loopback socketpair. |
-| **Status** | ❌ open → scheduled **0.0.118** |
+| **Fix** | 0.0.118: `send(fd,buf,len,flags)` + `recv(fd,buf,len,flags)` builtins added. x86-64 has no `send`/`recv` syscall — implemented as `sendto(44)`/`recvfrom(45)` with NULL addr/addrlen (r8/r9 zeroed to avoid EISCONN/hang). `net_test.quanta` transfers 8 real bytes over a socketpair (rc=0). Gate GREEN; fixpoint byte-verified. |
+| **Status** | ✅ CLOSED (0.0.118) |
 
 ## FIX-0.0.38  HIGH — atomics core has no blocking/spawn (futex + threads missing)
 
