@@ -431,6 +431,52 @@ No-deferral policy to 0.1.0 (user directive 2026-08-28): every verified gap gets
 
 ---
 
+## FIX-0.0.46  HIGH — `big_add`/`big_sub`/`big_mul` were MAGNITUDE-ONLY (signed operands miscomputed)
+
+| | |
+|---|---|
+| **Location** | lib/std/big.quanta: `big_add`, `big_sub`, `big_mul` (and the compiler's `+ - *` routing in parse.quanta) |
+| **Symptom** | `big_add(-5, 3)` returned `8`; `big_mul(-5, 3)` returned `15`; `(-5) + 3` (operator) returned `8`. Only `big_div`/`big_mod` were sign-aware. The lib header even admitted "Stage 1 is MAGNITUDE-ONLY... Sign handling arrives with DIV/MOD" but it never arrived for add/sub/mul, so the compiler's `big + big` silently produced wrong results for mixed-sign operands. |
+| **Root cause** | `big_add`/`big_sub`/`big_mul` computed magnitude arithmetic and left the sign bit untouched (or set to a single operand's sign). No sign-aware combine. |
+| **Severity** | HIGH — silent wrong numeric results for any negative big integer in `+ - *`. |
+| **Fix** | 0.0.117: added `big_add_signed`/`big_sub_signed`/`big_mul_signed` (sign-aware: combine signs via `big_is_neg`/`big_ge`; e.g. `(-a)+b = b-a` when `b>=a` else `-(a-b)`). The compiler's `parse_add`/`parse_sub`/`parse_mul` `+ - *` routes now call the SIGNED wrappers (14-byte name injection via `big_call_named`). New gate test `big_ops_test.quanta` covers signed add/sub/mul + ordering + bitwise + shift (23 assertions, all vs Python reference). |
+| **Status** | ✅ fixed in **0.0.117** |
+
+## FIX-0.0.47  HIGH — `: big` annotation with int-literal RHS held a raw i64 (garbage on big-op)
+
+| | |
+|---|---|
+| **Location** | compiler/0.0.117/src/x86/parse.quanta: `let`-binding path |
+| **Symptom** | `let a: big = -5` tagged `a` as big (vreg_is_big=1) but left it holding a raw i64 `-5`. Any subsequent big-op on `a` (e.g. `a + b`) dereferenced the int as a big-pointer → segfault. `let a: big = big_from_i64(5)` worked (RHS already a big); only int-literal RHS was broken. |
+| **Root cause** | The binding path set `vreg_is_big[vr]=1` on `vtype==12` but never promoted a non-big RHS to a big. |
+| **Severity** | HIGH — any `: big = <int>` then used in an op crashed or corrupted memory. |
+| **Fix** | 0.0.117: after binding, if `vtype==12 && vreg_is_big[vr]!=1`, call `big_promote(vr)` (which injects `big_from_i64` and returns a big-tagged vreg). `big_promote` is a no-op when already big, so existing `big_from_i64` bindings are unaffected. |
+| **Status** | ✅ fixed in **0.0.117** |
+
+## FIX-0.0.48  MED — `big` ordering (`< > <= >=`) rejected at compile time (error kind 6)
+
+| | |
+|---|---|
+| **Location** | compiler/0.0.117/src/x86/parse.quanta: `parse_cmp` (and features.quanta `compile_error` kind 6) |
+| **Symptom** | Comparing two bigs (`a < b`) emitted `error: ordering compare (< > <= >=) not supported for big` and aborted. |
+| **Root cause** | The 0.0.114 guard rejected big ordering because only a magnitude-only `big_ge` existed (no sign-aware compare). |
+| **Severity** | MED — blocks legitimate big comparisons; workaround was `big_ge` (magnitude-only, wrong for negatives). |
+| **Fix** | 0.0.117: added sign-aware `big_cmp(a,b)` (returns -1/0/1). `parse_cmp` now routes all four ordering ops on big operands to `big_cmp` and compares the result to 0 (e.g. `a < b` → `big_cmp(a,b) < 0`). Works for negatives (verified `-3 > -9` → 1, `-5 < 3` → 1). |
+| **Status** | ✅ fixed in **0.0.117** |
+
+## FIX-0.0.49  MED — `big` bitwise (`& | ^ << >>`) not operator-routable
+
+| | |
+|---|---|
+| **Location** | compiler/0.0.117/src/x86/parse.quanta: `parse_band`/`parse_bxor`/`parse_bor`/`parse_shift` |
+| **Symptom** | `& | ^ << >>` on big operands were not routed to any big lib fn; `big_and`/`big_or`/`big_xor` didn't exist, and `big_shl`/`big_shr` dropped the sign. |
+| **Root cause** | Operators emitted `IR_BAND`/`IR_SHL`/etc. on the raw big pointers (garbage), and the lib only had `big_shl`/`big_shr` (magnitude-only). |
+| **Severity** | MED — blocked big bitwise; required dropping to lib calls that didn't exist. |
+| **Fix** | 0.0.117: added `big_and`/`big_or`/`big_xor`/`big_shl_signed`/`big_shr_signed` (two's-complement round-trip so sign is preserved: e.g. `(-12) & 7 == 4`, `(-12) >> 1 == -6`, matching Python). The four operators now route big operands to these via `big_nm`/`big_binop_call` (7-byte) and `big_shift_call` (14-byte for the signed shift fns). |
+| **Status** | ✅ fixed in **0.0.117** |
+
+---
+
 ## Round 2 status table
 
 | ID | Sev | Status | Scheduled |
@@ -440,16 +486,16 @@ No-deferral policy to 0.1.0 (user directive 2026-08-28): every verified gap gets
 | FIX-0.0.33 | MED  | ✅ fixed | 0.0.116 |
 | FIX-0.0.34 | MED  | ✅ fixed | 0.0.116 |
 | FIX-0.0.35 | LOW  | ✅ fixed | 0.0.116 |
-| FIX-0.0.36 | HIGH | ❌ | 0.0.117 |
-| FIX-0.0.37 | HIGH | ❌ | 0.0.118 |
-| FIX-0.0.38 | HIGH | ❌ | 0.0.119 |
-| FIX-0.0.39 | MED  | ❌ | 0.0.120–0.0.122 |
 | FIX-0.0.40 | HIGH | ✅ fixed | 0.0.116 |
 | FIX-0.0.41 | HIGH | ✅ fixed | 0.0.116 |
 | FIX-0.0.42 | HIGH | ✅ fixed | 0.0.116 |
 | FIX-0.0.43 | MED  | ✅ fixed | 0.0.116 |
 | FIX-0.0.44 | MED  | ✅ fixed | 0.0.116 |
 | FIX-0.0.45 | HIGH | ✅ fixed | 0.0.116 |
+| FIX-0.0.46 | HIGH | ✅ fixed | 0.0.117 |
+| FIX-0.0.47 | HIGH | ✅ fixed | 0.0.117 |
+| FIX-0.0.48 | MED  | ✅ fixed | 0.0.117 |
+| FIX-0.0.49 | MED  | ✅ fixed | 0.0.117 |
 
 **Round 2 closes when 0.0.122 ships; 0.1.0 may then begin.**
 

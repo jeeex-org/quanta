@@ -391,6 +391,156 @@ fn big_shr1(x: big) -> big {
 
 // 1 if |a| == |b| (magnitude equality), else 0. Compares limb-by-limb ignoring
 // any leading zero limbs, so equal values with differing lengths still match.
+fn big_cmp(a: big, b: big) {
+  let an = big_is_neg(a)
+  let bn = big_is_neg(b)
+  if an == 1 && bn == 0 { return -1 }
+  if an == 0 && bn == 1 { return 1 }
+  if an == 0 && bn == 0 {
+    if big_ge(a, b) == 1 {
+      if big_eq(a, b) == 1 { return 0 } else { return 1 }
+    }
+    return -1
+  }
+  if big_ge(a, b) == 1 {
+    if big_eq(a, b) == 1 { return 0 } else { return -1 }
+  }
+  return 1
+}
+fn big_add_signed(x: big, y: big) -> big {
+    let xn = big_is_neg(x)
+    let yn = big_is_neg(y)
+    if xn == 0 && yn == 0 { return big_add(x, y) }       // a + b
+    if xn == 1 && yn == 1 {                              // (-a) + (-b) = -(a+b)
+        let r = big_add(x, y); big_set_neg(r, 1); return r
+    }
+    if xn == 1 && yn == 0 {                              // (-a) + b = b - a
+        let a = big_abs(x)                               // |x|
+        if big_ge(a, y) == 1 { let r = big_sub(a, y); big_set_neg(r, 1); return r }
+        let r = big_sub(y, a); big_set_neg(r, 0); return r
+    }
+    // xn==0 && yn==1 : a + (-b) = a - b
+    let b = big_abs(y)                                   // |y|
+    if big_ge(b, x) == 1 { let r = big_sub(b, x); big_set_neg(r, 1); return r }
+    let r = big_sub(x, b); big_set_neg(r, 0); return r
+}
+// big_abs: copy of a with sign cleared (non-mutating).
+fn big_abs(a: big) -> big {
+    let n = big_len(a)
+    let r = big_alloc(n)
+    let i = 0
+    while i < n { big_set(r, i, big_limb(a, i)); i = i + 1 }
+    big_set_neg(r, 0)
+    return big_norm(r)
+}
+fn big_sub_signed(x: big, y: big) -> big {
+    let xn = big_is_neg(x)
+    let yn = big_is_neg(y)
+    if xn == 0 && yn == 0 { return big_sub(x, y) }       // a - b
+    if xn == 1 && yn == 1 {                              // (-a) - (-b) = b - a = |y| - |x|
+        return big_sub(big_abs(y), big_abs(x))
+    }
+    if xn == 1 && yn == 0 {                              // (-a) - b = -(a+b)
+        let a = big_abs(x); let r = big_add(a, y); big_set_neg(r, 1); return r
+    }
+    // xn==0 && yn==1 : a - (-b) = a + b
+    let b = big_abs(y); let r = big_add(x, b); big_set_neg(r, 0); return r
+}
+fn big_mul_signed(x: big, y: big) -> big {
+  let r = big_mul(x, y)
+  if (big_is_neg(x) ^ big_is_neg(y)) == 1 { big_set_neg(r, 1) } else { big_set_neg(r, 0) }
+  return r
+}
+fn big_to_tc(a: big) -> big {
+  let n = big_len(a)
+  let r = big_alloc(n + 1)
+  let i = 0
+  while i < n { big_set(r, i, big_limb(a, i)); i = i + 1 }
+  big_set(r, n, 0)
+  if big_is_neg(a) == 1 {
+    let i2 = 0
+    while i2 <= n { big_set(r, i2, (16777215 - big_limb(r, i2)) & 16777215); i2 = i2 + 1 }
+    let i3 = 0; let carry = 1
+    while carry == 1 && i3 <= n { let s = big_limb(r, i3) + carry; big_set(r, i3, s & 16777215); carry = s >> 24; i3 = i3 + 1 }
+  }
+  r[0] = n + 1
+  return r
+}
+fn big_from_tc(t: big) -> big {
+  let n = big_len(t) - 1
+  let sign_bit = 0
+  if (big_limb(t, n) & 1) == 1 { sign_bit = 1 }
+  if sign_bit == 0 {
+    let r = big_alloc(n)
+    let i = 0
+    while i < n { big_set(r, i, big_limb(t, i)); i = i + 1 }
+    big_set_neg(r, 0)
+    return big_norm(r)
+  }
+  let r = big_alloc(n + 1)
+  let i2 = 0
+  while i2 <= n { big_set(r, i2, (16777215 - big_limb(t, i2)) & 16777215); i2 = i2 + 1 }
+  let i3 = 0; let carry = 1
+  while carry == 1 && i3 <= n { let s = big_limb(r, i3) + carry; big_set(r, i3, s & 16777215); carry = s >> 24; i3 = i3 + 1 }
+  r[0] = n
+  big_set_neg(r, 1)
+  return big_norm(r)
+}
+fn big_and(x: big, y: big) -> big {
+  let a = big_to_tc(x); let b = big_to_tc(y)
+  let n = big_len(a)
+  if big_len(b) > n { n = big_len(b) }
+  let r = big_alloc(n)
+  let i = 0
+  while i < n {
+    let av = 0; if i < big_len(a) { av = big_limb(a, i) }
+    let bv = 0; if i < big_len(b) { bv = big_limb(b, i) }
+    big_set(r, i, av & bv & 16777215)
+    i = i + 1
+  }
+  r[0] = n
+  return big_norm(big_from_tc(r))
+}
+fn big_or(x: big, y: big) -> big {
+  let a = big_to_tc(x); let b = big_to_tc(y)
+  let n = big_len(a)
+  if big_len(b) > n { n = big_len(b) }
+  let r = big_alloc(n)
+  let i = 0
+  while i < n {
+    let av = 0; if i < big_len(a) { av = big_limb(a, i) }
+    let bv = 0; if i < big_len(b) { bv = big_limb(b, i) }
+    big_set(r, i, (av | bv) & 16777215)
+    i = i + 1
+  }
+  r[0] = n
+  return big_norm(big_from_tc(r))
+}
+fn big_xor(x: big, y: big) -> big {
+  let a = big_to_tc(x); let b = big_to_tc(y)
+  let n = big_len(a)
+  if big_len(b) > n { n = big_len(b) }
+  let r = big_alloc(n)
+  let i = 0
+  while i < n {
+    let av = 0; if i < big_len(a) { av = big_limb(a, i) }
+    let bv = 0; if i < big_len(b) { bv = big_limb(b, i) }
+    big_set(r, i, (av ^ bv) & 16777215)
+    i = i + 1
+  }
+  r[0] = n
+  return big_norm(big_from_tc(r))
+}
+fn big_shl_signed(x: big, n) -> big {
+  let r = big_shl(x, n)
+  big_set_neg(r, big_is_neg(x))
+  return r
+}
+fn big_shr_signed(x: big, n) -> big {
+  let r = big_shr(x, n)
+  big_set_neg(r, big_is_neg(x))
+  return r
+}
 fn big_eq(a: big, b: big) {
   // 0.0.114: SIGNED equality — signs must match too (magnitude-only compare
   // wrongly reported big_eq(-5, 5) == 1).
