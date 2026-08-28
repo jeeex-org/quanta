@@ -1,0 +1,22 @@
+// rsp_test.quanta — 0.0.113 G-core introspection: rsp().
+// rsp() returns the current stack pointer (mov rax, rsp).
+//
+// Gate semantics (address-independent, stable across builds):
+//   1. the result is non-zero,
+//   2. the result is a plausible high stack address (>= 64KB),
+//   3. two reads in the same frame are deterministic (equal),
+//   4. a read inside a leaf function is also a plausible stack address.
+// Prints 0 on full success; distinct exit codes identify the first failure.
+fn leaf() -> i64 { return rsp() }
+fn main() {
+    let a = rsp()
+    let b = rsp()
+    let d = leaf()
+    if a == 0 { exit(1) }
+    if a < 65536 { exit(2) }      // stack lives at high addresses
+    if a != b { exit(3) }         // same frame, no calls between -> equal
+    if d == 0 { exit(4) }
+    if d < 65536 { exit(5) }
+    println(0)
+    exit(0)
+}
