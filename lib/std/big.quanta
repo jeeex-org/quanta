@@ -31,22 +31,22 @@
 // Allocate a big with `n` 24-bit limbs. Layout: a[0]=nlimbs, a[1]=sign(0/1),
 // a[2..]=limbs. mem_alloc(k) gives k qword slots (indices 0..k-1) with [base]=k;
 // we need n+2 slots (count + sign + n limbs).
-fn big_alloc(n) {
+fn big_alloc(n) -> big {
   let r = mem_alloc(n + 2)
   r[0] = n
   r[1] = 0
   return r
 }
 
-fn big_len(a) { return a[0] }
-fn big_limb(a, i) { return a[i + 2] }
-fn big_set(a, i, v) { a[i + 2] = v }
+fn big_len(a: big) { return a[0] }
+fn big_limb(a: big, i) { return a[i + 2] }
+fn big_set(a: big, i, v) { a[i + 2] = v }
 
-fn big_is_neg(a) { return a[1] }
-fn big_set_neg(a, s) { a[1] = s; return 0 }
+fn big_is_neg(a: big) { return a[1] }
+fn big_set_neg(a: big, s) { a[1] = s; return 0 }
 
 // Strip leading zero limbs; never reduce below 1.
-fn big_norm(r) {
+fn big_norm(r: big) -> big {
   let m = big_len(r)
   while m > 1 {
     if big_limb(r, m - 1) == 0 { m = m - 1 }
@@ -57,7 +57,7 @@ fn big_norm(r) {
 }
 
 // Unsigned addition: r = a + b.
-fn big_add(a, b) {
+fn big_add(a: big, b: big) -> big {
   let na = big_len(a)
   let nb = big_len(b)
   let n = na
@@ -81,7 +81,7 @@ fn big_add(a, b) {
 }
 
 // Unsigned subtraction: r = |a - b| (magnitude difference).
-fn big_sub(a, b) {
+fn big_sub(a: big, b: big) -> big {
   let na = big_len(a)
   let nb = big_len(b)
   let swap = 0
@@ -120,7 +120,7 @@ fn big_sub(a, b) {
 
 // Unsigned multiplication: r = a * b. Dispatches to Karatsuba for large inputs
 // (O(n^1.585)) and schoolbook (big_mul_base) for small ones.
-fn big_mul(a, b) {
+fn big_mul(a: big, b: big) -> big {
   let na = big_len(a)
   let nb = big_len(b)
   if na < 32 && nb < 32 { return big_mul_base(a, b) }
@@ -128,7 +128,7 @@ fn big_mul(a, b) {
 }
 
 // Schoolbook multiplication (24-bit limbs). Used directly for small inputs.
-fn big_mul_base(a, b) {
+fn big_mul_base(a: big, b: big) -> big {
   let na = big_len(a)
   let nb = big_len(b)
   let nr = na + nb
@@ -156,7 +156,7 @@ fn big_mul_base(a, b) {
 }
 
 // r[off..] += x (term-by-term add with carry), used by Karatsuba combine.
-fn big_add_off(r, off, x) {
+fn big_add_off(r: big, off, x: big) {
   let n = big_len(x)
   let carry = 0
   let i = 0
@@ -178,7 +178,7 @@ fn big_add_off(r, off, x) {
 }
 
 // r[off..] -= x (assumes r[off..] >= x term-by-term after borrow); magnitude sub.
-fn big_sub_off(r, off, x) {
+fn big_sub_off(r: big, off, x: big) {
   let n = big_len(x)
   let borrow = 0
   let i = 0
@@ -201,7 +201,7 @@ fn big_sub_off(r, off, x) {
 
 // Karatsuba multiply (magnitude). Splits each operand at a midpoint strictly
 // less than both lengths, so the recursion actually reduces in size.
-fn big_mul_kara(a, b) {
+fn big_mul_kara(a: big, b: big) -> big {
   let na = big_len(a)
   let nb = big_len(b)
   let half = na
@@ -235,7 +235,7 @@ fn big_mul_kara(a, b) {
 }
 
 // low `n` limbs of x (x mod B^n)
-fn big_lo(x, n) {
+fn big_lo(x: big, n) -> big {
   let nx = big_len(x)
   let m = n
   if m > nx { m = nx }
@@ -246,7 +246,7 @@ fn big_lo(x, n) {
 }
 
 // high limbs of x (x div B^n); returns 0 if x < B^n
-fn big_hi(x, n) {
+fn big_hi(x: big, n) -> big {
   let nx = big_len(x)
   if n >= nx { return big_from_i64(0) }
   let m = nx - n
@@ -257,7 +257,7 @@ fn big_hi(x, n) {
 }
 
 // Build a big from a single i64 (handles negatives via the sign slot).
-fn big_from_i64(x) {
+fn big_from_i64(x) -> big {
   let neg = 0
   let m = x
   if x < 0 { neg = 1; m = -x }          // m = |x| (positive, < 2^63)
@@ -272,7 +272,7 @@ fn big_from_i64(x) {
 // Build a big from an ASCII decimal string `s` (Quanta runtime string layout:
 // [8:len][packed bytes, 1 byte each]). Returns 0 (null) on empty / non-digit.
 // Algorithm: acc = 0; for each char c: acc = acc*10 + (c - '0').
-fn big_from_dec(s) {
+fn big_from_dec(s) -> big {
   let slen = mem_load(s)                 // string length (bytes) at s+0
   if slen == 0 { return 0 }
   let acc = big_from_i64(0)
@@ -292,7 +292,7 @@ fn big_from_dec(s) {
 // Build a big from two 64-bit values (lo64, hi64), each split into three 24-bit
 // limbs (little-endian, 6 limbs total). Useful for tests; e.g.
 // big_from_2x64(-1, 0) = 2^64-1.
-fn big_from_2x64(lo64, hi64) {
+fn big_from_2x64(lo64, hi64) -> big {
   let r = big_alloc(6)
   big_set(r, 0, lo64 & 16777215)
   big_set(r, 1, (lo64 >> 24) & 16777215)
@@ -306,7 +306,7 @@ fn big_from_2x64(lo64, hi64) {
 // Return the value as an i64, valid only when it fits in signed 64 bits
 // (value < 2^63; i.e. len <= 3 for 24-bit limbs). Reconstructs from the
 // non-overlapping limb fields so no intermediate shift overflows i64.
-fn big_to_i64(a) {
+fn big_to_i64(a: big) {
   let lo = big_limb(a, 0)
   let mid = 0
   let hi = 0
@@ -320,7 +320,7 @@ fn big_to_i64(a) {
 // Print a big in hexadecimal (exact, limb-by-limb). Each 24-bit limb is 6 hex
 // digits, most-significant limb printed first. Cross-checks against Python.
 // Each nibble is printed followed by a comma (unambiguous parsing).
-fn big_print_hex(a) {
+fn big_print_hex(a: big) {
   let n = big_len(a)
   let k = n - 1
   while k >= 0 {
@@ -355,7 +355,7 @@ fn big_print_hex(a) {
 // ============================================================================
 
 // r = x << 1 (magnitude). Out-of-place; allocates a new big.
-fn big_shl1(x) {
+fn big_shl1(x: big) -> big {
   let n = big_len(x)
   let r = big_alloc(n + 1)
   let carry = 0
@@ -374,7 +374,7 @@ fn big_shl1(x) {
 }
 
 // r = x >> 1 (magnitude).
-fn big_shr1(x) {
+fn big_shr1(x: big) -> big {
   let n = big_len(x)
   let r = big_alloc(n)
   let carry = 0
@@ -391,7 +391,10 @@ fn big_shr1(x) {
 
 // 1 if |a| == |b| (magnitude equality), else 0. Compares limb-by-limb ignoring
 // any leading zero limbs, so equal values with differing lengths still match.
-fn big_eq(a, b) {
+fn big_eq(a: big, b: big) {
+  // 0.0.114: SIGNED equality — signs must match too (magnitude-only compare
+  // wrongly reported big_eq(-5, 5) == 1).
+  if big_is_neg(a) != big_is_neg(b) { return 0 }
   let na = big_len(a)
   let nb = big_len(b)
   let i = 0
@@ -413,7 +416,7 @@ fn big_eq(a, b) {
 // 1 if |a| >= |b| (magnitude compare), else 0. Compares limb-by-limb from the
 // most significant position down, treating absent limbs as zero, so it is
 // robust to any leading-zero inconsistencies in the representation.
-fn big_ge(a, b) {
+fn big_ge(a: big, b: big) {
   let na = big_len(a)
   let nb = big_len(b)
   let m = na
@@ -434,7 +437,7 @@ fn big_ge(a, b) {
 // Unsigned magnitude division x / y (returns quotient big). Uses binary
 // restoring division (shift-subtract), which needs only shifts + subtract, so it
 // never trips ovf_trap. Caller must ensure 0 < y <= x (else returns 0).
-fn big_udiv(x, y) {
+fn big_udiv(x: big, y: big) -> big {
   if big_ge(y, x) == 1 {           // y >= x  ->  q = (x==y ? 1 : 0)
     if big_ge(x, y) == 1 {         // x == y
       let o = big_alloc(1); big_set(o, 0, 1); o[0] = 1; return o
@@ -469,7 +472,7 @@ fn big_udiv(x, y) {
 // Signed division a / b. Floor semantics (like Python //). When the true
 // truncating quotient's remainder is non-zero and the signs differ, the floor
 // quotient is one less than the magnitude quotient.
-fn big_div(a, b) {
+fn big_div(a: big, b: big) -> big {
   let an = big_is_neg(a)
   let bn = big_is_neg(b)
   big_set_neg(a, 0); big_set_neg(b, 0)     // work on magnitudes
@@ -486,7 +489,7 @@ fn big_div(a, b) {
 // Signed modulo a % b. Python semantics: result has the SIGN OF THE DIVISOR.
 // r = |a| - q*|b| where q is the floor quotient; when signs differ and r != 0,
 // the adjusted remainder is |b| - r.
-fn big_mod(a, b) {
+fn big_mod(a: big, b: big) -> big {
   let an = big_is_neg(a)
   let bn = big_is_neg(b)
   big_set_neg(a, 0); big_set_neg(b, 0)     // magnitudes
@@ -508,7 +511,7 @@ fn big_mod(a, b) {
 // ============================================================================
 
 // r = |x| << n  (n >= 0). If n < 0, shifts right instead.
-fn big_shl(x, n) {
+fn big_shl(x: big, n) -> big {
   if n < 0 { return big_shr(x, -n) }
   if n == 0 { return x }
   let limb_shift = n / 24
@@ -531,7 +534,7 @@ fn big_shl(x, n) {
 }
 
 // r = |x| >> n  (n >= 0). If n < 0, shifts left instead.
-fn big_shr(x, n) {
+fn big_shr(x: big, n) -> big {
   if n < 0 { return big_shl(x, -n) }
   if n == 0 { return x }
   let limb_shift = n / 24
@@ -572,7 +575,7 @@ fn putc(b) {
 // Print the decimal digits of |a| (magnitude), iteratively.
 // Builds digits into a fixed buffer, tracking a real write count, then emits
 // exactly that many ASCII bytes.
-fn big_print_dec_mag(a) {
+fn big_print_dec_mag(a: big) {
   let ten = big_from_i64(10)
   // count digits
   let dcount = 0
@@ -597,14 +600,14 @@ fn big_print_dec_mag(a) {
 }
 
 // Print a big as a signed decimal integer followed by a newline.
-fn big_println(a) {
+fn big_println(a: big) {
   big_print(a)
   putc(10)                               // '\n'
   return 0
 }
 
 // Print a big as a signed decimal integer.
-fn big_print(a) {
+fn big_print(a: big) {
   let neg = big_is_neg(a)
   if neg == 1 { putc(45) }              // '-'
   // magnitude copy of a (strip sign by leaving the copy's sign slot 0)

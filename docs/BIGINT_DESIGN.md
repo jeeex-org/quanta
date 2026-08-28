@@ -1,8 +1,15 @@
 # Big-Int (big) Design — Quanta x86-64
 
-Last updated: 2026-08-24. Status: IMPLEMENTED. Landed: ADD/SUB/MUL (0.0.81),
+Last updated: 2026-08-28. Status: IMPLEMENTED. Landed: ADD/SUB/MUL (0.0.81),
 DIV/MOD (0.0.82), SHL/SHR (0.0.83), decimal printing + 24-bit limbs +
-Karatsuba multiply (0.0.84). See `lib/std/big.quanta`.
+Karatsuba multiply (0.0.84). **0.0.114: `big` became a first-class type
+keyword** — `: big` param / `-> big` return annotations, operator routing
+(`+ - * / % == !=` → `big_add/sub/mul/div/mod/eq`) with automatic int→big
+promotion (operator operands and call-site args to `: big` params), ordering
+compares rejected at compile time, `println(big)` → `big_println`, overflowing
+decimal literals lex as a single `TT_BIGNUM` token. The public stdlib API is
+fully annotated so raw-int args auto-promote and big-returning calls never
+double-wrap. Gated by `big_test.quanta` (rc=0). See `lib/std/big.quanta`.
 
 ## Goal
 Support arbitrarily large integers so 250-digit literals and PQC/Kademlia key

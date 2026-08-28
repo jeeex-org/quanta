@@ -1,0 +1,41 @@
+// 0.0.114 gate: `big` arbitrary-precision integers.
+// Verifies big literals, operator routing (+ - * / % == !=), and mixed
+// int->big promotion. Each result is compared against a known-good literal
+// via big_eq; any mismatch exits 1. All-pass exits 0.
+import std/big
+
+fn check(got: big, want: big) {
+  if big_eq(got, want) == 0 { exit(1) }
+}
+
+fn main() {
+  let a = 123456789012345678901234567890
+  let b = 987654321098765432109876543210
+
+  // Addition
+  check(a + b, 1111111110111111111011111111100)
+  // Subtraction
+  check(b - a, 864197532086419753208641975320)
+  // Multiplication (Karatsuba path: 5 limbs each)
+  check(a * b, 121932631137021795226185032733622923332237463801111263526900)
+  // Division
+  check(b / a, 8)
+  // Modulus
+  check(b % a, 9000000000900000000090)
+
+  // Mixed int -> big promotion (int operand wrapped via big_from_i64)
+  check(a + 5, 123456789012345678901234567895)
+  check(2 * (a + b), 2222222220222222222022222222200)
+
+  // Equality / inequality
+  if (a == a) == 0 { exit(1) }
+  if (a == b) == 1 { exit(1) }
+  if (a != b) == 0 { exit(1) }
+  if (a != a) == 1 { exit(1) }
+
+  // Identity ops
+  check(a - 0, a)
+  check(a * 1, a)
+
+  exit(0)
+}

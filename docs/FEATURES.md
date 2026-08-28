@@ -227,7 +227,7 @@ it; 🟡 file-only = a test file exists on disk but is NOT in the gate; ❌ none
 
 | Library | Status | Test? | Notes / test file |
 |---|---|---|---|
-| `big` (arbitrary-precision int) | ✅ done | ❌ none | 4 stages shipped (ADD/SUB/MUL, DIV/MOD, SHL/SHR, decimal print) + literal auto-promotion. `lib/std/big.quanta`. No dedicated gate test (verified ad-hoc vs Python; `big_test.quanta` NOT yet written). `big` is a library convention (pointer-in-vreg), NOT yet a first-class `big` keyword/type. |
+| `big` (arbitrary-precision int) | ✅ done | ✅ gate | 4 stages shipped (ADD/SUB/MUL, DIV/MOD, SHL/SHR, decimal print) + literal auto-promotion. `lib/std/big.quanta`. **0.0.114: `big` is a first-class type keyword** — `: big` param / `-> big` return annotations, operator routing (`+ - * / % == !=` → `big_add/sub/mul/div/mod/eq`) with automatic int→big promotion (operator operands and call-site args), ordering compares rejected at compile time, `println(big)` → `big_println`, overflowing decimal literals lex as `TT_BIGNUM`. Public stdlib API fully annotated so raw-int args auto-promote and big-returning calls never double-wrap. Gated `big_test.quanta` (rc=0, 30-digit ops vs Python reference values). |
 | `crypto` (SHA-256/HMAC/AES/CSPRNG) | ✅ done | ✅ gate | std_crypto_test.quanta (rc=3, gated at 0.0.87). 643 lines, 21 fns. |
 | `quantum` (Keccak/SHA3/SHAKE) | ✅ done | ❌ none | lib/std/quantum.quanta (240 lines, 8 fns). No dedicated test file. |
 | `linalg` (matmul/transpose/det/inverse/vectors) | ✅ done | ❌ none | lib/std/linalg.quanta (363 lines, 25 fns). No dedicated test file. |
