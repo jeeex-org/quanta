@@ -1,0 +1,671 @@
+// === P5: object-format (.o) emission (corrected) ===
+// When emit_obj==1, finalize() calls p5_elf_obj instead of write_elf: it emits
+// a relocatable ET_REL .o with .text / .rela.text / .symtab / .strtab /
+// .shstrtab + section headers, leaving call targets as RELA relocations.
+// Relocation: x86-64 uses R_X86_64_PLT32 (type 4, addend -4); AArch64 uses
+// R_AARCH64_CALL26 (type 0x11b, addend 0). e_machine mirrors target_arch.
+// An external `ld`/`gcc` links the .o (see rebuild.sh). x86-64 + ARM64 both
+// supported.
+
+// add a symbol whose name lives at src+nm for nl bytes. returns symbol index.
+fn p5_add_symbol_b(nm, nl) {
+    let idx = symc
+    w32(symtab + idx*24 + 0, strtablen)        // st_name -> .strtab offset
+    let j=0
+    while j<nl { w8(strtab + strtablen + j, r8(src+nm+j)); j=j+1 }
+    w8(strtab + strtablen + nl, 0); strtablen = strtablen + nl + 1
+    symc = symc+1
+    return idx
+}
+// add a symbol whose name is a literal string header at sptr (sptr+8, NUL-term).
+fn p5_add_symbol_l(sptr) {
+    let nlen = 0
+    while r8(sptr+8+nlen) != 0 { nlen = nlen+1 }
+    return p5_add_symbol_b(sptr+8, nlen)
+}
+// find an existing symbol by src name, else add it as UNDEFINED (st_shndx=0).
+fn p5_sym_for_name(tg, nl) {
+    let k=0
+    while k<symc {
+        let soff = r32(symtab + k*24 + 0)
+        let ok=1; let m=0
+        while m<nl { if r8(strtab+soff+m) != r8(src+tg+m) { ok=0; break }; m=m+1 }
+        if ok==1 && r8(strtab+soff+nl)==0 { return k }
+        k=k+1
+    }
+    let idx = p5_add_symbol_b(tg, nl)
+    w16(symtab + idx*24 + 6, 0)        // st_shndx = SHN_UNDEF
+    w8(symtab + idx*24 + 4, 0x10)      // STT_FUNC|STB_GLOBAL
+    return idx
+}
+// append a RELA relocation for a call site.
+// x86-64: R_X86_64_PLT32 (type 4) at r_offset = po+1 (rel32 field), r_addend = -4.
+//   (GCC emits PLT32, not PC32, for call sites; PC32 triggers "relocation
+//   truncated to fit" under PIE.)
+// AArch64: R_AARCH64_CALL26 (type 0x11b=283) at r_offset = po (whole 4-byte
+//   `bl` instruction), r_addend = 0. The linker computes imm26 = (S+A-P)>>2.
+// po = call instruction start (recorded before the bl/call placeholder).
+fn p5_add_reloc(po, symidx) {
+        w64(reldyn + relc*24 + 0, po+1)               // r_offset = rel32 field
+        // R_X86_64_PLT32 (type 4)
+        w64(reldyn + relc*24 + 8, (symidx<<32) | 4)   // r_info = (symidx<<32)|R_X86_64_PLT32
+        // r_addend = -4. Quanta truncates 64-bit literals to 32 bits, so write the
+        // two 32-bit halves explicitly: -4 = 0xFFFFFFFFFFFFFFFC
+        w32(reldyn + relc*24 + 16, 0xFFFFFFFC)        // r_addend low  = 0xFFFFFFFC
+        w32(reldyn + relc*24 + 20, 0xFFFFFFFF)        // r_addend high = 0xFFFFFFFF (-4)
+    relc = relc+1
+}
+// x86-64 fnptr lea relocation: R_X86_64_PC32 (type 2) at r_offset = po+3 (the
+// disp32 field of `lea rax,[rip+disp32]`), addend = -4. At runtime lea computes
+// rip(po+7) + disp; linker sets disp = S + A - P with P = po+3, so the result is
+// (po+7) + (S - 4 - (po+3)) = S. (PLT32 with r_offset=po+1 is for `call`, not lea.)
+fn p5_add_reloc_pc32(po, symidx) {
+    w64(reldyn + relc*24 + 0, po+3)               // r_offset = lea disp32 field
+    w64(reldyn + relc*24 + 8, (symidx<<32) | 2)   // r_info = (symidx<<32)|R_X86_64_PC32
+    w32(reldyn + relc*24 + 16, 0xFFFFFFFC)        // r_addend low  = 0xFFFFFFFC (-4)
+    w32(reldyn + relc*24 + 20, 0xFFFFFFFF)        // r_addend high = 0xFFFFFFFF (-4)
+    relc = relc+1
+}
+// return the .strtab offset stored in symbol idx's st_name field.
+fn symc_stname(idx) { return r32(symtab + idx*24 + 0) }
+
+fn p5_elf_obj(out_p) {
+    let i=0
+    // 1. copy code buffer -> objcode (relocatable image)
+    while i<codelen { w8(objcode+i, r8(code+i)); i=i+1 }
+    objcodelen = codelen
+
+    // 2. symbol table (index 0 = null symbol). Use a helper that writes the
+    // name bytes into .strtab and returns the symbol index, so the st_name
+    // offset is always correct (no manual strtab surgery).
+    // p5_mksym(namep, namen, info, shndx, value) -> symidx
+    symc = 0; strtablen = 1
+    let s_null = p5_add_symbol_b(0,0)          // index 0: null symbol
+    // _gdata (STB_LOCAL) — start of the .data region (globals + string literals).
+    // LOCAL binding keeps it before any globals (ELF ordering) and prevents a
+    // "multiple definition of _gdata" collision when linking multiple Quanta
+    // object files (each TU gets its own local _gdata; ld resolves this TU's
+    // global-access relocations against its own local symbol).
+    let sg = p5_add_symbol_b(0,0)
+    let psgn = symc_stname(sg)
+    w8(strtab+psgn+0,95); w8(strtab+psgn+1,103); w8(strtab+psgn+2,100); w8(strtab+psgn+3,97); w8(strtab+psgn+4,116); w8(strtab+psgn+5,97); w8(strtab+psgn+6,0)
+    strtablen = strtablen + 6
+    w8(symtab + sg*24 + 4, 0x00)              // STT_NOTYPE|STB_LOCAL (info=(bind<<4)|type => 0x00)
+    w16(symtab + sg*24 + 6, 3)                // st_shndx = .data (section 3)
+    w64(symtab + sg*24 + 8, 0)                // offset 0 within .data
+    gdata_sym = sg
+    // first non-local symbol index (set when we add the first GLOBAL symbol)
+    let symtab_shinfo = -1
+    // __init (STB_LOCAL) — only the entry TU's _start calls it internally;
+    // LOCAL avoids a cross-TU collision on the name.
+    let si = p5_add_symbol_b(0,0)
+    w8(strtab + symc_stname(si), 95); w8(strtab + symc_stname(si)+1, 95); w8(strtab + symc_stname(si)+2, 105)
+    w8(strtab + symc_stname(si)+3, 110); w8(strtab + symc_stname(si)+4, 105); w8(strtab + symc_stname(si)+5, 116); w8(strtab + symc_stname(si)+6, 0)
+    strtablen = strtablen + 6
+    w8(symtab + si*24 + 4, 0x02)              // STT_FUNC|STB_LOCAL (info=0x02)
+    w16(symtab + si*24 + 6, 1)                // st_shndx = .text
+    w64(symtab + si*24 + 8, r64(func_code_starts+0))
+    w64(fn_symidx + 0*8, si)
+    // main: LOCAL in the entry TU (called only by _start); GLOBAL in a
+    // --no-start TU (library export). Skip if the TU has no main at all.
+    let sm = -1
+    if has_main==1 {
+        sm = p5_add_symbol_b(0,0)
+        let pmn = symc_stname(sm)
+        w8(strtab+pmn+0,109); w8(strtab+pmn+1,97); w8(strtab+pmn+2,105); w8(strtab+pmn+3,110); w8(strtab+pmn+4,0)
+        strtablen = strtablen + 4
+        if no_start==1 { w8(symtab + sm*24 + 4, 0x12) }  // GLOBAL export
+        else { w8(symtab + sm*24 + 4, 0x02) }            // LOCAL FUNC
+        w16(symtab + sm*24 + 6, 1)              // st_shndx = .text
+        w64(symtab + sm*24 + 8, g_main_ofs)     // main's code offset
+        w64(fn_symidx + g_main_fi*8, sm)         // g_main_fi = main fn index
+        if symtab_shinfo<0 && no_start==1 { symtab_shinfo = sm }
+    }
+    // per user fn: GLOBAL symbols (exported for cross-TU calls), mapped via
+    // fn_symidx. __init/main handled above; _start created last (sole GLOBAL
+    // in the entry TU). All LOCALs (__init, main, _gdata) already precede these.
+    let fi=0
+    while fi<fnc {
+        let nm=fn_name(fi); let nl=fn_nlen(fi)
+        if nl==4 && r8(src+nm)==109 && r8(src+nm+1)==97 && r8(src+nm+2)==105 && r8(src+nm+3)==110 {
+            if sm>=0 { w64(fn_symidx + fi*8, sm) }
+        } else if nl==6 && r8(src+nm)==95 && r8(src+nm+1)==95 && r8(src+nm+2)==105 && r8(src+nm+3)==110 && r8(src+nm+4)==105 && r8(src+nm+5)==116 {
+            w64(fn_symidx + fi*8, si)
+        } else if nl==6 && r8(src+nm)==95 && r8(src+nm+1)==115 && r8(src+nm+2)==116 && r8(src+nm+3)==97 && r8(src+nm+4)==114 && r8(src+nm+5)==116 {
+            // _start: created below as the (sole) GLOBAL symbol in the entry TU.
+        } else {
+            // P5.1: extern "C" fns are UNDEF symbols (created at their call
+            // sites via p5_sym_for_name), NOT defined here — so linking a TU
+            // that declares `extern "C" fn foo` against a TU that DEFINES foo
+            // gives exactly one definition.
+            if r64(fn_extern + fi*8)==1 { fi=fi+1; continue }
+            let s = p5_add_symbol_b(nm, nl)
+            w8(symtab + s*24 + 4, 0x12)       // STT_FUNC|STB_GLOBAL
+            w16(symtab + s*24 + 6, 1)         // st_shndx = .text
+            w64(symtab + s*24 + 8, r64(func_code_starts+(fi+1)*8))
+            w64(fn_symidx + fi*8, s)
+            if symtab_shinfo<0 { symtab_shinfo = s }
+        }
+        fi=fi+1
+    }
+    // _start (STB_GLOBAL) — ONLY in the entry TU (no_start==0). It is the sole
+    // GLOBAL symbol there; all locals (__init, main, _gdata) precede it, so the
+    // ELF locals-before-globals ordering holds.
+    let ss = -1
+    if no_start==0 {
+        ss = p5_add_symbol_b(0,0)
+        let psn = symc_stname(ss)
+        w8(strtab+psn+0,95); w8(strtab+psn+1,115); w8(strtab+psn+2,116); w8(strtab+psn+3,97); w8(strtab+psn+4,114); w8(strtab+psn+5,116); w8(strtab+psn+6,0)
+        strtablen = strtablen + 6
+        w8(symtab + ss*24 + 4, 0x12)              // STT_FUNC|STB_GLOBAL
+        w16(symtab + ss*24 + 6, 1)                // st_shndx = .text
+        w64(symtab + ss*24 + 8, 0)                // _start at offset 0
+        if symtab_shinfo<0 { symtab_shinfo = ss }
+    }
+    // P5.1 cross-TU DATA globals: emit one named ELF symbol per named global.
+    // `global NAME`   -> GLOBAL definition at st_value = gidx*8 (its slot in
+    //                    .data), st_shndx = .data. The linker merges all TUs'
+    //                    .data and binds cross-TU accesses to the single def.
+    // `extern "C" global NAME` -> UNDEF GLOBAL symbol (st_shndx=SHN_UNDEF),
+    // resolved by the external linker to the defining TU's symbol.
+    // Named globals' access relocations (below) target THIS symbol with addend
+    // -4 instead of `_gdata` with gidx*8-4, so the linker computes the right
+    // RIP-relative disp to the (merged) .data slot.
+    let gi=0
+    while gi<gvarc {
+        if r64(g_named + gi*8)>=1 {
+            let gnm = r64(gvars + gi*16)
+            let gnl = r64(gvars + gi*16 + 8)
+            let s = p5_add_symbol_b(gnm, gnl)
+            if r64(g_named + gi*8)==2 {
+                w8(symtab + s*24 + 4, 0x10)      // STT_NOTYPE|STB_GLOBAL (UNDEF import)
+                w16(symtab + s*24 + 6, 0)        // st_shndx = SHN_UNDEF
+                w64(symtab + s*24 + 8, 0)        // no value (defined elsewhere)
+            } else {
+                w8(symtab + s*24 + 4, 0x12)      // STT_NOTYPE|STB_GLOBAL (def)
+                w16(symtab + s*24 + 6, 3)        // st_shndx = .data (section 3)
+                w64(symtab + s*24 + 8, gi*8)  // slot offset in .data (source globals at gi*8; internals reserved at 38+)
+            }
+            w64(g_symidx + gi*8, s)
+            if symtab_shinfo<0 && r64(g_named + gi*8)!=2 { symtab_shinfo = s }
+        } else {
+            w64(g_symidx + gi*8, -1)
+        }
+        gi=gi+1
+    }
+    // 3. relocations for intra-TU and extern calls (ty==2 patches)
+    relc = 0
+    // x86 object-mode global relocations: inline loop (no patch_globals call) —
+    // for each recorded RIP-relative global access emit R_X86_64_PC32 against
+    // _gdata with addend gidx*8 - 4 (RIP is 4 bytes past the disp32 field).
+    if target_arch == 0 {
+        let xgi=0
+        while xgi<gpatchc {
+            let xgp = r64(gpatches+xgi*24)
+            let xgidx = r64(gpatches+xgi*24+8)
+            let xkind = r8(gpatches+xgi*24+16)
+            if xkind == 0||xkind == 1 {
+                // LOADG / STOREG. `xgidx` is the global index emitted by the IR
+                // instruction (gfind result for source globals, a reserved index
+                // 0..INTERNAL_GLOBAL_COUNT-1 for compiler-internal globals such as
+                // file handles). The .data layout is:
+                //   slots [0, INTERNAL_GLOBAL_COUNT)     -> internal globals
+                //   slots [INTERNAL_GLOBAL_COUNT, ...)    -> source globals (slot 38+gi)
+                // Three cases:
+                //   (a) named source (xgidx<gvarc && g_named[xgidx]>=1): emit reloc
+                //       against the named GLOBAL symbol, addend -4.
+                //   (b) legacy source (xgidx<gvarc && g_named==0): _gdata slot (38+xgidx)*8, addend -4.
+                //   (c) internal (xgidx>=gvarc): _gdata slot xgidx*8, addend -4.
+                // (Do NOT test `xgidx>=INTERNAL_GLOBAL_COUNT` to detect named: source
+                // global indices are 0..gvarc-1 and never reach 38, so that check
+                // silently forced every named global down the legacy path.)
+                let gsym = -1
+                if xgidx<gvarc && r64(g_named + xgidx*8)>=1 { gsym = r64(g_symidx + xgidx*8) }
+                if gsym>=0 {
+                    w64(reldyn + relc*24 + 0, xgp)
+                    w64(reldyn + relc*24 + 8, (gsym<<32) | 2)
+                    w32(reldyn + relc*24 + 16, 0xFFFFFFFC)   // addend = -4
+                    w32(reldyn + relc*24 + 20, 0xFFFFFFFF)
+                    relc = relc+1
+                } else {
+                    let xadd = xgidx*8 - 4
+                    w64(reldyn + relc*24 + 0, xgp)
+                    w64(reldyn + relc*24 + 8, (gdata_sym<<32) | 2)
+                    w32(reldyn + relc*24 + 16, xadd)
+                    w32(reldyn + relc*24 + 20, 0xFFFFFFFF)
+                    if xadd >= 0 { w32(reldyn + relc*24 + 20, 0) }
+                    relc = relc+1
+                }
+            } else {
+                // kind 2 (string lea): raw offset into .data - 4, against _gdata.
+                let xadd = xgidx - 4
+                w64(reldyn + relc*24 + 0, xgp)
+                w64(reldyn + relc*24 + 8, (gdata_sym<<32) | 2)
+                w32(reldyn + relc*24 + 16, xadd)
+                w32(reldyn + relc*24 + 20, 0xFFFFFFFF)
+                if xadd >= 0 { w32(reldyn + relc*24 + 20, 0) }
+                relc = relc+1
+            }
+            xgi=xgi+1
+        }
+    }
+    let pi=0
+    while pi<patchc {
+        if r64(patches+pi*PCS+16)==2 {
+            let po=r64(patches+pi*PCS)
+            let tg=r64(patches+pi*PCS+8)
+            let tg_nl=0
+            while tg_nl<256 { let c0=r8(src+tg+tg_nl)
+                if c0==0||c0==40||c0==41||c0==59||c0==123||c0==125||c0==44||c0==60||c0==62 { break }
+                if c0==32||c0==9||c0==10||c0==13 { break }; tg_nl=tg_nl+1 }
+            let tfi=findfn(tg,tg_nl)
+            if tfi>=0 {
+                if r64(fn_extern + tfi*8)==1 {
+                    let es = p5_sym_for_name(tg, tg_nl)
+                    p5_add_reloc(po, es)
+                } else {
+                    p5_add_reloc(po, r64(fn_symidx + tfi*8))
+                }
+            }
+        } else if r64(patches+pi*PCS+16)==3 {
+            // extern "C" call in OBJECT mode — resolve to the UNDEF GLOBAL symbol
+            // (created on demand by p5_sym_for_name) and emit a PLT32/CALL26
+            // relocation. This is what the external linker binds to the defining
+            // TU's GLOBAL symbol at link time.
+            let po=r64(patches+pi*PCS)
+            let tg=r64(patches+pi*PCS+8)
+            let tg_nl=0
+            while tg_nl<256 { let c0=r8(src+tg+tg_nl)
+                if c0==0||c0==40||c0==41||c0==59||c0==123||c0==125||c0==44||c0==60||c0==62 { break }
+                if c0==32||c0==9||c0==10||c0==13 { break }; tg_nl=tg_nl+1 }
+            let es = p5_sym_for_name(tg, tg_nl)
+            p5_add_reloc(po, es)
+        } else if r64(patches+pi*PCS+16)==4 {
+            // fnptr in OBJECT mode (x86). patches+8 = function index (fi). Emit a
+            // PC-relative R_X86_64_PC32 relocation against the function's symbol.
+            let po=r64(patches+pi*PCS)
+            let fi=r64(patches+pi*PCS+8)
+            let fsym=r64(fn_symidx + fi*8)
+            if fsym>=0 {
+                p5_add_reloc_pc32(po, fsym)
+            }
+        }
+        pi=pi+1
+    }
+    // startup stub: _start calls __init and main (entry TU only)
+    if no_start == 0 {
+        p5_add_reloc(g_init_call_ofs, si)
+        p5_add_reloc(g_main_call_ofs, sm)
+    }
+    // object-mode global relocations (ARM64): for each recorded global access,
+    // emit R_AARCH64_ADR_PREL_PG_HI21 (275) at the adrp site and
+    // R_AARCH64_ADD_ABS_LO12_NC (277) at the add site, both against _gdata with
+    // addend gidx*8. x86 global relocs were emitted in patch_globals().
+    let agi=0
+    while agi<gapatchc {
+        let adrp_ofs = r64(gpatches_a + agi*32 + 0)
+        let add_ofs  = r64(gpatches_a + agi*32 + 8)
+        let gidx     = r64(gpatches_a + agi*32 + 16)
+        let has_add  = r64(gpatches_a + agi*32 + 24)
+        // gidx is the global index emitted by the IR instruction (gfind result
+        // for source globals at .data slot gidx*8, or a reserved 38..37+INTERNAL_GLOBAL_COUNT
+        // index for compiler-internal globals at slot gidx*8). Named cross-TU globals
+        // (g_named[gidx]>=1) target their named GLOBAL symbol (addend 0); others target
+        // _gdata at slot gidx*8 (addend gidx*8).
+        let asym = gdata_sym
+        let aadd = gidx*8
+        if gidx<gvarc && r64(g_named + gidx*8)>=1 { asym = r64(g_symidx + gidx*8); aadd = 0 }
+        // ADR_PREL_PG_HI21: r_offset = adrp instruction, addend = aadd (slot offset)
+        w64(reldyn + relc*24 + 0, adrp_ofs)
+        w64(reldyn + relc*24 + 8, (asym<<32) | 275)
+        w32(reldyn + relc*24 + 16, aadd)
+        w32(reldyn + relc*24 + 20, 0)
+        relc = relc+1
+        if has_add == 1 {
+            w64(reldyn + relc*24 + 0, add_ofs)
+            w64(reldyn + relc*24 + 8, (asym<<32) | 277)
+            w32(reldyn + relc*24 + 16, aadd)
+            w32(reldyn + relc*24 + 20, 0)
+            relc = relc+1
+        }
+        agi=agi+1
+    }
+    // ARM64 fnptr relocations (object mode only): for each recorded IR_FNPTR site,
+    // emit R_AARCH64_ADR_PREL_PG_HI21 (275) at the adrp instruction and
+    // R_AARCH64_ADD_ABS_LO12_NC (277) at the add instruction, both against the
+    // function's symbol (fn_symidx[fi]) with addend 0. x86-64 fnptr relocs are
+    // emitted by the patches ty==3 handler via p5_add_reloc_pc32.
+    // 4. section header string table
+    let shstr = mmap(256); let shl=0
+    w8(shstr+shl,0); shl=shl+1
+    let o_text=shl;   w8(shstr+shl,46);w8(shstr+shl+1,116);w8(shstr+shl+2,101);w8(shstr+shl+3,120);w8(shstr+shl+4,116);w8(shstr+shl+5,0); shl=shl+6
+    let o_rel =shl;   w8(shstr+shl,46);w8(shstr+shl+1,114);w8(shstr+shl+2,101);w8(shstr+shl+3,108);w8(shstr+shl+4,97);w8(shstr+shl+5,46);w8(shstr+shl+6,116);w8(shstr+shl+7,101);w8(shstr+shl+8,120);w8(shstr+shl+9,116);w8(shstr+shl+10,0); shl=shl+11
+    let o_data=shl;   w8(shstr+shl,46);w8(shstr+shl+1,100);w8(shstr+shl+2,97);w8(shstr+shl+3,116);w8(shstr+shl+4,97);w8(shstr+shl+5,0); shl=shl+6
+    let o_sym =shl;   w8(shstr+shl,46);w8(shstr+shl+1,115);w8(shstr+shl+2,121);w8(shstr+shl+3,109);w8(shstr+shl+4,116);w8(shstr+shl+5,97);w8(shstr+shl+6,98);w8(shstr+shl+7,0); shl=shl+8
+    let o_str =shl;   w8(shstr+shl,46);w8(shstr+shl+1,115);w8(shstr+shl+2,116);w8(shstr+shl+3,114);w8(shstr+shl+4,116);w8(shstr+shl+5,97);w8(shstr+shl+6,98);w8(shstr+shl+7,0); shl=shl+8
+    let o_shs =shl;   w8(shstr+shl,46);w8(shstr+shl+1,115);w8(shstr+shl+2,104);w8(shstr+shl+3,115);w8(shstr+shl+4,116);w8(shstr+shl+5,114);w8(shstr+shl+6,116);w8(shstr+shl+7,97);w8(shstr+shl+8,98);w8(shstr+shl+9,0); shl=shl+10
+    let o_note=shl;   w8(shstr+shl,46);w8(shstr+shl+1,110);w8(shstr+shl+2,111);w8(shstr+shl+3,116);w8(shstr+shl+4,101);w8(shstr+shl+5,46);w8(shstr+shl+6,71);w8(shstr+shl+7,78);w8(shstr+shl+8,85);w8(shstr+shl+9,45);w8(shstr+shl+10,115);w8(shstr+shl+11,116);w8(shstr+shl+12,97);w8(shstr+shl+13,99);w8(shstr+shl+14,107);w8(shstr+shl+15,0); shl=shl+16
+
+    // 5. file layout  (8 sections: NULL,.text,.rela.text,.data,.symtab,.strtab,.shstrtab,.note.GNU-stack)
+    let ehsize=64
+    let text_off=ehsize
+    let rel_off =text_off + objcodelen
+    let datasz = (INTERNAL_GLOBAL_COUNT + gvarc)*8 + data_off   // globals(zero) + string literals
+    let data_off_sec = rel_off + relc*24
+    let sym_off =data_off_sec + datasz
+    let str_off =sym_off + symc*24
+    let shdr_off =str_off + strtablen
+    let shstr_off =shdr_off + 8*64
+    let note_off = shstr_off + shl
+    let total = note_off + 1
+    let e=mmap(total)
+
+    // 6. ELF header (ET_REL)
+    let z=0
+    while z<total { w8(e+z,0); z=z+1 }
+    w8(e+0,127); w8(e+1,69); w8(e+2,76); w8(e+3,70); w8(e+4,2); w8(e+5,1); w8(e+6,1)
+    w16(e+16, 1)          // e_type = ET_REL
+    w16(e+18, 62)                   // e_machine = EM_X86_64
+    w32(e+20, 1)          // e_version
+    w64(e+24, 0)          // e_entry = 0
+    w64(e+32, 0)          // e_phoff = 0
+    w64(e+40, shdr_off)    // e_shoff
+    w32(e+48, 0)          // e_flags
+    w16(e+52, 64)         // e_ehsize
+    w16(e+54, 0)          // e_phentsize
+    w16(e+56, 0)          // e_phnum
+    w16(e+58, 64)         // e_shentsize
+    w16(e+60, 8)          // e_shnum (8 sections)
+    w16(e+62, 6)          // e_shstrndx = .shstrtab index
+
+    // data sections
+    let t=0
+    while t<objcodelen { w8(e+text_off+t, r8(objcode+t)); t=t+1 }
+    let r=0
+    while r<relc*24 { w8(e+rel_off+r, r8(reldyn+r)); r=r+1 }
+    // .data content: globals region zero-filled, then string-literal bytes.
+    let d=0
+    while d<datasz { w8(e+data_off_sec+d, 0); d=d+1 }
+    let d2=0
+    while d2<data_off { w8(e+data_off_sec + (INTERNAL_GLOBAL_COUNT+gvarc)*8 + d2, r8(data+d2)); d2=d2+1 }
+    let sm2=0
+    while sm2<symc*24 { w8(e+sym_off+sm2, r8(symtab+sm2)); sm2=sm2+1 }
+    let st=0
+    while st<strtablen { w8(e+str_off+st, r8(strtab+0+st)); st=st+1 }
+    let ss2=0
+    while ss2<shl { w8(e+shstr_off+ss2, r8(shstr+ss2)); ss2=ss2+1 }
+    // .note.GNU-stack content: a single byte = 0 (non-executable stack).
+    w8(e+note_off, 0)
+
+    // 7. section header table (8 entries)
+    // sec0 NULL
+    // sec1 .text
+    w32(e+shdr_off + 1*64 + 0, o_text)
+    w32(e+shdr_off + 1*64 + 4, 1)            // SHT_PROGBITS
+    w64(e+shdr_off + 1*64 + 8, 6)            // SHF_ALLOC|SHF_EXECINSTR
+    w64(e+shdr_off + 1*64 + 16, 0)           // sh_addr
+    w64(e+shdr_off + 1*64 + 24, text_off)
+    w64(e+shdr_off + 1*64 + 32, objcodelen)
+    w32(e+shdr_off + 1*64 + 40, 0)           // sh_link
+    w32(e+shdr_off + 1*64 + 44, 0)           // sh_info
+    w64(e+shdr_off + 1*64 + 48, 1)          // sh_addralign (1, like gcc output)
+    w64(e+shdr_off + 1*64 + 56, 0)           // sh_entsize
+    // sec2 .rela.text
+    w32(e+shdr_off + 2*64 + 0, o_rel)
+    w32(e+shdr_off + 2*64 + 4, 4)            // SHT_RELA
+    w64(e+shdr_off + 2*64 + 8, 0)
+    w64(e+shdr_off + 2*64 + 16, 0)
+    w64(e+shdr_off + 2*64 + 24, rel_off)
+    w64(e+shdr_off + 2*64 + 32, relc*24)
+    w32(e+shdr_off + 2*64 + 40, 4)           // sh_link = .symtab index
+    w32(e+shdr_off + 2*64 + 44, 1)           // sh_info = .text index
+    w64(e+shdr_off + 2*64 + 48, 8)           // sh_addralign
+    w64(e+shdr_off + 2*64 + 56, 24)          // sh_entsize
+    // sec3 .data
+    w32(e+shdr_off + 3*64 + 0, o_data)
+    w32(e+shdr_off + 3*64 + 4, 1)            // SHT_PROGBITS
+    w64(e+shdr_off + 3*64 + 8, 3)            // SHF_ALLOC|SHF_WRITE
+    w64(e+shdr_off + 3*64 + 16, 0)           // sh_addr
+    w64(e+shdr_off + 3*64 + 24, data_off_sec)
+    w64(e+shdr_off + 3*64 + 32, datasz)
+    w32(e+shdr_off + 3*64 + 40, 0)           // sh_link
+    w32(e+shdr_off + 3*64 + 44, 0)           // sh_info
+    w64(e+shdr_off + 3*64 + 48, 8)           // sh_addralign
+    w64(e+shdr_off + 3*64 + 56, 1)           // sh_entsize
+    // sec4 .symtab
+    w32(e+shdr_off + 4*64 + 0, o_sym)
+    w32(e+shdr_off + 4*64 + 4, 2)            // SHT_SYMTAB
+    w64(e+shdr_off + 4*64 + 8, 0)
+    w64(e+shdr_off + 4*64 + 16, 0)
+    w64(e+shdr_off + 4*64 + 24, sym_off)
+    w64(e+shdr_off + 4*64 + 32, symc*24)
+    w32(e+shdr_off + 4*64 + 40, 5)           // sh_link = .strtab index
+    if symtab_shinfo < 0 { symtab_shinfo = symc }   // no globals: sh_info = symc (valid)
+    w32(e+shdr_off + 4*64 + 44, symtab_shinfo) // sh_info = first non-local
+    w64(e+shdr_off + 4*64 + 48, 8)
+    w64(e+shdr_off + 4*64 + 56, 24)
+    // sec5 .strtab
+    w32(e+shdr_off + 5*64 + 0, o_str)
+    w32(e+shdr_off + 5*64 + 4, 3)            // SHT_STRTAB
+    w64(e+shdr_off + 5*64 + 8, 0)
+    w64(e+shdr_off + 5*64 + 16, 0)
+    w64(e+shdr_off + 5*64 + 24, str_off)
+    w64(e+shdr_off + 5*64 + 32, strtablen)
+    w32(e+shdr_off + 5*64 + 40, 0)
+    w32(e+shdr_off + 5*64 + 44, 0)
+    w64(e+shdr_off + 5*64 + 48, 1)
+    w64(e+shdr_off + 5*64 + 56, 0)
+    // sec6 .shstrtab
+    w32(e+shdr_off + 6*64 + 0, o_shs)
+    w32(e+shdr_off + 6*64 + 4, 3)            // SHT_STRTAB
+    w64(e+shdr_off + 6*64 + 8, 0)
+    w64(e+shdr_off + 6*64 + 16, 0)
+    w64(e+shdr_off + 6*64 + 24, shstr_off)
+    w64(e+shdr_off + 6*64 + 32, shl)
+    w32(e+shdr_off + 6*64 + 40, 0)
+    w32(e+shdr_off + 6*64 + 44, 0)
+    w64(e+shdr_off + 6*64 + 48, 1)
+    w64(e+shdr_off + 6*64 + 56, 0)
+    // sec7 .note.GNU-stack (non-exec stack; sh_flags=0). Conventionally SHT_PROGBITS
+    // (type 1) with a single content byte (0 = non-executable), matching gcc output.
+    w32(e+shdr_off + 7*64 + 0, o_note)
+    w32(e+shdr_off + 7*64 + 4, 1)            // SHT_PROGBITS (NOT SHT_NOTE)
+    w64(e+shdr_off + 7*64 + 8, 0)
+    w64(e+shdr_off + 7*64 + 16, 0)
+    w64(e+shdr_off + 7*64 + 24, note_off)
+    w64(e+shdr_off + 7*64 + 32, 1)           // size = 1 byte (0 = non-exec)
+    w32(e+shdr_off + 7*64 + 40, 0)
+    w32(e+shdr_off + 7*64 + 44, 0)
+    w64(e+shdr_off + 7*64 + 48, 1)           // sh_addralign = 1
+    w64(e+shdr_off + 7*64 + 56, 0)           // sh_entsize = 0
+
+    // 8. write the .o to out_p
+    let ofd=file_open(out_p,577,493)
+    if ofd>=0 { file_write(ofd, e, total); file_close(ofd) }
+    // Linker invocation is delegated to an external driver (rebuild.sh / the
+    // future `quanta build` tool). Quanta has no system()/execve; the .o is the
+    // deliverable. From the shell: `ld <out_p> -o <exe>` (or `gcc <out_p>`).
+}
+
+// `include io` (no quotes) resolves `io.q`, searching: cwd, std/, ext/.
+// Honored ONLY at line-start and OUTSIDE // comments, so it can never match
+// prose/comments. Quanta is flat-global: included text is concatenated into
+// the single 'src' buffer before tokenizing. Used for internal stdlib
+// (std/*). `import` (external, namespaced) is reserved for later.
+fn imp_strlen() {
+  let i=0
+  while r8(imp_full+i) != 0 { i=i+1 }
+  return i
+}
+fn imp_hash() {            // hash of NUL-terminated imp_full
+  // G2: masked to 32 bits so the djb2 accumulator never overflows a signed
+  // i64 (long include paths would otherwise trip --overflow-trap at self-host
+  // time). Only used for dedup self-equality, so the reduced range is fine.
+  let h=0; let i=0
+  while r8(imp_full+i) != 0 { h = (h*31 + r8(imp_full+i)) & 4294967295; i=i+1 }
+  return h
+}
+fn imp_already() {
+  let k=0
+  while k<imp_seenc { if r64(imp_seen+k*8)==imp_hash() { return 1 }; k=k+1 }
+  return 0
+}
+fn src_strlen(p) {           // length of NUL-terminated string at p
+  let i=0
+  while r8(p+i) != 0 { i=i+1 }
+  return i
+}
+// Set imp_dir = dirname of path[0..len) (everything up to and including the last
+// '/'); if no '/', imp_dirlen=0 (cwd). Used so relative quoted includes resolve
+// against the directory of the file that contains them.
+fn imp_dir_from(path, len) {
+  let last = -1; let k=0
+  while k<len { if r8(path+k)==47 { last=k }; k=k+1 }
+  if last<0 { imp_dirlen=0 }
+  else { let c=0; while c<=last { w8(imp_dir+c, r8(path+c)); c=c+1 }; imp_dirlen=last+1 }
+}
+// Save current imp_dir into the depth-indexed stack slot.
+fn imp_dir_save(d) {
+  let c=0
+  while c<imp_dirlen { w8(imp_dir_stack + d*4096 + c, r8(imp_dir+c)); c=c+1 }
+  w64(imp_dir_stacklen + d*8, imp_dirlen)
+}
+fn imp_dir_restore(d) {
+  imp_dirlen = r64(imp_dir_stacklen + d*8)
+  let c=0
+  while c<imp_dirlen { w8(imp_dir+c, r8(imp_dir_stack + d*4096 + c)); c=c+1 }
+}
+// Build imp_full = prefix[0..pl-1] + NAME[0..nl-1]  (NO extension; files are
+// extensionless, e.g. 'std/io', 'std/string'). Returns fd or -1.
+// F8/0.0.30: a bare name is resolved both as-is AND with a '.quanta' suffix,
+// so `import std/math` finds `lib/std/math.quanta`.
+fn imp_try(name, nl, pfx, pl) {
+  let ok = imp_try_one(name, nl, pfx, pl, 0)
+  if ok >= 0 { return ok }
+  return imp_try_one(name, nl, pfx, pl, 1)
+}
+fn imp_try_one(name, nl, pfx, pl, use_ext) {
+  // FIX-0.0.4 (C2): imp_full is 4096 bytes; prefix + name + ".quanta" + NUL must
+  // fit. Overlong bare include names fail closed (all imp_try attempts return -1
+  // -> imp_err=1 -> exit(16)).
+  if pl + nl + 8 >= 4095 { return -1 }
+  let k=0
+  while k<pl { w8(imp_full+k, r8(pfx+k)); k=k+1 }
+  let j=0
+  while j<nl { w8(imp_full+k, r8(name+j)); k=k+1; j=j+1 }
+  if use_ext==1 {
+    w8(imp_full+k, 46); k=k+1   // '.'
+    w8(imp_full+k, 113); k=k+1  // 'q'
+    w8(imp_full+k, 117); k=k+1  // 'u'
+    w8(imp_full+k, 97); k=k+1   // 'a'
+    w8(imp_full+k, 110); k=k+1  // 'n'
+    w8(imp_full+k, 116); k=k+1  // 't'
+    w8(imp_full+k, 97); k=k+1   // 'a'
+  }
+  w8(imp_full+k, 0)
+  return file_open(imp_full, 0)
+}
+
+fn imp_load(fd, depth) {     // read fd into depth buffer, dedup, recurse-expand
+  if imp_already()==0 {
+    w64(imp_seen + imp_seenc*8, imp_hash()); if imp_seenc >= IMPSEEN_CAP { emit_ovf() }; imp_seenc=imp_seenc+1
+    let ib = impbufs + (depth%8)*16777216
+    let n = file_read(fd, ib, 16777216); file_close(fd)
+    if n>0 { expand_includes(ib, n, depth+1) }
+  } else { file_close(fd) }
+}
+
+fn expand_includes(buf, len, depth) {
+  if depth>8 { imp_err=1; return }
+  let i=0
+  while i<len {
+    // FIX-0.0.5 (C2): the 16MB src buffer cap was only checked AFTER expansion
+    // (entry.quanta), so main+includes totaling >16MB overflowed src mid-copy.
+    // Guard in-loop: every branch writes at most 1 byte per iteration, so checking
+    // before each iteration covers all write sites. imp_err -> exit(16) fail-closed.
+    if srclen >= 16777216 { imp_err=1; return }
+    let ch = r8(buf+i)
+    if ch==47 && i+1<len && r8(buf+i+1)==42 {
+      // /* block comment */ -> skip to closing */
+      i=i+2; while i+1<len && !(r8(buf+i)==42 && r8(buf+i+1)==47) { i=i+1 }
+      if i+1<len { i=i+2 }
+    } else if ch==47 && i+1<len && r8(buf+i+1)==47 {
+      // // comment -> skip whole line (so 'include' inside prose is invisible)
+      i=i+2; while i<len && r8(buf+i)!=10 { i=i+1 }
+    } else if (i==0 || r8(buf+i-1)==10 || r8(buf+i-1)==32 || r8(buf+i-1)==9) {
+      // Directive at line start: 'include' / 'import' (optionally '#'-prefixed).
+      // All four spellings share the SAME textual-inclusion semantics (Quanta is
+      // flat-global): inline the referenced source into 'src'.
+      let wstart = i
+      if ch==35 { wstart = i+1 }   // skip a leading '#'
+      let wc = r8(buf+wstart)
+      // 'include' = i,n,c,l,u,d,e (7) ; 'import' = i,m,p,o,r,t (6)
+      let is_include = (wc==105 && r8(buf+wstart+1)==110 && r8(buf+wstart+2)==99 && r8(buf+wstart+3)==108 && r8(buf+wstart+4)==117 && r8(buf+wstart+5)==100 && r8(buf+wstart+6)==101)
+      let is_import  = (wc==105 && r8(buf+wstart+1)==109 && r8(buf+wstart+2)==112 && r8(buf+wstart+3)==111 && r8(buf+wstart+4)==114 && r8(buf+wstart+5)==116)
+      if is_include || is_import {
+        let wlen = 7; if is_import { wlen = 6 }
+        let nx = r8(buf+wstart+wlen)
+        if nx==32 || nx==9 || nx==10 || nx==0 || nx==47 || nx==34 {
+          let j=wstart+wlen
+          while j<len && (r8(buf+j)==32 || r8(buf+j)==9) { j=j+1 }
+          if r8(buf+j)==34 {
+            // quoted form: include "path/file.q"
+            //   - absolute path (starts with '/') -> open verbatim
+            //   - relative path -> resolve against the current include dir (imp_dir)
+            let q=j+1
+            while q<len && r8(buf+q)!=34 { q=q+1 }
+            let ql = q - (j+1)
+            if ql>0 {
+              let first = r8(buf+j+1)
+              if first==47 {
+                // absolute: imp_full = verbatim path
+                // FIX-0.0.4 (C2): imp_full is 4096 bytes; an overlong quoted path
+                // would write past it into the adjacent imp_dir arena. Fail closed.
+                if ql >= 4095 { imp_err=1; return }
+                let k=0
+                while k<ql { w8(imp_full+k, r8(buf+j+1+k)); k=k+1 }
+                w8(imp_full+k, 0)
+              } else {
+                // relative: imp_full = imp_dir + path
+                // FIX-0.0.4 (C2): bound imp_dirlen + ql against the 4096-byte buffer.
+                if imp_dirlen + ql >= 4095 { imp_err=1; return }
+                let k=0
+                while k<imp_dirlen { w8(imp_full+k, r8(imp_dir+k)); k=k+1 }
+                let m=0
+                while m<ql { w8(imp_full+k+m, r8(buf+j+1+m)); m=m+1 }
+                w8(imp_full+k+m, 0)
+              }
+              let fd = file_open(imp_full, 0)
+              if fd>=0 {
+                // save parent dir, switch to this file's dir for nested includes,
+                // load (recurse), then restore the parent dir.
+                imp_dir_save(depth)
+                imp_dir_from(imp_full, src_strlen(imp_full))
+                imp_load(fd, depth)
+                imp_dir_restore(depth)
+              } else { imp_err=1 }
+            } else { imp_err=1 }
+            i=q+1
+          } else {
+            // bare form: include NAME -> resolve via cwd/std/ext prefixes
+            let ns=j; let nl=0
+            while j<len && r8(buf+j)!=32 && r8(buf+j)!=9 && r8(buf+j)!=10 && r8(buf+j)!=0 { nl=nl+1; j=j+1 }
+            let fd = imp_try(buf+ns, nl, 0, 0)
+            if fd<0 { fd = imp_try(buf+ns, nl, imp_std_pfx, 4) }
+            if fd<0 { fd = imp_try(buf+ns, nl, imp_ext_pfx, 4) }
+            if fd<0 { fd = imp_try(buf+ns, nl, imp_lib_pfx, 4) }   // F8/0.0.30: lib/ capability modules
+            if fd>=0 { imp_load(fd, depth) } else { imp_err=1 }
+            i=j
+          }
+        } else {
+          w8(src+srclen, ch); srclen=srclen+1; i=i+1
+        }
+      } else {
+        w8(src+srclen, ch); srclen=srclen+1; i=i+1
+      }
+    } else {
+      w8(src+srclen, ch); srclen=srclen+1; i=i+1
+    }
+  }
+}
+

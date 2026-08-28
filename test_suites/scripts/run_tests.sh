@@ -208,6 +208,16 @@ else
   echo "  SKIP: EXPECTED_STDLIB.tsv missing"
 fi
 
+echo "########## MULTI-TU (cross-TU call + global, --emit-obj + link) ##########"
+MTU_RC=0
+if [ -f "$TEST_SUITES/scripts/multi_tu_tests.sh" ]; then
+  if ! QC="$QC" bash "$TEST_SUITES/scripts/multi_tu_tests.sh"; then
+    MTU_RC=1
+  fi
+else
+  echo "  SKIP: multi_tu_tests.sh missing"
+fi
+
 echo "=== GATE SUMMARY ==="
 echo "  functional : $([ $FUNCTIONAL_RC = 0 ] && echo GREEN || echo RED)"
 echo "  extern-c  : $([ $EXTERN_RC = 0 ] && echo GREEN || echo RED)  (object-mode + gcc libc link)"
@@ -218,11 +228,12 @@ echo "  fuzz       : $([ $FUZZ_RC = 0 ] && echo GREEN || echo RED)  (fail-closed
 echo "  differential: $([ $DIFF_RC = 0 ] && echo GREEN || echo RED)  (opt -O==no-O + vs-seed)"
 echo "  generics    : $([ $GENERICS_RC = 0 ] && echo GREEN || echo RED)  (negative type-arg checks fail closed)"
 echo "  stdlib      : $([ $STDLIB_RC = 0 ] && echo GREEN || echo RED)  (lib/std/* via import, EXPECTED_STDLIB.tsv)"
-# Block promotion on a real functional/security/perf/valgrind/fuzz/diff/stdlib regression.
+echo "  multi-tu    : $([ $MTU_RC = 0 ] && echo GREEN || echo RED)  (cross-TU call + global, --emit-obj + gcc link)"
+# Block promotion on a real functional/security/perf/valgrind/fuzz/diff/stdlib/mtu regression.
 # Security KNOWN issues are surfaced by the script but do not turn the gate red.
 if [ $FUNCTIONAL_RC -ne 0 ] || [ $SECURITY_RC -ne 0 ] || [ $PERF_RC -ne 0 ] \
    || [ $VALGRIND_RC -ne 0 ] || [ $FUZZ_RC -ne 0 ] || [ $DIFF_RC -ne 0 ] \
-   || [ $GENERICS_RC -ne 0 ] || [ $STDLIB_RC -ne 0 ]; then
+   || [ $GENERICS_RC -ne 0 ] || [ $STDLIB_RC -ne 0 ] || [ $MTU_RC -ne 0 ]; then
   exit 1
 fi
 exit 0

@@ -289,44 +289,45 @@ No-deferral policy to 0.1.0 (user directive 2026-08-28): every verified gap gets
 
 | | |
 |---|---|
-| **Location** | codegen/expression lowering (exact site TBD in 0.0.116 debug pass) |
-| **Symptom** | `let z = 3; let r = rsp() + z` prints `6` (z+z) instead of stackptr+3. Any builtin whose result feeds an arithmetic expression with a live local miscomputes. |
+| **Location** | emitter.quanta `rsp()` emit (was line ~830) |
+| **Symptom** | `let z = 3; let r = rsp() + z` prints `6` (z+z) instead of stackptr+3. `rsp()-z`→0, `rsp()*z`→z*z. |
+| **Root cause (found 0.0.116)** | NOT a vreg collision. The `rsp()` emitter wrote `eb(72); eb(137); eb(228)` intending `mov rax, rsp` (48 89 **E0**), but 228 = 0xE4 = ModR/M for `mov rsp, rsp` — a **no-op**. rax kept holding the live local z, so every `rsp() op z` lowered to `z op z`. Disassembly-verified: mis1.bin main body had no `mov rax,rsp` and no add. `getpid()+z` worked because syscall builtins emit correctly. |
 | **Provenance** | Pre-existing since ≤0.0.114 (identical on baseline); NOT introduced by 0.0.115 patches. Discovered while writing `rsp_test.quanta`. |
-| **Severity** | HIGH — silent wrong-codegen class; any builtin in an arithmetic expr with a live local is affected, not just `rsp()`. |
-| **Fix** | 0.0.116: root-cause the vreg/register allocation collision between the builtin result and the live local, fix, and add a regression test covering builtin+local arithmetic for several builtins. |
-| **Status** | ❌ open → scheduled **0.0.116** |
+| **Severity** | HIGH — silent wrong-codegen; scoped to `rsp()` (only builtin with this byte error). |
+| **Fix** | 0.0.116: `eb(228)` → `eb(224)` (0xE0). Regression coverage added to `rsp_test.quanta` (checks 5–8: rsp()+z, rsp()-z, rsp()*z, rsp() in nested call) — verified rc=6 on 0.0.115 (catches bug), rc=0 on 0.0.116. |
+| **Status** | ✅ fixed in **0.0.116** |
 
 ## FIX-0.0.32  MED — `quantum` stdlib has no dedicated gate test
 
 | | |
 |---|---|
 | **Evidence** | lib/std/quantum.quanta (240 lines, 8 fns: Keccak/SHA3/SHAKE) shipped 0.0.87; no `quantum_test` in EXPECTED_STDLIB.tsv. ROADMAP line 79 noted the gap. |
-| **Fix** | 0.0.116: add `quantum_test.quanta` with known-answer vectors (SHA3-256 of empty string etc.), wire into stdlib suite. |
-| **Status** | ❌ open → scheduled **0.0.116** |
+| **Fix** | 0.0.116: added `quantum_test.quanta` (5 NIST/OpenSSL-verified vectors: SHA3-256(""), SHA3-256("abc"), SHA3-512("abc"), SHAKE128/256). Writing it exposed 3 real bugs (FIX-0.0.40/41/42). rc=0 on 0.0.116. |
+| **Status** | ✅ fixed in **0.0.116** |
 
 ## FIX-0.0.33  MED — `linalg` stdlib has no dedicated gate test
 
 | | |
 |---|---|
 | **Evidence** | lib/std/linalg.quanta (363 lines, 25 fns) shipped 0.0.87; no `linalg_test` in EXPECTED_STDLIB.tsv. |
-| **Fix** | 0.0.116: add `linalg_test.quanta` (matmul/transpose/det/inverse vs hand-computed values), wire into stdlib suite. |
-| **Status** | ❌ open → scheduled **0.0.116** |
+| **Fix** | 0.0.116: added `linalg_test.quanta` (mat_mul/transpose/add/sub/scal/det/identity vs hand-computed). Writing it exposed 2 real bugs (FIX-0.0.43/44). rc=0 on 0.0.116. |
+| **Status** | ✅ fixed in **0.0.116** |
 
 ## FIX-0.0.34  MED — float trig builtins implemented but never gated
 
 | | |
 |---|---|
 | **Evidence** | `sin`/`cos`/`tan` present in is_bltn (features.quanta:505-507, x87) since 0.0.103, but `float_test.quanta` contains ZERO trig calls (grep-verified). FEATURES.md line 175 falsely claimed coverage — corrected. |
-| **Fix** | 0.0.116: add trig gate test (sin/cos/tan of known angles vs expected integer-truncated values). |
-| **Status** | ❌ open → scheduled **0.0.116** |
+| **Fix** | 0.0.116: added `trig_test.quanta` (sin/cos/tan of 0,1,2 vs libm bit-patterns, 8-ULP tolerance). Writing it exposed a real bug (FIX-0.0.45). rc=0 on 0.0.116. |
+| **Status** | ✅ fixed in **0.0.116** |
 
 ## FIX-0.0.35  LOW — multi-TU fixtures exist but are not wired into the gate
 
 | | |
 |---|---|
 | **Evidence** | `test_suites/codes/mtu_*` fixtures exist; multi-TU linking shipped as a core feature but the fixtures were never added to run_tests.sh (same class of hole as the stdlib suite, FIX-0.0.15). |
-| **Fix** | 0.0.116: wire mtu_* fixtures into the gate as a multi-TU layer. |
-| **Status** | ❌ open → scheduled **0.0.116** |
+| **Fix** | 0.0.116: added `test_suites/scripts/multi_tu_tests.sh` (compiles mtu_helper/mtu_glob_def with `--emit-obj --no-start`, mtu_main/mtu_glob_use with `--emit-obj`, links via `gcc -nostartfiles`, runs both, expects rc=49 and rc=25). Wired as a new MULTI-TU layer in run_tests.sh + gate summary + promotion gate. Verified both pairs link and run correctly. |
+| **Status** | ✅ fixed in **0.0.116** |
 
 ## FIX-0.0.36  HIGH — `big` ordering + bitwise operators rejected/absent
 
@@ -362,19 +363,93 @@ No-deferral policy to 0.1.0 (user directive 2026-08-28): every verified gap gets
 
 ---
 
+## FIX-0.0.40  HIGH — hex literals with high bit set rejected as i64 overflow
+
+| | |
+|---|---|
+| **Location** | lexer.quanta hex-literal parser |
+| **Symptom** | `let x = 0x800000000000808a` → `error: integer literal overflows i64 range`. Any hex constant ≥ 0x8000000000000000 rejected. |
+| **Root cause** | Hex parser capped the accumulator at I64MAX (576460752303423487 = I64MAX/16), treating the unsigned 64-bit range as signed-positive-only. Keccak round constants (e.g. 0x800000000000808a) fundamentally need the high half of the 64-bit space, so the quantum stdlib could not even compile. |
+| **Severity** | HIGH — blocks any code using large hex constants (crypto, bitmasks, two's-complement sentinels). |
+| **Fix** | 0.0.116: hex literals now span the FULL 64-bit two's-complement range (like C): up to 16 hex digits accepted; values above I64MAX wrap to negative i64. Implemented by accumulating two 32-bit halves (hi/lo) and combining via `(hi << 32) + lo` — shifts are not overflow-trap-checked, so this avoids the G2 `ud2` signed-overflow trap that a naive `val*16` fold would hit on the 16th digit. Verified `0x800000000000808a` → -9223372036854742902 (correct two's-complement). |
+| **Status** | ✅ fixed in **0.0.116** |
+
+## FIX-0.0.41  HIGH — quantum Keccak rho+pi step scrambled (wrong digests)
+
+| | |
+|---|---|
+| **Location** | lib/std/quantum.quanta `keccak_f` rho+pi lane store block |
+| **Symptom** | SHA3-256("") produced `71378d15...` instead of `a7ffc6f8...`. All Keccak-derived digests wrong. |
+| **Root cause** | The rho+pi table had wrong lane assignments AND invalid rotation offsets (23 and 29 appear, but neither is a valid Keccak rho offset — the valid set is {0,1,3,6,10,15,21,28,36,44,55,2,14,27,41,56,8,25,43,62,18,39,61,20,44}... specifically the offsets used must come from the official KeccakRhoOffsets). |
+| **Severity** | HIGH — silent cryptographic incorrectness; every SHA3/SHAKE result was wrong. |
+| **Fix** | 0.0.116: rewrote the rho+pi block with the correct lane mapping `(x,y)->(y,(2x+3y)%5)` and official rotation offsets. Verified programmatically against the official KeccakRhoOffsets table (all 25 destinations covered, all rotations valid) before patching. |
+| **Status** | ✅ fixed in **0.0.116** |
+
+## FIX-0.0.42  HIGH — quantum Keccak sponge absorb/squeeze bugs
+
+| | |
+|---|---|
+| **Location** | lib/std/quantum.quanta `keccak_sponge` |
+| **Symptom** | After fixing rho+pi, SHA3-256("") gave correct first 8 bytes then zeros — only lane 0 of output was written. |
+| **Root cause** | Two bugs: (a) absorb loop computed `blocks=(mlen+rate)/rate` which is ≥1 even for mlen<rate, absorbing a phantom zero block and double-permuting short messages; (b) squeeze loop incremented the `produced` byte counter inside the per-lane loop, so it exited after writing only the first 8 bytes. |
+| **Severity** | HIGH — silent cryptographic incorrectness (truncated/wrong output). |
+| **Fix** | 0.0.116: rewrote the sponge — absorb only real message blocks then apply padding block once; squeeze increments the byte counter correctly across lanes/blocks. Verified SHA3-256/512 + SHAKE128/256 against OpenSSL (`openssl dgst -sha3-*`) — two independent FIPS implementations agree with the fixed lib. |
+| **Status** | ✅ fixed in **0.0.116** |
+
+## FIX-0.0.43  MED — linalg mat_from_flat off-by-8 array read
+
+| | |
+|---|---|
+| **Location** | lib/std/linalg.quanta `mat_from_flat` |
+| **Symptom** | `mat_from_flat([1,2,3,4],2,2)` then `mat_get(A,0,0)` returned 2 (not 1); whole matrix shifted by one slot (`2,3,4,0`). |
+| **Root cause** | Read the input array at `arr + 16`, but Quanta array literals have an **8-byte header** (length at +0, elements at +8). Verified by dumping raw memory (`mem_load(arr+0)=4` = length, `mem_load(arr+8)=10` = first element) and confirming `arr[i] == mem_load(arr+8+i*8)`. |
+| **Severity** | MED — every matrix built from a flat literal was shifted; all downstream linalg results wrong. |
+| **Fix** | 0.0.116: `arr + 16 + i*8` → `arr + 8 + i*8`. (The matrix's own 16-byte rows/cols/elements layout is correct; only the input-array read was wrong.) |
+| **Status** | ✅ fixed in **0.0.116** |
+
+## FIX-0.0.44  MED — linalg mat_det used truncated integer division
+
+| | |
+|---|---|
+| **Location** | lib/std/linalg.quanta `mat_det` |
+| **Symptom** | `mat_det([[1,2],[3,4]])` returned -6 (correct is -2); diagonal matrices passed by luck. |
+| **Root cause** | Gaussian elimination computed the multiplier `f = row[col] / pivot` with truncated integer division. For [[1,2],[3,4]]: f = 1/3 = 0, so elimination did nothing → wrong determinant. Integer Gaussian elimination with division is mathematically invalid. |
+| **Severity** | MED — determinant wrong for any non-triangular integer matrix. |
+| **Fix** | 0.0.116: rewrote `mat_det` using **Bareiss fraction-free elimination** (exact integer arithmetic, no division until the final step, divides only by the previous pivot which is guaranteed to divide evenly). Verified [[1,2],[3,4]]→-2, diag(2,3,4)→24, [[1,2,3],[4,5,6],[7,8,10]]→-3. |
+| **Status** | ✅ fixed in **0.0.116** |
+
+## FIX-0.0.45  HIGH — sin/cos/tan reloaded arg from wrong vreg (returned 0)
+
+| | |
+|---|---|
+| **Location** | emitter.quanta sin/cos/tan emit blocks |
+| **Symptom** | `sin(x)`, `cos(x)`, `tan(x)` all returned 0.0 for every input (even cos(0)=1 came back 0). |
+| **Root cause** | The trig emitters did `rbp(7, spill_home(irres(ira2(ii))))` to reload the argument into rdi, but `irres(ira2(ii))` resolved to the wrong vreg → loaded 0. The codegen already loads arg0 into rdi before calling emit_bltn (proven by `sqrt`, which is gated and works, using rdi directly after `flush_all()`). The redundant reload clobbered the correct value. |
+| **Severity** | HIGH — all three trig builtins silently returned 0. |
+| **Fix** | 0.0.116: removed the redundant reload; sin/cos/tan now use rdi directly (matching the proven sqrt pattern). Verified bit-exact against libm: sin(1)=4605754516372524270, cos(1)=4603041830072026764, etc. |
+| **Status** | ✅ fixed in **0.0.116** |
+
+---
+
 ## Round 2 status table
 
 | ID | Sev | Status | Scheduled |
 |---|---|---|---|
-| FIX-0.0.31 | HIGH | ❌ | 0.0.116 |
-| FIX-0.0.32 | MED  | ❌ | 0.0.116 |
-| FIX-0.0.33 | MED  | ❌ | 0.0.116 |
-| FIX-0.0.34 | MED  | ❌ | 0.0.116 |
-| FIX-0.0.35 | LOW  | ❌ | 0.0.116 |
+| FIX-0.0.31 | HIGH | ✅ fixed | 0.0.116 |
+| FIX-0.0.32 | MED  | ✅ fixed | 0.0.116 |
+| FIX-0.0.33 | MED  | ✅ fixed | 0.0.116 |
+| FIX-0.0.34 | MED  | ✅ fixed | 0.0.116 |
+| FIX-0.0.35 | LOW  | ✅ fixed | 0.0.116 |
 | FIX-0.0.36 | HIGH | ❌ | 0.0.117 |
 | FIX-0.0.37 | HIGH | ❌ | 0.0.118 |
 | FIX-0.0.38 | HIGH | ❌ | 0.0.119 |
 | FIX-0.0.39 | MED  | ❌ | 0.0.120–0.0.122 |
+| FIX-0.0.40 | HIGH | ✅ fixed | 0.0.116 |
+| FIX-0.0.41 | HIGH | ✅ fixed | 0.0.116 |
+| FIX-0.0.42 | HIGH | ✅ fixed | 0.0.116 |
+| FIX-0.0.43 | MED  | ✅ fixed | 0.0.116 |
+| FIX-0.0.44 | MED  | ✅ fixed | 0.0.116 |
+| FIX-0.0.45 | HIGH | ✅ fixed | 0.0.116 |
 
 **Round 2 closes when 0.0.122 ships; 0.1.0 may then begin.**
 

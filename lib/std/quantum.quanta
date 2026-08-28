@@ -72,31 +72,34 @@ fn keccak_f(st) {
     let A15 = mem_load(st + 15*8); let A16 = mem_load(st + 16*8); let A17 = mem_load(st + 17*8); let A18 = mem_load(st + 18*8); let A19 = mem_load(st + 19*8)
     let A20 = mem_load(st + 20*8); let A21 = mem_load(st + 21*8); let A22 = mem_load(st + 22*8); let A23 = mem_load(st + 23*8); let A24 = mem_load(st + 24*8)
     // pi: (x,y) -> (y, (2x+3y)%5) ; rho offset r[x,y]
+    // FIX-0.0.33: previous table had wrong lane assignments and invalid
+    // rotation offsets (23, 29 are not Keccak rho offsets) -> wrong digests.
+    // Regenerated from the official KeccakRhoOffsets + pi permutation.
     mem_store(st + 0*8,  A0)
-    mem_store(st + 1*8,  rotl64(A1, 44))
+    mem_store(st + 1*8,  rotl64(A6, 44))
     mem_store(st + 2*8,  rotl64(A12, 43))
-    mem_store(st + 3*8,  rotl64(A23, 21))
-    mem_store(st + 4*8,  rotl64(A14, 14))
-    mem_store(st + 5*8,  rotl64(A10, 3))
-    mem_store(st + 6*8,  rotl64(A21, 45))
-    mem_store(st + 7*8,  rotl64(A7, 8))
-    mem_store(st + 8*8,  rotl64(A18, 18))
-    mem_store(st + 9*8,  rotl64(A4, 2))
-    mem_store(st + 10*8, rotl64(A20, 62))
-    mem_store(st + 11*8, rotl64(A11, 6))
-    mem_store(st + 12*8, rotl64(A2, 61))
-    mem_store(st + 13*8, rotl64(A13, 28))
-    mem_store(st + 14*8, rotl64(A24, 23))
-    mem_store(st + 15*8, rotl64(A15, 20))
-    mem_store(st + 16*8, rotl64(A6, 1))
-    mem_store(st + 17*8, rotl64(A22, 36))
-    mem_store(st + 18*8, rotl64(A8, 10))
-    mem_store(st + 19*8, rotl64(A19, 15))
-    mem_store(st + 20*8, rotl64(A5, 39))
-    mem_store(st + 21*8, rotl64(A16, 41))
-    mem_store(st + 22*8, rotl64(A17, 45))
-    mem_store(st + 23*8, rotl64(A3, 25))
-    mem_store(st + 24*8, rotl64(A9, 29))
+    mem_store(st + 3*8,  rotl64(A18, 21))
+    mem_store(st + 4*8,  rotl64(A24, 14))
+    mem_store(st + 5*8,  rotl64(A3, 28))
+    mem_store(st + 6*8,  rotl64(A9, 20))
+    mem_store(st + 7*8,  rotl64(A10, 3))
+    mem_store(st + 8*8,  rotl64(A16, 45))
+    mem_store(st + 9*8,  rotl64(A22, 61))
+    mem_store(st + 10*8, rotl64(A1, 1))
+    mem_store(st + 11*8, rotl64(A7, 6))
+    mem_store(st + 12*8, rotl64(A13, 25))
+    mem_store(st + 13*8, rotl64(A19, 8))
+    mem_store(st + 14*8, rotl64(A20, 18))
+    mem_store(st + 15*8, rotl64(A4, 27))
+    mem_store(st + 16*8, rotl64(A5, 36))
+    mem_store(st + 17*8, rotl64(A11, 10))
+    mem_store(st + 18*8, rotl64(A17, 15))
+    mem_store(st + 19*8, rotl64(A23, 56))
+    mem_store(st + 20*8, rotl64(A2, 62))
+    mem_store(st + 21*8, rotl64(A8, 55))
+    mem_store(st + 22*8, rotl64(A14, 39))
+    mem_store(st + 23*8, rotl64(A15, 41))
+    mem_store(st + 24*8, rotl64(A21, 2))
     // --- chi ---
     let B0 = mem_load(st + 0*8); let B1 = mem_load(st + 1*8); let B2 = mem_load(st + 2*8); let B3 = mem_load(st + 3*8); let B4 = mem_load(st + 4*8)
     let B5 = mem_load(st + 5*8); let B6 = mem_load(st + 6*8); let B7 = mem_load(st + 7*8); let B8 = mem_load(st + 8*8); let B9 = mem_load(st + 9*8)
@@ -139,24 +142,23 @@ fn keccak_f(st) {
 //   rate  = lane-rate in BYTES (136 for SHA3-256, 144 for SHA3-512, etc.)
 //   delim = domain suffix byte (0x06 for SHA-3, 0x1f for SHAKE)
 fn keccak_sponge(msg, mlen, rate, delim, out, outlen) {
+  // FIX-0.0.33: rewritten. Old version (a) absorbed a phantom zero block for
+  // mlen < rate (blocks=(mlen+rate)/rate >= 1 always), double-permuting, and
+  // (b) incremented `produced` by `rate` INSIDE the per-lane squeeze loop, so
+  // only the first 8 bytes of every digest were ever written.
   let st = mem_alloc(25)            // 25 i64 lanes (200 bytes)
   let i = 0
   while i < 25 { mem_store(st + i*8, 0); i = i + 1 }
-  // absorb (rate in bytes -> rate/8 lanes per block)
   let rate_lanes = rate >> 3
-  let blocks = (mlen + rate) / rate
-  let b = 0
-  while b < blocks {
-    let off = b * rate
+  // --- absorb full blocks ---
+  let off = 0
+  while off + rate <= mlen {
     let j = 0
     while j < rate_lanes {
-      // XOR message bytes into lane j (big-endian? Keccak is little-endian per lane)
       let lane = 0
       let k = 0
       while k < 8 {
-        let pos = off + j*8 + k
-        let bb = 0
-        if pos < mlen { bb = mem_load8(msg + pos) }
+        let bb = mem_load8(msg + off + j*8 + k)
         lane = lane | (bb << (k*8))
         k = k + 1
       }
@@ -164,53 +166,44 @@ fn keccak_sponge(msg, mlen, rate, delim, out, outlen) {
       j = j + 1
     }
     keccak_f(st)
-    b = b + 1
+    off = off + rate
   }
-  // pad: append delim then 0x00... then 0x80 at the last lane byte of the block
-  // (Handled by treating the message's remainder + padding in the final partial block.)
-  // Simpler robust approach: re-absorb the final partial block with padding.
-  let rem = mlen % rate
-  let last_off = (blocks - 1) * rate   // wait; for mlen < rate, blocks=1, last_off=0
-  // We already absorbed full blocks above. For the final (possibly partial) block we
-  // must absorb the tail + padding. Recompute tail block:
-  let tail_off = blocks * rate
-  // (if mlen is an exact multiple of rate and delim needs a new block, handle below)
-  // Absorb the remainder:
-  let jj = 0
-  while jj < rate_lanes {
+  // --- final block: remainder + pad10*1 (delim at first free byte, 0x80 at
+  //     the last byte of the block; if the message filled the block exactly,
+  //     this is a fresh padding-only block) ---
+  let rem = mlen - off
+  let j2 = 0
+  while j2 < rate_lanes {
     let lane = 0
     let k = 0
     while k < 8 {
-      let pos = tail_off + jj*8 + k
+      let idx = j2*8 + k
       let bb = 0
-      if pos < mlen { bb = mem_load8(msg + pos) }
-      // padding: first free byte gets delim; last lane byte of block gets 0x80
-      if pos == mlen { bb = delim }
-      if pos == ((blocks + 1) * rate - 1) { bb = bb | 0x80 }
+      if idx < rem { bb = mem_load8(msg + off + idx) }
+      if idx == rem { bb = delim }
+      if idx == rate - 1 { bb = bb | 0x80 }
       lane = lane | (bb << (k*8))
       k = k + 1
     }
-    mem_store(st + jj*8, mem_load(st + jj*8) ^ u64(lane))
-    jj = jj + 1
+    mem_store(st + j2*8, mem_load(st + j2*8) ^ u64(lane))
+    j2 = j2 + 1
   }
   keccak_f(st)
-  // squeeze
+  // --- squeeze ---
   let produced = 0
   while produced < outlen {
-    let j = 0
-    while j < rate_lanes {
-      let lane = mem_load(st + j*8)
+    let j3 = 0
+    while j3 < rate_lanes && produced < outlen {
+      let lane = mem_load(st + j3*8)
       let k = 0
-      while k < 8 {
-        if produced + j*8 + k < outlen {
-          mem_store8(out + produced + j*8 + k, u64(lane >> (k*8)) & 0xff)
-        }
+      while k < 8 && produced < outlen {
+        mem_store8(out + produced, u64(lane >> (k*8)) & 0xff)
+        produced = produced + 1
         k = k + 1
       }
-      j = j + 1
-      produced = produced + rate
-      if produced < outlen { keccak_f(st) }
+      j3 = j3 + 1
     }
+    if produced < outlen { keccak_f(st) }
   }
 }
 

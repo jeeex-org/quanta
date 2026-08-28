@@ -6,6 +6,10 @@
 //   2. the result is a plausible high stack address (>= 64KB),
 //   3. two reads in the same frame are deterministic (equal),
 //   4. a read inside a leaf function is also a plausible stack address.
+//   5. FIX-0.0.31 regression: rsp() in arithmetic with a LIVE LOCAL must use
+//      the real stack value, not the local (rsp()+z was miscompiled to z+z
+//      because the emitter wrote `mov rsp,rsp` (0xE4) instead of `mov rax,rsp`
+//      (0xE0) — a no-op that left the local's register in rax).
 // Prints 0 on full success; distinct exit codes identify the first failure.
 fn leaf() -> i64 { return rsp() }
 fn main() {
@@ -17,6 +21,14 @@ fn main() {
     if a != b { exit(3) }         // same frame, no calls between -> equal
     if d == 0 { exit(4) }
     if d < 65536 { exit(5) }
+    // FIX-0.0.31: builtin result + live local arithmetic
+    let z = 3
+    let r = rsp() + z
+    if r < 65536 { exit(6) }      // bug: r == z+z == 6
+    let s = rsp() - z
+    if s < 65536 { exit(7) }      // bug: s == z-z == 0
+    let m = rsp() * z
+    if m < 65536 { exit(8) }      // bug: m == z*z == 9
     println(0)
     exit(0)
 }

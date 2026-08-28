@@ -52,7 +52,9 @@ fn mat_identity(n) {
 fn mat_from_flat(arr, r, c) {
   let m = mat_new(r, c)
   let i = 0
-  while i < r * c { mat_set(m, i / c, i % c, mem_load(arr + 16 + i * 8)); i = i + 1 }
+  // FIX-0.0.34: Quanta array literals have an 8-byte header (length at +0),
+  // elements at +8 — was reading arr+16 (shifted by one slot).
+  while i < r * c { mat_set(m, i / c, i % c, mem_load(arr + 8 + i * 8)); i = i + 1 }
   return m
 }
 
@@ -177,54 +179,61 @@ fn vdot(a, b) {               // sum_i a_i * b_i over all elements
 }
 fn vnorm(a) { return sqrt(vdot(a, a)) }     // Euclidean norm (f64)
 
-// ---------------- determinant (int, Gaussian elimination w/ partial pivot) ----------------
+// ---------------- determinant (int, Bareiss fraction-free elimination) ----------------
+// FIX-0.0.35: old version used truncated integer division in Gaussian
+// elimination (f = row[col] / pivot), which is mathematically wrong — e.g.
+// det([[1,2],[3,4]]) returned -6 instead of -2. Bareiss keeps every
+// intermediate value an exact integer (division is always exact).
 fn mat_det(a) {
   let n = mat_rows(a)
-  // copy a into a flat working buffer
+  if n == 0 { return 0 }
+  if n == 1 { return mat_get(a, 0, 0) }
+  // copy a into a flat working buffer (matrix layout: rows@0, cols@8, elems@16)
   let buf = mem_alloc(n * n + 2)
   mem_store(buf, n); mem_store(buf + 8, n)
   let i = 0
   while i < n * n { mem_store(buf + 16 + i * 8, mat_get(a, i / n, i % n)); i = i + 1 }
-  let det = 1
-  let col = 0
-  while col < n {
-    // find pivot row >= col with largest |val|
-    let piv = col; let best = 0; let prow = col
+  let sign = 1
+  let prev = 1
+  let k = 0
+  while k < n - 1 {
+    // partial pivot: row >= k with largest |buf[row][k]|
+    let piv = k; let best = 0; let prow = k
     while prow < n {
-      let v = mem_load(buf + 16 + (prow * n + col) * 8)
+      let v = mem_load(buf + 16 + (prow * n + k) * 8)
       if v < 0 { v = -v }
       if v > best { best = v; piv = prow }
       prow = prow + 1
     }
     if best == 0 { return 0 }    // singular
-    // swap pivot row into position `col`
-    if piv != col {
+    if piv != k {
       let cc = 0
       while cc < n {
-        let t1 = mem_load(buf + 16 + (col * n + cc) * 8)
+        let t1 = mem_load(buf + 16 + (k * n + cc) * 8)
         let t2 = mem_load(buf + 16 + (piv * n + cc) * 8)
-        mem_store(buf + 16 + (col * n + cc) * 8, t2)
+        mem_store(buf + 16 + (k * n + cc) * 8, t2)
         mem_store(buf + 16 + (piv * n + cc) * 8, t1)
         cc = cc + 1
       }
-      det = -det
+      sign = -sign
     }
-    // eliminate below
-    let row = col + 1
+    let akk = mem_load(buf + 16 + (k * n + k) * 8)
+    // fraction-free update: a[i][j] = (akk*a[i][j] - a[i][k]*a[k][j]) / prev
+    let row = k + 1
     while row < n {
-      let f = mem_load(buf + 16 + (row * n + col) * 8) / mem_load(buf + 16 + (col * n + col) * 8)
-      let cc = col
+      let cc = k + 1
       while cc < n {
-        let nv = mem_load(buf + 16 + (row * n + cc) * 8) - f * mem_load(buf + 16 + (col * n + cc) * 8)
-        mem_store(buf + 16 + (row * n + cc) * 8, nv)
+        let num = akk * mem_load(buf + 16 + (row * n + cc) * 8) - mem_load(buf + 16 + (row * n + k) * 8) * mem_load(buf + 16 + (k * n + cc) * 8)
+        mem_store(buf + 16 + (row * n + cc) * 8, num / prev)
         cc = cc + 1
       }
+      mem_store(buf + 16 + (row * n + k) * 8, 0)
       row = row + 1
     }
-    det = det * mem_load(buf + 16 + (col * n + col) * 8)
-    col = col + 1
+    prev = akk
+    k = k + 1
   }
-  return det
+  return sign * mem_load(buf + 16 + ((n - 1) * n + (n - 1)) * 8)
 }
 
 // ---------------- inverse (f64, Gauss-Jordan) ----------------

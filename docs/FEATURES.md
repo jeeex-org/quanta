@@ -172,7 +172,7 @@ native type keyword parsing). `as` width casts (`x as T`) are done (0.0.90).
 | closures | closure literal `\|a\| { … }`, fnptr, closure_call | ✅ gate (closure_basic.quanta rc=6, closure_multi_param.quanta rc=7, closure_higher_order.quanta rc=42, fnptr_test.quanta rc=7) |
 | float arith | fadd, fsub, fmul, fdiv, i2f, f2i | ✅ gate (float_test.quanta rc=159, simple_fadd.quanta rc=7) |
 | float compare | feq, flt, fgt, fle, fge, fisnan, fisinf | ✅ gate (float_test.quanta rc=159) |
-| float math | sqrt, floor, ceil, abs, sin, cos, tan, pow, log | ✅ gate (float_test.quanta rc=159) for sqrt/floor/ceil/abs/pow/log; **sin/cos/tan implemented (x87) but NOT gated** — float_test.quanta has zero trig calls; trig gating scheduled 0.0.116. min/max are NOT yet implemented (see §G) |
+| float math | sqrt, floor, ceil, abs, sin, cos, tan, pow, log | ✅ gate (float_test.quanta rc=159) for sqrt/floor/ceil/abs/pow/log; **sin/cos/tan gated 0.0.116** (trig_test.quanta rc=0, bit-exact vs libm; FIX-0.0.45 fixed a wrong-vreg reload that made them always return 0). min/max are NOT core builtins — pure-Quanta in lib/std/math.quanta (see §G) |
 | process / env | getpid, getppid, arg_count, environ | ✅ gate (getpid_test.quanta, getppid_test.quanta, argc_test.quanta). getenv is a STUB returning 0 (see §I) |
 | stdin I/O | getc | ✅ gate (getc_test.quanta). getline untested-in-gate |
 | fs metadata | stat, fstat, lseek, unlink, mkdir, chdir, rename | ✅ 7/7 gated (fs_meta_test.quanta rc=11) — root cause: path-string remap applied +8 twice / not at all; fixed via `argp8` for string literals + `vreg_is_str` detection so `file_open` also accepts raw C-string pointers (e.g. argv). See §I. |
@@ -186,7 +186,7 @@ native type keyword parsing). `as` width casts (`x as T`) are done (0.0.90).
 
 | Group | Items | Test? |
 |---|---|---|
-| float math (remaining) | sin, cos, tan, pow, log, min, max | 🟡 sin/cos/tan/pow/log shipped as core builtins (emit_bltn P6.1a, x87) but trig never gated → **trig gate tests in 0.0.116**. min/max are NOT core builtins — implemented in pure Quanta in lib/std/math.quanta (genuine stdlib story, complete, gated via std_math_test rc=19). |
+| float math (remaining) | sin, cos, tan, pow, log, min, max | ✅ sin/cos/tan/pow/log shipped as core builtins (emit_bltn P6.1a, x87); trig gated 0.0.116 (trig_test.quanta rc=0, bit-exact vs libm after FIX-0.0.45). min/max are NOT core builtins — implemented in pure Quanta in lib/std/math.quanta (genuine stdlib story, complete, gated via std_math_test rc=19). |
 | string ops | strcat, substr, str_split, utf8 | ✅ gate (strcat_test rc=6, substr_test rc=3, str_split_test rc=0, utf8_test rc=5). strcat/substr in 0.0.102; str_split + utf8 in 0.0.104. utf8 decodes UTF-8 bytes → qword array of scalar codepoints. strcmp is really str_eq/str_ne (already shipped). |
 | atomics | atomic_load/store/add/swap/cmpxchg | ✅ 5/5 gated (atomic_test.rc=11). **futex + thread create/join scheduled 0.0.119** (atomics without blocking/spawn is half a concurrency feature). |
 | networking | socket/connect/bind/listen/accept | ✅ 5/5 gated (net_test.rc=11). **send/recv (sc 44/45) scheduled 0.0.118** — no data transfer today; net_test only exercises socket+connect+close. |
@@ -230,9 +230,9 @@ it; 🟡 file-only = a test file exists on disk but is NOT in the gate; ❌ none
 |---|---|---|---|
 | `big` (arbitrary-precision int) | → **core** (0.0.114) | ✅ gate | **Moved to the core type system in 0.0.114 — see §B Core Types.** `lib/std/big.quanta` remains the implementation (now fully annotated with `: big` / `-> big`); the 4 original stages (ADD/SUB/MUL, DIV/MOD, SHL/SHR, decimal print + Karatsuba) plus first-class keyword, operator routing, and int→big promotion are all core features now. Gated `big_test.quanta` (rc=0). |
 | `crypto` (SHA-256/HMAC/AES/CSPRNG) | ✅ done | ✅ gate | std_crypto_test.quanta (rc=3, gated at 0.0.87). 643 lines, 21 fns. |
-| `quantum` (Keccak/SHA3/SHAKE) | ✅ done | 🟡 scheduled 0.0.116 | lib/std/quantum.quanta (240 lines, 8 fns). `quantum_test` gate test scheduled for 0.0.116 (audit close-off #2). |
-| `linalg` (matmul/transpose/det/inverse/vectors) | ✅ done | 🟡 scheduled 0.0.116 | lib/std/linalg.quanta (363 lines, 25 fns). `linalg_test` gate test scheduled for 0.0.116 (audit close-off #2). |
-| `math` (sqrt/floor/ceil/abs/sin/cos/tan/pow/log/min/max) | ✅ done | ✅ gate | std_math_test.quanta (rc=19, gated at 0.0.87; covers sqrt/floor/ceil/abs + pow/log/min/max/gcd/lcm — min/max are pure-Quanta stdlib fns, genuine stdlib story). Core-level sin/cos/tan gating scheduled **0.0.116**. |
+| `quantum` (Keccak/SHA3/SHAKE) | ✅ done | ✅ gate (0.0.116) | lib/std/quantum.quanta (8 fns). `quantum_test.quanta` (rc=0, 5 NIST/OpenSSL-verified vectors) landed 0.0.116 — exposed + fixed FIX-0.0.41 (Keccak rho+pi scrambled) and FIX-0.0.42 (sponge absorb/squeeze bugs); all digests now verified vs OpenSSL. |
+| `linalg` (matmul/transpose/det/inverse/vectors) | ✅ done | ✅ gate (0.0.116) | lib/std/linalg.quanta (25 fns). `linalg_test.quanta` (rc=0) landed 0.0.116 — exposed + fixed FIX-0.0.43 (mat_from_flat off-by-8) and FIX-0.0.44 (mat_det truncated division → Bareiss rewrite). |
+| `math` (sqrt/floor/ceil/abs/sin/cos/tan/pow/log/min/max) | ✅ done | ✅ gate | std_math_test.quanta (rc=19, gated at 0.0.87; covers sqrt/floor/ceil/abs + pow/log/min/max/gcd/lcm — min/max are pure-Quanta stdlib fns, genuine stdlib story). Core-level sin/cos/tan gated **0.0.116** (trig_test.quanta). |
 | `map` | ✅ done | ✅ gate | test_mmap.quanta / mmap1.quanta (both gated); std_map_test.quanta also gated at 0.0.87 (rc=6). |
 | `str` (string ops) | ✅ done | ✅ gate | string_keyword_case.quanta (gated); std_str_test.quanta also gated at 0.0.87 (rc=13). |
 | `vec` | ✅ done | ✅ gate | std_vec_test.quanta (rc=8, gated at 0.0.87). |
@@ -246,7 +246,7 @@ it; 🟡 file-only = a test file exists on disk but is NOT in the gate; ❌ none
 ## Summary counts (source-derived)
 - **Keywords (ktext): 57 codes defined; ~19 parsed, ~13 lexed-only gaps, rest partial.**
 - **Builtins registered: 87 (prefixes expanded).**
-- **Core tests in gate: 148** (EXPECTED.tsv, 148 rows — verified 2026-08-28, includes `big_test.quanta` landed with 0.0.114 and `rsp_test.quanta` added at 0.0.115). `std_*` tests are kept in a SEPARATE `test_suites/EXPECTED_STDLIB.tsv` (7 rows, now wired into the gate as the stdlib layer) and are NOT in the core gate (core-only rule); `mtu_*` multi-translation-unit experiments are also file-only. So ~11 code files are file-only (not in the gate count).
+- **Core tests in gate: 151** (EXPECTED.tsv, 151 rows — verified 2026-08-28, includes `big_test.quanta` landed with 0.0.114, `rsp_test.quanta` added at 0.0.115, and `quantum_test`/`linalg_test`/`trig_test` added at 0.0.116). `std_*` tests are kept in a SEPARATE `test_suites/EXPECTED_STDLIB.tsv` (7 rows, wired into the gate as the stdlib layer) and are NOT in the core gate (core-only rule). `mtu_*` multi-translation-unit fixtures are gated at 0.0.116 as their own MULTI-TU layer (`test_suites/scripts/multi_tu_tests.sh`, 3/3).
 - **Test framework note:** tests `return`/`exit` a *computed value* (not just 0); EXPECTED.tsv's
   `expected_rc` is that computed answer. So non-zero expected_rc entries are correct results, not
   hidden failures. Verified by reading test bodies (e.g. array_test.quanta returns 200 = a.1; simple_fadd.quanta

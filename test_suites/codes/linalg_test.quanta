@@ -1,0 +1,72 @@
+// linalg_test.quanta — 0.0.116 gate: lib/std/linalg (integer matrix ops).
+// Verifies mat_mul, mat_transpose, mat_add, mat_sub, mat_scal_i, mat_det,
+// mat_identity against hand-computed results. Any mismatch exits nonzero.
+// Prints 0 on full success; distinct exit codes identify the first failure.
+import std/linalg
+
+fn chk(got, want, code) {
+  if got != want { exit(code) }
+}
+
+fn main() {
+  // A = [[1,2],[3,4]]   B = [[5,6],[7,8]]
+  let A = mat_from_flat([1,2,3,4], 2, 2)
+  let B = mat_from_flat([5,6,7,8], 2, 2)
+
+  // --- mat_mul: A*B = [[19,22],[43,50]] ---
+  let M = mat_mul(A, B)
+  chk(mat_get(M,0,0), 19, 1)
+  chk(mat_get(M,0,1), 22, 2)
+  chk(mat_get(M,1,0), 43, 3)
+  chk(mat_get(M,1,1), 50, 4)
+
+  // --- mat_transpose(A) = [[1,3],[2,4]] ---
+  let T = mat_transpose(A)
+  chk(mat_get(T,0,0), 1, 5)
+  chk(mat_get(T,0,1), 3, 6)
+  chk(mat_get(T,1,0), 2, 7)
+  chk(mat_get(T,1,1), 4, 8)
+
+  // --- mat_add: A+B = [[6,8],[10,12]] ---
+  let S = mat_add(A, B)
+  chk(mat_get(S,0,0), 6, 9)
+  chk(mat_get(S,0,1), 8, 10)
+  chk(mat_get(S,1,0), 10, 11)
+  chk(mat_get(S,1,1), 12, 12)
+
+  // --- mat_sub: A-B = [[-4,-4],[-4,-4]] ---
+  let D = mat_sub(A, B)
+  chk(mat_get(D,0,0), -4, 13)
+  chk(mat_get(D,0,1), -4, 14)
+  chk(mat_get(D,1,0), -4, 15)
+  chk(mat_get(D,1,1), -4, 16)
+
+  // --- mat_scal_i: A*3 = [[3,6],[9,12]] ---
+  let C = mat_scal_i(A, 3)
+  chk(mat_get(C,0,0), 3, 17)
+  chk(mat_get(C,0,1), 6, 18)
+  chk(mat_get(C,1,0), 9, 19)
+  chk(mat_get(C,1,1), 12, 20)
+
+  // --- mat_det(A) = 1*4 - 2*3 = -2 ---
+  chk(mat_det(A), -2, 21)
+
+  // --- mat_det of a 3x3: [[2,0,0],[0,3,0],[0,0,4]] = 24 ---
+  let D3 = mat_from_flat([2,0,0,0,3,0,0,0,4], 3, 3)
+  chk(mat_det(D3), 24, 22)
+
+  // --- mat_identity(3): diagonal 1, off-diagonal 0 ---
+  let I = mat_identity(3)
+  chk(mat_get(I,0,0), 1, 23)
+  chk(mat_get(I,1,1), 1, 24)
+  chk(mat_get(I,2,2), 1, 25)
+  chk(mat_get(I,0,1), 0, 26)
+  chk(mat_get(I,2,0), 0, 27)
+
+  // --- singular matrix det = 0: [[1,2],[2,4]] ---
+  let SG = mat_from_flat([1,2,2,4], 2, 2)
+  chk(mat_det(SG), 0, 28)
+
+  println(0)
+  exit(0)
+}
