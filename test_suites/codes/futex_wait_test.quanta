@@ -1,0 +1,20 @@
+// 0.0.124 (FIX-0.0.47): exercise futex_wait + the negative-errno clamp (FIX-0.0.37).
+//   futex_wait(addr, expected): blocks only if *addr == expected.
+//   Here *addr = 5 but we wait for expected 0 -> kernel returns EAGAIN (-11)
+//   immediately; the builtin clamps the negative retval to 0 (no crash, no hang).
+//   Also covers futex_wake error clamp: futex_wake(0, 1) (bad addr) must return 0,
+//   not the raw -EFAULT (rc=242) that 0.0.123 produced.
+//   exit(1) = futex_wait did not clamp to 0 (hung or wrong retval)
+//   exit(2) = futex_wake(bad addr) did not clamp to 0
+//   exit(0) = success
+
+fn main() {
+    let addr = mem_alloc(16)
+    // *addr = 5 (so a wait-for-0 returns immediately with EAGAIN)
+    addr[0] = 5
+    let w = futex_wait(addr, 0)
+    if w != 0 { exit(1) }
+    let bad = futex_wake(0, 1)
+    if bad != 0 { exit(2) }
+    return 0
+}
