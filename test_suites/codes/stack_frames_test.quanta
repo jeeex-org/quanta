@@ -1,0 +1,36 @@
+// 0.0.120: stack_frames() full unwind.
+// stack_frames() returns a qword-array of return addresses walking the rbp
+// frame chain. Called deep inside nested functions, it must observe >= 4 frames
+// (leaf, mid2, mid1, main) and every address must be a real code pointer in
+// [0x400000, 0x412000). Address-independent, stable across builds.
+//   exit(1) = too few frames
+//   exit(2) = a frame address < 0x400000 (not code)
+//   exit(3) = a frame address > 0x412000 (past code end)
+//   exit(4) = two adjacent frames are identical (walk didn't advance)
+//   exit(0) = success
+
+fn leaf() -> i64[] {
+    return stack_frames()
+}
+fn mid2() -> i64[] {
+    return leaf()
+}
+fn mid1() -> i64[] {
+    return mid2()
+}
+fn main() {
+    let frames = mid1()
+    let n = len(frames)
+    if n < 4 { exit(1) }
+    let i = 0
+    let prev = 0
+    while i < n {
+        let ra = frames[i]
+        if ra < 4194304 { exit(2) }       // < 0x400000
+        if ra > 4268032 { exit(3) }       // > 0x412000 (CODE_VBASE + generous code cap)
+        if i > 0 && ra == prev { exit(4) } // walk didn't advance
+        prev = ra
+        i = i + 1
+    }
+    exit(0)
+}
