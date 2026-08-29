@@ -94,6 +94,41 @@ EXTERN_RC=${EXTERN_RC:-0}
 [ "$EXTERN_FAIL" -eq 0 ] && EXTERN_RC=0 || EXTERN_RC=1
 if [ $EXTERN_RC -ne 0 ]; then FUNCTIONAL_RC=1; fi
 
+# --- Stage 1.6: EXTERN "C" FFI via DIRECT LINKER (GCC-FREE, PLT/GOT) ----------
+# 0.0.122 deliverable: a Quanta EXE links libc symbols STANDALONE without gcc.
+# qc emits the relocatable .o (R_X86_64_PLT32 relocs); the system linker `ld`
+# emits the PLT/GOT + PT_INTERP. quanta_link.sh drives `ld` with the Linux
+# glibc interpreter. This is the fixpoint-safe alternative to hand-rolling a
+# dynamic ELF inside write_elf (which breaks the self-host, per
+# references/extern-c-and-dynamic-elf-bootstrap-trap.md).
+echo ""
+echo "########## EXTERN \"C\" FFI LAYER (object mode + ld, GCC-FREE) ##########"
+EXTERN_LD_FAIL=0
+while IFS=$'\t' read -r name sentinel; do
+  src="$TEST_SUITES/codes/$name"
+  [ -f "$src" ] || continue
+  obj="$TEST_SUITES/bin/${name%.quanta}_ld.o"
+  bin="$TEST_SUITES/bin/${name%.quanta}_ld"
+  if ! $QC --emit-obj "$src" "$obj" 2>/tmp/extern_ld_stderr.txt; then
+    echo "  FAIL (compile) $name  $(cat /tmp/extern_ld_stderr.txt)"
+    EXTERN_LD_FAIL=$((EXTERN_LD_FAIL + 1)); continue
+  fi
+  if ! ./scripts/quanta_link.sh "$obj" "$bin" 2>/tmp/extern_ld_link.txt; then
+    echo "  FAIL (link) $name  $(cat /tmp/extern_ld_link.txt)"
+    EXTERN_LD_FAIL=$((EXTERN_LD_FAIL + 1)); continue
+  fi
+  got=$("$bin" 2>&1)
+  if echo "$got" | grep -q "$sentinel"; then
+    echo "  PASS extern-ld $name (sentinel '$sentinel' found)"
+  else
+    echo "  FAIL extern-ld $name (expected sentinel '$sentinel', got: '$got')"
+    EXTERN_LD_FAIL=$((EXTERN_LD_FAIL + 1))
+  fi
+done < "$TEST_SUITES/EXTERN_EXPECTED.tsv"
+EXTERN_LD_RC=0
+[ "$EXTERN_LD_FAIL" -eq 0 ] && EXTERN_LD_RC=0 || EXTERN_LD_RC=1
+if [ $EXTERN_LD_RC -ne 0 ]; then FUNCTIONAL_RC=1; fi
+
 # --- Stage 2: SECURITY layer (overflow traps, OOB, malformed/garbage input) ---
 echo ""
 echo "########## SECURITY TEST LAYER ##########"
@@ -221,6 +256,7 @@ fi
 echo "=== GATE SUMMARY ==="
 echo "  functional : $([ $FUNCTIONAL_RC = 0 ] && echo GREEN || echo RED)"
 echo "  extern-c  : $([ $EXTERN_RC = 0 ] && echo GREEN || echo RED)  (object-mode + gcc libc link)"
+echo "  extern-ld : $([ $EXTERN_LD_RC = 0 ] && echo GREEN || echo RED)  (object-mode + ld, GCC-FREE 0.0.122)"
 echo "  security   : $([ $SECURITY_RC = 0 ] && echo GREEN || echo RED)  (KNOWN bugs reported by script, not blocking)"
 echo "  performance: $([ $PERF_RC = 0 ] && echo GREEN || echo RED)"
 echo "  valgrind   : $([ $VALGRIND_RC = 0 ] && echo GREEN || echo RED)  (compiler binary leak/error scan)"
