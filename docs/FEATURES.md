@@ -140,7 +140,7 @@ native type keyword parsing). `as` width casts (`x as T`) are done (0.0.90).
 | user fn overrides builtin | ✅ done (0.0.68) | ✅ gate | user_fn_beats_builtin.quanta (rc=42), user_fn_beats_builtin_chain.quanta (rc=38), builtin_still_inline.quanta (rc=3). EXCEPTION: mem_load/mem_store/mem_load8/mem_store8 + fadd/fsub/fmul/fdiv are primitive intrinsics and NOT overridable |
 | fnptr + closure_call | ✅ done (0.0.72) | ✅ gate | fnptr_test.quanta (rc=7). fnptr returns a [codeptr, env=0] tuple; before 0.0.72 feeding it to closure_call SEGFAULTed |
 | const redefinition | ✅ done (0.0.75) | ✅ gate | const_redefine.quanta (rc=5, was 10). First value wins; duplicate skipped |
-| closure captures | ✅ done (0.0.67) | ✅ gate | closure_capture.quanta (rc=15), closure_capture_multi.quanta (rc=11), closure_capture_byvalue.quanta (rc=11). Free vars captured BY VALUE into heap env; IR_CAPREAD from env in r10; max 32 captures. **By-ref capture (mutate enclosing local) scheduled 0.0.121.** |
+| closure captures | ✅ done (0.0.67 value, 0.0.121 by-ref) | ✅ gate | closure_capture.quanta (rc=15), closure_capture_multi.quanta (rc=11), closure_capture_byvalue.quanta (rc=11). Free vars captured BY VALUE into heap env (0.0.67). **By-ref capture landed in 0.0.121**: a closure can now mutate an enclosing local via `&enclosing_slot` env pointers (`IR_CAPREAD=82`/`IR_CAPWRITE=83`); gated by ca1/ca2/ca3/clo_wr/clo1/clo2/clo3/closure_capture/cw1/closure_dbg/closure_byref_test (all PASS). **Escape hazard:** returning/storing a closure capturing a stack-local is a compile-time error (`error: by-ref closure escapes a stack-local (dangling pointer)`); capturing a param is allowed. Max CAP_MAX=32 captures. |
 
 ## E. Memory & Runtime
 

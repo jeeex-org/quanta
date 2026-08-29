@@ -1,0 +1,1178 @@
+// === IR OPS ===
+let IR_CONST = 0; let IR_MOV = 1; let IR_ADD = 2; let IR_SUB = 3
+let IR_MUL = 4; let IR_DIV = 5; let IR_MOD = 6
+let IR_EQ = 7; let IR_NE = 8; let IR_LT = 9; let IR_GT = 10
+let IR_LE = 11; let IR_GE = 12; let IR_AND = 13; let IR_OR = 14
+let IR_NEG = 15; let IR_NOT = 16; let IR_CALL = 17; let IR_LABEL = 18
+let IR_CALL_IDX = 78   // 0.0.97: like IR_CALL but a0 carries the fn INDEX directly
+                        // (no name ptr) — used by operator overloads to avoid
+                        // source-name lookup/corruption. Patch type 2 resolves it.
+let IR_JMP = 19; let IR_BR = 20; let IR_RET = 21; let IR_PARAM = 22
+let IR_STR = 23
+let IR_BAND = 24; let IR_BOR = 25; let IR_BXOR = 26; let IR_BNOT = 27; let IR_SHL = 28; let IR_SHR = 29
+let IR_LOADG = 30; let IR_STOREG = 31
+// t10: closure-call IR — fnb is a mk_any tuple (tag=codeptr, val=env).
+// IR_CLOSURE_CALL carries (fnb_vreg, caller-arg MOV-start, caller-argc);
+// its codegen does the env-shift + indirect call. Bound to 36 to avoid
+// colliding with the inline field-index 32 and the existing 33/34/35 ops.
+let IR_CLOSURE_CALL = 36
+// P3: extern linkage flag for function table (C ABI, no name mangling)
+let FN_EXTERN = 1
+// IR_IDX = 32 (a[idx] / t.N: 8-byte load at base+idx*8) — inlined constant, not a global
+// IR_ISTORE = 33 (a[idx]=v / t.N=v: 8-byte store at base+idx*8)
+let IR_ISTORE = 33
+// IR_TALLOC = 34 (t.N tuple return): allocate n*8 bytes (mmap) -> pointer in res
+let IR_TALLOC = 34
+// t10: fnptr(FNAME) -> code pointer as a runtime value.
+// IR_FNPTR carries the function index; codegen emits PIC lea rax,[rip+disp].
+let IR_FNPTR = 35
+// IR_FREE = 37 (P2 ownership): free the mem_alloc-owned binding in a0 at scope end.
+// Compiler inserts these automatically (ownership-by-default); app code never calls free.
+let IR_FREE = 37
+// P6.1a: f64 float support. A float value lives in the SAME 64-bit vreg slot as an
+// int (both 64 bits), but is tagged via vreg_is_flt[vr]=1 so codegen routes it to the
+// FP register file (xmm on x86, v/d on ARM) instead of GP regs.
+let IR_FCONST = 38   // a0 = IEEE-754 f64 bit pattern; result vreg tagged float
+let IR_FADD = 39; let IR_FSUB = 40; let IR_FMUL = 41; let IR_FDIV = 42
+let IR_F2I = 43      // double -> int64 (truncate): result vreg tagged INT
+let IR_I2F = 44      // int64 -> double: result vreg tagged FLOAT
+// float comparison ops reuse IR_EQ/IR_NE/IR_LT/IR_GT/IR_LE/IR_GE but on float vregs
+// (codegen checks vreg_is_flt to pick comisd / fcmp instead of cmp).
+
+// P6.1b: enum/match/Option/Result IR ops
+// Enum: sum type with discriminant + payload. Tag stored at offset 0, payload at 8+
+let IR_ENUM = 45     // create enum variant: (tag, payload...) -> IR_TALLOC + store tag
+let IR_MATCH = 46    // match expression: discriminant + arms -> jump table
+let IR_SOME = 47     // Option::Some(payload) - variant tag 1
+let IR_NONE = 48     // Option::None - variant tag 0
+let IR_OK = 49       // Result::Ok(payload) - variant tag 1
+let IR_ERR = 50      // Result::Err(payload) - variant tag 0
+let IR_UNWRAP = 51   // unwrap / ? operator - panic if None/Err
+let IR_TRY = 74      // P7: `?` operator. Like IR_UNWRAP but on tag==0 (None/Err)
+                      // early-returns the WHOLE value from the enclosing fn
+                      // (rax already holds the in-memory Option base) instead of
+                      // panicking. On tag==1 extracts payload [base+16].
+// Generics: monomorphization handled at compile time via type substitution
+// Interfaces: vtable-based dispatch (trait objects)
+let IR_VTABLE = 52   // construct vtable for trait impl
+let IR_DYN = 53      // dyn Trait: fat pointer (data, vtable)
+
+// P6: Low-level IR ops (raw pointers, inline asm, volatile)
+let IR_RAW_PTR = 54      // *T type (immutable raw pointer)
+let IR_MUT_PTR = 55      // *mut T type (mutable raw pointer)
+let IR_DEREF = 56        // *p (load through raw pointer)
+let IR_DEREF_MUT = 57    // *p = v (store through raw pointer)
+let IR_PTR_ADD = 58      // p + n (element-sized pointer arithmetic)
+let IR_PTR_SUB = 59      // p - n
+let IR_PTR_DIFF = 60     // p - q (elements)
+let IR_PTR_CAST = 61     // p as usize / usize as *T
+let IR_IS_NULL = 62      // p == 0
+let IR_VOLATILE_LOAD = 63   // volatile load (MMIO)
+let IR_VOLATILE_STORE = 64  // volatile store (MMIO)
+let IR_ASM = 65          // inline assembly
+let IR_FFI_CALL = 66     // FFI call
+let IR_VEC128 = 67       // SIMD vec128
+let IR_UNSAFE_BLOCK = 68 // unsafe block marker (no-op)
+let IR_ARRAY_LEN = 69    // get array length from header [base]
+// P10: Generics monomorphization
+let IR_GENERIC_INST = 70  // instantiate generic function with type args
+let IR_APUSH = 72         // P10: array push (qword append; header counts elements)
+let IR_ARRNEW = 73        // P10: runtime-count array alloc (n = VALUE of vreg a0).
+                          // IR_TALLOC's count is a compile-time literal; slices
+                          // need a runtime n, so this mirrors mem_alloc(n) but
+                          // loads n from the vreg's home slot instead of rdi.
+// P10: fn-value tuple: a0 = fn index -> [codeptr, env=0] 16-byte no-header
+// tuple (same layout mk_any produces), so fn-typed params called via
+// IR_CLOSURE_CALL work unchanged on both arches.
+let IR_FNVAL = 71
+// P11: closure literal with captures -> [codeptr, env] tuple (same layout as
+// IR_FNVAL/mk_any so IR_CLOSURE_CALL works on both). a0 = fn index of the
+// generated closure body (which expects env in r10); a1..an = captured vregs.
+let IR_CLOSURE = 76       // P11: closure literal -> [codeptr, env] tuple.
+                          // MUST NOT collide with any other opcode: it was
+                          // introduced at 72, which is IR_APUSH, so parse_let's
+                          // fn-value tagging misread every array push as a
+                          // closure and corrupted the result vreg (array push
+                          // silently returned 0). Regression vs 0.0.64.
+// P11 (0.0.67): read the k'th captured value out of the closure's env array.
+// a0 = capture slot index k. Valid only inside a closure body, where env
+// arrives in r10 (see IR_CLOSURE_CALL). Lowered as: mov rax,[r10+k*8].
+let IR_CAPREAD = 77
+// 0.0.121 BY-REF write opcode
+let IR_CAPWRITE = 83
+
+// 0.0.96: try/catch exception handling (real unwind via handler-chain).
+// NOTE: opcode 78 (IR_TRY) is ALREADY the `?` early-return operator — do NOT
+// reuse it here. These are distinct opcodes.
+let IR_TRY_PUSH = 82    // push a handler node (entering try block)
+let IR_CATCH = 79       // catch handler landing label (rax = thrown value on entry)
+let IR_TRY_END = 80     // pop handler node (normal exit of try block)
+let IR_THROW = 81       // throw a0 (unwind to nearest enclosing catch)
+
+// $$(cmd) external command substitution: returns CmdResult{out,code,err}
+// a0 = cmd vreg; result = CmdResult heap struct pointer
+let IR_SHCMD = 75
+
+// === GLOBAL BUFFERS ===
+// Source
+let src = mmap(16777216); let srclen = 0
+// include NAME  (compile-time inline expansion of internal stdlib, e.g. std/*)
+let mainsrc = mmap(16777216)            // the primary source file
+let impbufs = mmap(134217728)           // 8 x 16MB, indexed by include depth (avoids clobber)
+let imp_full = mmap(4096)               // resolved include path (NUL-terminated)
+let imp_dir = mmap(4096)                // current include dir (NUL-term); relative quoted paths resolve here
+let imp_dirlen = 0
+let imp_dir_stack = mmap(4096*9)        // saved include dirs per recursion depth
+let imp_dir_stacklen = mmap(8*9)
+// prefix byte buffers (string literals can't be used as byte-src in r8(); fill at startup)
+let imp_std_pfx = mmap(8)
+let imp_ext_pfx = mmap(8)
+let imp_lib_pfx = mmap(8)   // F8/0.0.30: 'lib/' search root for capability modules
+let imp_seen = mmap(8192); let imp_seenc = 0   // dedup: hashes of resolved paths
+let imp_err = 0
+// Tokens: 40 bytes each [type,value,line,col,len]
+let toks = mmap(320000000); let tokc = 0; let tokp = 0
+// $(name(args)) sigil paren-depth tracker: when >0 we are inside a $(…) sigil
+// and the PNCT handler skips the ')' that closes the $() (the one AFTER the
+// args' own ')'), so $(f(1,b)) does not leave a stray ')'.
+let dz = 0
+// NEW-3: parser recursion-depth guard. parse_expr->parse_primary->'('->parse_expr
+// is unbounded native-stack recursion; a few hundred nested parens segfaults qc.
+// pdepth tracks current expression nesting; parse_primary aborts past PDEPTH_MAX.
+let pdepth = 0; let PDEPTH_MAX = 30
+let unsafe_count = 0   // G1: total `unsafe {}` blocks parsed (CI gate counter)
+let dot_guard = 0   // DBG: guards against runaway dot-chain recursion
+// IR: 40 bytes each [op,res,a0,a1,a2]
+let ir = mmap(1073741824); let irc = 0
+let ir_dbg = mmap(64)
+// 0.0.55: literal-address map. Keyed by the literal's result vreg (vreg*8).
+// Populated during IR_STR codegen (str_addr is known there); read by emit_bltn
+// for qc_sys_cmd to load the cmd string's data-section address directly into
+// rdi. This sidesteps the fragile arg-record/vreg-copy path that caused every
+// $$(cmd) after the first to read a stale cmd (the previous call's command).
+let lit_addr = mmap(1073741824)
+// G2: per-IR-record "inside unsafe{}" flag (1 byte per record). Set in iremit
+// from unsafe_depth; read at emit so `unsafe {}` opts OUT of the overflow trap.
+// Parallel to `ir` (record i -> ir_unsafe[i]) because the IR record is full.
+let ir_unsafe = mmap(1073741824)   // sized to IR_CAP (26000000)
+let unsafe_depth = 0   // >0 while parsing inside an `unsafe {}` block
+// P7: track function body nesting for implicit match return
+let in_fn_body = 0    // 1 while parsing the outermost block of a function
+let blk_depth = 0     // nesting depth of braces inside the function (1 = function body)
+// DCE liveness byte-flags, allocated ONCE (per-function mmap collides with ir/code arenas)
+let live_bits = mmap(1000000)
+// Functions: 40 bytes each [name_ptr,name_len,body_tok,code_ofs,param_c]
+let fns = mmap(2000000); let fnc = 0
+let fn_var = mmap(2000000)   // per-fn variadic flag (1 if fn ends in ...)
+let fn_pcount = mmap(2000000)  // per-fn fixed param count
+// t4: param names for named-argument call resolution.
+let fn_pnames = mmap(4000000)   // flat [name_ptr,name_len] per param, fn_pbase-indexed
+let fn_pncnt = mmap(2000000)    // per-fn param count
+let fn_pbase = mmap(2000000)    // per-fn base offset into fn_pnames
+let fn_retstruct = mmap(2000000) // per-fn: struct index returned by `return StructCtor(...)` (-1 if none)
+// P10: per-fn return type name (for generic return types like [U])
+let fn_rettype_name = mmap(2000000)
+let fn_rettype_len = mmap(2000000)
+// Phase 4.3: per-fn-param struct type. fn_partype[(fi*200 + z)*8] = struct
+// index of param z's declared `: Type` annotation (-1 if scalar/none).
+let fn_partype = mmap(2000000)
+// P10: per-fn-param fn-pointer flag. fn_parfn[(fi*200 + z)*8] = 1 when the
+// param's declared type is fn(...) -> ... (indirect-call params).
+let fn_parfn = mmap(2000000)
+// 0.0.114: per-fn-param big-type flag. fn_parbig[(fi*200 + z)*8] = 1 when the
+// param is annotated `: big`, so entry.quanta tags the param vreg big.
+let fn_parbig = mmap(2000000)
+// 0.0.114: per-fn big-return flag. fn_retbig[fi*8] = 1 when the fn returns a
+// big (detected by scan_retbig: `return <big literal>` or `return big_*(...)`).
+// method.quanta tags the call-result vreg big so chained big ops keep working.
+let fn_retbig = mmap(800000)
+let alias_tab = mmap(8000000)   // t6: [name_ptr,name_len,target_idx]*N (24B each)
+let alias_c = 0
+let fn_poff = 0
+// P3: per-fn extern linkage flag (1 = extern "C", 0 = internal)
+let fn_extern = mmap(2000000)
+// P10: Generic function table extensions
+let fn_generic = mmap(2000000)      // 1 if function has generic params
+let fn_genparams = mmap(2000000)    // number of generic type params
+let fn_genparam_names = mmap(8000000) // flat [name_ptr,name_len] per generic param
+let fn_genparam_base = mmap(2000000)  // base offset into fn_genparam_names
+// Monomorphization cache: key = (fn_index, type_args_hash) -> instantiated_fn_index
+let mono_cache = mmap(2000000)
+let mono_cache_size = 0
+// FIX-0.0.9: struct stat buffer (144 bytes on x86-64; 256 for headroom) used by
+// the main-source size pre-check in entry.quanta. st_size lives at offset 48.
+let stat_buf = mmap(256)
+// P10: global scratch for generic scanning — locals inside scanfns reuse
+// register slots across nested blocks (bootstrap allocator), so the generic
+// parse state lives here where no local assignment can clobber it.
+let gscan_kstart = 0
+let gscan_gcount = 0
+let gscan_gpoff = 0
+let gscan_isgen = 0
+// === STRUCT TYPES (Phase 4.3) — named-field tuples ===
+// A struct is a compile-time record: name + ordered field names. Construction
+// `Name(a,b,...)` emits IR_TALLOC(n)+stores and tags the result vreg with the
+// struct index. Field access `obj.field` resolves field->index via the vreg's
+// struct tag. These helpers call ONLY builtins/wrappers (no user-fn calls while
+// locals are live) to avoid the allocator's caller-saved clobber.
+let struct_max = 256
+let structc = 0
+let sdefs = mmap(256 * 64)        // 64B/struct: [nameptr,namelen,fldcount,fldbase,0,0,0,0]
+let sfldtab = mmap(256 * 64 * 16) // flat field names: [fldptr,fldlen]*N (64 slots/struct max)
+let sfldtyp = mmap(256 * 64 * 8)  // per-field struct-type index (-1 if scalar); parallels sfldtab slots
+let vreg_struct = mmap(400000 * 8)  // vreg -> struct index (-1 if none); sized to VREG_CAP
+let vreg_is_str = mmap(400000 * 8)  // vreg -> 1 if it holds a byte-stride string (els -1); sized to VREG_CAP
+let vreg_is_big = mmap(400000 * 8)  // 0.0.114: vreg -> 1 if it holds a big-int (els -1); sized to VREG_CAP
+let vreg_str_arr = mmap(400000 * 8) // vreg -> 1 if it holds a qword-array of STRING-PTR elements (els -1); sized to VREG_CAP
+let tdefs = mmap(256 * 80)
+let tmethods = mmap(256 * 32 * 24)
+let idefs = mmap(256 * 96)
+let imethods = mmap(256 * 32 * 32)
+let vreg_trait = mmap(400000 * 8)
+let g_traitc = 0
+let g_implc = 0
+// P2 ownership: vreg_owned[vr]=1 iff vr was bound by `let p = mem_alloc(...)`...
+let vreg_owned = mmap(400000 * 8)
+// FIX-0.0.7: frame-context flag. 1 while ci_func is emitting a function body
+// (every ci_func body gets a push-rbp prologue, so [rbp+8] is a valid return
+// address there); 0 outside (e.g. the _start stub where rbp=argv). stack_trace()
+// reads this at emit time and degrades to rax=0 when no frame exists.
+let g_in_frame = 0
+let g_thread_ffi = 0   // 0.0.119: function index of the worker passed to thread_create (set by codegen, read by emit_bltn)
+let owned_stk = mmap(8192 * 8)
+let owned_top = 0
+let owned_scopes = mmap(8192 * 8)
+let owned_sctop = 0
+// P6.1a: vreg_is_flt[vr]=1 iff vr holds an f64 (routed to FP register file).
+let vreg_is_flt = mmap(400000 * 8)
+// P6.1b: vreg_type[vr] = type tag for unsigned/bool/char/byte (0=signed, 1=u8, 2=u16, 3=u32, 4=u64, 5=usize, 6=bool, 7=char, 8=byte)
+// 9 = mut, 10 = String (first-class string type)
+let vreg_type = mmap(400000 * 8)
+fn findstruct(nm, nl) {
+  let i = 0
+  while i < structc {
+    let onm = r64(sdefs + i*64); let onl = r64(sdefs + i*64 + 8)
+    if onl == nl {
+      let ok = 1; let j = 0
+      while j < nl { if r8(src+onm+j) != r8(src+nm+j) { ok = 0; break }; j = j+1 }
+      if ok == 1 { return i }
+    }
+    i = i+1
+  }
+  return -1
+}
+fn sfield_idx(si, fld, fl) {
+  let fc = r64(sdefs + si*64 + 16)
+  let fb = r64(sdefs + si*64 + 24)
+  let j = 0
+  while j < fc {
+    let fp = r64(sfldtab + (fb+j)*16); let fl2 = r64(sfldtab + (fb+j)*16 + 8)
+    if fl2 == fl {
+      let ok = 1; let k = 0
+      while k < fl { if r8(src+fp+k) != r8(src+fld+k) { ok = 0; break }; k = k+1 }
+      if ok == 1 { return j }
+    }
+    j = j+1
+  }
+  return -1
+}
+fn sfield_type(si, fidx) {
+  let fb = r64(sdefs + si*64 + 24)
+  return r64(sfldtyp + (fb+fidx)*8)
+}
+
+// P6.1b: enum types — sum types with discriminant + payload
+let enum_max = 64
+let enumc = 0
+let enums = mmap(64 * 96)     // 96B/enum: [nameptr,namelen,varcount,varbase,0,0,0,0,0,0,0,0]
+let evartab = mmap(64 * 32 * 40) // variants: [nameptr,namelen,tag,fcount,fldbase] (40B/variant, 32 variants/enum max)
+let evfldtab = mmap(64 * 32 * 8 * 16) // variant fields: [fldptr,fldlen]*N (8 fields/variant max)
+let evfldtyp = mmap(64 * 32 * 8 * 8)  // per-field struct type index (-1 if scalar)
+let vreg_enum = mmap(400000 * 8)  // vreg -> enum index (-1 if none); sized to VREG_CAP
+let vreg_enum_var = mmap(400000 * 8) // vreg -> variant tag (0..n) when known; sized to VREG_CAP
+// P3: module registry — flat array of [nameptr, namelen] for registered `mod X` names.
+// Used by call resolution to recognize `X.fn()` as a module call.
+let modtab = mmap(64 * 16)  // 64 modules max, 16B each (nameptr, namelen)
+let modc = 0
+fn findenum(nm, nl) {
+  let i = 0
+  while i < enumc {
+    let onm = r64(enums + i*96); let onl = r64(enums + i*96 + 8)
+    if onl == nl {
+      let ok = 1; let j = 0
+      while j < nl { if r8(src+onm+j) != r8(src+nm+j) { ok = 0; break }; j = j+1 }
+      if ok == 1 { return i }
+    }
+    i = i+1
+  }
+  return -1
+}
+fn evariant_idx(ei, vnm, vnl) {
+  let vc = r64(enums + ei*96 + 16)
+  let vb = r64(enums + ei*96 + 24)
+  let j = 0
+  while j < vc {
+    let vp = r64(evartab + (vb+j)*40); let vl = r64(evartab + (vb+j)*40 + 8)
+    if vl == vnl {
+      let ok = 1; let k = 0
+      while k < vl { if r8(src+vp+k) != r8(src+vnm+k) { ok = 0; break }; k = k+1 }
+      if ok == 1 { return j }
+    }
+    j = j+1
+  }
+  return -1
+}
+fn evariant_tag(ei, vidx) {
+  return r64(evartab + (r64(enums + ei*96 + 24) + vidx)*40 + 16)
+}
+// mod_synth_name(modp, modl, basep, basel): write "mod.base\0" into src past srclen
+// and return the src pointer, so a fn declared inside `mod X` is registered as `X.base`.
+// findfn matches by exact byte comparison, so `X.base` resolves directly at call sites.
+fn mod_synth_name(mp, ml, bp, bl) {
+  let sp = srclen
+  let k = 0
+  while k < ml { w8(src+sp+k, r8(src+mp+k)); k = k+1 }
+  w8(src+sp+ml, 46)            // '.'
+  let k2 = 0
+  while k2 < bl { w8(src+sp+ml+1+k2, r8(src+bp+k2)); k2 = k2+1 }
+  w8(src+sp+ml+1+bl, 0)
+  srclen = sp + ml + 1 + bl + 1
+  return sp
+}
+// bvmark(): sentinel bit (1<<60) used to mark const-table entries that are bare enum
+// variant names (value = bvmark() + ei*1048576 + vidx). 1<<60 is far above any real const.
+fn bvmark() { return 1152921504606846976 }
+fn evariant_fields(ei, vidx) {
+  let vb = r64(enums + ei*96 + 24)
+  return r64(evartab + (vb+vidx)*40 + 32)  // fldbase
+}
+fn evariant_fcount(ei, vidx) {
+  return r64(evartab + (r64(enums + ei*96 + 24) + vidx)*40 + 24)
+}
+fn scannenums() {
+  let p = 0
+  while p < tokc {
+    if tokt(p) == TT_ENUM {
+      let nt = p+1
+      if nt<tokc && tokt(nt)==TT_ID {
+        let onm = tokv(nt); let onl = tokln(nt)
+        let bp = nt+1
+                while bp<tokc && !(tokt(bp)==TT_PNCT && tokv(bp)==123) { bp = bp+1 }
+                if bp<tokc {
+                  let ei = enumc; enumc = ei+1
+                  w64(enums + ei*96, onm); w64(enums + ei*96 + 8, onl)
+                  w64(enums + ei*96 + 24, ei*32)   // varbase = ei*32 (32 variant slots/enum)
+                  let vc = 0; let cp = bp+1
+          while cp<tokc && !(tokt(cp)==TT_PNCT && tokv(cp)==125) {
+            if tokt(cp)==TT_ID {
+              let vnm = tokv(cp); let vnl = tokln(cp)
+              // Optional explicit tag: `Variant = N` (N is a TT_NUM literal).
+              let vtag = vc
+              let np0 = cp+1
+              if np0<tokc && tokt(np0)==TT_OP && tokv(np0)==61 {
+                if np0+1<tokc && tokt(np0+1)==TT_NUM { vtag = tokv(np0+1); cp = np0+1 }
+              }
+              let slot = (ei*32 + vc)*40
+              w64(evartab + slot, vnm); w64(evartab + slot + 8, vnl)
+              w64(evartab + slot + 16, vtag)   // tag = explicit value or variant index (0-based)
+              w64(evartab + slot + 32, ei*32*8 + vc*8)   // fldbase
+              // Check for tuple-style payload: `Variant(Type)` or `Variant { field: Type, ... }`
+              let fc = 0; let np = cp+1
+              if np<tokc && tokt(np)==TT_PNCT && tokv(np)==40 {  // '(' tuple
+                np = np+1
+                while np<tokc && !(tokt(np)==TT_PNCT && tokv(np)==41) {
+                  if tokt(np)==TT_ID || tokt(np)==TT_KEY {
+                    let fldp = tokv(np); let fldl = tokln(np)
+                    let fslot = (ei*32*8 + vc*8 + fc)*16
+                    w64(evfldtab + fslot, fldp); w64(evfldtab + fslot + 8, fldl)
+                    // optional type annotation
+                    let ftyp = -1
+                    let tp = np+1
+                    if tp<tokc && tokt(tp)==TT_PNCT && tokv(tp)==58 { // ':'
+                      let typ = tp+1
+                      if typ<tokc && (tokt(typ)==TT_ID || tokt(typ)==TT_KEY) {
+                        let su = 0
+                        while su<structc {
+                          if r64(sdefs + su*64 + 8)==tokln(typ) {
+                            let sp=r64(sdefs + su*64); let sl=tokln(typ); let sm=0; let smatch=1
+                            while sm<sl { if r8(src+sp+sm)!=r8(src+tokv(typ)+sm) { smatch=0; break }; sm=sm+1 }
+                            if smatch==1 { ftyp=su; break }
+                          }
+                          su=su+1
+                        }
+                        if ftyp==-1 {
+                          let eu = 0
+                          while eu<enumc {
+                            if r64(enums + eu*96 + 8)==tokln(typ) {
+                              let ep=r64(enums + eu*96); let el=tokln(typ); let em=0; let ematch=1
+                              while em<el { if r8(src+ep+em)!=r8(src+tokv(typ)+em) { ematch=0; break }; em=em+1 }
+                              if ematch==1 { ftyp = eu | (1<<30); break }  // tag as enum
+                            }
+                            eu=eu+1
+                          }
+                        }
+                      }
+                      np = tp+1
+                    }
+                    w64(evfldtyp + (ei*32*8 + vc*8 + fc)*8, ftyp)
+                    fc = fc+1
+                  }
+                  np = np+1
+                  if np<tokc && tokt(np)==TT_PNCT && tokv(np)==44 { np = np+1 } // ','
+                }
+                w64(evartab + slot + 24, fc)  // fcount
+                cp = np
+              } else if np<tokc && tokt(np)==TT_PNCT && tokv(np)==123 {  // '{' struct-style
+                np = np+1
+                while np<tokc && !(tokt(np)==TT_PNCT && tokv(np)==125) {
+                  if tokt(np)==TT_ID {
+                    let fldp = tokv(np); let fldl = tokln(np)
+                    let fslot = (ei*32*8 + vc*8 + fc)*16
+                    w64(evfldtab + fslot, fldp); w64(evfldtab + fslot + 8, fldl)
+                    let ftyp = -1
+                    let tp = np+1
+                    if tp<tokc && tokt(tp)==TT_PNCT && tokv(tp)==58 { // ':'
+                      let typ = tp+1
+                      if typ<tokc && (tokt(typ)==TT_ID || tokt(typ)==TT_KEY) {
+                        let su = 0
+                        while su<structc {
+                          if r64(sdefs + su*64 + 8)==tokln(typ) {
+                            let sp=r64(sdefs + su*64); let sl=tokln(typ); let sm=0; let smatch=1
+                            while sm<sl { if r8(src+sp+sm)!=r8(src+tokv(typ)+sm) { smatch=0; break }; sm=sm+1 }
+                            if smatch==1 { ftyp=su; break }
+                          }
+                          su=su+1
+                        }
+                        if ftyp==-1 {
+                          let eu = 0
+                          while eu<enumc {
+                            if r64(enums + eu*96 + 8)==tokln(typ) {
+                              let ep=r64(enums + eu*96); let el=tokln(typ); let em=0; let ematch=1
+                              while em<el { if r8(src+ep+em)!=r8(src+tokv(typ)+em) { ematch=0; break }; em=em+1 }
+                              if ematch==1 { ftyp = eu | (1<<30); break }
+                            }
+                            eu=eu+1
+                          }
+                        }
+                      }
+                      np = tp+1
+                    }
+                    w64(evfldtyp + (ei*32*8 + vc*8 + fc)*8, ftyp)
+                    fc = fc+1
+                  }
+                  np = np+1
+                  if np<tokc && tokt(np)==TT_PNCT && tokv(np)==44 { np = np+1 }
+                }
+                w64(evartab + slot + 24, fc)
+                cp = np
+              } else {
+                w64(evartab + slot + 24, 0)  // unit variant
+                // Register bare variant name as a MARKED const (value = bvmark()+ei*1048576+vidx)
+                // so bare `Green` resolves via the existing cfind path (method.quanta).
+                w64(consts + constc*24, vnm); w64(consts + constc*24 + 8, vnl)
+                w64(consts + constc*24 + 16, bvmark() + ei*1048576 + vc); constc = constc + 1
+              }
+              vc = vc+1
+            }
+            cp = cp+1
+          }
+          w64(enums + ei*96 + 16, vc)
+        }
+      }
+    }
+    p = p+1
+  }
+}
+
+fn scanstructs() {
+  // P11: register builtin CmdResult struct (return type of $$(cmd)) so that
+  // .out/.code/.err field access resolves. Injected into src past srclen
+  // (tokenization complete by the time scanstructs runs at startup).
+  let cnm = srclen
+  w8(src+cnm, 67); w8(src+cnm+1, 109); w8(src+cnm+2, 100); w8(src+cnm+3, 82); w8(src+cnm+4, 101); w8(src+cnm+5, 115); w8(src+cnm+6, 117); w8(src+cnm+7, 108); w8(src+cnm+8, 116); w8(src+cnm+9, 0)
+  srclen = cnm + 10
+  let si = structc; structc = si + 1
+  w64(sdefs + si*64, cnm); w64(sdefs + si*64 + 8, 9)
+  w64(sdefs + si*64 + 24, si*64)   // fldbase = si*64
+  // fields: out, code, err
+  let fbase = si*64
+  // out
+  let fon = srclen; w8(src+fon, 111); w8(src+fon+1, 117); w8(src+fon+2, 116); w8(src+fon+3, 0); srclen = fon + 4
+  w64(sfldtab + (fbase+0)*16, fon); w64(sfldtab + (fbase+0)*16 + 8, 3)
+  w64(sfldtyp + (fbase+0)*8, 0-2)   // out: string field (special marker -2)
+  // code
+  let fcn = srclen; w8(src+fcn, 99); w8(src+fcn+1, 111); w8(src+fcn+2, 100); w8(src+fcn+3, 101); w8(src+fcn+4, 0); srclen = fcn + 5
+  w64(sfldtab + (fbase+1)*16, fcn); w64(sfldtab + (fbase+1)*16 + 8, 4)
+  w64(sfldtyp + (fbase+1)*8, 0-1)   // code: scalar (int)
+  // err
+  let fen = srclen; w8(src+fen, 101); w8(src+fen+1, 114); w8(src+fen+2, 114); w8(src+fen+3, 0); srclen = fen + 4
+  w64(sfldtab + (fbase+2)*16, fen); w64(sfldtab + (fbase+2)*16 + 8, 3)
+  w64(sfldtyp + (fbase+2)*8, 0-2)   // err: STRING field (ptr to [len][bytes]) — was 0-1 (scalar) which made print(o.err) emit the pointer as an integer
+
+  w64(sdefs + si*64 + 16, 3)   // field count = 3
+  let p = 0
+  while p < tokc {
+    if (tokt(p)==TT_KEY || tokt(p)==TT_ID) {
+      let nm = tokv(p); let nl = tokln(p)
+      // match keyword/ident "struct" (len 6)
+      if nl==6 && r8(src+nm)=='s'&&r8(src+nm+1)=='t'&&r8(src+nm+2)=='r'&&r8(src+nm+3)=='u'&&r8(src+nm+4)=='c'&&r8(src+nm+5)=='t' {
+        let nt = p+1
+        if nt<tokc && tokt(nt)==TT_ID {
+          let onm = tokv(nt); let onl = tokln(nt)
+          let bp = nt+1
+          while bp<tokc && !(tokt(bp)==TT_PNCT && tokv(bp)==123) { bp = bp+1 }
+          if bp<tokc {
+            let si = structc; structc = si+1
+            w64(sdefs + si*64, onm); w64(sdefs + si*64 + 8, onl)
+            w64(sdefs + si*64 + 24, si*64)   // fldbase = si*64 (64 field slots/struct)
+            let fc = 0; let cp = bp+1
+            while cp<tokc && !(tokt(cp)==TT_PNCT && tokv(cp)==125) {
+              if tokt(cp)==TT_ID {
+                let fldp = tokv(cp); let fldl = tokln(cp)
+                // P6.2: reject a field token that is the struct's own name
+                // (e.g. `struct S { x S }` — `S` here is a self-reference by name,
+                // which is infinitely sized and yields a malformed binary). This
+                // catches the bare `field Name` form that the `: Type` colon block
+                // (below) does not see.
+                if fldl==onl {
+                  let sm2=0; let selfref=1
+                  while sm2<fldl { if r8(src+fldp+sm2)!=r8(src+onm+sm2) { selfref=0; break }; sm2=sm2+1 }
+                  if selfref==1 { let mh="error: struct "; file_write(2, mh+8, len(mh)); file_write(2, onm, onl); let mc=" cannot contain itself as a field\n"; file_write(2, mc+8, len(mc)); had_error=1 }
+                }
+                let slot = (si*64 + fc)*16
+                w64(sfldtab + slot, fldp); w64(sfldtab + slot + 8, fldl)
+                // optional `: Type` annotation -> field holds a struct of that type
+                                let ftyp = 0-1
+                                let np = cp+1
+                                if np<tokc && tokt(np)==TT_PNCT && tokv(np)==58 {  // ':' separator
+                                  let tp = np+1
+                                  if tp<tokc && (tokt(tp)==TT_ID || tokt(tp)==TT_KEY) {
+                    // inline findstruct(tokv(tp), tokln(tp)) — must not call the
+                    // user fn here (live locals would be clobbered).
+                    let su=0
+                    while su<structc {
+                      if r64(sdefs + su*64 + 8)==tokln(tp) {
+                        let sp=r64(sdefs + su*64); let sl=tokln(tp); let sm=0; let smatch=1
+                        while sm<sl { if r8(src+sp+sm)!=r8(src+tokv(tp)+sm) { smatch=0; break }; sm=sm+1 }
+                        if smatch==1 {
+                            // P6.2: reject direct self-reference (struct S { x S }) —
+                            // it is infinitely sized and produces a malformed binary.
+                            if su==si { let mh="error: struct "; file_write(2, mh+8, len(mh)); file_write(2, r64(sdefs+si*64), onl); let mc=" cannot contain itself as a field type\n"; file_write(2, mc+8, len(mc)); had_error=1 }
+                            else { ftyp=su }
+                            break
+                        }
+                      }
+                      su=su+1
+                    }
+                  }
+                  // skip the ':' and the type-name token so the loop doesn't
+                  // re-scan them as field names. NOTE: only set cp to the type
+                  // token here — the loop's trailing `cp = cp+1` below advances
+                  // past it exactly once. An extra `cp = cp+1` here would skip
+                  // the struct's closing '}' and pollute the field table with
+                  // every later token (fn/let/vars) as phantom fields.
+                  cp = tp
+                }
+                w64(sfldtyp + (si*64 + fc)*8, ftyp)
+                fc = fc+1
+              }
+              cp = cp+1
+            }
+            w64(sdefs + si*64 + 16, fc)
+          }
+        }
+      }
+    }
+    p = p+1
+  }
+  // Phase 4.3: scan each fn signature for param `: Type` annotations and record
+  // the param's struct type in fn_partype, so `area(r)` params get tagged and
+  // `r.field` resolves inside the function body.
+  let fi = 0
+  while fi < fnc {
+    let pbase = r64(fn_pbase + fi*8)
+    let pcount = r64(fn_pcount + fi*8)
+    let z = 0
+    while z < pcount {
+      // recover this param's declared name token by re-scanning the signature
+      let pnm = r64(fn_pnames + pbase + z*16)
+      let pnl = r64(fn_pnames + pbase + z*16 + 8)
+      // find the param's token index in the signature (match name, first at depth)
+      let bt = fn_btok(fi)
+      // The signature `(` precedes the body `{`. Scan backward from the body
+      // to the `)` that closes the signature, then to its matching `(`.
+      let rp = bt
+      while rp>=0 {
+        if tokt(rp)==TT_PNCT && tokv(rp)==41 { break }
+        rp = rp-1
+      }
+      let lp = rp
+      while lp>=0 {
+        if tokt(lp)==TT_PNCT && tokv(lp)==40 { break }
+        lp = lp-1
+      }
+      if lp>=0 {
+        // find the z-th ID param at depth 1 (mirrors scanfns param scan)
+        let k = lp+1; let depth = 1; let seen = 0; let ptok = -1
+        while k < tokc {
+          let tk = tokt(k)
+          if tk==TT_PNCT {
+            let tv = tokv(k)
+            if tv==40 { depth = depth+1 }
+            else if tv==41 { break }
+            else if depth==1 && tv==44 { /* next param */ }
+          }
+          if depth==1 && tk==TT_ID {
+            // match this param's name
+            if seen==z {
+              let nm = tokv(k); let nln = tokln(k)
+              let mok = 1; let mm = 0
+              while mm < nln { if r8(src+nm+mm) != r8(src+pnm+mm) { mok=0; break }; mm=mm+1 }
+              if mok==1 { ptok = k; break }
+            }
+            seen = seen+1
+          }
+          k = k+1
+        }
+        if ptok>=0 {
+          // check ptok+1 == ':' and ptok+2 == TT_KEY Type
+          let ptyp = 0-1
+          if ptok+2<tokc && tokt(ptok+1)==TT_PNCT && tokv(ptok+1)==58 && (tokt(ptok+2)==TT_ID || tokt(ptok+2)==TT_KEY || tokt(ptok+2)==TT_TRAIT) {
+            let tnm = tokv(ptok+2); let tln = tokln(ptok+2)
+            let su = 0
+            while su < structc {
+              if r64(sdefs + su*64 + 8)==tln {
+                let sp = r64(sdefs + su*64); let sm = 0; let smatch = 1
+                while sm < tln { if r8(src+sp+sm) != r8(src+tnm+sm) { smatch=0; break }; sm=sm+1 }
+                if smatch==1 { ptyp = su; break }
+              }
+              su = su+1
+            }
+            // P9: also check for trait type
+            if ptyp == 0-1 {
+              let ti = 0
+              while ti < g_traitc {
+                let onm = r64(tdefs + ti*80); let onl = r64(tdefs + ti*80 + 8)
+                if onl == tln {
+                  let ok = 1; let k = 0
+                  while k < tln { if r8(src+onm+k) != r8(src+tnm+k) { ok = 0; break }; k = k+1 }
+                  if ok == 1 { ptyp = 0 - (ti + 2); break }  // negative = trait type
+                }
+                ti = ti+1
+              }
+            }
+          }
+          w64(fn_partype + (fi*200 + z)*8, ptyp)
+        }
+      }
+      z = z+1
+    }
+    fi = fi+1
+  }
+}
+// Phase 4.3: record, per function, the struct index it returns (when its body
+// has `return StructName(...)`). This lets `let q = make(...)` tag q's
+// call-result vreg with make's return struct, so `q.field` resolves.
+// NOTE: the struct-name comparison is INLINED (not a findstruct() call) because
+// this function keeps many locals live across the scan; a user-fn call would
+// trigger the allocator's caller-saved clobber and corrupt the loop state.
+fn scan_retstructs() {
+  let fi = 0
+  while fi < fnc {
+    w64(fn_retstruct + fi*8, 0-1)   // default: no struct return
+    let bt = fn_btok(fi)
+    // find the matching '}' that closes this fn body
+    let depth = 0; let p = bt; let end = tokc; let started = 0
+    while p < tokc {
+      if tokt(p)==TT_PNCT&&tokv(p)==123 { depth = depth+1; started = 1 }
+      else if tokt(p)==TT_PNCT&&tokv(p)==125 { depth = depth-1; if started==1&&depth==0 { end = p; break } }
+      p = p+1
+    }
+    // scan body for `return StructName(` -> record struct index
+    let q = bt
+    while q < end {
+      // `return` keyword: name len 6, bytes 'return'
+      if tokt(q)==TT_KEY && tokln(q)==6 && r8(src+tokv(q))=='r'&&r8(src+tokv(q)+1)=='e'&&r8(src+tokv(q)+2)=='t'&&r8(src+tokv(q)+3)=='u'&&r8(src+tokv(q)+4)=='r'&&r8(src+tokv(q)+5)=='n' {
+        let r = q+1
+        if r<end && tokt(r)==TT_ID {
+          // inline findstruct(tokv(r), tokln(r))
+          let si = 0; let found = 0
+          while si < structc {
+            let onm = r64(sdefs + si*64); let onl = r64(sdefs + si*64 + 8)
+            if onl == tokln(r) {
+              let ok = 1; let k = 0
+              while k < tokln(r) { if r8(src+onm+k) != r8(src+tokv(r)+k) { ok = 0; break }; k = k+1 }
+              if ok == 1 { found = 1; break }
+            }
+            si = si+1
+          }
+          if found == 1 { w64(fn_retstruct + fi*8, si) }
+        }
+      }
+      q = q+1
+    }
+    fi = fi+1
+  }
+}
+// 0.0.114: record, per function, whether it returns a big. Detected at the
+// token level: `return <big literal>` (TT_BIGNUM) or `return big_*(...)`
+// (TT_ID whose name starts with "big_"). method.quanta reads fn_retbig to tag
+// the call-result vreg big so chained big ops keep working.
+fn scan_retbig() {
+  let fi = 0
+  while fi < fnc {
+    w64(fn_retbig + fi*8, 0)   // default: not big-returning
+    let bt = fn_btok(fi)
+    // 0.0.114: EXPLICIT return annotation `-> big` takes priority. Scan backward
+    // from the body's '{' (bt) to the 'fn' keyword; if we hit a '->' operator
+    // (TT_OP value 45*256+62 = 11582) whose next token is the ID `big`
+    // (ktext==62), the function returns big. This is the reliable signal — the
+    // return-expression heuristic below misses fns that return a local (e.g.
+    // `return r`), which would otherwise leave a big pointer UNTAGGED and let
+    // call-site promotion double-wrap it in big_from_i64.
+    {
+      let sb = bt - 1
+      while sb >= 0 {
+        if tokt(sb)==TT_KEY && ktext(tokv(sb),tokln(sb))==1 { break }   // reached 'fn'
+        if tokt(sb)==TT_OP && tokv(sb)==11582 {                          // '->'
+          let nx = sb + 1
+          if nx<tokc && tokt(nx)==TT_ID && ktext(tokv(nx),tokln(nx))==62 { w64(fn_retbig + fi*8, 1) }
+          break
+        }
+        sb = sb - 1
+      }
+    }
+    let depth = 0; let p = bt; let end = tokc; let started = 0
+    while p < tokc {
+      if tokt(p)==TT_PNCT&&tokv(p)==123 { depth = depth+1; started = 1 }
+      else if tokt(p)==TT_PNCT&&tokv(p)==125 { depth = depth-1; if started==1&&depth==0 { end = p; break } }
+      p = p+1
+    }
+    let q = bt
+    while q < end {
+      if tokt(q)==TT_KEY && tokln(q)==6 && r8(src+tokv(q))=='r'&&r8(src+tokv(q)+1)=='e'&&r8(src+tokv(q)+2)=='t'&&r8(src+tokv(q)+3)=='u'&&r8(src+tokv(q)+4)=='r'&&r8(src+tokv(q)+5)=='n' {
+        let r = q+1
+        if r<end && tokt(r)==TT_BIGNUM { w64(fn_retbig + fi*8, 1) }
+        else if r<end && tokt(r)==TT_ID && tokln(r)>=4 && r8(src+tokv(r))=='b'&&r8(src+tokv(r)+1)=='i'&&r8(src+tokv(r)+2)=='g'&&r8(src+tokv(r)+3)=='_' { w64(fn_retbig + fi*8, 1) }
+      }
+      q = q+1
+    }
+    fi = fi+1
+  }
+}
+                 // running byte offset into fn_pnames
+// t5: default-argument token ranges. For fn fi, param z with a default,
+// fn_defargs[(fi*64+z)*16] = token-start, +8 = token-end (exclusive) of the
+// default expression (the text after '=' up to ',', ')', '...', or EOF within
+// the signature). fn_pdfixed[fi] = number of leading params that have NO
+// default (the mandatory minimum arg count at the call site).
+let fn_defargs = mmap(8000000)
+let fn_pdfixed = mmap(2000000)
+// === FUNCTION SCOPES (lexical scoping of functions) ===
+// fn_parent[i] = enclosing function index for a local fn, or -1 for top-level.
+// A bare call `f()` resolves LOCAL-FIRST (walk parent chain), `$(f)` resolves
+// GLOBAL-ONLY (top-level table). fn_btok/fn_bdepth record the def site.
+let fn_parent = mmap(2000000)
+// fstack: runtime stack of function indices currently being parsed (top of chain
+// = innermost enclosing fn). fsp = stack pointer (number of entries).
+let fstack = mmap(2000000)
+let fsp = 0
+fn fn_push(i) { w64(fstack + fsp*8, i); fsp = fsp + 1 }
+fn fn_pop() { if fsp>0 { fsp = fsp - 1 } }
+fn fn_curscope() { if fsp>0 { return r64(fstack + (fsp-1)*8) } else { return -1 } }
+
+// === P11 CLOSURE CAPTURES (0.0.67) ===
+// A closure literal `|x| { x + y }` may reference locals of the ENCLOSING
+// function (`y`). Those free variables are captured BY VALUE into a heap `env`
+// array at closure-construction time; the body reads them back out of `env`,
+// which IR_CLOSURE_CALL passes in r10.
+//
+// Per closure fn index ci:
+//   cap_count[ci]              = number of captured variables
+//   cap_name[ci*CAP_MAX + k]   = source offset of the k'th captured name
+//   cap_nlen[ci*CAP_MAX + k]   = its length
+//   cap_vreg[ci*CAP_MAX + k]   = the ENCLOSING function's vreg holding the value
+//                                (read at construction time, in the enclosing
+//                                frame, which is where that vreg is live)
+// Inside the body, the k'th capture lives at env+k*8.
+let CAP_MAX = 32
+let cap_count = mmap(2000000)
+let cap_name  = mmap(2000000)
+let cap_nlen  = mmap(2000000)
+let cap_vreg  = mmap(2000000)
+// 0.0.121 BY-REF: the body-local capread vreg bound to each capture slot, so a
+// CAPWRITE can refresh it (otherwise `return count` reads the stale pre-load).
+let cap_bodyvreg = mmap(2000000)
+// cur_clo = fn index of the closure body currently being parsed, or -1.
+// Set by the main compile loop around a closure body so parse_primary knows a
+// free variable should become a capture instead of a hard error.
+let cur_clo = 0 - 1
+// 0.0.121 ESCAPE bookkeeping
+let vreg_clo = mmap(2000000)
+let clo_escapes = mmap(2000000)
+// Deferred escape-check list: closure vregs that are returned/stored are
+// recorded during parse (when captures aren't yet resolved) and verified AFTER
+// the whole program is parsed (captures registered lazily during closure-body
+// parse). See check_closure_escape / escape_run in globals.quanta.
+let escape_vregs = mmap(2000000)
+let escape_n = 0
+
+// Find an existing capture slot for (nm,nl) in closure ci, or -1.
+fn cap_find(ci, nm, nl) {
+    let k = 0
+    let n = r64(cap_count + ci*8)
+    while k < n {
+        let cn = r64(cap_name + (ci*CAP_MAX + k)*8)
+        let cl = r64(cap_nlen + (ci*CAP_MAX + k)*8)
+        if cl == nl {
+            let ok = 1; let j = 0
+            while j < nl { if r8(src+cn+j) != r8(src+nm+j) { ok = 0; break }; j = j + 1 }
+            if ok == 1 { return k }
+        }
+        k = k + 1
+    }
+    return 0 - 1
+}
+
+// Record (nm,nl)->outer vreg as a capture of closure ci; returns its slot index.
+// Idempotent: referencing the same free variable twice reuses one slot.
+fn cap_add(ci, nm, nl, outer_vr) {
+    let ex = cap_find(ci, nm, nl)
+    if ex >= 0 { return ex }
+    let n = r64(cap_count + ci*8)
+    if n >= CAP_MAX { emit_ovf() }
+    w64(cap_name + (ci*CAP_MAX + n)*8, nm)
+    w64(cap_nlen + (ci*CAP_MAX + n)*8, nl)
+    w64(cap_vreg + (ci*CAP_MAX + n)*8, outer_vr)
+    w64(cap_count + ci*8, n + 1)
+    return n
+}
+
+// 0.0.121 ESCAPE HAZARD: a by-ref closure stores &enclosing_slot (a pointer into
+// the enclosing stack frame). If the closure ESCAPES its defining function
+// (returned or stored to a global) while capturing a STACK-LOCAL of that
+// function, the pointer dangles once the enclosing fn returns -> memory-unsafe.
+// Capturing a PARAM is safe (the param lives in the caller's frame, still alive
+// when the closure runs). Capturing a const/global is safe (immutable / static).
+// So: reject iff the closure captures any LOCAL (mutable binding, vreg index at
+// or after the enclosing fn's param count) of its directly-enclosing function.
+// vr is the value being returned/stored; if it is a closure vreg (vreg_clo>=0)
+// we walk its captures and check each against the enclosing scope snapshot.
+fn check_closure_escape_ci(ci) {
+    if ci < 0 { return 0 }
+    let pf = r64(fn_parent + ci*8)
+    if pf < 0 { return 0 }                 // top-level closure -> nothing to dangle
+    let pcount = r64(fn_pcount + pf*8)
+    let n = r64(cap_count + ci*8)
+    if n > CAP_MAX { n = CAP_MAX }         // defensive bound
+    let k = 0
+    while k < n {
+        let outer_vr = r64(cap_vreg + (ci*CAP_MAX + k)*8)
+        // is outer_vr a LOCAL (not a param) of the enclosing fn? Params occupy
+        // the lowest vreg indices in the saved scope; locals come after pcount.
+        let on = r64(osc_count + pf*8)
+        if on > OSC_MAX { on = OSC_MAX }   // defensive bound
+        let i = 0
+        let is_local = 0
+        while i < on {
+            if r64(osc_vreg + (pf*OSC_MAX + i)*8) == outer_vr {
+                if i >= pcount { is_local = 1 }
+                i = on
+            } else { i = i + 1 }
+        }
+        if is_local == 1 {
+            let msg = mmap(128)
+            // "error: by-ref closure escapes a stack-local (dangling pointer)\n"
+            w8(msg+0,101);w8(msg+1,114);w8(msg+2,114);w8(msg+3,111);w8(msg+4,114);w8(msg+5,58);w8(msg+6,32);w8(msg+7,98);w8(msg+8,121);w8(msg+9,45)
+            w8(msg+10,114);w8(msg+11,101);w8(msg+12,102);w8(msg+13,32);w8(msg+14,99);w8(msg+15,108);w8(msg+16,111);w8(msg+17,115);w8(msg+18,117);w8(msg+19,114)
+            w8(msg+20,101);w8(msg+21,32);w8(msg+22,101);w8(msg+23,115);w8(msg+24,99);w8(msg+25,97);w8(msg+26,112);w8(msg+27,101);w8(msg+28,115);w8(msg+29,32)
+            w8(msg+30,97);w8(msg+31,32);w8(msg+32,115);w8(msg+33,116);w8(msg+34,97);w8(msg+35,99);w8(msg+36,107);w8(msg+37,45);w8(msg+38,108);w8(msg+39,111)
+            w8(msg+40,99);w8(msg+41,97);w8(msg+42,108);w8(msg+43,32);w8(msg+44,40);w8(msg+45,100);w8(msg+46,97);w8(msg+47,110);w8(msg+48,103);w8(msg+49,108)
+            w8(msg+50,105);w8(msg+51,110);w8(msg+52,103);w8(msg+53,32);w8(msg+54,112);w8(msg+55,111);w8(msg+56,105);w8(msg+57,110);w8(msg+58,116);w8(msg+59,101)
+            w8(msg+60,114);w8(msg+61,41);w8(msg+62,10)
+            file_write(2, msg, 63)
+            exit(1)
+        }
+        k = k + 1
+    }
+    return 0
+}
+
+// 0.0.121: record a closure vreg that is returned/stored (a potential escape).
+// Captures are registered lazily during closure-body parse, which runs AFTER the
+// enclosing fn's parse_ret, so the actual hazard check must be DEFERRED until the
+// whole program is parsed. We just stash the vreg here; escape_run() verifies.
+// Record a potential escape: the value vreg `vr` is being returned/stored.
+// vreg indices are reused across functions (vclr resets vreg_n), so we resolve
+// the closure index cidx NOW (vreg_clo[vr] is still valid at record time) and
+// stash that instead of the bare vreg.
+fn escape_record(vr) {
+    let ci = r64(vreg_clo + vr*8)
+    if ci >= 0 {
+        w64(escape_vregs + escape_n*8, ci)
+        escape_n = escape_n + 1
+    }
+}
+
+// 0.0.121: run the deferred escape checks now that every closure body has been
+// parsed and its captures registered. Called once after the main parse/compile
+// loop. Rejects (exit 1) the first escaping by-ref closure it finds.
+fn escape_run() {
+    let i = 0
+    while i < escape_n {
+        check_closure_escape_ci(r64(escape_vregs + i*8))
+        i = i + 1
+    }
+}
+// === ENCLOSING-SCOPE SNAPSHOT (for capture resolution) ===
+// The main compile loop calls vclr() per function, so by the time a closure body
+// enclosing body finishes: name offset / vreg / name length per entry, keyed by
+// the enclosing fn index. Closure bodies are registered DURING the enclosing
+// parse and so always get a HIGHER fn index -> the snapshot is always in place
+// before the body that needs it is compiled.
+let OSC_MAX = 512
+let osc_name = mmap(2000000)
+let osc_vreg = mmap(2000000)
+let osc_nlen = mmap(2000000)
+let osc_count = mmap(2000000)
+
+// Save the current `vars` table as the scope of fn index fi.
+fn clo_scope_save(fi) {
+    let n = varc
+    if n > OSC_MAX { n = OSC_MAX }
+    let i = 0
+    while i < n {
+        w64(osc_name + (fi*OSC_MAX + i)*8, r64(vars + i*VRS))
+        w64(osc_vreg + (fi*OSC_MAX + i)*8, r64(vars + i*VRS + 8))
+        w64(osc_nlen + (fi*OSC_MAX + i)*8, r64(vars + i*VRS + 16))
+        i = i + 1
+    }
+    w64(osc_count + fi*8, n)
+}
+
+// Look up (nm,nl) in the saved scope of the closure's parent chain. Returns the
+// outer vreg, or -1. Walks fn_parent so a closure nested in a closure can reach
+// an outer-outer local.
+fn clo_outer_find(nm, nl) {
+    let ci = cur_clo
+    let hops = 0
+    while ci >= 0 && hops < 16 {
+        let pf = r64(fn_parent + ci*8)
+        if pf < 0 { return 0 - 1 }
+        let n = r64(osc_count + pf*8)
+        let i = n - 1
+        while i >= 0 {
+            let cn = r64(osc_name + (pf*OSC_MAX + i)*8)
+            let cl = r64(osc_nlen + (pf*OSC_MAX + i)*8)
+            if cl == nl {
+                let ok = 1; let j = 0
+                while j < nl { if r8(src+cn+j) != r8(src+nm+j) { ok = 0; break }; j = j + 1 }
+                if ok == 1 { return r64(osc_vreg + (pf*OSC_MAX + i)*8) }
+            }
+            i = i - 1
+        }
+        ci = pf
+        hops = hops + 1
+    }
+    return 0 - 1
+}
+// resolve_call(nm,nl): lexical function lookup, LOCAL-FIRST.
+// Search the fns defined directly inside the current scope (fn_parent == scope);
+// if none match, walk up fn_parent to the enclosing scope, finally the global
+// scope (fn_parent < 0). A local fn shadows a same-named global. Returns -1 if
+// the name is defined nowhere.
+fn resolve_call(nm, nl) {
+    let fi = fn_curscope()
+    while true {
+        let i = 0
+        while i < fnc {
+            if r64(fn_parent + i*8)==fi && fn_nlen(i)==nl {
+                let ok=1; let k=0
+                while k<nl { if r8(src+fn_name(i)+k)!=r8(src+nm+k) { ok=0; break }; k=k+1 }
+                if ok==1 { return i }
+            }
+            i = i + 1
+        }
+        if fi < 0 { return findfn(nm, nl) }   // global scope searched, not found;
+                                             // fall back to findfn (also resolves
+                                             // function aliases registered in alias_tab)
+        fi = r64(fn_parent + fi*8)          // up to parent scope
+    }
+    return -1
+}
+// findfn_global(nm,nl): top-level ONLY (used by the $(func) sigil).
+fn findfn_global(nm, nl) {
+    let i = 0
+    while i < fnc {
+        if r64(fn_parent + i*8) < 0 && fn_nlen(i)==nl {
+            let ok=1; let k=0
+            while k<nl { if r8(src+fn_name(i)+k)!=r8(src+nm+k) { ok=0; break }; k=k+1 }
+            if ok==1 { return i }
+        }
+        i = i + 1
+    }
+    // Fall back to findfn so $(alias) reaches an aliased top-level function.
+    return findfn(nm, nl)
+}
+// Variadic args are stored FRAME-LOCAL (not in a global table) so that a
+// variadic function calling another variadic function nests correctly.
+// For each variadic function, ci_func reserves 64 bytes at the bottom of its
+// stack frame: 8 bytes for the saved arg count (va_cnt) and 48 bytes holding
+// the first 6 incoming register-args (rdi..r9) copied on entry. Args arriving
+// on the stack (index >= 6) stay on the stack at [rbp+16+...] and are read
+// directly. These rbp-relative offsets are set per-function below.
+let g_va_cnt_off = 0   // rbp-relative offset of saved arg count
+let g_va_reg_off = 0   // rbp-relative offset of saved reg-arg[0..5] area
+// P2: proc/env builtins globals — captured at _start from the stack.
+// Reserved as internal data globals (indices 38,39,40) so every compiled
+// program has them. INTERNAL_GLOBAL_COUNT is bumped to 41 to reserve them.
+let g_argc = 38
+let g_argv = 39
+let g_environ = 40
+// 0.0.120: upper bound of the code segment (vaddr CODE_VBASE + codelen), written
+// by write_elf at finalize. stack_frames() uses it to validate each unwound
+// return address is a real code pointer (terminates the rbp walk at the entry
+// frame, whose [rbp+8] is not in code range). Reserved as internal global 41.
+let g_code_end = 41
+// Code
+let code = mmap(33554432); let codelen = 0
+let CODE_CAP = 33554432  // fail-closed cap: emit aborts (rc=1) if codelen exceeds this.
+                       // Mirrors the MAP_FAILED guard — out-of-bounds code emission
+                       // must never silently corrupt (SAFETY_MANUAL sec 3/6.3).
+// Patches: 24 bytes each [code_ofs,target,type]
+let patches = mmap(8000000); let patchc = 0
+let PATCH_CAP = 8000000
+// Global RIP-relative patches: [code_offset, global_index, is_internal]
+let gpatches = mmap(2000000); let gpatchc = 0
+// t11: ARM64 fnptr patches: [adrp_ofs, add_ofs, fn_index, 0]
+// recorded by the ARM IR_FNPTR handler; resolved at finalize (exec mode) or as
+// R_AARCH64_ADR_PREL_PG_HI21 + R_AARCH64_ADD_ABS_LO12_NC relocs (object mode).
+let fnptr_patches = mmap(8000000); let fnptr_patchc = 0
+
+// Compiler-internal global names to skip in scan_globals
+// Per-function
+let vars = mmap(2000000); let varc = 0; let vreg_n = 0; let lbl_n = 0
+// P2 ownership: parallel to `vars`, indexed by the varc index i (set in vadd/vown).
+// Tag: 0=plain, 1=mut, 2=ref, 3=move.
+let vars_own = mmap(2000000)
+let argstack = mmap(2000000); let argsp = 0
+// t4: temp buffers for named-argument reordering (collect args in argument
+// order, then permute into callee parameter order after the loop).
+let arg_tmp = mmap(2000000)   // reordered arg values
+let arg_tgt = mmap(2000000)   // per-argument target param index (pidx)
+let arg_filled = mmap(8000000) // t5: per-call bitmap of supplied param indices (base*64 + z)
+// Global-variable table: gvars holds (name-src-index, name-len) pairs; ginit
+// holds the token index of each global's initializer expression.  Globals live
+// at absolute address GDATA + index*8 in a dedicated writable segment.
+let gvars = mmap(2000000); let ginit = mmap(2000000); let gvarc = 0
+// F7: compile-time constants. `const NAME = EXPR` evaluates EXPR at compile time
+// (literal arithmetic only) and stores the value here. On use, parse_primary
+// substitutes IR_CONST directly — true comptime substitution.
+let consts = mmap(2000000)   // [i*24] name_off, [i*24+8] name_len, [i*24+16] value
+let constc = 0
+// 0.0.77: type aliases. `type NAME = TYPE` stores the target type code.
+let type_aliases = mmap(100000)  // [i*24] name_off, [i*24+8] name_len, [i*24+16] type_code
+let type_aliasc = 0
+// P5.1 cross-TU data globals: per-global named-symbol encoding in `g_named`:
+//   0 = legacy `let NAME = EXPR` top-level global (lives under `_gdata`)
+//   1 = named global DEFINED in this TU (`global NAME [= init]`) -> GLOBAL def sym
+//   2 = named global IMPORTED (`extern "C" global NAME`) -> UNDEF GLOBAL sym
+// Drives whether the named ELF symbol is emitted as UNDEF or GLOBAL def, and
+// whether __init skips the slot (imported globals have no initializer here).
+let g_named = mmap(2000000)
+// Map global index (0..gvarc-1) -> .symtab index of its named ELF symbol
+// (GLOBAL def for `global NAME`, UNDEF GLOBAL for `extern "C" global NAME`).
+// -1 if the global is not named (legacy `let` top-level global).
+let g_symidx = mmap(2000000)
+let GDATA = 1109393408  // 0x42200000: fixed BSS base (x86-64 ET_EXEC, absolute addressing)
+// 0.0.96: try/catch handler-chain head pointer (8 bytes) — lives in the writable
+// data segment, well below the global array (globals start at GDATA, this is
+// GDATA+1024, safely inside gdata_memsz which includes all src string data).
+let HANDLER_HEAD = GDATA + 1024   // 0x42200400
+// 0.0.111: free-list head for the real allocator. Internal-reserved:
+// past HANDLER_HEAD, inside the 8KB BSS, before the source-global/string-data region.
+// 0 = list empty. mem_free pushes a block; mem_realloc pushes the old block.
+let HEAP_CTRL = GDATA + 1032   // 0x42200408
+// 0.0.96: code segment virtual base for ABSOLUTE catch-target jumps in IR_THROW.
+// write_elf maps the code buffer at file offset ht = ELF_HDR(64) + PHDR_TAB(56*4=224)
+// = 288, and PT_LOAD vaddr = BASE (0x400000), so a code-buffer offset `off` executes
+// at vaddr (BASE + ht + off) = 0x400120 + off. e_entry is set to BASE+ht=0x400120.
+// IR_THROW uses an ABSOLUTE `jmp rax`, so it must add this exact base — NOT bare
+// 0x400000 (that would miss the +288 header/phdr region and land in garbage -> SIGSEGV).
+// Labels in `lblmap` store code-buffer offsets, so absolute catch vaddr = CODE_VBASE + off.
+let CODE_VBASE = 4194592   // 0x400120 = e_entry (BASE + ELF_HDR 64 + PHDR_TAB 224)
+let LINK_HT = 400         // ELF header + 6 program headers (64 + 56*6) — must match write_elf ht
+let target_arch = 0
+// P4: code-buffer offsets of __init and main, recorded at emit time, used by the
+// startup-stub bl patcher. Globals (cannot be shadowed by block-scoped lets).
+let g_init_ofs = 0
+let g_main_ofs = 0
+let g_main_fi = 0   // function index of `main` (set in finalize; used by P5 .o emit)
+let g_compiling_init = 0   // 1 while compiling __init (gates keyword-table emit)
+let g_init_call_ofs = 0   // code offset of the 'bl __init' placeholder in the startup stub
+let g_main_call_ofs = 0   // code offset of the 'bl main' placeholder in the startup stub
+
+// P5: object-format mode. When emit_obj==1, finalize emits a relocatable ELF64
+// .o (ET_REL) with .text/.rel.text/.symtab/.strtab/.shstrtab, plus section
+// header table, and leaves the calls (__init/main/extern) as RELA relocations
+// instead of patching them. An external `ld` links the .o (see rebuild.sh).
+// x86-64 + ARM64 (aarch64) object emission is supported; the relocation
+// type (R_X86_64_PLT32 vs R_AARCH64_CALL26) and e_machine are chosen by
+// target_arch at emit time.
+let emit_obj = 0
+let no_start = 0   // P5.1: secondary object TU — suppress _start/__init entry
+let has_main = 0  // P5.1: set in finalize; visible to p5_elf_obj for no_start
+let objcode = mmap(16777216)   // relocatable .text image (copy of code buffer at finalize)
+let objcodelen = 0
+let symtab = mmap(2000000)     // 24-byte ELF64 symbol entries
+let symc = 0                   // symbol count
+let strtab = mmap(4000000)     // .strtab string pool (starts with NUL)
+let strtablen = 1              // first byte is NUL
+let reldyn = mmap(4000000)     // 24-byte RELA relocations (.rel.text)
+let relc = 0
+let fn_symidx = mmap(2000000)  // map function index -> .symtab index (for relocations)
+// object-mode global patches: for each global access, record the relocation
+// site and global index so p5_elf_obj can emit relocations against _gdata.
+let gpatches_a = mmap(8000000)
+let parse_mut_flag = 0  // 0.0.76: set when TT_MUT consumed at statement level
+let parse_ref_flag = 0  // 0.0.94: set when TT_REF consumed at statement level
+let gapatchc = 0
+let gdata_sym = 0            // .symtab index of the _gdata symbol (set in p5_elf_obj)
+// unified data segment at GDATA holds: [internal globals][source globals][string data].
+let INTERNAL_GLOBAL_COUNT = 42
+// Function-call resolution modes (passed to parse_call / parse_call_impl).
+let FI_LOCAL = 0    // bare `f()`: resolve local-first (walk scope chain)
+let FI_GLOBAL = 1   // $(f): global table only (explicit external call)
+// Output binary data section (string literals) - mmap'd so IR_STR writes are valid.
+let data = mmap(33554432); let data_off = 0  // 32MB string-literal buffer
+let DAT_CAP = 33554432  // fail-closed cap for data buffer (parallel to CODE_CAP)
+// Label map: 16 bytes [label,ir_pos]
+let lblmap = mmap(2000000); let lblc = 0
+
+let TKS = 40; let IRS = 40; let FNS = 56; let VRS = 24; let PCS = 24; let LBS = 16
+// 0.0.97: operator-overload suppression flag. Set per-function in entry.quanta
+// (1 when the current fn is an operator-named fn) so user_binop() forces the
+// builtin primitive instead of infinitely recursing through the overload.
+let overload_suppressed = 0
+
+// === OPERATOR OVERLOAD DISPATCH (0.0.97) ===
+// Operator-overload fns (`fn +(a,b)`) are dispatched via an explicit fn-index
+// table indexed by the operator's integer value (single-char op byte, or the
+// two-char packed value op1*256+op2). scanfns sets OPFN[opval]=fn_index when it
+// registers an operator-named fn; parse.user_binop reads OPFN[opval] and, if >=0,
+// emits IR_CALL_IDX (carrying the fn index directly) instead of the builtin
+// primitive. No source-text name injection -> corruption-proof. The two-char
+// operators (== != <= >=) pack into opval <= 65535, well within the mmap range.
+let OPFN = mmap(65536*8)
+fn opfn_set(opval, fi) {
+    // Store fi+1 so an UNSET slot (mmap-zeroed 0) reads as "no overload" (fi<0).
+    w64(OPFN + opval*8, fi + 1)
+}
+// OPFN_SUPP[fi] = 1 marks fn index `fi` as an OPERATOR-OVERLOAD fn. While its
+// body is being parsed, user_binop must resolve the same operator to the BUILTIN
+// (otherwise `fn +(a,b){ return a + b }` would infinitely recurse). Keyed by fn
+// index (set in funcscan) — avoids re-deriving the operator from the fn name,
+// which for TT_OP tokens is an integer, not a src-text pointer.
+let OPFN_SUPP = mmap(65536*8)
+fn opfn_supp_set(fi) { w64(OPFN_SUPP + fi*8, 1) }
+
