@@ -1158,29 +1158,6 @@ fn emit_bltn2(nmi,nl,ii) {
         rxor(8,8); rxor(9,9)        // r8 = 0, r9 = 0
         ri(0,45); sysc(); return 1
     }
-    // 0.0.119: futex_wait(addr, expected) -> 0/-errno  and  futex_wake(addr, n) -> woken
-    //   Both are the single futex(2) syscall (sc 202) with 6 args:
-    //     rax=202, rdi=uaddr, rsi=op, rdx=val, r10=timeout, r8=uaddr2, r9=val3
-    //   futex_wait: op=FUTEX_WAIT(0), val=expected, timeout=NULL, uaddr2=0, val3=0
-    //   futex_wake: op=FUTEX_WAKE(1), val=n,      timeout=NULL, uaddr2=0, val3=0
-    //   Args arrive via IR_CALL as (addr, expected) / (addr, n); we reload addr->rdi,
-    //   set rsi=op, rdx=val(arg1), and zero r10/r8/r9.
-    if nl==10&&r8(nm)=='f'&&r8(nm+1)=='u'&&r8(nm+2)=='t'&&r8(nm+3)=='e'&&r8(nm+4)=='x'&&r8(nm+5)=='_'&&r8(nm+6)=='w'&&r8(nm+7)=='a'&&r8(nm+8)=='i'&&r8(nm+9)=='t' {
-        flush_all()
-        rbp(7, spill_home(irres(ira2(ii))))      // rdi = uaddr
-        ri(6, 0)                                  // rsi = FUTEX_WAIT = 0
-        rbp(2, spill_home(irres(ira2(ii)+1)))    // rdx = expected (val)
-        rxor(10,10); rxor(8,8); rxor(9,9)         // r10=timeout=0, r8=uaddr2=0, r9=val3=0
-        ri(0,202); sysc(); return 1
-    }
-    if nl==10&&r8(nm)=='f'&&r8(nm+1)=='u'&&r8(nm+2)=='t'&&r8(nm+3)=='e'&&r8(nm+4)=='x'&&r8(nm+5)=='_'&&r8(nm+6)=='w'&&r8(nm+7)=='a'&&r8(nm+8)=='k'&&r8(nm+9)=='e' {
-        flush_all()
-        rbp(7, spill_home(irres(ira2(ii))))      // rdi = uaddr
-        ri(6, 1)                                  // rsi = FUTEX_WAKE = 1
-        rbp(2, spill_home(irres(ira2(ii)+1)))    // rdx = n (val)
-        rxor(10,10); rxor(8,8); rxor(9,9)
-        ri(0,202); sysc(); return 1
-    }
     // syscall(num, a, b, c, d, e, f): GENERIC raw Linux syscall (any arity 1..7).
     //   IR_CALL already did flush_all() and loaded args rdi/rsi/rdx/rcx/r8/r9
     //   (and pushed arg6+ on the stack). We do NOT rely on those registers;
