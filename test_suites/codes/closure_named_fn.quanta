@@ -1,0 +1,34 @@
+// 0.0.123 regression: nested NAMED fn as a closure value (escape syntax).
+// `let f = fn helper(){}` must bind `f` to a callable closure and must NOT
+// error with "undeclared function: helper". Lambdas (|x|{}) already worked;
+// this covers the named-fn escape form that was broken before 0.0.123.
+// Exit code encodes the result so run_tests.sh can assert.
+
+fn make():i64 {
+  let f = fn helper():i64 { return 7 }
+  return f()
+}
+
+fn double_nest():i64 {
+  let outer = fn o():i64 {
+    let inner = fn i():i64 { return 3 }
+    return inner()
+  }
+  return outer()
+}
+
+fn capture():i64 {
+  let base = 100
+  let g = fn helper():i64 { return base + 7 }
+  return g()
+}
+
+fn main():i64 {
+  let a = make()        // 7
+  let b = double_nest() // 3
+  let c = capture()     // 107
+  if a != 7 { return 1 }
+  if b != 3 { return 2 }
+  if c != 107 { return 3 }
+  return 0              // all pass -> rc=0
+}
