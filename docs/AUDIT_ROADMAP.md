@@ -358,8 +358,8 @@ No-deferral policy to 0.1.0 (user directive 2026-08-28): every verified gap gets
 | | |
 |---|---|
 | **Evidence** | (a) `stack_trace()` returns ONE frame only (emitter.quanta:839 — immediate caller return address), not a full unwind. (b) closure captures by-value only (0.0.67) — no by-ref capture to mutate an enclosing local. (c) extern "C" works object-mode+gcc only; standalone EXE needs PLT/GOT emission. |
-| **Fix** | (a) 0.0.120: walk the full rbp frame chain. (b) 0.0.121: by-ref capture. (c) 0.0.122: PLT/GOT so a Quanta EXE links libc symbols without gcc. |
-| **Status** | ❌ open → scheduled **0.0.120 / 0.0.121 / 0.0.122** |
+| **Fix** | (a) 0.0.120 ✅: `stack_frames()` walks the full rbp frame chain and returns a qword-array of return addresses, bounded by `g_code_end` (CODE_VBASE+codelen, written by write_elf into the internal-global data slot) so the entry stub's `rbp=argv` frame (low relocated-stack base) is not dereferenced. Gated `stack_frames_test.quanta` (4-deep chain, rc=0) GREEN. Fixpoint byte-verified. (b) 0.0.121: by-ref capture. (c) 0.0.122: PLT/GOT so a Quanta EXE links libc symbols without gcc. |
+| **Status** | ✅ (a) CLOSED (0.0.120); (b)(c) scheduled **0.0.121 / 0.0.122** |
 
 ---
 
