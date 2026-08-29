@@ -162,7 +162,7 @@ Why post-0.1.0: the ARM64 backend is a new backend; shipping it while x86 debt
 remains would violate the debt-first rule and split correctness effort.
 Qualification evidence is gathered AFTER the core is complete, not before.
 
-### Current status (0.0.120 — live)
+### Current status (0.0.124 — live)
 
 **0.0.124 (current stable seed):** concurrency safety hardening — `thread_create` join-slot + child-stack `mmap` MAP_FAILED guards (FIX-0.0.35/36), child-stack `mprotect` guard page (FIX-0.0.40), `futex_wait`/`futex_wake` negative-errno → 0 clamp (FIX-0.0.37), and `clone`-failure cleanup (`munmap` both mappings + `exit(1)`, FIX-0.0.38). AUDIT_ROADMAP Part D findings 39/41/42/48 re-verified as stale/SPEC/not-defects/code-verified; FIX-0.0.47 added `futex_wait_test.quanta`. Built from 0.0.123 seed; fixpoint byte-verified (gen1==gen2==golden, md5 `2f579f42bd56995a822033a9baa8ed67`). Remaining cores before 0.1.0: NONE — 0.0.124 was the last core. Then 0.1.0 (std/lib resumes, borrow-checking, PTY layer). P4 tooling moved AFTER stdlibs (POST-0.1.0).
 

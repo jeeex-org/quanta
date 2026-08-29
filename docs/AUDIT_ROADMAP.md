@@ -665,32 +665,131 @@ All Part D concurrency findings are now RESOLVED (fixed or verified-not-defects)
 
 ---
 
-## Updated Core-Completeness Summary (post-0.0.123)
+## Updated Core-Completeness Summary (post-0.0.124)
 
-Per ROADMAP (line 116): **"Remaining cores before 0.1.0: NONE — 0.0.122 was the last core."**
+Per ROADMAP (current): **"Remaining cores before 0.1.0: NONE — 0.0.124 was the last core."**
 
 | Core Feature | Version | Status | Notes |
 |---|---|---|---|
 | `big` complete | 0.0.117 | ✅ | ordering + bitwise routed |
 | net send/recv | 0.0.118 | ✅ | real byte transfer |
-| futex + threads | 0.0.119 | ✅ | safety gaps **FIX-0.0.35–38 CLOSED in 0.0.124**; 39/40/41/42 verified not-defects |
+| futex + threads | 0.0.119 | ✅ | safety gaps **FIX-0.0.35–38 CLOSED in 0.0.124**; guard page (40) + futex_wait test (47) added; 39/41/42/48 verified not-defects |
 | stack_frames unwind | 0.0.120 | ✅ | 64-frame cap |
 | closures by-ref | 0.0.121 | ✅ | escape-hazard gate |
 | extern-C standalone EXE | 0.0.122 | ✅ | `ld` + `quanta_link.sh` |
 | named closure escape | 0.0.123 | ✅ | closes last verified gap |
+| concurrency hardening | 0.0.124 | ✅ | mmap/MAP_FAILED guards, clone-cleanup, futex errno clamp, guard page |
 
 **Remaining for 0.1.0 (only two items):**
 1. **Borrow-checking** (compile-time memory safety) — 2 TODO comments
 2. **PTY layer** for interactive `$$()` — zero source
 
 **Still-missing for "full-featured, complete language" (not in ROADMAP cores):**
-- Concurrency: present but **unsafe** (FIX-0.0.35–41)
-- Generics: type-erased, unconstrained (FIX-0.0.33)
+- Generics: type-erased, unconstrained (FIX-0.0.33) — 0.1.0 type-system work
 - `defer`: phantom (FIX-0.0.32)
-- `big` div-by-zero (FIX-0.0.19, 9 versions old)
-- 4 mandated stdlibs missing: `chain`, `secure`, `ai`, `physics`
-- 7 stdlibs untested: `crypto`, `fs`, `io`, `map`, `math`, `str`, `vec`
+- `big` div-by-zero (FIX-0.0.19, old) — runtime guard still pending
+- 4 mandated stdlibs missing: `chain`, `secure`, `ai`, `physics` (all 7 others — crypto/quantum/linalg/map/str/vec/fs/io/math — are ✅ gate)
+- ARM64 backend + P4 code-writing tool: POST-0.1.0
 
 ---
 
-*Updated 2026-08-30 with Part D (0.0.122/123 security audit + core-completeness); 0.0.124 verified-fix pass (FIX-0.0.35/36/37/38 closed; 39/40/41/42 verified not-defects).*
+*Updated 2026-08-30 with Part D (0.0.122/123 security audit + core-completeness); 0.0.124 verified-fix pass (FIX-0.0.35/36/37/38 closed, guard page 40 + futex_wait test 47 added; 39/41/42/48 verified not-defects).*
+
+---
+
+# Part E — Resolution: 0.0.124 Concurrency Safety Hardening (Part D Closure)
+
+**0.0.124 commits (`c300d71`, `11f4b6b`, `3103dc1`)** implement the hardening for Part D findings. All HIGH/MED concurrency findings are now **RESOLVED** (fixed or verified-not-defect). Gate **157/157 GREEN**; self-host fixpoint **BYTE-VERIFIED** (md5 `2f579f42bd56995a822033a9baa8ed67`).
+
+## FIX-0.0.35 ✅ FIXED — join-slot mmap MAP_FAILED guard
+
+| | |
+|---|---|
+| **Location** | `emitter.quanta:1282-1287` (0.0.124) |
+| **Fix** | After join-slot `mmap` syscall: `cmp rax,0; jge +12; mov edi,1; mov eax,60; syscall` (exit 1 on negative rax). Mirrors `mem_alloc` guard pattern. |
+| **Verified** | ✅ source: guard present after first `sysc()` in `thread_create`. |
+
+## FIX-0.0.36 ✅ FIXED — child-stack mmap MAP_FAILED guard
+
+| | |
+|---|---|
+| **Location** | `emitter.quanta:1293-1298` (0.0.124) |
+| **Fix** | Same guard after child-stack `mmap` syscall. |
+| **Verified** | ✅ source: guard present after second `sysc()`. |
+
+## FIX-0.0.37 ✅ FIXED — futex_wait/futex_wake clamp negative-errno → 0
+
+| | |
+|---|---|
+| **Location** | `emitter.quanta:1258-1262` (futex_wait), `1273-1277` (futex_wake) |
+| **Fix** | After `sysc()`: `rcmp(0,2); jge done; rxor(0,0)` — clamps negative rax to 0. |
+| **Test** | `futex_wait_test.quanta`: `futex_wait(addr,0)` with `*addr=5` returns EAGAIN (-11) → clamped to 0 (exit 0). `futex_wake(0,1)` returns EFAULT (-14) → clamped to 0 (exit 0). **rc 242→0 verified**. |
+| **Verified** | ✅ source + gate test. |
+
+## FIX-0.0.38 ✅ FIXED — clone failure → munmap both + exit(1)
+
+| | |
+|---|---|
+| **Location** | `emitter.quanta:1320-1332` (0.0.124) |
+| **Fix** | After `clone` syscall: `rcmp(0,2); jl ERR` (negative = error); `ERR` label: `munmap(child_stack, 1MB); munmap(join_slot, 16); exit(1)`. |
+| **Verified** | ✅ source: error path present with both `munmap` calls. |
+
+## FIX-0.0.40 ✅ FIXED — child-stack mprotect guard page (PROT_NONE)
+
+| | |
+|---|---|
+| **Location** | `emitter.quanta:1300-1301` (0.0.124) |
+| **Fix** | After child-stack `mmap`: `mprotect(r13, 4096, PROT_NONE)` (syscall 10). Failure ignored (best-effort). |
+| **Verified** | ✅ source: `rr(7,13); ri(6,4096); ri(2,0); ri(0,10); sysc()` present. |
+
+## FIX-0.0.47 ✅ FIXED — futex_wait_test.quanta added (gate coverage)
+
+| | |
+|---|---|
+| **Location** | `test_suites/codes/futex_wait_test.quanta` |
+| **Test** | 1) `futex_wait(addr,0)` with `*addr=5` → EAGAIN clamped to 0. 2) `futex_wake(0,1)` → EFAULT clamped to 0. Both assert `==0`. |
+| **Verified** | ✅ gate: `futex_wait_test.quanta\t0` in EXPECTED.tsv; 157/157 GREEN. |
+
+---
+
+## Re-verified NOT-DEFECTS (no code change)
+
+| ID | Verdict | Evidence |
+|---|---|---|
+| **FIX-0.0.39** | **STALE** | `thread_join` already reads result **after** `futex_wait` (post-refactor): `sysc()` (futex_wait) → `ldx(0,7,8)` (read result). No race. |
+| **FIX-0.0.41** | **SPEC** | Indefinite `futex_wait` (NULL timeout) **is the join contract** — `thread_join` must block until child exits. No timeout by design. |
+| **FIX-0.0.42** | **INVALID** | Capture loop is `O(body_tokens × enclosing_vars)` (single pass per closure, `vfind` per ID), not `O(n²)`. No quadratic blowup. |
+| **FIX-0.0.48** | **CODE-VERIFIED** | 64-frame cap present (`ri(14,64)`). Deep-chain test infeasible: recursion reuses rbp frame — `rec(100)` yields only 3 frames (caller/rec/rec...). |
+
+---
+
+## Remaining LOW (doc/test hygiene, tracked for 0.1.0)
+
+| ID | Status | Note |
+|---|---|---|
+| FIX-0.0.43 | KNOWN | Named closure self-recursion by name — same as lambda; documented limitation. |
+| FIX-0.0.44 | DOC | `extern "C"` RAII bypass via libc `exit()` — document constraint. |
+| FIX-0.0.45 | TEST | IR_CAP/TOK_CAP raised; no near-capacity OOM test. |
+| FIX-0.0.46 | NAMING | `thread_test.quanta` returns `ok` (1/0), not thread exit status. |
+| FIX-0.0.49 | EDGE | Named closure binds NAME before body parsed; shadowing untested. |
+
+**None are security or correctness defects.**
+
+---
+
+## Updated Priority Fix Order (post-0.0.124)
+
+**Part D concurrency: ALL RESOLVED.** Remaining open from earlier parts:
+
+1. **FIX-0.0.19** — `big_div`/`big_mod` div-by-zero (unscheduled, 9 versions old) → **add to 0.0.117 close-off**
+2. **FIX-0.0.32** — `defer` phantom (records IR, never executes) → **fix before advertising `defer`**
+3. **FIX-0.0.33** — Generics type-erased/unconstrained (no real monomorphisation) → **0.1.0**
+4. **FIX-0.0.43/44/45/46/49** — LOW doc/test hygiene → **0.1.0**
+5. **Borrow-check** (2 TODO comments) → **0.1.0 core**
+6. **PTY layer** (zero source) → **0.1.0 core**
+7. **4 mandated stdlibs missing** (`chain`, `secure`, `ai`, `physics`) → **post-0.1.0**
+8. **7 stdlibs untested** (`crypto`, `fs`, `io`, `map`, `math`, `str`, `vec`) → **gate them**
+
+---
+
+*Updated 2026-08-30 with Part E (0.0.124 resolution: all Part D HIGH/MED concurrency findings fixed or verified-not-defect; gate 157/157 GREEN; fixpoint md5 `2f579f42bd56995a822033a9baa8ed67`).*

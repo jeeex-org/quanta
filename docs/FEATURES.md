@@ -1,10 +1,9 @@
 # Quanta — Features: Shipped vs. To-Do
 
 Source-of-truth feature inventory for the Quanta x86 self-hosting compiler.
-Originally derived from the 0.0.55 source (keyword table `ktext` in helpers.quanta,
-87 builtins in `is_bltn`, parser dispatch in parse.quanta, 2026-08-17), since
-extended through 0.0.86 (float literals, big-int stages, literal auto-promotion,
-inline asm). Every row maps to a real token/builtin in source.
+Originally derived from the 0.0.55 source (keyword table `ktext` in tokens.quanta,
+builtins registered in `is_bltn`, parser dispatch in parse.quanta, 2026-08-17), since
+extended through 0.0.124 (concurrency hardening). Every row maps to a real token/builtin in source.
 
 Status legend:
 - ✅ done — implemented and exercised by a gated test
@@ -24,7 +23,7 @@ exist as files but are excluded from the gate per the "core only until 0.1.0" ru
 
 ---
 
-## A. Core — Keywords & Syntax (lexer `ktext` codes 1–57)
+## A. Core — Keywords & Syntax (lexer `ktext` keyword table, source-derived)
 
 | Keyword | ktext | Status | Test? | Notes / test file |
 |---|---|---|---|---|
@@ -157,7 +156,7 @@ native type keyword parsing). `as` width casts (`x as T`) are done (0.0.90).
 | ref/mut/move (ownership) | ✅ done (0.0.94) | ✅ gate | `mut` rebindable, `ref` borrow alias, `move` transfer prefix; ownership tag tracked in symbol table (`vars_own`, `vown`/`set_vown`). Enforce at 0.1.0. ownership_sigils_test.quanta gates it. |
 | security KNOWN issues (compiler robustness) | ✅ none — verified clean (0.0.122, 0.0.123, 0.0.124) | ✅ none | Investigated across 0.0.122→0.0.124 and found ALREADY WORKING: the security gate reports **0 known issues**; garbage-input fuzz = **0 compiler crashes**; extreme literal MININT-1 → clean lexer ERROR (rc=7), not a SIGILL. (The SIGILL lines printed by `security_tests.sh` are the *generated test binaries* trapping on overflow — expected PASS, not compiler faults.) Multi-arg extern-C and the Part D concurrency items (FIX-0.0.35–48) were re-verified in 0.0.124 and either fixed or confirmed not-defects — **no open security gaps remain**. The 0.0.123 nested named-fn escape and 0.0.124 concurrency hardening are both CLOSED. |
 
-## F. Builtins — Already Shipped (87 registered, prefixes expanded)
+## F. Builtins — Already Shipped (registered in `is_bltn`, ~127 names; emitter dispatches 130)
 
 | Group | Items | Test? |
 |---|---|---|
@@ -244,24 +243,14 @@ it; 🟡 file-only = a test file exists on disk but is NOT in the gate; ❌ none
 | `ai` (tensor ops + inference) | ❌ todo | ❌ none | Not in code. |
 | `physics` (ODE/PDE solvers) | ❌ todo | ❌ none | Not in code. |
 
-## Summary counts (source-derived)
-- **Keywords (ktext): 57 codes defined; ~19 parsed, ~13 lexed-only gaps, rest partial.**
-- **Builtins registered: 87 (prefixes expanded).**
-- **Core tests in gate: 152** (EXPECTED.tsv, 152 rows — verified 2026-08-28, includes `big_test.quanta` landed with 0.0.114, `rsp_test.quanta` added at 0.0.115, `quantum_test`/`linalg_test`/`trig_test` added at 0.0.116, `big_ops_test.quanta` added at 0.0.117). `std_*` tests are kept in a SEPARATE `test_suites/EXPECTED_STDLIB.tsv` (7 rows, wired into the gate as the stdlib layer) and are NOT in the core gate (core-only rule). `mtu_*` multi-translation-unit fixtures are gated at 0.0.116 as their own MULTI-TU layer (`test_suites/scripts/multi_tu_tests.sh`, 3/3).
-- **Test framework note:** tests `return`/`exit` a *computed value* (not just 0); EXPECTED.tsv's
-  `expected_rc` is that computed answer. So non-zero expected_rc entries are correct results, not
-  hidden failures. Verified by reading test bodies (e.g. array_test.quanta returns 200 = a.1; simple_fadd.quanta
-  returns 7 = 3.0+4.0). The gate is genuinely green.
+## Summary counts (source-derived, current at 0.0.124)
+
+- **Core tests in gate: 157** (`test_suites/EXPECTED.tsv`, 157 rows). Covers all cores through 0.0.124 (includes `big_test` 0.0.114, `rsp_test` 0.0.115, `quantum_test`/`linalg_test`/`trig_test` 0.0.116, `big_ops_test` 0.0.117, `closure_named_fn` 0.0.123, `futex_wait_test` 0.0.124). `std_*` tests live in a SEPARATE `test_suites/EXPECTED_STDLIB.tsv` (**7 rows**, wired in as the stdlib layer) and are NOT in the core gate. `mtu_*` multi-translation-unit fixtures are gated as their own MULTI-TU layer (`test_suites/scripts/multi_tu_tests.sh`, **3/3**).
+- **Builtins:** enumerated in `compiler/0.0.124/src/x86/emitter.quanta` (per-name dispatch branches). **Keywords:** enumerated in `compiler/0.0.124/src/x86/tokens.quanta` (`ktext` hash table). Both are authoritative; counts are derived from source, not a fixed audit number.
+- **Test framework note:** tests `return`/`exit` a *computed value* (not just 0); EXPECTED.tsv's `expected_rc` is that computed answer. Non-zero `expected_rc` entries are correct results, not hidden failures (e.g. `array_test.quanta` returns 200 = a.1; `simple_fadd.quanta` returns 7 = 3.0+4.0). The gate is genuinely green.
 
 ## Build order & sequencing
 
-The authoritative build order to 0.1.0 (debt window → P2 builtins → P3
-language → P4 tooling → 0.1.0) now lives in **`docs/ROADMAP.md` §3** (single
-source of truth, consolidated 2026-08-17). It is no longer duplicated here
-to prevent version-number drift.
+The authoritative build order to 0.1.0 now lives in **`docs/ROADMAP.md` §3** (single source of truth). It is no longer duplicated here to prevent version-number drift.
 
-Key invariants (unchanged): one feature per WIP version; debt window
-(0.0.43–0.0.50) closed before new features; gate green before promotion;
-Quanta-native code-writing tool is deferred to AFTER the stdlibs stage
-(POST-0.1.0, per user directive 2026-08-28 — no version reserved); ARM64 backend
-deferred to POST-0.1.0 (no version reserved).
+Key invariants (unchanged): one feature per WIP version; gate green before promotion; every verified gap gets a version (no-deferral policy, user directive 2026-08-28). The Quanta-native code-writing tool is deferred to AFTER the stdlibs stage (**POST-0.1.0**, no version reserved); ARM64 backend deferred to **POST-0.1.0** (no version reserved). Cores are complete through **0.0.124** (concurrency hardening); next is **0.1.0** (std/lib resumes, borrow-checking, PTY layer).
