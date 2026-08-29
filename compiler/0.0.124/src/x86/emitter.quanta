@@ -1299,6 +1299,11 @@ fn emit_bltn2(nmi,nl,ii) {
         eb(125); eb(12)                   // jge +12 (skip exit if rax >= 0)
         eb(191); ei(1); eb(184); ei(60); eb(15); eb(5)  // exit 1
         rr(13, 0)            // r13 = stack base
+        // FIX-0.0.40: guard page. The child stack grows downward from stack_top;
+        // protect the LOWEST page (at r13) with PROT_NONE so a stack underflow
+        // faults instead of silently corrupting adjacent mmap'd memory. mprotect
+        // failure is non-fatal (best-effort hardening) -> ignore its retval.
+        rr(7, 13); ri(6, 4096); ri(2, 0); ri(0, 10); sysc()  // mprotect(r13, 4096, PROT_NONE=0)
         ri(11, 1048576-16); ra(11, 13)   // r11 = stack_top-16
         rbp(0, spill_home(irres(ira2(ii)+1)))  // rax = arg (the value passed to worker, 2nd param)
         eb(0x49); eb(0x89); eb(0x43); eb(0)   // mov [r11+0], rax  (child rsp = arg)
