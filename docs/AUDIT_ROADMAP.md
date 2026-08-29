@@ -350,8 +350,8 @@ No-deferral policy to 0.1.0 (user directive 2026-08-28): every verified gap gets
 | | |
 |---|---|
 | **Evidence** | 5 lock-prefixed atomic ops gated (atomic_test rc=11) but zero futex matches in features/emitter (grep-verified); no thread_create/join. ROADMAP said "Futex deferred to a later core" with no version — now assigned. |
-| **Fix** | 0.0.119: `futex_wait`/`futex_wake` (sc 202) + `thread_create(fn,arg)`/`thread_join(tid)` (clone sc 56, per-thread stack mmap). Design pass: allocator interaction, stack layout, join semantics. |
-| **Status** | ❌ open → scheduled **0.0.119** |
+| **Fix** | 0.0.119: `futex_wait`/`futex_wake` (sc 202) + `thread_create(fn,arg)`/`thread_join(tid)` (clone sc 56, per-thread 1MB stack mmap + join-slot mmap, CLONE_CHILD_CLEARTID wakes join). Worker fn index resolved via `findfn(worker_name)` → patch type 5 (`fn_symidx[idx]`, R_X86_64_PC32). `thread_test.quanta` (worker(7)=107, join returns 107) + `futex_test.quanta` GREEN. Full gate GREEN. Fixpoint byte-verified (md5 `8c2ccfdb7388fda3f83ae1d1bd60474b`). |
+| **Status** | ✅ CLOSED (0.0.119) |
 
 ## FIX-0.0.39  MED — shipped-core feature gaps (stack_trace / closures / extern "C")
 

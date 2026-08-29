@@ -95,6 +95,15 @@ fn wbase(d, vr) { let rex=73; if vr>=8 { rex=77 }; eb(rex); eb(137); mr(2, vr%8,
 // lbase(d, vr): mov vr, [r11+d]
 fn lbase(d, vr) { let rex=73; if vr>=8 { rex=77 }; eb(rex); eb(139); mr(2, vr%8, 3); ei(d) }
 fn leabp(r,d) { let v=72; if r>=8 { v=73 }; eb(v); eb(141); if r>=8 { mr(2,r%8,4); eb(37) } else { mr(2,r%8,5) }; ei(d) }
+// lsp(r, disp): mov r64, [rsp+disp8]  (rsp base REQUIRES a SIB byte on x86-64).
+//   REX.W + 8B + modrm(01,reg,100) + SIB(0x24: scale0,no-index,base=rsp) + disp8.
+fn lsp(r, disp) {
+    let rex=72; if r>=8 { rex=76 }   // REX.W (+ REX.R to extend the DEST reg; base is rsp, must NOT be extended)
+    eb(rex); eb(139)                 // 8B = mov r/m, reg
+    if r>=8 { mr(1, r%8, 4) } else { mr(1, r%8, 4) }   // mod=01, reg=r, rm=100(rsp)
+    eb(36)                           // SIB = 0x24
+    eb(disp)                         // disp8 (mod=01 => 1 byte)
+}
 fn rmr(rd,ad) { rw(rd,ad); eb(139); mr(0,rd%8,ad%8) }
 fn wmr(ad,vl) { rw(vl,ad); eb(137); mr(0,vl%8,ad%8) }
 fn rmr8(rd,ad) { rw(rd,ad); eb(15); eb(182); mr(0,rd%8,ad%8) }
@@ -1181,6 +1190,79 @@ fn emit_bltn2(nmi,nl,ii) {
         rxor(10,10); rxor(8,8); rxor(9,9)
         ri(0,202); sysc(); return 1
     }
+    // 0.0.119: thread_create(worker_fn, arg) -> tid
+    //   Spawns a child via clone(56) sharing the address space (CLONE_VM|FS|FILES|
+    //   SIGHAND, no CLONE_THREAD) so the child is a waitable task and thread_join
+    //   collects its exit status via wait4(61). Raw clone resumes the child at the
+    //   instruction after the syscall (rax=0 in child, tid in parent), so the child
+    //   jumps to a trampoline: read arg from [rsp] (child rsp = stack_top-16),
+    //   call worker_fn (patched by linker to fn index g_thread_ffi), exit(result).
+    //   r13/r12 are callee-owned frame regs here; save/restore around the builtin.
+    if nl==13&&r8(nm)=='t'&&r8(nm+1)=='h'&&r8(nm+2)=='r'&&r8(nm+3)=='e'&&r8(nm+4)=='a'&&r8(nm+5)=='d'&&r8(nm+6)=='_'&&r8(nm+7)=='c'&&r8(nm+8)=='r'&&r8(nm+9)=='e'&&r8(nm+10)=='a'&&r8(nm+11)=='t'&&r8(nm+12)=='e' {
+        flush_all()
+        // DIAGNOSTIC removed: g_thread_ffi now stores the WORKER NAME OFFSET.
+        eb(65); eb(85)   // push r13 (callee-saved frame base; we clobber it below)
+        eb(65); eb(86)   // push r14 (callee-saved; we use it for js)
+        // join slot: mmap 16B -> [0]=tid(futex), [8]=result
+        ri(0, 9)            // rax = mmap
+        rxor(7,7)            // rdi = 0
+        ri(6, 16)            // rsi = 16
+        ri(2, 3); ri(10, 34); ri(8, 0-1); ri(9, 0)
+        sysc()               // rax = join slot (js)
+        rr(14, 0)            // r14 = js
+        // child stack: mmap 1MB RW
+        ri(0, 9); rxor(7,7); ri(6, 1048576); ri(2, 3); ri(10, 34); ri(8, 0-1); ri(9, 0)
+        sysc()               // rax = stack base
+        rr(13, 0)            // r13 = stack base
+        ri(11, 1048576-16); ra(11, 13)   // r11 = stack_top-16
+        rbp(0, spill_home(irres(ira2(ii)+1)))  // rax = arg (the value passed to worker, 2nd param)
+        eb(0x49); eb(0x89); eb(0x43); eb(0)   // mov [r11+0], rax  (child rsp = arg)
+        eb(0x4d); eb(0x89); eb(0x73); eb(8)   // mov [r11+8], r14  (store js on child stack for reload)
+        // clone(CLONE_VM|FS|FILES|SIGHAND|THREAD|PARENT_SETTID|CHILD_CLEARTID, sp, js, js, 0)
+        ri(0, 56)
+        ri(7, 0x100|0x200|0x400|0x800|0x10000|0x100000|0x200000)  // rdi = flags
+        rr(6, 11)            // rsi = stack_top-16
+        rr(2, 14)            // rdx = parent_tidptr = js
+        rr(10, 14)           // r10 = child_tidptr = js
+        rxor(8,8); rxor(9,9)
+        sysc()               // child: rax=0 ; parent: rax=tid (also *js=tid)
+        rxor(2,2)            // rdx = 0 (so cmp rax,0 is correct in both paths)
+        rcmp(0, 2)           // cmp rax, 0  (child: rax=0 -> ZF=1 -> fall to trampoline)
+        let jcc_ofs = codelen
+        jcc32(1, 0)          // jnz PARENT (skip trampoline in parent)
+        // TRAMPOLINE (child): rsp=stack_top-16, [rsp]=arg, [rsp+8]=js; r14=js preserved by worker
+        lsp(7, 0)           // rdi = arg
+        let call_ofs = codelen
+        eb(232); ei(0)       // call worker_fn (rel32 placeholder)
+        w64(patches+patchc*PCS, call_ofs); w64(patches+patchc*PCS+8, g_thread_ffi); w64(patches+patchc*PCS+16, 5); patchc = patchc + 1
+        lsp(14, 8)           // r14 = js, reloaded from child stack ([rsp+8]=[child_sp+8]; ret restored rsp)
+        eb(0x49); eb(0x89); eb(0x46); eb(8)   // mov [r14+8], rax  (store result in js+8)
+        rxor(7,7)            // rdi = 0  (exit code)
+        ri(0, 60); sysc()    // exit(0) -> kernel clears *js (futex wake)
+        // PARENT resumes: rax = js (join-slot ptr, also holds tid at [0])
+        let parent_ofs = codelen
+        w32(code + jcc_ofs + 2, parent_ofs - (jcc_ofs + 6))
+        rr(0, 14)            // rax = js (return join slot to caller)
+        eb(65); eb(94)   // pop r14
+        eb(65); eb(95)   // pop r13
+        return 1
+    }
+    // 0.0.119: thread_join(slot) -> worker result. slot: [0]=tid(futex), [8]=result.
+    //   Blocks in futex_wait(slot, *slot) until the child exits (kernel clears
+    //   *slot and wakes the futex), then returns the stored result at [8].
+    if nl==11&&r8(nm)=='t'&&r8(nm+1)=='h'&&r8(nm+2)=='r'&&r8(nm+3)=='e'&&r8(nm+4)=='a'&&r8(nm+5)=='d'&&r8(nm+6)=='_'&&r8(nm+7)=='j'&&r8(nm+8)=='o'&&r8(nm+9)=='i'&&r8(nm+10)=='n' {
+        flush_all()
+        rbp(7, spill_home(irres(ira2(ii)+0)))  // rdi = slot
+        // futex(slot, FUTEX_WAIT=0, *slot, 0, 0, 0): rsi=0 (op), rdx=val=*slot
+        ldx(11, 7, 0)      // r11 = [rdi+0] = tid (val)
+        ri(6, 0)           // rsi = FUTEX_WAIT (0)
+        rr(2, 11)          // rdx = val = tid
+        ri(10, 0); ri(8, 0); ri(9, 0)
+        ri(0, 202); sysc()  // futex_wait(slot, 0, tid, 0,0,0)
+        ldx(0, 7, 8)       // rax = [rdi+8] = result
+        return 1
+    }
+
     // syscall(num, a, b, c, d, e, f): GENERIC raw Linux syscall (any arity 1..7).
     //   IR_CALL already did flush_all() and loaded args rdi/rsi/rdx/rcx/r8/r9
     //   (and pushed arg6+ on the stack). We do NOT rely on those registers;
