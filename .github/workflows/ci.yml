@@ -2,27 +2,29 @@ name: ci
 
 # Quanta compiler continuous integration.
 #
-# Runs on every push/PR to main. The compiler under test is the committed
-# golden self-hosting binary at compiler/$(cat VERSION)/bin/x86/qc (built and verified
-# at the current feature release; valgrind-clean). Every stage must pass or the
-# build is RED:
-#   1. Compiler present  - the golden bin/x86/qc exists and is executable.
-#   2. Functional gate   - test_suites/scripts/run_tests.sh (functional + extern-c +
-#      security + perf layers). A compile-fail or wrong exit code fails the build.
-#   3. Valgrind scan     - run the golden qc under Valgrind to catch real memory
-#      unsafety (OOB writes, use-after-free) the functional gate misses.
-#   4. Fuzz              - tools/fuzz/fuzz_qc.py: random .quanta input must NEVER
-#      crash qc (fail-closed). Expects rc in {0,1,7,13,14,15,16,17}.
-#   5. Differential       - tools/diff_test/diff_qc.py: current qc vs the committed
-#      qc must agree on exit codes for reference programs.
+# DESIGN (hard-won, DO NOT REGRESS):
+#   The gate must ALWAYS run against the FINAL self-hosted qc, never a temp build
+#   and never a stale committed binary. So CI REBUILDS the compiler from source
+#   first (seed = previous version's golden), promotes the result into
+#   compiler/$(VERSION)/bin/x86/qc, then gates against that path. This is fully
+#   automatic per VERSION — no manual per-version edits.
 #
-# Self-host: the current compiler compiles the $(cat VERSION) source FAITHFULLY
-# (2-stage self-host verified byte-identical to the golden binary, 138/138 gate).
-# The "Self-host rebuild" step rebuilds from source with the golden binary and
-# re-runs the gate; it is NON-BLOCKING (continue-on-error) as a belt-and-braces
-# check that the shipped compiler still bootstraps itself.
+#   A missing-file guard fails the build LOUDLY if any test referenced by
+#   EXPECTED*.tsv is absent from the checkout (the silent `qc` exit(14) file-open
+#   trap that previously left CI red without explanation).
 #
-# Current version tracked in repo VERSION file (extern "C" FFI polish + gate expanded to 7 layers; self-host fixpoint byte-identical, 138/138 functional gate). Golden compiler: compiler/$(cat VERSION)/bin/x86/qc.
+# Stages (all blocking; any failure => RED):
+#   1. Read version + derive previous version (seed source).
+#   2. Self-host rebuild  - seed = compiler/$PREV/bin/x86/qc, build $VERSION source
+#      (2-stage), promote into compiler/$VERSION/bin/x86/qc. Must be byte-identical
+#      across stages (fixpoint) or the build fails.
+#   3. Missing-file guard - every name in EXPECTED.tsv / EXPECTED_STDLIB.tsv must
+#      exist on disk, else fail with the exact missing filename.
+#   4. IR opcode uniqueness - structural guard (no duplicate IR_* values).
+#   5. Functional gate     - run_tests.sh (functional + extern-c + security + perf).
+#   6. Valgrind scan       - qc under Valgrind for real memory unsafety.
+#   7. Fuzz                - fail-closed: random input never crashes qc.
+#   8. Differential        - current qc vs rebuilt qc agree on exit codes.
 
 on:
   push:
@@ -41,33 +43,72 @@ jobs:
       - name: Install Valgrind
         run: sudo apt-get update && sudo apt-get install -y valgrind
 
-      - name: Read version
+      - name: Read version + derive previous version
         id: ver
         run: |
+          set -e
           V=$(cat VERSION)
           echo "version=$V" >> $GITHUB_OUTPUT
-          echo "version=$V"
+          # previous version = last 0.0.<N-1> in compiler/ (the seed golden)
+          PREV=$(ls -1d compiler/0.0.* | sed 's#compiler/##; s#/##' \
+                 | sort -V | awk -v cur="$V" '$1 < cur {last=$1} END {print last}')
+          [ -n "$PREV" ] || { echo "no previous version (seed) found"; exit 1; }
+          echo "prev=$PREV" >> $GITHUB_OUTPUT
+          echo "version=$V  prev=$PREV"
 
-      - name: Verify golden compiler present
+      - name: Self-host rebuild (seed = prev golden, promote final into bin/x86/qc)
         working-directory: ${{ github.workspace }}
         run: |
           set -e
           V=${{ steps.ver.outputs.version }}
-          QC=compiler/$V/bin/x86/qc
-          test -x "$QC" || { echo "golden compiler $QC missing"; exit 1; }
-          echo "golden qc ($V): $(md5sum $QC | cut -d' ' -f1)"
+          PREV=${{ steps.ver.outputs.prev }}
+          SEED="$GITHUB_WORKSPACE/compiler/$PREV/bin/x86/qc"
+          test -x "$SEED" || { echo "seed $SEED missing"; exit 1; }
+          D="$GITHUB_WORKSPACE/temp/build/ci_$V"
+          rm -rf "$D"; mkdir -p "$D"
+          cd "$GITHUB_WORKSPACE/compiler/$V/src/x86"
+          # stage A: seed compiles source -> boot
+          "$SEED" main.quanta "$D/qc_boot" -O 2>&1 | tail -3
+          test -x "$D/qc_boot" || { echo "stage A failed"; exit 1; }
+          # stage B: boot compiles source -> self
+          "$SEED" "$D/qc_boot" main.quanta "$D/qc_self" -O 2>&1 | tail -3
+          test -x "$D/qc_self" || { echo "stage B failed"; exit 1; }
+          # stage C: self compiles source -> gen3 (fixpoint vs self)
+          "$SEED" "$D/qc_self" main.quanta "$D/qc_gen3" -O 2>&1 | tail -3
+          test -x "$D/qc_gen3" || { echo "stage C failed"; exit 1; }
+          # fixpoint: self must byte-match gen3
+          A=$(md5sum "$D/qc_self" | cut -d' ' -f1)
+          B=$(md5sum "$D/qc_gen3" | cut -d' ' -f1)
+          echo "fixpoint self=$A gen3=$B"
+          [ "$A" = "$B" ] || { echo "FAIL: self-host fixpoint NOT byte-identical"; exit 1; }
+          # promote the final self-hosted binary into the version bin
+          mkdir -p "$GITHUB_WORKSPACE/compiler/$V/bin/x86"
+          cp "$D/qc_gen3" "$GITHUB_WORKSPACE/compiler/$V/bin/x86/qc"
+          echo "promoted final qc: $(md5sum "$GITHUB_WORKSPACE/compiler/$V/bin/x86/qc" | cut -d' ' -f1)"
+
+      - name: Guard — every expected test file must exist in checkout
+        working-directory: ${{ github.workspace }}
+        run: |
+          set -e
+          miss=0
+          for tsv in test_suites/EXPECTED.tsv test_suites/EXPECTED_STDLIB.tsv; do
+            [ -f "$tsv" ] || continue
+            while IFS=$'\t' read -r name expected; do
+              [ -n "$name" ] || continue
+              case "$name" in \#*) continue;; esac
+              if [ ! -f "test_suites/codes/$name" ]; then
+                echo "MISSING TEST FILE: test_suites/codes/$name (referenced by $tsv)"
+                miss=1
+              fi
+            done < "$tsv"
+          done
+          [ "$miss" = 0 ] || { echo "FAIL: missing test file(s) — see above"; exit 1; }
+          echo "OK: all expected test files present in checkout"
 
       - name: IR opcode uniqueness (structural guard)
         working-directory: ${{ github.workspace }}
         run: |
           set -e
-          # 0.0.65 shipped `let IR_CLOSURE = 72` while 72 was already IR_APUSH.
-          # parse_let tags fn-value RHS via irop(lr)==IR_CLOSURE, so every array
-          # push was misread as a closure and its result vreg corrupted: the
-          # array grew but the pushed element read back as 0. Silent wrong data,
-          # no diagnostic, and the whole functional gate stayed green because no
-          # test pushed onto an array. Fail the build on ANY duplicate opcode so
-          # this class cannot recur by convention alone.
           V=${{ steps.ver.outputs.version }}
           G=compiler/$V/src/x86/globals.quanta
           DUPS=$(grep -oE '^let IR_[A-Z_0-9]+ = [0-9]+' "$G" \
@@ -82,15 +123,12 @@ jobs:
           fi
           echo "OK: all IR opcode values unique ($(grep -cE '^let IR_[A-Z_0-9]+ = [0-9]+' "$G") opcodes)"
 
-      - name: Functional gate (run_tests.sh)
+      - name: Functional gate (run_tests.sh, against final promoted qc)
         working-directory: ${{ github.workspace }}
         env:
           QC: compiler/${{ steps.ver.outputs.version }}/bin/x86/qc
           PERF_BASELINE_MS: "60000"
         run: |
-          # The runner wraps this step in `bash -e`; the gate legitimately exits
-          # non-zero when red, so append `|| true` to let the log print below
-          # instead of aborting the step before `cat`.
           bash test_suites/scripts/run_tests.sh > /tmp/gate.log 2>&1 || true
           cat /tmp/gate.log
           grep -qE "functional : RED|FAIL \(compile\)|FAIL [a-z]+_.*quanta|FAIL [a-z]+_[a-z]+ \(" /tmp/gate.log && exit 1 || true
@@ -111,7 +149,7 @@ jobs:
           V=${{ steps.ver.outputs.version }}
           python3 tools/fuzz/fuzz_qc.py --qc compiler/$V/bin/x86/qc --iter 5000
 
-      - name: Differential (cross-check vs committed qc)
+      - name: Differential (cross-check vs rebuilt qc)
         working-directory: ${{ github.workspace }}
         run: |
           set -e
@@ -119,20 +157,3 @@ jobs:
           python3 tools/diff_test/diff_qc.py \
             --current compiler/$V/bin/x86/qc \
             --seed compiler/$V/bin/x86/qc
-
-      - name: Self-host rebuild (2-stage from 0.0.87 source — now faithful)
-        continue-on-error: true
-        working-directory: ${{ github.workspace }}
-        run: |
-          V=${{ steps.ver.outputs.version }}
-          SEED="$GITHUB_WORKSPACE/compiler/$V/bin/x86/qc"
-          test -x "$SEED" || { echo "SELFHOST seed missing"; exit 0; }
-          cd "$GITHUB_WORKSPACE/compiler/$V/src/x86"
-          "$SEED" main.quanta qc_rebuilt 2>&1 | tail -3 || true
-          if [ -x qc_rebuilt ]; then
-            cd "$GITHUB_WORKSPACE"
-            QC="$GITHUB_WORKSPACE/compiler/$V/src/x86/qc_rebuilt" PERF_BASELINE_MS=60000 bash test_suites/scripts/run_tests.sh > /tmp/selfhost.log 2>&1 || true
-            echo "SELFHOST $(grep -E 'Results:|functional :' /tmp/selfhost.log | head -3)"
-          else
-            echo "SELFHOST qc_rebuilt not produced"
-          fi

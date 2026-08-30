@@ -1,0 +1,29 @@
+import std/fs
+fn main() {
+  // 1. mkdir a temp dir (mode 0755 = 493)
+  let mk = mkdir("/tmp/quanta_129_dir", 493)
+  if mk != 0 { exit(1) }
+  // 2. open a file inside it for writing (O_WRONLY|O_CREAT|O_TRUNC = 577, mode 0644 = 420)
+  let fd = open("/tmp/quanta_129_dir/f.txt", 577, 420)
+  if fd < 0 { exit(2) }
+  let w = write_str(fd, "hello")
+  if w != 5 { exit(3) }
+  close(fd)
+  // 3. stat the file (buf >= 144 bytes)
+  let buf = mem_alloc(20)   // 160 bytes >= struct stat
+  let st = stat("/tmp/quanta_129_dir/f.txt", buf)
+  if st != 0 { exit(4) }
+  // 4. rename the file
+  let rn = rename("/tmp/quanta_129_dir/f.txt", "/tmp/quanta_129_dir/g.txt")
+  if rn != 0 { exit(5) }
+  // 5. unlink the renamed file
+  let ul = unlink("/tmp/quanta_129_dir/g.txt")
+  if ul != 0 { exit(6) }
+  // 6. rmdir the temp dir
+  let rd = rmdir("/tmp/quanta_129_dir")
+  if rd != 0 { exit(7) }
+  // 7. chdir to /tmp should succeed
+  let cd = chdir("/tmp")
+  if cd != 0 { exit(8) }
+  exit(0)
+}

@@ -1,0 +1,17 @@
+fn main() {
+  let ok = 0
+  let m = pty_open()
+  if m < 0 { return 10 }
+  let s = pty_slave(m)
+  if s < 0 { return 20 }
+  ok = 1                  // master+slave opened
+  let p = fork()
+  if p == 0 {
+    dup2(s, 1)            // redirect child stdout to pty slave
+    exec("printf hi")     // runs on the slave
+    exit(99)
+  }
+  let w = wait(p)
+  if w == 0 { ok = 2 }    // child ran + exited cleanly via the pty
+  return ok
+}
