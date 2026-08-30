@@ -6,7 +6,7 @@
 #   compiler/   - the Quanta self-hosting source + promoted binaries
 #   docs/       - documentation
 #   lib/        - standard library source
-#
+
 # Everything else is internal/local and must NOT be pushed:
 #   systems/ agents/ bootstrap/ test_suites/ tools/ scripts/ bin/ src/
 #   .github/ .hyperresearch/ .claude/ scratch/ temp/ and all junk.
@@ -19,13 +19,18 @@
 !/compiler/
 !/docs/
 !/lib/
-!/tree-sitter-quanta/
+!/test_suites/        # CI gate reads codes/, EXPECTED*.tsv, scripts/ — must not be ignored
+
+# Build/fixpoint SCRATCH goes to temp/ in the project root (see line ~34), never
+# under compiler/<VER>/. compiler/ holds ONLY src/ + bin/ + STATE.md.
+# (debug/ was previously created under compiler/<VER>/debug — that is gone; this
+# negation is intentionally NOT present so accidental compiler/**/debug creation
+# would surface in `git status` and get caught.)
 
 # --- internal / local-only (never pushed) ---
 systems/
 agents/
 bootstrap/
-test_suites/
 tools/
 scripts/
 .hyperresearch/
@@ -33,19 +38,15 @@ scripts/
 scratch/
 temp/
 
-# --- EXCEPTIONS: CI gate inputs must be tracked (blanket-ignore landmine fix) ---
-# The gate (test_suites/scripts/run_tests.sh, invoked by ci.yml) reads these paths.
-# Previously force-added ad-hoc per regression (c899044, e5173a4, 350a4a9); now
-# permanently allowed so a new test source can never be silently dropped from CI.
-!test_suites/codes/
-!test_suites/EXPECTED.tsv
-!test_suites/EXTERN_EXPECTED.tsv
-!test_suites/EXPECTED_STDLIB.tsv
-!test_suites/scripts/
-!scripts/quanta_run.sh
-!scripts/quanta_link.sh
-!tools/fuzz/fuzz_qc.py
-!tools/diff_test/diff_qc.py
+# --- CI gate inputs (under test_suites/, already un-ignored above) ---
+# test_suites/ as a whole is un-ignored; nothing else needed here.
+
+# --- compiler golden binaries + self-hosting SOURCE are NEVER ignorable ---
+# These two negations guarantee a future broad ignore can never silently drop
+# compiler/<VER>/bin (promoted golden seed) or compiler/<VER>/src (source).
+# Order matters: they must follow the !/compiler/ negation above.
+!compiler/**/bin/
+!compiler/**/src/
 
 # --- junk ---
 vgcore.*
@@ -58,9 +59,8 @@ ergz_pass_placeholder
 
 # compiler-specific: keep compiler/<VER>/src/ (SOURCE ONLY) + STATE.md + bin/ tracked.
 # src/ must contain SOURCE ONLY — never binaries. bin/ holds the promoted seed
-# (rebuilt by CI from src/) and IS tracked. debug/ is in /tmp, never in repo.
-# STATE.md is the per-version release record — TRACKED (do NOT ignore).
-compiler/**/debug/      # debug is in /tmp, never in repo; removed after problem solved
+# (rebuilt by CI from src/) and IS tracked. Scratch builds live in temp/ (ignored),
+# never under compiler/. STATE.md is the per-version release record — TRACKED.
 qc_boot
 qc_self
 qc_boot_n
