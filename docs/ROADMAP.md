@@ -163,16 +163,16 @@ Why post-0.1.0: the ARM64 backend is a new backend; shipping it while x86 debt
 remains would violate the debt-first rule and split correctness effort.
 Qualification evidence is gathered AFTER the core is complete, not before.
 
-### Current status (0.0.128 — live)
+### Current status (0.0.129 — live)
 
-**0.0.128 (current stable seed, live):** `big` div-by-zero guard (FIX-0.0.19, partial core). `lib/std/big.quanta`'s `big_div`/`big_mod` now guard a zero divisor via a new `big_is_zero` helper and `exit(1)` (fatal, matching the IR_UNWRAP panic convention), instead of hanging forever in `big_udiv`'s shift-subtract loop. Previously `big / 0` / `big % 0` would loop indefinitely (no guard — a genuine hole). New `big_divzero_test.quanta` (rc=1) gates the fix; `big_test.quanta` (rc=0) confirms normal division/modulo unchanged. Built from 0.0.127 seed; fixpoint byte-verified (gen1==gen2==gen3, md5 `e1d5ed96d9df41f69297c4bcd2b50b4c` — identical to 0.0.127 since the change is library-only). Gate: functional 161/161, stdlib 7/7, multi-TU 3/3, all 11 layers GREEN. Next core = **0.0.129** (`fs` missing ops: stat/unlink/mkdir/chdir/rename/rmdir). 0.1.0 = post-core STABLE.
+**0.0.129 (current stable seed, live):** `fs` missing ops (partial core). Added the six missing filesystem builtins — `file_stat`(sc 4), `file_unlink`(sc 87), `file_mkdir`(sc 83), `file_chdir`(sc 80), `file_rename`(sc 82), `file_rmdir`(sc 84) — and their `lib/std/fs.quanta` wrappers (`stat`/`unlink`/`mkdir`/`chdir`/`rename`/`rmdir`). Previously only `open`/`read`/`write`/`close` existed (a genuine ops gap). **Dispatch fix:** `chdir`/`rename`/`rmdir` collide on the 6th-character `file_` dispatch (`c`→close, `r`→read), so they use full-name matching before the single-char branches — a naive single-char `c5=='d'/'n'/'i'` would have silently misfired (rmdir→read, chdir→close). New `fs_ops_test.quanta` (rc=0) exercises mkdir→write→stat→rename→unlink→rmdir→chdir end-to-end. Built from 0.0.128 seed; fixpoint byte-verified (gen1==gen2==gen3, md5 `463c47c91485efb3cc6623f103b0f3fc`). Gate: functional 162/162, stdlib 7/7, multi-TU 3/3, all 11 layers GREEN. Next core = **0.0.130** (extern-C variadic). 0.1.0 = post-core STABLE.
 
 **0.0.125→0.0.138 (core sequence, per 2026-08-30 — cores do NOT go into 0.1.0; ALL PARTIAL cores first after `process`, then AI/QC-era, then classical/hardest):**
 - 0.0.125 `time` (clock/now/sleep/nanosleep) — ✅ **DONE** (fixpoint md5 `350e156a7e4d5615f9df4e3780151010`, gate 158/158)
 - 0.0.126 `process` (fork/exec/wait/kill) — ✅ **DONE** (fixpoint md5 `2504e5b10d4fcbe812199b6f2e56679b`, gate 159/159, process_test rc=4)
 - 0.0.127 `pty` (open/slave/name/dup2/ioctl) — ✅ **DONE** (fixpoint md5 `e1d5ed96d9df41f69297c4bcd2b50b4c`, gate 160/160, pty_test rc=2)
 - 0.0.128 `big` div-by-zero guard (FIX-0.0.19) — ✅ **DONE** (big_div/big_mod guard b==0 → exit(1); big_divzero_test rc=1, big_test rc=0, gate 161/161)
-- 0.0.129 `fs` missing ops (partial core — stat/unlink/mkdir/chdir/rename/rmdir absent; `fs` shipped 0.0.87)
+- 0.0.129 `fs` missing ops (stat/unlink/mkdir/chdir/rename/rmdir) — ✅ **DONE** (6 new file_* builtins + fs.quanta wrappers; fs_ops_test rc=0, gate 162/162)
 - 0.0.130 extern-C variadic (partial core — `printf(fmt,...)` not modeled; extern-C shipped 0.0.98/122)
 - 0.0.131 closure self-recursion by name (partial core — `findfn` doesn't resolve name in closure body; closures shipped 0.0.65→123)
 - 0.0.132 `json` (data/AI interchange)

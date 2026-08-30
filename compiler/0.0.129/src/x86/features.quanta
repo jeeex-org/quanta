@@ -1,0 +1,579 @@
+// === P2 OWNERSHIP: compiler-inserted free of mem_alloc-owned bindings ===
+// A binding `let p = mem_alloc(...)` is compiler-owned: on every exit edge of
+// the scope that introduced it, the compiler emits IR_FREE(p). Scope handling is
+// INDEX-BASED and IDEMPOTENT so that early exits (break/return) which jump past a
+// block's trailing pop cannot double-free: a scope's frees are emitted exactly
+// once, tracked by restoring owned_top straight to the scope's base.
+fn owned_scope_push() {
+    w64(owned_scopes + owned_sctop*8, owned_top)
+    owned_sctop = owned_sctop + 1
+}
+// Free exactly scope index `sc` (the one a parse_block pushed). Idempotent: if sc
+// was already collapsed by an earlier break/return, owned_top is already at its
+// base, so no IR_FREE is re-emitted and counters are left consistent.
+fn owned_scope_pop_one(sc) {
+    if sc<0 || sc>=owned_sctop { return }
+    let base = r64(owned_scopes + sc*8)
+    let i = owned_top - 1
+    while i >= base {
+        let ov = r64(owned_stk + i*8)
+        // FIX-0.0.3: only free if still owned. An explicit mem_free(p)/drop(p)
+        // clears vreg_owned[p] at the call site, so scope exit must NOT re-push
+        // the same block (double-free -> aliased-block heap corruption once the
+        // allocator starts recycling the free list).
+        if r64(vreg_owned + ov*8)==1 { iremit(IR_FREE, 0, ov, 0, 0) }
+        i = i - 1
+    }
+    owned_top = base
+    owned_sctop = sc
+}
+fn owned_pop_all() {
+    while owned_sctop>0 { owned_scope_pop_one(owned_sctop-1) }
+}
+fn owned_pop_to(base_sctop) {
+    while owned_sctop > base_sctop { owned_scope_pop_one(owned_sctop-1) }
+}
+fn owned_add(vr) {
+    // FIX-0.0.8: owned_stk is an 8192-slot arena. Without a cap, 8192+ live
+    // mem_alloc bindings (deeply nested scopes/loops) write past the arena and
+    // corrupt adjacent compiler state — breaks the "all arenas capped" invariant.
+    if owned_top >= 8192 { exit(1) }
+    w64(owned_stk + owned_top*8, vr)
+    owned_top = owned_top + 1
+}
+
+// === F6 DEFER: delayed statement execution at scope exit (LIFO) ===
+// `defer STMT` captures STMT's IR, removes it from the inline stream, and
+// replays it verbatim at every exit of the enclosing block (normal fall-through
+// and `return`). Vregs are replayed with their original numbers; Quanta's IR is
+// SSA-like (each vreg defined once, live until scope exit), so replaying at
+// scope exit reads the correct values. break/continue-triggered defer is a
+// documented F6 limitation.
+let DEFER_BUF = mmap(8000000)       // deferred IR records (200K @ 40B)
+let DEFER_USAFE = mmap(200000)      // unsafe flags for deferred records
+let defer_meta = mmap(400000)       // [scope, bufoff, buflen] x N (24B each)
+let defer_ids = mmap(8000)          // scratch for replay ordering
+let defer_count = 0
+let defer_buftop = 0
+fn defer_push(scope, start, end) {
+    let len = end - start
+    if len <= 0 { return }
+    let bufoff = defer_buftop
+    let j = 0
+    while j < len {
+        let s = ir + (start + j)*IRS
+        let d = DEFER_BUF + (bufoff + j)*IRS
+        w64(d+0, r64(s+0)); w64(d+8, r64(s+8)); w64(d+16, r64(s+16)); w64(d+24, r64(s+24)); w64(d+32, r64(s+32))
+        w8(DEFER_USAFE + (bufoff + j), r8(ir_unsafe + (start + j)))
+        j = j + 1
+    }
+    w64(defer_meta + defer_count*24 + 0, scope)
+    w64(defer_meta + defer_count*24 + 8, bufoff)
+    w64(defer_meta + defer_count*24 + 16, len)
+    defer_count = defer_count + 1
+    defer_buftop = bufoff + len
+    irc = start   // remove inline IR; replayed at scope exit
+}
+fn defer_replay(scope) {
+    let nids = 0; let i = 0
+    while i < defer_count { if r64(defer_meta + i*24) == scope { w64(defer_ids + nids*8, i); nids = nids + 1 }; i = i + 1 }
+    let k = nids - 1
+    while k >= 0 {
+        let idx = r64(defer_ids + k*8)
+        let bufoff = r64(defer_meta + idx*24 + 8)
+        let len = r64(defer_meta + idx*24 + 16)
+        let j = 0
+        while j < len {
+            let s = DEFER_BUF + (bufoff + j)*IRS
+            let d = ir + irc*IRS
+            w64(d+0, r64(s+0)); w64(d+8, r64(s+8)); w64(d+16, r64(s+16)); w64(d+24, r64(s+24)); w64(d+32, r64(s+32))
+            w8(ir_unsafe + irc, r8(DEFER_USAFE + (bufoff + j)))
+            irc = irc + 1
+            j = j + 1
+        }
+        k = k - 1
+    }
+    let ni = 0; let i2 = 0
+    while i2 < defer_count {
+        if r64(defer_meta + i2*24) != scope {
+            w64(defer_meta + ni*24 + 0, r64(defer_meta + i2*24 + 0))
+            w64(defer_meta + ni*24 + 8, r64(defer_meta + i2*24 + 8))
+            w64(defer_meta + ni*24 + 16, r64(defer_meta + i2*24 + 16))
+            ni = ni + 1
+        }
+        i2 = i2 + 1
+    }
+    defer_count = ni
+}
+fn defer_replay_range(base) {
+    let si = owned_sctop - 1
+    while si >= base { defer_replay(si); si = si - 1 }
+}
+fn parse_defer(scope) {
+    adv()   // consume 'defer'
+    let start = irc
+    let t = peek()
+    if t==TT_PNCT && pval()==123 { adv(); parse_block(); mpnct(125) }   // defer { ... }
+    else if t==TT_KEY && ktext(pval(),plen())==2 { parse_let() }
+    else { parse_expr() }
+    defer_push(scope, start, irc)
+}
+
+fn gfind(nm,nl) {
+    let i=0
+    while i<gvarc {
+        if r64(gvars+i*16+8)==nl {
+            let gnm=r64(gvars+i*16); let ok=1; let j=0
+            while j<nl { if r8(src+gnm+j)!=r8(src+nm+j) { ok=0; break }; j=j+1 }
+            if ok { return i }
+        }
+        i=i+1
+    }
+    return -1
+}
+
+// Scan for top-level `let NAME = EXPR` declarations (brace depth 0) and record
+// each as a global with its initializer token position.
+// Compiler-internal global names to skip in scan_globals
+let INTERNAL_GLOBALS = mmap(400)
+// Compiler-internal global addresses (absolute BSS addresses). Declared as a
+// real global so the undeclared-variable check passes and codegen writes to
+// the mmap'd buffer (not address 0, which the old silent-0 path did).
+let CGLOBALS = mmap(512)
+// Returns the internal-global GDATA index (0..INTERNAL_GLOBAL_COUNT-1) for a
+// name, or -1 if it is not an internal global.  Internal globals occupy the
+// first INTERNAL_GLOBAL_COUNT slots of the GDATA segment; source (program)
+// globals follow at INTERNAL_GLOBAL_COUNT + source_index.
+fn is_internal_global(nm,nl) {
+    let i=0; let entry=0
+    while i<400 {
+        let p=INTERNAL_GLOBALS+i
+        let c=r8(p)
+        if c==0 { break }
+        let matchvar=1
+        let j=0
+        while j<nl {
+            if r8(p+j)!=r8(nm+j) { matchvar=0; break }
+            j=j+1
+        }
+        if matchvar!=0&&r8(p+nl)==0 { return entry }
+        // skip to next null-terminated entry, counting entries
+        while r8(p)!=0 { p=p+1 }
+        i=p-INTERNAL_GLOBALS+1
+        entry=entry+1
+    }
+    return -1
+}
+
+fn scan_globals() {
+    gvarc=0; let depth=0; let p=0
+    while p<tokc {
+        if tokt(p)==TT_PNCT {
+            if tokv(p)==123 { depth=depth+1 }
+            if tokv(p)==125 { depth=depth-1 }
+        }
+        if depth==0&&tokt(p)==TT_KEY {
+            let kt=ktext(tokv(p),tokln(p))
+            // ktext==2 -> `let NAME = EXPR` (legacy top-level global)
+            // ktext==20 -> `global NAME [= init]` (exported cross-TU global)
+            if kt==2||kt==20 {
+                let nt=p+1
+                if nt<tokc&&tokt(nt)==TT_ID {
+                    w64(gvars+gvarc*16, tokv(nt)); w64(gvars+gvarc*16+8, tokln(nt))
+                    if kt==20 { w64(g_named+gvarc*8, 1) } else { w64(g_named+gvarc*8, 0) }
+                    // ginit: skip name and '='; for `global NAME` with no init it
+                    // still points past '=', harmless (initializer is empty / 0).
+                    w64(ginit+gvarc*8, nt+2)
+                    if gvarc >= GVAR_CAP { emit_ovf() }
+                    gvarc=gvarc+1
+                }
+            }
+            // F7: ktext==57 -> `const NAME = EXPR` (compile-time constant).
+            // Evaluate EXPR at scan time and store in the consts table so every
+            // later function body can substitute IR_CONST for the name.
+            else if kt==57 {
+                let nt=p+1
+                if nt<tokc&&tokt(nt)==TT_ID {
+                    // 0.0.75: reject const redefinition (silently took second value before)
+                    let cnm = tokv(nt)
+                    let cnl = tokln(nt)
+                    let dup=0
+                    let i=constc-1
+                    while i>=0 {
+                        if r64(consts+i*24+8)==cnl {
+                            let ok=1; let j=0
+                            let nm_off = r64(consts+i*24)
+                            while j<cnl { if r8(src+nm_off+j)!=r8(src+cnm+j){ok=0;break}; j=j+1 }
+                            if ok==1 { dup=1 }
+                        }
+                        i=i-1
+                    }
+                    if dup==0 {
+                        let old_tokp = tokp
+                        tokp = p+3                       // position past NAME and '='
+                        let val = eval_const()           // compile-time evaluate
+                        tokp = old_tokp                  // restore (main compile re-sets tokp)
+                        w64(consts + constc*24, cnm)
+                        w64(consts + constc*24 + 8, cnl)
+                        w64(consts + constc*24 + 16, val)
+                        constc = constc + 1
+                    }
+                }
+            }
+            // ktext==19 -> `extern "C" global NAME` (imported cross-TU global)
+            else if kt==19 {
+                // Token stream: extern(KEY) "C"(STR) global(KEY) NAME(ID).
+                // The string literal "C" is a single STR token at p+1.
+                if p+3<tokc&&tokt(p+1)==TT_STR {
+                    if tokt(p+2)==TT_KEY&&ktext(tokv(p+2),tokln(p+2))==20 {  // global
+                        let nt=p+3
+                        if nt<tokc&&tokt(nt)==TT_ID {
+                            w64(gvars+gvarc*16, tokv(nt)); w64(gvars+gvarc*16+8, tokln(nt))
+                            w64(g_named+gvarc*8, 2)   // imported (UNDEF named symbol)
+                            w64(ginit+gvarc*8, 0)       // no initializer
+                            if gvarc >= GVAR_CAP { emit_ovf() }
+                            gvarc=gvarc+1
+                            // FIX (1.1.14): consume the whole `extern "C" global NAME`
+                            // construct. Otherwise the inner `global` keyword (at p+2,
+                            // depth 0) is re-scanned below as a fresh top-level
+                            // `global NAME` and registered AGAIN as a DEFINED global
+                            // (g_named=1). That spurious entry's __init initializer then
+                            // spans the rest of the file (e.g. `fn bar(d){...}`), which
+                            // references `d` with no binding -> "undeclared variable: d".
+                            // Advance p to the NAME token; the loop's trailing p=p+1
+                            // then lands just past it, skipping the inner `global`.
+                            p = nt
+                        }
+                    }
+                }
+            }
+        }
+        p=p+1
+    }
+}
+
+fn lbladd(l,ip) { let i=lblc; lblc=i+1; w64(lblmap+i*LBS,l); w64(lblmap+i*LBS+8,ip) }
+
+fn lblf(l) { let i=0; while i<lblc { if r64(lblmap+i*LBS)==l { return r64(lblmap+i*LBS+8) }; i=i+1 }; return -1 }
+// Record a forward/backward branch patch for the current function. ty: 0=jmp, 1=je.
+// Resolved by ci_func's per-function label fixup (after emit_bltn runs).
+fn emit_patch(po, lbl, ty) { if patchc >= PATCH_CAP { emit_ovf() }; w64(patches+patchc*PCS, po); w64(patches+patchc*PCS+8, lbl); w64(patches+patchc*PCS+16, ty); patchc=patchc+1 }
+
+fn nv() { if vreg_n >= VREG_CAP { emit_ovf() }; let v=vreg_n; vreg_n=vreg_n+1; w64(vreg_is_str + v*8, 0-1); w64(vreg_is_big + v*8, 0-1); w64(vreg_clo + v*8, 0-1); return v }
+fn nl() { if lbl_n >= LBL_CAP { emit_ovf() }; let l=lbl_n; lbl_n=lbl_n+1; return l }
+
+fn findfn(nm,nl) {
+    let ai=0
+    while ai<alias_c {
+        if r64(alias_tab + ai*24 + 8)==nl {
+            let ap=r64(alias_tab + ai*24); let m=0; let mm=1
+            while m<nl { if r8(src+ap+m)!=r8(src+nm+m) { mm=0; break }; m=m+1 }
+            if mm==1 { return r64(alias_tab + ai*24 + 16) }
+        }
+        ai=ai+1
+    }
+    let i=0
+    while i<fnc {
+        if fn_nlen(i)==nl {
+            let ok=1; let j=0
+            while j<nl { if r8(src+fn_name(i)+j)!=r8(src+nm+j) { ok=0; break }; j=j+1 }
+            if ok { return i }
+        }
+        i=i+1
+    }
+    return -1
+}
+// t4: return the declared-param index of name (nm,nl) in function fi, or -1.
+fn findparam(fi, nm, nl) {
+    let base = r64(fn_pbase + fi*8)
+    let pc = r64(fn_pcount + fi*8)
+    let z=0
+    while z<pc {
+        let pnm = r64(fn_pnames + base + z*16)
+        let pln = r64(fn_pnames + base + z*16 + 8)
+        if pln==nl {
+            let ok=1; let j=0
+            while j<nl { if r8(src+pnm+j)!=r8(src+nm+j) { ok=0; break }; j=j+1 }
+            if ok { return z }
+        }
+        z=z+1
+    }
+    return -1
+}
+// t4: length of a call-site named-arg name: scan from nm until ':' (58) or a
+// generic delimiter. (nm points at the name ID, which is immediately followed
+// by ': value' at the call site — so the name stops at the ':'.)
+fn len_name_colon(nm) {
+    let l=0
+    while l<256 {
+        let c0=r8(src+nm+l)
+        if c0==58||c0==0||c0==40||c0==59||c0==123||c0==125||c0==44||c0==60||c0==62||c0==32||c0==9||c0==10||c0==13 { break }
+        l=l+1
+    }
+    return l
+}
+// Length of a token-name stored as a raw source slice (up to the next
+// delimiter: null, '(', ',', ';', '{', '}', space/tab/newline). Used to
+// recover a function name's length from the IR_CALL name pointer.
+fn len_name(nm) {
+    let n=0
+    while n<256 {
+        let c=r8(src+nm+n)
+        if c==0||c==40||c==41||c==59||c==123||c==125||c==44||c==32||c==9||c==10||c==13 { break }
+        n=n+1
+    }
+    return n
+}
+
+// is_bltn: true if name (nm,nl) is a builtin that emit_bltn inlines at codegen.
+// Mirrors emit_bltn's name checks so parse_primary emits IR_CALL for builtins.
+// compile_error: record a hard compile error (call to undeclared function).
+// We CANNOT call exit() from inside the parser (it would be emitted as a
+// deferred target-call, not abort the compiler). Instead set had_error and
+// print to stderr; main() checks had_error after the compile and exits(1).
+let had_error = 0
+fn compile_error(kind, nm, nl) {
+    // kind: 0 = undeclared function call, 1 = undeclared variable, 2 = arity mismatch
+    // nm/nl = source offset + length of the offending token (for located context).
+    let lnmsg = "line "
+    file_write(2, lnmsg+8, len(lnmsg))
+    // compute 1-based line number from source offset nm
+    let lno = 1; let lp = 0
+    while lp < nm { if r8(src+lp)==10 { lno = lno+1 }; lp = lp+1 }
+    let lnbuf = mmap(16)
+    let lc = 0
+    let t = lno
+    if t==0 { t = 1 }
+    while t > 0 { w8(lnbuf+lc, 48 + (t % 10)); lc = lc+1; t = t / 10 }
+    while lc > 0 { lc = lc-1; file_write(2, lnbuf+lc, 1) }
+    let colon = ": "
+    file_write(2, colon+8, 2)
+    if kind==0 {
+        let msg = "error: call to undeclared function: "
+        file_write(2, msg+8, len(msg)); file_write(2, src+nm, nl)
+    } else if kind==1 {
+        let msg = "error: undeclared variable: "
+        file_write(2, msg+8, len(msg)); file_write(2, src+nm, nl)
+    } else if kind==2 {
+        let msg = "error: wrong argument count for: "
+        file_write(2, msg+8, len(msg)); file_write(2, src+nm, nl)
+    } else if kind==3 {
+        let msg = "error: missing return value (function body ends after return)"
+        file_write(2, msg+8, len(msg))
+    } else if kind==4 {
+        let msg = "error: void function returns a value"
+        file_write(2, msg+8, len(msg))
+    } else if kind==6 {
+        // 0.0.114: ordering compare (< > <= >=) on a big operand. std/big has
+        // magnitude-only big_ge with a separate sign bit, so a silent pointer
+        // compare would be wrong; reject until signed big_cmp exists.
+        let msg = "error: ordering compare (< > <= >=) not supported for big: "
+        file_write(2, msg+8, len(msg)); file_write(2, src+nm, nl)
+    } else {
+        let msg = "error: function declares return type but 'return' has no value"
+        file_write(2, msg+8, len(msg))
+    }
+    let nlch = "\n"
+    file_write(2, nlch+8, 1)
+    had_error = 1
+}
+
+// 0.0.68: primitive intrinsics that a user fn may NOT override. These are the
+// irreducible memory/FP operations the compiler itself is built from; the
+// compiler defines same-named wrappers (helpers.quanta w64 <-> mem_store) that
+// are mutually recursive with the builtin breaking the cycle, so honouring
+// user-wins for them is infinite recursion and the self-host stops bootstrapping.
+fn is_prim_intrin(nm,nl) {
+    if nl==8&&r8(src+nm)=='m'&&r8(src+nm+1)=='e'&&r8(src+nm+2)=='m'&&r8(src+nm+3)=='_'&&r8(src+nm+4)=='l'&&r8(src+nm+5)=='o'&&r8(src+nm+6)=='a'&&r8(src+nm+7)=='d' { return 1 }
+    if nl==9&&r8(src+nm)=='m'&&r8(src+nm+1)=='e'&&r8(src+nm+2)=='m'&&r8(src+nm+3)=='_'&&r8(src+nm+4)=='l'&&r8(src+nm+5)=='o'&&r8(src+nm+6)=='a'&&r8(src+nm+7)=='d'&&r8(src+nm+8)=='8' { return 1 }
+    if nl==9&&r8(src+nm)=='m'&&r8(src+nm+1)=='e'&&r8(src+nm+2)=='m'&&r8(src+nm+3)=='_'&&r8(src+nm+4)=='s'&&r8(src+nm+5)=='t'&&r8(src+nm+6)=='o'&&r8(src+nm+7)=='r'&&r8(src+nm+8)=='e' { return 1 }
+    if nl==10&&r8(src+nm)=='m'&&r8(src+nm+1)=='e'&&r8(src+nm+2)=='m'&&r8(src+nm+3)=='_'&&r8(src+nm+4)=='s'&&r8(src+nm+5)=='t'&&r8(src+nm+6)=='o'&&r8(src+nm+7)=='r'&&r8(src+nm+8)=='e'&&r8(src+nm+9)=='8' { return 1 }
+    if nl==4&&r8(src+nm)=='f'&&r8(src+nm+1)=='a'&&r8(src+nm+2)=='d'&&r8(src+nm+3)=='d' { return 1 }
+    if nl==4&&r8(src+nm)=='f'&&r8(src+nm+1)=='s'&&r8(src+nm+2)=='u'&&r8(src+nm+3)=='b' { return 1 }
+    if nl==4&&r8(src+nm)=='f'&&r8(src+nm+1)=='m'&&r8(src+nm+2)=='u'&&r8(src+nm+3)=='l' { return 1 }
+    if nl==4&&r8(src+nm)=='f'&&r8(src+nm+1)=='d'&&r8(src+nm+2)=='i'&&r8(src+nm+3)=='v' { return 1 }
+    return 0
+}
+
+fn is_bltn(nm,nl) {
+    if nl>=8&&r8(src+nm)=='m'&&r8(src+nm+1)=='e'&&r8(src+nm+2)=='m'&&r8(src+nm+3)=='_' { return 1 } // mem_*
+    // memcpy(dst, src, n): rep movsb (forward).  m-e-m-c-p-y
+    if nl==6&&r8(src+nm)=='m'&&r8(src+nm+1)=='e'&&r8(src+nm+2)=='m'&&r8(src+nm+3)=='c'&&r8(src+nm+4)=='p'&&r8(src+nm+5)=='y' { return 1 }
+    // memcmp(a, b, n): repe cmpsb, return <0/0/>0.  m-e-m-c-m-p
+    if nl==6&&r8(src+nm)=='m'&&r8(src+nm+1)=='e'&&r8(src+nm+2)=='m'&&r8(src+nm+3)=='c'&&r8(src+nm+4)=='m'&&r8(src+nm+5)=='p' { return 1 }
+    // memmove(dst, src, n): direction-aware copy.  m-e-m-m-o-v-e
+    if nl==7&&r8(src+nm)=='m'&&r8(src+nm+1)=='e'&&r8(src+nm+2)=='m'&&r8(src+nm+3)=='m'&&r8(src+nm+4)=='o'&&r8(src+nm+5)=='v'&&r8(src+nm+6)=='e' { return 1 }
+    if nl==5&&r8(src+nm+0)=='b'&&r8(src+nm+1)=='s'&&r8(src+nm+2)=='w'&&r8(src+nm+3)=='a'&&r8(src+nm+4)=='p' { return 1 }
+    if nl==8&&r8(src+nm+0)=='p'&&r8(src+nm+1)=='o'&&r8(src+nm+2)=='p'&&r8(src+nm+3)=='c'&&r8(src+nm+4)=='o'&&r8(src+nm+5)=='u'&&r8(src+nm+6)=='n'&&r8(src+nm+7)=='t' { return 1 }
+    if nl==3&&r8(src+nm+0)=='c'&&r8(src+nm+1)=='l'&&r8(src+nm+2)=='z' { return 1 }
+    if nl==3&&r8(src+nm+0)=='c'&&r8(src+nm+1)=='t'&&r8(src+nm+2)=='z' { return 1 }
+    if nl==4&&r8(src+nm+0)=='r'&&r8(src+nm+1)=='o'&&r8(src+nm+2)=='t'&&r8(src+nm+3)=='l' { return 1 }
+    if nl==4&&r8(src+nm+0)=='r'&&r8(src+nm+1)=='o'&&r8(src+nm+2)=='t'&&r8(src+nm+3)=='r' { return 1 }
+    // 0.0.107: bit/byte extras.
+    if nl==6&&r8(src+nm)=='p'&&r8(src+nm+1)=='a'&&r8(src+nm+2)=='r'&&r8(src+nm+3)=='i'&&r8(src+nm+4)=='t'&&r8(src+nm+5)=='y' { return 1 }  // parity(x) -> 0/1
+    if nl==8&&r8(src+nm)=='b'&&r8(src+nm+1)=='i'&&r8(src+nm+2)=='t'&&r8(src+nm+3)=='f'&&r8(src+nm+4)=='i'&&r8(src+nm+5)=='e'&&r8(src+nm+6)=='l'&&r8(src+nm+7)=='d' { return 1 }  // bitfield(x,off,wid) -> bits
+    if nl==7&&r8(src+nm)=='b'&&r8(src+nm+1)=='s'&&r8(src+nm+2)=='w'&&r8(src+nm+3)=='a'&&r8(src+nm+4)=='p'&&r8(src+nm+5)=='1'&&r8(src+nm+6)=='6' { return 1 }  // bswap16(x)
+    if nl==7&&r8(src+nm)=='b'&&r8(src+nm+1)=='s'&&r8(src+nm+2)=='w'&&r8(src+nm+3)=='a'&&r8(src+nm+4)=='p'&&r8(src+nm+5)=='3'&&r8(src+nm+6)=='2' { return 1 }  // bswap32(x)
+    if nl==7&&r8(src+nm)=='b'&&r8(src+nm+1)=='s'&&r8(src+nm+2)=='w'&&r8(src+nm+3)=='a'&&r8(src+nm+4)=='p'&&r8(src+nm+5)=='6'&&r8(src+nm+6)=='4' { return 1 }  // bswap64(x)
+    // realloc(old_ptr, old_n, new_n): mmap new, copy, munmap old.  r-e-a-l-l-o-c
+    if nl==7&&r8(src+nm)=='r'&&r8(src+nm+1)=='e'&&r8(src+nm+2)=='a'&&r8(src+nm+3)=='l'&&r8(src+nm+4)=='l'&&r8(src+nm+5)=='o'&&r8(src+nm+6)=='c' { return 1 }
+    if nl>=8&&r8(src+nm)=='f'&&r8(src+nm+1)=='i'&&r8(src+nm+2)=='l'&&r8(src+nm+3)=='e'&&r8(src+nm+4)=='_' { return 1 } // file_*
+    if nl==4&&r8(src+nm)=='e'&&r8(src+nm+1)=='x'&&r8(src+nm+2)=='i'&&r8(src+nm+3)=='t' { return 1 } // exit
+    if nl==4&&r8(src+nm)=='f'&&r8(src+nm+1)=='r'&&r8(src+nm+2)=='e'&&r8(src+nm+3)=='e' { return 1 } // free(ptr)
+    if nl==4&&r8(src+nm)=='m'&&r8(src+nm+1)=='m'&&r8(src+nm+2)=='a'&&r8(src+nm+3)=='p' { return 1 } // mmap
+    if nl==9&&r8(src+nm)=='m'&&r8(src+nm+1)=='e'&&r8(src+nm+2)=='m'&&r8(src+nm+3)=='_'&&r8(src+nm+4)=='a'&&r8(src+nm+5)=='l'&&r8(src+nm+6)=='l'&&r8(src+nm+7)=='o'&&r8(src+nm+8)=='c' { return 1 } // mem_alloc(n) -> ptr to n*8 bytes
+    if nl==8&&r8(src+nm)=='m'&&r8(src+nm+1)=='e'&&r8(src+nm+2)=='m'&&r8(src+nm+3)=='_'&&r8(src+nm+4)=='f'&&r8(src+nm+5)=='r'&&r8(src+nm+6)=='e'&&r8(src+nm+7)=='e' { return 1 } // mem_free(ptr): push block onto free-list at HEAP_CTRL
+    if nl==11&&r8(src+nm)=='m'&&r8(src+nm+1)=='e'&&r8(src+nm+2)=='m'&&r8(src+nm+3)=='_'&&r8(src+nm+4)=='r'&&r8(src+nm+5)=='e'&&r8(src+nm+6)=='a'&&r8(src+nm+7)=='l'&&r8(src+nm+8)=='l'&&r8(src+nm+9)=='o'&&r8(src+nm+10)=='c' { return 1 } // mem_realloc(ptr,newn): new block, copy min(old,newn) qwords, free old via list
+    if nl==4&&r8(src+nm)=='d'&&r8(src+nm+1)=='r'&&r8(src+nm+2)=='o'&&r8(src+nm+3)=='p' { return 1 } // drop(ptr): destructor hook -> mem_free (free-list recycle). RAII default for owned heap bindings (0.0.112).
+    if nl==3&&r8(src+nm)=='r'&&r8(src+nm+1)=='s'&&r8(src+nm+2)=='p' { return 1 } // rsp(): return current rsp (permanent debug builtin)
+    if nl==11&&r8(src+nm)=='s'&&r8(src+nm+1)=='t'&&r8(src+nm+2)=='a'&&r8(src+nm+3)=='c'&&r8(src+nm+4)=='k'&&r8(src+nm+5)=='_'&&r8(src+nm+6)=='t'&&r8(src+nm+7)=='r'&&r8(src+nm+8)=='a'&&r8(src+nm+9)=='c'&&r8(src+nm+10)=='e' { return 1 } // stack_trace(): return immediate caller return addr from [rsp+cur_frame]
+    if nl==12&&r8(src+nm)=='s'&&r8(src+nm+1)=='t'&&r8(src+nm+2)=='a'&&r8(src+nm+3)=='c'&&r8(src+nm+4)=='k'&&r8(src+nm+5)=='_'&&r8(src+nm+6)=='f'&&r8(src+nm+7)=='r'&&r8(src+nm+8)=='a'&&r8(src+nm+9)=='m'&&r8(src+nm+10)=='e'&&r8(src+nm+11)=='s' { return 1 } // stack_frames(): return qword-array of all return addrs (full unwind, 0.0.120)
+
+    if nl==7&&r8(src+nm)=='p'&&r8(src+nm+1)=='r'&&r8(src+nm+2)=='i'&&r8(src+nm+3)=='n'&&r8(src+nm+4)=='t'&&r8(src+nm+5)=='s'&&r8(src+nm+6)=='p' { return 1 } // printsp(i)
+    if nl==7&&r8(src+nm)=='p'&&r8(src+nm+1)=='r'&&r8(src+nm+2)=='i'&&r8(src+nm+3)=='n'&&r8(src+nm+4)=='t'&&r8(src+nm+5)=='l'&&r8(src+nm+6)=='n' { return 1 } // println(i)
+    if nl==7&&r8(src+nm)=='n'&&r8(src+nm+1)=='e'&&r8(src+nm+2)=='w'&&r8(src+nm+3)=='l'&&r8(src+nm+4)=='i'&&r8(src+nm+5)=='n'&&r8(src+nm+6)=='e' { return 1 } // newline()
+    if nl==6&&r8(src+nm)=='p'&&r8(src+nm+1)=='r'&&r8(src+nm+2)=='i'&&r8(src+nm+3)=='n'&&r8(src+nm+4)=='t'&&r8(src+nm+5)=='s' { return 1 } // prints(s)
+    if nl==6&&r8(src+nm)=='p'&&r8(src+nm+1)=='r'&&r8(src+nm+2)=='i'&&r8(src+nm+3)=='n'&&r8(src+nm+4)=='t'&&r8(src+nm+5)=='i' { return 1 } // printi
+    if nl==5&&r8(src+nm)=='p'&&r8(src+nm+1)=='r'&&r8(src+nm+2)=='i'&&r8(src+nm+3)=='n'&&r8(src+nm+4)=='t' { return 1 } // print(buf,len) alias
+    if nl==4&&r8(src+nm)=='e'&&r8(src+nm+1)=='c'&&r8(src+nm+2)=='h'&&r8(src+nm+3)=='o' { return 1 } // echo(x) unified print (int|string)
+    if nl==3&&r8(src+nm)=='l'&&r8(src+nm+1)=='e'&&r8(src+nm+2)=='n' { return 1 } // len
+    if nl==3&&r8(src+nm)=='s'&&r8(src+nm+1)=='t'&&r8(src+nm+2)=='r' { return 1 } // str
+    if nl==6&&r8(src+nm)=='s'&&r8(src+nm+1)=='t'&&r8(src+nm+2)=='r'&&r8(src+nm+3)=='_'&&r8(src+nm+4)=='e'&&r8(src+nm+5)=='q' { return 1 } // str_eq(a,b): length-aware string == -> 0/1
+    if nl==6&&r8(src+nm)=='s'&&r8(src+nm+1)=='t'&&r8(src+nm+2)=='r'&&r8(src+nm+3)=='_'&&r8(src+nm+4)=='n'&&r8(src+nm+5)=='e' { return 1 } // str_ne(a,b): string != -> 0/1
+    if nl==4&&r8(src+nm)=='p'&&r8(src+nm+1)=='u'&&r8(src+nm+2)=='s'&&r8(src+nm+3)=='h' { return 1 } // push (string byte-append builtin)
+    if nl==3&&r8(src+nm)=='p'&&r8(src+nm+1)=='o'&&r8(src+nm+2)=='p' { return 1 } // pop (string byte-pop builtin)
+    if nl==6&&r8(src+nm)=='m'&&r8(src+nm+1)=='k'&&r8(src+nm+2)=='_'&&r8(src+nm+3)=='a'&&r8(src+nm+4)=='n'&&r8(src+nm+5)=='y' { return 1 } // mk_any(tag,val) -> 2-tuple
+    if nl==3&&r8(src+nm)=='a'&&r8(src+nm+1)=='r'&&r8(src+nm+2)=='g' { return 1 } // arg(i) (variadic read)
+    if nl==12&&r8(src+nm)=='c'&&r8(src+nm+1)=='l'&&r8(src+nm+2)=='o'&&r8(src+nm+3)=='s'&&r8(src+nm+4)=='u'&&r8(src+nm+5)=='r'&&r8(src+nm+6)=='e'&&r8(src+nm+7)=='_'&&r8(src+nm+8)=='c'&&r8(src+nm+9)=='a'&&r8(src+nm+10)=='l'&&r8(src+nm+11)=='l' { return 1 } // closure_call(fnb,args...)
+    if nl==5&&r8(src+nm)=='f'&&r8(src+nm+1)=='n'&&r8(src+nm+2)=='p'&&r8(src+nm+3)=='t'&&r8(src+nm+4)=='r' { return 1 } // fnptr(FNAME) -> code ptr
+    // --- Phase A1: unsigned arithmetic builtins (emit true unsigned x86) ---
+    if nl==4&&r8(src+nm)=='u'&&r8(src+nm+1)=='d'&&r8(src+nm+2)=='i'&&r8(src+nm+3)=='v' { return 1 } // udiv(a,b): unsigned a/b
+    if nl==4&&r8(src+nm)=='u'&&r8(src+nm+1)=='m'&&r8(src+nm+2)=='o'&&r8(src+nm+3)=='d' { return 1 } // umod(a,b): unsigned a%b
+    if nl==3&&r8(src+nm)=='u'&&r8(src+nm+1)=='l'&&r8(src+nm+2)=='t' { return 1 } // ult(a,b): unsigned a<b -> 0/1
+    if nl==3&&r8(src+nm)=='u'&&r8(src+nm+1)=='g'&&r8(src+nm+2)=='t' { return 1 } // ugt(a,b): unsigned a>b -> 0/1
+    if nl==4&&r8(src+nm)=='u'&&r8(src+nm+1)=='l'&&r8(src+nm+2)=='t'&&r8(src+nm+3)=='e' { return 1 } // ulte(a,b): unsigned a<=b
+    if nl==4&&r8(src+nm)=='u'&&r8(src+nm+1)=='g'&&r8(src+nm+2)=='t'&&r8(src+nm+3)=='e' { return 1 } // ugte(a,b): unsigned a>=b
+    if nl==2&&r8(src+nm)=='u'&&r8(src+nm+1)=='8' { return 1 } // u8(x): mask to 8 bits
+    if nl==3&&r8(src+nm)=='u'&&r8(src+nm+1)=='3'&&r8(src+nm+2)=='2' { return 1 } // u32(x): mask to 32 bits
+    if nl==3&&r8(src+nm)=='u'&&r8(src+nm+1)=='6'&&r8(src+nm+2)=='4' { return 1 } // u64(x): identity at 64-bit runtime
+    if nl==5&&r8(src+nm)=='p'&&r8(src+nm+1)=='a'&&r8(src+nm+2)=='n'&&r8(src+nm+3)=='i'&&r8(src+nm+4)=='c' { return 1 } // panic() -> exit(1)
+    if nl==8&&r8(src+nm)=='s'&&r8(src+nm+1)=='y'&&r8(src+nm+2)=='s'&&r8(src+nm+3)=='c'&&r8(src+nm+4)=='a'&&r8(src+nm+5)=='l'&&r8(src+nm+6)=='l'&&r8(src+nm+7)=='3' { return 1 } // syscall3(num,a,b,c): raw 3-arg syscall
+    if nl==7&&r8(src+nm)=='s'&&r8(src+nm+1)=='y'&&r8(src+nm+2)=='s'&&r8(src+nm+3)=='c'&&r8(src+nm+4)=='a'&&r8(src+nm+5)=='l'&&r8(src+nm+6)=='l' { return 1 } // syscall(num,a,b,c,d,e,f): generic raw syscall (any arity 1..7)
+    // --- Phase A2: time builtins (x86_64 syscall numbers) ---
+    if nl==13&&r8(src+nm)=='c'&&r8(src+nm+4)=='k'&&r8(src+nm+5)=='_'&&r8(src+nm+6)=='g'&&r8(src+nm+11)=='m'&&r8(src+nm+12)=='e' { return 1 } // clock_gettime(clk_id, ts_ptr): sc 228
+    if nl==12&&r8(src+nm)=='g'&&r8(src+nm+1)=='e'&&r8(src+nm+2)=='t'&&r8(src+nm+3)=='t'&&r8(src+nm+4)=='i'&&r8(src+nm+5)=='m'&&r8(src+nm+6)=='e'&&r8(src+nm+7)=='o'&&r8(src+nm+8)=='f'&&r8(src+nm+9)=='d'&&r8(src+nm+10)=='a'&&r8(src+nm+11)=='y' { return 1 } // gettimeofday(tv_ptr, tz_ptr): sc 96
+    if nl==9&&r8(src+nm)=='n'&&r8(src+nm+1)=='a'&&r8(src+nm+2)=='n'&&r8(src+nm+3)=='o'&&r8(src+nm+4)=='s'&&r8(src+nm+5)=='l'&&r8(src+nm+6)=='e'&&r8(src+nm+7)=='e'&&r8(src+nm+8)=='p' { return 1 } // nanosleep(req_ptr, rem_ptr): sc 35
+    if nl==5&&r8(src+nm)=='s'&&r8(src+nm+1)=='l'&&r8(src+nm+2)=='e'&&r8(src+nm+3)=='e'&&r8(src+nm+4)=='p' { return 1 } // sleep(sec): internal mmap + nanosleep + munmap
+    // 0.0.125: time core — zero-arg monotonic/epoch wrappers.
+    if nl==5&&r8(src+nm)=='c'&&r8(src+nm+1)=='l'&&r8(src+nm+2)=='o'&&r8(src+nm+3)=='c'&&r8(src+nm+4)=='k' { return 1 } // clock(): CLOCK_MONOTONIC ns
+    // 0.0.126: process core — fork/exec/wait/kill builtins (low-level, no std IO).
+    if nl==4&&r8(src+nm)=='f'&&r8(src+nm+1)=='o'&&r8(src+nm+2)=='r'&&r8(src+nm+3)=='k' { return 1 } // fork(): sc 57, 0=child, >0=pid, <0=errno
+    if nl==4&&r8(src+nm)=='e'&&r8(src+nm+1)=='x'&&r8(src+nm+2)=='e'&&r8(src+nm+3)=='c' { return 1 } // exec(cmd): replace image with /bin/sh -c cmd
+    if nl==4&&r8(src+nm)=='w'&&r8(src+nm+1)=='a'&&r8(src+nm+2)=='i'&&r8(src+nm+3)=='t' { return 1 } // wait(pid): sc 61 wait4, returns WEXITSTATUS
+    if nl==4&&r8(src+nm)=='k'&&r8(src+nm+1)=='i'&&r8(src+nm+2)=='l'&&r8(src+nm+3)=='l' { return 1 } // kill(pid,sig): sc 62
+    // 0.0.127: PTY core — pseudo-terminal allocation (posix_openpt/grantpt/unlockpt/ptsname).
+    if nl==8&&r8(src+nm)=='p'&&r8(src+nm+1)=='t'&&r8(src+nm+2)=='y'&&r8(src+nm+3)=='_'&&r8(src+nm+4)=='o'&&r8(src+nm+5)=='p'&&r8(src+nm+6)=='e'&&r8(src+nm+7)=='n' { return 1 } // pty_open(): open /dev/ptmx, unlock, return master fd
+    if nl==9&&r8(src+nm)=='p'&&r8(src+nm+1)=='t'&&r8(src+nm+2)=='y'&&r8(src+nm+3)=='_'&&r8(src+nm+4)=='s'&&r8(src+nm+5)=='l'&&r8(src+nm+6)=='a'&&r8(src+nm+7)=='v'&&r8(src+nm+8)=='e' { return 1 } // pty_slave(master): open /dev/pts/N, return slave fd
+    if nl==8&&r8(src+nm)=='p'&&r8(src+nm+1)=='t'&&r8(src+nm+2)=='y'&&r8(src+nm+3)=='_'&&r8(src+nm+4)=='n'&&r8(src+nm+5)=='a'&&r8(src+nm+6)=='m'&&r8(src+nm+7)=='e' { return 1 } // pty_name(master): return "/dev/pts/N" string
+    if nl==4&&r8(src+nm)=='d'&&r8(src+nm+1)=='u'&&r8(src+nm+2)=='p'&&r8(src+nm+3)=='2' { return 1 } // dup2(oldfd,newfd): sc 33
+    if nl==4&&r8(src+nm)=='i'&&r8(src+nm+1)=='o'&&r8(src+nm+2)=='c'&&r8(src+nm+3)=='t' { return 1 } // ioctl(fd,request,arg): sc 16
+    if nl==3&&r8(src+nm)=='n'&&r8(src+nm+1)=='o'&&r8(src+nm+2)=='w' { return 1 } // now(): CLOCK_REALTIME epoch ns
+    // P2: proc/env builtins (syscall-based)
+    if nl==6&&r8(src+nm)=='g'&&r8(src+nm+1)=='e'&&r8(src+nm+2)=='t'&&r8(src+nm+3)=='p'&&r8(src+nm+4)=='i'&&r8(src+nm+5)=='d' { return 1 } // getpid(): sc 39
+    if nl==7&&r8(src+nm)=='g'&&r8(src+nm+1)=='e'&&r8(src+nm+2)=='t'&&r8(src+nm+3)=='p'&&r8(src+nm+4)=='p'&&r8(src+nm+5)=='i'&&r8(src+nm+6)=='d' { return 1 } // getppid(): sc 110
+    if nl==6&&r8(src+nm)=='g'&&r8(src+nm+1)=='e'&&r8(src+nm+2)=='t'&&r8(src+nm+3)=='e'&&r8(src+nm+4)=='n'&&r8(src+nm+5)=='v' { return 1 } // getenv(name): uses g_environ
+    if nl==4&&r8(src+nm)=='a'&&r8(src+nm+1)=='r'&&r8(src+nm+2)=='g'&&r8(src+nm+3)=='c' { return 1 } // argc(): variadic arg count (internal)
+    if nl==9&&r8(src+nm)=='a'&&r8(src+nm+1)=='r'&&r8(src+nm+2)=='g'&&r8(src+nm+3)=='_'&&r8(src+nm+4)=='c'&&r8(src+nm+5)=='o'&&r8(src+nm+6)=='u'&&r8(src+nm+7)=='n'&&r8(src+nm+8)=='t' { return 1 } // arg_count(): process argv count (g_argc)
+    if nl==8&&r8(src+nm)=='e'&&r8(src+nm+1)=='n'&&r8(src+nm+2)=='v'&&r8(src+nm+3)=='i'&&r8(src+nm+4)=='r'&&r8(src+nm+5)=='o'&&r8(src+nm+6)=='n' { return 1 } // environ(): returns global environ pointer
+    // P2: stdin builtins
+    if nl==4&&r8(src+nm)=='g'&&r8(src+nm+1)=='e'&&r8(src+nm+2)=='t'&&r8(src+nm+3)=='c' { return 1 } // getc(): read 1 byte from stdin
+    if nl==7&&r8(src+nm)=='g'&&r8(src+nm+1)=='e'&&r8(src+nm+2)=='t'&&r8(src+nm+3)=='l'&&r8(src+nm+4)=='i'&&r8(src+nm+5)=='n'&&r8(src+nm+6)=='e' { return 1 } // getline(buf,maxlen): sc 0 read(0, buf, len)
+    // P2: random builtins
+    if nl==9&&r8(src+nm)=='g'&&r8(src+nm+1)=='e'&&r8(src+nm+2)=='t'&&r8(src+nm+3)=='r'&&r8(src+nm+4)=='a'&&r8(src+nm+5)=='n'&&r8(src+nm+6)=='d'&&r8(src+nm+7)=='o'&&r8(src+nm+8)=='m' { return 1 } // getrandom(buf,len,flags): sc 318
+    // P2: fs-metadata builtins
+    if nl==5&&r8(src+nm)=='l'&&r8(src+nm+1)=='s'&&r8(src+nm+2)=='e'&&r8(src+nm+3)=='e'&&r8(src+nm+4)=='k' { return 1 } // lseek(fd,off,whence): sc 8
+    if nl==6&&r8(src+nm)=='u'&&r8(src+nm+1)=='n'&&r8(src+nm+2)=='l'&&r8(src+nm+3)=='i'&&r8(src+nm+4)=='n'&&r8(src+nm+5)=='k' { return 1 } // unlink(path): sc 87
+    if nl==5&&r8(src+nm)=='m'&&r8(src+nm+1)=='k'&&r8(src+nm+2)=='d'&&r8(src+nm+3)=='i'&&r8(src+nm+4)=='r' { return 1 } // mkdir(path,mode): sc 83
+    if nl==5&&r8(src+nm)=='c'&&r8(src+nm+1)=='h'&&r8(src+nm+2)=='d'&&r8(src+nm+3)=='i'&&r8(src+nm+4)=='r' { return 1 } // chdir(path): sc 80
+    if nl==6&&r8(src+nm)=='r'&&r8(src+nm+1)=='e'&&r8(src+nm+2)=='n'&&r8(src+nm+3)=='a'&&r8(src+nm+4)=='m'&&r8(src+nm+5)=='e' { return 1 } // rename(old,new): sc 82
+    if nl==5&&r8(src+nm)=='f'&&r8(src+nm+1)=='s'&&r8(src+nm+2)=='t'&&r8(src+nm+3)=='a'&&r8(src+nm+4)=='t' { return 1 } // fstat(fd,buf): sc 5
+    if nl==4&&r8(src+nm)=='s'&&r8(src+nm+1)=='t'&&r8(src+nm+2)=='a'&&r8(src+nm+3)=='t' { return 1 } // stat(path,buf): sc 262 newfstatat
+    // P2: introspection builtins
+    if nl==5&&r8(src+nm)=='a'&&r8(src+nm+1)=='b'&&r8(src+nm+2)=='o'&&r8(src+nm+3)=='r'&&r8(src+nm+4)=='t' { return 1 } // abort(): exit(134)
+    if nl==10&&r8(src+nm)=='d'&&r8(src+nm+1)=='e'&&r8(src+nm+2)=='b'&&r8(src+nm+3)=='u'&&r8(src+nm+4)=='g'&&r8(src+nm+5)=='b'&&r8(src+nm+6)=='r'&&r8(src+nm+7)=='e'&&r8(src+nm+8)=='a'&&r8(src+nm+9)=='k' { return 1 } // debugbreak(): int3
+    // P2: float comparison builtins
+    if nl==3&&r8(src+nm)=='f'&&r8(src+nm+1)=='e'&&r8(src+nm+2)=='q' { return 1 } // feq(a,b)
+    if nl==3&&r8(src+nm)=='f'&&r8(src+nm+1)=='l'&&r8(src+nm+2)=='t' { return 1 } // flt(a,b)
+    if nl==3&&r8(src+nm)=='f'&&r8(src+nm+1)=='l'&&r8(src+nm+2)=='e' { return 1 } // fle(a,b)
+    if nl==3&&r8(src+nm)=='f'&&r8(src+nm+1)=='g'&&r8(src+nm+2)=='t' { return 1 } // fgt(a,b)
+    if nl==3&&r8(src+nm)=='f'&&r8(src+nm+1)=='g'&&r8(src+nm+2)=='e' { return 1 } // fge(a,b)
+    if nl==6&&r8(src+nm)=='f'&&r8(src+nm+1)=='i'&&r8(src+nm+2)=='s'&&r8(src+nm+3)=='n'&&r8(src+nm+4)=='a'&&r8(src+nm+5)=='n' { return 1 } // fisnan(a)
+    if nl==6&&r8(src+nm)=='f'&&r8(src+nm+1)=='i'&&r8(src+nm+2)=='s'&&r8(src+nm+3)=='i'&&r8(src+nm+4)=='n'&&r8(src+nm+5)=='f' { return 1 } // fisinf(a)
+    // P2: math builtins
+    if nl==4&&r8(src+nm)=='s'&&r8(src+nm+1)=='q'&&r8(src+nm+2)=='r'&&r8(src+nm+3)=='t' { return 1 } // sqrt(a)
+    if nl==5&&r8(src+nm)=='f'&&r8(src+nm+1)=='l'&&r8(src+nm+2)=='o'&&r8(src+nm+3)=='o'&&r8(src+nm+4)=='r' { return 1 } // floor(a)
+    if nl==4&&r8(src+nm)=='c'&&r8(src+nm+1)=='e'&&r8(src+nm+2)=='i'&&r8(src+nm+3)=='l' { return 1 } // ceil(a)
+    if nl==3&&r8(src+nm)=='a'&&r8(src+nm+1)=='b'&&r8(src+nm+2)=='s' { return 1 } // abs(a) f64
+    // P2: transcendental + min/max math builtins (0.0.58)
+    if nl==4&&r8(src+nm)=='f'&&r8(src+nm+1)=='m'&&r8(src+nm+2)=='i'&&r8(src+nm+3)=='n' { return 1 } // fmin(a,b)
+    if nl==4&&r8(src+nm)=='f'&&r8(src+nm+1)=='m'&&r8(src+nm+2)=='a'&&r8(src+nm+3)=='x' { return 1 } // fmax(a,b)
+    if nl==3&&r8(src+nm)=='s'&&r8(src+nm+1)=='i'&&r8(src+nm+2)=='n' { return 1 } // sin(a) x87
+    if nl==3&&r8(src+nm)=='c'&&r8(src+nm+1)=='o'&&r8(src+nm+2)=='s' { return 1 } // cos(a) x87
+    if nl==3&&r8(src+nm)=='t'&&r8(src+nm+1)=='a'&&r8(src+nm+2)=='n' { return 1 } // tan(a) x87
+    if nl==3&&r8(src+nm)=='l'&&r8(src+nm+1)=='o'&&r8(src+nm+2)=='g' { return 1 } // log(a)=ln(a) x87
+    if nl==3&&r8(src+nm)=='p'&&r8(src+nm+1)=='o'&&r8(src+nm+2)=='w' { return 1 } // pow(a,b) x87
+    // P6.1a: float builtins (SSE on x86). Args/results are raw
+    // 64-bit bit-patterns; emit_bltn inline the FP op.
+    if nl==3&&r8(src+nm)=='i'&&r8(src+nm+1)=='2'&&r8(src+nm+2)=='f' { return 1 } // i2f(x)
+    if nl==3&&r8(src+nm)=='f'&&r8(src+nm+1)=='2'&&r8(src+nm+2)=='i' { return 1 } // f2i(x)
+    if nl==4&&r8(src+nm)=='f'&&r8(src+nm+1)=='a'&&r8(src+nm+2)=='d'&&r8(src+nm+3)=='d' { return 1 } // fadd(a,b)
+    if nl==4&&r8(src+nm)=='f'&&r8(src+nm+1)=='s'&&r8(src+nm+2)=='u'&&r8(src+nm+3)=='b' { return 1 } // fsub(a,b)
+    if nl==4&&r8(src+nm)=='f'&&r8(src+nm+1)=='m'&&r8(src+nm+2)=='u'&&r8(src+nm+3)=='l' { return 1 } // fmul(a,b)
+    if nl==4&&r8(src+nm)=='f'&&r8(src+nm+1)=='d'&&r8(src+nm+2)=='i'&&r8(src+nm+3)=='v' { return 1 } // fdiv(a,b)
+    // 0.0.102: string + rand builtins
+    if nl==6&&r8(src+nm)=='s'&&r8(src+nm+1)=='u'&&r8(src+nm+2)=='b'&&r8(src+nm+3)=='s'&&r8(src+nm+4)=='t'&&r8(src+nm+5)=='r' { return 1 } // substr(s,start,len)
+    if nl==6&&r8(src+nm)=='s'&&r8(src+nm+1)=='t'&&r8(src+nm+2)=='r'&&r8(src+nm+3)=='c'&&r8(src+nm+4)=='a'&&r8(src+nm+5)=='t' { return 1 } // strcat(a,b)
+    if nl==4&&r8(src+nm)=='r'&&r8(src+nm+1)=='a'&&r8(src+nm+2)=='n'&&r8(src+nm+3)=='d' { return 1 } // rand(): getrandom 8B -> i64
+    // 0.0.104: string split + UTF-8 decode builtins
+    if nl==9&&r8(src+nm)=='s'&&r8(src+nm+1)=='t'&&r8(src+nm+2)=='r'&&r8(src+nm+3)=='_'&&r8(src+nm+4)=='s'&&r8(src+nm+5)=='p'&&r8(src+nm+6)=='l'&&r8(src+nm+7)=='i'&&r8(src+nm+8)=='t' { return 1 } // str_split(s,sep) -> array of substrings
+    if nl==4&&r8(src+nm)=='u'&&r8(src+nm+1)=='t'&&r8(src+nm+2)=='f'&&r8(src+nm+3)=='8' { return 1 } // utf8(s) -> array of i64 codepoints
+    // 0.0.105: atomic primitives (lock-based). ptr is an i64*, val/newv are i64.
+    if nl==11&&r8(src+nm)=='a'&&r8(src+nm+1)=='t'&&r8(src+nm+2)=='o'&&r8(src+nm+3)=='m'&&r8(src+nm+4)=='i'&&r8(src+nm+5)=='c'&&r8(src+nm+6)=='_'&&r8(src+nm+7)=='l'&&r8(src+nm+8)=='o'&&r8(src+nm+9)=='a'&&r8(src+nm+10)=='d' { return 1 } // atomic_load(ptr) -> *ptr
+    if nl==12&&r8(src+nm)=='a'&&r8(src+nm+1)=='t'&&r8(src+nm+2)=='o'&&r8(src+nm+3)=='m'&&r8(src+nm+4)=='i'&&r8(src+nm+5)=='c'&&r8(src+nm+6)=='_'&&r8(src+nm+7)=='s'&&r8(src+nm+8)=='t'&&r8(src+nm+9)=='o'&&r8(src+nm+10)=='r'&&r8(src+nm+11)=='e' { return 1 } // atomic_store(ptr,val) -> val
+    if nl==10&&r8(src+nm)=='a'&&r8(src+nm+1)=='t'&&r8(src+nm+2)=='o'&&r8(src+nm+3)=='m'&&r8(src+nm+4)=='i'&&r8(src+nm+5)=='c'&&r8(src+nm+6)=='_'&&r8(src+nm+7)=='a'&&r8(src+nm+8)=='d'&&r8(src+nm+9)=='d' { return 1 } // atomic_add(ptr,val) -> old
+    if nl==11&&r8(src+nm)=='a'&&r8(src+nm+1)=='t'&&r8(src+nm+2)=='o'&&r8(src+nm+3)=='m'&&r8(src+nm+4)=='i'&&r8(src+nm+5)=='c'&&r8(src+nm+6)=='_'&&r8(src+nm+7)=='s'&&r8(src+nm+8)=='w'&&r8(src+nm+9)=='a'&&r8(src+nm+10)=='p' { return 1 } // atomic_swap(ptr,val) -> old
+    if nl==14&&r8(src+nm)=='a'&&r8(src+nm+1)=='t'&&r8(src+nm+2)=='o'&&r8(src+nm+3)=='m'&&r8(src+nm+4)=='i'&&r8(src+nm+5)=='c'&&r8(src+nm+6)=='_'&&r8(src+nm+7)=='c'&&r8(src+nm+8)=='m'&&r8(src+nm+9)=='p'&&r8(src+nm+10)=='x'&&r8(src+nm+11)=='c'&&r8(src+nm+12)=='h'&&r8(src+nm+13)=='g' { return 1 } // atomic_cmpxchg(ptr,oldv,newv) -> old
+    // 0.0.106: networking builtins (raw Linux syscalls). Returns fd/0/-errno.
+    if nl==6&&r8(src+nm)=='s'&&r8(src+nm+1)=='o'&&r8(src+nm+2)=='c'&&r8(src+nm+3)=='k'&&r8(src+nm+4)=='e'&&r8(src+nm+5)=='t' { return 1 } // socket(domain,type,proto) -> fd (sc 41)
+    if nl==4&&r8(src+nm)=='s'&&r8(src+nm+1)=='e'&&r8(src+nm+2)=='n'&&r8(src+nm+3)=='d' { return 1 } // send(fd,buf,len,flags) -> bytes (sc 44)
+    if nl==4&&r8(src+nm)=='r'&&r8(src+nm+1)=='e'&&r8(src+nm+2)=='c'&&r8(src+nm+3)=='v' { return 1 } // recv(fd,buf,len,flags) -> bytes (sc 45)
+    if nl==10&&r8(src+nm)=='f'&&r8(src+nm+1)=='u'&&r8(src+nm+2)=='t'&&r8(src+nm+3)=='e'&&r8(src+nm+4)=='x'&&r8(src+nm+5)=='_'&&r8(src+nm+6)=='w'&&r8(src+nm+7)=='a'&&r8(src+nm+8)=='i'&&r8(src+nm+9)=='t' { return 1 } // futex_wait(addr,expected) -> 0/-errno (sc 202)
+    if nl==10&&r8(src+nm)=='f'&&r8(src+nm+1)=='u'&&r8(src+nm+2)=='t'&&r8(src+nm+3)=='e'&&r8(src+nm+4)=='x'&&r8(src+nm+5)=='_'&&r8(src+nm+6)=='w'&&r8(src+nm+7)=='a'&&r8(src+nm+8)=='k'&&r8(src+nm+9)=='e' { return 1 } // futex_wake(addr,n) -> woken (sc 202)
+    if nl==13&&r8(src+nm)=='t'&&r8(src+nm+1)=='h'&&r8(src+nm+2)=='r'&&r8(src+nm+3)=='e'&&r8(src+nm+4)=='a'&&r8(src+nm+5)=='d'&&r8(src+nm+6)=='_'&&r8(src+nm+7)=='c'&&r8(src+nm+8)=='r'&&r8(src+nm+9)=='e'&&r8(src+nm+10)=='a'&&r8(src+nm+11)=='t'&&r8(src+nm+12)=='e' { return 1 } // thread_create(worker,arg) -> tid (0.0.119)
+    if nl==11&&r8(src+nm)=='t'&&r8(src+nm+1)=='h'&&r8(src+nm+2)=='r'&&r8(src+nm+3)=='e'&&r8(src+nm+4)=='a'&&r8(src+nm+5)=='d'&&r8(src+nm+6)=='_'&&r8(src+nm+7)=='j'&&r8(src+nm+8)=='o'&&r8(src+nm+9)=='i'&&r8(src+nm+10)=='n' { return 1 } // thread_join(tid) -> exit status (0.0.119)
+    if nl==4&&r8(src+nm)=='b'&&r8(src+nm+1)=='i'&&r8(src+nm+2)=='n'&&r8(src+nm+3)=='d' { return 1 } // bind(fd,sa_ptr,len) -> 0 (sc 49)
+    if nl==6&&r8(src+nm)=='l'&&r8(src+nm+1)=='i'&&r8(src+nm+2)=='s'&&r8(src+nm+3)=='t'&&r8(src+nm+4)=='e'&&r8(src+nm+5)=='n' { return 1 } // listen(fd,backlog) -> 0 (sc 50)
+    if nl==6&&r8(src+nm)=='a'&&r8(src+nm+1)=='c'&&r8(src+nm+2)=='c'&&r8(src+nm+3)=='e'&&r8(src+nm+4)=='p'&&r8(src+nm+5)=='t' { return 1 } // accept(fd,sa_ptr,len_ptr) -> newfd (sc 43)
+    // P11: SIMD vec128 builtins. A vec128 is a 16-byte buffer = 2x f64 packed
+    // double (2 lanes x 8 bytes). Ops take/return buffer POINTERS; real SIMD
+    // instructions (x86 SSE2 addpd/mulpd.., ARM64 NEON fadd v0.2d..) operate on
+    // the memory operands. Lane access via vec_get/vec_set (lane = 0 or 1).
+    // NOTE: names use the 'vec_' prefix so they cannot collide with the
+    // compiler's own internal functions (vadd/vfind/vclr are symbol-table ops).
+    if nl==8&&r8(src+nm)=='v'&&r8(src+nm+1)=='e'&&r8(src+nm+2)=='c'&&r8(src+nm+3)=='_'&&r8(src+nm+4)=='l'&&r8(src+nm+5)=='o'&&r8(src+nm+6)=='a'&&r8(src+nm+7)=='d' { return 1 } // vec_load(dst,src)
+    if nl==9&&r8(src+nm)=='v'&&r8(src+nm+1)=='e'&&r8(src+nm+2)=='c'&&r8(src+nm+3)=='_'&&r8(src+nm+4)=='s'&&r8(src+nm+5)=='t'&&r8(src+nm+6)=='o'&&r8(src+nm+7)=='r'&&r8(src+nm+8)=='e' { return 1 } // vec_store(dst,src)
+    if nl==7&&r8(src+nm)=='v'&&r8(src+nm+1)=='e'&&r8(src+nm+2)=='c'&&r8(src+nm+3)=='_'&&r8(src+nm+4)=='a'&&r8(src+nm+5)=='d'&&r8(src+nm+6)=='d' { return 1 } // vec_add(dst,a,b)
+    if nl==7&&r8(src+nm)=='v'&&r8(src+nm+1)=='e'&&r8(src+nm+2)=='c'&&r8(src+nm+3)=='_'&&r8(src+nm+4)=='s'&&r8(src+nm+5)=='u'&&r8(src+nm+6)=='b' { return 1 } // vec_sub(dst,a,b)
+    if nl==7&&r8(src+nm)=='v'&&r8(src+nm+1)=='e'&&r8(src+nm+2)=='c'&&r8(src+nm+3)=='_'&&r8(src+nm+4)=='m'&&r8(src+nm+5)=='u'&&r8(src+nm+6)=='l' { return 1 } // vec_mul(dst,a,b)
+    if nl==7&&r8(src+nm)=='v'&&r8(src+nm+1)=='e'&&r8(src+nm+2)=='c'&&r8(src+nm+3)=='_'&&r8(src+nm+4)=='d'&&r8(src+nm+5)=='i'&&r8(src+nm+6)=='v' { return 1 } // vec_div(dst,a,b)
+    if nl==7&&r8(src+nm)=='v'&&r8(src+nm+1)=='e'&&r8(src+nm+2)=='c'&&r8(src+nm+3)=='_'&&r8(src+nm+4)=='s'&&r8(src+nm+5)=='e'&&r8(src+nm+6)=='t' { return 1 } // vec_set(ptr,lane,val)
+    if nl==7&&r8(src+nm)=='v'&&r8(src+nm+1)=='e'&&r8(src+nm+2)=='c'&&r8(src+nm+3)=='_'&&r8(src+nm+4)=='g'&&r8(src+nm+5)=='e'&&r8(src+nm+6)=='t' { return 1 } // vec_get(ptr,lane)
+    // 0.0.108: CPU intrinsics (prefetch / pause / memory fences). void builtins.
+    if nl==8&&r8(src+nm)=='p'&&r8(src+nm+1)=='r'&&r8(src+nm+2)=='e'&&r8(src+nm+3)=='f'&&r8(src+nm+4)=='e'&&r8(src+nm+5)=='t'&&r8(src+nm+6)=='c'&&r8(src+nm+7)=='h' { return 1 } // prefetch(addr)
+    if nl==5&&r8(src+nm)=='p'&&r8(src+nm+1)=='a'&&r8(src+nm+2)=='u'&&r8(src+nm+3)=='s'&&r8(src+nm+4)=='e' { return 1 } // pause()
+    if nl==5&&r8(src+nm)=='f'&&r8(src+nm+1)=='e'&&r8(src+nm+2)=='n'&&r8(src+nm+3)=='c'&&r8(src+nm+4)=='e' { return 1 } // fence() = mfence
+    if nl==6&&r8(src+nm)=='l'&&r8(src+nm+1)=='f'&&r8(src+nm+2)=='e'&&r8(src+nm+3)=='n'&&r8(src+nm+4)=='c'&&r8(src+nm+5)=='e' { return 1 } // lfence()
+    if nl==6&&r8(src+nm)=='s'&&r8(src+nm+1)=='f'&&r8(src+nm+2)=='e'&&r8(src+nm+3)=='n'&&r8(src+nm+4)=='c'&&r8(src+nm+5)=='e' { return 1 } // sfence()
+    return 0
+}
+

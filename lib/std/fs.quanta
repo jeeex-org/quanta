@@ -43,3 +43,74 @@ fn write_raw(fd, buf, count) {
 fn close(fd) {
   return file_close(fd)
 }
+
+// --- 0.0.129: missing fs ops (FIX partial core) ---
+// All wrappers null-terminate the path(s) the same way open() does, then call
+// the corresponding file_* syscall builtin. Return values follow POSIX:
+// 0 = success, -errno = failure.
+
+// stat(path, buf): buf must be a byte buffer >= 144 bytes (struct stat on x86-64).
+// Returns 0 on success, -errno on failure.
+fn stat(path, buf) {
+  let n = len(path)
+  let cp = mem_alloc((n + 1 + 7) / 8)
+  let i = 0
+  while i < n { mem_store8(cp + 8 + i, mem_load8(path + 8 + i)); i = i + 1 }
+  mem_store8(cp + 8 + n, 0)
+  return file_stat(cp + 8, buf)
+}
+
+// unlink(path): delete a file. Returns 0 / -errno.
+fn unlink(path) {
+  let n = len(path)
+  let cp = mem_alloc((n + 1 + 7) / 8)
+  let i = 0
+  while i < n { mem_store8(cp + 8 + i, mem_load8(path + 8 + i)); i = i + 1 }
+  mem_store8(cp + 8 + n, 0)
+  return file_unlink(cp + 8)
+}
+
+// mkdir(path, mode): create a directory. Returns 0 / -errno.
+fn mkdir(path, mode) {
+  let n = len(path)
+  let cp = mem_alloc((n + 1 + 7) / 8)
+  let i = 0
+  while i < n { mem_store8(cp + 8 + i, mem_load8(path + 8 + i)); i = i + 1 }
+  mem_store8(cp + 8 + n, 0)
+  return file_mkdir(cp + 8, mode)
+}
+
+// chdir(path): change working directory. Returns 0 / -errno.
+fn chdir(path) {
+  let n = len(path)
+  let cp = mem_alloc((n + 1 + 7) / 8)
+  let i = 0
+  while i < n { mem_store8(cp + 8 + i, mem_load8(path + 8 + i)); i = i + 1 }
+  mem_store8(cp + 8 + n, 0)
+  return file_chdir(cp + 8)
+}
+
+// rename(old, new): move/rename a file or directory. Returns 0 / -errno.
+fn rename(oldp, newp) {
+  let no = len(oldp)
+  let co = mem_alloc((no + 1 + 7) / 8)
+  let i = 0
+  while i < no { mem_store8(co + 8 + i, mem_load8(oldp + 8 + i)); i = i + 1 }
+  mem_store8(co + 8 + no, 0)
+  let nn = len(newp)
+  let cn = mem_alloc((nn + 1 + 7) / 8)
+  let j = 0
+  while j < nn { mem_store8(cn + 8 + j, mem_load8(newp + 8 + j)); j = j + 1 }
+  mem_store8(cn + 8 + nn, 0)
+  return file_rename(co + 8, cn + 8)
+}
+
+// rmdir(path): remove an empty directory. Returns 0 / -errno.
+fn rmdir(path) {
+  let n = len(path)
+  let cp = mem_alloc((n + 1 + 7) / 8)
+  let i = 0
+  while i < n { mem_store8(cp + 8 + i, mem_load8(path + 8 + i)); i = i + 1 }
+  mem_store8(cp + 8 + n, 0)
+  return file_rmdir(cp + 8)
+}

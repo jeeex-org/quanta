@@ -1,0 +1,81 @@
+// === PATCH CODE ===
+fn patch_it() {
+    let i=0
+    while i<patchc {
+        let po=r64(patches+i*PCS); let tg=r64(patches+i*PCS+8); let ty=r64(patches+i*PCS+16)
+        let tofs=0
+        if ty==0 || ty==1 {
+            tofs=lblf(tg)
+        } else if ty==2 || ty==3 {
+            // tg is a source index to the function name (ty==2) or a fn
+            // index (ty==3). Resolve the function's code start.
+            let fi=-1
+            if ty==2 {
+                let tg_nl=0
+                while tg_nl<256 {
+                    let c0=r8(src+tg+tg_nl)
+                    if c0==0||c0==40||c0==41||c0==59||c0==123||c0==125||c0==44||c0==60||c0==62 { break }
+                    if c0==32||c0==9||c0==10||c0==13 { break }
+                    tg_nl=tg_nl+1
+                }
+                fi=findfn(tg,tg_nl)
+            } else { fi=tg }   // ty==3: tg is already the fn index
+            if fi>=0 { tofs=r64(func_code_starts+(fi+1)*8) }
+        }
+        else if ty==3 {
+            // (handled above: cof already resolved into tofs)
+        }
+        let ilen=5; if ty==1 { ilen=6 }
+        let rel=tofs-(po+ilen)
+        if ty==0||ty==2 {
+            w8(code+po,233)
+            w32(code+po+1,rel)
+        } else if ty==1 {
+            w8(code+po,15); w8(code+po+1,132)
+            w32(code+po+2,rel)
+        }
+        i=i+1
+    }
+}
+
+// Patch global RIP-relative displacements
+fn patch_globals() {
+    let i=0
+    while i<gpatchc {
+        let gp = r64(gpatches+i*24)
+        let gidx = r64(gpatches+i*24+8)
+        let is_store = r8(gpatches+i*24+16)
+        if emit_obj == 1 {
+            // OBJECT mode: emit an R_X86_64_PC32 relocation against _gdata so the
+            // external linker binds the global to wherever it places .data. The
+            // disp32 field is left as whatever it is (don't-care) — the linker
+            // overwrites it. r_offset = gp (the 4-byte disp field). addend = gidx*8-4
+            // (RIP points 4 bytes past the disp field, so S+A-P yields the right disp).
+            w64(reldyn + relc*24 + 0, gp)
+            w64(reldyn + relc*24 + 8, (gdata_sym<<32) | 2)   // r_info = (sym<<32)|R_X86_64_PC32
+            w32(reldyn + relc*24 + 16, gidx*8 - 4)   // r_addend low  = gidx*8 - 4
+            w32(reldyn + relc*24 + 20, 0xFFFFFFFF)   // r_addend high = 0 (unsigned)
+            relc = relc+1
+            i=i+1
+            continue
+        }
+        // Uniform global addressing: every global (internal + source) lives in the
+        // single data segment at GDATA; index directly. Patched to RIP-relative disp.
+        let gaddr = GDATA + gidx*8
+        // Code is loaded at vaddr (BASE + ht) where ht = ELF header + phdr
+        // size = 64 + 56*4 = 288 for x86-64 (PT_PHDR, code LOAD, data LOAD,
+        // GNU_STACK = 4 program headers), matching write_elf's e_entry=BASE+ht.
+        // A code byte at buffer offset gp therefore executes at vaddr
+        // (BASE + 288 + gp).  gp points at the 4-byte disp (byte 3 of the 7-byte
+        // REX.W 8B mod=00 disp32 instruction), so the instruction end is
+        // at (BASE + 288 + gp + 4).  The RIP-relative disp is measured
+        // from there, matching the Python oracle (rip = base + patch_ofs + 4).
+        let rip = BASE + 288 + gp + 4
+        let disp = gaddr - rip
+        w32(code+gp, disp)
+        i=i+1
+    }
+}
+
+
+
