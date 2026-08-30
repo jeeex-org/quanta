@@ -181,6 +181,7 @@ native type keyword parsing). `as` width casts (`x as T`) are done (0.0.90).
 | unsigned arith | udiv, umod, ult, ugt, ulte, ugte, u8, u32, u64 | ✅ gate (unsigned_ops.quanta) |
 | byte/endianness | bswap, popcount, clz, ctz, rotl, rotr | ✅ gate (bits_test.quanta) |
 | time | clock_gettime, gettimeofday, nanosleep, sleep, **clock() (CLOCK_MONOTONIC ns), now() (CLOCK_REALTIME epoch ns)** | ✅ gate (time_test.quanta + clock_now_test.quanta, 0.0.125) |
+| process | **fork()**, **exec(cmd)** (replaces image with `/bin/sh -c cmd`, mirrors `qc_sys_cmd` child marshaling), **wait(pid)** (wait4, returns WEXITSTATUS), **kill(pid,sig)** | ✅ gate (process_test.quanta rc=4 — S1 child exits 42→wait 42; S2 child exec "exit 7"→wait 7; S4 plain fork+exit(0)→0; S3 kill(p,9) on a sleep(100) child→ promptly reaped, WEXITSTATUS 0). All four preserve callee-saved r12–r15 (x86-64 ABI). Built 0.0.125→0.0.126; fixpoint md5 `2504e5b10d4fcbe812199b6f2e56679b`, gate 159/159. |
 
 ## G. Builtins — To-Do
 

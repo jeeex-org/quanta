@@ -1,0 +1,31 @@
+// 0.0.126 process core: fork/exec/wait/kill end-to-end.
+// wait() returns WEXITSTATUS (matches qc_sys_cmd convention):
+//   normal exit N  -> N ; signaled child -> 0 (signal is in low 7 bits).
+// S3 verifies kill by using a child that would sleep forever; if kill()
+// failed, wait() would block past the 15s guard (run rc=124). A live
+// SIGKILL reaps it promptly with WEXITSTATUS 0.
+fn main() {
+  let ok = 0
+  // ---- S1: child exits 42 ----
+  let p1 = fork()
+  if p1 == 0 { exit(42) }
+  let w1 = wait(p1)
+  if w1 == 42 { ok = ok + 1 }
+  // ---- S2: child execs "/bin/sh -c exit 7" ----
+  let p2 = fork()
+  if p2 == 0 { exec("exit 7"); exit(99) }
+  let w2 = wait(p2)
+  if w2 == 7 { ok = ok + 1 }
+  // ---- S4: child exits 0 without exec ----
+  let p4 = fork()
+  if p4 == 0 { exit(0) }
+  let w4 = wait(p4)
+  if w4 == 0 { ok = ok + 1 }
+  // ---- S3: kill child (would otherwise sleep forever) ----
+  let p3 = fork()
+  if p3 == 0 { sleep(100); exit(0) }
+  kill(p3, 9)
+  let w3 = wait(p3)
+  if w3 == 0 { ok = ok + 1 }   // signaled -> WEXITSTATUS 0; promptly reaped proves kill worked
+  exit(ok)   // expect 4
+}
