@@ -180,7 +180,7 @@ native type keyword parsing). `as` width casts (`x as T`) are done (0.0.90).
 | random | getrandom, rand | ✅ gate (getrandom_test.quanta rc=1; rand_test.quanta rc=0 — `rand()` convenience over getrandom returns a random i64). Implemented in 0.0.102. |
 | unsigned arith | udiv, umod, ult, ugt, ulte, ugte, u8, u32, u64 | ✅ gate (unsigned_ops.quanta) |
 | byte/endianness | bswap, popcount, clz, ctz, rotl, rotr | ✅ gate (bits_test.quanta) |
-| time | gettimeofday, nanosleep, sleep | ✅ gate (time_test.quanta) |
+| time | clock_gettime, gettimeofday, nanosleep, sleep, **clock() (CLOCK_MONOTONIC ns), now() (CLOCK_REALTIME epoch ns)** | ✅ gate (time_test.quanta + clock_now_test.quanta, 0.0.125) |
 
 ## G. Builtins — To-Do
 
