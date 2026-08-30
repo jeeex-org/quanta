@@ -163,14 +163,14 @@ Why post-0.1.0: the ARM64 backend is a new backend; shipping it while x86 debt
 remains would violate the debt-first rule and split correctness effort.
 Qualification evidence is gathered AFTER the core is complete, not before.
 
-### Current status (0.0.126 — live)
+### Current status (0.0.127 — live)
 
-**0.0.126 (current stable seed, live):** `process` core completion — adds low-level process builtins **`fork()`** (sc 57), **`exec(cmd)`** (replaces the image with `/bin/sh -c cmd`, reusing the proven `qc_sys_cmd` child-side marshaling), **`wait(pid)`** (sc 61 wait4, returns `WEXITSTATUS` — matches `qc_sys_cmd`'s `(status>>8)&0xff` convention), and **`kill(pid,sig)`** (sc 62). All four preserve callee-saved r12–r15 per the x86-64 ABI (the `qc_sys_cmd` pattern). Verified end-to-end: `process_test.quanta` (rc=4 — S1 fork+exit(42)→wait 42; S2 fork+exec("exit 7")→wait 7; S4 plain fork+exit(0)→0; S3 kill(p,9) on a sleep(100) child→ promptly reaped, WEXITSTATUS 0). Built from 0.0.125 seed; fixpoint byte-verified (gen1==gen2==gen3, md5 `2504e5b10d4fcbe812199b6f2e56679b`). Gate: functional 159/159, stdlib 7/7, multi-TU 3/3, all 11 layers GREEN. Next core = **0.0.127** (PTY layer). 0.1.0 = post-core STABLE.
+**0.0.127 (current stable seed, live):** `pty` (pseudo-terminal) core completion — adds low-level pty builtins **`pty_open()`** (open `/dev/ptmx` + `ioctl(TIOCSPTLCK,&0)` unlock → master fd), **`pty_slave(m)`** (ioctl `TIOCGPTLCK`→`TIOCGPTN` → open `/dev/pts/N` → slave fd), **`pty_name(m)`** (returns the `/dev/pts/N` string), **`dup2(a,b)`** (sc 33), and **`ioctl(fd,req,arg)`** (sc 16). All preserve callee-saved r12–r15 per the x86-64 ABI (the `qc_sys_cmd` pattern). Verified end-to-end: `pty_test.quanta` (rc=2 — child `dup2(slave,1)`+`exec` runs with stdout wired to the pty; parent `wait` returns 0, proving the full open→slave→fork→dup2→exec→wait pipeline). Built from 0.0.126 seed; fixpoint byte-verified (gen1==gen2==gen3, md5 `e1d5ed96d9df41f69297c4bcd2b50b4c`). Gate: functional 160/160, stdlib 7/7, multi-TU 3/3, all 11 layers GREEN. Next core = **0.0.128** (`big` div-by-zero guard, FIX-0.0.19). 0.1.0 = post-core STABLE.
 
 **0.0.125→0.0.138 (core sequence, per 2026-08-30 — cores do NOT go into 0.1.0; ALL PARTIAL cores first after `process`, then AI/QC-era, then classical/hardest):**
 - 0.0.125 `time` (clock/now/sleep/nanosleep) — ✅ **DONE** (fixpoint md5 `350e156a7e4d5615f9df4e3780151010`, gate 158/158)
 - 0.0.126 `process` (fork/exec/wait/kill) — ✅ **DONE** (fixpoint md5 `2504e5b10d4fcbe812199b6f2e56679b`, gate 159/159, process_test rc=4)
-- 0.0.127 PTY layer (partial core, needs 0.0.126 process + pty-alloc)
+- 0.0.127 `pty` (open/slave/name/dup2/ioctl) — ✅ **DONE** (fixpoint md5 `e1d5ed96d9df41f69297c4bcd2b50b4c`, gate 160/160, pty_test rc=2)
 - 0.0.128 `big` div-by-zero guard (FIX-0.0.19, partial core — `big` shipped 0.0.114, hole remains)
 - 0.0.129 `fs` missing ops (partial core — stat/unlink/mkdir/chdir/rename/rmdir absent; `fs` shipped 0.0.87)
 - 0.0.130 extern-C variadic (partial core — `printf(fmt,...)` not modeled; extern-C shipped 0.0.98/122)

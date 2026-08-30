@@ -182,6 +182,7 @@ native type keyword parsing). `as` width casts (`x as T`) are done (0.0.90).
 | byte/endianness | bswap, popcount, clz, ctz, rotl, rotr | ✅ gate (bits_test.quanta) |
 | time | clock_gettime, gettimeofday, nanosleep, sleep, **clock() (CLOCK_MONOTONIC ns), now() (CLOCK_REALTIME epoch ns)** | ✅ gate (time_test.quanta + clock_now_test.quanta, 0.0.125) |
 | process | **fork()**, **exec(cmd)** (replaces image with `/bin/sh -c cmd`, mirrors `qc_sys_cmd` child marshaling), **wait(pid)** (wait4, returns WEXITSTATUS), **kill(pid,sig)** | ✅ gate (process_test.quanta rc=4 — S1 child exits 42→wait 42; S2 child exec "exit 7"→wait 7; S4 plain fork+exit(0)→0; S3 kill(p,9) on a sleep(100) child→ promptly reaped, WEXITSTATUS 0). All four preserve callee-saved r12–r15 (x86-64 ABI). Built 0.0.125→0.0.126; fixpoint md5 `2504e5b10d4fcbe812199b6f2e56679b`, gate 159/159. |
+| pty (pseudo-terminal) | **pty_open()** (open `/dev/ptmx` + `ioctl(TIOCSPTLCK,&0)` unlock → master fd), **pty_slave(m)** (ioctl `TIOCGPTN` → open `/dev/pts/N` → slave fd), **pty_name(m)** (returns `/dev/pts/N` string), **dup2(a,b)** (sc 33), **ioctl(fd,req,arg)** (sc 16) | ✅ gate (pty_test.quanta rc=2 — child `dup2(slave,1)`+`exec` runs with stdout wired to the pty; parent `wait` returns 0, proving the full open→slave→fork→dup2→exec→wait pipeline). O_NOCTTY dropped from the ptmx open (it broke master reads); TIOCSPTLCK takes a pointer to a zero int (NULL faults). Built 0.0.126→0.0.127; fixpoint md5 `e1d5ed96d9df41f69297c4bcd2b50b4c`, gate 160/160. |
 
 ## G. Builtins — To-Do
 
