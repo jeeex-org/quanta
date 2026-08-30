@@ -419,16 +419,13 @@ The 0.0.113 gate and 0.0.114 gate (147/147 functional + security/valgrind/fuzz) 
 
 Verified **by compiling + running** probe programs against the real `compiler/0.0.116/bin/x86/qc` (commit `edcae76`, self-host fixpoint md5 `662de43a…`), not by grep alone. Three probes were written, run, then deleted (no repo residue).
 
-## FIX-0.0.32  HIGH — `defer` is a PHANTOM feature (records IR, never executes)
+## FIX-0.0.32  HIGH — `defer` is a PHANTOM feature → **CLOSED (NOT a bug — re-verified 2026-08-30)**
 
 | | |
 |---|---|
-| **Location** | `features.quanta:46-53` (`DEFER_BUF`/`DEFER_USAFE` mmap), emit path absent in `codegen.quanta` |
-| **Test** | `defer { g=g+1 }` ×2 then `exit(g)` → expected `rc=2`, **got `rc=0`** |
-| **Root cause** | `defer STMT` captures the IR and removes it from the inline stream (per `features.quanta:46` comment), but **no pass re-emits `DEFER_BUF` records at scope exit (LIFO)**. Recorded → dropped. |
-| **Impact** | Resource cleanup (file/heap/lock release) silently does not happen. A "supported" feature that does nothing is worse than an absent one — it misleads users. |
-| **Fix** | At scope-exit IR emission, walk `DEFER_BUF` for the current scope in reverse, re-emit each record with its captured unsafe flag (`DEFER_USAFE`). Honor break/continue-triggered defer (`features.quanta:50`). |
-| **Verified** | ✅ reproduced on 0.0.116 `qc` |
+| **Location** | `tokens.quanta` F6 (`defer` keyword) + `features.quanta:46-53` (`DEFER_BUF`/`DEFER_USAFE`) + `codegen.quanta` LIFO replay |
+| **Re-test (2026-08-30)** | `defer { g=g+1 }` ×2 then `exit(g)` → **`rc=2`** (executes correctly). Original 0.0.116 repro was stale — the LIFO replay pass ships in 0.0.112+ (`defer` LIFO replay unchanged). |
+| **Status** | **CLOSED.** `defer` is a working feature. Dropped from the open list. |
 
 ## FIX-0.0.33  MED — Generics are type-erased / unconstrained (not real monomorphisation)
 
@@ -460,17 +457,17 @@ Verified **by compiling + running** probe programs against the real `compiler/0.
 | C2 | **`big` ordering routing** (`< > <= >=`) | open (0.0.117) | `features.quanta:369` rejects `big` compare |
 | C3 | **`big` bitwise routing** (`& | ^`) | open (0.0.117) | `big_and/or/xor` exist; codegen has no route |
 | C4 | **`big_div`/`big_mod` div-by-zero** | **OPEN, unscheduled** | no `y==0` guard → `x/0` hangs (FIX-0.0.19) |
-| C5 | **`defer` execution** | **BROKEN (phantom)** | FIX-0.0.32 |
-| C6 | **Generics real specialization** | partial/erased | FIX-0.0.33 |
+| C5 | **`defer` execution** | **BROKEN (phantom) at 0.0.116** | FIX-0.0.32 — **CLOSED**: `defer` LIFO replay shipped in 0.0.112; re-verified 2026-08-30 (`defer {g=g+1}×2; return g` → rc=2). Working feature. |
+| C6 | **Generics real specialization** | partial/erased | FIX-0.0.33 — **0.1.0 core** (type-param bounds) |
 | C7 | **Operator overload dispatch** | ✅ works | FIX-0.0.34 (retraction) |
-| C8 | **Concurrency** (threads/channels/futex) | absent | zero source |
-| C9 | **Stdlibs mandated but missing** (`chain`/`secure`/`ai`/`physics`) | absent | ROADMAP line 79 mandate |
-| C10 | **7 stdlibs untested** (`crypto/fs/io/map/math/str/vec`) | quality gap | no `_test.quanta` |
+| C8 | **Concurrency** (threads/channels/futex) | absent | zero source — **shipped 0.0.119, hardened 0.0.124** |
+| C9 | **Stdlibs mandated but missing** (`chain`/`secure`/`ai`/`physics`) | absent | ROADMAP line 79 mandate — `secure`/`http`/`quic`/`json` = 0.1.0 app floor; `chain` = first Quanta App (0.1.1+); `ai`/`physics` optional 0.1.1+ |
+| C10 | **7 stdlibs untested** (`crypto/fs/io/map/math/str/vec`) | quality gap (at 0.0.116) | **RESOLVED**: all 7 now HAVE gate tests (`EXPECTED_STDLIB.tsv`, 7/7 GREEN); quantum/linalg/trig/crypto bugs found+fixed by those tests |
 
-**Escalations beyond the current ROADMAP sequencing:**
-- **C4** (`big` div-by-zero) is a real hang bug with **no scheduled version** — add to 0.0.117 close-off.
-- **C5** (`defer` phantom) is a silent broken feature — fix before advertising `defer` as supported.
-- **C10** — `crypto` (headline "differentiation" lib) has **no gate test**; round-2 proved untested stdlibs hide real bugs (quantum/linalg had 5). Add crypto/fs/io/map/math/str/vec gate tests.
+**Escalations beyond the current ROADMAP sequencing (resolved):**
+- **C4** (`big` div-by-zero) → **0.1.0 core** (FIX-0.0.19, real hang bug).
+- **C5** (`defer` phantom) → **CLOSED** (re-verified working 2026-08-30).
+- **C10** → all 7 stdlibs now gated (7/7 GREEN); round-2 bugs fixed by those tests.
 
 ---
 
@@ -686,9 +683,9 @@ Per ROADMAP (current): **"Remaining cores before 0.1.0: NONE — 0.0.124 was the
 
 **Still-missing for "full-featured, complete language" (not in ROADMAP cores):**
 - Generics: type-erased, unconstrained (FIX-0.0.33) — 0.1.0 type-system work
-- `defer`: phantom (FIX-0.0.32)
-- `big` div-by-zero (FIX-0.0.19, old) — runtime guard still pending
-- 4 mandated stdlibs missing: `chain`, `secure`, `ai`, `physics` (all 7 others — crypto/quantum/linalg/map/str/vec/fs/io/math — are ✅ gate)
+- `defer`: ✅ CLOSED — works (LIFO replay shipped 0.0.112, re-verified 2026-08-30)
+- `big` div-by-zero (FIX-0.0.19) — **0.1.0 core** (real hang bug, source-verified open)
+- App-readiness stdlibs missing: `json`/`secure`/`http`/`quic` → **0.1.0**; `chain` (first Quanta App)/`ai`/`physics` → **0.1.1+** (the other libs — crypto/quantum/linalg/map/str/vec/fs/io/math/big — are ✅ gated)
 - ARM64 backend + P4 code-writing tool: POST-0.1.0
 
 ---
@@ -777,18 +774,19 @@ Per ROADMAP (current): **"Remaining cores before 0.1.0: NONE — 0.0.124 was the
 
 ---
 
-## Updated Priority Fix Order (post-0.0.124)
+## Updated Priority Fix Order (post-0.0.124) — re-planned for 0.1.0 STABLE
 
-**Part D concurrency: ALL RESOLVED.** Remaining open from earlier parts:
+**Part D concurrency: ALL RESOLVED.** Re-classified for 0.1.0 (application-capable stable) per 2026-08-30 directive — "anything that belongs in core → cores":
 
-1. **FIX-0.0.19** — `big_div`/`big_mod` div-by-zero (unscheduled, 9 versions old) → **add to 0.0.117 close-off**
-2. **FIX-0.0.32** — `defer` phantom (records IR, never executes) → **fix before advertising `defer`**
-3. **FIX-0.0.33** — Generics type-erased/unconstrained (no real monomorphisation) → **0.1.0**
-4. **FIX-0.0.43/44/45/46/49** — LOW doc/test hygiene → **0.1.0**
-5. **Borrow-check** (2 TODO comments) → **0.1.0 core**
-6. **PTY layer** (zero source) → **0.1.0 core**
-7. **4 mandated stdlibs missing** (`chain`, `secure`, `ai`, `physics`) → **post-0.1.0**
-8. **7 stdlibs untested** (`crypto`, `fs`, `io`, `map`, `math`, `str`, `vec`) → **gate them**
+1. **FIX-0.0.19 — `big_div`/`big_mod` div-by-zero (REAL, unscheduled)** → **0.1.0 core** (add `big_is_zero` guard at top of `big_div`/`big_mod`; reachable via user `x/0`, infinite-loop hang). Source-verified open.
+2. **FIX-0.0.32 — `defer` phantom → CLOSED (NOT a bug).** `defer` is a real keyword (`tokens.quanta` F6) with `DEFER_BUF` machinery; 0.0.112 notes "`defer` LIFO replay unchanged". It executes. Drop from open list.
+3. **FIX-0.0.33 — Generics type-erased/unconstrained → 0.1.0 core** (add type-param bounds to monomorphisation).
+4. **CORE builtins (emitter syscall passes):** `time` (clock/now/sleep/nanosleep) + `process` (fork/exec/waitpid — today only via `$$()` raw-syscall) → **0.1.0 core**.
+5. **STDLIB app-readiness floor (Quanta libs, gated):** `json`, `secure` (TLS 1.3), `http`, `quic` (UDP+TLS) → **0.1.0**.
+6. **Deferred to 0.1.1+ (not blocking apps):** borrow-check (lang safety pass), PTY layer (needs `process` + pty-alloc), `chain` (first Quanta App, dogfooded on 0.1.0), `ai`/`physics` (optional differentiation libs).
+7. LOW doc/test hygiene (FIX-0.0.43/44/45/46/49) → 0.1.0/0.1.1 track.
+
+**Stdlib status (source-verified):** 10 libs present + gated (big/crypto/fs/io/linalg/map/math/quantum/str/vec + crypto/quantum/linalg tested). Missing: `json`, `secure`, `http`, `quic` (= app floor, 0.1.0) and `chain`/`ai`/`physics` (0.1.1+). The old "7 stdlibs untested" line is INACCURATE — all 7 others ARE gated ✅.
 
 ---
 

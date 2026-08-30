@@ -17,7 +17,7 @@ Test legend (the **Test?** column):
 
 All test-file names below are verified to exist in `test_suites/codes/` and their
 gate status (✅ gate / 🟡 file-only) is verified against EXPECTED.tsv. `std_*` tests
-exist as files but are excluded from the gate per the "core only until 0.1.0" rule.
+exist as files but are excluded from the core gate per the "core-only until 0.1.0" rule. In 0.1.0 the app-readiness stdlibs (`json`/`secure`/`http`/`quic`) JOIN the gated stdlib layer; `chain`/`ai`/`physics` remain 0.1.1+.
 
 "Core" = the language itself. "Builtins" = inline-code primitives emitted by the compiler.
 
@@ -130,7 +130,7 @@ native type keyword parsing). `as` width casts (`x as T`) are done (0.0.90).
 | operator overloading | ✅ done (0.0.97) | ✅ gate | op_overload_add.quanta (rc=52), op_overload_mul.quanta (rc=7), op_overload_cmp.quanta (rc=5), op_overload_recur.quanta (rc=7). User `fn +(a,b)` shadows builtin `+`; dispatched via `OPFN` fn-index table + `IR_CALL_IDX` (no src-name injection — corruption-proof). All 11 ops (`+ - * / % == != < > <= >=`) verified; `overload_suppressed` (from `OPFN_SUPP`) makes an operator fn body fall back to BUILTIN for the same op (no infinite recursion). |
 | range `..` expression | ✅ done (0.0.97) | ✅ gate | range_for.quanta (rc=6, 1..4→6); feeds `for i in a..b` (exclusive end). |
 | array push `a.push(v)` | ✅ done | ✅ gate | array_push_method.quanta (rc=7), array_push_empty_annot.quanta (rc=7), array_push_closure_mix.quanta (rc=35). Method form only — bare `push(v,e)` is the byte-stride STRING push. Silently returned 0 in 0.0.65 (IR_CLOSURE/IR_APUSH both = opcode 72); fixed 0.0.66 |
-| generics `<T>` | ✅ checks + type-erased | ✅ gate | Compile-time type-arg validation added in 0.0.101: arity must match fn_genparams, each type-arg must name an existing struct or `i64`; unknown types / arity mismatches are HARD compile errors (fails closed, generic_neg_tests gated). Implicit instantiation (no `<T>`) defaults to i64. `generics_test.quanta` (rc=42) + `generics_typecheck.quanta` (rc=42) pass; `where_clause_test` (rc=7) preserved. Per-type body specialization (monomorphisation) deferred to 0.0.102. |
+| generics `<T>` | ✅ checks + type-erased | ✅ gate | Compile-time type-arg validation added in 0.0.101: arity must match fn_genparams, each type-arg must name an existing struct or `i64`; unknown types / arity mismatches are HARD compile errors (fails closed, generic_neg_tests gated). Implicit instantiation (no `<T>`) defaults to i64. `generics_test.quanta` (rc=42) + `generics_typecheck.quanta` (rc=42) pass; `where_clause_test` (rc=7) preserved. Per-type body specialization (monomorphisation) deferred to 0.0.102. **FIX-0.0.33 (type-param bounds unenforced) → 0.1.0 core** (per 2026-08-30 plan). |
 | tuples `(a,b)` | ✅ done | ✅ gate | tuple_test.quanta (rc=40), option_tuple.quanta (rc=42). Literals, N-tuples, nested access `t.0.1`, tuple-valued returns, element reassign, tuple in array, destructuring `let x,y = f()` |
 | `and` / `or` keywords | ✅ done (0.0.70) | ✅ gate | logical_keywords.quanta (rc=4), logical_keywords_shortcircuit.quanta (rc=2). Before 0.0.70 the keyword was tokenized but never consumed |
 | `!` / `not` | ✅ done (0.0.71) | ✅ gate | logical not -> 0/1. Const and runtime paths now agree; `~`/`~~` is separate bitwise-not. bitwise_not.quanta pins both |
@@ -238,10 +238,15 @@ it; 🟡 file-only = a test file exists on disk but is NOT in the gate; ❌ none
 | `vec` | ✅ done | ✅ gate | std_vec_test.quanta (rc=8, gated at 0.0.87). |
 | `fs` (file system) | ✅ done | ✅ gate | std_fs_test.quanta (rc=9, gated at 0.0.87). NOTE: stat/unlink/mkdir/chdir/rename are still BROKEN (0.107); this test covers the working write/read round-trip only. |
 | `io` (file IO) | ✅ done | ✅ gate | file_io.quanta (in gate). |
-| `chain` (blockchain: Merkle/signed-tx/UTXO/Block) | ❌ todo | ❌ none | Not in code. Part of the differentiation mandate (math/physics/crypto/blockchain/quantum/AI). |
-| `secure` (capability I/O, constant-time) | ❌ todo | ❌ none | Not in code. |
-| `ai` (tensor ops + inference) | ❌ todo | ❌ none | Not in code. |
-| `physics` (ODE/PDE solvers) | ❌ todo | ❌ none | Not in code. |
+| `chain` (blockchain: Merkle/signed-tx/UTXO/Block) | ❌ todo → **0.1.1+ (first Quanta App)** | ❌ none | Not in code. Per 2026-08-30 directive, `chain` is the **first Quanta App** — dogfooded ON 0.1.0, not a compiler core. |
+| `secure` (TLS 1.3, constant-time) | ❌ todo → **0.1.0 (app floor)** | ❌ none | Not in code. Prerequisite for `http`/`quic`. |
+| `http` (client+server over `secure`) | ❌ todo → **0.1.0 (app floor)** | ❌ none | Not in code; depends on `secure`. |
+| `quic` (UDP+TLS 1.3 transport) | ❌ todo → **0.1.0 (app floor)** | ❌ none | Not in code; depends on `secure` (QUIC handshake IS TLS 1.3). Raw UDP already reachable via `socket(AF_INET, SOCK_DGRAM)`. |
+| `json` (parse/serialize) | ❌ todo → **0.1.0 (app floor)** | ❌ none | Not in code; data-app prerequisite. |
+| `ai` (tensor ops + inference) | ❌ todo → **0.1.1+ (optional)** | ❌ none | Not in code. Optional differentiation lib. |
+| `physics` (ODE/PDE solvers) | ❌ todo → **0.1.1+ (optional)** | ❌ none | Not in code. Optional differentiation lib. |
+
+**Stdlib status (source-verified 0.0.124):** 10 libs present + gated (big/crypto/fs/io/linalg/map/math/quantum/str/vec + crypto/quantum/linalg tested). The other 6 (json/secure/http/quic/chain/ai/physics) are NOT in code. The "app-readiness floor" = `json`+`secure`+`http`+`quic` (0.1.0); `chain` is the first Quanta App (0.1.1+); `ai`/`physics` optional.
 
 ## Summary counts (source-derived, current at 0.0.124)
 
