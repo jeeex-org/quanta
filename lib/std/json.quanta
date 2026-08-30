@@ -1,0 +1,311 @@
+// std/json — JSON parse + stringify for Quanta (0.0.132 core).
+//
+// A JSON value is a heap node (3 i64 words, allocated via mem_alloc):
+//   [0] = kind    (0=null, 1=bool, 2=number, 3=string, 4=array, 5=object)
+//   [1] = payload (bool:0/1 | number:i64 | string:ptr | array:vec-ptr | object:map-ptr)
+//   [2] = reserved
+//
+// Arrays use std/vec (vec of i64 node-handles). Objects use std/map
+// (string key -> i64 node-handle). Both store i64, so node handles fit.
+//
+// parse:  json_parse(s)   -> root node handle (or 0 on error)
+// emit:   json_stringify(j) -> Quanta string (header+8 bytes layout)
+//
+// Import with:  import std/json
+import std/str
+import std/vec
+import std/map
+
+// ---- parse state (globals; single-threaded, set by json_parse) ----
+let _js_src = 0      // source string pointer
+let _js_pos = 0      // current index into source
+let _js_len = 0      // source byte length
+
+fn _js_peek() {
+  if _js_pos >= _js_len { return 0 }
+  return byte_at(_js_src, _js_pos)
+}
+fn _js_adv() {
+  _js_pos = _js_pos + 1
+}
+fn _js_skip_ws() {
+  while _js_pos < _js_len {
+    let c = byte_at(_js_src, _js_pos)
+    if c == 32 || c == 9 || c == 10 || c == 13 { _js_pos = _js_pos + 1 }
+    else { return }
+  }
+}
+
+// Allocate a node with given kind/payload.
+fn _js_mk(kind, payload) {
+  let p = mem_alloc(3)
+  mem_store(p, kind)
+  mem_store(p + 8, payload)
+  mem_store(p + 16, 0)
+  return p
+}
+
+// Parse a JSON string literal starting just AFTER the opening quote.
+// Returns a Quanta string pointer (header+8). Advances _js_pos past closing quote.
+fn _js_parse_str() {
+  // first pass: count output bytes and find closing quote
+  let j = _js_pos
+  let cnt = 0
+  while j < _js_len {
+    let c = byte_at(_js_src, j)
+    if c == 34 { break }            // closing "
+    if c == 92 { j = j + 2; cnt = cnt + 1 }   // backslash escape -> 1 byte
+    else { j = j + 1; cnt = cnt + 1 }
+  }
+  // allocate string (header word + cnt bytes, rounded to 8)
+  let buf = mem_alloc((cnt + 9 + 7) / 8)
+  mem_store(buf, cnt)
+  let k = 0
+  let i = _js_pos
+  while k < cnt {
+    let c = byte_at(_js_src, i)
+    if c == 92 {
+      let e = byte_at(_js_src, i + 1)
+      if e == 110 { mem_store8(buf + 8 + k, 10) }      // \n
+      else if e == 116 { mem_store8(buf + 8 + k, 9) }  // \t
+      else if e == 114 { mem_store8(buf + 8 + k, 13) } // \r
+      else if e == 98 { mem_store8(buf + 8 + k, 8) }   // \b
+      else if e == 102 { mem_store8(buf + 8 + k, 12) } // \f
+      else { mem_store8(buf + 8 + k, e) }              // \" \\ \/ and pass-through
+      i = i + 2
+    } else {
+      mem_store8(buf + 8 + k, c)
+      i = i + 1
+    }
+    k = k + 1
+  }
+  _js_pos = j + 1   // consume closing quote
+  return buf
+}
+
+// Parse a number: optional '-', integer digits. Fraction/exponent are
+// consumed for correct position but the integer part is stored (v1).
+fn _js_parse_num() {
+  let neg = 0
+  if _js_peek() == 45 { neg = 1; _js_adv() }   // '-'
+  let val = 0
+  while _js_pos < _js_len {
+    let c = byte_at(_js_src, _js_pos)
+    if c >= 48 && c <= 57 {
+      val = val * 10 + (c - 48)
+      _js_adv()
+    } else { break }
+  }
+  // consume fraction / exponent so position stays correct
+  if _js_peek() == 46 {            // '.'
+    _js_adv()
+    while _js_pos < _js_len {
+      let c = byte_at(_js_src, _js_pos)
+      if c >= 48 && c <= 57 { _js_adv() } else { break }
+    }
+  }
+  if _js_peek() == 101 || _js_peek() == 69 {   // e / E
+    _js_adv()
+    if _js_peek() == 43 || _js_peek() == 45 { _js_adv() }
+    while _js_pos < _js_len {
+      let c = byte_at(_js_src, _js_pos)
+      if c >= 48 && c <= 57 { _js_adv() } else { break }
+    }
+  }
+  if neg == 1 { val = 0 - val }
+  return val
+}
+
+// Parse array: '[' elements (value ',')* ']'
+fn _js_parse_arr() {
+  _js_adv()   // consume '['
+  let v = vec_new()
+  let n = 0
+  _js_skip_ws()
+  if _js_peek() == 93 { _js_adv(); return _js_mk(4, v) }  // empty []
+  while 1 {
+    _js_skip_ws()
+    let child = _js_parse_value()
+    vec_put(v, n, child)
+    n = n + 1
+    _js_skip_ws()
+    let c = _js_peek()
+    if c == 44 { _js_adv(); continue }   // ','
+    if c == 93 { _js_adv(); break }        // ']'
+    break
+  }
+  vec_set_len(v, n)
+  return _js_mk(4, v)
+}
+
+// Parse object: '{' (string ':' value ',')* '}'
+fn _js_parse_obj() {
+  _js_adv()   // consume '{'
+  let m = map_new()
+  _js_skip_ws()
+  if _js_peek() == 125 { _js_adv(); return _js_mk(5, m) }  // empty {}
+  while 1 {
+    _js_skip_ws()
+    if _js_peek() != 34 { break }   // expecting string key
+    _js_adv()   // consume opening "
+    let key = _js_parse_str()
+    _js_skip_ws()
+    if _js_peek() == 58 { _js_adv() }  // ':'
+    _js_skip_ws()
+    let child = _js_parse_value()
+    map_put(m, key, child)
+    _js_skip_ws()
+    let c = _js_peek()
+    if c == 44 { _js_adv(); continue }   // ','
+    if c == 125 { _js_adv(); break }       // '}'
+    break
+  }
+  return _js_mk(5, m)
+}
+
+fn _js_parse_value() {
+  _js_skip_ws()
+  let c = _js_peek()
+  if c == 110 {            // 'n' -> null
+    _js_adv(); _js_adv(); _js_adv(); _js_adv()   // ull
+    return _js_mk(0, 0)
+  }
+  if c == 116 {            // 't' -> true
+    _js_adv(); _js_adv(); _js_adv(); _js_adv()   // rue
+    return _js_mk(1, 1)
+  }
+  if c == 102 {            // 'f' -> false
+    _js_adv(); _js_adv(); _js_adv(); _js_adv(); _js_adv()  // alse
+    return _js_mk(1, 0)
+  }
+  if c == 34 {             // '"' -> string
+    _js_adv()
+    let s = _js_parse_str()
+    return _js_mk(3, s)
+  }
+  if c == 91 { return _js_parse_arr() }   // '['
+  if c == 123 { return _js_parse_obj() }  // '{'
+  // otherwise number
+  let n = _js_parse_num()
+  return _js_mk(2, n)
+}
+
+// Public: parse JSON text -> root node handle (0 on empty/invalid at start).
+fn json_parse(s) {
+  _js_src = s
+  _js_len = len(s)
+  _js_pos = 0
+  _js_skip_ws()
+  if _js_pos >= _js_len { return 0 }
+  return _js_parse_value()
+}
+
+// ---- node accessors ----
+fn json_kind(j) { return mem_load(j) }
+fn json_bool(j) { return mem_load(j + 8) }
+fn json_num(j) { return mem_load(j + 8) }
+fn json_str(j) { return mem_load(j + 8) }
+fn json_arr(j) { return mem_load(j + 8) }
+fn json_obj(j) { return mem_load(j + 8) }
+
+// ---- stringify ----
+// int -> decimal string
+fn _js_itoa(n) {
+  if n == 0 {
+    let z = mem_alloc(2)
+    mem_store(z, 1)
+    mem_store8(z + 8, 48)
+    return z
+  }
+  let neg = 0
+  if n < 0 { neg = 1; n = 0 - n }
+  // count digits
+  let t = n; let d = 0
+  while t > 0 { d = d + 1; t = t / 10 }
+  let total = d + neg
+  let buf = mem_alloc((total + 9 + 7) / 8)
+  mem_store(buf, total)
+  let k = total - 1
+  while n > 0 {
+    let r = n % 10
+    mem_store8(buf + 8 + k, 48 + r)
+    k = k - 1
+    n = n / 10
+  }
+  if neg == 1 { mem_store8(buf + 8, 45) }  // '-'
+  return buf
+}
+
+// quote + escape a Quanta string
+fn _js_esc(s) {
+  let n = len(s)
+  // worst case: each byte becomes 2 (e.g. " -> \") + surrounding quotes
+  let buf = mem_alloc((n * 2 + 2 + 9 + 7) / 8)
+  mem_store(buf, 0)   // fix length at end
+  let out = 0
+  mem_store8(buf + 8 + out, 34); out = out + 1   // opening "
+  let i = 0
+  while i < n {
+    let c = byte_at(s, i)
+    if c == 34 || c == 92 {           // " or \
+      mem_store8(buf + 8 + out, 92); out = out + 1   // backslash
+      mem_store8(buf + 8 + out, c); out = out + 1
+    } else if c == 10 { mem_store8(buf+8+out,92); out=out+1; mem_store8(buf+8+out,110); out=out+1 }
+    else if c == 9 { mem_store8(buf+8+out,92); out=out+1; mem_store8(buf+8+out,116); out=out+1 }
+    else if c == 13 { mem_store8(buf+8+out,92); out=out+1; mem_store8(buf+8+out,114); out=out+1 }
+    else { mem_store8(buf + 8 + out, c); out = out + 1 }
+    i = i + 1
+  }
+  mem_store8(buf + 8 + out, 34); out = out + 1   // closing "
+  mem_store(buf, out)
+  return buf
+}
+
+// public stringify
+fn json_stringify(j) {
+  let kind = mem_load(j)
+  if kind == 0 { return concat("null", "") }
+  if kind == 1 {
+    if mem_load(j + 8) == 1 { return concat("true", "") }
+    return concat("false", "")
+  }
+  if kind == 2 { return _js_itoa(mem_load(j + 8)) }
+  if kind == 3 { return _js_esc(mem_load(j + 8)) }
+  if kind == 4 {
+    let v = mem_load(j + 8)
+    let n = vec_len(v)
+    let out = concat("[", "")
+    let i = 0
+    while i < n {
+      let el = json_stringify(vec_at(v, i))
+      out = concat(out, el)
+      if i < n - 1 { out = concat(out, concat(",", "")) }
+      i = i + 1
+    }
+    out = concat(out, concat("]", ""))
+    return out
+  }
+  if kind == 5 {
+    let m = mem_load(j + 8)
+    let nb = mem_load(m)
+    let out = concat("{", "")
+    let first = 1
+    let b = 0
+    while b < nb {
+      let slot = m + 16 + b * 16
+      let key = mem_load(slot)
+      if key != 0 {
+        let val = mem_load(slot + 8)
+        if first == 0 { out = concat(out, concat(",", "")) }
+        first = 0
+        out = concat(out, _js_esc(key))
+        out = concat(out, concat(":", ""))
+        out = concat(out, json_stringify(val))
+      }
+      b = b + 1
+    }
+    out = concat(out, concat("}", ""))
+    return out
+  }
+  return concat("null", "")
+}
