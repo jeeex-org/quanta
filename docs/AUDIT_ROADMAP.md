@@ -458,15 +458,17 @@ Verified **by compiling + running** probe programs against the real `compiler/0.
 | C3 | **`big` bitwise routing** (`& | ^`) | open (0.0.117) | `big_and/or/xor` exist; codegen has no route |
 | C4 | **`big_div`/`big_mod` div-by-zero** | **OPEN, unscheduled** | no `y==0` guard → `x/0` hangs (FIX-0.0.19) |
 | C5 | **`defer` execution** | **BROKEN (phantom) at 0.0.116** | FIX-0.0.32 — **CLOSED**: `defer` LIFO replay shipped in 0.0.112; re-verified 2026-08-30 (`defer {g=g+1}×2; return g` → rc=2). Working feature. |
-| C6 | **Generics real specialization** | partial/erased | FIX-0.0.33 — **0.0.133 core** (type-param bounds; classical, pushed down) |
+| C6 | **Generics real specialization** | partial/erased | FIX-0.0.33 — **0.0.137 core** (type-param bounds; classical, pushed down; `where` constraint enforced) |
 | C7 | **Operator overload dispatch** | ✅ works | FIX-0.0.34 (retraction) |
 | C8 | **Concurrency** (threads/channels/futex) | absent | zero source — **shipped 0.0.119, hardened 0.0.124** |
-| C9 | **Stdlibs mandated but missing** (`chain`/`secure`/`ai`/`physics`) | absent | ROADMAP 0.0.125+ AI/QC-era core chain: `json`(0.0.127)/`secure`(0.0.128)/`quic`(0.0.129)/`http`(0.0.130)/`ai`(0.0.131); `chain` = first Quanta App (0.1.1+); `physics` optional 0.1.1+ |
+| C9 | **Partial-core / stdlib gaps** | partial/absent | ROADMAP 0.0.125+ PARTIAL cores first: PTY(0.0.127)/`big` div-by-zero FIX-0.0.19(0.0.128)/`fs` missing ops(0.0.129)/extern-C variadic(0.0.130)/closure self-recursion(0.0.131); then AI/QC-era chain `json`(0.0.132)/`secure`(0.0.133)/`quic`(0.0.134)/`http`(0.0.135)/`ai`(0.0.136); `chain` = first Quanta App (0.1.1+); `physics` optional 0.1.1+ |
 | C10 | **7 stdlibs untested** (`crypto/fs/io/map/math/str/vec`) | quality gap (at 0.0.116) | **RESOLVED**: all 7 now HAVE gate tests (`EXPECTED_STDLIB.tsv`, 7/7 GREEN); quantum/linalg/trig/crypto bugs found+fixed by those tests |
 
 **Escalations beyond the current ROADMAP sequencing (resolved):**
-- **C4** (`big` div-by-zero) → **0.0.128 core** (FIX-0.0.19, real hang bug).
+- **C4** (`big` div-by-zero) → **0.0.128 core** (FIX-0.0.19, partial core — `big` shipped 0.0.114, hole remains).
 - **C5** (`defer` phantom) → **CLOSED** (re-verified working 2026-08-30).
+- **C6** (generics) → **0.0.137 core** (classical, pushed down; `where` bounds enforced).
+- **C9** → PARTIAL cores first (PTY 0.0.127, `big` div-by-zero 0.0.128, `fs` ops 0.0.129, extern-C variadic 0.0.130, closure self-recursion 0.0.131), then AI/QC chain 0.0.132–0.0.136; `chain`/`physics` 0.1.1+.
 - **C10** → all 7 stdlibs now gated (7/7 GREEN); round-2 bugs fixed by those tests.
 
 ---
@@ -681,11 +683,12 @@ Per ROADMAP (current): **"Remaining cores before 0.1.0: NONE — 0.0.124 was the
 1. **Borrow-checking** (compile-time memory safety) — 2 TODO comments
 2. **PTY layer** for interactive `$$()` — zero source
 
-**Still-missing for "full-featured, complete language" (all in 0.0.125+ core chain per 2026-08-30 — cores do NOT go into 0.1.0):**
-- Generics: type-erased, unconstrained (FIX-0.0.33) — **0.0.133 core** (classical, pushed down)
+**Still-missing for "full-featured, complete language" (all in 0.0.125+ core chain per 2026-08-30 — cores do NOT go into 0.1.0; ALL PARTIAL cores first, then AI/QC-era, then classical/hardest):**
+- Partial-core completions (right after `process`): PTY(0.0.127) / `big` div-by-zero FIX-0.0.19(0.0.128) / `fs` missing ops stat/unlink/mkdir/chdir/rename/rmdir(0.0.129) / extern-C variadic `printf(fmt,...)`(0.0.130) / closure self-recursion by name(0.0.131) — all shipped-but-incomplete cores
+- Generics: type-erased, unconstrained (FIX-0.0.33) — **0.0.137 core** (classical, pushed down; `where` bounds enforced)
 - `defer`: ✅ CLOSED — works (LIFO replay shipped 0.0.112, re-verified 2026-08-30)
-- `big` div-by-zero (FIX-0.0.19) — **0.0.132 core** (classical, pushed down; real hang bug, source-verified open)
-- AI/QC-era core chain: `json`(0.0.127)/`secure` TLS 1.3+hybrid X25519/ML-KEM (0.0.128, **PQC-ready**)/`quic` HTTP/3 (0.0.129, ahead of HTTP/2)/`http` HTTP/2-over-TLS (0.0.130)/`ai` tensor+inference (0.0.131) — QUIC > HTTP/2 per 2026-08-30; PTY(0.0.134) + borrow-check(0.0.135) cores; `chain` (first Quanta App)/`physics` → **0.1.1+** (the other libs — crypto/quantum/linalg/map/str/vec/fs/io/math/big — are ✅ gated)
+- `big` div-by-zero (FIX-0.0.19) — **0.0.128 core** (partial core, real hang bug, source-verified open)
+- AI/QC-era core chain: `json`(0.0.132) / `secure` TLS 1.3+hybrid X25519/ML-KEM (0.0.133, **PQC-ready**) / `quic` HTTP/3 (0.0.134, ahead of HTTP/2) / `http` HTTP/2-over-TLS (0.0.135) / `ai` tensor+inference (0.0.136) — QUIC > HTTP/2 per 2026-08-30; borrow-check(0.0.138) core; `chain` (first Quanta App)/`physics` → **0.1.1+** (the other libs — crypto/quantum/linalg/map/str/vec/fs/io/math/big — are ✅ gated)
 - **QC-age / AI-age note:** existing `crypto` (AES-256/SHA-2/SHA-3) is already quantum-resistant; `secure` adds **post-quantum KEM (ML-KEM/FIPS 203)** so TLS is QC-safe from day one. `json` is the universal AI/data interchange. NO "quantum transport protocol" — that's not a real app-layer need (QKD is fiber-only key distribution). Plaintext `http://` deliberately NOT shipped.
 - ARM64 backend + P4 code-writing tool: POST-0.1.0 (tooling dogfooded as app on 0.1.0)
 
@@ -777,16 +780,16 @@ Per ROADMAP (current): **"Remaining cores before 0.1.0: NONE — 0.0.124 was the
 
 ## Updated Priority Fix Order (post-0.0.124) — re-planned for 0.1.0 STABLE
 
-**Part D concurrency: ALL RESOLVED.** Re-classified per 2026-08-30 directive — "anything that belongs in core → cores" (cores continue 0.0.125+, one feature per version; 0.1.0 = post-core STABLE):
+**Part D concurrency: ALL RESOLVED.** Re-classified per 2026-08-30 directive — "anything that belongs in core → cores" (cores continue 0.0.125+, one feature per version; 0.1.0 = post-core STABLE). **All PARTIAL cores first (right after `process`), then AI/QC-era, then classical/hardest:**
 
-1. **FIX-0.0.19 — `big_div`/`big_mod` div-by-zero (REAL, unscheduled)** → **0.0.132 core** (classical, pushed down; add `big_is_zero` guard; reachable via user `x/0`, infinite-loop hang). Source-verified open.
+1. **FIX-0.0.19 — `big_div`/`big_mod` div-by-zero (REAL, unscheduled)** → **0.0.128 core** (partial core — `big` shipped 0.0.114, hole remains; add `big_is_zero` guard; reachable via user `x/0`, infinite-loop hang). Source-verified open.
 2. **FIX-0.0.32 — `defer` phantom → CLOSED (NOT a bug).** `defer` is a real keyword (`tokens.quanta` F6) with `DEFER_BUF` machinery; 0.0.112 notes "`defer` LIFO replay unchanged". It executes (re-verified 2026-08-30: `defer {g=g+1}×2; return g` → rc=2). Drop from open list.
-3. **FIX-0.0.33 — Generics type-erased/unconstrained → 0.0.133 core** (classical type-system, pushed down; add type-param bounds to monomorphisation).
+3. **FIX-0.0.33 — Generics type-erased/unconstrained → 0.0.137 core** (classical type-system, last-but-one; add type-param bounds to monomorphisation; `where` constraint enforced).
 4. **CORE builtins (emitter syscall passes):** `time` (clock/now/sleep/nanosleep) → **0.0.125**; `process` (fork/exec/waitpid — today only via `$$()` raw-syscall) → **0.0.126** (also retires the `/bin/sh -c` injection path in `$$()`).
-5. **AI/QC-era core chain (gated, related-to-existing first; QUIC > HTTP/2):** `json` (0.0.127, data/AI interchange) → `secure` TLS 1.3 + hybrid X25519/ML-KEM (0.0.128, **PQC-ready — QC-age**) → `quic` HTTP/3 UDP+TLS (0.0.129, ahead of HTTP/2) → `http` HTTP/2-over-TLS (0.0.130, no plaintext) → `ai` tensor ops + inference (0.0.131, AI-age, promoted into core chain). Classical pushed down: `big` div-by-zero guard FIX-0.0.19 → **0.0.132**; generics constraints FIX-0.0.33 → **0.0.133**.
-6. **PTY layer → 0.0.134 core** (needs 0.0.126 `process` + pty-alloc syscall; interactive runtime surface).
-7. **borrow-check → 0.0.135 core** (language safety pass — a compiler guarantee, NOT a stdlib; hardest item).
-8. **0.1.0 (STABLE)** after 0.0.125–0.0.135 cores are done. `chain` = first Quanta App (dogfooded on 0.1.0, lands 0.1.1+); `physics` optional 0.1.1+.
+5. **PARTIAL core completions (right after `process`):** PTY layer → **0.0.127 core** (needs 0.0.126 `process` + pty-alloc syscall; interactive runtime surface); `fs` missing ops → **0.0.129 core** (stat/unlink/mkdir/chdir/rename/rmdir absent; `fs` shipped 0.0.87); extern-C variadic → **0.0.130 core** (`printf(fmt,...)` not modeled; extern-C shipped 0.0.98/122); closure self-recursion by name → **0.0.131 core** (`findfn` doesn't resolve name in closure body; closures shipped 0.0.65→123).
+6. **AI/QC-era core chain (gated; QUIC > HTTP/2):** `json` (0.0.132, data/AI interchange) → `secure` TLS 1.3 + hybrid X25519/ML-KEM (0.0.133, **PQC-ready — QC-age**) → `quic` HTTP/3 UDP+TLS (0.0.134, ahead of HTTP/2) → `http` HTTP/2-over-TLS (0.0.135, no plaintext) → `ai` tensor ops + inference (0.0.136, AI-age, promoted into core chain).
+7. **borrow-check → 0.0.138 core** (language safety pass — a compiler guarantee, NOT a stdlib; hardest item, last).
+8. **0.1.0 (STABLE)** after 0.0.125–0.0.138 cores are done. `chain` = first Quanta App (dogfooded on 0.1.0, lands 0.1.1+); `physics` optional 0.1.1+.
 
 ---
 
