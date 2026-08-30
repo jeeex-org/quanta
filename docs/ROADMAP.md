@@ -78,8 +78,8 @@ SEQUENCING is the contract, not the literal numbers.
 | P2 builtins | 0.0.55–0.0.60 | float cmp ✅(0.0.55), proc/env ✅(0.0.55), stdin ✅(0.0.55), fs meta ✅(0.0.55 — path-string remap fixed), string ops, math ✅(sqrt/floor/ceil/abs; sin/cos/tan/pow/log/min/max TODO), atomics, net, introspection ✅(abort/debugbreak), random ✅(getrandom), **`$$(cmd)` external-command substitution (0.0.57)** — `unsafe`-gated runtime `fork`/`execve`/`pipe`/`wait4` via the raw `syscall()` builtin (no libc); `$$(str)`→`/bin/sh -c`, `$$(arr)`→direct `execve` (no shell, injection-safe). Returns `CmdResult{stdout,stderr,status}`. |
 | P3 language | 0.0.61–0.0.85 | **float literals ✅(0.0.61)**, **float-arg-to-builtin ✅(0.0.62: f2i/fadd/fsub/fmul/fdiv read float vregs correctly)**, **user enums ✅(0.0.63: qualified+bare variant resolution, explicit tags, match)**, **modules ✅(0.0.64: mod Name { fn ... } + Mod.fn() qualified calls)**, **closure literals ✅(0.0.65: `|x,y| { expr }` → [codeptr, env] tuple, callable directly or via fn-typed param)**, **array push fix ✅(0.0.66: IR_CLOSURE/IR_APUSH opcode collision silently zeroed every pushed element)**, **closure captures ✅(0.0.67: free vars of the enclosing fn captured by value into a heap env array)**, **user-fn-beats-builtin ✅(0.0.68: was enforced in only 2 of 86 builtin branches, so a user `fn abs` was silently hijacked)**, **match guards ✅(0.0.69: `n if cond => expr` — the `if` was never consumed, so guarded arms silently yielded 0)**; remaining: generic monomorphisation (type params are erased today), ref/ref-return/borrow (needs borrow-checking), and op-overload (needs trait vtable dispatch) — all 0.1.0 type-system work. **`big` keyword/type shipped in 0.0.114** (first-class `big` type: `: big`/`-> big` annotations, operator routing with int→big promotion, `big_test` gate). **Differentiation libs (math/physics/crypto/blockchain/quantum/AI mandate):** `crypto`/`quantum`/`linalg`/`math` shipped; `quantum_test`/`linalg_test` gate tests landed 0.0.116 (exposed + fixed 5 real stdlib bugs); `big_test` landed with 0.0.114; `chain`/`secure`/`ai`/`physics` not yet in code (native lib track, post-0.0.86). |
 | **P4 tooling** | **0.1.x (first Quanta App)** | **`chain` package/build tool — the first Quanta App**, built ON 0.1.0 (not a compiler core). Per user directive 2026-08-30: tooling is dogfooded as an application on the stable release, not baked into the language. |
-| **0.0.125+** | 0.0.125 → 0.0.134 | **Cores resume at 0.0.125** (one feature per version, fixpoint-verified, per 2026-08-30 directive — cores do NOT go into 0.1.0). Order: related-to-existing first, hard/complex last. Sequencing: `time` (0.0.125) → `process` fork/exec/waitpid (0.0.126, enables shell-free `$$()`) → `json` (0.0.127, data/AI interchange, trivial vs crypto) → `big` div-by-zero guard FIX-0.0.19 (0.0.128, real bug) → generics type constraints FIX-0.0.33 (0.0.129) → `secure` TLS 1.3 + hybrid X25519/ML-KEM (0.0.130, **PQC-ready**, QC-age) → `http` HTTP/2-over-TLS (0.0.131, no plaintext) → `quic` HTTP/3 UDP+TLS (0.0.132) → PTY layer (0.0.133, needs 0.0.126) → borrow-check (0.0.134, language safety pass, hardest). Each self-hosts + gate-green before promotion. |
-| **0.1.0** | 0.1.0 (STABLE) | **Application-capable stable release — AFTER all cores (0.0.125–0.0.134) are done.** 0.1.0 is the post-core stable; it does not carry new cores. `chain` (first Quanta App) dogfooded on 0.1.0, lands 0.1.1+; `ai`/`physics` optional 0.1.1+. |
+| **0.0.125+** | 0.0.125 → 0.0.135 | **Cores resume at 0.0.125** (one feature per version, fixpoint-verified, per 2026-08-30 directive — cores do NOT go into 0.1.0). **AI/QC-era priorities lead; classical pushed down; QUIC > HTTP/2.** Sequencing: `time` (0.0.125) → `process` fork/exec/waitpid (0.0.126, shell-free `$$()`) → `json` (0.0.127, AI/data interchange) → `secure` TLS 1.3 + hybrid X25519/ML-KEM (0.0.128, **PQC-ready QC-age**) → `quic` HTTP/3 UDP+TLS (0.0.129, modern transport, ahead of HTTP/2) → `http` HTTP/2-over-TLS (0.0.130, no plaintext) → `ai` tensor ops + inference (0.0.131, AI-age, promoted into core chain) → `big` div-by-zero guard FIX-0.0.19 (0.0.132, classical bug) → generics type constraints FIX-0.0.33 (0.0.133, classical type-system) → PTY layer (0.0.134, needs 0.0.126) → borrow-check (0.0.135, language safety pass, hardest). Each self-hosts + gate-green before promotion. |
+| **0.1.0** | 0.1.0 (STABLE) | **Application-capable stable release — AFTER all cores (0.0.125–0.0.135) are done.** 0.1.0 is the post-core stable; it does not carry new cores. `chain` (first Quanta App) dogfooded on 0.1.0, lands 0.1.1+; `physics` optional 0.1.1+. |
 
 ### Outstanding cores — per-version sequencing (0.0.87 → 0.1.0+)
 
@@ -167,18 +167,19 @@ Qualification evidence is gathered AFTER the core is complete, not before.
 
 **0.0.124 (current stable seed, live):** concurrency safety hardening — `thread_create` join-slot + child-stack `mmap` MAP_FAILED guards (FIX-0.0.35/36), child-stack `mprotect` guard page (FIX-0.0.40), `futex_wait`/`futex_wake` negative-errno → 0 clamp (FIX-0.0.37), and `clone`-failure cleanup (`munmap` both mappings + `exit(1)`, FIX-0.0.38). AUDIT_ROADMAP Part D findings 39/41/42/48 re-verified as stale/SPEC/not-defects/code-verified; FIX-0.0.47 added `futex_wait_test.quanta`. Built from 0.0.123 seed; fixpoint byte-verified (gen1==gen2==golden, md5 `2f579f42bd56995a822033a9baa8ed67`). **0.0.124 was the last concurrency/core version in the 0.0.x series — but cores RESUME at 0.0.125** (per 2026-08-30 directive: cores do NOT go into 0.1.0; they continue 0.0.125+ one feature per version until done). Next core = **0.0.125** (`time` builtins). 0.1.0 = post-core STABLE.
 
-**0.0.125→0.0.134 (core sequence, per 2026-08-30 — cores do NOT go into 0.1.0; related-to-existing first, hard last):**
+**0.0.125→0.0.135 (core sequence, per 2026-08-30 — cores do NOT go into 0.1.0; AI/QC-era lead, classical down, QUIC > HTTP/2):**
 - 0.0.125 `time` (clock/now/sleep/nanosleep)
 - 0.0.126 `process` (fork/exec/waitpid — today only via `$$()` raw-syscall; enables shell-free `$$()`)
-- 0.0.127 `json` (data/AI interchange; trivial vs crypto)
-- 0.0.128 `big` div-by-zero guard (FIX-0.0.19, real hang bug)
-- 0.0.129 generics type constraints (FIX-0.0.33)
-- 0.0.130 `secure` TLS 1.3 + hybrid X25519/ML-KEM (FIPS 203) — **PQC-ready**, the QC-age requirement
-- 0.0.131 `http` HTTP/2-over-TLS (no plaintext shipped)
-- 0.0.132 `quic` HTTP/3 (UDP+TLS 1.3, hybrid PQ)
-- 0.0.133 PTY layer (needs 0.0.126 process + pty-alloc) — core
-- 0.0.134 borrow-check (language safety pass) — core, hardest
-- **0.1.0 (STABLE)** after the above. `chain` = first Quanta App (0.1.1+); `ai`/`physics` optional 0.1.1+.
+- 0.0.127 `json` (data/AI interchange)
+- 0.0.128 `secure` TLS 1.3 + hybrid X25519/ML-KEM (FIPS 203) — **PQC-ready**, the QC-age requirement
+- 0.0.129 `quic` HTTP/3 (UDP+TLS 1.3, hybrid PQ) — modern transport, ahead of HTTP/2
+- 0.0.130 `http` HTTP/2-over-TLS (no plaintext shipped)
+- 0.0.131 `ai` tensor ops + inference (AI-age, promoted into core chain)
+- 0.0.132 `big` div-by-zero guard (FIX-0.0.19, real hang bug) — classical
+- 0.0.133 generics type constraints (FIX-0.0.33) — classical type-system
+- 0.0.134 PTY layer (needs 0.0.126 process + pty-alloc) — core
+- 0.0.135 borrow-check (language safety pass) — core, hardest
+- **0.1.0 (STABLE)** after the above. `chain` = first Quanta App (0.1.1+); `physics` optional 0.1.1+.
 
 **0.0.117 (prior stable seed):** `big` completion. Ordering (`< > <= >=`) + bitwise (`& | ^ << >>`) routed to sign-aware `big_cmp`/`big_and`/`big_or`/`big_xor`/`big_shl_signed`/`big_shr_signed`. **Also fixed: `big_add`/`big_sub`/`big_mul` were MAGNITUDE-ONLY** (negative operands silently miscomputed — e.g. `(-5)+3`→8) — now sign-aware via `big_add_signed`/`big_sub_signed`/`big_mul_signed`; `+ - *` operators route to them. `: big` annotation with int-literal RHS now promotes via `big_from_i64`. Gate: **152/152 functional + 7/7 stdlib + 3/3 multi-tu + extern-c/security/perf/valgrind/fuzz/differential/generics (all GREEN)**. **Self-host fixpoint BYTE-VERIFIED** (md5 `8b8a1e21573f12b5742a64f695a50b85`).
 

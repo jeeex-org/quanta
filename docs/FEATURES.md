@@ -17,7 +17,7 @@ Test legend (the **Test?** column):
 
 All test-file names below are verified to exist in `test_suites/codes/` and their
 gate status (✅ gate / 🟡 file-only) is verified against EXPECTED.tsv. `std_*` tests
-exist as files but are excluded from the core gate per the "core-only until 0.1.0" rule. In 0.1.0 the app-readiness stdlibs (`json`/`secure`/`http`/`quic`) JOIN the gated stdlib layer; `chain`/`ai`/`physics` remain 0.1.1+.
+exist as files but are excluded from the core gate per the "core-only until 0.1.0" rule. In 0.1.0 the AI/QC-era stdlibs (`json`/`secure`/`quic`/`http`/`ai`) JOIN the gated stdlib layer; `chain`/`physics` remain 0.1.1+.
 
 "Core" = the language itself. "Builtins" = inline-code primitives emitted by the compiler.
 
@@ -130,7 +130,7 @@ native type keyword parsing). `as` width casts (`x as T`) are done (0.0.90).
 | operator overloading | ✅ done (0.0.97) | ✅ gate | op_overload_add.quanta (rc=52), op_overload_mul.quanta (rc=7), op_overload_cmp.quanta (rc=5), op_overload_recur.quanta (rc=7). User `fn +(a,b)` shadows builtin `+`; dispatched via `OPFN` fn-index table + `IR_CALL_IDX` (no src-name injection — corruption-proof). All 11 ops (`+ - * / % == != < > <= >=`) verified; `overload_suppressed` (from `OPFN_SUPP`) makes an operator fn body fall back to BUILTIN for the same op (no infinite recursion). |
 | range `..` expression | ✅ done (0.0.97) | ✅ gate | range_for.quanta (rc=6, 1..4→6); feeds `for i in a..b` (exclusive end). |
 | array push `a.push(v)` | ✅ done | ✅ gate | array_push_method.quanta (rc=7), array_push_empty_annot.quanta (rc=7), array_push_closure_mix.quanta (rc=35). Method form only — bare `push(v,e)` is the byte-stride STRING push. Silently returned 0 in 0.0.65 (IR_CLOSURE/IR_APUSH both = opcode 72); fixed 0.0.66 |
-| generics `<T>` | ✅ checks + type-erased | ✅ gate | Compile-time type-arg validation added in 0.0.101: arity must match fn_genparams, each type-arg must name an existing struct or `i64`; unknown types / arity mismatches are HARD compile errors (fails closed, generic_neg_tests gated). Implicit instantiation (no `<T>`) defaults to i64. `generics_test.quanta` (rc=42) + `generics_typecheck.quanta` (rc=42) pass; `where_clause_test` (rc=7) preserved. Per-type body specialization (monomorphisation) deferred to 0.0.102. **FIX-0.0.33 (type-param bounds unenforced) → 0.0.129 core** (per 2026-08-30 plan: cores continue 0.0.125+, one per version). |
+| generics `<T>` | ✅ checks + type-erased | ✅ gate | Compile-time type-arg validation added in 0.0.101: arity must match fn_genparams, each type-arg must name an existing struct or `i64`; unknown types / arity mismatches are HARD compile errors (fails closed, generic_neg_tests gated). Implicit instantiation (no `<T>`) defaults to i64. `generics_test.quanta` (rc=42) + `generics_typecheck.quanta` (rc=42) pass; `where_clause_test` (rc=7) preserved. Per-type body specialization (monomorphisation) deferred to 0.0.102. **FIX-0.0.33 (type-param bounds unenforced) → 0.0.133 core** (classical type-system, pushed down per 2026-08-30 AI/QC-era priority; cores continue 0.0.125+, one per version). |
 | tuples `(a,b)` | ✅ done | ✅ gate | tuple_test.quanta (rc=40), option_tuple.quanta (rc=42). Literals, N-tuples, nested access `t.0.1`, tuple-valued returns, element reassign, tuple in array, destructuring `let x,y = f()` |
 | `and` / `or` keywords | ✅ done (0.0.70) | ✅ gate | logical_keywords.quanta (rc=4), logical_keywords_shortcircuit.quanta (rc=2). Before 0.0.70 the keyword was tokenized but never consumed |
 | `!` / `not` | ✅ done (0.0.71) | ✅ gate | logical not -> 0/1. Const and runtime paths now agree; `~`/`~~` is separate bitwise-not. bitwise_not.quanta pins both |
@@ -239,14 +239,14 @@ it; 🟡 file-only = a test file exists on disk but is NOT in the gate; ❌ none
 | `fs` (file system) | ✅ done | ✅ gate | std_fs_test.quanta (rc=9, gated at 0.0.87). NOTE: stat/unlink/mkdir/chdir/rename are still BROKEN (0.107); this test covers the working write/read round-trip only. |
 | `io` (file IO) | ✅ done | ✅ gate | file_io.quanta (in gate). |
 | `chain` (blockchain: Merkle/signed-tx/UTXO/Block) | ❌ todo → **0.1.1+ (first Quanta App)** | ❌ none | Not in code. Per 2026-08-30 directive, `chain` is the **first Quanta App** — dogfooded ON 0.1.0, not a compiler core. |
-| `secure` (TLS 1.3, PQC-ready, constant-time) | ❌ todo → **0.0.130 core** | ❌ none | Not in code. **QC-age design:** TLS 1.3 + **hybrid KEM X25519 + ML-KEM (NIST FIPS 203)** from day one (post-quantum key exchange — the one genuine quantum-threat requirement). Existing `crypto` lib (SHA-256/AES/SHA3) is already QC-resistant (AES-256, SHA-2/3); `secure` adds the PQ KEM + handshake. Prerequisite for `http`/`quic`. |
-| `http` (HTTP/2 over TLS; HTTP/3 via `quic`) | ❌ todo → **0.0.131 core** | ❌ none | Not in code; **plaintext `http://` is NOT shipped** (outdated/insecure) — only HTTP/2-over-TLS and HTTP/3 (QUIC). Depends on `secure`. |
-| `quic` (HTTP/3: UDP+TLS 1.3 transport) | ❌ todo → **0.0.132 core** | ❌ none | Not in code; QUIC handshake IS TLS 1.3 (hybrid PQ). Raw UDP already reachable via `socket(AF_INET, SOCK_DGRAM)`. This is the current low-latency standard (not "outdated"). |
+| `secure` (TLS 1.3, PQC-ready, constant-time) | ❌ todo → **0.0.128 core** | ❌ none | Not in code. **QC-age design:** TLS 1.3 + **hybrid KEM X25519 + ML-KEM (NIST FIPS 203)** from day one (post-quantum key exchange — the one genuine quantum-threat requirement). Existing `crypto` lib (SHA-256/AES/SHA3) is already QC-resistant (AES-256, SHA-2/3); `secure` adds the PQ KEM + handshake. Prerequisite for `http`/`quic`. |
+| `quic` (HTTP/3: UDP+TLS 1.3 transport) | ❌ todo → **0.0.129 core** | ❌ none | Not in code; QUIC handshake IS TLS 1.3 (hybrid PQ). Raw UDP already reachable via `socket(AF_INET, SOCK_DGRAM)`. **Modern transport — sequenced AHEAD of HTTP/2** (QUIC > HTTP/2 per 2026-08-30 AI/QC-era priority). |
+| `http` (HTTP/2 over TLS; HTTP/3 via `quic`) | ❌ todo → **0.0.130 core** | ❌ none | Not in code; **plaintext `http://` is NOT shipped** (outdated/insecure) — only HTTP/2-over-TLS and HTTP/3 (QUIC). Depends on `secure`. |
 | `json` (parse/serialize) | ❌ todo → **0.0.127 core** | ❌ none | Not in code; data/AI interchange (universal format). Trivial vs crypto, slotted early in the core chain. |
-| `ai` (tensor ops + inference) | ❌ todo → **0.1.1+ (optional)** | ❌ none | Not in code. Optional differentiation lib. |
+| `ai` (tensor ops + inference) | ❌ todo → **0.0.131 core** | ❌ none | Not in code. **AI-age priority** (promoted into the core chain per 2026-08-30). ONNX-style tensor/inference runtime — local LLM/vision inference. |
 | `physics` (ODE/PDE solvers) | ❌ todo → **0.1.1+ (optional)** | ❌ none | Not in code. Optional differentiation lib. |
 
-**Stdlib status (source-verified 0.0.124):** 10 libs present + gated (big/crypto/fs/io/linalg/map/math/quantum/str/vec + crypto/quantum/linalg tested). The other 6 (json/secure/http/quic/chain/ai/physics) are NOT in code. The "app-readiness floor" = `json`+`secure`+`http`+`quic` (0.1.0); `chain` is the first Quanta App (0.1.1+); `ai`/`physics` optional.
+**Stdlib status (source-verified 0.0.124):** 10 libs present + gated (big/crypto/fs/io/linalg/map/math/quantum/str/vec + crypto/quantum/linalg tested). Not yet in code: `json`(0.0.127)/`secure`(0.0.128)/`quic`(0.0.129)/`http`(0.0.130)/`ai`(0.0.131) = AI/QC-era core chain (QUIC ahead of HTTP/2); `chain` = first Quanta App (0.1.1+); `physics` optional 0.1.1+.
 
 ## Summary counts (source-derived, current at 0.0.124)
 
