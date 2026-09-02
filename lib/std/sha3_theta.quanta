@@ -1,35 +1,37 @@
-// lib/std/sha3_theta.quanta - Keccak theta step (FIPS 202)
-
-include "sha3_base.quanta"
+import std/sha3_constants
 
 fn keccak_theta(st) {
-  let a0 = mem_load(st+0); let a1 = mem_load(st+8); let a2 = mem_load(st+16); let a3 = mem_load(st+24); let a4 = mem_load(st+32)
-  let a5 = mem_load(st+40); let a6 = mem_load(st+48); let a7 = mem_load(st+56); let a8 = mem_load(st+64); let a9 = mem_load(st+72)
-  let a10 = mem_load(st+80); let a11 = mem_load(st+88); let a12 = mem_load(st+96); let a13 = mem_load(st+104); let a14 = mem_load(st+112)
-  let a15 = mem_load(st+120); let a16 = mem_load(st+128); let a17 = mem_load(st+136); let a18 = mem_load(st+144); let a19 = mem_load(st+152)
-  let a20 = mem_load(st+160); let a21 = mem_load(st+168); let a22 = mem_load(st+176); let a23 = mem_load(st+184); let a24 = mem_load(st+192)
+  let C = malloc(40)
+  let i = 0
+  while (i < 5) {
+    let sum = 0
+    let j = 0
+    while (j < 5) {
+      let idx = i + j * 5
+      let lane = mem_load(st + idx * 8)
+      sum = sum ^ lane
+      j = j + 1
+    }
+    mem_store(C + i * 8, sum)
+    i = i + 1
+  }
 
-  let C0 = a0 ^ a5 ^ a10 ^ a15 ^ a20
-  let C1 = a1 ^ a6 ^ a11 ^ a16 ^ a21
-  let C2 = a2 ^ a7 ^ a12 ^ a17 ^ a22
-  let C3 = a3 ^ a8 ^ a13 ^ a18 ^ a23
-  let C4 = a4 ^ a9 ^ a14 ^ a19 ^ a24
-
-  let D0 = C4 ^ krot(C1, 1)
-  let D1 = C0 ^ krot(C2, 1)
-  let D2 = C1 ^ krot(C3, 1)
-  let D3 = C2 ^ krot(C4, 1)
-  let D4 = C3 ^ krot(C0, 1)
-
-  a0 ^= D0; a1 ^= D1; a2 ^= D2; a3 ^= D3; a4 ^= D4
-  a5 ^= D0; a6 ^= D1; a7 ^= D2; a8 ^= D3; a9 ^= D4
-  a10 ^= D0; a11 ^= D1; a12 ^= D2; a13 ^= D3; a14 ^= D4
-  a15 ^= D0; a16 ^= D1; a17 ^= D2; a18 ^= D3; a19 ^= D4
-  a20 ^= D0; a21 ^= D1; a22 ^= D2; a23 ^= D3; a24 ^= D4
-
-  mem_store(st+0, a0); mem_store(st+8, a1); mem_store(st+16, a2); mem_store(st+24, a3); mem_store(st+32, a4)
-  mem_store(st+40, a5); mem_store(st+48, a6); mem_store(st+56, a7); mem_store(st+64, a8); mem_store(st+72, a9)
-  mem_store(st+80, a10); mem_store(st+88, a11); mem_store(st+96, a12); mem_store(st+104, a13); mem_store(st+112, a14)
-  mem_store(st+120, a15); mem_store(st+128, a16); mem_store(st+136, a17); mem_store(st+144, a18); mem_store(st+152, a19)
-  mem_store(st+160, a20); mem_store(st+168, a21); mem_store(st+176, a22); mem_store(st+184, a23); mem_store(st+192, a24)
+  let i = 0
+  while (i < 5) {
+    let im4 = i + 4
+    if (im4 >= 5) { im4 = im4 - 5 }
+    let ip1 = i + 1
+    if (ip1 >= 5) { ip1 = ip1 - 5 }
+    let D = mem_load(C + im4 * 8) ^ krot(mem_load(C + ip1 * 8), 1)
+    let j = 0
+    while (j < 5) {
+      let idx = i + j * 5
+      let lane = mem_load(st + idx * 8)
+      mem_store(st + idx * 8, lane ^ D)
+      j = j + 1
+    }
+    i = i + 1
+  }
 }
+
+extern fn malloc(size: u64) -> u64

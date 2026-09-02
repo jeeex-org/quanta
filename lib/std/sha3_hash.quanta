@@ -1,0 +1,95 @@
+import std/sha3_keccak_f
+
+fn keccak_absorb(st, rate, input, input_len, offset) {
+  let j = 0
+  while (j < rate && offset + j < input_len) {
+    let b = input[offset + j] & 0xFF
+    let idx = j >> 3
+    let shift = (j & 7) * 8
+    let lane = mem_load(st + idx * 8)
+    lane = lane ^ (b << shift)
+    mem_store(st + idx * 8, lane)
+    j = j + 1
+  }
+  return j
+}
+
+fn keccak_pad(st, rate, j, suffix_byte) {
+  let idx0 = j >> 3
+  let shift0 = (j & 7) * 8
+  let lane0 = mem_load(st + idx0 * 8)
+  lane0 = lane0 ^ (suffix_byte << shift0)
+  mem_store(st + idx0 * 8, lane0)
+
+  let idx1 = (rate - 1) >> 3
+  let shift1 = ((rate - 1) & 7) * 8
+  let lane1 = mem_load(st + idx1 * 8)
+  lane1 = lane1 ^ (0x80 << shift1)
+  mem_store(st + idx1 * 8, lane1)
+}
+
+fn keccak_squeeze(st, rate, out, out_len) {
+  let i = 0
+  while (i < out_len) {
+    let lane_idx = i >> 3
+    let shift = (i & 7) * 8
+    let v = mem_load(st + lane_idx * 8)
+    out[i] = (v >> shift) & 0xFF
+    i = i + 1
+    if (i % rate == 0 && i < out_len) {
+      keccak_f(st)
+    }
+  }
+}
+
+fn keccak_hash(input, input_len, rate, suffix_byte, out, out_len) {
+  let st = malloc(200)
+  let i = 0
+  while (i < 25) { mem_store(st + i * 8, 0); i = i + 1 }
+
+  if (input_len == 0) {
+    keccak_pad(st, rate, 0, suffix_byte)
+    keccak_f(st)
+  } else {
+    let offset = 0
+    while (offset < input_len) {
+      let j = keccak_absorb(st, rate, input, input_len, offset)
+      if (offset + j >= input_len) {
+        keccak_pad(st, rate, j, suffix_byte)
+        keccak_f(st)
+        break
+      } else {
+        keccak_f(st)
+        offset = offset + rate
+      }
+    }
+  }
+
+  keccak_squeeze(st, rate, out, out_len)
+}
+
+fn sha3_224(input, input_len, out) {
+  keccak_hash(input, input_len, 144, 0x06, out, 28)
+}
+
+fn sha3_256(input, input_len, out) {
+  keccak_hash(input, input_len, 136, 0x06, out, 32)
+}
+
+fn sha3_384(input, input_len, out) {
+  keccak_hash(input, input_len, 104, 0x06, out, 48)
+}
+
+fn sha3_512(input, input_len, out) {
+  keccak_hash(input, input_len, 72, 0x06, out, 64)
+}
+
+fn shake128(input, input_len, out, out_len) {
+  keccak_hash(input, input_len, 168, 0x1F, out, out_len)
+}
+
+fn shake256(input, input_len, out, out_len) {
+  keccak_hash(input, input_len, 136, 0x1F, out, out_len)
+}
+
+extern fn malloc(size: u64) -> u64
