@@ -2,8 +2,6 @@ fn krot(x, n) {
   return (x << n) | (x >> (64 - n))
 }
 
-extern fn malloc(size: u64) -> u64
-
 fn keccak_rc(rnd) {
   if (rnd == 0) { return 0x0000000000000001 }
   if (rnd == 1) { return 0x0000000000008082 }
@@ -12,11 +10,11 @@ fn keccak_rc(rnd) {
   if (rnd == 4) { return 0x000000000000808b }
   if (rnd == 5) { return 0x0000000080000001 }
   if (rnd == 6) { return 0x8000000080008081 }
-  if (rnd == 7) { return 0x0000000000008009 }
+  if (rnd == 7) { return 0x8000000000008009 }
   if (rnd == 8) { return 0x000000000000008a }
   if (rnd == 9) { return 0x0000000000000088 }
   if (rnd == 10) { return 0x0000000080008009 }
-  if (rnd == 11) { return 0x800000008000000a }
+  if (rnd == 11) { return 0x000000008000000a }
   if (rnd == 12) { return 0x000000008000808b }
   if (rnd == 13) { return 0x800000000000008b }
   if (rnd == 14) { return 0x8000000000008089 }
@@ -24,13 +22,14 @@ fn keccak_rc(rnd) {
   if (rnd == 16) { return 0x8000000000008002 }
   if (rnd == 17) { return 0x8000000000000080 }
   if (rnd == 18) { return 0x000000000000800a }
-  if (rnd == 19) { return 0x8000000080008008 }
-  if (rnd == 20) { return 0x8000000080008009 }
-  if (rnd == 21) { return 0x800000008000000a }
-  if (rnd == 22) { return 0x800000008000808b }
-  return 0x8000000080008081
+  if (rnd == 19) { return 0x800000008000000a }
+  if (rnd == 20) { return 0x8000000080008081 }
+  if (rnd == 21) { return 0x8000000000008080 }
+  if (rnd == 22) { return 0x0000000080000001 }
+  return 0x8000000080008008
 }
 
+// Standard FIPS 202 theta: D[x] = C[x-1] ^ rot(C[x+1], 1)
 fn keccak_theta(st) {
   let a0 = mem_load(st+0); let a1 = mem_load(st+8); let a2 = mem_load(st+16); let a3 = mem_load(st+24); let a4 = mem_load(st+32)
   let a5 = mem_load(st+40); let a6 = mem_load(st+48); let a7 = mem_load(st+56); let a8 = mem_load(st+64); let a9 = mem_load(st+72)
@@ -63,6 +62,7 @@ fn keccak_theta(st) {
   mem_store(st+160, a20); mem_store(st+168, a21); mem_store(st+176, a22); mem_store(st+184, a23); mem_store(st+192, a24)
 }
 
+// Standard Rho/Pi from KeccakP-1600-64.macros
 fn keccak_rhopi(st) {
   let a0 = mem_load(st+0); let a1 = mem_load(st+8); let a2 = mem_load(st+16); let a3 = mem_load(st+24); let a4 = mem_load(st+32)
   let a5 = mem_load(st+40); let a6 = mem_load(st+48); let a7 = mem_load(st+56); let a8 = mem_load(st+64); let a9 = mem_load(st+72)
@@ -71,18 +71,19 @@ fn keccak_rhopi(st) {
   let a20 = mem_load(st+160); let a21 = mem_load(st+168); let a22 = mem_load(st+176); let a23 = mem_load(st+184); let a24 = mem_load(st+192)
 
   let b0 = krot(a0, 0); let b1 = krot(a6, 44); let b2 = krot(a12, 43); let b3 = krot(a18, 21); let b4 = krot(a24, 14)
-  let b5 = krot(a3, 28); let b6 = krot(a9, 20); let b7 = krot(a15, 15); let b8 = krot(a21, 61); let b9 = krot(a2, 62)
+  let b5 = krot(a3, 28); let b6 = krot(a9, 20); let b7 = krot(a10, 3); let b8 = krot(a16, 45); let b9 = krot(a22, 61)
   let b10 = krot(a1, 1); let b11 = krot(a7, 6); let b12 = krot(a13, 25); let b13 = krot(a19, 8); let b14 = krot(a20, 18)
-  let b15 = krot(a4, 27); let b16 = krot(a10, 36); let b17 = krot(a16, 10); let b18 = krot(a22, 39); let b19 = krot(a3, 41)
-  let b20 = krot(a2, 62); let b21 = krot(a8, 55); let b22 = krot(a14, 56); let b23 = krot(a15, 45); let b24 = krot(a11, 55)
+  let b15 = krot(a4, 27); let b16 = krot(a5, 36); let b17 = krot(a11, 10); let b18 = krot(a17, 15); let b19 = krot(a23, 56)
+  let b20 = krot(a2, 62); let b21 = krot(a8, 55); let b22 = krot(a14, 39); let b23 = krot(a15, 41); let b24 = krot(a21, 2)
 
-  mem_store(st+0, b0); mem_store(st+8, b5); mem_store(st+16, b10); mem_store(st+24, b15); mem_store(st+32, b20)
-  mem_store(st+40, b1); mem_store(st+48, b6); mem_store(st+56, b11); mem_store(st+64, b16); mem_store(st+72, b21)
-  mem_store(st+80, b2); mem_store(st+88, b7); mem_store(st+96, b12); mem_store(st+104, b17); mem_store(st+112, b22)
-  mem_store(st+120, b3); mem_store(st+128, b8); mem_store(st+136, b13); mem_store(st+144, b18); mem_store(st+152, b23)
-  mem_store(st+160, b4); mem_store(st+168, b9); mem_store(st+176, b14); mem_store(st+184, b19); mem_store(st+192, b24)
+  mem_store(st+0, b0); mem_store(st+8, b1); mem_store(st+16, b2); mem_store(st+24, b3); mem_store(st+32, b4)
+  mem_store(st+40, b5); mem_store(st+48, b6); mem_store(st+56, b7); mem_store(st+64, b8); mem_store(st+72, b9)
+  mem_store(st+80, b10); mem_store(st+88, b11); mem_store(st+96, b12); mem_store(st+104, b13); mem_store(st+112, b14)
+  mem_store(st+120, b15); mem_store(st+128, b16); mem_store(st+136, b17); mem_store(st+144, b18); mem_store(st+152, b19)
+  mem_store(st+160, b20); mem_store(st+168, b21); mem_store(st+176, b22); mem_store(st+184, b23); mem_store(st+192, b24)
 }
 
+// Standard FIPS 202 chi: E[x][y] = B[x][y] ^ ((~B[(x+1)%5][y]) & B[(x+2)%5][y])
 fn keccak_chi(st) {
   let b0 = mem_load(st+0); let b1 = mem_load(st+8); let b2 = mem_load(st+16); let b3 = mem_load(st+24); let b4 = mem_load(st+32)
   let b5 = mem_load(st+40); let b6 = mem_load(st+48); let b7 = mem_load(st+56); let b8 = mem_load(st+64); let b9 = mem_load(st+72)
@@ -90,11 +91,40 @@ fn keccak_chi(st) {
   let b15 = mem_load(st+120); let b16 = mem_load(st+128); let b17 = mem_load(st+136); let b18 = mem_load(st+144); let b19 = mem_load(st+152)
   let b20 = mem_load(st+160); let b21 = mem_load(st+168); let b22 = mem_load(st+176); let b23 = mem_load(st+184); let b24 = mem_load(st+192)
 
-  let e0 = b0 ^ ((~b1) & b2); let e1 = b1 ^ ((~b2) & b3); let e2 = b2 ^ ((~b3) & b4); let e3 = b3 ^ ((~b4) & b0); let e4 = b4 ^ ((~b0) & b1)
-  let e5 = b5 ^ ((~b6) & b7); let e6 = b6 ^ ((~b7) & b8); let e7 = b7 ^ ((~b8) & b9); let e8 = b8 ^ ((~b9) & b5); let e9 = b9 ^ ((~b5) & b6)
-  let e10 = b10 ^ ((~b11) & b12); let e11 = b11 ^ ((~b12) & b13); let e12 = b12 ^ ((~b13) & b14); let e13 = b13 ^ ((~b14) & b10); let e14 = b14 ^ ((~b10) & b11)
-  let e15 = b15 ^ ((~b16) & b17); let e16 = b16 ^ ((~b17) & b18); let e17 = b17 ^ ((~b18) & b19); let e18 = b18 ^ ((~b19) & b15); let e19 = b19 ^ ((~b15) & b16)
-  let e20 = b20 ^ ((~b21) & b22); let e21 = b21 ^ ((~b22) & b23); let e22 = b22 ^ ((~b23) & b24); let e23 = b23 ^ ((~b24) & b20); let e24 = b24 ^ ((~b20) & b21)
+  // Row y=0 (lanes 0,5,10,15,20): x=0..4
+  let e0 = b0 ^ ((~b1) & b2)
+  let e5 = b5 ^ ((~b6) & b7)
+  let e10 = b10 ^ ((~b11) & b12)
+  let e15 = b15 ^ ((~b16) & b17)
+  let e20 = b20 ^ ((~b21) & b22)
+
+  // Row y=1 (lanes 1,6,11,16,21): x=0..4
+  let e1 = b1 ^ ((~b2) & b3)
+  let e6 = b6 ^ ((~b7) & b8)
+  let e11 = b11 ^ ((~b12) & b13)
+  let e16 = b16 ^ ((~b17) & b18)
+  let e21 = b21 ^ ((~b22) & b23)
+
+  // Row y=2 (lanes 2,7,12,17,22): x=0..4
+  let e2 = b2 ^ ((~b3) & b4)
+  let e7 = b7 ^ ((~b8) & b9)
+  let e12 = b12 ^ ((~b13) & b14)
+  let e17 = b17 ^ ((~b18) & b19)
+  let e22 = b22 ^ ((~b23) & b24)
+
+  // Row y=3 (lanes 3,8,13,18,23): x=0..4
+  let e3 = b3 ^ ((~b4) & b0)
+  let e8 = b8 ^ ((~b9) & b5)
+  let e13 = b13 ^ ((~b14) & b10)
+  let e18 = b18 ^ ((~b19) & b15)
+  let e23 = b23 ^ ((~b24) & b20)
+
+  // Row y=4 (lanes 4,9,14,19,24): x=0..4
+  let e4 = b4 ^ ((~b0) & b1)
+  let e9 = b9 ^ ((~b5) & b6)
+  let e14 = b14 ^ ((~b10) & b11)
+  let e19 = b19 ^ ((~b15) & b16)
+  let e24 = b24 ^ ((~b20) & b21)
 
   mem_store(st+0, e0); mem_store(st+8, e1); mem_store(st+16, e2); mem_store(st+24, e3); mem_store(st+32, e4)
   mem_store(st+40, e5); mem_store(st+48, e6); mem_store(st+56, e7); mem_store(st+64, e8); mem_store(st+72, e9)
@@ -130,35 +160,49 @@ fn sha3_256(input, input_len) {
   let i = 0
   while (i < 25) { mem_store(st + i * 8, 0); i = i + 1 }
 
-  let offset = 0
-  while (offset < input_len) {
-    let j = 0
-    while (j < rate && offset + j < input_len) {
-      let b = input[offset + j] & 0xFF
-      let idx = j >> 3
-      let shift = (j & 7) * 8
-      let lane = mem_load(st + idx * 8)
-      lane = lane ^ (b << shift)
-      mem_store(st + idx * 8, lane)
-      j = j + 1
-    }
-    if (j < rate) {
-      let idx = j >> 3
-      let shift = (j & 7) * 8
-      let lane = mem_load(st + idx * 8)
-      lane = lane ^ (0x06 << shift)
-      mem_store(st + idx * 8, lane)
-      j = j + 1
-    }
-    if (j < rate) {
-      let idx = (rate - 1) >> 3
-      let shift = ((rate - 1) & 7) * 8
-      let lane = mem_load(st + idx * 8)
-      lane = lane ^ (0x80 << shift)
-      mem_store(st + idx * 8, lane)
-    }
+  if (input_len == 0) {
+    // Empty string: just pad and permute once
+    // SHA3-256 padding: 0x06 at byte 0 (bit 0 of lane 0), 0x80 at byte 135 (bit 56 of lane 16)
+    let lane0 = mem_load(st + 0) ^ 0x06
+    mem_store(st + 0, lane0)
+    let lane16 = mem_load(st + 128) ^ 0x8000000000000000
+    mem_store(st + 128, lane16)
     keccak_f(st)
-    offset = offset + rate
+  } else {
+    let offset = 0
+    while (offset < input_len) {
+      let j = 0
+      while (j < rate && offset + j < input_len) {
+        let b = input[offset + j] & 0xFF
+        let idx = j >> 3
+        let shift = (j & 7) * 8
+        let lane = mem_load(st + idx * 8)
+        lane = lane ^ (b << shift)
+        mem_store(st + idx * 8, lane)
+        j = j + 1
+      }
+      if (offset + j >= input_len) {
+        // Last block - pad and permute
+        let idx0 = j >> 3
+        let shift0 = (j & 7) * 8
+        let lane0 = mem_load(st + idx0 * 8)
+        lane0 = lane0 ^ (0x06 << shift0)
+        mem_store(st + idx0 * 8, lane0)
+        
+        let idx1 = 135 >> 3  // 16
+        let shift1 = (135 & 7) * 8  // 56
+        let lane1 = mem_load(st + idx1 * 8)
+        lane1 = lane1 ^ (0x80 << shift1)
+        mem_store(st + idx1 * 8, lane1)
+        
+        keccak_f(st)
+        break
+      } else {
+        // Full block - permute and continue
+        keccak_f(st)
+        offset = offset + rate
+      }
+    }
   }
 
   let out = malloc(32)
@@ -196,3 +240,5 @@ fn main() {
   let out2 = sha3_256(msg, 3)
   print_hex(out2, 32)
 }
+
+extern fn malloc(size: u64) -> u64
