@@ -178,21 +178,20 @@ fn opt_func() {
                 else if (op==IR_ADD||op==IR_SUB||op==IR_BOR||op==IR_BXOR) && v1==0 { w64(ir+opt_i*IRS,IR_MOV); w64(ir+opt_i*IRS+8,r0); w64(ir+opt_i*IRS+16,a0); w64(ir+opt_i*IRS+24,0); w64(ir+opt_i*IRS+32,0) }
                 else if op==IR_DIV && v1==1 { w64(ir+opt_i*IRS,IR_MOV); w64(ir+opt_i*IRS+8,r0); w64(ir+opt_i*IRS+16,a0); w64(ir+opt_i*IRS+24,0); w64(ir+opt_i*IRS+32,0) }
                 else if (op==IR_SHL||op==IR_SHR) && v1==0 { w64(ir+opt_i*IRS,IR_MOV); w64(ir+opt_i*IRS+8,r0); w64(ir+opt_i*IRS+16,a0); w64(ir+opt_i*IRS+24,0); w64(ir+opt_i*IRS+32,0) }
-                else if (op==IR_SHL||op==IR_SHR) && v1>0 && v1<64 && op_is_const(a1)==1 {
-                    // Fold a constant shift amount into an IR_CONST. Requires the
-                    // SHIFT AMOUNT (a1, the right operand) to be a constant; a
-                    // variable amount must fall through to the runtime shift.
-                    // Compute the power-of-two with addition (pw = pw + pw) rather
-                    // than multiplication/shift accumulation so it cannot overflow
-                    // 32-bit intermediate math in the bootstrapping compiler.
-                    // Final result is masked to 64 bits.
+                else if (op==IR_SHL||op==IR_SHR) && v1>0 && v1<64 && op_is_const(a0)==1 {
+                    // FIX-0.0.50 (0.0.118): only fold when BOTH operands are
+                    // constants. The compiler's own << / >> operators are broken
+                    // for shift counts >= 31 (confirmed 1<<32 -> 0 at compile
+                    // time), so compute the power-of-two via repeated *2
+                    // (reliable) and apply with * / (reliable). If a0 is not a
+                    // constant we must NOT use a0 (it is a vreg number, not a
+                    // value) — let it fall through to the runtime shift emit.
                     let va0 = op_const_val(a0)
                     let pw = 1
                     let pk = 0
-                    while pk < v1 { pw = pw + pw; pk = pk + 1 }
+                    while pk < v1 { pw = pw * 2; pk = pk + 1 }
                     let f = 0
                     if op==IR_SHL { f = va0 * pw } else { f = va0 / pw }
-                    f = f & 0xffffffffffffffff
                     w64(ir+opt_i*IRS,IR_CONST); w64(ir+opt_i*IRS+8,r0); w64(ir+opt_i*IRS+16,f); w64(ir+opt_i*IRS+24,0); w64(ir+opt_i*IRS+32,0)
                 }
             }

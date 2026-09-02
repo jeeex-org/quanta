@@ -2,7 +2,7 @@
 
 > **Last updated: 2026-09-02. Current compiler: 0.0.133** (x86-64 ELF emitter,
 > multi-file tree, Valgrind-clean; self-host fixpoint **BYTE-VERIFIED** —
-> md5 `...`; IR_CAP=1B/40GB, TOK_CAP=48M/1.92GB, CODE_CAP=512MB, fn_btok fix for bare function declarations. All cores through 0.0.133 complete. ARM64 (AArch64) backend is
+> md5 `...`; IR_CAP=1B/40GB, TOK_CAP=48M/1.92GB, CODE_CAP=512MB, fn_btok fix for bare function declarations. SHA3-256 foundation complete. ARM64 (AArch64) backend is
 > DEFERRED POST-0.1.0 (see #2 schedule below); the working compiler is x86-64 only.
 >
 > Version sequence: each feature lands in its own directory. 0.0.55 = P2
@@ -159,7 +159,7 @@ Qualification evidence is gathered AFTER the core is complete, not before.
 
 ### Current status (0.0.133 — live)
 
-**0.0.133 (current stable seed, live):** SHA3 foundation (secure module prerequisite). IR_CAP=1B/40GB, TOK_CAP=48M/1.92GB, CODE_CAP=512MB, fn_btok fix for bare function declarations (`fn foo();` terminates at `;` without body). All 11 gate layers GREEN (functional 163/163, extern-c, extern-ld, security, performance, valgrind, fuzz, differential, generics, stdlib 8/8, multi-tu 3/3). Self-host fixpoint byte-verified. Built from 0.0.132 seed. Next core = **0.0.134** (`secure`, TLS 1.3 + hybrid X25519/ML-KEM PQC). 0.1.0 = post-core STABLE.
+**0.0.133 (current stable seed, live):** SHA3-256 foundation. IR_CAP=1B/40GB, TOK_CAP=48M/1.92GB, CODE_CAP=512MB, fn_btok fix for bare function declarations (`fn foo();` terminates at `;` without body). All 11 gate layers GREEN (functional 163/163, extern-c, extern-ld, security, performance, valgrind, fuzz, differential, generics, stdlib 8/8, multi-tu 3/3). Self-host fixpoint byte-verified. Built from 0.0.132 seed. Next core = **0.0.134** (`secure` — full FIPS 202: SHA3-224/256/384/512 + SHAKE128/256). 0.1.0 = post-core STABLE.
 
 **0.0.130 (current stable seed, live):** extern-C variadic (partial core). `extern "C" fn printf(fmt: i64, ...): i64;` declares a variadic libc fn and `printf(fmt, a, b, ...)` passes the variadic args. Register args 0–5 load into rdi/rsi/rdx/rcx/r8/r9; args **6+ spill onto the stack AFTER the rsp-alignment `push r11`** so they land directly above the return address. The naive order (spill before alignment) shifted every stack arg by 8 and corrupted it — `printf(s,1..7)` printed `1 2 3 4 5 582 6` (arg 6 = garbage `582`, arg 7 missing). Fix: defer the internal-stack-args spill (for non-extern calls) to after `is_ext_call` is resolved, and let the extern branch spill 6+ args in reverse order right before the call. New `extern_var_test.quanta` (sentinel `EXTERN_VAR_OK`) exercises ≤6 args AND the 7-arg stack-spill path, gated under both gcc-link and gcc-free `ld` link. Built from 0.0.129 seed; fixpoint byte-verified (gen1==gen2==gen3, md5 `85f4122ae7b9626fe529d2b94eb79158`). Gate: functional 162/162, stdlib 7/7, multi-TU 3/3, all 11 layers GREEN. Next core = **0.0.131** (closure self-recursion). 0.1.0 = post-core STABLE.
 
@@ -167,7 +167,7 @@ Qualification evidence is gathered AFTER the core is complete, not before.
 
 **0.0.132 (current stable seed, live):** `json` stdlib (AI/data interchange). `import std/json` provides `json_parse(s)` → tagged heap-node tree (kind: null/bool/number/string/array/object) and `json_stringify(j)` → Quanta string. Arrays use `std/vec` (vec of i64 node-handles); objects use `std/map` (string→i64 node-handle). Accessors: `json_kind`/`json_bool`/`json_num`/`json_str`/`json_arr`/`json_obj`; recursion via globals `_js_src`/`_js_pos`/`_js_len`. Stringify round-trips (verified: `{"nums":[1,2,3],"meta":{"k":"v"},"name":"Quanta","flag":true,"ver":132}`). New `std_json_test.quanta` (rc=0, 24 assertions: parse object/array/nested, kind+value checks, round-trip re-parse, scalar true/false/null, escapes `\n`→byte 10). Built from 0.0.131 seed; fixpoint byte-verified (gen1==gen2==gen3, md5 `8e1bb23fc7e626ee4b8513dc690197c1`). Gate: functional **163/163**, stdlib **8/8**, multi-TU 3/3, all 11 layers GREEN. Next core = **0.0.133** (`secure`, TLS 1.3 + hybrid X25519/ML-KEM PQC). 0.1.0 = post-core STABLE.
 
-### 0.0.125→0.0.138 (core sequence, per 2026-08-30 — cores do NOT go into 0.1.0; ALL PARTIAL cores first after `process`, then AI/QC-era, then classical/hardest):
+### 0.0.125→0.0.148 (core sequence, per 2026-08-30 — cores do NOT go into 0.1.0; ALL PARTIAL cores first after `process`, then AI/QC-era crypto foundations, then TLS/hybrid, then classical/hardest):
 - 0.0.125 `time` (clock/now/sleep/nanosleep) — ✅ **DONE** (fixpoint md5 `350e156a7e4d5615f9df4e3780151010`, gate 158/158)
 - 0.0.126 `process` (fork/exec/wait/kill) — ✅ **DONE** (fixpoint md5 `2504e5b10d4fcbe812199b6f2e56679b`, gate 159/159, process_test rc=4)
 - 0.0.127 `pty` (open/slave/name/dup2/ioctl) — ✅ **DONE** (fixpoint md5 `e1d5ed96d9df41f69297c4bcd2b50b4c`, gate 160/160, pty_test rc=2)
@@ -176,13 +176,19 @@ Qualification evidence is gathered AFTER the core is complete, not before.
 - 0.0.130 extern-C variadic (partial core — `printf(fmt,...)` not modeled; extern-C shipped 0.0.98/122) — ✅ **DONE** (variadic decl + args 0–5 in regs, 6+ spill after rsp-align; extern_var_test sentinel EXTERN_VAR_OK, both gcc + gcc-free ld; fixpoint md5 `85f4122ae7b9626fe529d2b94eb79158`, gate 162/162)
 - 0.0.131 closure self-recursion by name (partial core — `findfn` doesn't resolve name in closure body; closures shipped 0.0.65→123) — ✅ **DONE** (self-name bound as real enclosing local type-11 + captured into body; self-call routes via IR_CLOSURE_CALL; closure_selfrec_test rc=0 fact(5)=120; fixpoint md5 `8e1bb23fc7e626ee4b8513dc690197c1`, gate 163/163)
 - 0.0.132 `json` (data/AI interchange) — ✅ **DONE** (parse + stringify; tagged heap-node tree; arrays via std/vec, objects via std/map; std_json_test rc=0; fixpoint md5 `8e1bb23fc7e626ee4b8513dc690197c1`, gate 163/163 + stdlib 8/8)
-- 0.0.133 SHA3 foundation (secure module prerequisite) — ✅ **DONE** (IR_CAP=1B/40GB, TOK_CAP=48M/1.92GB, CODE_CAP=512MB, fn_btok fix for bare function declarations; all 11 gates GREEN, self-host fixpoint byte-verified)
-- 0.0.134 `secure` TLS 1.3 + hybrid X25519/ML-KEM (FIPS 203) — **PQC-ready**, the QC-age requirement
-- 0.0.135 `quic` HTTP/3 (UDP+TLS 1.3, hybrid PQ) — modern transport, ahead of HTTP/2
-- 0.0.136 `http` HTTP/2-over-TLS (no plaintext shipped)
-- 0.0.137 `ai` tensor ops + inference (AI-age, promoted into core chain)
-- 0.0.138 generics type constraints (FIX-0.0.33; `where` bounds enforced) — classical type-system
-- 0.0.139 borrow-check (language safety pass) — core, hardest
+- 0.0.133 SHA3-256 foundation — ✅ **DONE** (IR_CAP=1B/40GB, TOK_CAP=48M/1.92GB, CODE_CAP=512MB, fn_btok fix for bare function declarations; all 11 gates GREEN, self-host fixpoint byte-verified)
+- 0.0.134 `secure` — full FIPS 202: SHA3-224/256/384/512 + SHAKE128/256
+- 0.0.135 `secure` — AES-GCM (TLS 1.3 AEAD)
+- 0.0.136 `secure` — X25519 (ECDH for TLS 1.3)
+- 0.0.137 `secure` — ML-KEM (FIPS 203, Kyber) + hybrid X25519+ML-KEM KEM
+- 0.0.138 `secure` — ML-DSA (FIPS 204, Dilithium) + hybrid X25519+ML-DSA sig
+- 0.0.139 `secure` — SLH-DSA (FIPS 205, SPHINCS+)
+- 0.0.140 `secure` — TLS 1.3 handshake (hybrid PQC)
+- 0.0.141 `quic` HTTP/3 (UDP+TLS 1.3, hybrid PQ) — modern transport, ahead of HTTP/2
+- 0.0.142 `http` HTTP/2-over-TLS (no plaintext shipped)
+- 0.0.143 `ai` tensor ops + inference (AI-age, promoted into core chain)
+- 0.0.144 generics type constraints (FIX-0.0.33; `where` bounds enforced) — classical type-system
+- 0.0.145 borrow-check (language safety pass) — core, hardest
 - **0.1.0 (STABLE)** after the above. `chain` = first Quanta App (0.1.1+); `physics` optional 0.1.1+.
 
 **0.0.117 (prior stable seed):** `big` completion. Ordering (`< > <= >=`) + bitwise (`& | ^ << >>`) routed to sign-aware `big_cmp`/`big_and`/`big_or`/`big_xor`/`big_shl_signed`/`big_shr_signed`. **Also fixed: `big_add`/`big_sub`/`big_mul` were MAGNITUDE-ONLY** (negative operands silently miscomputed — e.g. `(-5)+3`→8) — now sign-aware via `big_add_signed`/`big_sub_signed`/`big_mul_signed`; `+ - *` operators route to them. `: big` annotation with int-literal RHS now promotes via `big_from_i64`. Gate: **152/152 functional + 7/7 stdlib + 3/3 multi-tu + extern-c/security/perf/valgrind/fuzz/differential/generics (all GREEN)**. **Self-host fixpoint BYTE-VERIFIED** (md5 `8b8a1e21573f12b5742a64f695a50b85`).

@@ -197,31 +197,6 @@ native type keyword parsing). `as` width casts (`x as T`) are done (0.0.90).
 | bit/byte extras | parity, bitfield, per-size swap (bswap16/32/64) | ✅ 0.0.107 — parity(x)=odd-bit-count?1:0; bitfield(x,off,wid)=(x>>off)&((1<<wid)-1); bswap16/32/64. Gated by bitops_test.quanta (rc=0). NOTE: bitfield wid==64 is the documented exception (result 0, mirrors rotl/rotr &63 shift-count behavior). |
 | intrinsics | prefetch, pause, lfence, sfence, mfence | ✅ 0.0.108 — `prefetch(addr)`=prefetchnta[rax] (0F 18 08); `pause()`=F3 90; `fence()`=mfence (0F AE F0); `lfence()`=0F AE E8; `sfence()`=0F AE F8. All void builtins, gated by intrinsic_test.quanta (rc=0, byte-emission verified via objdump). Branch-hint intrinsics (likely/unlikely) deliberately OUT OF SCOPE — conditional jumps emit centrally in the shared IR_BR backend, not at call sites, so a builtin cannot prefix a following branch. |
 
-## I. Known issues (tracked, not blocking promotion)
-- **fs-meta path-string remap (stat/unlink/mkdir/chdir/rename): BROKEN.** These
-  builtins call `newfstatat`/`unlinkat`/etc. with the path pointer taken from the
-  string *length-prefix base* (off by 8) and/or a faulty `rr`-based register
-  remap that ends up passing the buffer as the path → kernel returns `-ENOENT`
-  (rc=254). `fstat(fd,buf)` and `lseek(fd,off,whence)` work (no path string, no
-  remap). Quanta strings are length-prefixed `[8-byte len][null-term data]`; the
-  syscall ABI needs `base + 8`. `file_open` works only when called as
-  `file_open(path + 8, flags)` (see `file_open_test.quanta`). Fix: correct the
-  path-pointer offset / remap in `emit_bltn2` (compiler/0.0.66/src/x86/emitter.quanta).
-- **`getenv(name)` is a STUB** — returns `0` unconditionally (environment parsing
-  not yet implemented). Documented as such; `getenv_test.quanta` pins the stub
-  behaviour so a future real implementation is caught by the gate.
-- **`debugbreak()` = `int3`** → SIGTRAP (rc=133). Works but not in the gate
-  (would need a harness that tolerates the trap). `abort()` → `exit(134)` is gated.
-
-## H. Tooling
-
-| Item | Status | Test? | Notes |
-|---|---|---|---|
-| Quanta-native code-writing tool | ❌ todo | ❌ none | user-stated goal — edit Quanta source reliably without external scripting |
-| debugger/objdump integration | ❌ todo | ❌ none | |
-| package manager | ❌ todo | ❌ none | |
-| build system (beyond `qc src bin`) | ❌ todo | ❌ none | |
-
 ## J. Standard Library (`lib/std/*.quanta`) — native libraries
 
 Source-of-truth inventory of the shipped stdlib. Every `lib/std/*.quanta` is a
@@ -241,23 +216,48 @@ it; 🟡 file-only = a test file exists on disk but is NOT in the gate; ❌ none
 | `fs` (file system) | ✅ **completed (0.0.129)** — stat/unlink/mkdir/chdir/rename/rmdir added | ✅ gate (std_fs_test.quanta rc=9 + new fs_ops_test.quanta rc=0) | `lib/std/fs.quanta` now exposes `open/write/read/close/stat/unlink/mkdir/chdir/rename/rmdir` over the `file_*` syscall builtins. 0.0.129 added the missing low-level `file_stat`(sc 4)/`file_unlink`(sc 87)/`file_mkdir`(sc 83)/`file_chdir`(sc 80)/`file_rename`(sc 82)/`file_rmdir`(sc 84) builtins and their `fs.quanta` wrappers. **Dispatch note:** `chdir`/`rename`/`rmdir` collide on the 6th-char `file_` dispatch (`c`→close, `r`→read), so they use full-name matching before the single-char branches. |
 | `io` (file IO) | ✅ done | ✅ gate | file_io.quanta (in gate). |
 | `chain` (blockchain: Merkle/signed-tx/UTXO/Block) | ❌ todo → **0.1.1+ (first Quanta App)** | ❌ none | Not in code. Per 2026-08-30 directive, `chain` is the **first Quanta App** — dogfooded ON 0.1.0, not a compiler core. |
-| `secure` (TLS 1.3, PQC-ready, constant-time) | ❌ todo → **0.0.134 core** | ❌ none | Not in code. **QC-age design:** TLS 1.3 + **hybrid KEM X25519 + ML-KEM (NIST FIPS 203)** from day one (post-quantum key exchange — the one genuine quantum-threat requirement). Existing `crypto` lib (SHA-256/AES/SHA3) is already QC-resistant (AES-256, SHA-2/3); `secure` adds the PQ KEM + handshake. Prerequisite for `http`/`quic`. SHA3 foundation (Keccak) completed in 0.0.133. |
-| `quic` (HTTP/3: UDP+TLS 1.3 transport) | ❌ todo → **0.0.135 core** | ❌ none | Not in code; QUIC handshake IS TLS 1.3 (hybrid PQ). Raw UDP already reachable via `socket(AF_INET, SOCK_DGRAM)`. **Modern transport — sequenced AHEAD of HTTP/2** (QUIC > HTTP/2 per 2026-08-30 AI/QC-era priority). |
-| `http` (HTTP/2 over TLS; HTTP/3 via `quic`) | ❌ todo → **0.0.136 core** | ❌ none | Not in code; **plaintext `http://` is NOT shipped** (outdated/insecure) — only HTTP/2-over-TLS and HTTP/3 (QUIC). Depends on `secure`. |
+| `secure` (TLS 1.3, PQC-ready, constant-time) | ❌ todo → **0.0.134–0.0.140 core** | ❌ none | Not in code. **QC-age design:** TLS 1.3 + **hybrid KEM X25519 + ML-KEM (FIPS 203)** + **hybrid SIG X25519 + ML-DSA (FIPS 204)** + **SLH-DSA (FIPS 205)** from day one. Existing `crypto` lib (SHA-256/AES/SHA3) is already QC-resistant (AES-256, SHA-2/3); `secure` adds the PQ KEM/SIG + handshake. **Per-version split:** 0.0.134 full FIPS 202 (SHA3-224/256/384/512 + SHAKE128/256), 0.0.135 AES-GCM, 0.0.136 X25519, 0.0.137 ML-KEM (Kyber) + hybrid KEM, 0.0.138 ML-DSA (Dilithium) + hybrid SIG, 0.0.139 SLH-DSA (SPHINCS+), 0.0.140 TLS 1.3 handshake (hybrid PQC). Prerequisite for `http`/`quic`. SHA3-256 foundation completed in 0.0.133. |
+| `quic` (HTTP/3: UDP+TLS 1.3 transport) | ❌ todo → **0.0.141 core** | ❌ none | Not in code; QUIC handshake IS TLS 1.3 (hybrid PQ). Raw UDP already reachable via `socket(AF_INET, SOCK_DGRAM)`. **Modern transport — sequenced AHEAD of HTTP/2** (QUIC > HTTP/2 per 2026-08-30 AI/QC-era priority). |
+| `http` (HTTP/2 over TLS; HTTP/3 via `quic`) | ❌ todo → **0.0.142 core** | ❌ none | Not in code; **plaintext `http://` is NOT shipped** (outdated/insecure) — only HTTP/2-over-TLS and HTTP/3 (QUIC). Depends on `secure`. |
 | `json` (parse/serialize) | ✅ **DONE (0.0.132)** | ✅ gated (`std_json_test.quanta` rc=0) | Parses JSON to a tagged heap-node tree (null/bool/number/string/array/object) and stringifies back; arrays via std/vec, objects via std/map. Round-trip + accessor coverage gated. Part of AI/QC-era core chain. |
-| `ai` (tensor ops + inference) | ❌ todo → **0.0.137 core** | ❌ none | Not in code. **AI-age priority** (promoted into the core chain per 2026-08-30). ONNX-style tensor/inference runtime — local LLM/vision inference. |
+| `ai` (tensor ops + inference) | ❌ todo → **0.0.143 core** | ❌ none | Not in code. **AI-age priority** (promoted into the core chain per 2026-08-30). ONNX-style tensor/inference runtime — local LLM/vision inference. |
 | `physics` (ODE/PDE solvers) | ❌ todo → **0.1.1+ (optional)** | ❌ none | Not in code. Optional differentiation lib. |
 
-**Stdlib status (source-verified 0.0.133):** 10 libs present + gated (big/crypto/fs/io/linalg/map/math/quantum/str/vec + crypto/quantum/linalg tested). `fs` completed in 0.0.129 (stat/unlink/mkdir/chdir/rename/rmdir added). AI/QC-era core chain: `json`(0.0.132) ✅ DONE, `secure`(0.0.134)/`quic`(0.0.135)/`http`(0.0.136)/`ai`(0.0.137) (QUIC ahead of HTTP/2); `chain` = first Quanta App (0.1.1+); `physics` optional 0.1.1+. Extern-C variadic + closure self-recursion (partial cores) fixed 0.0.130/0.0.131. SHA3 foundation for `secure` completed in 0.0.133 (IR_CAP=1B/40GB, TOK_CAP=48M/1.92GB, CODE_CAP=512MB, fn_btok fix).
+**Stdlib status (source-verified 0.0.133):** 10 libs present + gated (big/crypto/fs/io/linalg/map/math/quantum/str/vec + crypto/quantum/linalg tested). `fs` completed in 0.0.129 (stat/unlink/mkdir/chdir/rename/rmdir added). AI/QC-era crypto chain: `json`(0.0.132) ✅ DONE, `secure` full FIPS 202 (0.0.134), AES-GCM (0.0.135), X25519 (0.0.136), ML-KEM hybrid (0.0.137), ML-DSA hybrid (0.0.138), SLH-DSA (0.0.139), TLS 1.3 handshake (0.0.140), `quic`(0.0.141), `http`(0.0.142), `ai`(0.0.143) (QUIC ahead of HTTP/2); `chain` = first Quanta App (0.1.1+); `physics` optional 0.1.1+. Extern-C variadic + closure self-recursion (partial cores) fixed 0.0.130/0.0.131. SHA3-256 foundation for `secure` completed in 0.0.133 (IR_CAP=1B/40GB, TOK_CAP=48M/1.92GB, CODE_CAP=512MB, fn_btok fix).
 
-## Summary counts (source-derived, current at 0.0.124)
+## H. Tooling
 
-- **Core tests in gate: 157** (`test_suites/EXPECTED.tsv`, 157 rows). Covers all cores through 0.0.124 (includes `big_test` 0.0.114, `rsp_test` 0.0.115, `quantum_test`/`linalg_test`/`trig_test` 0.0.116, `big_ops_test` 0.0.117, `closure_named_fn` 0.0.123, `futex_wait_test` 0.0.124). `std_*` tests live in a SEPARATE `test_suites/EXPECTED_STDLIB.tsv` (**7 rows**, wired in as the stdlib layer) and are NOT in the core gate. `mtu_*` multi-translation-unit fixtures are gated as their own MULTI-TU layer (`test_suites/scripts/multi_tu_tests.sh`, **3/3**).
-- **Builtins:** enumerated in `compiler/0.0.124/src/x86/emitter.quanta` (per-name dispatch branches). **Keywords:** enumerated in `compiler/0.0.124/src/x86/tokens.quanta` (`ktext` hash table). Both are authoritative; counts are derived from source, not a fixed audit number.
+| Item | Status | Test? | Notes |
+|---|---|---|---|
+| Quanta-native code-writing tool | ❌ todo | ❌ none | user-stated goal — edit Quanta source reliably without external scripting |
+| debugger/objdump integration | ❌ todo | ❌ none | |
+| package manager | ❌ todo | ❌ none | |
+| build system (beyond `qc src bin`) | ❌ todo | ❌ none | |
+
+## I. Known issues (tracked, not blocking promotion)
+- **fs-meta path-string remap (stat/unlink/mkdir/chdir/rename): BROKEN.** These
+  builtins call `newfstatat`/`unlinkat`/etc. with the path pointer taken from the
+  string *length-prefix base* (off by 8) and/or a faulty `rr`-based register
+  remap that ends up passing the buffer as the path → kernel returns `-ENOENT`
+  (rc=254). `fstat(fd,buf)` and `lseek(fd,off,whence)` work (no path string, no
+  remap). Quanta strings are length-prefixed `[8-byte len][null-term data]`; the
+  syscall ABI needs `base + 8`. `file_open` works only when called as
+  `file_open(path + 8, flags)` (see `file_open_test.quanta`). Fix: correct the
+  path-pointer offset / remap in `emit_bltn2` (compiler/0.0.66/src/x86/emitter.quanta).
+- **`getenv(name)` is a STUB** — returns `0` unconditionally (environment parsing
+  not yet implemented). Documented as such; `getenv_test.quanta` pins the stub
+  behaviour so a future real implementation is caught by the gate.
+- **`debugbreak()` = `int3`** → SIGTRAP (rc=133). Works but not in the gate
+  (would need a harness that tolerates the trap). `abort()` → `exit(134)` is gated.
+
+## Summary counts (source-derived, current at 0.0.133)
+
+- **Core tests in gate: 163** (`test_suites/EXPECTED.tsv`, 163 rows). Covers all cores through 0.0.133 (includes `big_test` 0.0.114, `rsp_test` 0.0.115, `quantum_test`/`linalg_test`/`trig_test` 0.0.116, `big_ops_test` 0.0.117, `closure_named_fn` 0.0.123, `futex_wait_test` 0.0.124, `extern_var_test` 0.0.130, `closure_selfrec_test` 0.0.131, `std_json_test` 0.0.132). `std_*` tests live in a SEPARATE `test_suites/EXPECTED_STDLIB.tsv` (**8 rows**, wired in as the stdlib layer) and are NOT in the core gate. `mtu_*` multi-translation-unit fixtures are gated as their own MULTI-TU layer (`test_suites/scripts/multi_tu_tests.sh`, **3/3**).
+- **Builtins:** enumerated in `compiler/0.0.133/src/x86/emitter.quanta` (per-name dispatch branches). **Keywords:** enumerated in `compiler/0.0.133/src/x86/tokens.quanta` (`ktext` hash table). Both are authoritative; counts are derived from source, not a fixed audit number.
 - **Test framework note:** tests `return`/`exit` a *computed value* (not just 0); EXPECTED.tsv's `expected_rc` is that computed answer. Non-zero `expected_rc` entries are correct results, not hidden failures (e.g. `array_test.quanta` returns 200 = a.1; `simple_fadd.quanta` returns 7 = 3.0+4.0). The gate is genuinely green.
 
 ## Build order & sequencing
 
 The authoritative build order to 0.1.0 now lives in **`docs/ROADMAP.md` §3** (single source of truth). It is no longer duplicated here to prevent version-number drift.
 
-Key invariants (unchanged): one feature per WIP version; gate green before promotion; every verified gap gets a version (no-deferral policy, user directive 2026-08-28). The Quanta-native code-writing tool is deferred to AFTER the stdlibs stage (**POST-0.1.0**, no version reserved); ARM64 backend deferred to **POST-0.1.0** (no version reserved). Cores are complete through **0.0.133** (SHA3 foundation); cores continue 0.0.134+ (secure→quic→http→ai→generics→borrow-check). 0.1.0 = post-core STABLE.
+Key invariants (unchanged): one feature per WIP version; gate green before promotion; every verified gap gets a version (no-deferral policy, user directive 2026-08-28). The Quanta-native code-writing tool is deferred to AFTER the stdlibs stage (**POST-0.1.0**, no version reserved); ARM64 backend deferred to **POST-0.1.0** (no version reserved). Cores are complete through **0.0.133** (SHA3-256 foundation); cores continue 0.0.134+ (secure FIPS 202→AES-GCM→X25519→ML-KEM→ML-DSA→SLH-DSA→TLS 1.3→quic→http→ai→generics→borrow-check). 0.1.0 = post-core STABLE.

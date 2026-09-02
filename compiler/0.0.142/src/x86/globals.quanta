@@ -131,7 +131,7 @@ let imp_lib_pfx = mmap(8)   // F8/0.0.30: 'lib/' search root for capability modu
 let imp_seen = mmap(8192); let imp_seenc = 0   // dedup: hashes of resolved paths
 let imp_err = 0
 // Tokens: 40 bytes each [type,value,line,col,len]
-let toks = mmap(7680000000); let tokc = 0; let tokp = 0
+let toks = mmap(320000000); let tokc = 0; let tokp = 0
 // $(name(args)) sigil paren-depth tracker: when >0 we are inside a $(…) sigil
 // and the PNCT handler skips the ')' that closes the $() (the one AFTER the
 // args' own ')'), so $(f(1,b)) does not leave a stray ')'.
@@ -143,18 +143,18 @@ let pdepth = 0; let PDEPTH_MAX = 30
 let unsafe_count = 0   // G1: total `unsafe {}` blocks parsed (CI gate counter)
 let dot_guard = 0   // DBG: guards against runaway dot-chain recursion
 // IR: 40 bytes each [op,res,a0,a1,a2]
-let ir = mmap(20000000000); let irc = 0
+let ir = mmap(1073741824); let irc = 0
 let ir_dbg = mmap(64)
 // 0.0.55: literal-address map. Keyed by the literal's result vreg (vreg*8).
 // Populated during IR_STR codegen (str_addr is known there); read by emit_bltn
 // for qc_sys_cmd to load the cmd string's data-section address directly into
 // rdi. This sidesteps the fragile arg-record/vreg-copy path that caused every
 // $$(cmd) after the first to read a stale cmd (the previous call's command).
-let lit_addr = mmap(40000000000)
+let lit_addr = mmap(1073741824)
 // G2: per-IR-record "inside unsafe{}" flag (1 byte per record). Set in iremit
 // from unsafe_depth; read at emit so `unsafe {}` opts OUT of the overflow trap.
 // Parallel to `ir` (record i -> ir_unsafe[i]) because the IR record is full.
-let ir_unsafe = mmap(1000000000)   // sized to IR_CAP (1000000000) = 40GB
+let ir_unsafe = mmap(1610612736)   // sized to IR_CAP (40000000) = 1.6GB
 let unsafe_depth = 0   // >0 while parsing inside an `unsafe {}` block
 // P7: track function body nesting for implicit match return
 let in_fn_body = 0    // 1 while parsing the outermost block of a function
@@ -1043,8 +1043,8 @@ let g_code_end = 41
 // Code
 let code = mmap(536870912); let codelen = 0
 let CODE_CAP = 536870912  // fail-closed cap: emit aborts (rc=1) if codelen exceeds this.
-                      // Mirrors the MAP_FAILED guard — out-of-bounds code emission
-                      // must never silently corrupt (SAFETY_MANUAL sec 3/6.3).
+                       // Mirrors the MAP_FAILED guard — out-of-bounds code emission
+                       // must never silently corrupt (SAFETY_MANUAL sec 3/6.3).
 // Patches: 24 bytes each [code_ofs,target,type]
 let patches = mmap(8000000); let patchc = 0
 let PATCH_CAP = 8000000
