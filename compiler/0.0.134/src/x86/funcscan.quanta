@@ -1,6 +1,30 @@
 // === FUNCTION SCANNER ===
 fn scanfns() {
     fnc=0; let p=0
+    // DEBUG
+    let dbg = "SCANFNS START tokc="
+    file_write(2, dbg+8, 18)
+    let tokc_buf = mmap(32)
+    let tokc_len = 0
+    let tokc_tmp = tokc
+    if tokc_tmp == 0 { w8(tokc_buf, 48); tokc_len = 1 }
+    else {
+      let digs = mmap(32)
+      let dn = 0
+      while tokc_tmp > 0 {
+        w8(digs+dn, 48 + (tokc_tmp % 10))
+        tokc_tmp = tokc_tmp / 10
+        dn = dn + 1
+      }
+      let k = 0
+      while k < dn {
+        w8(tokc_buf+k, r8(digs+dn-1-k))
+        k = k + 1
+      }
+      tokc_len = dn
+    }
+    file_write(2, tokc_buf, tokc_len)
+    let nl = "\n"; file_write(2, nl+8, 1)
     let encl = 0-1          // enclosing scope for the dup check; -1 = top-level
     // P3: module tracking. cur_mod/cur_mod_len = active `mod X` name; cur_mod_close
     // = token index of the `}` that closes the module block (so we clear cur_mod
@@ -74,6 +98,74 @@ fn scanfns() {
             // Capture the signature-scan start IMMEDIATELY, before any other
             // local assignment can alias the slot qc-1.0.1 places `nt` in.
             let kstart = nt + 1
+            // DEBUG: print when we see 'fn'
+            let dbg = "  SCANFN at p="
+            file_write(2, dbg+8, 13)
+            let p_buf = mmap(32)
+            let p_len = 0
+            let p_tmp = p
+            if p_tmp == 0 { w8(p_buf, 48); p_len = 1 }
+            else {
+              let digs = mmap(32)
+              let dn = 0
+              while p_tmp > 0 {
+                w8(digs+dn, 48 + (p_tmp % 10))
+                p_tmp = p_tmp / 10
+                dn = dn + 1
+              }
+              let k = 0
+              while k < dn {
+                w8(p_buf+k, r8(digs+dn-1-k))
+                k = k + 1
+              }
+              p_len = dn
+            }
+            file_write(2, p_buf, p_len)
+            let dbg2 = " nt="
+            file_write(2, dbg2+8, 4)
+            let nt_buf = mmap(32)
+            let nt_len = 0
+            let nt_tmp = nt
+            if nt_tmp == 0 { w8(nt_buf, 48); nt_len = 1 }
+            else {
+              let digs = mmap(32)
+              let dn = 0
+              while nt_tmp > 0 {
+                w8(digs+dn, 48 + (nt_tmp % 10))
+                nt_tmp = nt_tmp / 10
+                dn = dn + 1
+              }
+              let k = 0
+              while k < dn {
+                w8(nt_buf+k, r8(digs+dn-1-k))
+                k = k + 1
+              }
+              nt_len = dn
+            }
+            file_write(2, nt_buf, nt_len)
+            if nt<tokc {
+              let dbg3 = " tok="
+              file_write(2, dbg3+8, 5)
+              let tt = tokt(nt)
+              let digs = mmap(32)
+              let dn = 0
+              let tt_tmp = tt
+              if tt_tmp == 0 { w8(digs, 48); dn = 1 }
+              else {
+                while tt_tmp > 0 {
+                  w8(digs+dn, 48 + (tt_tmp % 10))
+                  tt_tmp = tt_tmp / 10
+                  dn = dn + 1
+                }
+              }
+              let k = 0
+              while k < dn {
+                w8(nt_buf+k, r8(digs+dn-1-k))
+                k = k + 1
+              }
+              file_write(2, nt_buf, dn)
+            }
+            let nl = "\n"; file_write(2, nl+8, 1)
             if nt<tokc && (tokt(nt)==TT_ID || tokt(nt)==TT_OP) {
                 let nm = tokv(nt); let nl = tokln(nt)
                 // 0.0.97: operator-overload fns (`fn +(a,b)`) name the fn after
@@ -254,11 +346,43 @@ fn scanfns() {
                     di = di + 1
                 }
                 if dup == 1 {
-                    let me = "error: duplicate function definition: "
-                    file_write(2, me+8, len(me))
-                    file_write(2, reg_nm, reg_nl)
-                    let mn = "\n"; file_write(2, mn+8, 1)
-                    exit(1)
+                    // skip re-registration (import dedup)
+                    // advance p to after this function (j was set to end of body/decl)
+                    // DEBUG
+                    let dbg = "  DUP SKIP fnc="
+                    file_write(2, dbg+8, 14)
+                    let fnc_buf = mmap(32)
+                    let fnc_len = 0
+                    let fnc_tmp = fnc
+                    if fnc_tmp == 0 { w8(fnc_buf, 48); fnc_len = 1 }
+                    else {
+                      let digs = mmap(32)
+                      let dn = 0
+                      while fnc_tmp > 0 {
+                        w8(digs+dn, 48 + (fnc_tmp % 10))
+                        fnc_tmp = fnc_tmp / 10
+                        dn = dn + 1
+                      }
+                      let k = 0
+                      while k < dn {
+                        w8(fnc_buf+k, r8(digs+dn-1-k))
+                        k = k + 1
+                      }
+                      fnc_len = dn
+                    }
+                    file_write(2, fnc_buf, fnc_len)
+                    let dbg2 = " name="
+                    file_write(2, dbg2+8, 6)
+                    let name_buf = mmap(64)
+                    let ki = 0
+                    while ki < reg_nl {
+                      w8(name_buf+ki, r8(src+reg_nm+ki))
+                      ki = ki + 1
+                    }
+                    file_write(2, name_buf, reg_nl)
+                    file_write(2, nl+8, 1)
+                    p = j
+                    continue
                 }
                 // Record this fn with its enclosing scope as parent (-1 = top-level
                 // for the flat model; fn_parent is used by resolve_call/findfn_global).
@@ -266,6 +390,52 @@ fn scanfns() {
                 sfn(fnc,reg_nm,reg_nl,bp,0,saw_param,ret_type_name,ret_type_len)
             w64(fn_extern + fnc*8, is_extern)
             fnc=fnc+1; p=j
+            // DEBUG
+            let dbg3 = "  AFTER REG fnc="
+            file_write(2, dbg3+8, 14)
+            let fnc_buf = mmap(32)
+            let fnc_len = 0
+            let fnc_tmp = fnc
+            if fnc_tmp == 0 { w8(fnc_buf, 48); fnc_len = 1 }
+            else {
+              let digs = mmap(32)
+              let dn = 0
+              while fnc_tmp > 0 {
+                w8(digs+dn, 48 + (fnc_tmp % 10))
+                fnc_tmp = fnc_tmp / 10
+                dn = dn + 1
+              }
+              let k = 0
+              while k < dn {
+                w8(fnc_buf+k, r8(digs+dn-1-k))
+                k = k + 1
+              }
+              fnc_len = dn
+            }
+            file_write(2, fnc_buf, fnc_len)
+            let dbg4 = " p="
+            file_write(2, dbg4+8, 3)
+            let p_buf = mmap(32)
+            let p_len = 0
+            let p_tmp = p
+            if p_tmp == 0 { w8(p_buf, 48); p_len = 1 }
+            else {
+              let digs = mmap(32)
+              let dn = 0
+              while p_tmp > 0 {
+                w8(digs+dn, 48 + (p_tmp % 10))
+                p_tmp = p_tmp / 10
+                dn = dn + 1
+              }
+              let k = 0
+              while k < dn {
+                w8(p_buf+k, r8(digs+dn-1-k))
+                k = k + 1
+              }
+              p_len = dn
+            }
+            file_write(2, p_buf, p_len)
+            file_write(2, nl+8, 1)
             } else { p=p+1 }
         } else { p=p+1 }
     }
