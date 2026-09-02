@@ -50,7 +50,9 @@ fn keccak_squeeze(st, rate, out, out_len) {
 }
 
 fn keccak_hash(input, input_len, rate, suffix_byte, out, out_len) {
-  let st = malloc(200)
+  // mem_alloc(25) gives 25*8+8 = 208 bytes total: [ptr]=25 header, ptr+8..ptr+208 payload
+  // We need 25 qwords (200 bytes) for Keccak state, so use mem_alloc(25) and skip header
+  let st = mem_alloc(25) + 8
   let i = 0
   while (i < 25) { mem_store(st + i * 8, 0); i = i + 1 }
 
@@ -98,5 +100,3 @@ fn shake128(input, input_len, out, out_len) {
 fn shake256(input, input_len, out, out_len) {
   keccak_hash(input, input_len, 136, 0x1F, out, out_len)
 }
-
-extern fn malloc(size: u64) -> u64
