@@ -55,7 +55,7 @@ than corrupt silently.
 
 | Mechanism | Behavior | Evidence |
 |-----------|----------|----------|
-| Integer overflow | `ud2` → SIGILL, rc=132 | Self-host; `unsafe{}` opts out |
+| Integer overflow | `ud2` → SIGILL, rc=132 | Self-host; `unsafe{}` opts out per-block; `--no-overflow-trap` opts out whole-program (intended for crypto/unsigned-bitwise code where wraparound is correct) |
 | OOB array access | `ud2` → SIGILL, rc=132 | `idx_trap_emit` in emitter; `unsafe{}` opts out |
 | `mmap` OOM | abort rc=1 (was SIGSEGV 139) | **Verified 0.0.49**: `ulimit -v 60000` → rc=1 |
 | Undeclared identifier | compile error rc=7 | Verified 0.0.48 |

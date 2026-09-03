@@ -138,6 +138,10 @@ rather than corrupt silently:
 - **Integer overflow**: `ud2` -> SIGILL, process exit rc=132.
   Opt-out: `unsafe { }` block (the overflow trap is suppressed inside
   `unsafe`; the `ir_unsafe` flag gates this — verified in self-host).
+  **Whole-program opt-out: `--no-overflow-trap`** — intended for
+  cryptographic/unsigned-bitwise code where intentional two's-complement
+  wraparound is correct (rotations, XOR, shifts, byte-positioning multiplies).
+  The shift-count UB trap (`shl_trap_emit`, count ≥ 64) remains active.
 - **Out-of-bounds array access**: `a[idx]` with `idx >= len` (or negative,
   read as huge unsigned) falls through to `ud2` -> SIGILL rc=132. Also
   suppressed inside `unsafe{}`.
