@@ -10,7 +10,7 @@ fn keccak_iota(st, rnd) {
 fn keccak_absorb(st, rate, input, input_len, offset) {
   let j = 0
   while (j < rate && offset + j < input_len) {
-    let b = input[offset + j] & 0xFF
+    let b = mem_load8(input + offset + j) & 0xFF
     let idx = j >> 3
     let shift = (j & 7) * 8
     let lane = mem_load(st + idx * 8)
@@ -41,7 +41,7 @@ fn keccak_squeeze(st, rate, out, out_len) {
     let lane_idx = i >> 3
     let shift = (i & 7) * 8
     let v = mem_load(st + lane_idx * 8)
-    out[i] = (v >> shift) & 0xFF
+    mem_store8(out + i, (v >> shift) & 0xFF)
     i = i + 1
     if (i % rate == 0 && i < out_len) {
       keccak_f(st)
