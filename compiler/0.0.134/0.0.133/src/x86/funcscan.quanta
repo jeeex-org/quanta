@@ -47,10 +47,10 @@ fn scanfns() {
                 continue
             }
         }
-        // P3: check for extern "C" fn OR bare extern fn
+        // P3: check for extern "C" fn
         let is_extern = 0
         if tokt(p)==TT_KEY&&ktext(tokv(p),tokln(p))==19 {
-            // extern keyword found - check for "C" or bare fn
+            // extern keyword found - check for "C"
             // The string literal "C" is a SINGLE STR token (no separate quote
             // tokens), so it sits at p+1. Advance p to p+2 to land on the next
             // keyword. ONLY treat it as a function extern if that keyword is
@@ -64,30 +64,6 @@ fn scanfns() {
                     is_extern = 1
                     p = np + 1
                 }
-            } else if np<tokc && tokt(np)==TT_KEY && ktext(tokv(np),tokln(np))==1 {
-                // Found bare `extern fn` (no "C" string)
-                // Check if this is a builtin we should compile inline (not extern)
-                let fn_name_tok = np+1
-                if fn_name_tok<tokc && tokt(fn_name_tok)==TT_ID {
-                    let nm = tokv(fn_name_tok)
-                    let nl = tokln(fn_name_tok)
-                    // Builtins: malloc(6), free(4), mem_alloc(9), mem_free(8), mem_realloc(11), drop(4), exit(4), mmap(4)
-                    let is_malloc = (nl==6 && r8(src+nm)==109 && r8(src+nm+1)==97 && r8(src+nm+2)==108 && r8(src+nm+3)==108 && r8(src+nm+4)==111 && r8(src+nm+5)==99)
-                    let is_free = (nl==4 && r8(src+nm)==102 && r8(src+nm+1)==114 && r8(src+nm+2)==101 && r8(src+nm+3)==101)
-                    let is_mem_alloc = (nl==9 && r8(src+nm)==109 && r8(src+nm+1)==101 && r8(src+nm+2)==109 && r8(src+nm+3)==95 && r8(src+nm+4)==97 && r8(src+nm+5)==108 && r8(src+nm+6)==108 && r8(src+nm+7)==111 && r8(src+nm+8)==99)
-                    let is_mem_free = (nl==8 && r8(src+nm)==109 && r8(src+nm+1)==101 && r8(src+nm+2)==109 && r8(src+nm+3)==95 && r8(src+nm+4)==102 && r8(src+nm+5)==114 && r8(src+nm+6)==101 && r8(src+nm+7)==101)
-                    let is_mem_realloc = (nl==11 && r8(src+nm)==109 && r8(src+nm+1)==101 && r8(src+nm+2)==109 && r8(src+nm+3)==95 && r8(src+nm+4)==114 && r8(src+nm+5)==101 && r8(src+nm+6)==97 && r8(src+nm+7)==108 && r8(src+nm+8)==108 && r8(src+nm+9)==111 && r8(src+nm+10)==99)
-                    let is_drop = (nl==4 && r8(src+nm)==100 && r8(src+nm+1)==114 && r8(src+nm+2)==111 && r8(src+nm+3)==112)
-                    let is_exit = (nl==4 && r8(src+nm)==101 && r8(src+nm+1)==120 && r8(src+nm+2)==105 && r8(src+nm+3)==116)
-                    let is_mmap = (nl==4 && r8(src+nm)==109 && r8(src+nm+1)==109 && r8(src+nm+2)==97 && r8(src+nm+3)==112)
-                    if is_malloc||is_free||is_mem_alloc||is_mem_free||is_mem_realloc||is_drop||is_exit||is_mmap {
-                        // This is a builtin - compile it inline, not as extern
-                        is_extern = 0
-                    } else {
-                        is_extern = 1
-                    }
-                }
-                p = np + 1  // advance past 'fn' to register function in this iteration
             }
         }
         // DISABLED: closure scanner (can't see inside function bodies)
@@ -98,74 +74,6 @@ fn scanfns() {
             // Capture the signature-scan start IMMEDIATELY, before any other
             // local assignment can alias the slot qc-1.0.1 places `nt` in.
             let kstart = nt + 1
-            // DEBUG: print when we see 'fn'
-            let dbg = "  SCANFN at p="
-            file_write(2, dbg+8, 13)
-            let p_buf = mmap(32)
-            let p_len = 0
-            let p_tmp = p
-            if p_tmp == 0 { w8(p_buf, 48); p_len = 1 }
-            else {
-              let digs = mmap(32)
-              let dn = 0
-              while p_tmp > 0 {
-                w8(digs+dn, 48 + (p_tmp % 10))
-                p_tmp = p_tmp / 10
-                dn = dn + 1
-              }
-              let k = 0
-              while k < dn {
-                w8(p_buf+k, r8(digs+dn-1-k))
-                k = k + 1
-              }
-              p_len = dn
-            }
-            file_write(2, p_buf, p_len)
-            let dbg2 = " nt="
-            file_write(2, dbg2+8, 4)
-            let nt_buf = mmap(32)
-            let nt_len = 0
-            let nt_tmp = nt
-            if nt_tmp == 0 { w8(nt_buf, 48); nt_len = 1 }
-            else {
-              let digs = mmap(32)
-              let dn = 0
-              while nt_tmp > 0 {
-                w8(digs+dn, 48 + (nt_tmp % 10))
-                nt_tmp = nt_tmp / 10
-                dn = dn + 1
-              }
-              let k = 0
-              while k < dn {
-                w8(nt_buf+k, r8(digs+dn-1-k))
-                k = k + 1
-              }
-              nt_len = dn
-            }
-            file_write(2, nt_buf, nt_len)
-            if nt<tokc {
-              let dbg3 = " tok="
-              file_write(2, dbg3+8, 5)
-              let tt = tokt(nt)
-              let digs = mmap(32)
-              let dn = 0
-              let tt_tmp = tt
-              if tt_tmp == 0 { w8(digs, 48); dn = 1 }
-              else {
-                while tt_tmp > 0 {
-                  w8(digs+dn, 48 + (tt_tmp % 10))
-                  tt_tmp = tt_tmp / 10
-                  dn = dn + 1
-                }
-              }
-              let k = 0
-              while k < dn {
-                w8(nt_buf+k, r8(digs+dn-1-k))
-                k = k + 1
-              }
-              file_write(2, nt_buf, dn)
-            }
-            let nl = "\n"; file_write(2, nl+8, 1)
             if nt<tokc && (tokt(nt)==TT_ID || tokt(nt)==TT_OP) {
                 let nm = tokv(nt); let nl = tokln(nt)
                 // 0.0.97: operator-overload fns (`fn +(a,b)`) name the fn after
@@ -332,10 +240,10 @@ fn scanfns() {
                 // ret_type_name/len intentionally NOT captured (return-type checking
                 // deferred — see STATE.md F3 note). Pass 0 so sfn records "inferred".
                 let ret_type_name = 0; let ret_type_len = 0
-                // Same-scope duplicate function name: if already registered in this
-                // scope (same parent), it's a duplicate FROM AN IMPORT (source was
-                // inlined). First-wins: skip re-registering instead of erroring.
-                // This allows `import std/foo` in multiple TUs without duplicate errors.
+                // Same-scope duplicate function name is a HARD ERROR (not silent
+                // first-wins). Only flag if an already-registered fn in the SAME
+                // scope (same parent) has the same name; nested scopes may reuse
+                // names freely (lexical scoping).
                 let dup = 0; let di = 0
                 while di < fnc {
                     if r64(fn_parent + di*8)==encl && fn_nlen(di) == reg_nl {
@@ -346,10 +254,11 @@ fn scanfns() {
                     di = di + 1
                 }
                 if dup == 1 {
-                    // skip re-registration (import dedup)
-                    // advance p to after this function (j was set to end of body/decl)
-                    p = j
-                    continue
+                    let me = "error: duplicate function definition: "
+                    file_write(2, me+8, len(me))
+                    file_write(2, reg_nm, reg_nl)
+                    let mn = "\n"; file_write(2, mn+8, 1)
+                    exit(1)
                 }
                 // Record this fn with its enclosing scope as parent (-1 = top-level
                 // for the flat model; fn_parent is used by resolve_call/findfn_global).

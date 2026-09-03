@@ -756,33 +756,6 @@ fn emit_bltn(nmi,nl,ii) {
         eb(72); eb(137); eb(24)          // mov [rax], rbx   ([base] = n header; rbx preserved)
         return 1
     }
-    // malloc(n): C-style allocator returning pointer to n bytes (with 8-byte header at ptr).
-    // Calls mem_alloc((n+7)/8) internally. Returns ptr (caller uses ptr+8 for data).
-    if nl==6&&r8(nm)=='m'&&r8(nm+1)=='a'&&r8(nm+2)=='l'&&r8(nm+3)=='l'&&r8(nm+4)=='o'&&r8(nm+5)=='c' {
-        flush_all()
-        // rdi = n (bytes). Compute qword count: (n+7)>>3
-        eb(72); eb(131); eb(199); eb(7)   // add rdi, 7   (n+7)
-        eb(72); eb(193); eb(230); eb(3)   // shr rdi, 3   ((n+7)/8)
-        // Now rdi = qword count. Fall through to mem_alloc logic.
-        eb(72); eb(137); eb(251)        // mov rbx, rdi   (rbx = qcount, saved across syscall)
-        eb(72); eb(137); eb(249)        // mov rcx, rdi   (rcx = qcount)
-        eb(72); eb(107); eb(201); eb(8)   // imul rcx, rcx, 8   (qcount*8)
-        eb(72); eb(131); eb(193); eb(8)   // add rcx, 8           (qcount*8+8 = len)
-        eb(72); eb(137); eb(206)         // mov rsi, rcx   (rsi = len)
-        eb(191); ei(0x60000001)          // mov edi, 0x60000001 (hint addr)
-        eb(186); ei(3)                   // mov edx, 3     (PROT_READ|WRITE)
-        eb(65); eb(186); ei(34)          // mov r10d, 0x22 (MAP_PRIVATE|ANON)
-        eb(65); eb(184); ei(0-1)         // mov r8d, -1    (fd)
-        eb(69); eb(49); eb(201)          // xor r9d, r9d   (offset=0)
-        eb(184); ei(9)                   // mov eax, 9
-        sysc()                           // rax = ptr
-        // FIX-0.0.1 (C1): MAP_FAILED guard
-        eb(72); eb(131); eb(248); eb(0)   // cmp rax, 0
-        eb(125); eb(12)                   // jge +12 (skip exit if rax >= 0)
-        eb(191); ei(1); eb(184); ei(60); eb(15); eb(5)  // mov edi,1; mov eax,60; syscall (exit 1)
-        eb(72); eb(137); eb(24)          // mov [rax], rbx   ([base] = qcount header; rbx preserved)
-        return 1
-    }
     // 0.0.111: mem_free(ptr) — push block onto free-list at HEAP_CTRL.
     // (Deferred reuse: mem_alloc left UNCHANGED to keep emitted bytes stable -> fixpoint-safe.)
     //   [ptr+8] = [HEAP_CTRL];  [HEAP_CTRL] = ptr

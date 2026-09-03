@@ -278,7 +278,7 @@ fn main(argc, argv) {
         w64(gpatches+gpatchc*24, pofs2); w64(gpatches+gpatchc*24+8, g_argv); w8(gpatches+gpatchc*24+16, 1)
         if gpatchc >= GPATCH_CAP { emit_ovf() }; gpatchc=gpatchc+1
         // Compute environ = argv + (argc+1)*8  => lea rax,[rsi+rdi*8+8]
-        eb(72); eb(141); eb(4); eb(254); ei(8)
+        eb(72); eb(141); eb(68); eb(254); ei(8)
         // Store environ -> g_environ  (mov [rip+disp], rax)
         eb(72); eb(137); eb(5 + 0*8); ei(0)
         let pofs3=codelen-4
@@ -507,34 +507,8 @@ fn main(argc, argv) {
             let tfi=findfn(tg,tg_nl)
             if tfi>=0 {
                 // P3: skip extern functions (resolved at link time, not via internal patching)
-                // BUT: bare extern functions that match builtins must be resolved to builtin code.
-                let is_ext = r64(fn_extern + tfi*8)
-                if is_ext==1 {
-                    // Check if this extern function is a builtin we can resolve
-                    let fn_nm = fn_name(tfi)
-                    let fn_nl = fn_nlen(tfi)
-                    // malloc (6 chars) -> builtin mem_alloc alias
-                    // free (4 chars) -> builtin mem_free
-                    // mem_alloc (9 chars) -> builtin
-                    // mem_free (8 chars) -> builtin
-                    // mem_realloc (11 chars) -> builtin
-                    // drop (4 chars) -> builtin
-                    // exit (4 chars) -> builtin
-                    // mmap (4 chars) -> builtin
-                    let is_malloc = (fn_nl==6 && r8(src+fn_nm)==109 && r8(src+fn_nm+1)==97 && r8(src+fn_nm+2)==108 && r8(src+fn_nm+3)==108 && r8(src+fn_nm+4)==111 && r8(src+fn_nm+5)==99)
-                    let is_free = (fn_nl==4 && r8(src+fn_nm)==102 && r8(src+fn_nm+1)==114 && r8(src+fn_nm+2)==101 && r8(src+fn_nm+3)==101)
-                    let is_mem_alloc = (fn_nl==9 && r8(src+fn_nm)==109 && r8(src+fn_nm+1)==101 && r8(src+fn_nm+2)==109 && r8(src+fn_nm+3)==95 && r8(src+fn_nm+4)==97 && r8(src+fn_nm+5)==108 && r8(src+fn_nm+6)==108 && r8(src+fn_nm+7)==111 && r8(src+fn_nm+8)==99)
-                    let is_mem_free = (fn_nl==8 && r8(src+fn_nm)==109 && r8(src+fn_nm+1)==101 && r8(src+fn_nm+2)==109 && r8(src+fn_nm+3)==95 && r8(src+fn_nm+4)==102 && r8(src+fn_nm+5)==114 && r8(src+fn_nm+6)==101 && r8(src+fn_nm+7)==101)
-                    let is_mem_realloc = (fn_nl==11 && r8(src+fn_nm)==109 && r8(src+fn_nm+1)==101 && r8(src+fn_nm+2)==109 && r8(src+fn_nm+3)==95 && r8(src+fn_nm+4)==114 && r8(src+fn_nm+5)==101 && r8(src+fn_nm+6)==97 && r8(src+fn_nm+7)==108 && r8(src+fn_nm+8)==108 && r8(src+fn_nm+9)==111 && r8(src+fn_nm+10)==99)
-                    let is_drop = (fn_nl==4 && r8(src+fn_nm)==100 && r8(src+fn_nm+1)==114 && r8(src+fn_nm+2)==111 && r8(src+fn_nm+3)==112)
-                    let is_exit = (fn_nl==4 && r8(src+fn_nm)==101 && r8(src+fn_nm+1)==120 && r8(src+fn_nm+2)==105 && r8(src+fn_nm+3)==116)
-                    let is_mmap = (fn_nl==4 && r8(src+fn_nm)==109 && r8(src+fn_nm+1)==109 && r8(src+fn_nm+2)==97 && r8(src+fn_nm+3)==112)
-                    if is_malloc||is_free||is_mem_alloc||is_mem_free||is_mem_realloc||is_drop||is_exit||is_mmap {
-                        // Resolve to the function's own code offset (it's a builtin, so it was compiled)
-                        let tofs=r64(func_code_starts+(tfi+1)*8)
-                        w8(code+po,232); w32(code+po+1, tofs-(po+5))
-                    }
-                    // else: leave as-is for dynamic linker
+                if r64(fn_extern + tfi*8)==1 {
+                    // extern "C" function - leave as-is for dynamic linker
                 } else {
                     // func_code_starts[tfi+1] = code start for user function tfi (0=__init, 1=first user fn)
                     let tofs=r64(func_code_starts+(tfi+1)*8)

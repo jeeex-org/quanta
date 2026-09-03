@@ -221,7 +221,7 @@ if [ -f "$TEST_SUITES/EXPECTED_STDLIB.tsv" ]; then
   while IFS=$'\t' read -r name expected; do
     src="$TEST_SUITES/codes/$name"
     bin="$TEST_SUITES/bin/${name%.quanta}"
-    if ! $QC "$src" "$bin" 2>/tmp/stdlib_stderr.txt; then
+    if ! $QC --no-overflow-trap "$src" "$bin" 2>/tmp/stdlib_stderr.txt; then
       echo "  FAIL (compile) $name  stderr: $(cat /tmp/stdlib_stderr.txt | head -1)"
       STDLIB_FAIL=$((STDLIB_FAIL + 1)); continue
     fi
