@@ -33,6 +33,7 @@
 // we need n+2 slots (count + sign + n limbs).
 fn big_alloc(n) -> big {
   let r = mem_alloc(n + 2)
+  if r < 0 { exit(1) }       // FIX-0.0.16: MAP_FAILED guard (mem_alloc returns -errno on OOM)
   r[0] = n
   r[1] = 0
   return r
@@ -224,7 +225,11 @@ fn big_mul_kara(a: big, b: big) -> big {
   // result = z2*B^(2lo) + z1*B^lo + z0
   // z2 is placed at offset 2*lo, so the result span can reach ~1.5*(na+nb);
   // allocate 2*(na+nb) limbs to avoid writing past the end of r.
-  let nr = (na + nb) * 2
+  // FIX-0.0.17: saturating check on na+nb to prevent i64 overflow
+  let sum = na + nb
+  if sum < 0 || sum > 1000000 { exit(1) }
+  let nr = sum * 2
+  if nr < 0 || nr > 2000000 { exit(1) }
   let r = big_alloc(nr)
   let i = 0
   while i < nr { big_set(r, i, 0); i = i + 1 }
@@ -275,6 +280,8 @@ fn big_from_i64(x) -> big {
 fn big_from_dec(s) -> big {
   let slen = mem_load(s)                 // string length (bytes) at s+0
   if slen == 0 { return 0 }
+  // FIX-0.0.21: cap input length to prevent unbounded allocation
+  if slen > 100000 { exit(1) }
   let acc = big_from_i64(0)
   let ten = big_from_i64(10)
   let i = 0
@@ -371,6 +378,29 @@ fn big_shl1(x: big) -> big {
   }
   if carry == 1 { big_set(r, n, 1) }
   return big_norm(r)
+}
+
+// r = x << 1 (magnitude). In-place; mutates x and returns it.
+// FIX-0.0.20: used by big_udiv to avoid allocation in hot loop.
+fn big_shl1_mut(x: big) -> big {
+  let n = big_len(x)
+  let carry = 0
+  let i = 0
+  while i < n {
+    let v = big_limb(x, i)
+    let nv = (v << 1) | carry
+    let c = 0
+    if nv > 16777215 { c = 1; nv = nv & 16777215 }
+    big_set(x, i, nv)
+    carry = c
+    i = i + 1
+  }
+  if carry == 1 {
+    // extend by one limb
+    big_set(x, n, 1)
+    x[0] = n + 1
+  }
+  return big_norm(x)
 }
 
 // r = x >> 1 (magnitude).
@@ -616,12 +646,12 @@ fn big_udiv(x: big, y: big) -> big {
   let r = big_alloc(1); big_set(r, 0, 0); r[0] = 1
   let i = nbits - 1
   while i >= 0 {
-    r = big_shl1(r)                                     // r = r << 1
+    r = big_shl1_mut(r)                                   // FIX-0.0.20: in-place, no allocation
     let bl = i / 24                                       // extract bit i of x
     let bb = i - bl * 24
     let bit = (big_limb(x, bl) >> bb) & 1
     if bit == 1 { r = big_add(r, ONE) }                  // r = r | 1 (r is even here)
-    q = big_shl1(q)                                      // q = q << 1
+    q = big_shl1_mut(q)                                   // FIX-0.0.20: in-place
     if big_ge(r, y) == 1 { r = big_sub(r, y); q = big_add(q, ONE) }
     i = i - 1
   }
@@ -675,6 +705,8 @@ fn big_mod(a: big, b: big) -> big {
 fn big_shl(x: big, n) -> big {
   if n < 0 { return big_shr(x, -n) }
   if n == 0 { return x }
+  // FIX-0.0.18: cap shift amount to prevent unbounded allocation (shift DoS)
+  if n > 1000000 { exit(1) }
   let limb_shift = n / 24
   let rem = n - limb_shift * 24
   let na = big_len(x)
@@ -698,6 +730,8 @@ fn big_shl(x: big, n) -> big {
 fn big_shr(x: big, n) -> big {
   if n < 0 { return big_shl(x, -n) }
   if n == 0 { return x }
+  // FIX-0.0.18: cap shift amount (mirrors big_shl)
+  if n > 1000000 { exit(1) }
   let limb_shift = n / 24
   let rem = n - limb_shift * 24
   let na = big_len(x)
