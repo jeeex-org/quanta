@@ -841,10 +841,10 @@ Verified by **source review** of `compiler/0.0.134/src`, `compiler/0.0.135/src` 
 
 | ID | Finding | Status |
 |---|---|---|
-| FIX-0.0.2 | `mem_realloc` missing `[new]` count header | ⚠️ OPEN |
-| FIX-0.0.3 | Free-list push no null/double-free validation | ⚠️ OPEN |
-| FIX-0.0.4 | Include-path overflow (4096 uncapped) | ⚠️ OPEN |
-| FIX-0.0.5 | Source expansion past 16MB before check | ⚠️ OPEN |
+| FIX-0.0.2 | `mem_realloc` missing `[new]` count header | ✅ **FIXED** — `emitter.quanta:836` `stx(R_R13, 0, R_R12)` writes `[new]=newn` |
+| FIX-0.0.3 | Free-list push no null/double-free validation | ✅ **FIXED** — `emitter.quanta:799-800` (mem_free) + `859-861` (drop) null-guards |
+| FIX-0.0.4 | Include-path overflow (4096 uncapped) | ✅ **FIXED** — `objfmt.quanta:561,634,641` bounds checks on `imp_full` |
+| FIX-0.0.5 | Source expansion past 16MB before check | ✅ **FIXED** — `objfmt.quanta:596` in-loop `srclen` guard + `entry.quanta:80-86` `stat()` pre-check |
 | FIX-0.0.6 | Raw pointers (`mem_*`/`rsp`/`stack_trace`) not gated by `unsafe{}` | ⚠️ DESIGN — callable from safe code |
 
 ---
@@ -904,17 +904,16 @@ Verified by **source review** of `compiler/0.0.134/src`, `compiler/0.0.135/src` 
 
 ## Priority Fix Order (post-0.0.135)
 
-**Immediate (security — reachable today):** **NONE RESOLVED** — all `big` runtime issues (FIX-0.0.16/17/18/19/20/21/22/26) fixed in 0.0.135.
+**Immediate (security — reachable today):** **NONE** — all `big` runtime issues (FIX-0.0.16/17/18/19/20/21/22/26) + compiler gaps (FIX-0.0.1/2/3/4/5/9) fixed in 0.0.135.
 
 **Before 0.1.0 (core chain):**
 1. Resolve all PARTIAL cores above (0.0.125–0.0.131)
-2. Compiler memory/codegen gaps: FIX-0.0.2/3/4/5 — `mem_realloc` header, free-list validation, include overflow, source expansion
-3. **FIX-0.0.6** — Design decision: gate raw pointers with `unsafe{}` or document as intentional
-4. AI/QC-era cores (0.0.134–0.0.136) + borrow-check (0.0.138)
+2. **FIX-0.0.6** — Design decision: gate raw pointers with `unsafe{}` or document as intentional
+3. AI/QC-era cores (0.0.134–0.0.136) + borrow-check (0.0.138)
 
 **Hygiene:**
-5. `SCANFN` DEBUG logging → add `--debug-scan` flag (always-on is noisy)
-6. Verify TOK_CAP=500M doesn't cause mmap issues on constrained systems
+4. `SCANFN` DEBUG logging → add `--debug-scan` flag (always-on is noisy)
+5. Verify TOK_CAP=500M doesn't cause mmap issues on constrained systems
 
 ---
 
