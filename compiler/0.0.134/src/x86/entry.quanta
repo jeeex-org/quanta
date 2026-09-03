@@ -220,97 +220,10 @@ fn main(argc, argv) {
     // 7.A part 1: require a 'main' function. Without it the startup stub would
     // patch to the first user fn and emit a binary that silently returns 0.
     has_main=0; let mmi=0
-    // DEBUG: print fnc and function names
-    let dbg = "HAS_MAIN CHECK fnc="
-    file_write(2, dbg+8, 19)
-    let fnc_buf = mmap(32)
-    let fnc_len = 0
-    let fnc_tmp = fnc
-    if fnc_tmp == 0 { w8(fnc_buf, 48); fnc_len = 1 }
-    else {
-      let digs = mmap(32)
-      let dn = 0
-      while fnc_tmp > 0 {
-        w8(digs+dn, 48 + (fnc_tmp % 10))
-        fnc_tmp = fnc_tmp / 10
-        dn = dn + 1
-      }
-      let k = 0
-      while k < dn {
-        w8(fnc_buf+k, r8(digs+dn-1-k))
-        k = k + 1
-      }
-      fnc_len = dn
-    }
-    file_write(2, fnc_buf, fnc_len)
-    let nl = "\n"; file_write(2, nl+8, 1)
     while mmi<fnc {
-        let nlen = fn_nlen(mmi)
-        let dbg3 = "  fn["
-        file_write(2, dbg3+8, 5)
-        // write mmi
-        let mmi_buf = mmap(32)
-        let mmi_len = 0
-        let mmi_tmp = mmi
-        if mmi_tmp == 0 { w8(mmi_buf, 48); mmi_len = 1 }
-        else {
-          let digs = mmap(32)
-          let dn = 0
-          while mmi_tmp > 0 {
-            w8(digs+dn, 48 + (mmi_tmp % 10))
-            mmi_tmp = mmi_tmp / 10
-            dn = dn + 1
-          }
-          let k = 0
-          while k < dn {
-            w8(mmi_buf+k, r8(digs+dn-1-k))
-            k = k + 1
-          }
-          mmi_len = dn
-        }
-        file_write(2, mmi_buf, mmi_len)
-        let dbg4 = "] nlen="
-        file_write(2, dbg4+8, 7)
-        // write nlen as decimal
-        let nlen_buf = mmap(32)
-        let nlen_len = 0
-        let nlen_tmp = nlen
-        if nlen_tmp == 0 { w8(nlen_buf, 48); nlen_len = 1 }
-        else {
-          let digs = mmap(32)
-          let dn = 0
-          while nlen_tmp > 0 {
-            w8(digs+dn, 48 + (nlen_tmp % 10))
-            nlen_tmp = nlen_tmp / 10
-            dn = dn + 1
-          }
-          let k = 0
-          while k < dn {
-            w8(nlen_buf+k, r8(digs+dn-1-k))
-            k = k + 1
-          }
-          nlen_len = dn
-        }
-        file_write(2, nlen_buf, nlen_len)
-        file_write(2, nl+8, 1)
-        // DEBUG: print ALL function names
-        let mmn=fn_name(mmi)
-        let dbg5 = "    name: "
-        file_write(2, dbg5+8, 8)
-        let name_buf = mmap(64)
-        let ki = 0
-        while ki < nlen {
-          w8(name_buf+ki, r8(src+mmn+ki))
-          ki = ki + 1
-        }
-        file_write(2, name_buf, nlen)
-        file_write(2, nl+8, 1)
-        if nlen==4 {
-            let c0 = r8(src+mmn)
-            let c1 = r8(src+mmn+1)
-            let c2 = r8(src+mmn+2)
-            let c3 = r8(src+mmn+3)
-            if c0==109 { if c1==97 { if c2==105 { if c3==110 { has_main=1 } } } }
+        if fn_nlen(mmi)==4 {
+            let mmn=fn_name(mmi)
+            if r8(src+mmn)==109 { if r8(src+mmn+1)==97 { if r8(src+mmn+2)==105 { if r8(src+mmn+3)==110 { has_main=1 } } } }
         }
         mmi=mmi+1
     }
@@ -365,7 +278,7 @@ fn main(argc, argv) {
         w64(gpatches+gpatchc*24, pofs2); w64(gpatches+gpatchc*24+8, g_argv); w8(gpatches+gpatchc*24+16, 1)
         if gpatchc >= GPATCH_CAP { emit_ovf() }; gpatchc=gpatchc+1
         // Compute environ = argv + (argc+1)*8  => lea rax,[rsi+rdi*8+8]
-        eb(72); eb(141); eb(68); eb(254); ei(8)
+        eb(72); eb(141); eb(68); eb(254); eb(8)
         // Store environ -> g_environ  (mov [rip+disp], rax)
         eb(72); eb(137); eb(5 + 0*8); ei(0)
         let pofs3=codelen-4
