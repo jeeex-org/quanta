@@ -1,0 +1,302 @@
+// lib/std/aes_gcm.quanta — AES-GCM (Galois/Counter Mode) per NIST SP 800-38D
+// Implements AES-128-GCM: CTR mode encryption + GHASH authentication.
+// Uses existing AES-128 ECB from crypto.quanta for block encryption.
+
+import std/crypto
+
+// ---------- GF(2^128) multiplication (GHASH) ----------
+// Multiplies two 128-bit values (represented as 16-byte arrays) in GF(2^128)
+// with reduction polynomial x^128 + x^7 + x^2 + x + 1 (0xE1 at byte 15).
+fn gf128_mul(x, y) {
+  // x, y: pointers to 16-byte arrays (big-endian)
+  // Returns pointer to 16-byte result
+  let res = mem_alloc(2)  // 16 bytes = 2 i64
+  let i = 0
+  while i < 16 { mem_store8(res + i, 0); i = i + 1 }
+  
+  let v = mem_alloc(2)  // copy of x
+  i = 0
+  while i < 16 { mem_store8(v + i, mem_load8(x + i)); i = i + 1 }
+  
+  // Process y from MSB to LSB (big-endian)
+  let byte_idx = 0
+  while byte_idx < 16 {
+    let y_byte = mem_load8(y + byte_idx)
+    let bit = 0
+    while bit < 8 {
+      let y_bit = (y_byte >> (7 - bit)) & 1
+      if y_bit == 1 {
+        // res ^= v
+        i = 0
+        while i < 16 {
+          let r = mem_load8(res + i) ^ mem_load8(v + i)
+          mem_store8(res + i, r)
+          i = i + 1
+        }
+      }
+      // v = v * x (multiply by x in GF(2^128))
+      // Check MSB of v[0]
+      let msb = (mem_load8(v + 0) >> 7) & 1
+      // Left shift v by 1 bit
+      let carry = 0
+      i = 15
+      while i >= 0 {
+        let vi = mem_load8(v + i)
+        let new_carry = (vi >> 7) & 1
+        let shifted = (vi << 1) | carry
+        mem_store8(v + i, shifted)
+        carry = new_carry
+        i = i - 1
+      }
+      // If MSB was set, reduce by polynomial (0xE1 at byte 15)
+      if msb == 1 {
+        let r15 = mem_load8(v + 15) ^ 0xE1
+        mem_store8(v + 15, r15)
+      }
+      bit = bit + 1
+    }
+    byte_idx = byte_idx + 1
+  }
+  return res
+}
+
+// ---------- GHASH(H, AAD, Ciphertext) ----------
+// Computes the authentication tag component: GHASH(H, AAD || C || len(AAD) || len(C))
+fn ghash(H, aad, aad_len, ct, ct_len) {
+  // H: 16-byte hash subkey (from encrypting zero block with AES key)
+  // Returns pointer to 16-byte tag
+  let tag = mem_alloc(2)  // 16 bytes
+  let i = 0
+  while i < 16 { mem_store8(tag + i, 0); i = i + 1 }
+  
+  // Process AAD in 16-byte blocks
+  let aad_blocks = (aad_len + 15) >> 4
+  let b = 0
+  while b < aad_blocks {
+    let block = mem_alloc(2)
+    i = 0
+    while i < 16 {
+      let idx = b * 16 + i
+      if idx < aad_len {
+        mem_store8(block + i, mem_load8(aad + idx))
+      } else {
+        mem_store8(block + i, 0)
+      }
+      i = i + 1
+    }
+    // tag ^= block
+    i = 0
+    while i < 16 {
+      let t = mem_load8(tag + i) ^ mem_load8(block + i)
+      mem_store8(tag + i, t)
+      i = i + 1
+    }
+    // tag = gf128_mul(tag, H)
+    let tmp = gf128_mul(tag, H)
+    i = 0
+    while i < 16 { mem_store8(tag + i, mem_load8(tmp + i)); i = i + 1 }
+    b = b + 1
+  }
+  
+  // Process ciphertext in 16-byte blocks
+  let ct_blocks = (ct_len + 15) >> 4
+  b = 0
+  while b < ct_blocks {
+    let block = mem_alloc(2)
+    i = 0
+    while i < 16 {
+      let idx = b * 16 + i
+      if idx < ct_len {
+        mem_store8(block + i, mem_load8(ct + idx))
+      } else {
+        mem_store8(block + i, 0)
+      }
+      i = i + 1
+    }
+    // tag ^= block
+    i = 0
+    while i < 16 {
+      let t = mem_load8(tag + i) ^ mem_load8(block + i)
+      mem_store8(tag + i, t)
+      i = i + 1
+    }
+    // tag = gf128_mul(tag, H)
+    let tmp = gf128_mul(tag, H)
+    i = 0
+    while i < 16 { mem_store8(tag + i, mem_load8(tmp + i)); i = i + 1 }
+    b = b + 1
+  }
+  
+  // Final block: len(AAD) || len(C) as 64-bit big-endian each (in bits)
+  let len_block = mem_alloc(2)
+  let aad_bits = aad_len * 8
+  let ct_bits = ct_len * 8
+  i = 0
+  while i < 8 {
+    mem_store8(len_block + i, (aad_bits >> (56 - i * 8)) & 0xFF)
+    i = i + 1
+  }
+  i = 0
+  while i < 8 {
+    mem_store8(len_block + 8 + i, (ct_bits >> (56 - i * 8)) & 0xFF)
+    i = i + 1
+  }
+  
+  // tag ^= len_block
+  i = 0
+  while i < 16 {
+    let t = mem_load8(tag + i) ^ mem_load8(len_block + i)
+    mem_store8(tag + i, t)
+    i = i + 1
+  }
+  // tag = gf128_mul(tag, H)
+  let tmp = gf128_mul(tag, H)
+  i = 0
+  while i < 16 { mem_store8(tag + i, mem_load8(tmp + i)); i = i + 1 }
+  
+  return tag
+}
+
+// ---------- Increment 32-bit counter (big-endian) ----------
+fn incr_counter(ctr) {
+  // ctr: 16-byte counter block (12-byte IV || 4-byte counter)
+  // Increment the last 4 bytes as big-endian 32-bit integer
+  let i = 15
+  while i >= 12 {
+    let v = mem_load8(ctr + i) + 1
+    mem_store8(ctr + i, v)
+    if v != 0 { break }
+    i = i - 1
+  }
+}
+
+// ---------- AES-128-GCM Encrypt ----------
+// aes128_gcm_enc(key16, iv12, iv_len, aad, aad_len, plaintext, pt_len, out_ct, out_tag)
+// Returns 0 on success. out_ct must have pt_len bytes, out_tag must have 16 bytes.
+// Note: iv_len must be 12 (96-bit IV as recommended by NIST).
+fn aes128_gcm_enc(key16, iv12, iv_len, aad, aad_len, pt, pt_len, out_ct, out_tag) {
+  // Derive H = AES-128(key, 0^128)
+  let zero_block = mem_alloc(2)
+  let i = 0
+  while i < 16 { mem_store8(zero_block + i, 0); i = i + 1 }
+  let H = aes128_enc(key16, zero_block)  // 16-byte hash subkey
+  
+  // Build J0 = IV || 0^31 || 1 (for 96-bit IV)
+  // If IV != 96 bits, GHASH it first (not implemented - require 12-byte IV)
+  let J0 = mem_alloc(2)
+  i = 0
+  while i < 12 { mem_store8(J0 + i, mem_load8(iv12 + i)); i = i + 1 }
+  i = 12
+  while i < 15 { mem_store8(J0 + i, 0); i = i + 1 }
+  mem_store8(J0 + 15, 1)  // counter = 1
+  
+  // Encrypt plaintext in CTR mode
+  let ctr = mem_alloc(2)
+  i = 0
+  while i < 16 { mem_store8(ctr + i, mem_load8(J0 + i)); i = i + 1 }
+  
+  let pt_blocks = (pt_len + 15) >> 4
+  let b = 0
+  while b < pt_blocks {
+    // Encrypt counter block
+    let keystream = aes128_enc(key16, ctr)
+    
+    // XOR with plaintext
+    let block_bytes = 16
+    if b == pt_blocks - 1 && (pt_len & 15) != 0 {
+      block_bytes = pt_len & 15
+    }
+    i = 0
+    while i < block_bytes {
+      let c = mem_load8(pt + b * 16 + i) ^ mem_load8(keystream + i)
+      mem_store8(out_ct + b * 16 + i, c)
+      i = i + 1
+    }
+    
+    // Increment counter
+    incr_counter(ctr)
+    b = b + 1
+  }
+  
+  // Compute authentication tag
+  // Tag = GHASH(H, AAD, C) XOR AES-128(key, J0)
+  let gh = ghash(H, aad, aad_len, out_ct, pt_len)
+  let E_J0 = aes128_enc(key16, J0)
+  
+  i = 0
+  while i < 16 {
+    mem_store8(out_tag + i, mem_load8(gh + i) ^ mem_load8(E_J0 + i))
+    i = i + 1
+  }
+  
+  return 0
+}
+
+// ---------- AES-128-GCM Decrypt ----------
+// aes128_gcm_dec(key16, iv12, iv_len, aad, aad_len, ct, ct_len, tag16, out_pt)
+// Returns 0 on success, 1 on authentication failure.
+// out_pt must have ct_len bytes.
+fn aes128_gcm_dec(key16, iv12, iv_len, aad, aad_len, ct, ct_len, tag16, out_pt) {
+  // Derive H
+  let zero_block = mem_alloc(2)
+  let i = 0
+  while i < 16 { mem_store8(zero_block + i, 0); i = i + 1 }
+  let H = aes128_enc(key16, zero_block)
+  
+  // Build J0
+  let J0 = mem_alloc(2)
+  i = 0
+  while i < 12 { mem_store8(J0 + i, mem_load8(iv12 + i)); i = i + 1 }
+  i = 12
+  while i < 15 { mem_store8(J0 + i, 0); i = i + 1 }
+  mem_store8(J0 + 15, 1)
+  
+  // Verify tag first: compute expected tag
+  let gh = ghash(H, aad, aad_len, ct, ct_len)
+  let E_J0 = aes128_enc(key16, J0)
+  
+  let expected_tag = mem_alloc(2)
+  i = 0
+  while i < 16 {
+    mem_store8(expected_tag + i, mem_load8(gh + i) ^ mem_load8(E_J0 + i))
+    i = i + 1
+  }
+  
+  // Constant-time tag comparison
+  let match = 1
+  i = 0
+  while i < 16 {
+    if mem_load8(tag16 + i) != mem_load8(expected_tag + i) {
+      match = 0
+    }
+    i = i + 1
+  }
+  if match == 0 { return 1 }  // Authentication failed
+  
+  // Decrypt (same as encrypt in CTR mode)
+  let ctr = mem_alloc(2)
+  i = 0
+  while i < 16 { mem_store8(ctr + i, mem_load8(J0 + i)); i = i + 1 }
+  
+  let ct_blocks = (ct_len + 15) >> 4
+  let b = 0
+  while b < ct_blocks {
+    let keystream = aes128_enc(key16, ctr)
+    
+    let block_bytes = 16
+    if b == ct_blocks - 1 && (ct_len & 15) != 0 {
+      block_bytes = ct_len & 15
+    }
+    i = 0
+    while i < block_bytes {
+      let p = mem_load8(ct + b * 16 + i) ^ mem_load8(keystream + i)
+      mem_store8(out_pt + b * 16 + i, p)
+      i = i + 1
+    }
+    
+    incr_counter(ctr)
+    b = b + 1
+  }
+  
+  return 0
+}

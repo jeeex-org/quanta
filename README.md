@@ -4,7 +4,7 @@ Quanta designed with simple syntax that supports multiple execution modes: Nativ
 
 ## Status (verified)
 
-- **Native AOT compilation (`qc`)** — **ACTIVE, 0.0.134**. x86-64 only
+- **Native AOT compilation (`qc`)** — **ACTIVE, 0.0.135**. x86-64 only
   (AArch64 backend deferred POST-0.1.0).
   Bootstraps via a **self-host fixpoint**: the committed
   `compiler/${VERSION}/bin/x86/qc` compiles its own source to a byte-identical
@@ -19,7 +19,7 @@ Quanta designed with simple syntax that supports multiple execution modes: Nativ
 - **JIT** — PLANNED (Stage 5).
 
 Security: secure-by-default — signed-overflow and out-of-bounds traps
-(`SIGILL`, exit 132), opt-out via `unsafe {}`.
+(`SIGILL`, exit 132), opt-out via `unsafe {}` or `--no-overflow-trap` for crypto/unsigned-bitwise code.
 
 ## Syntax at a glance
 

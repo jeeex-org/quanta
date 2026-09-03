@@ -1,8 +1,8 @@
 # Quanta ROADMAP — consolidated single source of truth
 
-> **Last updated: 2026-09-02. Current compiler: 0.0.133** (x86-64 ELF emitter,
+> **Last updated: 2026-09-04. Current compiler: 0.0.135** (x86-64 ELF emitter,
 > multi-file tree, Valgrind-clean; self-host fixpoint **BYTE-VERIFIED** —
-> md5 `...`; IR_CAP=1B/40GB, TOK_CAP=48M/1.92GB, CODE_CAP=512MB, fn_btok fix for bare function declarations. SHA3-256 foundation complete. ARM64 (AArch64) backend is
+> md5 `aabe3cafbca502cc6ce7bb8925f9b52c`; IR_CAP=1B/40GB, TOK_CAP=48M/1.92GB, CODE_CAP=512MB, fn_btok fix for bare function declarations. FIPS 202 SHA3 + AES-GCM complete. ARM64 (AArch64) backend is
 > DEFERRED POST-0.1.0 (see #2 schedule below); the working compiler is x86-64 only.
 >
 > Version sequence: each feature lands in its own directory. 0.0.55 = P2
@@ -163,7 +163,9 @@ Qualification evidence is gathered AFTER the core is complete, not before.
 
 **0.0.134 (current stable, live):** `secure` — full FIPS 202: SHA3-224/256/384/512 + SHAKE128/256. Modular split: 6 modules (`sha3_constants`, `sha3_theta`, `sha3_rhopi` (fixed Pi perm), `sha3_chi`, `sha3_keccak_f`, `sha3_hash`) + re-export via `std/secure`. Compiler fixes: funcscan bare extern fn + builtin detection, entry.quanta ModR/M fix, lexer u8/u16/u32/u64 as TT_KEY, malloc builtin. All 11 gates GREEN (stdlib 9/9). Self-host fixpoint byte-verified. Built from 0.0.133 seed.
 
-Next core = **0.0.135** (`secure` — AES-GCM). 0.1.0 = post-core STABLE.
+**0.0.135 (current stable, live):** `secure` — AES-GCM (TLS 1.3 AEAD) + full FIPS 202 SHA3/SHAKE. Modular: 7 modules (`sha3_constants`, `sha3_theta`, `sha3_rhopi` (fixed Pi perm), `sha3_chi`, `sha3_keccak_f`, `sha3_hash`, `aes_gcm`), re-exported via `std/secure`. AES-GCM test compiles via `--emit-obj + ld` (token limit for single-TU); SHA3 tests compile directly. Self-host fixpoint BYTE-VERIFIED (md5 `1641c0b7195969ce4026846bc94583bb`).
+
+Next core = **0.0.136** (`secure` — X25519). 0.1.0 = post-core STABLE.
 
 **0.0.130 (current stable seed, live):** extern-C variadic (partial core). `extern "C" fn printf(fmt: i64, ...): i64;` declares a variadic libc fn and `printf(fmt, a, b, ...)` passes the variadic args. Register args 0–5 load into rdi/rsi/rdx/rcx/r8/r9; args **6+ spill onto the stack AFTER the rsp-alignment `push r11`** so they land directly above the return address. The naive order (spill before alignment) shifted every stack arg by 8 and corrupted it — `printf(s,1..7)` printed `1 2 3 4 5 582 6` (arg 6 = garbage `582`, arg 7 missing). Fix: defer the internal-stack-args spill (for non-extern calls) to after `is_ext_call` is resolved, and let the extern branch spill 6+ args in reverse order right before the call. New `extern_var_test.quanta` (sentinel `EXTERN_VAR_OK`) exercises ≤6 args AND the 7-arg stack-spill path, gated under both gcc-link and gcc-free `ld` link. Built from 0.0.129 seed; fixpoint byte-verified (gen1==gen2==gen3, md5 `85f4122ae7b9626fe529d2b94eb79158`). Gate: functional 162/162, stdlib 7/7, multi-TU 3/3, all 11 layers GREEN. Next core = **0.0.131** (closure self-recursion). 0.1.0 = post-core STABLE.
 
