@@ -1,0 +1,3057 @@
+let R_RAX=0; let R_RCX=1; let R_RDX=2; let R_RBX=3; let R_RSP=4; let R_RBP=5
+let R_RSI=6; let R_RDI=7; let R_R8=8; let R_R9=9; let R_R10=10; let R_R11=11
+let R_R12=12; let R_R13=13; let R_R14=14; let R_R15=15
+
+let cs = 0  // caller-saved count for save/restore
+
+// Emit helpers (use builtins emit_byte, emit_i32, emit_i64)
+fn eb(v) { if codelen >= CODE_CAP { exit(1) }; let a=codelen; codelen=a+1; w8(code+a,v%256) }
+fn ei(v) { if codelen >= CODE_CAP { exit(1) }; let a=codelen; codelen=a+4; w32(code+a,v) }
+fn eq(v) { if codelen >= CODE_CAP { exit(1) }; let a=codelen; codelen=a+8; w64(code+a,v) }
+
+// Write a 4-byte little-endian value into the code buffer (used for patching
+// relative offsets without disturbing the following bytes).
+fn w32(p,v) {
+    w8(p, v&255); w8(p+1, (v>>8)&255); w8(p+2, (v>>16)&255); w8(p+3, (v>>24)&255)
+}
+
+fn mr(mmod, reg, rm) { eb(mmod*64 + (reg&7)*8 + (rm&7)) }
+fn rw(reg, rm) {
+    let v=72; if reg>=8 { v=v+4 }; if rm>=8 { v=v+1 }; eb(v)
+}
+fn ri(reg, imm) {
+    if reg>=8 { eb(65); eb(184+(reg%8)) } else { eb(184+reg) }; ei(imm)
+}
+fn ri64(reg, imm) {
+    if reg>=8 { eb(73); eb(184+(reg%8)) } else { eb(72); eb(184+reg) }; eq(imm)
+}
+fn rr(d,s) {
+    if d==s { return }
+    if s<8&&d<8 { rw(s,d); eb(137); mr(3,s,d) } else { rw(s,d); eb(137); mr(3,s%8,d%8) }
+}
+fn ra(d,s) { rw(s,d); eb(1); mr(3,s%8,d%8) }
+fn rs(d,s) { rw(s,d); eb(41); mr(3,s%8,d%8) }
+fn rm(d,s) { rw(d,s); eb(15); eb(175); mr(3,d%8,s%8) }
+fn rxor(d,s) { rw(s,d); eb(49); mr(3,s%8,d%8) }
+fn rand(d,s) { rw(s,d); eb(33); mr(3,s%8,d%8) }
+fn ror(d,s) { rw(s,d); eb(9); mr(3,s%8,d%8) }
+fn rcmp(r1,r2) { rw(r2,r1); eb(57); mr(3,r2%8,r1%8) }
+fn rtest(r1,r2) { rw(r1,r2); eb(133); mr(3,r1%8,r2%8) }
+fn rcqo() { eb(72); eb(153) }
+fn smov(memreg, srcreg) { rw(srcreg, memreg); eb(137); mr(0, srcreg%8, memreg%8) }  // mov [memreg], srcreg
+// stx(base, disp, src): mov [base+disp], src   (stages base into r11; use src!=r11)
+fn stx(base, disp, sreg) {
+    rr(11, base)   // r11 = base
+    wbase(disp, sreg)
+}
+// ldx(dst, base, disp): mov dst, [base+disp]   (stages base into r11; use dst!=r11)
+fn ldx(dst, base, disp) {
+    rr(11, base)   // r11 = base
+    lbase(disp, dst)
+}
+fn rneg(r) { if r>=8 { eb(73) } else { eb(72) }; eb(247); mr(3,3,r%8) }
+fn rnot(r) { if r>=8 { eb(73) } else { eb(72) }; eb(247); mr(3,2,r%8) }
+fn ridiv(r) { if r>=8 { eb(73) } else { eb(72) }; eb(247); mr(3,7,r%8) }
+fn rshl(d,s) { if s!=1 { rr(1,s) }; eb(72); eb(211); mr(3,4,d%8) }
+fn rshr(d,s) { if s!=1 { rr(1,s) }; eb(72); eb(211); mr(3,5,d%8) }
+
+fn rsetc(cc,r) {
+    let c=0
+    if cc==0 { c=148 } else if cc==1 { c=149 } else if cc==2 { c=156 } else if cc==3 { c=159 } else if cc==4 { c=158 } else if cc==5 { c=157 }
+    if r<4 { eb(15); eb(c); mr(3,0,r) } else if r<8 { eb(64); eb(15); eb(c); mr(3,0,r%8) } else { eb(65); eb(15); eb(c); mr(3,0,r%8) }
+}
+fn rzx(d,s) {
+    if d<8&&s<8 { eb(72); eb(15); eb(182); mr(3,d%8,s%8); return }
+    rw(d,s); eb(15); eb(182); mr(3,d%8,s%8)
+}
+fn xpush(r) { if r<8 { eb(80+r) } else { eb(65); eb(80+(r%8)) } }
+fn xpop(r) { if r<8 { eb(88+r) } else { eb(65); eb(88+(r%8)) } }
+fn rcmov(cc,d,s) {
+   // cmovcc r64, r64 : REX.W 0F 4X modrm(11,d,s); cc 0=ae(43),1=b(42)
+   let op = 66; if cc==0 { op = 67 }   // 0x42=b, 0x43=ae
+   let v=72; if d>=8 { v=v+4 }; if s>=8 { v=v+1 }
+   eb(v); eb(15); eb(op); mr(3, d%8, s%8)
+}
+// fx87prep(): force FPU to 64-bit precision (0x027F). Freestanding binaries
+// default to 80-bit (0x037F) which breaks f2xm1/fscale/frndint. Must run
+// before any x87 transcendental. Writes CW to [rsp+8] (scratch slot) so it
+// never clobbers the value the caller stored in [rsp].
+fn fx87prep() {
+   eb(102); eb(199); eb(68); eb(36); eb(8); eb(127); eb(2)  // mov word [rsp+8], 0x027F (66 C7 44 24 08 7F 02)
+   eb(217); eb(108); eb(36); eb(8)                       // fldcw [rsp+8] (D9 6C 24 08)
+}
+fn ret() { eb(195) }
+fn sysc() { eb(15); eb(5) }
+fn callr(r) { if r<8 { eb(255); mr(3,2,r) } else { eb(65); eb(255); mr(3,2,r%8) } }
+fn sbi(imm) { eb(72); eb(129); mr(3,5,4); ei(imm) }
+fn abi(imm) { eb(72); eb(129); mr(3,0,4); ei(imm) }
+fn wbp(d,r) { rw(r,5); eb(137); if r>=8 { mr(2,r%8,4); eb(37) } else { mr(2,r%8,5) }; ei(d) }
+fn rbp(r,d) { rw(r,5); eb(139); if r>=8 { mr(2,r%8,4); eb(37) } else { mr(2,r%8,5) }; ei(d) }
+fn wsp(d,r) { rw(r,4); eb(137); mr(2,r%8,4); eb(36); ei(d) }
+fn rsp(r,d) { rw(r,4); eb(139); mr(2,r%8,4); eb(36); ei(d) }
+// wbase(d, vr): mov [r11+d], vr  -- r11 is an explicit base reg (NOT rbp), so it
+// avoids the REX.B/rbp conflict that breaks rbp+extended-reg encodings.
+fn wbase(d, vr) { let rex=73; if vr>=8 { rex=77 }; eb(rex); eb(137); mr(2, vr%8, 3); ei(d) }
+// lbase(d, vr): mov vr, [r11+d]
+fn lbase(d, vr) { let rex=73; if vr>=8 { rex=77 }; eb(rex); eb(139); mr(2, vr%8, 3); ei(d) }
+fn leabp(r,d) { let v=72; if r>=8 { v=73 }; eb(v); eb(141); if r>=8 { mr(2,r%8,4); eb(37) } else { mr(2,r%8,5) }; ei(d) }
+// lsp(r, disp): mov r64, [rsp+disp8]  (rsp base REQUIRES a SIB byte on x86-64).
+//   REX.W + 8B + modrm(01,reg,100) + SIB(0x24: scale0,no-index,base=rsp) + disp8.
+fn lsp(r, disp) {
+    let rex=72; if r>=8 { rex=76 }   // REX.W (+ REX.R to extend the DEST reg; base is rsp, must NOT be extended)
+    eb(rex); eb(139)                 // 8B = mov r/m, reg
+    if r>=8 { mr(1, r%8, 4) } else { mr(1, r%8, 4) }   // mod=01, reg=r, rm=100(rsp)
+    eb(36)                           // SIB = 0x24
+    eb(disp)                         // disp8 (mod=01 => 1 byte)
+}
+fn rmr(rd,ad) { rw(rd,ad); eb(139); mr(0,rd%8,ad%8) }
+fn wmr(ad,vl) { rw(vl,ad); eb(137); mr(0,vl%8,ad%8) }
+fn rmr8(rd,ad) { rw(rd,ad); eb(15); eb(182); mr(0,rd%8,ad%8) }
+fn wmr8(ad,vl) { if vl<4 { eb(72) }; eb(136); mr(0,vl%8,ad%8) }
+fn lesp(r,d) { rw(r,4); eb(141); mr(2,r%8,4); eb(36); ei(d) }
+fn wmi(b,d,i) { if b>=8 { eb(73) } else { eb(72) }; eb(199); mr(2,0,b%8); ei(d); ei(i) }
+fn wm8i(b,d,i) { if b>=8 { eb(65) } else { eb(64) }; eb(198); mr(2,0,b%8); ei(d); eb(i%256) }
+fn jmp32(o) { eb(233); ei(o) }
+fn jcc32(cc,o) {
+    let c=0; if cc==0 { c=132 } else if cc==1 { c=133 } else if cc==2 { c=140 } else if cc==3 { c=143 } else if cc==4 { c=142 } else if cc==5 { c=141 }
+    eb(15); eb(c); ei(o)
+}
+// jb32(o): unsigned-below conditional jump (0F 82 + rel32), rel at po+2 (ty==1).
+// Needed for byte-range tests vs 0x80/0xC0/0xE0/0xF0 where signed jl misclassifies.
+fn jb32(o) { eb(15); eb(130); ei(o) }
+// G2: inline overflow trap. After a signed arithmetic op sets OF, a short `jno`
+// skips a 2-byte `ud2` (0F 0B). On overflow (OF=1) we fall into ud2 -> #UD ->
+// SIGILL (signal 4): deterministic death. No rel32 relocation needed (rel8).
+// `ii` = current IR record index; if it was emitted inside `unsafe {}`
+// (ir_unsafe[ii]!=0) the trap is suppressed (user opted out).
+fn ovf_trap_emit(ii) { if ovf_trap==1 && r8(ir_unsafe+ii)==0 { eb(113); eb(2); eb(15); eb(11) } }
+// G2p3: shift-COUNT UB trap. x86 `shl/shr r/m64, cl` masks the count to 6 bits,
+// so `x << 64` silently == `x << 0`. With the count already in rcx, emit:
+//   cmp rcx,64 ; jb +2 ; ud2   (48 83 F9 40 / 72 02 / 0F 0B)
+// count>=64 (or negative -> huge unsigned) falls into ud2 -> SIGILL. Suppressed
+// inside unsafe{} (same ir_unsafe gate as the overflow trap).
+fn shl_trap_emit(ii) { if ovf_trap==1 && r8(ir_unsafe+ii)==0 { eb(72); eb(131); eb(249); eb(64); eb(114); eb(2); eb(15); eb(11) } }
+// G2 containers: bounds-check for indexed access `a[idx]`. At the call site the
+// base pointer is in rax and idx is in rcx. Emit `cmp [rax], rcx; jb +2; ud2`:
+//   unsigned idx >= len (or negative -> huge unsigned) falls through into ud2 ->
+//   SIGILL rc=132. Suppressed inside unsafe{} (same ir_unsafe gate). The +8 data
+//   offset is applied in the lea that follows this check.
+fn idx_trap_emit(ii) { if ovf_trap==1 && r8(ir_unsafe+ii)==0 { eb(72); eb(59); eb(8); eb(114); eb(2); eb(15); eb(11) } }
+// P10: ARM64 bounds-check trap for `a[idx]` — parity with x86 idx_trap_emit.
+// At the call site x0 = base ptr, x1 = idx. Emit:
+//   ldr x9,[x0]    ; x9 = len (header)
+//   cmp x1, x9     ; idx - len (unsigned)
+//   b.lo +8        ; if idx < len skip the udf (imm19=2: pc+8 past the 4B udf)
+// === REGISTER ALLOCATOR (corrected: reload on use, persist results) ===
+let REGS = mmap(112)  // 14 physical regs (all except RSP=4, RBP=5)
+fn init_regs() {
+    w64(REGS+0, 0); w64(REGS+8, 1); w64(REGS+16, 2); w64(REGS+24, 3)
+    w64(REGS+32, 6); w64(REGS+40, 7); w64(REGS+48, 8); w64(REGS+56, 9)
+    w64(REGS+64, 10); w64(REGS+72, 12); w64(REGS+80, 13); w64(REGS+88, 14)
+    w64(REGS+96, 15)
+}
+
+let alloc = mmap(2000000); let allocfc = 0
+let vr_init = mmap(400000)
+let vr_spill = mmap(400000)
+let vfloat = mmap(400000)    // 1 if vreg holds a float bit-pattern (i2f / f-literal result)
+let SPILL_BASE = 48
+fn spill_home(v) { return -(SPILL_BASE + (v + 1) * 8) }
+
+// aphys(vr): return a physical reg holding vr's value. On first use, allocate a
+// reg and reload from the home slot if the vreg has a defined value.
+fn aphys(vr) {
+    let f=afind(vr); if f>=0 { return f }
+    let p=afree()
+    if r8(vr_init+vr)!=0 { rbp(p, spill_home(vr)) }
+    aset(vr,p); return p
+}
+
+// adistinct(res, a1, a2): like aphys(res) but guarantees the returned physical
+// register is NOT a1 and NOT a2 (the operand registers).  This prevents a
+// binary result dst from aliasing an operand, which would let the zeroing /
+// read-modify-write (xor dst,dst / or dst,r2 / and dst,r2) clobber the operand
+// before it is consumed.  Operands must be loaded with aphys FIRST (so they
+// own their registers), then adistinct picks a distinct register for the result.
+fn adistinct(res, a1, a2) {
+    let f=afind(res); if f>=0 { if f!=a1&&f!=a2 { return f } }
+    // evict everything mapped to a1 or a2 so the result cannot reuse them
+    let i=0
+    while i<allocfc {
+        let pr=r64(alloc+i*16+8)
+        if pr==a1||pr==a2 {
+            let ev_vr=r64(alloc+i*16)
+            if r8(vr_init+ev_vr)!=0 { wbp(spill_home(ev_vr), pr) }
+            w8(vr_spill+ev_vr, 1)
+            // remove this entry by overwriting with last
+            allocfc=allocfc-1
+            w64(alloc+i*16, r64(alloc+allocfc*16))
+            w64(alloc+i*16+8, r64(alloc+allocfc*16+8))
+        } else { i=i+1 }
+    }
+    // Pick a free physical reg that is NEITHER a1 NOR a2.  afree()
+    // would otherwise hand back a just-evicted operand register as the
+    // result, aliasing rd with an operand so the xor/or/and rd,rd
+    // clobbers the operand before cmp consumes it.
+    let p=-1; let k=0
+    while k<14 {
+        let pr=r64(REGS+k*8)
+        if pr!=a1 && pr!=a2 {
+            let used=0; let j=0
+            while j<allocfc { if r64(alloc+j*16+8)==pr { used=1; break }; j=j+1 }
+            if used==0 { p=pr; break }
+        }
+        k=k+1
+    }
+    if p<0 {
+        // Degenerate: only a1/a2 still mapped. Evict a vreg that is NEITHER a1
+        // NOR a2 and reuse its register, so the result never aliases an operand.
+        allocfc=allocfc-1
+        let ev_vr=r64(alloc+allocfc*16); let ev_pr=r64(alloc+allocfc*16+8)
+        while ev_pr==a1 || ev_pr==a2 {
+            w64(alloc+allocfc*16, r64(alloc+(allocfc-1)*16))
+            w64(alloc+allocfc*16+8, r64(alloc+(allocfc-1)*16+8))
+            allocfc=allocfc-1
+            ev_vr=r64(alloc+allocfc*16); ev_pr=r64(alloc+allocfc*16+8)
+        }
+        if r8(vr_init+ev_vr)!=0 { wbp(spill_home(ev_vr), ev_pr) }
+        w8(vr_spill+ev_vr, 1)
+        p=ev_pr
+    }
+    if r8(vr_init+res)!=0 { rbp(p, spill_home(res)) }
+    aset(res,p); return p
+}
+
+fn afind(vr) {
+    let i=0; while i<allocfc { if r64(alloc+i*16)==vr { return r64(alloc+i*16+8) }; i=i+1 }; return -1
+}
+
+fn aset(vr,pr) {
+    if allocfc >= ALLOC_CAP { emit_ovf() }
+    w64(alloc+allocfc*16,vr); w64(alloc+allocfc*16+8,pr); allocfc=allocfc+1
+}
+
+fn aclr() { allocfc=0; let i=0; while i<vreg_n { w8(vr_init+i,0); w8(vr_spill+i,0); w8(vfloat+i,0); i=i+1 } }
+
+// afree(): return a free physical reg, evicting a mapped vreg (spilling it) if needed.
+fn afree() {
+    let k=0
+    while k<14 {
+        let pr=r64(REGS+k*8)
+        let used=0; let j=0
+        while j<allocfc { if r64(alloc+j*16+8)==pr { used=1; break }; j=j+1 }
+        if used==0 { return pr }
+        k=k+1
+    }
+    allocfc=allocfc-1
+    let ev_vr=r64(alloc+allocfc*16); let ev_pr=r64(alloc+allocfc*16+8)
+    if r8(vr_init+ev_vr)!=0 { wbp(spill_home(ev_vr), ev_pr) }
+    w8(vr_spill+ev_vr, 1)
+    return ev_pr
+}
+
+// is_float_vr(vr): resolve a vreg back through MOV chains to a float-builtin
+// IR_CALL (i2f/fmul/fadd/fsub/fdiv/etc) by NAME. Returns 1 if the vreg ultimately
+// carries a float bit-pattern, else 0. Robust against intermediate MOV/aliasing.
+fn is_float_vr(vr) {
+    // Fast path: consult the vfloat table, which emit_bltn populates via
+    // w8(vfloat+irres(ii),1) for i2f/fconst/fadd/fsub/fmul/fdiv results.
+    // Without this, chained float math (fadd -> fmul) cannot see that an
+    // argument vreg already holds a float bit-pattern, and falls back to
+    // cvtsi2sd on the raw bits -> silently wrong values (e.g. 20 -> 0).
+    if r8(vfloat+vr)==1 { return 1 }
+    let k=0
+    while k<irc {
+        if irres(k)==vr {
+            let op=irop(k)
+            if op==IR_CALL {
+                // name field is ira0(k); builtin name lives at src+ira0(k). Match first 3 chars.
+                // These builtins return a float bit-pattern in rax (verified: fadd(3,4)
+                // yields 0x401C000000000000 = 7.0's bits; codegen marks vfloat=1).
+                let nm=ira0(k)
+                if r8(src+nm)=='i'&&r8(src+nm+1)=='2'&&r8(src+nm+2)=='f' { return 1 }  // i2f -> float bits
+                if r8(src+nm)=='f'&&r8(src+nm+1)=='c'&&r8(src+nm+2)=='o' { return 1 }  // fconst -> float bits
+                return 0
+            }
+            if op==IR_MOV {
+                // follow the MOV source to see if IT is float
+                vr = ira0(k)
+                k = -1   // restart scan from the new vr (will become 0 after k++)
+                // (continue loop)
+            }
+            if op==IR_NEG {
+                // sign-flip preserves float-ness: follow the operand
+                vr = ira0(k)
+                k = -1
+            }
+        }
+        k=k+1
+    }
+    return 0
+}
+
+// resolve_mov(vr): follow IR_MOV chains back to the ultimate source vreg.
+// A builtin's float arg is often wrapped in an IR_MOV (vtmp) whose spill_home is
+// unpopulated; the float bits live in the SOURCE vreg's spill_home. Returns the
+// resolved source vreg (or vr itself if no MOV chain).
+fn resolve_mov(vr) {
+    let guard=0
+    while guard<100000 {
+        let k=0
+        while k<irc {
+            if irres(k)==vr {
+                if irop(k)==1 { vr = ira0(k); k = -1; break }  // IR_MOV: follow source, restart
+                else { return vr }
+            }
+            k=k+1
+        }
+        return vr
+    }
+    return vr
+}
+
+fn flush_all() {
+    let i=0
+    while i<allocfc {
+        let vr=r64(alloc+i*16); let pr=r64(alloc+i*16+8)
+        if r8(vr_init+vr)!=0 { wbp(spill_home(vr), pr) }
+        w8(vr_spill+vr, 1)
+        i=i+1
+    }
+    allocfc=0
+}
+
+// flush_clob(r0,r1,r2): target clobber-save for arithmetic ops (idiv/shl/shr)
+// that only destroy the given physical regs (rax=0, rcx=1, rdx=2). Spills just
+// those vregs to their home slots (already current via sdef) and frees the
+// physical regs, leaving every OTHER live vreg resident -> far fewer downstream
+// reloads than flush_all(). Home slots stay current, so the existing
+// rbp(0,home)/rbp(1,home) reloads after the op remain correct.
+fn flush_clob(r0,r1,r2) {
+    let i=0
+    while i<allocfc {
+        let vr=r64(alloc+i*16); let pr=r64(alloc+i*16+8)
+        if pr==r0 || pr==r1 || pr==r2 {
+            if r8(vr_init+vr)!=0 { wbp(spill_home(vr), pr) }
+            w8(vr_spill+vr, 1)
+            allocfc=allocfc-1
+            w64(alloc+i*16, r64(alloc+allocfc*16))
+            w64(alloc+i*16+8, r64(alloc+allocfc*16+8))
+        } else { i=i+1 }
+    }
+}
+
+// === FLOAT REGISTER ALLOCATOR (x86: xmm0-7; ARM: v0-7) ===
+// Mirrors the integer allocator but routes float vregs to the FP register file.
+// Float homes live in a SEPARATE spill region (fspill_home) so they never collide
+// with integer homes (which use spill_home). Both write 8 bytes; a float vreg vr
+// and an int vreg vr with the same index must NOT share a slot.
+let FREGS = mmap(64)   // 8 xmm/v physical regs
+fn init_fregs() {
+    w64(FREGS+0, 0); w64(FREGS+8, 1); w64(FREGS+16, 2); w64(FREGS+24, 3)
+    w64(FREGS+32, 4); w64(FREGS+40, 5); w64(FREGS+48, 6); w64(FREGS+56, 7)
+}
+let falloc = mmap(2000000); let fallocfc = 0
+let fvr_init = mmap(400000)
+let fvr_spill = mmap(400000)
+fn fspill_home(v) { return -(SPILL_BASE + 8192 + (v + 1) * 8) }
+
+fn fphys(vr) {
+    let f=ffind(vr); if f>=0 { return f }
+    let p=ffree()
+    if r8(fvr_init+vr)!=0 { frld(p, fspill_home(vr)) }
+    fset(vr,p); return p
+}
+fn fdistinct(res, a1, a2) {
+    let f=ffind(res); if f>=0 { if f!=a1&&f!=a2 { return f } }
+    let i=0
+    while i<fallocfc {
+        let pr=r64(falloc+i*16+8)
+        if pr==a1||pr==a2 {
+            let ev_vr=r64(falloc+i*16)
+            if r8(fvr_init+ev_vr)!=0 { frld(pr, fspill_home(ev_vr)) }
+            w8(fvr_spill+ev_vr, 1)
+            fallocfc=fallocfc-1
+            w64(falloc+i*16, r64(falloc+fallocfc*16))
+            w64(falloc+i*16+8, r64(falloc+fallocfc*16+8))
+        } else { i=i+1 }
+    }
+    let p=-1; let k=0
+    while k<8 {
+        let pr=r64(FREGS+k*8)
+        if pr!=a1 && pr!=a2 {
+            let used=0; let j=0
+            while j<fallocfc { if r64(falloc+j*16+8)==pr { used=1; break }; j=j+1 }
+            if used==0 { p=pr; break }
+        }
+        k=k+1
+    }
+    if p<0 {
+        fallocfc=fallocfc-1
+        let ev_vr=r64(falloc+fallocfc*16); let ev_pr=r64(falloc+fallocfc*16+8)
+        while ev_pr==a1 || ev_pr==a2 {
+            w64(falloc+fallocfc*16, r64(falloc+(fallocfc-1)*16))
+            w64(falloc+fallocfc*16+8, r64(falloc+(fallocfc-1)*16+8))
+            fallocfc=fallocfc-1
+            ev_vr=r64(falloc+fallocfc*16); ev_pr=r64(falloc+fallocfc*16+8)
+        }
+        if r8(fvr_init+ev_vr)!=0 { frld(ev_pr, fspill_home(ev_vr)) }
+        w8(fvr_spill+ev_vr, 1)
+        p=ev_pr
+    }
+    if r8(fvr_init+res)!=0 { frld(p, fspill_home(res)) }
+    fset(res,p); return p
+}
+fn ffind(vr) {
+    let i=0; while i<fallocfc { if r64(falloc+i*16)==vr { return r64(falloc+i*16+8) }; i=i+1 }; return -1
+}
+fn fset(vr,pr) {
+    if fallocfc >= ALLOC_CAP { emit_ovf() }
+    w64(falloc+fallocfc*16,vr); w64(falloc+fallocfc*16+8,pr); fallocfc=fallocfc+1
+}
+fn fclr() { fallocfc=0; let i=0; while i<vreg_n { w8(fvr_init+i,0); w8(fvr_spill+i,0); i=i+1 } }
+fn ffree() {
+    let k=0
+    while k<8 {
+        let pr=r64(FREGS+k*8)
+        let used=0; let j=0
+        while j<fallocfc { if r64(falloc+j*16+8)==pr { used=1; break }; j=j+1 }
+        if used==0 { return pr }
+        k=k+1
+    }
+    fallocfc=fallocfc-1
+    let ev_vr=r64(falloc+fallocfc*16); let ev_pr=r64(falloc+fallocfc*16+8)
+    if r8(fvr_init+ev_vr)!=0 { frld(ev_pr, fspill_home(ev_vr)) }
+    w8(fvr_spill+ev_vr, 1)
+    return ev_pr
+}
+fn fflush_all() {
+    let i=0
+    while i<fallocfc {
+        let vr=r64(falloc+i*16); let pr=r64(falloc+i*16+8)
+        if r8(fvr_init+vr)!=0 { frld(pr, fspill_home(vr)) }
+        w8(fvr_spill+vr, 1)
+        i=i+1
+    }
+    fallocfc=0
+}
+fn fdef(vr, reg) { frld(reg, fspill_home(vr)); w8(fvr_init+vr, 1) }
+// frld(xmm, off): movsd xmm, [rbp+off]  (REX.W F2 0F 10 /r with rbp base)
+fn frld(xmm, off) { eb(0xF2); eb(73); eb(15); eb(16); mr(2, xmm, 5); ei(off) }
+
+// x86 SSE emit helpers (target_arch==0)
+// xmm reg encoding in ModRM/reg fields: just the index 0-7.
+fn frr(d,s) { if d==s { return }; eb(0xF2); eb(15); eb(16); mr(3,d,s) }   // movsd xmm(d), xmm(s)
+fn fadd(d,s) { eb(0xF2); eb(15); eb(88); mr(3,d,s) }   // addsd xmm(d), xmm(s)
+fn fsub(d,s) { eb(0xF2); eb(15); eb(92); mr(3,d,s) }   // subsd xmm(d), xmm(s)
+fn fmul(d,s) { eb(0xF2); eb(15); eb(89); mr(3,d,s) }   // mulsd xmm(d), xmm(s)
+fn fdiv(d,s) { eb(0xF2); eb(15); eb(94); mr(3,d,s) }   // divsd xmm(d), xmm(s)
+fn fld_x(rdx_gp, xmm) { eb(0x66); eb(0x48); eb(15); eb(110); mr(3, xmm, rdx_gp%8) }   // movq xmm, gp   (66 48 0F 6E /r, mod=3 register)
+fn fst_x(gp, xmm) { eb(0x66); eb(0x48); eb(15); eb(126); mr(3, xmm, gp%8) }           // movq gp, xmm   (66 48 0F 7E /r, mod=3 register)
+fn fi2f(xmm, gp) { eb(0xF2); eb(0x48); eb(15); eb(42); mr(2, xmm, gp%8) }  // cvtsi2sd xmm, gp  (F2 REX.W 0F 2A /r, 64-bit)
+fn ff2i(gp, xmm) { eb(0xF2); eb(0x48); eb(15); eb(46); mr(2, gp%8, xmm) }  // cvttsd2si gp, xmm (F2 REX.W 0F 2C /r, 64-bit)
+fn fcomi(xmm1, xmm2) { eb(0x66); eb(15); eb(44); mr(3, xmm1, xmm2) }  // comisd xmm1, xmm2 (sets EFLAGS)
+
+
+// === divide-by-const signed magic (strength reduction for IR_DIV by constant) ===
+let magicM = 0
+let magicSh = 0
+// unsigned >= without xor: if signs equal use signed compare; else the
+// non-negative operand is larger in unsigned order.
+fn uge(a, b) {
+  if a >= 0 {
+    if b >= 0 { return a >= b }
+    return 1
+  }
+  if b >= 0 { return 0 }
+  return a >= b
+}
+// compute signed-division magic (M, sh) for nonzero divisor d.
+// M is negated when d<0 so the mul-add recovery needs no separate negation.
+fn compute_magic(d) {
+  // G2: signed-division magic-number recovery does deliberate 64-bit
+  // wraparound (H = 2^63-1, shifts past bit 63, negations). Wrap in unsafe{}
+  // so it is exempt from the overflow trap during self-host bootstrapping.
+  unsafe {
+  let ad = d
+  if d < 0 { ad = -d }
+  let H = 9223372036854775807   // 2^63 - 1 (literal: avoids (1<<63)-1 overflow trap)
+  let anc = H - (H % ad)
+  let q1 = H / anc
+  let r1 = H - q1 * anc + 1
+  let q2 = H / ad
+  let r2 = H - q2 * ad + 1
+  let p = 63
+  while 1 == 1 {
+    p = p + 1
+    q1 = q1 << 1
+    r1 = r1 << 1
+    if uge(r1, anc) { q1 = q1 + 1; r1 = r1 - anc }
+    q2 = q2 << 1
+    r2 = r2 << 1
+    if uge(r2, ad) { q2 = q2 + 1; r2 = r2 - ad }
+    let delta = ad - r2
+    let brk = uge(q1, delta)
+    if brk == 1 {
+      if q1 == delta && r1 == 0 { brk = 0 }
+    }
+    if brk == 1 { break }
+  }
+  let M = q2 + 1
+  if d < 0 { M = -M }
+  let sh = p - 64
+  magicM = M
+  magicSh = sh
+  return 0
+  }
+}
+
+// sdef(vr, reg): store result to home slot AND mark vreg defined (so later
+// aphys reloads the correct value after a flush_all).
+fn sdef(vr, reg) { wbp(spill_home(vr), reg); w8(vr_init+vr, 1) }
+// === BUILD IN NAME CHECK ===
+
+// argp8(reg, base, k): load arg k's spill-home pointer + 8 (skip the 8-byte
+// string length prefix) into reg. Quanta strings are [8:len][bytes]; syscall
+// path ABI needs base+8. Mirrors the reload-from-spill-home pattern used by the
+// generic syscall() helper.
+fn argp8(reg, base, k) {
+    let sv = irres(base + k)
+    rbp(reg, spill_home(sv))
+    ri(3, 8)          // rbx = 8  (low reg; ra() decodes high regs wrong)
+    ra(reg, 3)        // reg = reg + 8
+}
+
+// Emit inline machine code for a built-in call.  Arguments have already been
+// placed in the ABI registers (rdi,rsi,rdx,rcx,r8,r9); the result is left in
+// rax.  Returns 1 if a built-in was emitted, 0 otherwise.
+fn emit_bltn(nmi,nl,ii) {
+    let nm=src+nmi
+    // 0.0.68: USER FUNCTIONS WIN OVER BUILTINS -- one guard covering every
+    // builtin branch below, replacing the two ad-hoc push/pop checks.
+    // A user-defined `fn abs(x)` (or pow/gcd/min/max/...) must call the user's
+    // code, not the compiler's inline builtin. Previously only push/pop carried
+    // this check, so the other 84 branches silently hijacked a same-named user
+    // function: `fn abs(x){ if x<0 { return 0-x }; return x }` then `abs(-42)`
+    // returned 0, because the FLOAT builtin abs read the integer bits as a
+    // double. Silent wrong data, no diagnostic. Returning 0 makes codegen emit a
+    // normal patched call to the user's function.
+    //
+    // EXCEPTION -- primitive memory/FP intrinsics are NEVER overridable:
+    //   mem_load/mem_store/mem_load8/mem_store8, fadd/fsub/fmul/fdiv
+    // These are the irreducible operations every higher construct is built from,
+    // and the compiler defines its OWN same-named wrappers (helpers.quanta:
+    // `fn w64(p,v) { mem_store(p,v) }` and `fn mem_store(p,v) { ... w64(p,v) }`
+    // -- mutually recursive, with the builtin breaking the cycle). Honouring
+    // user-wins for them turns that cycle into infinite recursion: the 2-stage
+    // self-host then produced a stage-2 compiler that exited rc=0 while silently
+    // writing NO output file, and stage1 != stage2 (fixpoint broken). Keeping
+    // them inline is required for the compiler to bootstrap at all.
+    if is_prim_intrin(nmi,nl)==0 {
+        if findfn(nmi,nl)>=0 { return 0 }
+    }
+    // exit(code): mov eax,60; syscall   (arg0 already in rdi from IR_CALL arg load)
+    if nl==4&&r8(nm)=='e'&&r8(nm+1)=='x'&&r8(nm+2)=='i'&&r8(nm+3)=='t' {
+        eb(184); ei(60); sysc(); return 1
+    }
+    // free(ptr): munmap(ptr, len) where len = *(ptr) (the header = element count).
+    //   mmap rounds the base up to a page, so the region starting at the user
+    //   pointer (mapped length n*8+8) is exactly one page; unmapping len bytes
+    //   (the kernel rounds len up to a page) frees the whole allocation.
+    if nl==4&&r8(nm)=='f'&&r8(nm+1)=='r'&&r8(nm+2)=='e'&&r8(nm+3)=='e' {
+        flush_all()
+        // free(ptr): munmap(ptr, len).  The allocation carries a header word
+        // ([ptr] = element count n); munmap rounds len up to a page so passing
+        // n frees the whole page-granular region.  arg0 (ptr) is in rdi from
+        // the IR_CALL arg load; we read the header into rsi for the length.
+        eb(72); eb(139); eb(55)        // mov rsi, [rdi]   (len = header; munmap rounds up)
+        eb(184); ei(11)                // mov eax, 11      (munmap)
+        sysc(); return 1
+    }
+    // P6.1a: float builtins. Args arrive as raw 64-bit bit-patterns in rdi (arg0)
+    // / rsi (arg1) from the IR_CALL arg load. Float results are returned as raw
+    // 64-bit bit-patterns in rax (so callers chain them through i2f/f2i and the
+    // arithmetic builtins below with no FP register-file involvement in the IR).
+    // Encoding notes (REX.W=48):
+    //   movq xmmN, rM  = 66 48 0F 6E modrm   (GP -> xmm, raw 64b)
+    //   movq rM, xmmN  = 66 48 0F 7E modrm   (xmm -> GP, raw 64b)
+    //   cvtsi2sd xmmN, rM = 48 F2 0F 2A modrm (int64 -> double)
+    //   cvttsd2si rM, xmmN = 48 F2 0F 2C modrm (double -> int64 truncate)
+    //   addsd/subsd/mulsd/divsd xmmD, xmmS = F2 0F 58/5C/59/5E modrm
+    if nl==3&&r8(nm)=='i'&&r8(nm+1)=='2'&&r8(nm+2)=='f' {  // i2f(x): int64 -> f64
+        flush_all()
+        eb(102); eb(242); eb(72); eb(15); eb(42); eb(199)  // 66 F2 48 0F 2A C7  cvtsi2sd xmm0, rdi
+        eb(102); eb(72); eb(15); eb(126); eb(192) // 66 48 0F 7E C0  movq rax, xmm0
+        w8(vfloat+irres(ii), 1)                    // mark result vreg as float
+        return 1
+    }
+    if nl==3&&r8(nm)=='f'&&r8(nm+1)=='2'&&r8(nm+2)=='i' {  // f2i(x): f64 -> int64 (trunc)
+        flush_all()
+        // The generic IR_CALL arg loader already placed the float bit-pattern in rdi
+        // (same path println's float body uses: `mov rax, rdi`). Use it directly.
+        eb(102); eb(72); eb(15); eb(110); eb(199) // 66 48 0F 6E C7  movq xmm0, rdi
+        eb(242); eb(72); eb(15); eb(44); eb(192)  // F2 48 0F 2C C0  cvttsd2si rax, xmm0
+        w8(vfloat+irres(ira2(ii)), 0)                // f2i result is int
+        return 1
+    }
+    if nl==6&&r8(nm)=='f'&&r8(nm+1)=='c'&&r8(nm+2)=='o'&&r8(nm+3)=='n'&&r8(nm+4)=='s'&&r8(nm+5)=='t' {  // fconst(M, scale): float literal = M/scale
+        // rdi = M (integer numerator), rsi = scale (10^fd, an integer that fits i64).
+        // Returns the IEEE-754 f64 bit-pattern of (double)M / (double)scale in rax,
+        // tagged float, so it flows through i2f/f2i and the println float body.
+        flush_all()
+        eb(102); eb(242); eb(72); eb(15); eb(42); eb(199)  // 66 F2 48 0F 2A C7  cvtsi2sd xmm0, rdi  (xmm0 = (double)M)
+        eb(102); eb(242); eb(72); eb(15); eb(42); eb(206)  // 66 F2 48 0F 2A C6  cvtsi2sd xmm1, rsi  (xmm1 = (double)scale)
+        eb(242); eb(15); eb(94); eb(193)                  // F2 0F 5E C1  divsd xmm0, xmm1  (xmm0 = M/scale)
+        eb(102); eb(72); eb(15); eb(126); eb(192)         // 66 48 0F 7E C0  movq rax, xmm0  (bits)
+        w8(vfloat+irres(ii), 1)                          // result vreg is float
+        return 1
+    }
+    if nl==4&&r8(nm)=='f'&&r8(nm+1)=='a'&&r8(nm+2)=='d'&&r8(nm+3)=='d' {  // fadd(a,b): int or float args -> int
+        flush_all()
+        // Args live at irres(ira2(ii)); ira2(ii)+1 for arg1 (arg records are chained).
+        let fa0=0; if ira1(ii)>=1 { if is_float_vr(irres(ira2(ii)))==1 { fa0=1 } }
+        let fa1=0; if ira1(ii)>=2 { if is_float_vr(irres(ira2(ii)+1))==1 { fa1=1 } }
+        if fa0==1 { eb(102); eb(72); eb(15); eb(110); eb(199) } else { eb(102); eb(242); eb(72); eb(15); eb(42); eb(199) } // movq xmm0,rdi : cvtsi2sd xmm0,rdi
+        if fa1==1 { eb(102); eb(72); eb(15); eb(110); eb(206) } else { eb(72); eb(242); eb(15); eb(42); eb(206) } // movq xmm1,rsi : cvtsi2sd xmm1,rsi
+        eb(242); eb(15); eb(88); eb(193)          // addsd xmm0, xmm1     (F2 0F 58 C1)
+        eb(242); eb(72); eb(15); eb(44); eb(192)  // cvttsd2si rax, xmm0  (48 F2 0F 2C C0)
+        return 1
+    }
+    if nl==4&&r8(nm)=='f'&&r8(nm+1)=='s'&&r8(nm+2)=='u'&&r8(nm+3)=='b' {  // fsub(a,b)
+        flush_all()
+        let fa0=0; if ira1(ii)>=1 { if is_float_vr(irres(ira2(ii)))==1 { fa0=1 } }
+        let fa1=0; if ira1(ii)>=2 { if is_float_vr(irres(ira2(ii)+1))==1 { fa1=1 } }
+        if fa0==1 { eb(102); eb(72); eb(15); eb(110); eb(199) } else { eb(102); eb(242); eb(72); eb(15); eb(42); eb(199) }
+        if fa1==1 { eb(102); eb(72); eb(15); eb(110); eb(206) } else { eb(72); eb(242); eb(15); eb(42); eb(206) }
+        eb(242); eb(15); eb(92); eb(193)          // subsd xmm0, xmm1
+        eb(242); eb(72); eb(15); eb(44); eb(192)
+        return 1
+    }
+    if nl==4&&r8(nm)=='f'&&r8(nm+1)=='m'&&r8(nm+2)=='u'&&r8(nm+3)=='l' {  // fmul(a,b)
+        flush_all()
+        let fa0=0; if ira1(ii)>=1 { if is_float_vr(irres(ira2(ii)))==1 { fa0=1 } }
+        let fa1=0; if ira1(ii)>=2 { if is_float_vr(irres(ira2(ii)+1))==1 { fa1=1 } }
+        if fa0==1 { eb(102); eb(72); eb(15); eb(110); eb(199) } else { eb(102); eb(242); eb(72); eb(15); eb(42); eb(199) }
+        if fa1==1 { eb(102); eb(72); eb(15); eb(110); eb(206) } else { eb(72); eb(242); eb(15); eb(42); eb(206) }
+        eb(242); eb(15); eb(89); eb(193)          // mulsd xmm0, xmm1
+        eb(242); eb(72); eb(15); eb(44); eb(192)
+        return 1
+    }
+    if nl==4&&r8(nm)=='f'&&r8(nm+1)=='d'&&r8(nm+2)=='i'&&r8(nm+3)=='v' {  // fdiv(a,b)
+        flush_all()
+        let fa0=0; if ira1(ii)>=1 { if is_float_vr(irres(ira2(ii)))==1 { fa0=1 } }
+        let fa1=0; if ira1(ii)>=2 { if is_float_vr(irres(ira2(ii)+1))==1 { fa1=1 } }
+        if fa0==1 { eb(102); eb(72); eb(15); eb(110); eb(199) } else { eb(102); eb(242); eb(72); eb(15); eb(42); eb(199) }
+        if fa1==1 { eb(102); eb(72); eb(15); eb(110); eb(206) } else { eb(72); eb(242); eb(15); eb(42); eb(206) }
+        eb(242); eb(15); eb(94); eb(193)          // divsd xmm0, xmm1
+        eb(242); eb(72); eb(15); eb(44); eb(192)
+        return 1
+    }
+    // P11: SIMD vec128 builtins (x86 SSE2, packed double). A vec128 is a 16-byte
+    // buffer = 2x f64; dst/a/b are POINTERS to such buffers. Args arrive in
+    // rdi(dst)/rsi(a)/rdx(b) from the IR_CALL arg load. We load 16 bytes into
+    // xmm0/xmm1 with movupd, do the packed-double op, store back. Result (dst)
+    // returned in rax for chaining. Encodings verified vs GNU as:
+    //   movupd xmm0,[rsi] = 66 0F 10 06 ; movupd xmm1,[rdx] = 66 0F 10 0A
+    //   movupd [rdi],xmm0 = 66 0F 11 07
+    //   addpd xmm0,xmm1 = 66 0F 58 C1 ; subpd = 66 0F 5C C1
+    //   mulpd = 66 0F 59 C1 ; divpd = 66 0F 5E C1
+    if nl==8&&r8(nm)=='v'&&r8(nm+1)=='e'&&r8(nm+2)=='c'&&r8(nm+3)=='_'&&r8(nm+4)=='l'&&r8(nm+5)=='o'&&r8(nm+6)=='a'&&r8(nm+7)=='d' {  // vec_load(dst,src): 16B copy
+        flush_all()
+        eb(102); eb(15); eb(16); eb(6)     // movupd xmm0, [rsi]
+        eb(102); eb(15); eb(17); eb(7)     // movupd [rdi], xmm0
+        eb(72); eb(137); eb(248)           // mov rax, rdi (return dst)
+        return 1
+    }
+    if nl==9&&r8(nm)=='v'&&r8(nm+1)=='e'&&r8(nm+2)=='c'&&r8(nm+3)=='_'&&r8(nm+4)=='s'&&r8(nm+5)=='t'&&r8(nm+6)=='o'&&r8(nm+7)=='r'&&r8(nm+8)=='e' {  // vec_store(dst,src)
+        flush_all()
+        eb(102); eb(15); eb(16); eb(6)     // movupd xmm0, [rsi]
+        eb(102); eb(15); eb(17); eb(7)     // movupd [rdi], xmm0
+        eb(72); eb(137); eb(248)           // mov rax, rdi (return dst)
+        return 1
+    }
+    if nl==7&&r8(nm)=='v'&&r8(nm+1)=='e'&&r8(nm+2)=='c'&&r8(nm+3)=='_'&&r8(nm+4)=='a'&&r8(nm+5)=='d'&&r8(nm+6)=='d' {  // vec_add(dst,a,b)
+        flush_all()
+        eb(102); eb(15); eb(16); eb(6)     // movupd xmm0, [rsi]
+        eb(102); eb(15); eb(16); eb(10)    // movupd xmm1, [rdx]
+        eb(102); eb(15); eb(88); eb(193)   // addpd xmm0, xmm1
+        eb(102); eb(15); eb(17); eb(7)     // movupd [rdi], xmm0
+        eb(72); eb(137); eb(248)           // mov rax, rdi (return dst)
+        return 1
+    }
+    if nl==7&&r8(nm)=='v'&&r8(nm+1)=='e'&&r8(nm+2)=='c'&&r8(nm+3)=='_'&&r8(nm+4)=='s'&&r8(nm+5)=='u'&&r8(nm+6)=='b' {  // vec_sub(dst,a,b)
+        flush_all()
+        eb(102); eb(15); eb(16); eb(6)     // movupd xmm0, [rsi]
+        eb(102); eb(15); eb(16); eb(10)    // movupd xmm1, [rdx]
+        eb(102); eb(15); eb(92); eb(193)   // subpd xmm0, xmm1
+        eb(102); eb(15); eb(17); eb(7)     // movupd [rdi], xmm0
+        eb(72); eb(137); eb(248)           // mov rax, rdi (return dst)
+        return 1
+    }
+    if nl==7&&r8(nm)=='v'&&r8(nm+1)=='e'&&r8(nm+2)=='c'&&r8(nm+3)=='_'&&r8(nm+4)=='m'&&r8(nm+5)=='u'&&r8(nm+6)=='l' {  // vec_mul(dst,a,b)
+        flush_all()
+        eb(102); eb(15); eb(16); eb(6)     // movupd xmm0, [rsi]
+        eb(102); eb(15); eb(16); eb(10)    // movupd xmm1, [rdx]
+        eb(102); eb(15); eb(89); eb(193)   // mulpd xmm0, xmm1
+        eb(102); eb(15); eb(17); eb(7)     // movupd [rdi], xmm0
+        eb(72); eb(137); eb(248)           // mov rax, rdi (return dst)
+        return 1
+    }
+    if nl==7&&r8(nm)=='v'&&r8(nm+1)=='e'&&r8(nm+2)=='c'&&r8(nm+3)=='_'&&r8(nm+4)=='d'&&r8(nm+5)=='i'&&r8(nm+6)=='v' {  // vec_div(dst,a,b)
+        flush_all()
+        eb(102); eb(15); eb(16); eb(6)     // movupd xmm0, [rsi]
+        eb(102); eb(15); eb(16); eb(10)    // movupd xmm1, [rdx]
+        eb(102); eb(15); eb(94); eb(193)   // divpd xmm0, xmm1
+        eb(102); eb(15); eb(17); eb(7)     // movupd [rdi], xmm0
+        eb(72); eb(137); eb(248)           // mov rax, rdi (return dst)
+        return 1
+    }
+    // vec_set(ptr, lane, val): write one f64 lane (lane 0/1). ptr=rdi, lane=rsi,
+    // val=rdx. addr = ptr + lane*8. Encodings: mov rax,rdi=48 89 F8;
+    // shl rsi,3=48 C1 E6 03; add rax,rsi=48 01 F0; mov [rax],rdx=48 89 10.
+    if nl==7&&r8(nm)=='v'&&r8(nm+1)=='e'&&r8(nm+2)=='c'&&r8(nm+3)=='_'&&r8(nm+4)=='s'&&r8(nm+5)=='e'&&r8(nm+6)=='t' {
+        flush_all()
+        eb(72); eb(137); eb(248)           // mov rax, rdi
+        eb(72); eb(193); eb(230); eb(3)    // shl rsi, 3
+        eb(72); eb(1); eb(240)             // add rax, rsi
+        eb(72); eb(137); eb(16)            // mov [rax], rdx
+        return 1
+    }
+    // vec_get(ptr, lane): read one f64 lane into rax. addr = ptr + lane*8.
+    // Encodings: mov rax,rdi=48 89 F8; shl rsi,3=48 C1 E6 03; add rax,rsi=48 01
+    // F0; mov rax,[rax]=48 8B 00.
+    if nl==7&&r8(nm)=='v'&&r8(nm+1)=='e'&&r8(nm+2)=='c'&&r8(nm+3)=='_'&&r8(nm+4)=='g'&&r8(nm+5)=='e'&&r8(nm+6)=='t' {
+        flush_all()
+        eb(72); eb(137); eb(248)           // mov rax, rdi
+        eb(72); eb(193); eb(230); eb(3)    // shl rsi, 3
+        eb(72); eb(1); eb(240)             // add rax, rsi
+        eb(72); eb(139); eb(0)             // mov rax, [rax]
+        return 1
+    }
+    // mem_alloc(n): G2 containers. Returns a header-carrying array:
+    //   [base] = n (element count); base+8 .. base+8+n*8 = n qwords.
+    //   Layout matches IR_TALLOC so a[i]/a[i]=v work.  arg0 (n) arrives in
+    //   rdi from the IR_CALL arg load (same path as mmap(64), which works).
+    if nl==9&&r8(nm)=='m'&&r8(nm+1)=='e'&&r8(nm+2)=='m'&&r8(nm+3)=='_'&&r8(nm+4)=='a'&&r8(nm+5)=='l'&&r8(nm+6)=='l'&&r8(nm+7)=='o'&&r8(nm+8)=='c' {
+        flush_all()
+        eb(72); eb(137); eb(251)        // mov rbx, rdi   (rbx = n, saved across hint-set + syscall)
+        eb(72); eb(137); eb(249)        // mov rcx, rdi   (rcx = n)
+        eb(72); eb(107); eb(201); eb(8)   // imul rcx, rcx, 8   (n*8)
+        eb(72); eb(131); eb(193); eb(8)   // add rcx, 8           (n*8+8 = len)
+        eb(72); eb(137); eb(206)         // mov rsi, rcx   (rsi = len)
+        eb(191); ei(0)          // mov edi, 0x60000001 (hint addr)
+        eb(186); ei(3)                   // mov edx, 3     (PROT_READ|WRITE)
+        eb(65); eb(186); ei(34)          // mov r10d, 0x22 (MAP_PRIVATE|ANON)
+        eb(65); eb(184); ei(0-1)         // mov r8d, -1    (fd)
+        eb(69); eb(49); eb(201)          // xor r9d, r9d   (offset=0)
+        eb(184); ei(9)                   // mov eax, 9
+        sysc()                           // rax = ptr
+        // FIX-0.0.1 (C1): MAP_FAILED guard. mmap returns -errno (<0) on failure;
+        // writing the count header to a kernel address would SIGSEGV (rc=139)
+        // instead of failing closed. Identical 3-instruction guard to the mmap
+        // builtin below: cmp rax,0; jge +12; mov edi,1; mov eax,60; syscall.
+        eb(72); eb(131); eb(248); eb(0)   // cmp rax, 0
+        eb(125); eb(12)                   // jge +12 (skip exit if rax >= 0)
+        eb(191); ei(1); eb(184); ei(60); eb(15); eb(5)  // mov edi,1; mov eax,60; syscall (exit 1)
+        eb(72); eb(137); eb(24)          // mov [rax], rbx   ([base] = n header; rbx preserved)
+        return 1
+    }
+    // malloc(n): C-style allocator returning pointer to n bytes (with 8-byte header at ptr).
+    // Calls mem_alloc((n+7)/8) internally. Returns ptr (caller uses ptr+8 for data).
+    if nl==6&&r8(nm)=='m'&&r8(nm+1)=='a'&&r8(nm+2)=='l'&&r8(nm+3)=='l'&&r8(nm+4)=='o'&&r8(nm+5)=='c' {
+        flush_all()
+        // rdi = n (bytes). Compute qword count: (n+7)>>3
+        eb(72); eb(131); eb(199); eb(7)   // add rdi, 7   (n+7)
+        eb(72); eb(193); eb(230); eb(3)   // shr rdi, 3   ((n+7)/8)
+        // Now rdi = qword count. Fall through to mem_alloc logic.
+        eb(72); eb(137); eb(251)        // mov rbx, rdi   (rbx = qcount, saved across syscall)
+        eb(72); eb(137); eb(249)        // mov rcx, rdi   (rcx = qcount)
+        eb(72); eb(107); eb(201); eb(8)   // imul rcx, rcx, 8   (qcount*8)
+        eb(72); eb(131); eb(193); eb(8)   // add rcx, 8           (qcount*8+8 = len)
+        eb(72); eb(137); eb(206)         // mov rsi, rcx   (rsi = len)
+        eb(191); ei(0x60000001)          // mov edi, 0x60000001 (hint addr)
+        eb(186); ei(3)                   // mov edx, 3     (PROT_READ|WRITE)
+        eb(65); eb(186); ei(34)          // mov r10d, 0x22 (MAP_PRIVATE|ANON)
+        eb(65); eb(184); ei(0-1)         // mov r8d, -1    (fd)
+        eb(69); eb(49); eb(201)          // xor r9d, r9d   (offset=0)
+        eb(184); ei(9)                   // mov eax, 9
+        sysc()                           // rax = ptr
+        // FIX-0.0.1 (C1): MAP_FAILED guard
+        eb(72); eb(131); eb(248); eb(0)   // cmp rax, 0
+        eb(125); eb(12)                   // jge +12 (skip exit if rax >= 0)
+        eb(191); ei(1); eb(184); ei(60); eb(15); eb(5)  // mov edi,1; mov eax,60; syscall (exit 1)
+        eb(72); eb(137); eb(24)          // mov [rax], rbx   ([base] = qcount header; rbx preserved)
+        return 1
+    }
+    // 0.0.111: mem_free(ptr) — push block onto free-list at HEAP_CTRL.
+    // (Deferred reuse: mem_alloc left UNCHANGED to keep emitted bytes stable -> fixpoint-safe.)
+    //   [ptr+8] = [HEAP_CTRL];  [HEAP_CTRL] = ptr
+    if nl==8&&r8(nm)=='m'&&r8(nm+1)=='e'&&r8(nm+2)=='m'&&r8(nm+3)=='_'&&r8(nm+4)=='f'&&r8(nm+5)=='r'&&r8(nm+6)=='e'&&r8(nm+7)=='e' {
+        // Match proven realloc pattern: flush_all() FIRST, then push rdi (ptr).
+        // Reference ptr via a callee-saved reg (rbx) since flush_all may clobber
+        // scratch. [ptr+8] = [HEAP_CTRL]; [HEAP_CTRL] = ptr.
+        flush_all()
+        eb(87)                                    // push rdi  (save ptr at [rsp])
+        eb(91)                                    // pop rbx   (rbx = ptr, callee-saved)
+        // FIX-0.0.3: null-guard. mem_free(0) must be a clean no-op, not a write
+        // to address 8 (SIGSEGV). test rbx,rbx; jz +20 skips the 20-byte push
+        // sequence (8 + 4 + 8) straight to the rax=0 return.
+        eb(72); eb(137); eb(219)                  // test rbx, rbx   (48 85 DB)
+        eb(116); eb(20)                           // jz +20 (skip push if ptr==0)
+        eb(72); eb(139); eb(4); eb(37); ei(HEAP_CTRL)   // mov rax, [HEAP_CTRL]  (old head)
+        eb(72); eb(137); eb(91); eb(8)                 // mov [rbx+8], rax  ([ptr+8] = old head)  48 89 58 08
+        eb(72); eb(137); eb(27); eb(37); ei(HEAP_CTRL) // mov [HEAP_CTRL], rbx  (list head = ptr)  48 89 1C 25 imm32
+        ri(R_RAX, 0)                              // rax = 0  (clean return value)
+        return 1
+    }
+    // 0.0.111: mem_realloc(ptr, newn) — new block via mmap(len=newn*8+8),
+    //   copy min(old_count=[ptr], newn) qwords old+8 -> new+8 via rep movsq,
+    //   return new. (Free-list recycling deferred; mem_alloc unchanged ->
+    //   fixpoint-safe. The old block is simply leaked here; full GC later.)
+    //   args: rdi=ptr, rsi=newn. returns new in rax.
+    //   Uses callee-saved regs (rbx=ptr, r12=newn, r13=new) and the emitter's
+    //   safe move helpers (no hand-encoded eb bytes) so it is hoist-safe.
+    if nl==11&&r8(nm)=='m'&&r8(nm+1)=='e'&&r8(nm+2)=='m'&&r8(nm+3)=='_'&&r8(nm+4)=='r'&&r8(nm+5)=='e'&&r8(nm+6)=='a'&&r8(nm+7)=='l'&&r8(nm+8)=='l'&&r8(nm+9)=='o'&&r8(nm+10)=='c' {
+        flush_all()
+        rr(R_RBX, R_RDI)        // rbx = ptr (callee-saved)
+        rr(R_R12, R_RSI)        // r12 = newn (callee-saved)
+        rr(R_RSI, R_R12)        // rsi = newn
+        rshl(R_RSI, 3)          // rsi *= 8   (newn*8)
+        eb(72); eb(131); eb(198); eb(8)   // add rsi, 8   (newn*8+8)
+        ri(R_RDI, 0x60000001)   // edi = hint addr
+        ri(R_RDX, 3)            // edx = PROT_READ|WRITE
+        ri(R_R10, 0x22)         // r10d = MAP_PRIVATE|ANON
+        ri(R_R8, -1)            // r8d = fd -1
+        ri(R_R9, 0)             // r9d = offset 0
+        ri(R_RAX, 9)            // eax = 9 (mmap)
+        sysc()                  // rax = new block
+        // FIX-0.0.1 (C1): MAP_FAILED guard — identical to mem_alloc/mmap above.
+        eb(72); eb(131); eb(248); eb(0)   // cmp rax, 0
+        eb(125); eb(12)                   // jge +12 (skip exit if rax >= 0)
+        eb(191); ei(1); eb(184); ei(60); eb(15); eb(5)  // mov edi,1; mov eax,60; syscall (exit 1)
+        rr(R_R13, R_RAX)        // r13 = new (callee-saved)
+        // FIX-0.0.2: write the new block's count header [new] = newn. Without
+        // this, a[i] bounds checks (idx_trap_emit cmp [rax],rcx) read a stale
+        // or garbage length -> bounds-check bypass on OOB indices.
+        stx(R_R13, 0, R_R12)    // mov [r13+0], r12  ([new] = newn)
+        ldx(R_RCX, R_RBX, 0)    // rcx = old_count = [ptr]
+        rr(R_RDX, R_R12)        // rdx = newn
+        rcmp(R_RCX, R_RDX)      // cmp rdx, rcx  (newn vs old_count)
+        jcc32(5, 3)             // JGE (newn>=old_count) -> skip next (rcx stays old_count)
+        rr(R_RCX, R_RDX)        // rcx = newn   (rcx = min)
+        rr(R_RDI, R_R13)        // rdi = new
+        eb(72); eb(131); eb(199); eb(8)   // add rdi, 8   (new+8)
+        rr(R_RSI, R_RBX)        // rsi = ptr
+        eb(72); eb(131); eb(198); eb(8)   // add rsi, 8   (ptr+8)
+        eb(252)                  // cld
+        eb(243); eb(72); eb(165) // rep movsq  (copy min qwords)
+        rr(R_RAX, R_R13)        // rax = new
+        return 1
+    }
+    // 0.0.112: drop(ptr) — destructor hook. For a mem_alloc-owned heap pointer
+    // this recycles the block to the free-list (same op as mem_free). Emitted
+    // identically to mem_free so the two share one code path. RAII default:
+    // owned bindings auto-call drop() at scope exit (see owned_scope_pop_one).
+    if nl==4&&r8(nm)=='d'&&r8(nm+1)=='r'&&r8(nm+2)=='o'&&r8(nm+3)=='p' {
+        flush_all()
+        eb(87)                                    // push rdi  (save ptr at [rsp])
+        eb(91)                                    // pop rbx   (rbx = ptr, callee-saved)
+        // FIX-0.0.3: null-guard (same as mem_free). drop(0) = clean no-op.
+        eb(72); eb(137); eb(219)                  // test rbx, rbx   (48 85 DB)
+        eb(116); eb(20)                           // jz +20 (skip push if ptr==0)
+        eb(72); eb(139); eb(4); eb(37); ei(HEAP_CTRL)   // mov rax, [HEAP_CTRL]  (old head)
+        eb(72); eb(137); eb(91); eb(8)                 // mov [rbx+8], rax  ([ptr+8] = old head)  48 89 58 08
+        eb(72); eb(137); eb(27); eb(37); ei(HEAP_CTRL) // mov [HEAP_CTRL], rbx  (list head = ptr)  48 89 1C 25 imm32
+        ri(R_RAX, 0)                               // rax = 0  (clean return value)
+        return 1
+    }
+    // 0.0.113: rsp() -> rax = current rsp (stack layout discovery builtin).
+    // Permanent debug builtin (FIX-0.0.11): emitted as `mov rax, rsp`.
+    if nl==3&&r8(nm)=='r'&&r8(nm+1)=='s'&&r8(nm+2)=='p' {
+        flush_all()
+        eb(72); eb(137); eb(224)   // mov rax, rsp  (48 89 E0)  [FIX-0.0.31: was eb(228)=0xE4=mov rsp,rsp (no-op)]
+        return 1
+    }
+    // 0.0.113: stack_trace() -> rax = immediate caller return address.
+    // Each Quanta function uses a SysV-style prologue (push rbp; mov rsp,rbp;
+    // push callee-saved; sub $frame,rsp), so rbp is the live frame base. The
+    // return address the enclosing function will resume at lives at [rbp+8]
+    // (rbp itself holds the saved caller rbp; +8 is the slot the CALL pushed).
+    // Reading [rbp+8] of the *executing* frame is the immediate caller return
+    // address, and it is safe (within the mapped frame). No per-call
+    // instrumentation, so this is fixpoint-safe. Single-level unwind.
+    if nl==11&&r8(nm)=='s'&&r8(nm+1)=='t'&&r8(nm+2)=='a'&&r8(nm+3)=='c'&&r8(nm+4)=='k'&&r8(nm+5)=='_'&&r8(nm+6)=='t'&&r8(nm+7)=='r'&&r8(nm+8)=='a'&&r8(nm+9)=='c'&&r8(nm+10)=='e' {
+        flush_all()
+        // FIX-0.0.7: [rbp+8] is only a valid return address inside a ci_func
+        // body (push-rbp prologue). In entry/_start context rbp=argv, so reading
+        // [rbp+8] would yield argv[1], not a code pointer. Degrade to rax=0.
+        if g_in_frame==1 {
+            rbp(0, 8)                        // rax = [rbp+8] = immediate caller return address
+        } else {
+            ri(0, 0)                         // rax = 0 (no frame)
+        }
+        return 1
+    }
+    // 0.0.120: stack_frames() -> rax = qword-array header of return addresses
+    // (full stack unwind). Walks the SysV rbp frame chain from the executing
+    // frame: each frame's return address is [rbp+8]; the saved caller rbp is
+    // [rbp]; following [rbp] walks to the caller until the entry frame, whose
+    // [rbp+8] is NOT a code pointer (entry set rbp=argv) so it stops. A candidate
+    // return address is accepted only if CODE_VBASE(0x400000) <= ra < g_code_end;
+    // otherwise the walk terminates (defends against argv/garbage frames). No
+    // per-call instrumentation, so fixpoint-safe. Capacity capped at 64 frames.
+    // Array layout matches str_split: [arr]=count, element i at [arr+8+i*8].
+    if nl==12&&r8(nm)=='s'&&r8(nm+1)=='t'&&r8(nm+2)=='a'&&r8(nm+3)=='c'&&r8(nm+4)=='k'&&r8(nm+5)=='_'&&r8(nm+6)=='f'&&r8(nm+7)=='r'&&r8(nm+8)=='a'&&r8(nm+9)=='m'&&r8(nm+10)=='e'&&r8(nm+11)=='s' {
+        flush_all()
+        // r11 = frame base = current rbp
+        // r14 = capacity = 64
+        ri(14, 64)                      // r14 = 64
+        // r13 = count = 0
+        rxor(13, 13)                    // r13 = 0
+        // allocate array: size = cap*8 + 8  (rdi = cap<<3 + 8)
+        rr(7, 14); eb(72); eb(193); eb(231); eb(3)   // rdi = r14 << 3  (cap*8)
+        eb(72); eb(131); eb(199); eb(8)             // rdi += 8  (header)
+        rr(6, 7)                        // rsi = size
+        ri(0, 9); ri(2, 3); ri(10, 0x22); ri(8, 0-1); ri(9, 0); sysc()  // rax = arr (mmap)
+        rr(12, 0)                       // r12 = arr
+        rr(11, 5)                       // mov r11, rbp  (reload AFTER mmap clobbers r11)
+        rr(7, 12); smov(7, 13)          // [arr] = count (0)
+        rr(15, 12)                      // r15 = arr
+        eb(73); eb(131); eb(199); eb(8) // add r15, 8  (49 83 C7 08 = add r15,8; write ptr = arr+8)
+        // r9 = CODE_VBASE lower bound (0x400000)
+        ri(9, 4194304)                  // r9 = 0x400000
+        // load g_code_end (internal global 41) into r10 via RIP-relative + gpatch
+        let rd10 = 10
+        let rex10 = 72; if rd10 >= 8 { rex10 = 76 }
+        eb(rex10); eb(139); eb(5 + (rd10%8)*8); ei(0)
+        let ce_pofs = codelen - 4
+        w64(gpatches+gpatchc*24, ce_pofs); w64(gpatches+gpatchc*24+8, g_code_end); w8(gpatches+gpatchc*24+16, 0)
+        if gpatchc >= GPATCH_CAP { emit_ovf() }; gpatchc = gpatchc + 1
+        // --- walk loop ---
+        let f_loop = nl(); let f_done = nl()
+        lbladd(f_loop, codelen)
+        // guard: a real frame pointer is always high (≫ 4KB). The entry stub sets
+        // rbp = argv (a low relocated-stack base like 0x202); stop before deref.
+        eb(73); eb(129); eb(251); ei(4096)   // cmp r11, 0x1000  (49 81 FB 00 10 00 00)
+        let pfl = codelen; jb32(0); emit_patch(pfl, f_done, 1)   // jb done (r11 < 0x1000: not a frame)
+        // if count == cap -> done (no overflow)
+        rcmp(13, 14); let pfull = codelen; jcc32(5, 0); emit_patch(pfull, f_done, 1)  // jge done (count>=cap)
+        // rax = [r11+8] = return address of current frame
+        lbase(8, 0)                      // mov rax, [r11+8]
+        // lower bound: if rax < 0x400000 -> done
+        rcmp(0, 9); let plb = codelen; jb32(0); emit_patch(plb, f_done, 1)   // jb done (rax < CODE_VBASE)
+        // upper bound: if g_code_end < rax -> done  (cmp g_code_end, rax; jb done)
+        rcmp(10, 0); let pub = codelen; jb32(0); emit_patch(pub, f_done, 1)  // jb done (g_code_end < rax)
+        // store rax at [r15]; advance write ptr
+        wmr(15, 0)                       // mov [r15], rax
+        eb(73); eb(131); eb(199); eb(8) // add r15, 8  (49 83 C7 08 = add r15,8; advance write ptr)
+        // advance frame: r11 = [r11] (saved caller rbp)
+        rmr(11, 11)                      // mov r11, [r11]
+        // count++
+        eb(73); eb(255); eb(197)        // inc r13 (49 FF C5 = inc r13)
+        let plj = codelen; jmp32(0); emit_patch(plj, f_loop, 0)
+        // --- done ---
+        lbladd(f_done, codelen)
+        rr(7, 12); smov(7, 13)          // [arr] = count (final)
+        rr(0, 12)                        // rax = arr (return value)
+        return 1
+    }
+    // mk_any(tag, val): t9 generics primitive. Returns a STACK-LOCAL 2-tuple
+    // (ptr, len=16); [ptr]=tag, [ptr+8]=val. Caller may copy it (w64) if it
+    // must outlive this frame (tuple/return semantics handle the copy).
+    if nl==6&&r8(nm)=='m'&&r8(nm+1)=='k'&&r8(nm+2)=='_'&&r8(nm+3)=='a'&&r8(nm+4)=='n'&&r8(nm+5)=='y' {
+        // mk_any(tag, val): allocate a 16-byte tagged tuple via mmap and store
+        // (tag, val). Args arrive in rdi=tag, rsi=val (loaded by IR_CALL).
+        // SYSCALL clobbers r11/rcx, and any other register may be reused or
+        // clobbered by an interleaved helper call. The only spill guaranteed
+        // safe across the syscall AND any call is the stack, so push tag/val,
+        // do the mmap, pop into scratch, and store.
+        eb(87)                            // push rdi   (save tag)
+        eb(86)                            // push rsi   (save val)
+        ri(7, 16)                          // rdi = 16 bytes
+        eb(72); eb(137); eb(254)          // mov rsi, rdi   (len)
+        eb(191); ei(0)          // mov edi, 0x60000000 (hint addr)
+        eb(186); ei(3)                    // mov edx, 3     (PROT_READ|WRITE)
+        eb(65); eb(186); ei(34)           // mov r10d, 0x22 (MAP_PRIVATE|ANON)
+        eb(65); eb(184); ei(0-1)          // mov r8d, -1    (fd)
+        eb(69); eb(49); eb(201)           // xor r9d, r9d   (offset=0)
+        eb(184); ei(9)                    // mov eax, 9
+        sysc()                            // rax = ptr to 16-byte buffer
+        eb(90)                            // pop rdx    (val)
+        eb(89)                            // pop rcx    (tag)
+        eb(72); eb(137); eb(8)            // 48 89 08 = mov [rax], rcx   (tag)
+        eb(72); eb(137); eb(80); eb(8)    // 48 89 50 08 = mov [rax+8], rdx  (val)
+        return 1                          // result (ptr) already in rax -> IR_CALL saves it
+    }
+    if nl==4&&r8(nm)=='m'&&r8(nm+1)=='m'&&r8(nm+2)=='a'&&r8(nm+3)=='p' {
+        eb(72); eb(137); eb(254)      // mov rsi, rdi   (len)
+        eb(191); ei(0)          // mov edi, 0x60000001 (hint addr)
+        eb(186); ei(3)                // mov edx, 3     (PROT_READ|WRITE)
+        eb(65); eb(186); ei(34)       // mov r10d, 0x22 (MAP_PRIVATE|ANON)
+        eb(65); eb(184); ei(0-1)      // mov r8d, -1    (fd)
+        eb(69); eb(49); eb(201)       // xor r9d, r9d   (offset=0)
+        eb(184); ei(9)                // mov eax, 9
+        sysc()
+        // P6.2: mmap failure guard. Negative rax (-errno) = mapping failed.
+        eb(72); eb(131); eb(248); eb(0)   // cmp rax, 0
+        eb(125); eb(12)                   // jge +12 (skip abort if rax >= 0; fall through to abort if rax < 0)
+        eb(191); ei(1); eb(184); ei(60); eb(15); eb(5)  // mov edi,1; mov eax,60; syscall (exit 1)
+        return 1
+    }
+    // --- memory ops: memcpy / memcmp / memmove / realloc (placed BEFORE the mem_ block;
+    //     checks placed after the mem_ block fail to dispatch in this compiler) ---
+    if nl==5&&r8(nm)=='b'&&r8(nm+1)=='s'&&r8(nm+2)=='w'&&r8(nm+3)=='a'&&r8(nm+4)=='p' {
+        flush_all(); eb(72); eb(137); eb(248); eb(72); eb(15); eb(200); return 1
+    }    if nl==8&&r8(nm)=='p'&&r8(nm+1)=='o'&&r8(nm+2)=='p'&&r8(nm+3)=='c'&&r8(nm+4)=='o'&&r8(nm+5)=='u'&&r8(nm+6)=='n'&&r8(nm+7)=='t' {
+        flush_all(); eb(72); eb(248); eb(243); eb(72); eb(15); eb(184); eb(192); return 1
+    }    if nl==3&&r8(nm)=='c'&&r8(nm+1)=='l'&&r8(nm+2)=='z' {
+        flush_all(); eb(72); eb(248); eb(243); eb(72); eb(15); eb(189); eb(192); return 1
+    }    if nl==3&&r8(nm)=='c'&&r8(nm+1)=='t'&&r8(nm+2)=='z' {
+        flush_all(); eb(72); eb(248); eb(243); eb(72); eb(15); eb(188); eb(192); return 1
+    }    if nl==4&&r8(nm)=='r'&&r8(nm+1)=='o'&&r8(nm+2)=='t'&&r8(nm+3)=='l' {
+        flush_all(); eb(72); eb(137); eb(241); eb(72); eb(211); eb(192); return 1
+    }    if nl==4&&r8(nm)=='r'&&r8(nm+1)=='o'&&r8(nm+2)=='t'&&r8(nm+3)=='r' {
+        flush_all(); eb(72); eb(137); eb(241); eb(72); eb(211); eb(200); return 1
+    }
+    // 0.0.107: bit/byte extras. args arrive in rdi/rsi/rdx from IR_CALL;
+    // result left in rax (caller-saved; IR_CALL saves it into the dest vreg).
+    if nl==6&&r8(nm)=='p'&&r8(nm+1)=='a'&&r8(nm+2)=='r'&&r8(nm+3)=='i'&&r8(nm+4)=='t'&&r8(nm+5)=='y' {
+        flush_all()
+        rbp(0, spill_home(irres(ira2(ii))))   // rax = x (arg0, from its spill home)
+        rtest(0,0)                    // test rax,rax  (sets PF: 1 if EVEN #bits)
+        eb(15); eb(154); mr(3,0,2)    // setp dl  (dl = PF)
+        eb(15); eb(182); mr(3,0,2)    // movzx eax, dl   (0F B6 C2) -> parity raw (1=even)
+        eb(72); eb(129); mr(3,6,0); ei(1)   // xor eax,1 -> parity = 1 if ODD #bits
+        return 1
+    }
+    if nl==8&&r8(nm)=='b'&&r8(nm+1)=='i'&&r8(nm+2)=='t'&&r8(nm+3)=='f'&&r8(nm+4)=='i'&&r8(nm+5)=='e'&&r8(nm+6)=='l'&&r8(nm+7)=='d' {
+        // bitfield(x, off, wid) = (x >> off) & ((1<<wid)-1). wid in [1..63].
+        // NOTE (documented): wid==64 -> (1<<(64&63))-1 = 0 -> result 0 (exception).
+        // Args loaded from their spill homes (register-alloc independent).
+        flush_all()
+        rbp(0, spill_home(irres(ira2(ii))))      // rax = x (arg0)
+        rbp(1, spill_home(irres(ira2(ii)+1)))    // rcx = off (arg1)
+        rshr(0,1)                     // rax = x >> off   (shr rax, cl)
+        rbp(1, spill_home(irres(ira2(ii)+2)))    // rcx = wid (arg2)
+        ri(2,1)                       // rdx = 1
+        eb(72); eb(211); mr(3,4,2)    // shl rdx, cl  -> rdx = 1 << wid
+        eb(72); eb(129); mr(3,5,2); ei(1)   // rdx = rdx - 1  (mask = (1<<wid)-1)
+        rand(0,2)                     // rax = rax & rdx
+        return 1
+    }
+    if nl==7&&r8(nm)=='b'&&r8(nm+1)=='s'&&r8(nm+2)=='w'&&r8(nm+3)=='a'&&r8(nm+4)=='p'&&r8(nm+5)=='1'&&r8(nm+6)=='6' {
+        // bswap16(x): mask to 16 bits then swap the 2 bytes (xchg al, ah).
+        flush_all()
+        rbp(0, spill_home(irres(ira2(ii))))   // rax = x
+        eb(72); eb(129); mr(3,4,0); ei(0xFFFF)   // and rax, 0xFFFF  (low 16 bits; /4 = AND)
+        eb(134); mr(3,0,4)            // xchg al, ah  (0x86 /r modrm(11,0,4)=0xC4)
+        return 1
+    }
+    if nl==7&&r8(nm)=='b'&&r8(nm+1)=='s'&&r8(nm+2)=='w'&&r8(nm+3)=='a'&&r8(nm+4)=='p'&&r8(nm+5)=='3'&&r8(nm+6)=='2' {
+        // bswap32(x): bswap eax (32-bit byte swap, zero-extends to rax).
+        flush_all(); rbp(0, spill_home(irres(ira2(ii)))); eb(15); eb(200); return 1   // 0F C8 = bswap eax
+    }
+    if nl==7&&r8(nm)=='b'&&r8(nm+1)=='s'&&r8(nm+2)=='w'&&r8(nm+3)=='a'&&r8(nm+4)=='p'&&r8(nm+5)=='6'&&r8(nm+6)=='4' {
+        // bswap64(x): bswap rax.
+        flush_all(); rbp(0, spill_home(irres(ira2(ii)))); eb(72); eb(15); eb(200); return 1   // 48 0F C8 = bswap rax
+    }
+    // memcpy(dst, src, n): forward rep movsb.  m-e-m-c-p-y
+    if nl==6&&r8(nm)=='m'&&r8(nm+1)=='e'&&r8(nm+2)=='m'&&r8(nm+3)=='c'&&r8(nm+4)=='p'&&r8(nm+5)=='y' {
+        flush_all()
+        eb(87)                            // push rdi (save dst)
+        rr(1,2)                          // rcx = rdx (n)
+        eb(252)                          // cld
+        eb(243); eb(164)                 // rep movsb
+        eb(89)                           // pop rax (dst = return)
+        return 1
+    }
+    // memcmp(a, b, n): repe cmpsb, return <0/0/>0.  m-e-m-c-m-p
+    if nl==6&&r8(nm)=='m'&&r8(nm+1)=='e'&&r8(nm+2)=='m'&&r8(nm+3)=='c'&&r8(nm+4)=='m'&&r8(nm+5)=='p' {
+        flush_all()
+        eb(87)                            // push rdi (save a; balance stack)
+        ri(0,0)                           // rax = 0 (default: equal)
+        rr(1,2)                          // rcx = rdx (n)
+        eb(252)                          // cld
+        eb(243); eb(166)                 // repe cmpsb (f3 a6)
+        jcc32(0,14)                      // JE -> skip diff calc (14 bytes)
+        eb(138); eb(71); eb(255)         // mov al, [rdi-1]   (8A 47 FF)
+        eb(138); eb(94); eb(255)         // mov bl, [rsi-1]   (8A 5E FF)
+        eb(15); eb(182); eb(192)         // movzx eax, al     (0F B6 C0)
+        eb(15); eb(182); eb(219)         // movzx ebx, bl     (0F B6 DB)
+        eb(41); eb(216)                  // sub eax, ebx      (29 D8)  [32-bit diff]
+        eb(72); eb(152)                  // cdqe               (48 98)  sign-extend eax->rax
+        eb(89)                           // pop rdx (balance)
+        return 1                         // rax = signed diff (or 0 if equal)
+    }
+    // memmove(dst, src, n): direction-aware copy.  m-e-m-m-o-v-e
+    if nl==7&&r8(nm)=='m'&&r8(nm+1)=='e'&&r8(nm+2)=='m'&&r8(nm+3)=='m'&&r8(nm+4)=='o'&&r8(nm+5)=='v'&&r8(nm+6)=='e' {
+        flush_all()
+        eb(87)                            // push rdi (save dst)
+        eb(72); eb(57); eb(247)          // cmp rdi, rsi (48 39 F7)
+        jcc32(4,11)                      // JA dst>src -> skip forward, do backward (11 bytes)
+        // FORWARD:
+        eb(252)                          // cld
+        rr(1,2)                          // rcx = rdx (n)
+        eb(243); eb(164)                 // rep movsb
+        jmp32(21)                        // skip backward block (21 bytes)
+        // BACKWARD:
+        eb(253)                          // std
+        eb(72); eb(1); eb(215)           // add rdi, rdx (48 01 D7)  rdi = dst+n
+        eb(72); eb(131); eb(239); eb(1)  // sub rdi, 1    (48 83 EF 01) rdi = dst+n-1
+        eb(72); eb(1); eb(214)           // add rsi, rdx (48 01 D6)  rsi = src+n
+        eb(72); eb(131); eb(238); eb(1)  // sub rsi, 1    (48 83 EE 01) rsi = src+n-1
+        rr(1,2)                          // rcx = rdx (n)
+        eb(243); eb(164)                 // rep movsb
+        eb(252)                          // cld (restore)
+        eb(89)                           // pop rax (dst = return)
+        return 1
+    }
+    // realloc(old_ptr, old_n, new_n): mmap new (new_n*8+8), copy min(old_n,new_n)*8
+    //   bytes old+8 -> new+8 via forward rep movsb, munmap old (old_n*8+8), return new.
+    if nl==7&&r8(nm)=='r'&&r8(nm+1)=='e'&&r8(nm+2)=='a'&&r8(nm+3)=='l'&&r8(nm+4)=='l'&&r8(nm+5)=='o'&&r8(nm+6)=='c' {
+        flush_all()
+        eb(82)                            // push rdx  ([rsp+16]=new_n)
+        eb(86)                            // push rsi  ([rsp+8]=old_n)
+        eb(87)                            // push rdi  ([rsp]=old)
+        // new_len = new_n*8+8 -> rsi
+        eb(72); eb(139); eb(116); eb(36); eb(16)   // mov rsi, [rsp+16]  (new_n)  [rsp needs SIB 0x24]
+        eb(72); eb(193); eb(230); eb(3)   // shl rsi, 3  (new_n*8)        48 C1 E6 03
+        eb(72); eb(131); eb(198); eb(8)   // add rsi, 8   (new_n*8+8)     48 83 C6 08
+        eb(191); ei(0)           // mov edi, 0x60000001
+        eb(186); ei(3)                    // mov edx, 3
+        eb(65); eb(186); ei(34)           // mov r10d, 0x22
+        eb(65); eb(184); ei(0-1)          // mov r8d, -1
+        eb(69); eb(49); eb(201)           // xor r9d, r9d
+        eb(184); ei(9)                    // mov eax, 9
+        sysc()                            // rax = new
+        rr(3,0)                           // rbx = new (preserve)
+        // copy count = min(old_n, new_n), then *8 -> rcx
+        eb(72); eb(139); eb(76); eb(36); eb(8)   // mov rcx, [rsp+8]   (old_n)  48 8B 4C 24 08
+        eb(72); eb(139); eb(84); eb(36); eb(16)  // mov rdx, [rsp+16]  (new_n)  48 8B 54 24 10
+        eb(72); eb(57); eb(209)           // cmp rdx, rcx  (new_n vs old_n)  48 39 D1
+        jcc32(5,7)                        // JGE (new_n>=old_n) -> skip mov rcx,[rsp+16] (rcx stays old_n=min)
+        eb(72); eb(139); eb(76); eb(36); eb(16)   // mov rcx, [rsp+16]  (new_n)  [7 bytes]  48 8B 4C 24 10
+        eb(72); eb(193); eb(225); eb(3)   // shl rcx, 3  (count*8)  48 C1 E1 03
+        // rdi = new+8, rsi = old+8
+        eb(72); eb(141); eb(120); eb(8)   // lea rdi, [rax+8]  48 8D 78 08
+        eb(72); eb(139); eb(116); eb(36); eb(0)   // mov rsi, [rsp]  (old)  48 8B 74 24 00
+        eb(72); eb(141); eb(118); eb(8)   // lea rsi, [rsi+8]  48 8D 76 08
+        eb(252)                           // cld
+        eb(243); eb(164)                  // rep movsb
+        // munmap(old, old_n*8+8)
+        eb(72); eb(139); eb(116); eb(36); eb(0)   // mov rsi, [rsp]  (old)  48 8B 74 24 00
+        eb(72); eb(137); eb(247)          // mov rdi, rsi  (rdi=old)  48 89 F7
+        eb(72); eb(139); eb(116); eb(36); eb(8)   // mov rsi, [rsp+8]  (old_n)  48 8B 74 24 08
+        eb(72); eb(193); eb(230); eb(3)   // shl rsi, 3  (old_n*8)  48 C1 E6 03
+        eb(72); eb(131); eb(198); eb(8)   // add rsi, 8  (old_n*8+8)  48 83 C6 08
+        eb(184); ei(11)                   // mov eax, 11 (munmap)
+        sysc()
+        rr(0,3)                           // rax = rbx (new)
+        eb(89); eb(94); eb(95)             // pop rdx, pop rsi, pop rdi (balance 3 pushes)
+        return 1
+    }
+    // mem_load / mem_load8 / mem_store / mem_store8
+    if nl>=8&&r8(nm)=='m'&&r8(nm+1)=='e'&&r8(nm+2)=='m'&&r8(nm+3)=='_' {
+        flush_all()   // memory builtins clobber rdi/rsi/rax; spill live vregs first
+        if r8(nm+4)=='l' {
+            if nl==9 { eb(72); eb(15); eb(182); eb(7); return 1 }  // mem_load8: movzx rax,byte[rdi]
+            eb(72); eb(139); eb(7); return 1                       // mem_load:  mov rax,[rdi]
+        }
+        if r8(nm+4)=='s' {
+            if nl==10 { 
+                eb(72); eb(133); eb(255)       // test rdi, rdi
+                eb(116); eb(3)                 // jz +3 (skip the store when rdi==0)
+                eb(64); eb(136); eb(55)        // mov [rdi], sil
+                eb(72); eb(137); eb(240)       // mov rax, rsi  (return value)
+                return 1 
+            }        // mem_store8 (inline): null-guarded store, no ret
+            eb(72); eb(137); eb(55); return 1                      // mem_store:  mov [rdi],rsi
+        }
+    }
+    // Fallback to emit_bltn2 to keep each dispatch fn under the size ceiling.
+    if emit_bltn2(nmi,nl,ii)==1 { return 1 }
+    return 0
+}
+fn emit_bltn2(nmi,nl,ii) {
+    let nm=src+nmi
+    // 0.0.68: user functions win over builtins here too, with the same
+    // primitive-intrinsic exception (see emit_bltn).
+    if is_prim_intrin(nmi,nl)==0 {
+        if findfn(nmi,nl)>=0 { return 0 }
+    }
+
+    // file_open / file_read / file_write / file_close
+    if nl>=8&&r8(nm)=='f'&&r8(nm+1)=='i'&&r8(nm+2)=='l'&&r8(nm+3)=='e'&&r8(nm+4)=='_' {
+        // Full-name dispatch FIRST for names whose 6th char collides with read/close:
+        if nl==10&&r8(nm+5)=='c'&&r8(nm+6)=='h'&&r8(nm+7)=='d'&&r8(nm+8)=='i'&&r8(nm+9)=='r' { eb(184); ei(80); sysc(); return 1 }   // chdir(path)  sc 80
+        if nl==11&&r8(nm+5)=='r'&&r8(nm+6)=='e'&&r8(nm+7)=='n'&&r8(nm+8)=='a'&&r8(nm+9)=='m'&&r8(nm+10)=='e' { eb(184); ei(82); sysc(); return 1 }  // rename(old,new) sc 82
+        if nl==10&&r8(nm+5)=='r'&&r8(nm+6)=='m'&&r8(nm+7)=='d'&&r8(nm+8)=='i'&&r8(nm+9)=='r' { eb(184); ei(84); sysc(); return 1 }   // rmdir(path)  sc 84
+        let c5=r8(nm+5)
+        if c5=='o' {                   // open(path, flags, mode)
+            // path may be a Quanta string literal (needs +8 to skip the
+            // length prefix) OR a raw C-string pointer (e.g. argv, no prefix).
+            // Detect via the vreg_is_str tag, mirroring print()/echo().
+            let _av = irres(ira2(ii))
+            let _aisop = irop(ira2(ii))
+            let _isstr = r64(vreg_is_str + _av*8)
+            if _isstr!=1 && _aisop==IR_MOV {
+                let _srcv = ira0(ira2(ii))
+                if r64(vreg_is_str + _srcv*8)==1 { _isstr = 1 }
+            }
+            if _isstr!=1 && _aisop==IR_STR { _isstr = 1 }
+            flush_all()   // syscalls clobber rdi/rsi/rdx/rax; spill live vregs first
+            if _isstr==1 { argp8(7, ira2(ii), 0) }   // rdi = path + 8
+            // else rdi already holds the raw pointer from IR_CALL arg load
+            eb(184); ei(2); sysc(); return 1
+        }
+        if c5=='r' { eb(184); ei(0); sysc(); return 1 }                    // read
+        if c5=='w' { eb(184); ei(1); sysc(); return 1 }                    // write
+        if c5=='c' { eb(184); ei(3); sysc(); return 1 }                    // close
+        if c5=='s' { eb(184); ei(4); sysc(); return 1 }                    // stat(path, buf) -> 0/-errno  (sc 4)
+        if c5=='u' { eb(184); ei(87); sysc(); return 1 }                   // unlink(path) -> 0/-errno  (sc 87)
+        if c5=='m' { eb(184); ei(83); sysc(); return 1 }                   // mkdir(path, mode) -> 0/-errno (sc 83)
+    }
+    // 0.0.106: networking builtins (raw Linux syscalls). IR_CALL already loaded
+    // rdi/rsi/rdx from args 0/1/2 (same convention as file_open). We only set
+    // rax=syscall-num and issue the syscall; the result is in rax (fd/0/-errno).
+    if nl==6&&r8(nm)=='s'&&r8(nm+1)=='o'&&r8(nm+2)=='c'&&r8(nm+3)=='k'&&r8(nm+4)=='e'&&r8(nm+5)=='t' {
+        flush_all(); ri(0,41); sysc(); return 1   // socket(domain,type,proto) -> fd
+    }
+    if nl==7&&r8(nm)=='c'&&r8(nm+1)=='o'&&r8(nm+2)=='n'&&r8(nm+3)=='n'&&r8(nm+4)=='e'&&r8(nm+5)=='c'&&r8(nm+6)=='t' {
+        flush_all(); ri(0,42); sysc(); return 1   // connect(fd,sa_ptr,len) -> 0
+    }
+    if nl==4&&r8(nm)=='b'&&r8(nm+1)=='i'&&r8(nm+2)=='n'&&r8(nm+3)=='d' {
+        flush_all(); ri(0,49); sysc(); return 1   // bind(fd,sa_ptr,len) -> 0
+    }
+    if nl==6&&r8(nm)=='l'&&r8(nm+1)=='i'&&r8(nm+2)=='s'&&r8(nm+3)=='t'&&r8(nm+4)=='e'&&r8(nm+5)=='n' {
+        flush_all(); ri(0,50); sysc(); return 1   // listen(fd,backlog) -> 0
+    }
+    if nl==6&&r8(nm)=='a'&&r8(nm+1)=='c'&&r8(nm+2)=='c'&&r8(nm+3)=='e'&&r8(nm+4)=='p'&&r8(nm+5)=='t' {
+        flush_all(); ri(0,43); sysc(); return 1   // accept(fd,sa_ptr,len_ptr) -> newfd
+    }
+    // 0.0.118: send(fd, buf, len, flags) -> bytes (sc 44) and recv(fd, buf, len, flags) -> bytes (sc 45).
+    //   4-arg syscalls: 4th arg must be r10 (NOT rcx). IR_CALL loads rcx for calling-convention
+    //   arg4, so we reload all 4 args from their spill homes into the syscall-ABI regs.
+    if nl==4&&r8(nm)=='s'&&r8(nm+1)=='e'&&r8(nm+2)=='n'&&r8(nm+3)=='d' {
+        flush_all()
+        let sc_base = ira2(ii)
+        let sk = 0
+        while sk < 4 {
+            let sv = irres(sc_base + sk)
+            if sk == 0 { rbp(7, spill_home(sv)) }   // rdi = fd
+            if sk == 1 { rbp(6, spill_home(sv)) }   // rsi = buf
+            if sk == 2 { rbp(2, spill_home(sv)) }   // rdx = len
+            if sk == 3 { rbp(10, spill_home(sv)) }  // r10 = flags
+            sk = sk + 1
+        }
+        // x86-64 has no send/recv syscalls; glibc implements them via
+        // sendto(44)/recvfrom(45) with NULL addr/addrlen. Zero r8 (msg_name)
+        // and r9 (addrlen) so the kernel sees a connected-datagram/SOCK_STREAM send.
+        rxor(8,8); rxor(9,9)        // r8 = 0, r9 = 0
+        ri(0,44); sysc(); return 1
+    }
+    if nl==4&&r8(nm)=='r'&&r8(nm+1)=='e'&&r8(nm+2)=='c'&&r8(nm+3)=='v' {
+        flush_all()
+        let sc_base = ira2(ii)
+        let sk = 0
+        while sk < 4 {
+            let sv = irres(sc_base + sk)
+            if sk == 0 { rbp(7, spill_home(sv)) }   // rdi = fd
+            if sk == 1 { rbp(6, spill_home(sv)) }   // rsi = buf
+            if sk == 2 { rbp(2, spill_home(sv)) }   // rdx = len
+            if sk == 3 { rbp(10, spill_home(sv)) }  // r10 = flags
+            sk = sk + 1
+        }
+        rxor(8,8); rxor(9,9)        // r8 = 0, r9 = 0
+        ri(0,45); sysc(); return 1
+    }
+    // 0.0.119: futex_wait(addr, expected) -> 0/-errno  and  futex_wake(addr, n) -> woken
+    //   Both are the single futex(2) syscall (sc 202) with 6 args:
+    //     rax=202, rdi=uaddr, rsi=op, rdx=val, r10=timeout, r8=uaddr2, r9=val3
+    //   futex_wait: op=FUTEX_WAIT(0), val=expected, timeout=NULL, uaddr2=0, val3=0
+    //   futex_wake: op=FUTEX_WAKE(1), val=n,      timeout=NULL, uaddr2=0, val3=0
+    //   Args arrive via IR_CALL as (addr, expected) / (addr, n); we reload addr->rdi,
+    //   set rsi=op, rdx=val(arg1), and zero r10/r8/r9.
+    if nl==10&&r8(nm)=='f'&&r8(nm+1)=='u'&&r8(nm+2)=='t'&&r8(nm+3)=='e'&&r8(nm+4)=='x'&&r8(nm+5)=='_'&&r8(nm+6)=='w'&&r8(nm+7)=='a'&&r8(nm+8)=='i'&&r8(nm+9)=='t' {
+        flush_all()
+        rbp(7, spill_home(irres(ira2(ii))))      // rdi = uaddr
+        ri(6, 0)                                  // rsi = FUTEX_WAIT = 0
+        rbp(2, spill_home(irres(ira2(ii)+1)))    // rdx = expected (val)
+        rxor(10,10); rxor(8,8); rxor(9,9)         // r10=timeout=0, r8=uaddr2=0, r9=val3=0
+        ri(0,202); sysc()
+        // FIX-0.0.37: clamp negative (error) futex retval to 0 (see futex_wake).
+        rcmp(0, 2); let fwt_ofs = codelen; jcc32(5, 0); rxor(0,0)
+        let fwt_done = nl(); lbladd(fwt_done, codelen); emit_patch(fwt_ofs, fwt_done, 1)
+        return 1
+    }
+    if nl==10&&r8(nm)=='f'&&r8(nm+1)=='u'&&r8(nm+2)=='t'&&r8(nm+3)=='e'&&r8(nm+4)=='x'&&r8(nm+5)=='_'&&r8(nm+6)=='w'&&r8(nm+7)=='a'&&r8(nm+8)=='k'&&r8(nm+9)=='e' {
+        flush_all()
+        rbp(7, spill_home(irres(ira2(ii))))      // rdi = uaddr
+        ri(6, 1)                                  // rsi = FUTEX_WAKE = 1
+        rbp(2, spill_home(irres(ira2(ii)+1)))    // rdx = n (val)
+        rxor(10,10); rxor(8,8); rxor(9,9)
+        ri(0,202); sysc()
+        // FIX-0.0.37: futex syscalls return -errno (<0) on failure (e.g. EFAULT for a
+        // bad uaddr). Returning that raw to callers corrupts logic (0 = success, but a
+        // negative "count woken" looks like a huge positive). Clamp negatives to 0.
+        rcmp(0, 2); let fw_ofs = codelen; jcc32(5, 0)   // jge +0 -> skip next (rax>=0 OK)
+        rxor(0,0)                                          // rax = 0 (error -> 0)
+        let fw_done = nl(); lbladd(fw_done, codelen); emit_patch(fw_ofs, fw_done, 1)
+        return 1
+    }
+    // 0.0.119: thread_create(worker_fn, arg) -> tid
+    //   Spawns a child via clone(56) sharing the address space (CLONE_VM|FS|FILES|
+    //   SIGHAND, no CLONE_THREAD) so the child is a waitable task and thread_join
+    //   collects its exit status via wait4(61). Raw clone resumes the child at the
+    //   instruction after the syscall (rax=0 in child, tid in parent), so the child
+    //   jumps to a trampoline: read arg from [rsp] (child rsp = stack_top-16),
+    //   call worker_fn (patched by linker to fn index g_thread_ffi), exit(result).
+    //   r13/r12 are callee-owned frame regs here; save/restore around the builtin.
+    if nl==13&&r8(nm)=='t'&&r8(nm+1)=='h'&&r8(nm+2)=='r'&&r8(nm+3)=='e'&&r8(nm+4)=='a'&&r8(nm+5)=='d'&&r8(nm+6)=='_'&&r8(nm+7)=='c'&&r8(nm+8)=='r'&&r8(nm+9)=='e'&&r8(nm+10)=='a'&&r8(nm+11)=='t'&&r8(nm+12)=='e' {
+        flush_all()
+        // DIAGNOSTIC removed: g_thread_ffi now stores the WORKER NAME OFFSET.
+        eb(65); eb(85)   // push r13 (callee-saved frame base; we clobber it below)
+        eb(65); eb(86)   // push r14 (callee-saved; we use it for js)
+        // join slot: mmap 16B -> [0]=tid(futex), [8]=result
+        ri(0, 9)            // rax = mmap
+        rxor(7,7)            // rdi = 0
+        ri(6, 16)            // rsi = 16
+        ri(2, 3); ri(10, 34); ri(8, 0-1); ri(9, 0)
+        sysc()               // rax = join slot (js)
+        // FIX-0.0.35: MAP_FAILED guard. mmap returns -errno (<0) on OOM; writing
+        // the tid/result header to a kernel address would SIGSEGV (rc=139) instead
+        // of failing closed. Mirrors the approved mem_alloc guard (lines 753-755).
+        eb(72); eb(131); eb(248); eb(0)   // cmp rax, 0
+        eb(125); eb(12)                   // jge +12 (skip exit if rax >= 0)
+        eb(191); ei(1); eb(184); ei(60); eb(15); eb(5)  // mov edi,1; mov eax,60; syscall (exit 1)
+        rr(14, 0)            // r14 = js
+        // child stack: mmap 1MB RW
+        ri(0, 9); rxor(7,7); ri(6, 1048576); ri(2, 3); ri(10, 34); ri(8, 0-1); ri(9, 0)
+        sysc()               // rax = stack base
+        // FIX-0.0.36: MAP_FAILED guard (same rationale as FIX-0.0.35).
+        eb(72); eb(131); eb(248); eb(0)   // cmp rax, 0
+        eb(125); eb(12)                   // jge +12 (skip exit if rax >= 0)
+        eb(191); ei(1); eb(184); ei(60); eb(15); eb(5)  // exit 1
+        rr(13, 0)            // r13 = stack base
+        // FIX-0.0.40: guard page. The child stack grows downward from stack_top;
+        // protect the LOWEST page (at r13) with PROT_NONE so a stack underflow
+        // faults instead of silently corrupting adjacent mmap'd memory. mprotect
+        // failure is non-fatal (best-effort hardening) -> ignore its retval.
+        rr(7, 13); ri(6, 4096); ri(2, 0); ri(0, 10); sysc()  // mprotect(r13, 4096, PROT_NONE=0)
+        ri(11, 1048576-16); ra(11, 13)   // r11 = stack_top-16
+        rbp(0, spill_home(irres(ira2(ii)+1)))  // rax = arg (the value passed to worker, 2nd param)
+        eb(0x49); eb(0x89); eb(0x43); eb(0)   // mov [r11+0], rax  (child rsp = arg)
+        eb(0x4d); eb(0x89); eb(0x73); eb(8)   // mov [r11+8], r14  (store js on child stack for reload)
+        // clone(CLONE_VM|FS|FILES|SIGHAND|THREAD|PARENT_SETTID|CHILD_CLEARTID, sp, js, js, 0)
+        ri(0, 56)
+        ri(7, 0x100|0x200|0x400|0x800|0x10000|0x100000|0x200000)  // rdi = flags
+        rr(6, 11)            // rsi = stack_top-16
+        rr(2, 14)            // rdx = parent_tidptr = js
+        rr(10, 14)           // r10 = child_tidptr = js
+        rxor(8,8); rxor(9,9)
+        sysc()               // child: rax=0 ; parent: rax=tid (also *js=tid), <0 on error
+        rxor(2,2)            // rdx = 0 (so cmp rax,0 is correct in both paths)
+        rcmp(0, 2)           // cmp rax, 0
+        // FIX-0.0.38: clone failure path. A negative rax is an errno, not a parent
+        // tid -> the old code fell into the PARENT resume and returned a garbage
+        // slot with two leaked mappings. Fail closed: munmap both, exit(1).
+        let err_ofs = codelen
+        jcc32(2, 0)          // jl ERR (rax < 0 -> clone failed)
+        let jcc_ofs = codelen
+        jcc32(1, 0)          // jnz PARENT (rax > 0 -> parent resumes)
+        // TRAMPOLINE (child): rsp=stack_top-16, [rsp]=arg, [rsp+8]=js; r14=js preserved by worker
+        lsp(7, 0)           // rdi = arg
+        let call_ofs = codelen
+        eb(232); ei(0)       // call worker_fn (rel32 placeholder)
+        w64(patches+patchc*PCS, call_ofs); w64(patches+patchc*PCS+8, g_thread_ffi); w64(patches+patchc*PCS+16, 5); patchc = patchc + 1
+        lsp(14, 8)           // r14 = js, reloaded from child stack ([rsp+8]=[child_sp+8]; ret restored rsp)
+        eb(0x49); eb(0x89); eb(0x46); eb(8)   // mov [r14+8], rax  (store result in js+8)
+        rxor(7,7)            // rdi = 0  (exit code)
+        ri(0, 60); sysc()    // exit(0) -> kernel clears *js (futex wake)
+        // ERR (clone failed, rax < 0): fail closed. Unmap both mappings then exit(1).
+        // Reached only via the `jl ERR` jump above; the child hits exit(0) (never returns)
+        // and the parent jumps past this to PARENT, so neither falls through here.
+        let err_label = nl(); lbladd(err_label, codelen)
+        rr(7, 13); ri(6, 1048576); ri(0, 11); sysc()   // munmap(child_stack, 1MB)
+        rr(7, 14); ri(6, 16);      ri(0, 11); sysc()   // munmap(join_slot, 16)
+        eb(191); ei(1); eb(184); ei(60); eb(15); eb(5)  // mov edi,1; mov eax,60; syscall (exit 1)
+        emit_patch(err_ofs, err_label, 1)
+        // PARENT resumes: rax = js (join-slot ptr, also holds tid at [0])
+        let parent_ofs = codelen
+        w32(code + jcc_ofs + 2, parent_ofs - (jcc_ofs + 6))
+        rr(0, 14)            // rax = js (return join slot to caller)
+        eb(65); eb(94)   // pop r14
+        eb(65); eb(95)   // pop r13
+        return 1
+    }
+    // 0.0.119: thread_join(slot) -> worker result. slot: [0]=tid(futex), [8]=result.
+    //   Blocks in futex_wait(slot, *slot) until the child exits (kernel clears
+    //   *slot and wakes the futex), then returns the stored result at [8].
+    if nl==11&&r8(nm)=='t'&&r8(nm+1)=='h'&&r8(nm+2)=='r'&&r8(nm+3)=='e'&&r8(nm+4)=='a'&&r8(nm+5)=='d'&&r8(nm+6)=='_'&&r8(nm+7)=='j'&&r8(nm+8)=='o'&&r8(nm+9)=='i'&&r8(nm+10)=='n' {
+        flush_all()
+        rbp(7, spill_home(irres(ira2(ii)+0)))  // rdi = slot
+        // futex(slot, FUTEX_WAIT=0, *slot, 0, 0, 0): rsi=0 (op), rdx=val=*slot
+        ldx(11, 7, 0)      // r11 = [rdi+0] = tid (val)
+        ri(6, 0)           // rsi = FUTEX_WAIT (0)
+        rr(2, 11)          // rdx = val = tid
+        ri(10, 0); ri(8, 0); ri(9, 0)
+        ri(0, 202); sysc()  // futex_wait(slot, 0, tid, 0,0,0)
+        ldx(0, 7, 8)       // rax = [rdi+8] = result
+        return 1
+    }
+
+    // syscall(num, a, b, c, d, e, f): GENERIC raw Linux syscall (any arity 1..7).
+    //   IR_CALL already did flush_all() and loaded args rdi/rsi/rdx/rcx/r8/r9
+    //   (and pushed arg6+ on the stack). We do NOT rely on those registers;
+    //   instead we reload each arg vreg from its SPILL HOME directly into the
+    //   exact syscall-ABI register:
+    //     rax=num, rdi=a, rsi=b, rdx=c, r10=d, r8=e, r9=f
+    //   (the 4th syscall arg is r10, not rcx — that's why we reload from homes
+    //   rather than just shuffling IR_CALL's registers; arg6 also lives on the
+    //   stack in IR_CALL's layout, so reloading from home covers it too.)
+    if nl==7&&r8(nm)=='s'&&r8(nm+1)=='y'&&r8(nm+2)=='s'&&r8(nm+3)=='c'&&r8(nm+4)=='a'&&r8(nm+5)=='l'&&r8(nm+6)=='l' {
+        // arg count = ira1(ii); arg-start index = ira2(ii)
+        let sc_cnt = ira1(ii)
+        let sc_base = ira2(ii)
+        // Load arg k from its vreg home into the matching syscall register.
+        // target regs: 0=rax,7=rdi,6=rsi,2=rdx,10=r10,8=r8,9=r9
+        let sk = 0
+        while sk < sc_cnt {
+            if sk < 7 {
+                let sv = irres(sc_base + sk)
+                if sk == 0 { rbp(0, spill_home(sv)) }      // rax = num
+                if sk == 1 { rbp(7, spill_home(sv)) }      // rdi = a
+                if sk == 2 { rbp(6, spill_home(sv)) }      // rsi = b
+                if sk == 3 { rbp(2, spill_home(sv)) }      // rdx = c
+                if sk == 4 { rbp(10, spill_home(sv)) }     // r10 = d
+                if sk == 5 { rbp(8, spill_home(sv)) }      // r8  = e
+                if sk == 6 { rbp(9, spill_home(sv)) }      // r9  = f
+            }
+            sk = sk + 1
+        }
+        sysc()    // syscall (result in rax)
+        return 1
+    }
+    // clock_gettime(clk_id, ts_ptr): sc 228. IR_CALL loaded rdi=clk_id, rsi=ts_ptr.
+    if nl==13&&r8(nm)=='c'&&r8(nm+4)=='k'&&r8(nm+5)=='_'&&r8(nm+6)=='g'&&r8(nm+11)=='m'&&r8(nm+12)=='e' {
+        ri(0,228); sysc(); return 1
+    }
+    // gettimeofday(tv_ptr, tz_ptr): sc 96. rdi=tv, rsi=tz already loaded.
+    if nl==12&&r8(nm)=='g'&&r8(nm+1)=='e'&&r8(nm+2)=='t'&&r8(nm+3)=='t'&&r8(nm+4)=='i'&&r8(nm+5)=='m'&&r8(nm+6)=='e'&&r8(nm+7)=='o'&&r8(nm+8)=='f'&&r8(nm+9)=='d'&&r8(nm+10)=='a'&&r8(nm+11)=='y' {
+        ri(0,96); sysc(); return 1
+    }
+    // nanosleep(req_ptr, rem_ptr): sc 35. rdi=req, rsi=rem already loaded.
+    if nl==9&&r8(nm)=='n'&&r8(nm+1)=='a'&&r8(nm+2)=='n'&&r8(nm+3)=='o'&&r8(nm+4)=='s'&&r8(nm+5)=='l'&&r8(nm+6)=='e'&&r8(nm+7)=='e'&&r8(nm+8)=='p' {
+        ri(0,35); sysc(); return 1
+    }
+    // sleep(sec): internal mmap(16) -> fill {sec,0} -> nanosleep -> munmap.
+    //   rdi holds sec (arg0) from IR_CALL. Push it, mmap a scratch timespec,
+    //   pop sec into rdx, store [buf]=sec and [buf+8]=0, nanosleep(buf,0),
+    //   munmap(buf,16), return 0. buf is kept in rbx across the nanosleep
+    //   syscall (kernel preserves rbx; no live vregs in it after IR_CALL flush).
+    if nl==5&&r8(nm)=='s'&&r8(nm+1)=='l'&&r8(nm+2)=='e'&&r8(nm+3)=='e'&&r8(nm+4)=='p' {
+        eb(87)                            // push rdi   (save sec)
+        ri(7, 16)                         // rdi = 16
+        eb(72); eb(137); eb(254)          // mov rsi, rdi   (len=16)
+        eb(191); ei(0)           // mov edi, 0x60000001
+        eb(186); ei(3)                    // mov edx, 3     (PROT_READ|WRITE)
+        eb(65); eb(186); ei(34)           // mov r10d, 0x22 (MAP_PRIVATE|ANON)
+        eb(65); eb(184); ei(0-1)          // mov r8d, -1    (fd)
+        eb(69); eb(49); eb(201)           // xor r9d, r9d   (offset=0)
+        eb(184); ei(9)                    // mov eax, 9
+        sysc()                            // rax = buf
+        rr(3,0)                           // rbx = buf  (preserve across nanosleep)
+        eb(90)                            // pop rdx    (sec)
+        eb(72); eb(137); eb(16)           // mov [rax], rdx  (buf.sec = sec)
+        eb(72); eb(49); eb(201)           // xor rcx, rcx
+        eb(72); eb(137); eb(72); eb(8)     // mov [rax+8], rcx (buf.nsec = 0)
+        ri(0,35)                          // rax = 35 (nanosleep)
+        rr(7,3)                           // rdi = rbx (buf)
+        ri(6,0)                           // esi = 0 (rem = 0)
+        sysc()                            // nanosleep(buf, 0)
+        ri(0,11)                          // rax = 11 (munmap)
+        rr(7,3)                           // rdi = rbx (buf)
+        ri(6,16)                          // rsi = 16
+        sysc()                            // munmap(buf, 16)  (rax -> 0)
+        return 1
+    }
+    // 0.0.125: clock() -> i64 nanoseconds, CLOCK_MONOTONIC (clk 1).
+    //   Zero-arg. Internal mmap(16) timespec, clock_gettime(1, buf), combine
+    //   sec*1_000_000_000 + nsec into rax, munmap(buf, 16), return. r12 keeps
+    //   buf (prologue-saved free scratch per str_split ABI model; restored on
+    //   `return 1`). All other regs caller-saved.
+    if nl==5&&r8(nm)=='c'&&r8(nm+1)=='l'&&r8(nm+2)=='o'&&r8(nm+3)=='c'&&r8(nm+4)=='k' {
+        flush_all()
+        ri(7,16)                          // rdi = 16
+        eb(72); eb(137); eb(254)           // mov rsi, rdi (48 89 FE)
+        eb(191); ei(0)                     // mov edi, 0x60000001
+        eb(186); ei(3)                     // mov edx, 3
+        eb(65); eb(186); ei(34)            // mov r10d, 0x22
+        eb(65); eb(184); ei(0-1)           // mov r8d, -1
+        eb(69); eb(49); eb(201)            // xor r9d, r9d
+        eb(184); ei(9)                     // mov eax, 9
+        sysc()                             // rax = buf
+        rr(12,0)                          // r12 = buf
+        ri(7,1)                            // edi = CLOCK_MONOTONIC
+        rr(6,12)                           // rsi = buf
+        ri(0,228)                          // rax = 228 (clock_gettime)
+        sysc()                             // [buf]=sec, [buf+8]=nsec
+        ldx(0,12,0)                        // rax = [buf]  (sec; r12%8==4 -> ldx, NOT rmr)
+        eb(72); eb(105); eb(200); ei(1000000000)   // imul rcx, rax, 1e9  (48 69 C8 imm32; ModRM reg=rcx rm=rax)
+        ldx(0,12,8)                        // rax = [buf+8] (nsec)
+        ra(0,1)                            // rax += rcx  (nsec + sec*1e9)
+        rr(13,0)                           // r13 = ns (callee-saved; survives munmap)
+        rr(7,12)                           // rdi = buf
+        ri(6,16)                           // rsi = 16
+        ri(0,11)                           // rax = 11 (munmap)
+        sysc()                             // munmap(buf,16)
+        rr(0,13)                           // rax = ns  (result)
+        return 1
+    }
+    // 0.0.125: now() -> i64 epoch nanoseconds, CLOCK_REALTIME (clk 0).
+    //   Identical to clock() but clock_id 0.
+    if nl==3&&r8(nm)=='n'&&r8(nm+1)=='o'&&r8(nm+2)=='w' {
+        flush_all()
+        ri(7,16)                          // rdi = 16
+        eb(72); eb(137); eb(254)           // mov rsi, rdi (48 89 FE)
+        eb(191); ei(0)                     // mov edi, 0x60000001
+        eb(186); ei(3)                     // mov edx, 3
+        eb(65); eb(186); ei(34)            // mov r10d, 0x22
+        eb(65); eb(184); ei(0-1)           // mov r8d, -1
+        eb(69); eb(49); eb(201)            // xor r9d, r9d
+        eb(184); ei(9)                     // mov eax, 9
+        sysc()                             // rax = buf
+        rr(12,0)                          // r12 = buf
+        ri(7,0)                            // edi = CLOCK_REALTIME
+        rr(6,12)                           // rsi = buf
+        ri(0,228)                          // rax = 228 (clock_gettime)
+        sysc()                             // [buf]=sec, [buf+8]=nsec
+        ldx(0,12,0)                        // rax = [buf]  (sec)
+        eb(72); eb(105); eb(200); ei(1000000000)   // imul rcx, rax, 1e9
+        ldx(0,12,8)                        // rax = [buf+8] (nsec)
+        ra(0,1)                            // rax += rcx
+        rr(13,0)                           // r13 = ns
+        rr(7,12)                           // rdi = buf
+        ri(6,16)                           // rsi = 16
+        ri(0,11)                           // rax = 11 (munmap)
+        sysc()                             // munmap(buf,16)
+        rr(0,13)                           // rax = ns
+        return 1
+    }
+    // 0.0.126: fork() -> i64. sc 57. rax = 0 (child), >0 (parent: child pid), <0 (errno).
+    if nl==4&&r8(nm)=='f'&&r8(nm+1)=='o'&&r8(nm+2)=='r'&&r8(nm+3)=='k' {
+        flush_all()
+        eb(65); eb(84); eb(65); eb(85); eb(65); eb(86); eb(65); eb(87) // push r12/r13/r14/r15
+        ri(0,57); rxor(7,7); sysc()                 // rax = fork() (rdi=0)
+        eb(65); eb(95); eb(65); eb(94); eb(65); eb(93); eb(65); eb(92) // pop r15/r14/r13/r12
+        return 1
+    }
+    // 0.0.126: exec(cmd) -> never returns on success. Replaces the image with
+    //   /bin/sh -c <cmd> using the proven qc_sys_cmd child-side marshaling.
+    //   cmd = rdi = Quanta string header ptr (len at [cmd], bytes at cmd+8).
+    if nl==4&&r8(nm)=='e'&&r8(nm+1)=='x'&&r8(nm+2)=='e'&&r8(nm+3)=='c' {
+        flush_all()
+        eb(65); eb(84); eb(65); eb(85); eb(65); eb(86); eb(65); eb(87) // push r12/r13/r14/r15
+        // save cmd (rdi) -> r14 = cmd+8 (bytes ptr)
+        rr(14,7); ri(8,8); ra(14,8)
+        // scratch S (4096) for "/bin/sh", "-c", argv array
+        ri(6,4096); ri(7,0); ri(2,3); ri(10,0x22); ri(8,-1); rxor(9,9); ri(0,9); sysc()
+        rr(13,0)                                  // r13 = S
+        wmi(13,16,0x6e69622f)                     // [S+16] = "/bin"  ("/bin")
+        wmi(13,20,0x0068732f)                     // [S+20] = "/sh\0" ("/sh")
+        wmi(13,32,0x0000632d)                     // [S+32] = "-c\0\0" ("-c")
+        // argv array @ S+1024: [/bin/sh, -c, cmd, 0]
+        rr(10,13); ri(8,16); ra(10,8); stx(13,1024,10)  // [S+1024] = S+16
+        rr(10,13); ri(8,32); ra(10,8); stx(13,1032,10)  // [S+1032] = S+32
+        stx(13,1040,14)                           // [S+1040] = r14 (cmd bytes)
+        ri(10,0); stx(13,1048,10)                 // [S+1048] = 0 (null terminator)
+        rr(7,13); ri(8,16); ra(7,8)               // rdi = S+16 ("/bin/sh")
+        rr(6,13); ri(8,1024); ra(6,8)             // rsi = S+1024 (argv)
+        rxor(2,2)                                 // rdx = 0 (envp)
+        ri(0,59); sysc()                          // execve("/bin/sh","-c",cmd,0)
+        ri(7,127); ri(0,60); sysc()               // on failure: exit(127)
+        eb(65); eb(95); eb(65); eb(94); eb(65); eb(93); eb(65); eb(92) // pop r15/r14/r13/r12
+        return 1
+    }
+    // 0.0.126: wait(pid) -> i64 exit code (WEXITSTATUS). sc 61 wait4(pid,&st,0,0).
+    if nl==4&&r8(nm)=='w'&&r8(nm+1)=='a'&&r8(nm+2)=='i'&&r8(nm+3)=='t' {
+        flush_all()
+        eb(65); eb(84); eb(65); eb(85); eb(65); eb(86); eb(65); eb(87) // push r12/r13/r14/r15
+        rr(13,7)                                  // r13 = pid (preserve across mmap)
+        ri(6,8); ri(7,0); ri(2,3); ri(10,0x22); ri(8,-1); rxor(9,9); ri(0,9); sysc() // mmap status slot (8)
+        rr(12,0)                                  // r12 = status slot
+        rr(7,13)                                  // rdi = pid
+        rr(6,12)                                  // rsi = status slot
+        rxor(2,2); rxor(10,10)                    // rdx=0, r10=0
+        ri(0,61); sysc()                         // wait4(pid, &status, 0, 0)
+        ldx(6,12,0)                               // r6 = status (low 32)
+        eb(72); eb(193); eb(238); eb(8)           // shr r6, 8   (WEXITSTATUS high byte)
+        eb(72); eb(131); eb(230); eb(255)         // and r6, 0xff
+        rr(13,6)                                  // r13 = exit code (preserve across munmap)
+        rr(7,12); ri(6,8); ri(0,11); sysc()       // munmap(status slot, 8)
+        rr(0,13)                                  // rax = exit code
+        eb(65); eb(95); eb(65); eb(94); eb(65); eb(93); eb(65); eb(92) // pop r15/r14/r13/r12
+        return 1
+    }
+    // 0.0.126: kill(pid, sig) -> i64 (0 ok, -errno). sc 62.
+    if nl==4&&r8(nm)=='k'&&r8(nm+1)=='i'&&r8(nm+2)=='l'&&r8(nm+3)=='l' {
+        flush_all()
+        eb(65); eb(84); eb(65); eb(85); eb(65); eb(86); eb(65); eb(87) // push r12/r13/r14/r15
+        ri(0,62); sysc()                          // rax = kill(pid=rdi, sig=rsi)
+        eb(65); eb(95); eb(65); eb(94); eb(65); eb(93); eb(65); eb(92) // pop r15/r14/r13/r12
+        return 1
+    }
+    // 0.0.127: PTY core. Low-level pseudo-terminal allocation.
+    // ---- dup2(oldfd, newfd) -> newfd (or -errno). sc 33. ----
+    if nl==4&&r8(nm)=='d'&&r8(nm+1)=='u'&&r8(nm+2)=='p'&&r8(nm+3)=='2' {
+        flush_all()
+        eb(65); eb(84); eb(65); eb(85); eb(65); eb(86); eb(65); eb(87) // push r12/r13/r14/r15
+        ri(0,33); sysc()                          // rax = dup2(rdi=old, rsi=new)
+        eb(65); eb(95); eb(65); eb(94); eb(65); eb(93); eb(65); eb(92) // pop r15/r14/r13/r12
+        return 1
+    }
+    // ---- ioctl(fd, request, arg) -> result (or -errno). sc 16. ----
+    if nl==4&&r8(nm)=='i'&&r8(nm+1)=='o'&&r8(nm+2)=='c'&&r8(nm+3)=='t' {
+        flush_all()
+        eb(65); eb(84); eb(65); eb(85); eb(65); eb(86); eb(65); eb(87) // push r12/r13/r14/r15
+        ri(0,16); sysc()                          // rax = ioctl(rdi, rsi, rdx)
+        eb(65); eb(95); eb(65); eb(94); eb(65); eb(93); eb(65); eb(92) // pop r15/r14/r13/r12
+        return 1
+    }
+    // ---- pty_open() -> master fd. open("/dev/ptmx", O_RDWR|O_NOCTTY) then
+    //      ioctl(master, TIOCSPTLCK, 0) to unlock the slave. ----
+    if nl==8&&r8(nm)=='p'&&r8(nm+1)=='t'&&r8(nm+2)=='y'&&r8(nm+3)=='_'&&r8(nm+4)=='o'&&r8(nm+5)=='p'&&r8(nm+6)=='e'&&r8(nm+7)=='n' {
+        flush_all()
+        eb(65); eb(84); eb(65); eb(85); eb(65); eb(86); eb(65); eb(87) // push r12/r13/r14/r15
+        // mmap scratch S (4096) for "/dev/ptmx"
+        ri(6,4096); ri(7,0); ri(2,3); ri(10,0x22); ri(8,-1); rxor(9,9); ri(0,9); sysc()
+        rr(13,0)                                  // r13 = S
+        wmi(13,16,0x7665642f)                     // [S+16] = "/dev"  (LE 2f 64 65 76)
+        wmi(13,20,0x6d74702f)                     // [S+20] = "/ptm"  (LE 2f 70 74 6d)
+        wmi(13,24,0x00000078)                     // [S+24] = "x\0"   -> "/dev/ptmx"
+        // open(S+16, O_RDWR|O_NOCTTY = 0x802)
+        rr(7,13); ri(8,16); ra(7,8)               // rdi = S+16
+        ri(6,0x2); rxor(2,2); ri(0,2); sysc()   // rax = open(path, O_RDWR)
+        rr(12,0)                                  // r12 = master fd
+        // ioctl(master, TIOCSPTLCK=0x40045431, &unlock): unlock slave.
+        // TIOCSPTLCK needs a pointer to an int (=0 unlocks); passing NULL faults.
+        wmi(13,8,0x00000000)                     // [S+8] = 0 (unlock value)
+        rr(7,12); ri(6,0x40045431); rr(2,13); ri(8,8); ra(2,8); ri(0,16); sysc()  // rdx = S+8
+        rr(0,12)                                  // rax = master fd
+        eb(65); eb(95); eb(65); eb(94); eb(65); eb(93); eb(65); eb(92) // pop r15/r14/r13/r12
+        return 1
+    }
+    // ---- pty_slave(master) -> slave fd. ioctl(TIOCGPTN) to get the pty number,
+    //      build "/dev/pts/N" (N decimal), open it O_RDWR, return the fd. ----
+    if nl==9&&r8(nm)=='p'&&r8(nm+1)=='t'&&r8(nm+2)=='y'&&r8(nm+3)=='_'&&r8(nm+4)=='s'&&r8(nm+5)=='l'&&r8(nm+6)=='a'&&r8(nm+7)=='v'&&r8(nm+8)=='e' {
+        flush_all()
+        eb(65); eb(84); eb(65); eb(85); eb(65); eb(86); eb(65); eb(87) // push r12/r13/r14/r15
+        rr(14,7)                                  // r14 = master
+        // mmap scratch S (4096): [S]=ioctl int, [S+16]="/dev/pts/" + digits
+        ri(6,4096); ri(7,0); ri(2,3); ri(10,0x22); ri(8,-1); rxor(9,9); ri(0,9); sysc()
+        rr(13,0)                                  // r13 = S
+        // ioctl(master, TIOCGPTN=0x80045430, &n) -> n at [S]
+        rr(7,14); ri(6,0x80045430); rr(2,13); ri(0,16); sysc()
+        ldx(10,13,0)                              // r10 = n (pty number)
+        // build "/dev/pts/" at S+16 (9 bytes)
+        wmi(13,16,0x7665642f)                     // "/dev" (LE 2f 64 65 76)
+        wmi(13,20,0x7374702f)                     // "/pts" (LE 2f 70 74 73)
+        wmi(13,24,0x0000002f)                     // byte S+24 = '/' (9th char of "/dev/pts/")
+        // format n as decimal right-to-left into S+25+
+        rr(11,13); ri(8,25); ra(11,8)             // r11 = S+25 (write ptr)
+        rxor(9,9)                                 // r9 = 0 (digit count)
+        rtest(10,10); let _z=nl()
+        let _pz=codelen; jcc32(0,0); emit_patch(_pz, _z, 1)  // je _z (n==0)
+        rr(1,10)                                  // rcx = n (divisor/working copy)
+        let _dl=nl()
+        lbladd(_dl, codelen)
+        rxor(2,2); ridiv(1)                       // idiv rcx: rax=q, rdx=rem
+        rr(8,2); ri(7,0x30); ra(8,7)              // r8 = '0' + rem
+        stx(11,0,8)                               // [r11] = digit
+        ra(11,1); ra(9,1)                         // r11++ (next pos), r9++ (count)
+        rr(10,0)                                  // n = quotient (rax)
+        rtest(10,10)
+        let _pj=codelen; jcc32(1,0); emit_patch(_pj, _dl, 1)  // jne -> loop
+        let _pend=nl()
+        lbladd(_pend, codelen)
+        jmp32(0); emit_patch(codelen-5, _z, 0)
+        lbladd(_z, codelen)
+        wmi(13,25,0x00000030)                     // [S+25] = '0' (n==0 case)
+        ri(9,1)                                   // r9 = 1
+        lbladd(_pend, codelen)
+        // null-terminate at S+25+r9
+        rr(7,13); ri(8,25); ra(7,8); ra(7,9)      // rdi = S+25+r9
+        eb(198); eb(7); eb(0)                     // mov byte [rdi], 0
+        // open(S+16, O_RDWR=0x2) -> slave fd
+        rr(7,13); ri(8,16); ra(7,8)               // rdi = S+16
+        ri(6,0x2); rxor(2,2); ri(0,2); sysc()     // rax = open("/dev/pts/N", O_RDWR)
+        eb(65); eb(95); eb(65); eb(94); eb(65); eb(93); eb(65); eb(92) // pop r15/r14/r13/r12
+        return 1
+    }
+    //   IR_CALL arg load places: rdi=num, rsi=a, rdx=b, rcx=c.
+    //   The syscall instruction wants: rax=num, rdi=a, rsi=b, rdx=c.
+    //   Shuffle via rr() (register numbers: rax=0, rsi=6, rdi=7, rdx=2, rcx=1).
+    if nl==8&&r8(nm)=='s'&&r8(nm+1)=='y'&&r8(nm+2)=='s'&&r8(nm+3)=='c'&&r8(nm+4)=='a'&&r8(nm+5)=='l'&&r8(nm+6)=='l'&&r8(nm+7)=='3' {
+        flush_all()
+        rr(0,7)   // rax = rdi (syscall number)
+        rr(7,6)   // rdi = rsi (arg a)
+        rr(6,2)   // rsi = rdx (arg b)
+        rr(2,1)   // rdx = rcx (arg c)
+        sysc()    // syscall
+        return 1
+    }
+    // print: 2-arg print(buf,len) OR 1-arg unified print(x) auto-detecting
+    // string vs int via arg0's vreg_is_str tag. In IR_CALL: a1=arg count,
+    // a2=arg-start. So argc = ira1(ii); arg0 vreg = irres(ira2(ii)).
+    if nl==5&&r8(nm)=='p'&&r8(nm+1)=='r'&&r8(nm+2)=='i'&&r8(nm+3)=='n'&&r8(nm+4)=='t' {
+        let _pargc = ira1(ii)
+        if _pargc==2 {
+            // print(buf, len): write(1, buf, len)
+            flush_all()
+            eb(72); eb(137); eb(242)     // mov rdx, rsi   (count = len)
+            eb(72); eb(137); eb(254)     // mov rsi, rdi   (buf = buf)
+            eb(191); ei(1)               // mov edi, 1
+            eb(184); ei(1)               // mov eax, 1
+            sysc(); return 1
+        } else {
+            let _av = irres(ira2(ii))
+            let _aisop = irop(ira2(ii))
+            let _isstr = r64(vreg_is_str + _av*8)
+            if _isstr!=1 && _aisop==IR_MOV {
+                let _srcv = ira0(ira2(ii))
+                if r64(vreg_is_str + _srcv*8)==1 { _isstr = 1 }
+            }
+            if _isstr!=1 && _aisop==IR_STR { _isstr = 1 }
+            if _isstr==1 {
+                flush_all(); rr(6,7); eb(72); eb(129); eb(198); ei(8); eb(72); eb(139); eb(23); ri(7,1); ri(0,1); sysc(); return 1
+            } else {
+                flush_all(); let l_pos=nl(); let l_zero=nl(); let l_loop=nl(); let l_done=nl(); let l_signprep=nl(); let l_write=nl()
+                rr(0,7); sbi(32); lesp(10, 23); rxor(8,8); rxor(9,9); rr(9,0)
+                eb(77); eb(193); eb(233); eb(63); rtest(9,9); let p=codelen; jcc32(0,0); emit_patch(p, l_pos, 1)
+                rneg(0); lbladd(l_pos, codelen); rtest(0,0); let p=codelen; jcc32(0,0); emit_patch(p, l_zero, 1)
+                let p=codelen; jmp32(0); emit_patch(p, l_loop, 0); lbladd(l_zero, codelen)
+                eb(178); eb(48); eb(65); eb(136); eb(18); eb(73); eb(255); eb(202); eb(73); eb(255); eb(192)
+                let p=codelen; jmp32(0); emit_patch(p, l_signprep, 0); lbladd(l_loop, codelen)
+                rtest(0,0); let p=codelen; jcc32(0,0); emit_patch(p, l_done, 1); rxor(2,2); ri(1,10); ridiv(1)
+                eb(72); eb(129); eb(194); ei(48); eb(65); eb(136); eb(18); eb(73); eb(255); eb(202); eb(73); eb(255); eb(192)
+                let p=codelen; jmp32(0); emit_patch(p, l_loop, 0); lbladd(l_done, codelen); lbladd(l_signprep, codelen)
+                rtest(9,9); let p=codelen; jcc32(0,0); emit_patch(p, l_write, 1)
+                eb(178); eb(45); eb(65); eb(136); eb(18); eb(73); eb(255); eb(202); eb(73); eb(255); eb(192)
+                lbladd(l_write, codelen); eb(73); eb(141); eb(114); eb(1); rr(2,8); ri(7,1); ri(0,1); sysc(); abi(32); return 1
+            }
+        }
+    }
+    // echo(x): 1-arg unified print (same as print). argc = ira1(ii); arg0 = irres(ira2(ii)).
+    if nl==4&&r8(nm)=='e'&&r8(nm+1)=='c'&&r8(nm+2)=='h'&&r8(nm+3)=='o' {
+        let _ave = irres(ira2(ii))
+        let _aeop = irop(ira2(ii))
+        let _isstre = r64(vreg_is_str + _ave*8)
+        if _isstre!=1 && _aeop==IR_MOV {
+            let _esv = ira0(ira2(ii))
+            if r64(vreg_is_str + _esv*8)==1 { _isstre = 1 }
+        }
+        if _isstre!=1 && _aeop==IR_STR { _isstre = 1 }
+        if _isstre==1 {
+            flush_all(); rr(6,7); eb(72); eb(129); eb(198); ei(8); eb(72); eb(139); eb(23); ri(7,1); ri(0,1); sysc(); return 1
+        } else {
+            flush_all(); let el_pos=nl(); let el_zero=nl(); let el_loop=nl(); let el_done=nl(); let el_signprep=nl(); let el_write=nl()
+            rr(0,7); sbi(32); lesp(10, 23); rxor(8,8); rxor(9,9); rr(9,0)
+            eb(77); eb(193); eb(233); eb(63); rtest(9,9); let p=codelen; jcc32(0,0); emit_patch(p, el_pos, 1)
+            rneg(0); lbladd(el_pos, codelen); rtest(0,0); let p=codelen; jcc32(0,0); emit_patch(p, el_zero, 1)
+            let p=codelen; jmp32(0); emit_patch(p, el_loop, 0); lbladd(el_zero, codelen)
+            eb(178); eb(48); eb(65); eb(136); eb(18); eb(73); eb(255); eb(202); eb(73); eb(255); eb(192)
+            let p=codelen; jmp32(0); emit_patch(p, el_signprep, 0); lbladd(el_loop, codelen)
+            rtest(0,0); let p=codelen; jcc32(0,0); emit_patch(p, el_done, 1); rxor(2,2); ri(1,10); ridiv(1)
+            eb(72); eb(129); eb(194); ei(48); eb(65); eb(136); eb(18); eb(73); eb(255); eb(202); eb(73); eb(255); eb(192)
+            let p=codelen; jmp32(0); emit_patch(p, el_loop, 0); lbladd(el_done, codelen); lbladd(el_signprep, codelen)
+            rtest(9,9); let p=codelen; jcc32(0,0); emit_patch(p, el_write, 1)
+            eb(178); eb(45); eb(65); eb(136); eb(18); eb(73); eb(255); eb(202); eb(73); eb(255); eb(192)
+            lbladd(el_write, codelen); eb(73); eb(141); eb(114); eb(1); rr(2,8); ri(7,1); ri(0,1); sysc(); abi(32); return 1
+        }
+    }
+    // printi(val): write decimal representation of the integer in rdi to stdout.
+    if nl==6&&r8(nm)=='p'&&r8(nm+1)=='r'&&r8(nm+2)=='i'&&r8(nm+3)=='n'&&r8(nm+4)=='t'&&r8(nm+5)=='i' {
+        flush_all()   // spill all live vregs; after this any register is safe to clobber
+        let l_pos=nl(); let l_zero=nl(); let l_loop=nl(); let l_done=nl(); let l_signprep=nl(); let l_write=nl()
+        rr(0,7)                          // rax = rdi (value)
+        sbi(32)                          // sub rsp, 32  (decimal digit buffer)
+        lesp(10, 23)                      // r10 = rsp + 23  (direct buffer pointer, high end)
+        rxor(8,8)                        // r8 = len = 0
+        rxor(9,9)                        // r9 = sign = 0
+        rr(9,0)                          // r9 = value (for sign-bit extraction)
+        eb(77); eb(193); eb(233); eb(63) // shr r9, 63   (sign bit)
+        rtest(9,9)
+        let p=codelen; jcc32(0,0); emit_patch(p, l_pos, 1)   // je l_pos (non-negative)
+        rneg(0)                          // neg rax (make positive)
+        lbladd(l_pos, codelen)
+        rtest(0,0)
+        let p=codelen; jcc32(0,0); emit_patch(p, l_zero, 1)  // je l_zero (value == 0)
+        let p=codelen; jmp32(0); emit_patch(p, l_loop, 0)    // jmp l_loop
+        lbladd(l_zero, codelen)
+        eb(178); eb(48)                  // mov dl, '0'  (0x30)
+        eb(65); eb(136); eb(18)          // mov [r10], dl  (REX.B->r10, reg=2=dl)
+        eb(73); eb(255); eb(202)         // dec r10
+        eb(73); eb(255); eb(192)         // inc r8
+        let p=codelen; jmp32(0); emit_patch(p, l_signprep, 0) // jmp l_signprep
+        lbladd(l_loop, codelen)
+        rtest(0,0)
+        let p=codelen; jcc32(0,0); emit_patch(p, l_done, 1)   // je l_done (no more digits)
+        rxor(2,2)                        // xor rdx, rdx
+        ri(1,10)                         // rcx = 10
+        ridiv(1)                         // rax = quotient, rdx = remainder (digit)
+        eb(72); eb(129); eb(194); ei(48) // add rdx, 0x30  (digit -> ascii)
+        eb(65); eb(136); eb(18)          // mov [r10], dl  (REX.B->r10, reg=2=dl)
+        eb(73); eb(255); eb(202)         // dec r10
+        eb(73); eb(255); eb(192)         // inc r8
+        let p=codelen; jmp32(0); emit_patch(p, l_loop, 0)     // jmp l_loop
+        lbladd(l_done, codelen)
+        lbladd(l_signprep, codelen)
+        rtest(9,9)
+        let p=codelen; jcc32(0,0); emit_patch(p, l_write, 1)  // je l_write (skip if positive)
+        eb(178); eb(45)                  // mov dl, '-'  (0x2D)
+        eb(65); eb(136); eb(18)          // mov [r10], dl  (REX.B->r10, reg=2=dl)
+        eb(73); eb(255); eb(202)         // dec r10
+        eb(73); eb(255); eb(192)         // inc r8
+        lbladd(l_write, codelen)
+        eb(73); eb(141); eb(114); eb(1)  // lea rsi, [r10+1]  (buffer start = rsp+24-len)
+        rr(2,8)                          // rdx = r8 (length)
+        ri(7,1)                          // rdi = 1 (stdout)
+        ri(0,1)                          // rax = 1 (sys_write)
+        sysc()
+        abi(32)
+        return 1
+    }
+    // println(x): print x followed by a newline. x may be an integer (decimal) or
+    // a string (auto-detected via vreg_is_str), mirroring print()/echo() behavior.
+    if nl==7&&r8(nm)=='p'&&r8(nm+1)=='r'&&r8(nm+2)=='i'&&r8(nm+3)=='n'&&r8(nm+4)=='t'&&r8(nm+5)=='l'&&r8(nm+6)=='n' {
+        flush_all()
+        // String auto-detect (mirror print/echo): arg0 vreg = irres(ira2(ii)).
+        let _av = irres(ira2(ii))
+        let _aop = irop(ira2(ii))
+        let _isstr = r64(vreg_is_str + _av*8)
+        if _isstr!=1 && _aop==IR_MOV { let _sv=ira0(ira2(ii)); if r64(vreg_is_str + _sv*8)==1 { _isstr = 1 } }
+        if _isstr!=1 && _aop==IR_STR { _isstr = 1 }
+        if _isstr==1 {
+            // write the string bytes (header ptr in rdi), then a newline
+            rr(6,7); eb(72); eb(129); eb(198); ei(8); eb(72); eb(139); eb(23); ri(7,1); ri(0,1); sysc()  // writes(s)
+            sbi(8); lesp(10,0); eb(178); eb(10); eb(65); eb(136); eb(18)                                  // newline
+            rr(6,10); ri(2,1); ri(7,1); ri(0,1); sysc(); abi(8)
+            return 1
+        }
+        // float auto-detect: resolve arg vreg back through MOV chains to a float builtin.
+        let _isf = is_float_vr(_av)
+        if _isf!=1 && _aop==IR_MOV { let _sfv=ira0(ira2(ii)); if is_float_vr(_sfv)==1 { _isf = 1 } }
+        if _isf==1 {
+            flush_all()
+            let pos=nl()
+            eb(72); eb(137); eb(248)                    // mov rax, rdi  (rdi = float bits from arg loader)
+            rr(8,7)                                    // mov r8, rdi (raw float bits -> sign bit 63)
+            eb(73); eb(193); eb(232); eb(63)            // shr r8, 63  (sign)
+            eb(77); eb(137); eb(193)                    // mov r9, r8  (SAVE sign in r9)
+            eb(72); eb(15); eb(186); eb(247); eb(63)    // btr rdi, 63  (clear float sign bit in rdi)
+            eb(102); eb(72); eb(15); eb(110); eb(199)   // movq xmm0, rdi   (now positive float)
+            ri64(2, 0x412e848000000000)                // 1e6 f64
+            eb(102); eb(72); eb(15); eb(110); eb(202)   // movq xmm1, rdx
+            eb(242); eb(15); eb(89); eb(193)            // mulsd xmm0, xmm1
+            eb(242); eb(72); eb(15); eb(44); eb(192)    // cvttsd2si rax, xmm0  (scaled, positive)
+            lbladd(pos, codelen)
+            ri64(1, 1000000)
+            rxor(2,2)
+            eb(72); eb(247); eb(249)                    // idiv rcx (rcx=1000000): rax=ipart, rdx=fpart
+            rr(11,0)                                   // mov r11, rax  (ipart)
+            rr(0,2)                                    // mov rax, rdx  (rax = fpart)
+            rxor(2,2)                                  // rdx = 0
+            sbi(32); lesp(10, 23); rxor(8,8)           // buffer + length=0
+            // fpart (6 digits, unrolled)
+            rxor(2,2); ri(1,10); ridiv(1); eb(128); eb(194); eb(48); eb(65); eb(136); eb(18); eb(73); eb(255); eb(202); eb(73); eb(255); eb(192)
+            rxor(2,2); ri(1,10); ridiv(1); eb(128); eb(194); eb(48); eb(65); eb(136); eb(18); eb(73); eb(255); eb(202); eb(73); eb(255); eb(192)
+            rxor(2,2); ri(1,10); ridiv(1); eb(128); eb(194); eb(48); eb(65); eb(136); eb(18); eb(73); eb(255); eb(202); eb(73); eb(255); eb(192)
+            rxor(2,2); ri(1,10); ridiv(1); eb(128); eb(194); eb(48); eb(65); eb(136); eb(18); eb(73); eb(255); eb(202); eb(73); eb(255); eb(192)
+            rxor(2,2); ri(1,10); ridiv(1); eb(128); eb(194); eb(48); eb(65); eb(136); eb(18); eb(73); eb(255); eb(202); eb(73); eb(255); eb(192)
+            rxor(2,2); ri(1,10); ridiv(1); eb(128); eb(194); eb(48); eb(65); eb(136); eb(18); eb(73); eb(255); eb(202); eb(73); eb(255); eb(192)
+            eb(65); eb(198); eb(2); eb(46); eb(73); eb(255); eb(202); eb(73); eb(255); eb(192)   // '.' store
+            let ipz=nl(); let iloop=nl(); let idone=nl()
+            rr(0,11)                                   // mov rax, r11  (ipart into rax for digit loop)
+            eb(72); eb(133); eb(192); let pz=codelen; jcc32(0,0); emit_patch(pz, ipz, 1)   // test rax,rax ; je ipz
+            lbladd(iloop, codelen)
+            rxor(2,2); ri(1,10); ridiv(1); eb(128); eb(194); eb(48); eb(65); eb(136); eb(18); eb(73); eb(255); eb(202); eb(73); eb(255); eb(192)
+            eb(72); eb(133); eb(192); let pd=codelen; jcc32(0,0); emit_patch(pd, idone, 1)   // test rax,rax ; je idone
+            let pl=codelen; jmp32(0); emit_patch(pl, iloop, 0)
+            lbladd(ipz, codelen)
+            eb(65); eb(198); eb(2); eb(48); eb(73); eb(255); eb(202); eb(73); eb(255); eb(192)   // '0' store (ipart==0)
+            lbladd(idone, codelen)
+            // sign (use r9, the saved sign flag)
+            let sdone=nl(); eb(77); eb(133); eb(201); let p6=codelen; jcc32(0,0); emit_patch(p6, sdone, 1)   // test r9,r9 ; je sdone
+            eb(65); eb(198); eb(2); eb(45); eb(73); eb(255); eb(202); eb(73); eb(255); eb(192)   // '-' store
+            lbladd(sdone, codelen)
+            eb(73); eb(141); eb(114); eb(1)             // lea rsi, [r10+1]
+            rr(2,8); ri(7,1); ri(0,1); sysc()           // write float
+            sbi(8); lesp(10,0); eb(178); eb(10); eb(65); eb(136); eb(18)
+            rr(6,10); ri(2,1); ri(7,1); ri(0,1); sysc(); abi(8)   // newline
+            abi(32)
+            return 1
+        }
+        // integer path
+
+        let lp_pos=nl(); let lp_zero=nl(); let lp_loop=nl(); let lp_done=nl(); let lp_signprep=nl(); let lp_write=nl()
+        rr(0,7)                          // rax = rdi (value)
+        sbi(32)                          // sub rsp, 32
+        lesp(10, 23)                     // r10 = rsp + 23
+        rxor(8,8); rxor(9,9); rr(9,0)
+        eb(77); eb(193); eb(233); eb(63) // shr r9, 63
+        rtest(9,9); let p=codelen; jcc32(0,0); emit_patch(p, lp_pos, 1)   // je lp_pos (non-negative)
+        rneg(0)                          // neg rax
+        lbladd(lp_pos, codelen)
+        rtest(0,0); let p=codelen; jcc32(0,0); emit_patch(p, lp_zero, 1)   // je lp_zero (value == 0)
+        let p=codelen; jmp32(0); emit_patch(p, lp_loop, 0)                // jmp lp_loop
+        lbladd(lp_zero, codelen)
+        eb(178); eb(48); eb(65); eb(136); eb(18); eb(73); eb(255); eb(202); eb(73); eb(255); eb(192) // '0', dec r10, inc r8
+        let p=codelen; jmp32(0); emit_patch(p, lp_signprep, 0)            // jmp lp_signprep
+        lbladd(lp_loop, codelen)
+        rtest(0,0); let p=codelen; jcc32(0,0); emit_patch(p, lp_done, 1)   // je lp_done
+        rxor(2,2); ri(1,10); ridiv(1)
+        eb(72); eb(129); eb(194); ei(48); eb(65); eb(136); eb(18); eb(73); eb(255); eb(202); eb(73); eb(255); eb(192)
+        let p=codelen; jmp32(0); emit_patch(p, lp_loop, 0)                // jmp lp_loop
+        lbladd(lp_done, codelen); lbladd(lp_signprep, codelen)
+        rtest(9,9); let p=codelen; jcc32(0,0); emit_patch(p, lp_write, 1)  // je lp_write (skip if positive)
+        eb(178); eb(45); eb(65); eb(136); eb(18); eb(73); eb(255); eb(202); eb(73); eb(255); eb(192) // '-'
+        lbladd(lp_write, codelen)
+        eb(73); eb(141); eb(114); eb(1)   // lea rsi, [r10+1]
+        rr(2,8); ri(7,1); ri(0,1); sysc()  // write integer
+        // write '\n'
+        sbi(8); lesp(10,0); eb(178); eb(10); eb(65); eb(136); eb(18)
+        rr(6,10); ri(2,1); ri(7,1); ri(0,1); sysc(); abi(8)
+        abi(32)
+        return 1
+    }
+    // newline(): emit a single '\n' to stdout.
+    if nl==7&&r8(nm)=='n'&&r8(nm+1)=='e'&&r8(nm+2)=='w'&&r8(nm+3)=='l'&&r8(nm+4)=='i'&&r8(nm+5)=='n'&&r8(nm+6)=='e' {
+        flush_all()
+        sbi(8); lesp(10,0); eb(178); eb(10); eb(65); eb(136); eb(18)
+        rr(6,10); ri(2,1); ri(7,1); ri(0,1); sysc(); abi(8)
+        return 1
+    }
+    // printsp(i): print integer i followed by a space.
+    if nl==7&&r8(nm)=='p'&&r8(nm+1)=='r'&&r8(nm+2)=='i'&&r8(nm+3)=='n'&&r8(nm+4)=='t'&&r8(nm+5)=='s'&&r8(nm+6)=='p' {
+        flush_all(); let lp3_pos=nl(); let lp3_zero=nl(); let lp3_loop=nl(); let lp3_done=nl(); let lp3_signprep=nl(); let lp3_write=nl()
+        rr(0,7); sbi(32); lesp(10,23); rxor(8,8); rxor(9,9); rr(9,0)
+        eb(77); eb(193); eb(233); eb(63); rtest(9,9); let p=codelen; jcc32(0,0); emit_patch(p, lp3_pos, 1)
+        rneg(0); lbladd(lp3_pos, codelen); rtest(0,0); let p=codelen; jcc32(0,0); emit_patch(p, lp3_zero, 1)
+        let p=codelen; jmp32(0); emit_patch(p, lp3_loop, 0); lbladd(lp3_zero, codelen)
+        eb(178); eb(48); eb(65); eb(136); eb(18); eb(73); eb(255); eb(202); eb(73); eb(255); eb(192)
+        let p=codelen; jmp32(0); emit_patch(p, lp3_signprep, 0); lbladd(lp3_loop, codelen)
+        rtest(0,0); let p=codelen; jcc32(0,0); emit_patch(p, lp3_done, 1); rxor(2,2); ri(1,10); ridiv(1)
+        eb(72); eb(129); eb(194); ei(48); eb(65); eb(136); eb(18); eb(73); eb(255); eb(202); eb(73); eb(255); eb(192)
+        let p=codelen; jmp32(0); emit_patch(p, lp3_loop, 0); lbladd(lp3_done, codelen); lbladd(lp3_signprep, codelen)
+        rtest(9,9); let p=codelen; jcc32(0,0); emit_patch(p, lp3_write, 1)
+        eb(178); eb(45); eb(65); eb(136); eb(18); eb(73); eb(255); eb(202); eb(73); eb(255); eb(192)
+        lbladd(lp3_write, codelen); eb(73); eb(141); eb(114); eb(1); rr(2,8); ri(7,1); ri(0,1); sysc()
+        sbi(8); lesp(10,0); eb(178); eb(32); eb(65); eb(136); eb(18)
+        rr(6,10); ri(2,1); ri(7,1); ri(0,1); sysc(); abi(8); abi(32); return 1
+    }
+    // prints(s): write header-string s (bytes at s+8, length len(s)) to stdout.
+    if nl==6&&r8(nm)=='p'&&r8(nm+1)=='r'&&r8(nm+2)=='i'&&r8(nm+3)=='n'&&r8(nm+4)=='t'&&r8(nm+5)=='s' {
+        flush_all()
+        rr(6,7)                          // rsi = rdi (string ptr)
+        eb(72); eb(129); eb(198); ei(8)  // rsi = ptr + 8 (byte start)  [modrm 0xC6 = add rsi, imm32]
+        eb(72); eb(139); eb(23)          // rdx = [rdi] = len(s) (count)  [modrm 0x17 = mov rdx,[rdi]]
+        ri(7,1); ri(0,1); sysc()         // sys_write(1, ptr+8, len)
+        return 1
+    }
+    // --- Phase A1: unsigned arithmetic builtins (true unsigned x86) ---
+    // IR_CALL has already flush_all()'d and loaded a=rdi, b=rsi. Do NOT call
+    // flush_all() again here: emit_bltn's scratch spill relocates rsi -> rbx,
+    // corrupting arg1. Use rdi/rsi directly.
+    // udiv(a,b): unsigned a/b.
+    if nl==4&&r8(nm)=='u'&&r8(nm+1)=='d'&&r8(nm+2)=='i'&&r8(nm+3)=='v' {
+        rr(0,7)                            // rax = rdi = a (dividend low)
+        rxor(2,2)                          // xor edx,edx (clear dividend high)
+        eb(72); eb(247); eb(246)           // 48 F7 F6 = div rsi  (rax = a/b unsigned)
+        return 1
+    }
+    // umod(a,b): unsigned a%b
+    if nl==4&&r8(nm)=='u'&&r8(nm+1)=='m'&&r8(nm+2)=='o'&&r8(nm+3)=='d' {
+        rr(0,7)                            // rax = rdi = a
+        rxor(2,2)
+        eb(72); eb(247); eb(246)           // div rsi
+        rr(0,2)                            // rax = rdx (remainder)
+        return 1
+    }
+    // ult/ugt/ulte/ugte(a,b): unsigned compares -> 0/1 in rax (low byte)
+    // a=rdi(7), b=rsi(6); rcmp(r1,r2)=cmp r1,r2.
+    // UNSIGNED setcc (rsetc uses the SIGNED setl/setg, so emit bytes directly).
+    // Each setcc is "0F OP C0" = eb(15); eb(OP); mr(3,0,0)  (setX %al)
+    //   0F 92=setb(<)  0F 97=seta(>)  0F 96=setbe(<=)  0F 93=setae(>=)
+    if nl==3&&r8(nm)=='u'&&r8(nm+1)=='l'&&r8(nm+2)=='t' {
+        rxor(0,0); rcmp(7,6); eb(15); eb(146); mr(3,0,0); return 1
+    }
+    if nl==3&&r8(nm)=='u'&&r8(nm+1)=='g'&&r8(nm+2)=='t' {
+        rxor(0,0); rcmp(7,6); eb(15); eb(151); mr(3,0,0); return 1
+    }
+    if nl==4&&r8(nm)=='u'&&r8(nm+1)=='l'&&r8(nm+2)=='t'&&r8(nm+3)=='e' {
+        rxor(0,0); rcmp(7,6); eb(15); eb(150); mr(3,0,0); return 1
+    }
+    if nl==4&&r8(nm)=='u'&&r8(nm+1)=='g'&&r8(nm+2)=='t'&&r8(nm+3)=='e' {
+        rxor(0,0); rcmp(7,6); eb(15); eb(147); mr(3,0,0); return 1
+    }
+    if nl==3&&r8(nm)=='l'&&r8(nm+1)=='e'&&r8(nm+2)=='n' {
+        rmr(0,7); return 1
+    }
+    // u8/u32/u64(x): reinterpret x as unsigned of N bits (mask). Identity at the
+    // 64-bit runtime; the mask bounds the value to the named unsigned width so
+    // unsigned arithmetic/comparisons stay in range. Self-host neutral (emit is a
+    // mov+and, well-defined regardless of optimizer state).
+    if nl==2&&r8(nm)=='u'&&r8(nm+1)=='8' { flush_all(); rr(0,7); eb(72); eb(129); mr(3,4,0); ei(255); return 1 }   // rax=rdi; and rax,0xFF (0x81 imm32: 0xFF sign-extends, so MUST use imm32 form)
+    if nl==3&&r8(nm)=='u'&&r8(nm+1)=='3'&&r8(nm+2)=='2' { flush_all(); rr(0,7); eb(37); eb(255); eb(255); eb(255); eb(255); return 1 }  // and eax,0xFFFFFFFF (opcode 0x25 + imm32)
+    if nl==3&&r8(nm)=='u'&&r8(nm+1)=='6'&&r8(nm+2)=='4' { flush_all(); rr(0,7); return 1 }                          // 64-bit: identity (mov rax,rdi)
+    // str(a,b): a=rdi, b=rsi. returns header ptr (len at [new], bytes at new+8)
+    if nl==3&&r8(nm)=='s'&&r8(nm+1)=='t'&&r8(nm+2)=='r' {
+        flush_all()
+        rr(3,7)            // rbx = a
+        rr(14,6)           // r14 = b
+        rmr(0,3)           // rax = [rbx] = la
+        rr(15,0)           // r15 = la
+        rmr(0,14)          // rax = [r14] = lb
+        rr(13,0)           // r13 = lb
+        rr(7,15); ra(7,13) // rdi = la + lb = total
+        eb(72);eb(255);eb(199)   // inc rdi -> total+1
+        eb(72);eb(131);eb(199);eb(8)  // rdi += 8 -> size = total+9
+        rr(6,7)            // rsi = size
+        ri(7,0); ri(2,3); ri(10,0x22); ri(8,-1); rxor(9,9); ri(0,9); sysc()  // rax = new
+        eb(72); eb(131); eb(248); eb(0); eb(125); eb(12); eb(191); ei(1); eb(184); ei(60); eb(15); eb(5)  // mmap-fail guard: if rax<0 exit(1)
+        rr(12,0)           // r12 = new
+        rr(0,15); ra(0,13) // rax = total
+        rr(7,12); eb(72);eb(137);eb(7)   // [new] = total
+        // copy la bytes a+8 -> new+8
+        rr(6,3); eb(72);eb(131);eb(198);eb(8)   // rsi = a+8 (rbx+8)
+        rr(7,12); eb(72);eb(131);eb(199);eb(8)  // rdi = new+8
+        rr(1,15); eb(243);eb(164)    // rcx = la; rep movsb
+        // copy lb bytes b+8 -> new+8+la
+        rr(6,14); eb(72);eb(131);eb(198);eb(8)  // rsi = b+8 (r14+8)
+        rr(7,12); eb(72);eb(131);eb(199);eb(8)  // rdi = new+8
+        ra(7,15)          // rdi += r15 (la) -- dest for b's bytes = new+8+la
+        rr(1,13); eb(243);eb(164)    // rcx = lb; rep movsb
+        // nul at new+8+total
+        rr(7,12); eb(72);eb(131);eb(199);eb(8)  // rdi = new+8
+        ra(7,15)          // rdi += r15 (la)
+        ra(7,13)          // rdi += r13 (lb)
+        eb(198);eb(7);eb(0)    // mov byte [rdi], 0  (C6 07 00)
+        rr(0,12)           // rax = new
+        return 1
+    }
+    // str_eq(a,b): compare two strings. a=rdi,b=rsi. Returns 1 if equal, 0 if not.
+    // Header: [ptr]=len, bytes at ptr+8. Manual byte loop (repe cmpsb is broken in Quanta).
+    // 'mov al,[rsi]' writes al (low byte of rax), so only set rax at the returns.
+    // SINGLE 'return 1' (builtin exit); both paths converge: EQUAL sets rax=1,
+    // MISMATCH uses rxor(0,0); a jmp32 skips the unneeded half. Offsets filled post-measure.
+    if nl==6&&r8(nm)=='s'&&r8(nm+1)=='t'&&r8(nm+2)=='r'&&r8(nm+3)=='_'&&r8(nm+4)=='e'&&r8(nm+5)=='q' {
+        flush_all()
+        rr(3,7)            // rbx = a
+        rr(14,6)           // r14 = b
+        rmr(0,3)           // rax = [rbx] = la
+        rr(15,0)           // r15 = la
+        rmr(0,14)          // rax = [r14] = lb
+        rr(13,0)           // rbp = lb  (13↔rbp under %8)
+        rcmp(13,15)        // cmp rbp, r15  (lb vs la)
+        jcc32(1, 54)       // jne -> lengths differ -> forward to MISMATCH (rxor)
+        rr(6,3); eb(72); eb(131); eb(198); eb(8)   // rsi = a+8
+        rr(7,14); eb(72); eb(131); eb(199); eb(8)   // rdi = b+8
+        rr(1,15)           // rcx = la
+        eb(138); eb(6)     // LOOP: mov al, [rsi]
+        eb(58); eb(7)      // cmp al, [rdi]
+        jcc32(1, 27)       // jne -> mismatch -> forward to MISMATCH (rxor)
+        eb(72); eb(255); eb(198)   // inc rsi
+        eb(72); eb(255); eb(199)   // inc rdi
+        eb(72); eb(255); eb(201)   // dec rcx
+        jcc32(1, -25)      // jne -> loop back (rcx!=0)  (backward)
+        eb(72); eb(199); eb(192); eb(1); eb(0); eb(0); eb(0)   // mov rax, 1 (EQUAL)
+        jmp32(3)           // jmp forward to END (skip rxor)
+        rxor(0,0)          // MISMATCH: rax = 0
+        return 1           // END: auto-ret
+    }
+    // str_ne(a,b): returns 1 if NOT equal, 0 if equal.
+    if nl==6&&r8(nm)=='s'&&r8(nm+1)=='t'&&r8(nm+2)=='r'&&r8(nm+3)=='_'&&r8(nm+4)=='n'&&r8(nm+5)=='e' {
+        flush_all()
+        rr(3,7)            // rbx = a
+        rr(14,6)           // r14 = b
+        rmr(0,3)           // rax = [rbx] = la
+        rr(15,0)           // r15 = la
+        rmr(0,14)          // rax = [r14] = lb
+        rr(13,0)           // rbp = lb
+        rcmp(13,15)        // cmp rbp, r15  (lb vs la)
+        jcc32(1, 50)       // jne -> lengths differ -> forward to NOT-EQUAL (mov rax,1)
+        rr(6,3); eb(72); eb(131); eb(198); eb(8)   // rsi = a+8
+        rr(7,14); eb(72); eb(131); eb(199); eb(8)   // rdi = b+8
+        rr(1,15)           // rcx = la
+        eb(138); eb(6)     // LOOP: mov al, [rsi]
+        eb(58); eb(7)      // cmp al, [rdi]
+        jcc32(1, 23)       // jne -> mismatch -> forward to NOT-EQUAL (mov rax,1)
+        eb(72); eb(255); eb(198)   // inc rsi
+        eb(72); eb(255); eb(199)   // inc rdi
+        eb(72); eb(255); eb(201)   // dec rcx
+        jcc32(1, -25)      // jne -> loop back (rcx!=0)  (backward)
+        rxor(0,0)          // EQUAL: rax = 0
+        jmp32(7)           // jmp forward to END (skip mov rax,1)
+        eb(72); eb(199); eb(192); eb(1); eb(0); eb(0); eb(0)   // NOT-EQUAL: mov rax, 1
+        return 1           // END: auto-ret
+    }
+    // qc_sys_cmd(cmd): run external command, return CmdResult{out,code,err} struct.
+    // cmd=rdi = header ptr (len at [cmd], bytes at cmd+8). Returns heap struct:
+    //   [0]  = len (24)
+    //   [8]  = out_ptr (string header ptr, or 0 if empty)
+    //   [16] = code    (i64, exit status)
+    //   [24] = err_ptr (0; stderr not captured in this minimal impl)
+    if nl==10&&r8(nm)=='q'&&r8(nm+1)=='c'&&r8(nm+2)=='_'&&r8(nm+3)=='s'&&r8(nm+4)=='y'&&r8(nm+5)=='s'&&r8(nm+6)=='_'&&r8(nm+7)=='c'&&r8(nm+8)=='m'&&r8(nm+9)=='d' {
+        flush_all()
+        // 0.0.55: load the cmd. Two cases:
+        //   - compile-time string literal: its data-section address is in
+        //     lit_addr[cmd_vreg] (populated by IR_STR codegen) and is non-zero.
+        //   - runtime variable (e.g. let s="..."; $$(s)) or fn param: the string
+        //     pointer lives in the vreg's home slot at runtime -> spill_home(cmd).
+        // Discriminate by whether lit_addr[cmd] is populated (non-zero), since a
+        // literal's address is always known, while a variable's may not be.
+        let _cmdv = ira1(ii)
+        if r64(lit_addr + _cmdv*8) != 0 {
+            ri64(7, r64(lit_addr + _cmdv*8))      // literal: known data address
+        } else {
+            rbp(7, spill_home(_cmdv))             // variable/fn-param: runtime ptr
+        }
+        let l_parent=nl(); let l_rdbrk=nl(); let l_disc=nl()
+        // Preserve callee-saved regs (r12-r15) per x86-64 ABI — this builtin
+        // clobbers them, so save/restore to avoid corrupting caller state (e.g.
+        // the result struct ptr held in r12 by the caller).
+        eb(65); eb(84)   // push r12  (41 54)
+        eb(65); eb(85)   // push r13  (41 55)
+        eb(65); eb(86)   // push r14  (41 56)
+        eb(65); eb(87)   // push r15  (41 57)
+        // SAVE cmd (rdi) FIRST — every syscall below clobbers rdi. r14 = cmd+8 (bytes ptr).
+        rr(14,7); ri(8,8); ra(14,8)
+        // Allocate result struct: mmap(0, 48, RW, ANON|PRIVATE, -1, 0). The extra
+        // 16 bytes past the 32-byte [len,out,code,err] header serve as the .err
+        // buffer (zero-filled by mmap -> len 0 -> ""). err_ptr points at this
+        // in-struct tail, so it is always a valid runtime address (no separate
+        // mmap / register-clobber pitfalls).
+        ri(6,48); ri(7,0); ri(2,3); ri(10,0x22); ri(8,-1); rxor(9,9); ri(0,9); sysc()
+        rr(12,0)           // r12 = result struct ptr (rax)
+        // struct field access uses IR_IDX => load [base + idx*8 + 8].
+        // So fields live at out@8, code@16, err@24; [0] is a len header.
+        ri(0,24); stx(12,0,0)   // [r12+0] = 24 (len)
+        stx(12,8,0)        // [r12+8] = 0 (out_ptr)
+        stx(12,16,0)       // [r12+16] = 0 (code)
+        // 0.0.55: .err returns a VALID empty string (stderr is not captured in
+        // this minimal impl). The result struct was mmap'd as 48 bytes; the 16
+        // bytes past the 32-byte header [r12+32..r12+48] serve as the .err buffer
+        // (zero-filled by mmap -> len 0 -> ""). Point err_ptr at this in-struct
+        // tail: it is always a valid runtime address.
+        rr(0,12); ri(8,32); ra(0,8)   // r0 = r12 + 32 (err buffer inside struct)
+        stx(12,24,0)       // [r12+24] = err_ptr -> "" (in-struct, zero-filled)
+        // output string buffer (header + 4096 bytes): mmap(0, 4104, ...)
+        ri(6,4104); ri(7,0); ri(2,3); ri(10,0x22); ri(8,-1); rxor(9,9); ri(0,9); sysc()
+        rr(15,0)           // r15 = out_buf (rax)
+        // scratch S for argv/envp (4096 bytes)
+        ri(6,4096); ri(7,0); ri(2,3); ri(10,0x22); ri(8,-1); rxor(9,9); ri(0,9); sysc()
+        rr(13,0)           // r13 = S
+        // [S+16] = "/bin/sh\0"  (two 32-bit stores; ri is 32-bit so split the 8-byte literal)
+        wmi(13,16,0x6e69622f)   // low:  "/bin"
+        wmi(13,20,0x0068732f)   // high: "/sh\0"
+        // [S+32] = "-c\0\0\0\0"
+        wmi(13,32,0x0000632d)   // "-c\0\0"
+        // r14 already = cmd+8 (saved at builtin entry before rdi was clobbered)
+        // argv array at S+1024: [S+1024]=S+16, [S+1032]=S+32, [S+1040]=r14, [S+1048]=0
+        rr(10,13); ri(8,16); ra(10,8); stx(13,1024,10)   // [S+1024] = S+16
+        rr(10,13); ri(8,32); ra(10,8); stx(13,1032,10)   // [S+1032] = S+32
+        stx(13,1040,14)                     // [S+1040] = r14
+        ri(10,0);  stx(13,1048,10)          // [S+1048] = 0
+        // pipe(S+2048): rdi = S+2048 (pipefd array; [S+2048]=read, [S+2052]=write)
+        rr(7,13); ri(8,2048); ra(7,8); ri(0,22); sysc()   // pipe(S+2048)
+        // fork() -> rax (0=child, >0=parent). fork = rax=57, rdi=0
+        ri(0,57); ri(7,0); sysc()
+        rtest(0,0); let pj=codelen; jcc32(3,0); emit_patch(pj, l_parent, 1)   // jg -> parent (rax>0)
+        // ===== CHILD (rax==0) =====
+        // dup2(write_fd=[S+2052], 1): rdi=[S+2052], rsi=1
+        ldx(7,13,2052); ri(6,1); ri(0,33); sysc()     // dup2(write_fd, 1)
+        // execve("/bin/sh", argv_array, 0): rdi = S+16 (path), rsi = S+1024 (argv), rdx = 0
+        rr(7,13); ri(8,16); ra(7,8)      // rdi = S+16
+        rr(6,13); ri(8,1024); ra(6,8)    // rsi = S+1024 (argv array)
+        ri(2,0); ri(0,59); sysc()        // execve (rdx/envp=0)
+        ri(7,127); ri(0,60); sysc()          // execve failed -> exit(127)
+        // ===== PARENT =====
+        lbladd(l_parent, codelen)
+        // close write end so EOF propagates when child exits
+        ldx(7,13,2052); ri(0,3); sysc()     // close(write_fd)
+        // read loop: accumulate child output into out_buf+8, total len in r9
+        rxor(9,9)                            // r9 = total = 0
+        let l_rd=nl()
+        lbladd(l_rd, codelen)
+        // 0.0.55: cap output at the 4096-byte buffer. If total >= 4096 the buffer
+        // is full; keep DRAINING the pipe (discard) so the child is not blocked on
+        // a full pipe (which would hang wait4 forever). We never store past 4096.
+        let _pjcap = codelen
+        eb(73); eb(129); eb(249); ei(4096)   // cmp r9, 4096  (49 81 F9 00001000)
+        let _pjcap2 = codelen
+        jcc32(5, 0); emit_patch(_pjcap2, l_disc, 1)  // jge -> discard path
+        ldx(7,13,2048)                       // rdi = read_fd
+        rr(6,15); ri(8,8); ra(6,9); ra(6,8)  // rsi = out_buf + 8 + total
+        ri(10,4096); rs(10,9)            // rdx = 4096 - total
+        ri(0,0); sysc()                      // read -> rax = n
+        rtest(0,0); let pj2=codelen; jcc32(4,0); emit_patch(pj2, l_rdbrk, 1)  // jle -> break (n<=0)
+        ra(9,0)                              // total += n (rax=n)
+        let pj3=codelen; jmp32(0); emit_patch(pj3, l_rd, 0)
+        // discard path: read into out_buf+8 (overwrite, stays within 4096),
+        // do NOT advance total. Keeps the pipe drained until child EOF.
+        lbladd(l_disc, codelen)
+        ldx(7,13,2048)                       // rdi = read_fd
+        rr(6,15); ri(8,8); ra(6,8)           // rsi = out_buf + 8 (fixed; within buf)
+        ri(10,4096); rs(10,0)            // rdx = 4096 (dummy; never stored)
+        ri(0,0); sysc()                      // read -> rax = n
+        rtest(0,0); let pj4=codelen; jcc32(4,0); emit_patch(pj4, l_rdbrk, 1)  // jle -> break
+        jmp32(0); emit_patch(codelen-5, l_disc, 0)
+        lbladd(l_rdbrk, codelen)
+        // set output string header: [out_buf] = total (len). rax is 0 here (n<=0).
+        rr(7,15); stx(7,0,9)  // [out_buf+0] = total (r9)
+        // wait4(-1, &status@S+2064, 0, 0): rdi=-1, rsi=S+2064 (ADDRESS, not value)
+        rr(6,13); ri(8,2064); ra(6,8)    // rsi = S+2064
+        ri(7,-1); ri(2,0); ri(10,0); ri(0,61); sysc()   // rdi=-1, rdx=0, r10=0, wait4
+        // extract exit code: code = (status >> 8) & 0xff  (WEXITSTATUS)
+        ldx(6,13,2064)                    // r6 = status (low 32)
+        eb(72); eb(193); eb(238); eb(8)   // shr r6, 8   (48 C1 EE 08)
+        eb(72); eb(131); eb(230); eb(255) // and r6, 0xff (48 83 E6 FF)
+        stx(12,16,6)      // [r12+16] = code
+        stx(12,8,15)      // [r12+8] = out_buf (out_ptr)
+        // NOTE: [r12+24] (err_ptr) is set earlier to the empty-string buffer
+        // (in-struct tail, line ~1205); do NOT overwrite it with 0 here.
+        // munmap S (4096): rdi=S, rsi=4096, rax=11
+        rr(7,13); ri(8,4096); ri(0,11); sysc()
+        rr(0,12)           // rax = result struct ptr
+        // restore callee-saved regs
+        eb(65); eb(95)   // pop r15  (41 5F)
+        eb(65); eb(94)   // pop r14  (41 5E)
+        eb(65); eb(93)   // pop r13  (41 5D)
+        eb(65); eb(92)   // pop r12  (41 5C)
+        return 1
+    }
+    // NOTE: a user-defined fn push(...) MUST win over this builtin. If a user fn
+    // named "push" exists, this is not the builtin -> return 0 so the IR_CALL
+    // handler emits a real (patched) call to the user function instead.
+    if nl==4&&r8(nm)=='p'&&r8(nm+1)=='u'&&r8(nm+2)=='s'&&r8(nm+3)=='h' {
+        if findfn(nmi,nl)>=0 { return 0 }
+        flush_all()
+        rr(3,7)            // rbx = v
+        rr(13,6)           // r13 = e
+        rmr(14,3)          // r14 = oldlen = [v]
+        rr(7,14)           // rdi = oldlen
+        eb(72);eb(131);eb(199);eb(9)      // add rdi, 9 -> size = oldlen+1(byte)+8(header) (48 83 C7 09)
+        rr(6,7)            // rsi = size
+        ri(7,0); ri(2,3); ri(10,0x22); ri(8,-1); rxor(9,9); ri(0,9); sysc()  // rax = new
+        eb(72); eb(131); eb(248); eb(0); eb(125); eb(12); eb(191); ei(1); eb(184); ei(60); eb(15); eb(5)  // mmap-fail guard: if rax<0 exit(1)
+        rr(12,0)           // r12 = new
+        rr(0,14); eb(72);eb(255);eb(192)  // rax = oldlen+1 = newlen (inc rax -> 48 FF C0)
+        rr(7,12); eb(72);eb(137);eb(7)    // [new] = newlen
+        // copy oldlen bytes v+8 -> new+8 via rep movsb
+        rr(6,3); eb(72);eb(131);eb(198);eb(8)   // rsi = v+8 (rbx+8)
+        rr(7,12); eb(72);eb(131);eb(199);eb(8)  // rdi = new+8
+        rr(1,14); eb(243);eb(164)               // rcx = oldlen; rep movsb
+        // store byte e at new+8+oldlen
+        rr(7,12); eb(72);eb(131);eb(199);eb(8)  // rdi = new+8
+        ra(7,14)          // rdi += r14 (oldlen) -> new+8+oldlen
+        eb(68);eb(136);eb(47)  // mov [rdi], r13b  (44 88 2F: REX.R->r13, byte store)
+        rr(0,12)           // rax = new
+        return 1
+    }
+    // pop(v): remove last byte, return it (or 0 if empty). byte-oriented (matches str). v=rdi.
+    // Same user-wins guard as push: a user-defined fn pop(...) shadows this builtin.
+    if nl==3&&r8(nm)=='p'&&r8(nm+1)=='o'&&r8(nm+2)=='p' {
+        if findfn(nmi,nl)>=0 { return 0 }
+        flush_all()
+        rr(3,7)            // rbx = v
+        rmr(14,3)          // r14 = oldlen
+        let lz=nl(); let lret=nl()
+        rtest(14,14)
+        let p=codelen; jcc32(0,0); emit_patch(p, lz, 1)  // je lz (empty)
+        rr(7,3)            // rdi = v
+        eb(72);eb(131);eb(199);eb(7)   // add rdi, 7 (48 83 C7 07)
+        ra(7,14)          // rdi += r14 (oldlen) -> v+7+oldlen = &last byte
+        eb(72);eb(15);eb(182);eb(7)    // movzx rax, byte [rdi] (48 0F B6 07)
+        rr(15,0)          // r15 = elem (save)
+        rr(7,3)           // rdi = v
+        rr(0,14); eb(72);eb(131);eb(232);eb(1)  // rax = oldlen-1 (sub rax,1)
+        eb(72);eb(137);eb(7)   // [v] = rax
+        rr(0,15)          // rax = elem
+        let p2=codelen; jmp32(0); emit_patch(p2, lret, 0)
+        lbladd(lz, codelen)
+        rxor(0,0)         // rax = 0
+        lbladd(lret, codelen)
+        return 1
+    }
+    // argc(): return saved variadic arg count (frame-local, set by prologue).
+    if nl==4&&r8(nm)=='a'&&r8(nm+1)=='r'&&r8(nm+2)=='g'&&r8(nm+3)=='c' {
+        rbp(0, g_va_cnt_off)   // rax = [rbp + g_va_cnt_off]
+        return 1
+    }
+    // arg(i): return variadic arg i (0-based, includes named params).
+    //   i < 6  -> saved reg-arg area:  [r11 + g_va_reg_off + i*8]
+    //   i >= 6 -> stack arg still there: [r11 + 16 + (i-6)*8]   (r11 = rbp)
+    // i arrives in rdi (arg0). PRESERVE rdi (loop var) via push/pop.
+    if nl==3&&r8(nm)=='a'&&r8(nm+1)=='r'&&r8(nm+2)=='g' {
+        let lstack=nl(); let ldone=nl()
+        eb(72); eb(129); mr(3,7,7); ei(6)   // cmp rdi, 6 (immediate)
+        let p=codelen; jcc32(2, 0); emit_patch(p, lstack, 1)  // jl lstack (i<6)
+        // --- i >= 6: r11 = rbp + 16 + (i-6)*8 ---
+        eb(87)                          // push rdi (preserve index)
+        rr(11, 5)                       // r11 = rbp
+        eb(73); eb(129); mr(3,0,3); ei(16)   // add r11, 16
+        rr(1, 7)                        // rcx = rdi (i)
+        eb(72); eb(131); mr(3,5,1); eb(6)    // sub rcx, 6   -> rcx = i - 6
+        eb(72); eb(193); eb(225); eb(3) // shl rcx, 3  (48 C1 E1 03) -> (i-6)*8
+        ra(11, 1)                       // r11 += rcx
+        lbase(0, 0)                     // rax = [r11]
+        eb(95)                          // pop rdi
+        let p1=codelen; jmp32(0); emit_patch(p1, ldone, 0)
+        lbladd(lstack, codelen)
+        // --- i < 6: r11 = rbp + g_va_reg_off + i*8 ---
+        eb(87)                          // push rdi (preserve index)
+        rr(11, 5)                       // r11 = rbp
+        eb(73); eb(129); mr(3,0,3); ei(g_va_reg_off)  // add r11, g_va_reg_off
+        eb(72); eb(193); eb(231); eb(3) // shl rdi, 3  (48 C1 E7 03) -> i*8
+        ra(11, 7)                       // r11 += rdi
+        lbase(0, 0)                     // rax = [r11]
+        eb(95)                          // pop rdi
+        lbladd(ldone, codelen)
+        return 1
+    }
+    // P2: proc/env builtins (syscall-based)
+    // getpid(): sc 39
+    if nl==6&&r8(nm)=='g'&&r8(nm+1)=='e'&&r8(nm+2)=='t'&&r8(nm+3)=='p'&&r8(nm+4)=='i'&&r8(nm+5)=='d' {
+        flush_all()
+        ri(0,39); sysc(); return 1
+    }
+    // getppid(): sc 110
+    if nl==7&&r8(nm)=='g'&&r8(nm+1)=='e'&&r8(nm+2)=='t'&&r8(nm+3)=='p'&&r8(nm+4)=='p'&&r8(nm+5)=='i'&&r8(nm+6)=='d' {
+        flush_all()
+        ri(0,110); sysc(); return 1
+    }
+    // arg_count(): process argv count (argc) -> load g_argc via RIP-relative
+    if nl==9&&r8(nm)=='a'&&r8(nm+1)=='r'&&r8(nm+2)=='g'&&r8(nm+3)=='_'&&r8(nm+4)=='c'&&r8(nm+5)=='o'&&r8(nm+6)=='u'&&r8(nm+7)=='n'&&r8(nm+8)=='t' {
+        let rd=aphys(0)
+        let rex=72; if rd>=8 { rex=76 }
+        eb(rex); eb(139); eb(5 + (rd%8)*8); ei(0)
+        let pofs=codelen-4
+        w64(gpatches+gpatchc*24, pofs)
+        w64(gpatches+gpatchc*24+8, g_argc)
+        w8(gpatches+gpatchc*24+16, 0)
+        if gpatchc >= GPATCH_CAP { emit_ovf() }
+        gpatchc=gpatchc+1
+        sdef(0, rd)
+        return 1
+    }
+    // environ(): return g_environ pointer
+    if nl==8&&r8(nm)=='e'&&r8(nm+1)=='n'&&r8(nm+2)=='v'&&r8(nm+3)=='i'&&r8(nm+4)=='r'&&r8(nm+5)=='o'&&r8(nm+6)=='n' {
+        let rd=aphys(0)
+        let rex=72; if rd>=8 { rex=76 }
+        eb(rex); eb(139); eb(5 + (rd%8)*8); ei(0)
+        let pofs=codelen-4
+        w64(gpatches+gpatchc*24, pofs)
+        w64(gpatches+gpatchc*24+8, g_environ)
+        w8(gpatches+gpatchc*24+16, 0)
+        if gpatchc >= GPATCH_CAP { emit_ovf() }
+        gpatchc=gpatchc+1
+        sdef(0, rd)
+        return 1
+    }
+    // getenv(name): uses g_environ
+    if nl==6&&r8(nm)=='g'&&r8(nm+1)=='e'&&r8(nm+2)=='t'&&r8(nm+3)=='e'&&r8(nm+4)=='n'&&r8(nm+5)=='v' {
+        flush_all()
+        // getenv is complex - for now return 0
+        let vr=aphys(0)
+        ri(vr, 0)
+        sdef(vr, vr)
+        return 1
+    }
+    // getc(): read 1 byte from stdin, return it (0 on EOF). Stack scratch buffer.
+    if nl==4&&r8(nm)=='g'&&r8(nm+1)=='e'&&r8(nm+2)=='t'&&r8(nm+3)=='c' {
+        flush_all()
+        eb(72); eb(131); eb(236); eb(16)      // sub rsp, 16  (scratch) - imm8
+        ri(7, 0)                                // rdi = 0 (stdin)
+        eb(72); eb(137); eb(230)               // mov rsi, rsp (buf)
+        ri(2, 1)                               // rdx = 1
+        eb(184); ei(0); sysc()                 // read(0, rsp, 1)
+        eb(72); eb(15); eb(182); eb(4); eb(36) // movzx eax, byte [rsp]
+        eb(72); eb(131); eb(196); eb(16)       // add rsp, 16  - imm8
+        sdef(0, 0); return 1
+    }
+    // ---- P2: float comparison builtins (SSE, return int 0/1, BRANCHLESS via setcc) ----
+    // All comparisons use comisd (66 0F 2F) then a setcc to avoid jump/label patching.
+    // NOTE: ucomisd (F2 0F 2E) triggers #UD in this target environment, so comisd is used.
+    // comisd result flags:  a<b => CF=1,ZF=0 ; a==b => ZF=1 ; unordered => CF=ZF=PF=1
+    // feq(a,b): ordered-equal. comisd sets ZF=1 for equal OR unordered, CF=1 for
+    // a<b/unordered. Ordered-equal = ZF=1 AND CF=0 = sete AND setae. NOTE: do NOT
+    // insert xor eax,eax here -- it sets ZF and clobbers the comisd flags.
+    if nl==3&&r8(nm)=='f'&&r8(nm+1)=='e'&&r8(nm+2)=='q' {
+        flush_all()
+        eb(102); eb(72); eb(15); eb(110); eb(199)  // movq xmm0, rdi
+        eb(102); eb(72); eb(15); eb(110); eb(206)  // movq xmm1, rsi
+        eb(102); eb(15); eb(47); eb(193)          // comisd xmm0, xmm1
+        eb(15); eb(148); eb(192)                   // sete al  (ZF=1)
+        eb(15); eb(147); eb(193)                   // setae cl (CF=0)
+        eb(32); eb(200)                            // and al, cl (20 C8) -> 1 only if ZF=1 AND CF=0
+        eb(15); eb(182); eb(192)                   // movzx eax, al
+        return 1
+    }
+    // flt(a,b): a<b
+    if nl==3&&r8(nm)=='f'&&r8(nm+1)=='l'&&r8(nm+2)=='t' {
+        flush_all()
+        eb(102); eb(72); eb(15); eb(110); eb(199)
+        eb(102); eb(72); eb(15); eb(110); eb(206)
+        eb(102); eb(15); eb(47); eb(193)          // comisd xmm0, xmm1
+        eb(15); eb(146); eb(192)                   // setb al  (CF=1,ZF=0 => a<b)
+        eb(15); eb(182); eb(192)                   // movzx eax, al
+        return 1
+    }
+    // fle(a,b): a<=b
+    if nl==3&&r8(nm)=='f'&&r8(nm+1)=='l'&&r8(nm+2)=='e' {
+        flush_all()
+        eb(102); eb(72); eb(15); eb(110); eb(199)
+        eb(102); eb(72); eb(15); eb(110); eb(206)
+        eb(102); eb(15); eb(47); eb(193)          // comisd xmm0, xmm1
+        eb(15); eb(150); eb(192)                   // setbe al (CF=1 or ZF=1 => a<=b)
+        eb(15); eb(182); eb(192)                   // movzx eax, al
+        return 1
+    }
+    // fgt(a,b): a>b  (comisd a,b then seta)
+    if nl==3&&r8(nm)=='f'&&r8(nm+1)=='g'&&r8(nm+2)=='t' {
+        flush_all()
+        eb(102); eb(72); eb(15); eb(110); eb(199)  // movq xmm0, rdi (a)
+        eb(102); eb(72); eb(15); eb(110); eb(206)  // movq xmm1, rsi (b)
+        eb(102); eb(15); eb(47); eb(193)          // comisd xmm0(=a), xmm1(=b)
+        eb(15); eb(151); eb(192)                   // seta al (CF=0,ZF=0 => a>b)
+        eb(15); eb(182); eb(192)                   // movzx eax, al
+        return 1
+    }
+    // fge(a,b): a>=b  (comisd a,b then setae)
+    if nl==3&&r8(nm)=='f'&&r8(nm+1)=='g'&&r8(nm+2)=='e' {
+        flush_all()
+        eb(102); eb(72); eb(15); eb(110); eb(199)  // movq xmm0, rdi (a)
+        eb(102); eb(72); eb(15); eb(110); eb(206)  // movq xmm1, rsi (b)
+        eb(102); eb(15); eb(47); eb(193)
+        eb(15); eb(147); eb(192)                   // setae al (CF=0 => a>=b)
+        eb(15); eb(182); eb(192)                   // movzx eax, al
+        return 1
+    }
+    // fisnan(a): unordered (PF=1)
+    if nl==6&&r8(nm)=='f'&&r8(nm+1)=='i'&&r8(nm+2)=='s'&&r8(nm+3)=='n'&&r8(nm+4)=='a'&&r8(nm+5)=='n' {
+        flush_all()
+        eb(102); eb(72); eb(15); eb(110); eb(199)  // movq xmm0, rdi
+        eb(102); eb(15); eb(47); eb(192)          // comisd xmm0, xmm0 (nan => PF=1)
+        eb(15); eb(154); eb(192)                   // setp al (PF=1 => nan)
+        eb(15); eb(182); eb(192)                   // movzx eax, al
+        return 1
+    }
+    // fisinf(a): abs(a)==inf
+    if nl==6&&r8(nm)=='f'&&r8(nm+1)=='i'&&r8(nm+2)=='s'&&r8(nm+3)=='i'&&r8(nm+4)=='n'&&r8(nm+5)=='f' {
+        flush_all()
+        eb(102); eb(72); eb(15); eb(110); eb(199)  // movq xmm0, rdi
+        ri(0, 0x7FF0000000000000)
+        eb(102); eb(72); eb(15); eb(110); eb(192)  // movq xmm1, rax (inf bits)
+        eb(102); eb(15); eb(80); eb(193)          // andpd xmm0, xmm1 (abs)
+        eb(102); eb(72); eb(15); eb(110); eb(192)  // movq xmm1, rax
+        eb(102); eb(15); eb(47); eb(193)          // comisd xmm0, xmm1
+        eb(15); eb(148); eb(192)                   // sete al (equal => inf)
+        eb(15); eb(182); eb(192)                   // movzx eax, al
+        return 1
+    }
+    // ---- P2: math builtins (SSE, f64 bit-pattern in/out) ----
+    // sqrt(a): a=rdi
+    if nl==4&&r8(nm)=='s'&&r8(nm+1)=='q'&&r8(nm+2)=='r'&&r8(nm+3)=='t' {
+        flush_all()
+        eb(102); eb(72); eb(15); eb(110); eb(199)      // movq xmm0, rdi
+        eb(242); eb(15); eb(81); eb(192)               // sqrtsd xmm0, xmm0 (F2 0F 51 C0)
+        eb(102); eb(72); eb(15); eb(126); eb(192)      // movq rax, xmm0
+        return 1
+    }
+    // floor(a), ceil(a): use roundsd
+    if nl==5&&r8(nm)=='f'&&r8(nm+1)=='l'&&r8(nm+2)=='o'&&r8(nm+3)=='o'&&r8(nm+4)=='r' {
+        flush_all()
+        eb(102); eb(72); eb(15); eb(110); eb(199)
+        eb(102); eb(15); eb(58); eb(11); eb(192); eb(1)  // roundsd xmm0, xmm0, 1 (66 0F 3A 0B C0 01)
+        eb(102); eb(72); eb(15); eb(126); eb(192)
+        return 1
+    }
+    if nl==4&&r8(nm)=='c'&&r8(nm+1)=='e'&&r8(nm+2)=='i'&&r8(nm+3)=='l' {
+        flush_all()
+        eb(102); eb(72); eb(15); eb(110); eb(199)
+        eb(102); eb(15); eb(58); eb(11); eb(192); eb(2)  // roundsd xmm0, xmm0, 2 (66 0F 3A 0B C0 02)
+        eb(102); eb(72); eb(15); eb(126); eb(192)
+        return 1
+    }
+    // abs(a) for f64: clear sign bit
+    if nl==3&&r8(nm)=='a'&&r8(nm+1)=='b'&&r8(nm+2)=='s' {
+        flush_all()
+        let arg0v = irres(ira2(ii))
+        rbp(7, spill_home(arg0v))                     // rdi = a (arg0 from spill home)
+        eb(72); eb(137); eb(192)           // mov rax, rdi
+        ri64(1, 0x7FFFFFFFFFFFFFFF)        // mov rcx, mask
+        eb(72); eb(33); eb(200)            // and rax, rcx (48 21 C8)
+        return 1
+    }
+    // ---- P2: fmin / fmax (SSE, branchless via comisd + cmov) ----
+    // fmin(a,b): a=rdi, b=rsi. result = (b<a) ? b : a  (NaN -> a, like C fmin)
+    if nl==4&&r8(nm)=='f'&&r8(nm+1)=='m'&&r8(nm+2)=='i'&&r8(nm+3)=='n' {
+        flush_all()
+        let arg0v = irres(ira2(ii))
+        let arg1v = irres(ira2(ii)+1)
+        rbp(7, spill_home(arg0v))                     // rdi = a (arg0 from spill home)
+        rbp(6, spill_home(arg1v))                     // rsi = b (arg1 from spill home)
+        eb(102); eb(72); eb(15); eb(110); eb(199)   // movq xmm0, rdi (a)
+        eb(102); eb(72); eb(15); eb(110); eb(206)   // movq xmm1, rsi (b)
+        eb(102); eb(15); eb(47); eb(193)           // comisd xmm0, xmm1 (a vs b)
+        eb(15); eb(147); eb(192)                   // setae al (CF=0 => a>=b)
+        rzx(0, 0)                                  // movzx eax, al
+        rr(0, 7)                                   // mov rax, rdi (default a)
+        rr(2, 6)                                   // mov rdx, rsi (b)
+        rcmov(0, 0, 2)                             // cmovae rax, rdx (a>=b keep a else b) => min
+        return 1
+    }
+    if nl==4&&r8(nm)=='f'&&r8(nm+1)=='m'&&r8(nm+2)=='a'&&r8(nm+3)=='x' {
+        flush_all()
+        let arg0v = irres(ira2(ii))
+        let arg1v = irres(ira2(ii)+1)
+        rbp(7, spill_home(arg0v))                     // rdi = a (arg0 from spill home)
+        rbp(6, spill_home(arg1v))                     // rsi = b (arg1 from spill home)
+        eb(102); eb(72); eb(15); eb(110); eb(199)   // movq xmm0, rdi (a)
+        eb(102); eb(72); eb(15); eb(110); eb(206)   // movq xmm1, rsi (b)
+        eb(102); eb(15); eb(47); eb(193)           // comisd xmm0, xmm1 (a vs b)
+        eb(15); eb(146); eb(192)                   // setb al (CF=1 => a<b)
+        rzx(0, 0)                                  // movzx eax, al
+        rr(0, 7)                                   // mov rax, rdi (default a)
+        rr(2, 6)                                   // mov rdx, rsi (b)
+        rcmov(1, 0, 2)                             // cmovb rax, rdx (a<b take b) => max
+        return 1
+    }
+    // ---- P2: transcendentals via x87 FPU (freestanding, no libm) ----
+    // Input is the f64 bit-pattern in rdi. We spill to the stack, load to x87,
+    // compute, store back, and return the bit-pattern in rax.
+    // sin(a): fld a; fsin
+    // FIX-0.0.37: arg0 is already in rdi (loaded by codegen before emit_bltn).
+    // The old code reloaded via rbp(7, spill_home(irres(ira2(ii)))) which
+    // resolved to the wrong vreg -> loaded 0. Use rdi directly like sqrt.
+    if nl==3&&r8(nm)=='s'&&r8(nm+1)=='i'&&r8(nm+2)=='n' {
+        flush_all()
+        sbi(16)                                  // sub rsp, 16
+        fx87prep()                               // force 64-bit FPU precision
+        eb(72); eb(137); eb(60); eb(36)   // mov [rsp], rdi (48 89 3C 24)
+        eb(221); eb(4); eb(36)                    // fld qword [rsp]   (DD 04 24)
+        eb(217); eb(254)                          // fsin              (D9 FE)
+        eb(221); eb(28); eb(36)                   // fstp qword [rsp]  (DD 1C 24)
+        eb(72); eb(139); eb(4); eb(36)            // mov rax, [rsp]
+        abi(16)                                 // add rsp, 16 (undo sbi(16))
+        return 1
+    }
+    // cos(a): fld a; fcos
+    if nl==3&&r8(nm)=='c'&&r8(nm+1)=='o'&&r8(nm+2)=='s' {
+        flush_all()
+        sbi(16)
+        fx87prep()                               // force 64-bit FPU precision
+        eb(72); eb(137); eb(60); eb(36)   // mov [rsp], rdi (48 89 3C 24)
+        eb(221); eb(4); eb(36)                    // fld qword [rsp]
+        eb(217); eb(255)                          // fcos              (D9 FF)
+        eb(221); eb(28); eb(36)                   // fstp qword [rsp]
+        eb(72); eb(139); eb(4); eb(36)            // mov rax, [rsp]
+        abi(16)
+        return 1
+    }
+    if nl==3&&r8(nm)=='t'&&r8(nm+1)=='a'&&r8(nm+2)=='n' {
+        flush_all()
+        sbi(16)
+        fx87prep()                               // force 64-bit FPU precision
+        eb(72); eb(137); eb(60); eb(36)   // mov [rsp], rdi (48 89 3C 24)
+        eb(221); eb(4); eb(36)                    // fld qword [rsp]
+        eb(217); eb(242)                          // fptan             (D9 F2)
+        eb(221); eb(216)                          // fstp st(0)        (DD D8) -> drops the 1.0, tan in st1->st0
+        eb(221); eb(28); eb(36)                   // fstp qword [rsp]
+        eb(72); eb(139); eb(4); eb(36)            // mov rax, [rsp]
+        abi(16)
+        return 1
+    }
+    // log(a) = ln(a): fldln2; fld a; fyl2x  (st0 = ln2 * log2(a) = ln(a))
+    if nl==3&&r8(nm)=='l'&&r8(nm+1)=='o'&&r8(nm+2)=='g' {
+        flush_all()
+        let arg0v = irres(ira2(ii))
+        rbp(7, spill_home(arg0v))                     // rdi = a (arg0 from spill home)
+        sbi(16)
+        fx87prep()                               // force 64-bit FPU precision
+        eb(72); eb(137); eb(60); eb(36)   // mov [rsp], rdi (CORRECT: 48 89 3C 24, mod=00 no disp)
+        eb(217); eb(237)                          // fldln2            (D9 ED)
+        eb(221); eb(4); eb(36)                    // fld qword [rsp]   (a)
+        eb(217); eb(241)                          // fyl2x             (D9 F1) -> st0 = ln2*log2(a)
+        eb(221); eb(28); eb(36)                   // fstp qword [rsp]
+        eb(72); eb(139); eb(4); eb(36)            // mov rax, [rsp]
+        abi(16)
+        return 1
+    }
+    // pow(a,b) = exp(b * ln(a)). Compute ln(a) via fyl2x*ln2, multiply by b, exp.
+    if nl==3&&r8(nm)=='p'&&r8(nm+1)=='o'&&r8(nm+2)=='w' {
+        flush_all()
+        let arg0v = irres(ira2(ii))
+        let arg1v = irres(ira2(ii)+1)
+        rbp(7, spill_home(arg0v))                     // rdi = a (arg0 from spill home)
+        rbp(6, spill_home(arg1v))                     // rsi = b (arg1 from spill home)
+        sbi(32)                                  // sub rsp, 32 (slots: a[rsp], b[rsp+8])
+        fx87prep()                               // force 64-bit FPU precision
+        eb(72); eb(137); eb(60); eb(36)   // mov [rsp], rdi      (a bits)
+        eb(72); eb(137); eb(116); eb(36); eb(8)   // mov [rsp+8], rsi  (b bits)
+        // ln(a): fldln2; fld [rsp]; fyl2x
+        // z = b * log2(a). log2(a) via fyl2x: fld1; fld a; fyl2x -> st0 = 1.0*log2(a) = log2(a)
+        // (z = b*ln(a)*log2(e) = b*log2(a) since ln(a)*log2(e)=log2(a) exactly — avoids rounding error)
+        eb(217); eb(232)                          // fld1               (D9 E8)
+        eb(221); eb(4); eb(36)                    // fld qword [rsp]     (a)
+        eb(217); eb(241)                          // fyl2x -> st0 = log2(a)
+        eb(221); eb(68); eb(36); eb(8)            // fld qword [rsp+8]   (b)
+        eb(222); eb(201)                          // fmulp st(1),st(0)   (DE C9) -> st0 = z = b*log2(a)
+        // store z to [rsp] (a slot, no longer needed), reset FPU, reload clean
+        eb(221); eb(28); eb(36)                   // fstp qword [rsp]     (DD 1C 24)
+        eb(219); eb(227)                          // fninit             (DB E3) clean FPU (clears stack + tags)
+        fx87prep()                               // re-assert 64-bit precision (fninit defaulted 80-bit)
+        eb(221); eb(4); eb(36)                    // fld qword [rsp]     (DD 04 24)  reload z clean
+        // exp2(z) — verified-correct x87 sequence (clean .S test: 2^10=1024, 2^0.5=1.414, 2^-1=0.5, 2^3=8)
+        eb(217); eb(192)                          // fld st(0)          (D9 C0) [z, z]
+        eb(217); eb(252)                          // frndint            (D9 FC) [trunc(z), z]
+        eb(217); eb(201)                          // fxch st(1)         (D9 C9) [z, trunc(z)]  st0=z, st1=trunc
+        eb(216); eb(225)                          // fsub st(1)         (D8 E1) st0=z-trunc=frac [frac, trunc]
+        eb(217); eb(240)                          // f2xm1             (D9 F0) [2^frac-1, trunc]
+        eb(217); eb(232)                          // fld1               (D9 E8) [1, 2^frac-1, trunc]
+        eb(222); eb(193)                          // faddp st(1)        (DE C1) [2^frac, trunc]
+        eb(217); eb(253)                          // fscale            (D9 FD) [2^z, trunc]
+        eb(221); eb(217)                          // fstp st(1)        (DD D9) drop trunc -> [2^z]
+        eb(221); eb(28); eb(36)                   // fstp qword [rsp]
+        eb(72); eb(139); eb(4); eb(36)            // mov rax, [rsp]
+        abi(32)                                 // add rsp, 32 (undo sbi(32))
+        return 1
+    }
+    // ---- P2: random / fs-meta / introspection builtins (syscall-backed) ----
+    // getrandom(buf, len, flags): sc 318
+    if nl==9&&r8(nm)=='g'&&r8(nm+1)=='e'&&r8(nm+2)=='t'&&r8(nm+3)=='r'&&r8(nm+4)=='a'&&r8(nm+5)=='n'&&r8(nm+6)=='d'&&r8(nm+7)=='o'&&r8(nm+8)=='m' {
+        flush_all()
+        ri(0,318); sysc(); return 1
+    }
+    // 0.0.102: substr(s, start, len) -> header ptr (len at [new], bytes at new+8).
+    // s=rdi (header ptr), start=rsi (i64), len=rdx (i64). Copies len bytes
+    // from s+8+start into a fresh mmap buffer; header=new len; NUL-terminated.
+    if nl==6&&r8(nm)=='s'&&r8(nm+1)=='u'&&r8(nm+2)=='b'&&r8(nm+3)=='s'&&r8(nm+4)=='t'&&r8(nm+5)=='r' {
+        flush_all()
+        rr(3,7)            // rbx = s
+        rr(14,6)           // r14 = start
+        rr(13,2)           // r13 = len (rdx)
+        rr(7,13); eb(72);eb(255);eb(199); eb(72);eb(131);eb(199);eb(8)  // rdi = len+1+8 = len+9
+        rr(6,7)            // rsi = size
+        ri(7,0); ri(2,3); ri(10,0x22); ri(8,-1); rxor(9,9); ri(0,9); sysc()  // rax = new
+        eb(72); eb(131); eb(248); eb(0); eb(125); eb(12); eb(191); ei(1); eb(184); ei(60); eb(15); eb(5)  // mmap-fail guard
+        rr(12,0)           // r12 = new
+        rr(0,13); rr(7,12); eb(72);eb(137);eb(7)   // [new] = len
+        rr(6,3); eb(72);eb(131);eb(198);eb(8)   // rsi = s+8
+        ra(6,14)           // rsi += start
+        rr(7,12); eb(72);eb(131);eb(199);eb(8)  // rdi = new+8
+        rr(1,13); eb(243);eb(164)    // rcx = len; rep movsb
+        rr(7,12); eb(72);eb(131);eb(199);eb(8); ra(7,13); eb(198);eb(7);eb(0)  // NUL at new+8+len
+        rr(0,12)           // rax = new
+        return 1
+    }
+    // 0.0.102: strcat(a, b) -> header ptr. Identical concat to str(a,b).
+    if nl==6&&r8(nm)=='s'&&r8(nm+1)=='t'&&r8(nm+2)=='r'&&r8(nm+3)=='c'&&r8(nm+4)=='a'&&r8(nm+5)=='t' {
+        flush_all()
+        rr(3,7)            // rbx = a
+        rr(14,6)           // r14 = b
+        rmr(0,3)           // rax = [rbx] = la
+        rr(15,0)           // r15 = la
+        rmr(0,14)          // rax = [r14] = lb
+        rr(13,0)           // r13 = lb
+        rr(7,15); ra(7,13) // rdi = la + lb = total
+        eb(72);eb(255);eb(199)   // inc rdi -> total+1
+        eb(72);eb(131);eb(199);eb(8)  // rdi += 8 -> size = total+9
+        rr(6,7)            // rsi = size
+        ri(7,0); ri(2,3); ri(10,0x22); ri(8,-1); rxor(9,9); ri(0,9); sysc()  // rax = new
+        eb(72); eb(131); eb(248); eb(0); eb(125); eb(12); eb(191); ei(1); eb(184); ei(60); eb(15); eb(5)  // mmap-fail guard
+        rr(12,0)           // r12 = new
+        rr(0,15); ra(0,13) // rax = total
+        rr(7,12); eb(72);eb(137);eb(7)   // [new] = total
+        rr(6,3); eb(72);eb(131);eb(198);eb(8)   // rsi = a+8
+        rr(7,12); eb(72);eb(131);eb(199);eb(8)  // rdi = new+8
+        rr(1,15); eb(243);eb(164)    // rcx = la; rep movsb
+        rr(6,14); eb(72);eb(131);eb(198);eb(8)   // rsi = b+8
+        rr(7,12); eb(72);eb(131);eb(199);eb(8)  // rdi = new+8
+        ra(7,15)          // rdi += la
+        rr(1,13); eb(243);eb(164)    // rcx = lb; rep movsb
+        rr(7,12); eb(72);eb(131);eb(199);eb(8); ra(7,15); ra(7,13); eb(198);eb(7);eb(0)  // NUL
+        rr(0,12)           // rax = new
+        return 1
+    }
+    // 0.0.102: rand() -> i64. mmap 8 bytes, getrandom(buf,8,0), return the int.
+    if nl==4&&r8(nm)=='r'&&r8(nm+1)=='a'&&r8(nm+2)=='n'&&r8(nm+3)=='d' {
+        flush_all()
+        ri(6,8); ri(7,0); ri(2,3); ri(10,0x22); ri(8,-1); rxor(9,9); ri(0,9); sysc()  // rax = buf (8B)
+        rr(12,0)           // r12 = buf
+        rr(7,12); ri(6,8); rxor(2,2); ri(0,318); sysc()   // getrandom(buf,8,0)
+        rr(0,12); rmr(0,12)   // rax = [buf]  (random i64)
+        return 1
+    }
+    // 0.0.104: str_split(s, sep) -> qword-array header ptr of N substrings.
+    //   s   = rdi, sep = rsi (string headers: [ptr]=len, bytes at ptr+8).
+    // Returns a qword array [ptr]=nparts; each element an independent string
+    // header ptr (own mmap, byte-stride, NUL-terminated). No str tag => qword
+    // stride (matches a[i] indexing). Single-byte sep. Empty s -> [""], 1 part.
+    // No sep found in s -> [s], 1 part.
+    if nl==9&&r8(nm)=='s'&&r8(nm+1)=='t'&&r8(nm+2)=='r'&&r8(nm+3)=='_'&&r8(nm+4)=='s'&&r8(nm+5)=='p'&&r8(nm+6)=='l'&&r8(nm+7)=='i'&&r8(nm+8)=='t' {
+        flush_all()
+        // ABI model: the IR_CALL prologue (codegen) already pushes
+        // rbp,r12,r13,r14,r15 and `return 1` pops them, so r12,r13,r14,r15 are
+        // free scratch here (caller values restored by the epilogue). rbx is the
+        // ONLY callee-saved NOT in that set, so we save/restore it ourselves.
+        // r10 (idx) is caller-saved and clobbered by the mmap syscall, so we
+        // save/restore it only around the mmap. Everything else is balanced.
+        //   rbx = s header            (pushed/popped manually)
+        //   r13 = sep header          (prologue-saved, epilogue-restored)
+        //   r12 = result arr          (prologue-saved, epilogue-restored)
+        //   r15 = start (scan cursor) (prologue-saved, epilogue-restored)
+        //   r14 = nparts (constant for whole loop; r13/r12/r15/rbx are
+        //       prologue-saved so never clobbered)
+        //   r11 = seg_len (transient; pushed with idx around the mmap)
+        //   r9  = sub (mmap result) / slen (transient)
+        //   r10 = idx (pushed/popped around mmap)
+        // NOTE: do NOT push/pop rbx -- the IR_CALL caller already saved it, so
+        // we may clobber it freely. A manual `push rbx` trips the audit canary.
+        rr(3,7)            // rbx = s header (rdi = IR_CALL arg0)
+        rr(13,6)           // r13 = sep header (rsi = IR_CALL arg1)
+        rmr(0,3); rr(15,0) // r15 = slen = [rbx]  (temporary; reused as start later)
+        // --- count parts: occ = number of sep bytes in s ---
+        rxor(14,14)        // r14 = occ = 0
+        rr(6,3); eb(72); eb(131); eb(198); eb(8)   // rsi = rbx+8 = s_data
+        rr(1,15)           // rcx = slen
+        let c_loop=nl(); let c_done=nl(); let c_next=nl()
+        lbladd(c_loop, codelen)
+        rtest(1,1); let p=codelen; jcc32(0,0); emit_patch(p, c_done, 1)   // rcx==0 -> done
+        eb(172)            // lodsb  (al=[rsi]; rsi++)
+        eb(65); eb(58); eb(69); eb(8)   // cmp al, [r13+8]  (sep first byte)
+        let p2=codelen; jcc32(1,0); emit_patch(p2, c_next, 1)   // al != sep -> next
+        rr(0,14); eb(72); eb(255); eb(192); rr(14,0)   // occ++  (inc rax; r14 = rax)
+        lbladd(c_next, codelen)
+        rr(1,1); eb(72); eb(255); eb(201)   // rcx--
+        let p3=codelen; jmp32(0); emit_patch(p3, c_loop, 0)
+        lbladd(c_done, codelen)
+        rr(0,14); eb(72); eb(255); eb(192); rr(14,0)   // r14 = nparts = occ+1
+        // --- allocate result array [arr]=nparts ---
+        rr(7,14); eb(72); eb(193); eb(231); eb(3)   // rdi = nparts*8  (shl rdi,3)
+        eb(72); eb(131); eb(199); eb(8)             // rdi += 8  (header)
+        rr(6,7)           // rsi = size
+        ri(7,0); ri(2,3); ri(10,0x22); ri(8,-1); rxor(9,9); ri(0,9); sysc()  // rax = arr
+        rr(12,0)          // r12 = arr
+        rr(7,12); smov(7,14)   // [arr] = nparts
+        // --- build each part ---
+        rxor(10,10)        // r10 = idx = 0
+        rr(6,3); eb(72); eb(131); eb(198); eb(8)   // rsi = rbx+8 = s_data (first scan cursor)
+        let b_loop=nl(); let b_done=nl(); let b_find=nl(); let b_cont=nl(); let b_alloc=nl(); let b_end=nl()
+        lbladd(b_loop, codelen)
+        rcmp(10,14)        // cmp idx(r10), nparts(r14)  [nparts stays in r14]
+        let p4=codelen; jcc32(0,0); emit_patch(p4, b_done, 1)   // idx == nparts -> done
+        rr(15,6)           // r15 = start = current rsi (callee-saved, survives mmap)
+        lbladd(b_find, codelen)
+        rmr(0,3); rr(9,0)   // r9 = slen = [rbx]  (reload; keep r15=start)
+        rr(0,3); eb(72); eb(131); eb(192); eb(8); ra(0,9)   // rax = s_end = rbx+8+slen
+        rr(1,0)            // rcx = s_end
+        rs(1,6)            // rcx = s_end - rsi = remaining
+        rtest(1,1); let p5=codelen; jcc32(0,0); emit_patch(p5, b_end, 1)   // remaining==0 -> last segment
+        eb(172)            // lodsb  (al=[rsi]; rsi++)
+        eb(65); eb(58); eb(69); eb(8)   // cmp al, [r13+8]  (sep first byte)
+        let p6=codelen; jcc32(1,0); emit_patch(p6, b_cont, 1)   // al != sep -> keep scanning
+        // FOUND sep: rsi points at sep+1; seg_len = (rsi-1) - start
+        rr(11,6)           // r11 = rsi
+        eb(73); eb(131); eb(235); eb(1)   // r11 -= 1  (sep position)
+        rs(11,15)          // r11 -= r15 (start) -> seg_len  (keep nparts in r14)
+        let pba=codelen; jmp32(0); emit_patch(pba, b_alloc, 0)
+        lbladd(b_cont, codelen)   // continue scanning (this byte != sep)
+        let p7=codelen; jmp32(0); emit_patch(p7, b_find, 0)
+        lbladd(b_end, codelen)   // no sep left; segment runs from start to s_end
+        rr(11,6)           // r11 = rsi (= s_end)
+        rs(11,15)          // r11 -= r15 (start) -> seg_len  (keep nparts in r14)
+        lbladd(b_alloc, codelen)
+        eb(65); eb(82)     // push r10  (save idx across mmap)
+        eb(65); eb(83)     // push r11  (save seg_len across mmap)
+        rr(7,11); eb(72); eb(131); eb(199); eb(8)   // rdi = seg_len(r11) + 8
+        rr(6,7)            // rsi = seg_len + 8 (mmap length)
+        ri(7,0); ri(2,3); ri(10,0x22); ri(8,-1); rxor(9,9); ri(0,9); sysc()  // rax = sub
+        rr(9,0)            // r9 = sub
+        eb(65); eb(91)     // pop r11  (restore seg_len BEFORE the syscall-clobbered r11 is used)
+        rr(7,9)            // rdi = sub
+        smov(7,11)         // [sub] = seg_len (r11)  -- r11 now holds the restored seg_len
+        eb(65); eb(90)     // pop r10  (restore idx)
+        rr(6,15)           // rsi = start (r15)  -- reset scan cursor to segment start for copy
+        rr(7,9); eb(72); eb(131); eb(199); eb(8)   // rdi = sub + 8
+        rr(1,11)           // rcx = seg_len (r11)
+        let cp_loop=nl(); let cp_done=nl()
+        lbladd(cp_loop, codelen)
+        rtest(1,1); let p8=codelen; jcc32(0,0); emit_patch(p8, cp_done, 1)   // rcx==0 -> done
+        eb(172)            // lodsb  (al=[rsi]; rsi++)
+        eb(170)            // stosb  ([rdi]=al; rdi++)
+        rr(1,1); eb(72); eb(255); eb(201)   // rcx--
+        let p9=codelen; jmp32(0); emit_patch(p9, cp_loop, 0)
+        lbladd(cp_done, codelen)
+        eb(72); eb(131); eb(198); eb(1)   // rsi += 1  (skip past the separator for next segment)
+        rr(7,12)           // rdi = arr
+        rr(0,10); eb(72); eb(193); eb(224); eb(3)   // rax = idx*8  (shl rax,3)
+        eb(72); eb(141); eb(124); eb(7); eb(8)   // lea 0x8(%rdi,%rax,1),%rdi  (arr+8+idx*8; rdi=dest, SIB idx=rax)
+        smov(7,9)          // [rdi] = sub (r9)
+        rr(0,10); eb(72); eb(255); eb(192); rr(10,0)   // idx++  (inc rax; r10 = rax)
+        let p10=codelen; jmp32(0); emit_patch(p10, b_loop, 0)
+        lbladd(b_done, codelen)
+        rr(0,12)          // rax = arr (return value)
+        // Mark the result vreg as a "string-array" so that IR_IDX on it reads
+        // each element (a string pointer) with a STRING tag -- enabling byte
+        // stride indexing (parts[i][j]) and len(parts[i]) to work correctly.
+        w64(vreg_str_arr + irres(ii)*8, 1)
+        return 1
+    }
+    //   s = rdi (string header: [s]=len, bytes at s+8, UTF-8).
+    // Decodes each code point (1/2/3/4-byte) to its scalar (i64) stored as a
+    // qword element. Result is a qword array (no str tag). Malformed lead bytes
+    // (0x80-0xBF seen as a lead) are stored as the raw byte value (1-byte).
+    if nl==4&&r8(nm)=='u'&&r8(nm+1)=='t'&&r8(nm+2)=='f'&&r8(nm+3)=='8' {
+        flush_all()
+        // ABI-correct leaf: save callee-saved regs this builtin scratches.
+        eb(53)                       // push rbx
+        eb(65); eb(84)               // push r12
+        eb(65); eb(87)               // push r15
+        rr(3,7)            // rbx = s header
+        rmr(0,3); rr(15,0) // r15 = slen = [s]
+        // --- pass 1: count codepoints (lead bytes) ---  NOTE: n lives in r12
+        // (callee-saved) because the mmap syscall clobbers r11 + rcx.
+        rxor(12,12)        // r12 = n = 0
+        rr(6,3); eb(72); eb(131); eb(198); eb(8)   // rsi = s+8
+        rr(1,15)           // rcx = slen
+        let u_c=nl(); let u_cd=nl(); let u_lead=nl(); let u_nxt=nl()
+        lbladd(u_c, codelen)
+        rtest(1,1); let p=codelen; jcc32(0,0); emit_patch(p, u_cd, 1)   // rcx==0 -> done
+        eb(172)            // lodsb
+        rr(1,1); eb(72); eb(255); eb(201)   // rcx--
+        eb(60); eb(128)     // cmp al, 0x80
+        let p1=codelen; jb32(0); emit_patch(p1, u_lead, 1)   // jb (unsigned) -> lead (al<0x80)
+        eb(60); eb(192)     // cmp al, 0xC0
+        let p2=codelen; jb32(0); emit_patch(p2, u_nxt, 1)   // jb (unsigned) -> continuation (0x80..0xBF), skip
+        lbladd(u_lead, codelen)
+        rr(0,12); eb(72); eb(255); eb(192); rr(12,0)   // n++ (inc rax)
+        lbladd(u_nxt, codelen)
+        let p3=codelen; jmp32(0); emit_patch(p3, u_c, 0)
+        lbladd(u_cd, codelen)
+        // --- allocate result array ---
+        rr(7,12); eb(72); eb(193); eb(231); eb(3); eb(72); eb(131); eb(199); eb(8)  // rdi = n*8+8 (shl rdi,3; +8; modrm 0xC7=rm/rdi)
+        rr(6,7)
+        ri(7,0); ri(2,3); ri(10,0x22); ri(8,-1); rxor(9,9); ri(0,9); sysc()  // rax = arr
+        rr(9,0)            // r9 = arr (callee-saved; no further mmap)
+        rr(7,9); smov(7,12)   // [arr] = n
+        // --- pass 2: decode ---
+        rr(6,3); eb(72); eb(131); eb(198); eb(8)   // rsi = s+8
+        rr(1,15)           // rcx = slen
+        rxor(13,13)         // r13 = idx = 0
+        let u_d=nl(); let u_dd=nl(); let u_1=nl(); let u_2=nl(); let u_3=nl(); let u_4=nl(); let u_skip=nl(); let u_store=nl()
+        lbladd(u_d, codelen)
+        rmr(0,9); rcmp(13,0)   // cmp n(rax=[arr]), idx(r13)
+        let p4=codelen; jcc32(0,0); emit_patch(p4, u_dd, 1)   // idx == n -> done
+        eb(172)            // lodsb  (al = lead byte; rsi++)
+        rr(1,1); eb(72); eb(255); eb(201)   // rcx--
+        eb(60); eb(128)     // cmp al, 0x80
+        let p5=codelen; jb32(0); emit_patch(p5, u_1, 1)   // jb (unsigned) -> 1-byte
+        eb(60); eb(192)     // cmp al, 0xC0
+        let p6=codelen; jb32(0); emit_patch(p6, u_skip, 1)   // jb (unsigned) -> continuation, skip
+        eb(60); eb(224)     // cmp al, 0xE0
+        let p7=codelen; jb32(0); emit_patch(p7, u_2, 1)   // jb (unsigned) -> 2-byte
+        eb(60); eb(240)     // cmp al, 0xF0
+        let p12=codelen; jb32(0); emit_patch(p12, u_3, 1)   // jb (unsigned) -> 3-byte
+        let p13=codelen; jmp32(0); emit_patch(p13, u_4, 0)   // else 4-byte
+        lbladd(u_skip, codelen)
+        let p14=codelen; jmp32(0); emit_patch(p14, u_d, 0)
+        lbladd(u_1, codelen)
+        rr(3,0); eb(72); eb(129); eb(227); ei(255)   // rbx = al & 0xFF
+        let p15=codelen; jmp32(0); emit_patch(p15, u_store, 0)
+        lbladd(u_2, codelen)
+        rr(3,0); eb(72); eb(129); eb(227); ei(31); eb(72); eb(193); eb(227); eb(6)  // rbx = (al&0x1F)<<6
+        eb(172); rr(1,1); eb(72); eb(255); eb(201)   // lodsb b1; rcx--
+        rr(2,0); eb(72); eb(129); eb(226); ei(63); eb(72); eb(9); eb(211)   // rdx=b1&0x3F; or rbx,rdx
+        let p16=codelen; jmp32(0); emit_patch(p16, u_store, 0)
+        lbladd(u_3, codelen)
+        rr(3,0); eb(72); eb(129); eb(227); ei(15); eb(72); eb(193); eb(227); eb(12)  // rbx = (al&0x0F)<<12
+        eb(172); rr(1,1); eb(72); eb(255); eb(201)   // b1; rcx--
+        rr(2,0); eb(72); eb(129); eb(226); ei(63); eb(72); eb(193); eb(226); eb(6); eb(72); eb(9); eb(211)  // b1<<6; or rbx,rdx
+        eb(172); rr(1,1); eb(72); eb(255); eb(201)   // b2; rcx--
+        rr(2,0); eb(72); eb(129); eb(226); ei(63); eb(72); eb(9); eb(211)   // b2; or rbx,rdx
+        let p17=codelen; jmp32(0); emit_patch(p17, u_store, 0)
+        lbladd(u_4, codelen)
+        rr(3,0); eb(72); eb(129); eb(227); ei(7); eb(72); eb(193); eb(227); eb(24)  // rbx = (al&0x07)<<18
+        eb(172); rr(1,1); eb(72); eb(255); eb(201)   // b1; rcx--
+        rr(2,0); eb(72); eb(129); eb(226); ei(63); eb(72); eb(193); eb(226); eb(12); eb(72); eb(9); eb(211)  // b1<<12; or
+        eb(172); rr(1,1); eb(72); eb(255); eb(201)   // b2; rcx--
+        rr(2,0); eb(72); eb(129); eb(226); ei(63); eb(72); eb(193); eb(226); eb(6); eb(72); eb(9); eb(211)   // b2<<6; or
+        eb(172); rr(1,1); eb(72); eb(255); eb(201)   // b3; rcx--
+        rr(2,0); eb(72); eb(129); eb(226); ei(63); eb(72); eb(9); eb(211)   // b3; or rbx,rdx
+        lbladd(u_store, codelen)
+        rr(10,3)           // r10 = rbx (codepoint)
+        rr(7,9); eb(72); eb(131); eb(199); eb(8)   // rdi = arr+8
+        rr(0,13); eb(72); eb(193); eb(224); eb(3)   // rax = idx*8  (shl rax,3)
+        ra(7,0)           // rdi += idx*8
+        smov(7,10)         // [rdi] = r10 (codepoint)
+        rr(0,13); eb(72); eb(255); eb(192); rr(13,0)   // idx++ (inc rax; r13=rax)
+        let p8=codelen; jmp32(0); emit_patch(p8, u_d, 0)
+        lbladd(u_dd, codelen)
+        rr(0,9)           // rax = arr
+        // restore callee-saved regs (reverse of push order); r9 left = arr
+        eb(65); eb(95)               // pop r15
+        eb(65); eb(92)               // pop r12
+        eb(91)                       // pop rbx
+        return 1
+    }
+    // =========================================================================
+    // 0.0.105: lock-based atomic primitives (x86 LOCK-prefixed RMW / xchg).
+    //   arg0 = ptr (i64*), arg1 = val, arg2 = new. Args arrive in
+    //   rdi/rsi/rdx from IR_CALL; we reload from spill homes (flush_all ran)
+    //   so the values are authoritative. Results return in rax (the IR_CALL
+    //   epilogue saves rax into the result vreg's home). Only caller-saved
+    //   regs are touched (rax/rdi/rsi/rdx), so no push/pop is needed.
+    // -------------------------------------------------------------------------
+    // atomic_load(ptr) -> old value at *ptr  (lock-free plain load; seq_cst
+    //   on x86 is just a normal MOV since loads are not reordered with older
+    //   loads). ptr=rdi, [rdi]=old -> rax.
+    if nl==11&&r8(nm)=='a'&&r8(nm+1)=='t'&&r8(nm+2)=='o'&&r8(nm+3)=='m'&&r8(nm+4)=='i'&&r8(nm+5)=='c'&&r8(nm+6)=='_'&&r8(nm+7)=='l'&&r8(nm+8)=='o'&&r8(nm+9)=='a'&&r8(nm+10)=='d' {
+        flush_all()
+        let a0 = irres(ira2(ii))
+        rbp(7, spill_home(a0))        // rdi = ptr
+        rmr(0, 7)                     // rax = [rdi]  (48 8B 07)
+        return 1
+    }
+    // atomic_store(ptr, val) -> val   (mov [rdi], rsi). Returns the stored val.
+    if nl==12&&r8(nm)=='a'&&r8(nm+1)=='t'&&r8(nm+2)=='o'&&r8(nm+3)=='m'&&r8(nm+4)=='i'&&r8(nm+5)=='c'&&r8(nm+6)=='_'&&r8(nm+7)=='s'&&r8(nm+8)=='t'&&r8(nm+9)=='o'&&r8(nm+10)=='r'&&r8(nm+11)=='e' {
+        flush_all()
+        let a0 = irres(ira2(ii))
+        let a1 = irres(ira2(ii)+1)
+        rbp(7, spill_home(a0))        // rdi = ptr
+        rbp(6, spill_home(a1))        // rsi = val
+        smov(7, 6)                    // [rdi] = rsi  (48 89 3E)
+        rr(0, 6)                      // rax = rsi (return val)
+        return 1
+    }
+    // atomic_add(ptr, val) -> old  (lock xadd [rdi], rsi; rax=old=rsi).
+    if nl==10&&r8(nm)=='a'&&r8(nm+1)=='t'&&r8(nm+2)=='o'&&r8(nm+3)=='m'&&r8(nm+4)=='i'&&r8(nm+5)=='c'&&r8(nm+6)=='_'&&r8(nm+7)=='a'&&r8(nm+8)=='d'&&r8(nm+9)=='d' {
+        flush_all()
+        let a0 = irres(ira2(ii))
+        let a1 = irres(ira2(ii)+1)
+        rbp(7, spill_home(a0))        // rdi = ptr
+        rbp(6, spill_home(a1))        // rsi = val
+        eb(240); eb(72); eb(15); eb(193); eb(55)   // lock xadd [rdi], rsi (F0 48 0F C1 37)
+        rr(0, 6)                      // rax = rsi (old value)
+        return 1
+    }
+    // atomic_swap(ptr, val) -> old  (xchg [rdi], rsi; rax=old=rsi).
+    if nl==11&&r8(nm)=='a'&&r8(nm+1)=='t'&&r8(nm+2)=='o'&&r8(nm+3)=='m'&&r8(nm+4)=='i'&&r8(nm+5)=='c'&&r8(nm+6)=='_'&&r8(nm+7)=='s'&&r8(nm+8)=='w'&&r8(nm+9)=='a'&&r8(nm+10)=='p' {
+        flush_all()
+        let a0 = irres(ira2(ii))
+        let a1 = irres(ira2(ii)+1)
+        rbp(7, spill_home(a0))        // rdi = ptr
+        rbp(6, spill_home(a1))        // rsi = val
+        eb(72); eb(135); eb(55)        // xchg [rdi], rsi (48 87 37)
+        rr(0, 6)                      // rax = rsi (old value; rsi now holds the old mem value)
+        return 1
+    }
+    // atomic_cmpxchg(ptr, oldv, newv) -> old mem value (lock cmpxchg [rdi], rdx).
+    //   Expected (oldv) must be in rax for cmpxchg; ZF set if swapped; rax = old.
+    if nl==14&&r8(nm)=='a'&&r8(nm+1)=='t'&&r8(nm+2)=='o'&&r8(nm+3)=='m'&&r8(nm+4)=='i'&&r8(nm+5)=='c'&&r8(nm+6)=='_'&&r8(nm+7)=='c'&&r8(nm+8)=='m'&&r8(nm+9)=='p'&&r8(nm+10)=='x'&&r8(nm+11)=='c'&&r8(nm+12)=='h'&&r8(nm+13)=='g' {
+        flush_all()
+        let a0 = irres(ira2(ii))
+        let a1 = irres(ira2(ii)+1)
+        let a2 = irres(ira2(ii)+2)
+        rbp(7, spill_home(a0))        // rdi = ptr
+        rbp(6, spill_home(a1))        // rsi = oldv
+        rbp(2, spill_home(a2))        // rdx = newv
+        rr(0, 6)                      // rax = oldv (cmpxchg compares [rdi] to rax)
+        eb(240); eb(72); eb(15); eb(177); eb(23)   // lock cmpxchg [rdi], rdx (F0 48 0F B1 17)
+        // rax = old memory value (returned)
+        return 1
+    }
+    // argp8(reg, base, k): load arg k's spill-home pointer + 8 (skip the 8-byte
+    // string length prefix) into reg. Quanta strings are [8:len][bytes]; syscall
+    // path ABI needs base+8. Mirrors the reload-from-spill-home pattern used by
+    // the generic syscall() helper.
+    // unlink(path): sc 87  -- rdi = path+8 via argp8
+    if nl==6&&r8(nm)=='u'&&r8(nm+1)=='n'&&r8(nm+2)=='l'&&r8(nm+3)=='i'&&r8(nm+4)=='n'&&r8(nm+5)=='k' {
+        flush_all()
+        argp8(7, ira2(ii), 0)
+        ri(0,87); sysc(); return 1
+    }
+    // mkdir(path, mode): sc 83  -- rdi=path(+8 via argp8), rsi=mode via IR_CALL
+    if nl==5&&r8(nm)=='m'&&r8(nm+1)=='k'&&r8(nm+2)=='d'&&r8(nm+3)=='i'&&r8(nm+4)=='r' {
+        flush_all()
+        let scb = ira2(ii)
+        argp8(7, scb, 0)        // rdi = path + 8
+        rbp(6, spill_home(irres(scb+1)))   // rsi = mode
+        ri(0,83); sysc(); return 1
+    }
+    // chdir(path): sc 80  -- rdi = path+8 via argp8
+    if nl==5&&r8(nm)=='c'&&r8(nm+1)=='h'&&r8(nm+2)=='d'&&r8(nm+3)=='i'&&r8(nm+4)=='r' {
+        flush_all()
+        argp8(7, ira2(ii), 0)
+        ri(0,80); sysc(); return 1
+    }
+    // rename(old, new): sc 82  -- rdi=old+8, rsi=new+8 via argp8
+    if nl==6&&r8(nm)=='r'&&r8(nm+1)=='e'&&r8(nm+2)=='n'&&r8(nm+3)=='a'&&r8(nm+4)=='m'&&r8(nm+5)=='e' {
+        flush_all()
+        let scb = ira2(ii)
+        argp8(7, scb, 0)        // rdi = old + 8
+        argp8(6, scb, 1)        // rsi = new + 8
+        ri(0,82); sysc(); return 1
+    }
+    // stat(path, buf): newfstatat(AT_FDCWD, path, buf, 0) = sc 262
+    //   rsi=path+8 (argp8), rdx=buf (raw), rdi=AT_FDCWD, r10=0
+    if nl==4&&r8(nm)=='s'&&r8(nm+1)=='t'&&r8(nm+2)=='a'&&r8(nm+3)=='t' {
+        flush_all()
+        let scb = ira2(ii)
+        ri(7, -100)             // rdi = AT_FDCWD
+        argp8(6, scb, 0)        // rsi = path + 8
+        rbp(2, spill_home(irres(scb+1)))   // rdx = buf (raw pointer)
+        ri(10, 0)               // r10 = 0 (flags)
+        ri(0, 262); sysc(); return 1
+    }
+    // abort(): exit(134) = 128 + SIGABRT
+    if nl==5&&r8(nm)=='a'&&r8(nm+1)=='b'&&r8(nm+2)=='o'&&r8(nm+3)=='r'&&r8(nm+4)=='t' {
+        flush_all()
+        ri(7,134); ri(0,60); sysc(); return 1
+    }
+    // debugbreak(): int3
+    if nl==10&&r8(nm)=='d'&&r8(nm+1)=='e'&&r8(nm+2)=='b'&&r8(nm+3)=='u'&&r8(nm+4)=='g'&&r8(nm+5)=='b'&&r8(nm+6)=='r'&&r8(nm+7)=='e'&&r8(nm+8)=='a'&&r8(nm+9)=='k' {
+        flush_all()
+        eb(204); return 1
+    }
+    // 0.0.108: CPU intrinsics (hints / memory fences). All are void builtins;
+    // emit the raw instruction bytes into CODE. They take no observable
+    // argument except prefetch (an address); results are undefined-on-read but
+    // the call site never requires a value.
+    // pause(): spin-wait hint = F3 90
+    if nl==5&&r8(nm)=='p'&&r8(nm+1)=='a'&&r8(nm+2)=='u'&&r8(nm+3)=='s'&&r8(nm+4)=='e' {
+        flush_all(); eb(243); eb(144); return 1
+    }
+    // fence(): full memory fence mfence = 0F AE F0
+    if nl==5&&r8(nm)=='f'&&r8(nm+1)=='e'&&r8(nm+2)=='n'&&r8(nm+3)=='c'&&r8(nm+4)=='e' {
+        flush_all(); eb(15); eb(174); eb(240); return 1
+    }
+    // lfence(): 0F AE E8
+    if nl==6&&r8(nm)=='l'&&r8(nm+1)=='f'&&r8(nm+2)=='e'&&r8(nm+3)=='n'&&r8(nm+4)=='c'&&r8(nm+5)=='e' {
+        flush_all(); eb(15); eb(174); eb(232); return 1
+    }
+    // sfence(): 0F AE F8
+    if nl==6&&r8(nm)=='s'&&r8(nm+1)=='f'&&r8(nm+2)=='e'&&r8(nm+3)=='n'&&r8(nm+4)=='c'&&r8(nm+5)=='e' {
+        flush_all(); eb(15); eb(174); eb(248); return 1
+    }
+    // prefetch(addr): prefetchnta [rax] = 0F 18 08. addr = arg0, loaded from its
+    // spill-home (register-allocation-independent; matches bitfield/stat).
+    if nl==8&&r8(nm)=='p'&&r8(nm+1)=='r'&&r8(nm+2)=='e'&&r8(nm+3)=='f'&&r8(nm+4)=='e'&&r8(nm+5)=='t'&&r8(nm+6)=='c'&&r8(nm+7)=='h' {
+        flush_all()
+        rbp(0, spill_home(irres(ira2(ii))))   // rax = addr (arg0)
+        eb(15); eb(24); eb(8)                  // 0F 18 08  prefetchnta [rax]
+        return 1
+    }
+    return 0
+}
+
