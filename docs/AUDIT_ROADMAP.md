@@ -883,22 +883,30 @@ Verified by **source review** of `compiler/0.0.134/src`, `compiler/0.0.135/src` 
 | **json stdlib** (AI/data interchange) | **0.0.132** | ✅ | |
 | **secure** (TLS 1.3 + hybrid X25519/ML-KEM + FIPS 202 SHA3/SHAKE + AES-GCM) | **0.0.133/135** | ✅ | **PQC-ready — QC-age** |
 
-**Next PARTIAL cores (one per version, right after `process`):**
-1. **0.0.125** — `time` (clock/now/sleep/nanosleep)
-2. **0.0.126** — `process` (fork/exec/waitpid — retires `$$()` injection path)
-3. **0.0.127** — `PTY` layer (interactive `$$()`)
-4. **0.0.128** — `big` div-by-zero guard (FIX-0.0.19) — **REAL HANG BUG**
-5. **0.0.129** — `fs` missing ops (stat/unlink/mkdir/chdir/rename/rmdir)
-6. **0.0.130** — extern-C variadic `printf(fmt,...)`
-7. **0.0.131** — closure self-recursion by name
+**Next PARTIAL cores (one per version, right after `process`):** — **ALL COMPLETE**
+1. **0.0.125** — `time` (clock/now/sleep/nanosleep) ✅ DONE (fixpoint md5 `350e156a...`, gate 158/158)
+2. **0.0.126** — `process` (fork/exec/waitpid) ✅ DONE (fixpoint md5 `2504e5b1...`, gate 159/159)
+3. **0.0.127** — `PTY` layer ✅ DONE (fixpoint md5 `e1d5ed96...`, gate 160/160)
+4. **0.0.128** — `big` div-by-zero guard (FIX-0.0.19) ✅ DONE (gate 161/161)
+5. **0.0.129** — `fs` missing ops ✅ DONE (gate 162/162)
+6. **0.0.130** — extern-C variadic `printf(fmt,...)` ✅ DONE (fixpoint md5 `85f4122a...`, gate 162/162)
+7. **0.0.131** — closure self-recursion by name ✅ DONE (fixpoint md5 `8e1bb23f...`, gate 163/163)
 
 **AI/QC-era core chain (gated; QUIC > HTTP/2):**
-8. **0.0.134** — `quic` HTTP/3 UDP+TLS
-9. **0.0.135** — `http` HTTP/2-over-TLS (no plaintext)
-10. **0.0.136** — `ai` tensor ops + inference
-11. **0.0.138** — borrow-check (hardest, last)
-
-**0.1.0 STABLE** after 0.0.125–0.0.138. `chain` = first Quanta App (dogfooded on 0.1.0, lands 0.1.1+).
+8. **0.0.132** — `json` stdlib ✅ DONE (fixpoint md5 `8e1bb23f...`, gate 163/163 + stdlib 8/8)
+9. **0.0.133** — `secure` FIPS 202 SHA3/SHAKE ✅ DONE (fixpoint md5 `1641c0b7...`)
+10. **0.0.134** — `secure` AES-GCM (TLS 1.3 AEAD) ✅ DONE (fixpoint md5 `443e2a43...`)
+11. **0.0.135** — `secure` X25519 (ECDH for TLS 1.3) — **NEXT**
+12. **0.0.136** — `secure` ML-KEM (FIPS 203, Kyber) + hybrid X25519+ML-KEM KEM
+13. **0.0.137** — `secure` ML-DSA (FIPS 204, Dilithium) + hybrid X25519+ML-DSA sig
+14. **0.0.138** — `secure` SLH-DSA (FIPS 205, SPHINCS+)
+15. **0.0.139** — `secure` TLS 1.3 handshake (hybrid PQC)
+16. **0.0.140** — `quic` HTTP/3 (UDP+TLS 1.3, hybrid PQ)
+17. **0.0.141** — `http` HTTP/2-over-TLS (no plaintext)
+18. **0.0.142** — `ai` tensor ops + inference
+19. **0.0.143** — generics type constraints (FIX-0.0.33; `where` bounds enforced)
+20. **0.0.144** — borrow-check (language safety pass) — hardest, last
+21. **0.1.0 STABLE** after 0.0.125–0.0.144. `chain` = first Quanta App (dogfooded on 0.1.0, lands 0.1.1+).
 
 ---
 
@@ -907,13 +915,12 @@ Verified by **source review** of `compiler/0.0.134/src`, `compiler/0.0.135/src` 
 **Immediate (security — reachable today):** **NONE** — all `big` runtime issues (FIX-0.0.16/17/18/19/20/21/22/26) + compiler gaps (FIX-0.0.1/2/3/4/5/9) fixed in 0.0.135.
 
 **Before 0.1.0 (core chain):**
-1. Resolve all PARTIAL cores above (0.0.125–0.0.131)
-2. **FIX-0.0.6** — Design decision: gate raw pointers with `unsafe{}` or document as intentional
-3. AI/QC-era cores (0.0.134–0.0.136) + borrow-check (0.0.138)
+1. **FIX-0.0.6** — Design decision: gate raw pointers with `unsafe{}` or document as intentional
+2. AI/QC-era cores (0.0.135 X25519 → 0.0.136 ML-KEM → 0.0.137 ML-DSA → 0.0.138 SLH-DSA → 0.0.139 TLS 1.3 → 0.0.140 quic → 0.0.141 http → 0.0.142 ai → 0.0.143 generics constraints → 0.0.144 borrow-check)
 
 **Hygiene:**
-4. `SCANFN` DEBUG logging → add `--debug-scan` flag (always-on is noisy)
-5. Verify TOK_CAP=500M doesn't cause mmap issues on constrained systems
+3. `SCANFN` DEBUG logging → add `--debug-scan` flag (always-on is noisy)
+4. Verify TOK_CAP=500M doesn't cause mmap issues on constrained systems
 
 ---
 
@@ -932,4 +939,4 @@ Verified by **source review** of `compiler/0.0.134/src`, `compiler/0.0.135/src` 
 
 ---
 
-*Updated 2026-09-04 with Part F (0.0.134/135 security audit + core-completeness; gate 11/11 GREEN; fixpoint md5 `443e2a43...`).*
+*Updated 2026-09-04 with Part F (0.0.134/135 security audit + core-completeness; gate 11/11 GREEN; fixpoint md5 `443e2a43...`). **0.0.125–0.0.134 cores complete; next = 0.0.135 X25519.***
