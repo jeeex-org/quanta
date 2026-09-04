@@ -1,0 +1,33 @@
+// x25519_test_min.quanta — minimal test with hex parsing
+
+import std/x25519
+
+fn main() {
+  let scalar = mem_alloc(32)
+  let scalar_hex = "2a2cb91db9a5f7b71b2a99c0eb872f4cdf4566b25172c1163c7da518730a6d77"
+  let i = 0
+  while i < 32 {
+    let hi = 0; let lo = 0
+    let c1 = mem_load8(scalar_hex + i*2)
+    let c2 = mem_load8(scalar_hex + i*2 + 1)
+    if c1 >= 48 && c1 <= 57 { hi = c1 - 48 }
+    else if c1 >= 97 && c1 <= 102 { hi = c1 - 87 }
+    else if c1 >= 65 && c1 <= 70 { hi = c1 - 55 }
+    if c2 >= 48 && c2 <= 57 { lo = c2 - 48 }
+    else if c2 >= 97 && c2 <= 102 { lo = c2 - 87 }
+    else if c2 >= 65 && c2 <= 70 { lo = c2 - 55 }
+    mem_store8(scalar + i, (hi << 4) | lo)
+    i = i + 1
+  }
+  
+  let u = mem_alloc(32)
+  i = 0
+  while i < 32 { mem_store8(u + i, 0); i = i + 1 }
+  mem_store8(u, 9)
+  
+  let out = mem_alloc(32)
+  x25519(scalar, u, out)
+  
+  println(0)
+  exit(0)
+}

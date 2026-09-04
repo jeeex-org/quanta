@@ -1,0 +1,405 @@
+// lib/std/x25519.quanta — X25519 ECDH (RFC 7748, Curve25519)
+// Pure Quanta implementation over GF(2^255 - 19). No external deps.
+// Uses 32-bit limbs with overflow-trap disabled (unsafe blocks).
+
+// ---------- Field arithmetic over GF(2^255 - 19) ----------
+// Field elements as 8 limbs of 32 bits (256 bits, top bit masked).
+// p = 2^255 - 19 = 0x7fffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffed
+
+fn u32(x) { return x & 0xffffffff }
+
+// p limbs (2^255 - 19)
+fn P0() { return 0xffffffed }
+fn P1() { return 0xffffffff }
+fn P2() { return 0xffffffff }
+fn P3() { return 0xffffffff }
+fn P4() { return 0xffffffff }
+fn P5() { return 0xffffffff }
+fn P6() { return 0xffffffff }
+fn P7() { return 0x7fffffff }
+
+// fe_zero(out): set field element to 0
+fn fe_zero(out) {
+  let i = 0
+  while i < 8 {
+    mem_store(out + i*8, 0)
+    i = i + 1
+  }
+}
+
+// fe_one(out): set field element to 1
+fn fe_one(out) {
+  mem_store(out, 1)
+  let i = 1
+  while i < 8 {
+    mem_store(out + i*8, 0)
+    i = i + 1
+  }
+}
+
+// fe_copy(src, dst): copy field element
+fn fe_copy(src, dst) {
+  let i = 0
+  while i < 8 {
+    mem_store(dst + i*8, mem_load(src + i*8))
+    i = i + 1
+  }
+}
+
+// fe_from_bytes(in32[32], out[8]): load little-endian 32-byte array to 8 limbs
+fn fe_from_bytes(in32, out) {
+  let i = 0
+  while i < 8 {
+    let limb = 0
+    let j = 0
+    while j < 4 {
+      let b = mem_load8(in32 + i*4 + j)
+      limb = limb | (b << (j*8))
+      j = j + 1
+    }
+    mem_store(out + i*8, u32(limb))
+    i = i + 1
+  }
+}
+
+// fe_to_bytes(in[8], out32[32]): store 8 limbs to little-endian 32-byte array
+fn fe_to_bytes(in8, out32) {
+  let i = 0
+  while i < 8 {
+    let limb = mem_load(in8 + i*8)
+    let j = 0
+    while j < 4 {
+      mem_store8(out32 + i*4 + j, (limb >> (j*8)) & 0xff)
+      j = j + 1
+    }
+    i = i + 1
+  }
+}
+
+// fe_add(a, b, out): out = a + b mod p
+fn fe_add(a, b, out) {
+  let carry = 0
+  let i = 0
+  while i < 8 {
+    let ai = mem_load(a + i*8)
+    let bi = mem_load(b + i*8)
+    let sum = ai + bi + carry
+    mem_store(out + i*8, u32(sum))
+    carry = sum >> 32
+    i = i + 1
+  }
+  fe_reduce(out)
+}
+
+// fe_sub(a, b, out): out = a - b mod p
+fn fe_sub(a, b, out) {
+  let borrow = 0
+  let i = 0
+  while i < 8 {
+    let ai = mem_load(a + i*8)
+    let bi = mem_load(b + i*8)
+    let diff = ai - bi - borrow
+    mem_store(out + i*8, u32(diff))
+    borrow = (diff >> 63) & 1
+    i = i + 1
+  }
+  if borrow != 0 {
+    fe_add_p(out)
+  }
+}
+
+// fe_add_p(x): x = x + p (for underflow correction)
+fn fe_add_p(x) {
+  let carry = 0
+  let i = 0
+  while i < 8 {
+    let pi = 0
+    if i == 0 { pi = P0() }
+    else if i == 1 { pi = P1() }
+    else if i == 2 { pi = P2() }
+    else if i == 3 { pi = P3() }
+    else if i == 4 { pi = P4() }
+    else if i == 5 { pi = P5() }
+    else if i == 6 { pi = P6() }
+    else if i == 7 { pi = P7() }
+    let xi = mem_load(x + i*8)
+    let sum = xi + pi + carry
+    mem_store(x + i*8, u32(sum))
+    carry = sum >> 32
+    i = i + 1
+  }
+}
+
+// fe_mul(a, b, out): out = a * b mod p (32-bit limbs, mask after each product)
+fn fe_mul(a, b, out) {
+  unsafe {
+    let p = mem_alloc(16*8)
+    
+    let a0 = u32(mem_load(a)); let a1 = u32(mem_load(a+8)); let a2 = u32(mem_load(a+16)); let a3 = u32(mem_load(a+24))
+    let a4 = u32(mem_load(a+32)); let a5 = u32(mem_load(a+40)); let a6 = u32(mem_load(a+48)); let a7 = u32(mem_load(a+56))
+    let b0 = u32(mem_load(b)); let b1 = u32(mem_load(b+8)); let b2 = u32(mem_load(b+16)); let b3 = u32(mem_load(b+24))
+    let b4 = u32(mem_load(b+32)); let b5 = u32(mem_load(b+40)); let b6 = u32(mem_load(b+48)); let b7 = u32(mem_load(b+56))
+    
+    // Schoolbook multiply with masking after each operation
+    mem_store(p, u32(a0 * b0))
+    mem_store(p+8, u32(u32(a0 * b1) + u32(a1 * b0)))
+    mem_store(p+16, u32(u32(u32(a0 * b2) + u32(a1 * b1)) + u32(a2 * b0)))
+    mem_store(p+24, u32(u32(u32(u32(a0 * b3) + u32(a1 * b2)) + u32(a2 * b1)) + u32(a3 * b0)))
+    mem_store(p+32, u32(u32(u32(u32(u32(a0 * b4) + u32(a1 * b3)) + u32(a2 * b2)) + u32(a3 * b1)) + u32(a4 * b0)))
+    mem_store(p+40, u32(u32(u32(u32(u32(u32(a0 * b5) + u32(a1 * b4)) + u32(a2 * b3)) + u32(a3 * b2)) + u32(a4 * b1)) + u32(a5 * b0)))
+    mem_store(p+48, u32(u32(u32(u32(u32(u32(u32(a0 * b6) + u32(a1 * b5)) + u32(a2 * b4)) + u32(a3 * b3)) + u32(a4 * b2)) + u32(a5 * b1)) + u32(a6 * b0)))
+    mem_store(p+56, u32(u32(u32(u32(u32(u32(u32(u32(a0 * b7) + u32(a1 * b6)) + u32(a2 * b5)) + u32(a3 * b4)) + u32(a4 * b3)) + u32(a5 * b2)) + u32(a6 * b1)) + u32(a7 * b0)))
+    mem_store(p+64, u32(u32(u32(u32(u32(u32(u32(a1 * b7) + u32(a2 * b6)) + u32(a3 * b5)) + u32(a4 * b4)) + u32(a5 * b3)) + u32(a6 * b2)) + u32(a7 * b1)))
+    mem_store(p+72, u32(u32(u32(u32(u32(u32(a2 * b7) + u32(a3 * b6)) + u32(a4 * b5)) + u32(a5 * b4)) + u32(a6 * b3)) + u32(a7 * b2)))
+    mem_store(p+80, u32(u32(u32(u32(u32(a3 * b7) + u32(a4 * b6)) + u32(a5 * b5)) + u32(a6 * b4)) + u32(a7 * b3)))
+    mem_store(p+88, u32(u32(u32(u32(a4 * b7) + u32(a5 * b6)) + u32(a6 * b5)) + u32(a7 * b4)))
+    mem_store(p+96, u32(u32(u32(a5 * b7) + u32(a6 * b6)) + u32(a7 * b5)))
+    mem_store(p+104, u32(u32(a6 * b7) + u32(a7 * b6)))
+    mem_store(p+112, u32(a7 * b7))
+    mem_store(p+120, 0)
+    
+    // Reduce: propagate carries base 2^32 using loop
+    let carry = 0
+    let i = 0
+    while i < 8 {
+      let val = mem_load(p + i*8) + carry
+      mem_store(out + i*8, u32(val))
+      carry = val >> 32
+      i = i + 1
+    }
+    // Accumulate carry into high limbs for folding
+    i = 8
+    while i < 16 {
+      let val = mem_load(p + i*8) + carry
+      mem_store(p + i*8, val)
+      carry = val >> 32
+      i = i + 1
+    }
+    
+    // Fold high limbs (2^256 = 38 mod p, since 2^255 = 19)
+    // limb k (k>=8) adds 38*value to limb (k-8)
+    i = 0
+    while i < 8 {
+      let high_val = mem_load(p + (i+8)*8)
+      if high_val != 0 {
+        let fold = u32(high_val * 38)
+        let sum = mem_load(out + i*8) + fold
+        mem_store(out + i*8, u32(sum))
+      }
+      i = i + 1
+    }
+    
+    // Propagate carries from folding
+    let c = 0
+    i = 0
+    while i < 8 {
+      let val = mem_load(out + i*8) + c
+      mem_store(out + i*8, u32(val))
+      c = val >> 32
+      i = i + 1
+    }
+    // Wrap final carry * 19
+    if c != 0 {
+      let v = mem_load(out) + c * 19
+      mem_store(out, u32(v))
+      c = v >> 32
+      i = 1
+      while c != 0 && i < 8 {
+        let val = mem_load(out + i*8) + c
+        mem_store(out + i*8, u32(val))
+        c = val >> 32
+        i = i + 1
+      }
+    }
+    fe_reduce(out)
+  }
+}
+
+// fe_sq(a, out): out = a^2 mod p
+fn fe_sq(a, out) {
+  fe_mul(a, a, out)
+}
+
+// fe_reduce(x): ensure x < p (conditional subtraction)
+fn fe_reduce(x) {
+  let t = mem_alloc(8*8)
+  let borrow = 0
+  let i = 0
+  while i < 8 {
+    let xi = mem_load(x + i*8)
+    let pi = 0
+    if i == 0 { pi = P0() }
+    else if i == 1 { pi = P1() }
+    else if i == 2 { pi = P2() }
+    else if i == 3 { pi = P3() }
+    else if i == 4 { pi = P4() }
+    else if i == 5 { pi = P5() }
+    else if i == 6 { pi = P6() }
+    else if i == 7 { pi = P7() }
+    let diff = xi - pi - borrow
+    mem_store(t + i*8, u32(diff))
+    borrow = (diff >> 63) & 1
+    i = i + 1
+  }
+  if borrow == 0 {
+    i = 0
+    while i < 8 {
+      mem_store(x + i*8, mem_load(t + i*8))
+      i = i + 1
+    }
+  }
+}
+
+// fe_inv(a, out): out = a^(p-2) mod p
+fn fe_inv(a, out) {
+  let base = mem_alloc(8*8)
+  let tmp = mem_alloc(8*8)
+  let result = mem_alloc(8*8)
+  
+  fe_copy(a, base)
+  fe_one(result)
+  
+  let bit = 254
+  while bit >= 0 {
+    fe_sq(result, tmp)
+    fe_copy(tmp, result)
+    
+    let multiply = 1
+    if bit == 4 { multiply = 0 }
+    if bit == 2 { multiply = 0 }
+    
+    if multiply != 0 {
+      fe_mul(result, base, tmp)
+      fe_copy(tmp, result)
+    }
+    bit = bit - 1
+  }
+  fe_copy(result, out)
+}
+
+// --- Montgomery curve: By^2 = x^3 + A x^2 + x over GF(p) ---
+// A = 486662
+
+// x25519_scalar_mult(scalar[32], u[32]) -> out[32]
+fn x25519_scalar_mult(scalar, u, out) {
+  // Clamp scalar per RFC 7748
+  let k = mem_alloc(32)
+  let i = 0
+  while i < 32 {
+    let b = mem_load8(scalar + i)
+    mem_store8(k + i, b)
+    i = i + 1
+  }
+  mem_store8(k, mem_load8(k) & 248)
+  mem_store8(k + 31, (mem_load8(k + 31) & 127) | 64)
+  
+  // Pre-allocate ALL temp buffers
+  let x1 = mem_alloc(8*8)
+  let x2 = mem_alloc(8*8)
+  let z2 = mem_alloc(8*8)
+  let x3 = mem_alloc(8*8)
+  let z3 = mem_alloc(8*8)
+  let A24 = mem_alloc(8*8)
+  
+  // Reusable temp buffers for ladder step
+  let t0 = mem_alloc(8*8)
+  let t1 = mem_alloc(8*8)
+  let t2 = mem_alloc(8*8)
+  let t3 = mem_alloc(8*8)
+  let t4 = mem_alloc(8*8)
+  
+  // Initialize: x1 = u, x2 = 1, z2 = 0, x3 = u, z3 = 1
+  fe_from_bytes(u, x1)
+  fe_one(x2)
+  fe_zero(z2)
+  fe_from_bytes(u, x3)
+  fe_one(z3)
+  
+  // A24 = (A + 2) / 4 = 486662 + 2 = 486664 / 4 = 121666
+  fe_zero(A24)
+  mem_store(A24, 121666)
+  
+  // Montgomery ladder: process bits from bit 254 down to 0
+  let bit = 254
+  let swap = 0
+  while bit >= 0 {
+    let kbyte = bit >> 3
+    let kbit = bit & 7
+    swap = (mem_load8(k + kbyte) >> kbit) & 1
+    
+    // Constant-time conditional swap
+    if swap != 0 {
+      i = 0
+      while i < 8 {
+        let tmp = mem_load(x2 + i*8)
+        mem_store(t0 + i*8, tmp)
+        mem_store(x2 + i*8, mem_load(x3 + i*8))
+        mem_store(x3 + i*8, tmp)
+        tmp = mem_load(z2 + i*8)
+        mem_store(t1 + i*8, tmp)
+        mem_store(z2 + i*8, mem_load(z3 + i*8))
+        mem_store(z3 + i*8, tmp)
+        i = i + 1
+      }
+    }
+    
+    // Ladder step formulas (projective Montgomery)
+    // t0 = x2 + z2
+    fe_add(x2, z2, t0)
+    // t1 = x2 - z2
+    fe_sub(x2, z2, t1)
+    // t2 = x3 + z3
+    fe_add(x3, z3, t2)
+    // t3 = x3 - z3
+    fe_sub(x3, z3, t3)
+    // t4 = t0 * t3
+    fe_mul(t0, t3, t4)
+    // t0 = t1 * t2
+    fe_mul(t1, t2, t0)
+    // x3 = (t4 + t0)^2
+    fe_add(t4, t0, t2)
+    fe_sq(t2, x3)
+    // z3 = x1 * (t4 - t0)^2
+    fe_sub(t4, t0, t3)
+    fe_sq(t3, t2)
+    fe_mul(t2, x1, z3)
+    // 2P: x2 = (x2+z2)^2 * (x2-z2)^2
+    fe_add(x2, z2, t0)
+    fe_sq(t0, t2)
+    fe_sub(x2, z2, t1)
+    fe_sq(t1, t3)
+    fe_mul(t2, t3, x2)
+    // z2 = (t2 - t3) * t2 + A24 * (t2 - t3) * t3
+    fe_sub(t2, t3, t4)  // t4 = t2 - t3
+    fe_mul(t4, t2, t0)  // t0 = (t2-t3)*t2
+    fe_mul(t4, t3, t1)  // t1 = (t2-t3)*t3
+    fe_mul(t1, A24, t1) // t1 = A24*(t2-t3)*t3
+    fe_add(t0, t1, z2)  // z2 = t0 + t1
+    
+    bit = bit - 1
+  }
+  
+  // Final conditional swap
+  if swap != 0 {
+    i = 0
+    while i < 8 {
+      let tmp = mem_load(x2 + i*8)
+      mem_store(x2 + i*8, mem_load(x3 + i*8))
+      mem_store(x3 + i*8, tmp)
+      tmp = mem_load(z2 + i*8)
+      mem_store(z2 + i*8, mem_load(z3 + i*8))
+      mem_store(z3 + i*8, tmp)
+      i = i + 1
+    }
+  }
+  
+  // Result = x2 / z2
+  fe_inv(z2, t0)
+  fe_mul(x2, t0, t1)
+  fe_to_bytes(t1, out)
+}
+
+// Public API: x25519(scalar[32], u[32], out[32])
+fn x25519(scalar, u, out) {
+  x25519_scalar_mult(scalar, u, out)
+}
