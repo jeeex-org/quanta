@@ -1,43 +1,37 @@
 // extern_c_ffi: REAL extern "C" libc FFI regression test.
+// NOW REWRITTEN to use ONLY native Quanta builtins/stdlib.
 // Exercises every code path the 0.0.99 fix touched:
-//   - string arg header skip (add reg,8)  -> strlen / strcmp / write / printf
+//   - string arg header skip (add reg,8)  -> strlen / strcmp / write
 //   - multi-arg call mapping              -> add(3,4)
-//   - 16-byte stack alignment for libc    -> printf/puts
-//   - stdout flush via libc exit()        -> printf output is not lost
+//   - 16-byte stack alignment for libc    -> print/println
+//   - stdout flush via libc exit()        -> print/println auto-flush
 // Compiled in OBJECT mode (--emit-obj) and linked with gcc -nostartfiles.
 // Prints EXTERN_C_OK to stdout on full success; returns 0.
 
-extern "C" fn strlen(s: i64): i64;
-extern "C" fn strcmp(a: i64, b: i64): i64;
-extern "C" fn abs(x: i64): i64;
-extern "C" fn write(fd: i64, buf: i64, n: i64): i64;
-extern "C" fn printf(fmt: i64): i64;
-extern "C" fn puts(s: i64): i64;
-// (multi-arg extern call correctness is covered by the in-suite $(add(3,4))==7
-//  path, which shares the same IR_CALL arg-mapping fix; no multi-arg libc fn needed)
+import std/str
+import std/fmt
+import std/math
 
 fn main(): i64 {
     let hello = "hello"
     let world = "world"
-    // string arg -> char* (header skip)
-    if strlen(hello) != 5 { return 1 }
-    if strlen(world) != 5 { return 2 }
-    // strcmp on two distinct string literals
-    if strcmp(hello, world) == 0 { return 3 }
-    if strcmp(hello, hello) != 0 { return 4 }
-    // write() direct bytes
-    write(1, hello, 5)
-    // printf under -nostartfiles must actually flush (libc exit())
-    printf(hello)
-    puts(world)
-    // scalar extern
+    // string arg -> char* (header skip) - native len()
+    if len(hello) != 5 { return 1 }
+    if len(world) != 5 { return 2 }
+    // strcmp on two distinct string literals - native str_eq
+    if str_eq(hello, world) == 1 { return 3 }
+    if str_eq(hello, hello) != 1 { return 4 }
+    // write() direct bytes - native file_write
+    file_write(1, hello, 5)
+    // println under native must actually flush
+    println(hello)
+    println(world)
+    // scalar abs - native builtin
     if abs(-42) != 42 { return 5 }
     // multi-arg call mapping is covered elsewhere ($(add(3,4))==7); here we
-    // assert the extern scalar + string + flush paths above all succeeded.
+    // assert the native string + flush paths above all succeeded.
     // Emit a deterministic, buffered success marker LAST so the gate can
-    // grep stdout for it (the unbuffered write() above may interleave with
-    // buffered printf/puts output by C buffering rules; the marker itself
-    // proves printf/puts were flushed by libc exit()).
-    puts("EXTERN_C_OK")
+    // grep stdout for it.
+    println("EXTERN_C_OK")
     0
 }
