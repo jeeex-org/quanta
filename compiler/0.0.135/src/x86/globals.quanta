@@ -1108,6 +1108,10 @@ let HEAP_CTRL = GDATA + 1032   // 0x42200408
 // Labels in `lblmap` store code-buffer offsets, so absolute catch vaddr = CODE_VBASE + off.
 let CODE_VBASE = 4194592   // 0x400120 = e_entry (BASE + ELF_HDR 64 + PHDR_TAB 224)
 let LINK_HT = 400         // ELF header + 6 program headers (64 + 56*6) — must match write_elf ht
+// write_elf's ht = ELF_HDR(64) + PHDR_TAB(56 * phc) where phc=3 (static PIE) or 6 (dynamic)
+// For static PIE: ht = 64 + 56*3 = 232
+// For dynamic: ht = 64 + 56*6 = 400
+// We use LINK_HT = 400 as the max, and in entry.quanta we compute dynamically if needed
 let target_arch = 0
 // P4: code-buffer offsets of __init and main, recorded at emit time, used by the
 // startup-stub bl patcher. Globals (cannot be shadowed by block-scoped lets).
@@ -1126,6 +1130,15 @@ let g_main_call_ofs = 0   // code offset of the 'bl main' placeholder in the sta
 // type (R_X86_64_PLT32 vs R_AARCH64_CALL26) and e_machine are chosen by
 // target_arch at emit time.
 let emit_obj = 0
+// P5.2: dynamic linking mode. When emit_dynamic==1 and emit_obj==0, write_elf
+// emits PT_INTERP, PT_DYNAMIC, .dynsym, .dynstr, .hash, .gnu.hash, .got,
+// .got.plt, .plt, .rela.plt (dynamic ELF for extern "C" libc calls).
+// When emit_dynamic==0 (default), write_elf emits static PIE (ET_DYN, no
+// PT_INTERP, no dynamic section) — fully self-contained, no libc dependency.
+let emit_dynamic = 0
+// write_elf's ht (ELF header + program header table size) — set by write_elf
+// so entry.quanta can compute correct PLT entry addresses for extern "C" calls.
+let g_elf_ht = 0
 let no_start = 0   // P5.1: secondary object TU — suppress _start/__init entry
 let has_main = 0  // P5.1: set in finalize; visible to p5_elf_obj for no_start
 let objcode = mmap(16777216)   // relocatable .text image (copy of code buffer at finalize)

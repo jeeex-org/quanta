@@ -939,4 +939,181 @@ Verified by **source review** of `compiler/0.0.134/src`, `compiler/0.0.135/src` 
 
 ---
 
-*Updated 2026-09-04 with Part F (0.0.134/135 security audit + core-completeness; gate 11/11 GREEN; fixpoint md5 `443e2a43...`). **0.0.125–0.0.134 cores complete; next = 0.0.135 X25519.***
+# Part G — External Dependency Audit (Quanta Self-Sufficiency Goal)
+
+**Goal:** Quanta must be 100% self-sufficient with NO external dependencies. Every `extern "C"` / `ld` / `libc` / `gcc` reliance must be replaced with native Quanta implementations.
+
+## G1 — Dynamic Linker / libc (CRITICAL)
+
+| Dependency | Location | Purpose | Replacement Target |
+|---|---|---|---|
+| `ld` (system linker) | `scripts/quanta_link.sh` | Emit PLT/GOT, resolve UNDEF symbols, set PT_INTERP | **Quanta-native linker** (emit ELF with PLT/GOT/DYNAMIC/INTERP internally) |
+| `libc.so.6` (glibc) | All `extern "C"` tests + `quanta_link.sh -lc` | `strlen`, `strcmp`, `printf`, `puts`, `write`, `abs`, `malloc`, `free`, `exit`, `getrandom` | **Native Quanta implementations** in `lib/std/` |
+| `libc` dynamic linker (`/lib64/ld-linux-x86-64.so.2`) | `quanta_link.sh` probe | PT_INTERP for standalone EXE | **Quanta emits PT_INTERP path** or **static PIE** (no interpreter) |
+| `gcc -nostartfiles` | CI gate (extern-c layer) | Compile test objects for comparison | **Quanta `--emit-obj` + native link** only |
+
+### G1.1 libc Functions Used (must implement natively)
+
+| Function | Used In | Quanta Replacement |
+|---|---|---|
+| `strlen` | `extern_c_ffi.quanta` | `len(s)` — already native |
+| `strcmp` | `extern_c_ffi.quanta` | `str_eq`/`str_cmp` — already native |
+| `abs` | `extern_c_ffi.quanta` | builtin `abs` — already native |
+| `write` | `extern_c_ffi.quanta` | `file_write` builtin — already native |
+| `printf` | `extern_c_ffi.quanta`, `extern_var_test.quanta` | **Need native `printf` / formatted output** |
+| `puts` | `extern_c_ffi.quanta` | `print`/`println` builtin — already native |
+| `malloc` | `std_aes_gcm_test.quanta`, test files | `mem_alloc` builtin — already native |
+| `free` | (implicit via libc) | `mem_free` builtin — already native |
+| `exit` | `extern_c_ffi.quanta` (libc flush) | `exit` builtin (raw syscall) — already native |
+| `getrandom` | `crypto.quanta:190` | `syscall3(318,...)` — already native |
+
+**Gap:** `printf` / variadic formatted output — **no native implementation**. `extern_var_test.quanta` declares `extern "C" fn printf(fmt: i64, ...): i64;`.
+
+### G1.2 Linker Responsibilities to Internalize
+
+| Task | Current (ld) | Quanta-Native Target |
+|---|---|---|
+| Resolve UNDEF symbols | `ld` processes `R_X86_64_PLT32` | `qc` emits PLT/GOT + resolves at link time |
+| Emit `PT_INTERP` | `ld --dynamic-linker` | `write_elf` writes correct interpreter path |
+| Build `.dynsym`/`.dynstr`/`.rela.plt`/`.got.plt` | `ld` auto-generates | `objfmt.quanta` / `elf.quanta` emit full dynamic section |
+| Pull `libc.so.6` | `ld -lc` | **Eliminate** — replace libc calls with native Quanta |
+
+---
+
+## G2 — Build-Time Toolchain (MEDIUM)
+
+| Dependency | Location | Purpose | Replacement Target |
+|---|---|---|---|
+| `gcc` (for CI comparison) | `test_suites/scripts/run_tests.sh` | Compile reference objects | **Remove** — Quanta `--emit-obj` + native link is the only path |
+| `objdump` / `readelf` | CI verification | Inspect generated ELF | **Optional** — `qc --verify-elf` built-in |
+| `bash` | `quanta_link.sh`, CI scripts | Drive link process | **Replace with Quanta script runner** (`$$()`) |
+
+---
+
+## G3 — Kernel / Hardware (ACCEPTABLE — not "external dependencies")
+
+| Dependency | Verdict | Rationale |
+|---|---|---|
+| Linux syscalls (`syscall` builtin) | ✅ ACCEPTABLE | OS interface — Quanta talks to kernel directly, no libc wrapper |
+| x86-64 ISA | ✅ ACCEPTABLE | Target architecture — not a software dependency |
+| ELF format | ✅ ACCEPTABLE | Standard binary format — Quanta emits it natively |
+
+---
+
+## G4 — Test Suite Dependencies (to clean up)
+
+| File | External Decl | Action |
+|---|---|---|
+| `test_suites/codes/extern_c_ffi.quanta` | 6 `extern "C"` libc fns | **Rewrite** using native Quanta builtins only |
+| `test_suites/codes/extern_var_test.quanta` | `extern "C" fn printf(fmt, ...)` | **Rewrite** — implement native `printf` or remove variadic test |
+| `test_suites/codes/std_aes_gcm_test.quanta` | `extern "C" fn aes128_gcm_enc` + `extern fn malloc` | **Rewrite** — use `import std/aes_gcm` + `mem_alloc` |
+| `lib/std/test_*_extern_c.quanta` | `extern "C" fn malloc` | **Delete or rewrite** — use `mem_alloc` |
+| `test_suites/codes/mtu_*.quanta` | `extern "C"` cross-TU | **Keep** — this tests Quanta's OWN extern-C mechanism (valid) |
+
+---
+
+## G5 — Roadmap Integration (Fix IDs)
+
+| Fix ID | Title | Severity | Target Version |
+|---|---|---|---|
+| **FIX-0.0.50** | Native `printf` / formatted output (replace libc `printf`) | HIGH | 0.0.136 (self-sufficiency) |
+| **FIX-0.0.51** | Quanta-native ELF linker (emit PLT/GOT/DYNAMIC/INTERP, replace `ld`) | CRITICAL | 0.0.137 (self-sufficiency) |
+| **FIX-0.0.52** | Eliminate `libc.so.6` from all gates — rewrite `extern_c_ffi` / `extern_var_test` / `std_aes_gcm_test` | HIGH | 0.0.136 (immediate) |
+| **FIX-0.0.53** | Remove `gcc` from CI — `--emit-obj` + native link only | MEDIUM | 0.0.138 (self-sufficiency) |
+| **FIX-0.0.54** | Replace `quanta_link.sh` with `qc --link` built-in | CRITICAL | 0.0.139 (self-sufficiency) |
+| **FIX-0.0.55** | Static PIE option (no PT_INTERP, no dynamic linker) | CRITICAL | 0.0.140 (self-sufficiency) |
+
+---
+
+## Priority Order (Self-Sufficiency Track) — **REPRIORITIZED 2026-09-04 PER USER DIRECTIVE**
+
+**Immediate (0.0.136):**
+1. **FIX-0.0.52** — Rewrite all test files to use native Quanta only (no `extern "C"` libc). Gate must pass with **zero** external symbols.
+
+**Before 0.1.0 (critical path — self-sufficiency FIRST, per 2026-09-04: "Bring all self-sufficiency first -- i don't want you to build any new features using thirdparty"):**
+2. **FIX-0.0.51** — Native ELF linker in `elf.quanta`/`objfmt.quanta` (emit PLT/GOT/DYNAMIC/INTERP, resolve UNDEF). This is the **single largest blocker** to "no external dependencies".
+3. **FIX-0.0.50** — Native `printf` / variadic formatting in `lib/std/` (needed for any real program output).
+4. **FIX-0.0.54** — `qc --link` built-in replaces `quanta_link.sh`.
+5. **FIX-0.0.55** — Static PIE (fully self-contained, no dynamic linker at all) — **promoted from "nice-to-have" to critical path**.
+
+**Crypto/Quantum cores (0.0.136–0.0.140) DEFERRED until self-sufficiency complete.**
+
+---
+
+## Verification Criteria (Gate Additions)
+
+| Check | Pass Condition |
+|---|---|
+| `readelf -d <qc_binary>` | **No** `NEEDED` entry for `libc.so.6` |
+| `readelf -r <qc_binary>` | **No** `R_X86_64_PLT32` relocations to external symbols |
+| `ldd <qc_binary>` | `not a dynamic executable` (static PIE) OR only `linux-vdso.so.1` |
+| Gate `extern_c_ffi` | Rewritten to use **only** `import std/...` + builtins — **no `extern "C"`** |
+| Gate `extern_var_test` | Rewritten or removed (variadic not modeled natively yet) |
+| CI | **No `gcc`/`ld`/`objdump` invocations** — only `qc` |
+
+---
+
+## Part H — Post-Self-Sufficiency Review Checklist (fill in after 0.0.140 complete)
+
+Run this AFTER all self-sufficiency fixes (FIX-0.0.50 through FIX-0.0.55) land and before resuming crypto/quantum core work. Every check below must PASS with zero exceptions.
+
+### H1 — Dynamic Linker Verification
+
+| Check | Command | Pass Condition |
+|---|---|---|
+| No libc needed | `readelf -d /opt/tali/quanta/compiler/0.0.140/bin/x86/qc` | **No** `NEEDED` entry for `libc.so.6` |
+| No PLT to libc | `readelf -r /opt/tali/quanta/compiler/0.0.140/bin/x86/qc` | **No** `R_X86_64_PLT32` to `strlen`/`strcmp`/`printf`/`puts`/`write`/`abs` |
+| No dynamic linker | `ldd /opt/tali/quanta/compiler/0.0.140/bin/x86/qc` | `not a dynamic executable` OR only `linux-vdso.so.1` |
+
+### H2 — Gate Boundary Verification
+
+| Check | Action | Pass Condition |
+|---|---|---|
+| `extern_c_ffi.quanta` | `grep -c 'extern "C"' test_suites/codes/extern_c_ffi.quanta` | **0** — must use only `import std/...` + builtins |
+| `extern_var_test.quanta` | `grep -c 'extern "C"' test_suites/codes/extern_var_test.quanta` | **0** — either rewritten or deleted |
+| `std_aes_gcm_test.quanta` | `grep -c 'extern "C"' test_suites/codes/std_aes_gcm_test.quanta` | **0** — must use `import std/aes_gcm` + `mem_alloc` |
+| All lib/std test files | `grep -r 'extern "C"' lib/std/test_*.quanta` | **0** matches — all must use native Quanta |
+| mtu_* tests (keep) | `grep -r 'extern "C"' test_suites/codes/mtu_*.quanta` | Expected — these test Quanta's OWN extern-C mechanism |
+
+### H3 — CI / Build Toolchain Verification
+
+| Check | File | Pass Condition |
+|---|---|---|
+| No gcc in CI | `test_suites/scripts/run_tests.sh` | **No** `gcc` invocations — only `qc` |
+| No ld in CI | `test_suites/scripts/run_tests.sh` | **No** `ld` invocations — only `qc` (or `qc --link`) |
+| No bash in CI | `test_suites/scripts/run_tests.sh` | No `bash` subprocesses for linking — `qc --link` built-in |
+| `quanta_link.sh` retired | `scripts/quanta_link.sh` | Either deleted or superseded by `qc --link` |
+
+### H4 — Runtime Verification
+
+| Check | Command | Pass Condition |
+|---|---|---|
+| qc binary self-links | `/opt/tali/quanta/compiler/0.0.140/bin/x86/qc --emit-obj qc_source.quanta /tmp/qc.o && qc --link /tmp/qc.o /tmp/qc_test && /tmp/qc_test --version` | Runs without external linker, no shared library errors |
+| Gate passes | Full 11-layer gate run on 0.0.140 | All GREEN, functional 163/163 |
+| Self-host fixpoint | 2-stage build: gen1 == gen2 byte-identical | md5-verified |
+
+### H5 — SHA3 Crypto Check
+
+| Check | File | Pass Condition |
+|---|---|---|
+| sha3 primitives pure | `lib/std/sha3_*.quanta` | No `extern "C"` — already pure Quanta |
+| SHA3 KATs pass | `test_suites/codes/test_sha3_*.quanta` | Compiled via pure Quanta pipeline only |
+| adm files not required | `lib/std/sha3_*.adm` | Confirmed derivative docs, not compilation dependencies |
+
+---
+
+### H6 — Sign-Off
+
+| Criterion | Met? | Evidence |
+|---|---|---|
+| qc binary requires no shared libraries | ☐ | readelf/ldd output |
+| All gate tests pass with zero extern "C" libc | ☐ | Gate output + grep results |
+| CI uses only qc (no gcc/ld/bash) | ☐ | CI log |
+| Self-host fixpoint verified | ☐ | md5 output |
+| SHA3 crypto self-contained | ☐ | grep for extern in sha3_*.quanta |
+
+**When all boxes checked:** self-sufficiency complete. Resume crypto/quantum core chain at 0.0.141+.
+
+---
+
+*Added 2026-09-04 with Part H (Post-Self-Sufficiency Review Checklist). Fill in after 0.0.139 complete, before crypto/quantum work resumes.*

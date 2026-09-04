@@ -35,6 +35,7 @@ fn main(argc, argv) {
             //   --no-overflow-trap   : turn the trap OFF (for code that relies on
             //                          two's-complement wraparound and isn't ported)
             if r8(ap)==45 && r8(ap+1)==45 {
+                // Check for flags that start with "--"
                 let is_ovf = 1; let ki=0
                 let ovfstr = "overflow-trap"
                 // argv strings are raw (no header); Quanta string literals carry an
@@ -47,20 +48,30 @@ fn main(argc, argv) {
                     let novfstr = "no-overflow-trap"
                     while kj<17 { if r8(ap+2+kj) != r8(novfstr+8+kj) { is_novf=0; break }; kj=kj+1 }
                     if is_novf==1 { ovf_trap = 0 }
-                    let is_arm = 0   // x86-only build: no ARM target selection
-                    // P5: try "--emit-obj" (relocatable .o + linker, object-format pillar)
-                    let is_obj=1; let oa=0
-                    let emobj = "emit-obj"
-                    while oa<8 { if r8(ap+2+oa) != r8(emobj+8+oa) { is_obj=0; break }; oa=oa+1 }
-                    if is_obj==1 { emit_obj=1 }
-                    // P5.1: try "--no-start" (9 chars) — secondary object TU
-                    let is_nostart=1; let kc=0
-                    let nostr = "no-start"
-                    while kc<9 { if r8(ap+2+kc) != r8(nostr+8+kc) { is_nostart=0; break }; kc=kc+1 }
-                    if is_nostart==1 { no_start=1 }
-                    if !is_novf && !is_arm && !is_obj && !is_nostart {
-                        if srcp==0 { srcp=ap } else if out_p==0 { out_p=ap }
-                    }
+                }
+                
+                let is_arm = 0   // x86-only build: no ARM target selection
+                
+                // P5: try "--emit-obj" (relocatable .o + linker, object-format pillar)
+                let is_obj=1; let oa=0
+                let emobj = "emit-obj"
+                while oa<8 { if r8(ap+2+oa) != r8(emobj+8+oa) { is_obj=0; break }; oa=oa+1 }
+                if is_obj==1 { emit_obj=1 }
+                
+                // P5.2: try "--emit-dynamic" (dynamic ELF with PT_INTERP + libc, for extern "C")
+                let is_dyn=1; let od=0
+                let emdyn = "emit-dynamic"
+                while od<12 { if r8(ap+2+od) != r8(emdyn+8+od) { is_dyn=0; break }; od=od+1 }
+                if is_dyn==1 { emit_dynamic=1 }
+                
+                // P5.1: try "--no-start" (9 chars) — secondary object TU
+                let is_nostart=1; let kc=0
+                let nostr = "no-start"
+                while kc<9 { if r8(ap+2+kc) != r8(nostr+8+kc) { is_nostart=0; break }; kc=kc+1 }
+                if is_nostart==1 { no_start=1 }
+                
+                if !is_novf && !is_arm && !is_obj && !is_nostart && !is_dyn {
+                    if srcp==0 { srcp=ap } else if out_p==0 { out_p=ap }
                 }
             } else {
                 if srcp==0 { srcp=ap }
@@ -557,6 +568,64 @@ fn main(argc, argv) {
             let cof=r64(func_code_starts+(tfi+1)*8)
             let disp=cof-(po3+7)
             w32(code+po3+3, disp)
+        } else if r64(patches+pi*PCS+16)==3 {
+            // extern "C" call in exec mode (dynamic linking) — patches+8 = function name ptr.
+            // Patch the CALL instruction to point to the PLT entry for this symbol.
+            let po3=r64(patches+pi*PCS)
+            let tg=r64(patches+pi*PCS+8)
+            let tg_nl=0
+            while tg_nl<256 {
+                let c0=r8(src+tg+tg_nl)
+                if c0==0||c0==40||c0==41||c0==59||c0==123||c0==125||c0==44||c0==60||c0==62 { break }
+                if c0==32||c0==9||c0==10||c0==13 { break }
+                tg_nl=tg_nl+1
+            }
+            let tfi=findfn(tg,tg_nl)
+            if tfi>=0 && r64(fn_extern + tfi*8)==1 {
+                // Find the extern index (0-based) for this function
+                let ext_idx = 0
+                let fi2 = 0
+                while fi2 < fnc {
+                    if r64(fn_extern + fi2*8) == 1 {
+                        if fi2 == tfi { break }
+                        ext_idx = ext_idx + 1
+                    }
+                    fi2 = fi2 + 1
+                }
+                // Recompute the same layout as write_elf to get plt_vaddr
+                // These must match write_elf's calculations exactly
+                let num_extern = 0
+                let fi3 = 0
+                while fi3 < fnc {
+                    if r64(fn_extern + fi3*8) == 1 { num_extern = num_extern + 1 }
+                    fi3 = fi3 + 1
+                }
+                let interp_len = 28  // "/lib64/ld-linux-x86-64.so.2\0"
+                let dynstr_size = 200
+                let dynsym_count = num_extern + 1
+                let dynsym_size = dynsym_count * 24
+                let hash_size = 32
+                let gnu_hash_size = 48
+                let dynamic_count = 15
+                let dynamic_size = dynamic_count * 16
+                let got_size = 8 * (num_extern + 3)
+                let got_plt_size = 8 * 3 + 8 * num_extern
+                let plt_size = 16 + 16 * num_extern
+                let rela_plt_size = num_extern * 24
+                let dyn_total = interp_len + dynstr_size + dynsym_size + hash_size + gnu_hash_size + dynamic_size + got_size + got_plt_size + plt_size + rela_plt_size
+                let dyn_pad = dyn_total % 16
+                if dyn_pad > 0 { dyn_total = dyn_total + (16 - dyn_pad) }
+                let gdata_size = (INTERNAL_GLOBAL_COUNT + gvarc) * 8
+                let data_off = 0  // placeholder - but we need the actual value
+                // The dynamic data starts at gdata_vaddr + gdata_size + data_off
+                let dynamic_vaddr = GDATA + gdata_size + data_off
+                let plt_vaddr = dynamic_vaddr + interp_len + dynstr_size + dynsym_size + hash_size + gnu_hash_size + dynamic_size + got_size + got_plt_size
+                let plt_entry_vaddr = plt_vaddr + 16 + ext_idx * 16
+                // Patch the CALL instruction (E8 rel32)
+                // rel32 = target - (call_addr + 5)
+                // Use g_elf_ht (set by write_elf) instead of hardcoded ht
+                w32(code+po3+1, plt_entry_vaddr - (BASE + g_elf_ht + po3 + 5))
+            }
         }
         pi=pi+1
     }
