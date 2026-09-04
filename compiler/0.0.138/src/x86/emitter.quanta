@@ -554,6 +554,21 @@ fn emit_bltn(nmi,nl,ii) {
     if nl==4&&r8(nm)=='e'&&r8(nm+1)=='x'&&r8(nm+2)=='i'&&r8(nm+3)=='t' {
         eb(184); ei(60); sysc(); return 1
     }
+    // execve(path, argv, envp): raw syscall wrapper for direct execve
+    //   path = rdi (C string, no Quanta header), argv = rsi (pointer array, NULL-terminated), envp = rdx (pointer array or 0).
+    //   This is a raw syscall wrapper for direct execve (not via /bin/sh).
+    if nl==6&&r8(nm)=='e'&&r8(nm+1)=='x'&&r8(nm+2)=='e'&&r8(nm+3)=='c'&&r8(nm+4)=='v'&&r8(nm+5)=='e' {
+        flush_all()
+        // args: a0=path, a1=argv, a2=envp (already in home slots after flush_all)
+        // Load path into rdi, argv into rsi, envp into rdx
+        rbp(7, spill_home(irres(ira2(ii))))       // rdi = path
+        rbp(6, spill_home(irres(ira2(ii)+1)))     // rsi = argv
+        rbp(2, spill_home(irres(ira2(ii)+2)))     // rdx = envp
+        ri(0,59); sysc()                          // execve
+        // On failure: exit(127)
+        ri(7,127); ri(0,60); sysc()
+        return 1
+    }
     // free(ptr): munmap(ptr, len) where len = *(ptr) (the header = element count).
     //   mmap rounds the base up to a page, so the region starting at the user
     //   pointer (mapped length n*8+8) is exactly one page; unmapping len bytes
