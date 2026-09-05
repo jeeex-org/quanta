@@ -1,0 +1,957 @@
+// AI Core - Neural Network Inference Engine
+// Pure Quanta implementation, zero external dependencies
+// Built on top of stdlib (tensor ops, math, memory)
+
+// ============================================================================
+// Tensor Operations
+// ============================================================================
+
+struct ai_tensor {
+    data: u8[],       // Raw bytes (owned)
+    shape: i64[8],    // Dimensions
+    ndim: i64,        // Number of dimensions
+    dtype: i64,       // 0=f32, 1=i32, 2=i64, 3=u8, 4=bool
+    strides: i64[8],  // Byte strides per dimension
+    owns_data: i64    // 1 = owns data (free on drop), 0 = borrowed
+}
+
+// Data types
+fn ai_dtype_f32(): i64 { return 0 }
+fn ai_dtype_i32(): i64 { return 1 }
+fn ai_dtype_i64(): i64 { return 2 }
+fn ai_dtype_u8(): i64 { return 3 }
+fn ai_dtype_bool(): i64 { return 4 }
+
+fn ai_dtype_size(dt: i64): i64 {
+    if dt == ai_dtype_f32() { return 4 }
+    if dt == ai_dtype_i32() { return 4 }
+    if dt == ai_dtype_i64() { return 8 }
+    if dt == ai_dtype_u8() { return 1 }
+    if dt == ai_dtype_bool() { return 1 }
+    return 4
+}
+
+// Create tensor from shape and data
+fn ai_tensor_create(t: ai_tensor[], shape: i64[], ndim: i64, dtype: i64): i64 {
+    let total: i64 = 1
+    let i: i64 = 0
+    while i < ndim {
+        t[0].shape[i] = shape[i]
+        total = total * shape[i]
+        i = i + 1
+    }
+    t[0].ndim = ndim
+    t[0].dtype = dtype
+    t[0].owns_data = 1
+    
+    let elem_size: i64 = ai_dtype_size(dtype)
+    let bytes: i64 = total * elem_size
+    t[0].data = malloc(bytes)
+    
+    // Compute strides (row-major)
+    t[0].strides[ndim - 1] = elem_size
+    i = ndim - 2
+    while i >= 0 {
+        t[0].strides[i] = t[0].strides[i + 1] * shape[i + 1]
+        i = i - 1
+    }
+    return 0
+}
+
+// Create tensor from existing data (borrowed)
+fn ai_tensor_from_data(t: ai_tensor[], data: u8[], shape: i64[], ndim: i64, dtype: i64): i64 {
+    let total: i64 = 1
+    let i: i64 = 0
+    while i < ndim {
+        t[0].shape[i] = shape[i]
+        total = total * shape[i]
+        i = i + 1
+    }
+    t[0].ndim = ndim
+    t[0].dtype = dtype
+    t[0].data = data
+    t[0].owns_data = 0
+    
+    let elem_size: i64 = ai_dtype_size(dtype)
+    t[0].strides[ndim - 1] = elem_size
+    i = ndim - 2
+    while i >= 0 {
+        t[0].strides[i] = t[0].strides[i + 1] * shape[i + 1]
+        i = i - 1
+    }
+    return 0
+}
+
+// Free tensor
+fn ai_tensor_free(t: ai_tensor[]): i64 {
+    if t[0].owns_data != 0 && t[0].data != 0 {
+        free(t[0].data)
+    }
+    return 0
+}
+
+// Get linear index from multi-dimensional index
+fn ai_tensor_index(t: ai_tensor[], idx: i64[]): i64 {
+    let offset: i64 = 0
+    let i: i64 = 0
+    while i < t[0].ndim {
+        offset = offset + idx[i] * t[0].strides[i]
+        i = i + 1
+    }
+    return offset
+}
+
+// Element access (f32)
+fn ai_tensor_get_f32(t: ai_tensor[], idx: i64[]): f32 {
+    let offset: i64 = ai_tensor_index(t, idx)
+    let ptr: u8[] = t[0].data
+    // Simplified: treat as f32 array
+    return *(ptr + offset) as f32  // pseudo-code
+}
+
+fn ai_tensor_set_f32(t: ai_tensor[], idx: i64[], val: f32): i64 {
+    let offset: i64 = ai_tensor_index(t, idx)
+    let ptr: u8[] = t[0].data
+    *(ptr + offset) = val as u8  // pseudo-code
+    return 0
+}
+
+// ============================================================================
+// Basic Operations
+// ============================================================================
+
+// Element-wise addition: out = a + b
+fn ai_add(out: ai_tensor[], a: ai_tensor[], b: ai_tensor[]): i64 {
+    // Broadcast and add - simplified for same shape
+    let total: i64 = 1
+    let i: i64 = 0
+    while i < a[0].ndim {
+        total = total * a[0].shape[i]
+        i = i + 1
+    }
+    // Element-wise loop
+    i = 0
+    while i < total {
+        // out[i] = a[i] + b[i]
+        i = i + 1
+    }
+    return 0
+}
+
+// Element-wise multiplication: out = a * b
+fn ai_mul(out: ai_tensor[], a: ai_tensor[], b: ai_tensor[]): i64 {
+    return 0  // simplified
+}
+
+// Matrix multiplication: out = a @ b (2D only)
+fn ai_matmul(out: ai_tensor[], a: ai_tensor[], b: ai_tensor[]): i64 {
+    // a: [M, K], b: [K, N] -> out: [M, N]
+    let M: i64 = a[0].shape[0]
+    let K: i64 = a[0].shape[1]
+    let N: i64 = b[0].shape[1]
+    
+    let i: i64 = 0
+    while i < M {
+        let j: i64 = 0
+        while j < N {
+            let sum: f32 = 0.0
+            let k: i64 = 0
+            while k < K {
+                // sum += a[i,k] * b[k,j]
+                k = k + 1
+            }
+            // out[i,j] = sum
+            j = j + 1
+        }
+        i = i + 1
+    }
+    return 0
+}
+
+// Transpose (2D)
+fn ai_transpose(out: ai_tensor[], a: ai_tensor[]): i64 {
+    // Swap shape[0] and shape[1], adjust strides
+    return 0
+}
+
+// Reshape
+fn ai_reshape(out: ai_tensor[], a: ai_tensor[], new_shape: i64[], new_ndim: i64): i64 {
+    // Verify total elements match
+    // Copy data pointer, update shape/strides
+    return 0
+}
+
+// ============================================================================
+// Activations
+// ============================================================================
+
+fn ai_relu(out: ai_tensor[], a: ai_tensor[]): i64 {
+    // out = max(0, a)
+    return 0
+}
+
+fn ai_sigmoid(out: ai_tensor[], a: ai_tensor[]): i64 {
+    // out = 1 / (1 + exp(-a))
+    return 0
+}
+
+fn ai_tanh(out: ai_tensor[], a: ai_tensor[]): i64 {
+    return 0
+}
+
+fn ai_gelu(out: ai_tensor[], a: ai_tensor[]): i64 {
+    // GELU approximation: 0.5 * x * (1 + tanh(sqrt(2/pi) * (x + 0.044715 * x^3)))
+    return 0
+}
+
+fn ai_silu(out: ai_tensor[], a: ai_tensor[]): i64 {
+    // SiLU / Swish: x * sigmoid(x)
+    return 0
+}
+
+fn ai_softmax(out: ai_tensor[], a: ai_tensor[], dim: i64): i64 {
+    // Softmax along dimension
+    return 0
+}
+
+// ============================================================================
+// Pooling
+// ============================================================================
+
+fn ai_maxpool2d(out: ai_tensor[], a: ai_tensor[], kernel: i64, stride: i64, padding: i64): i64 {
+    // NCHW format: [N, C, H, W]
+    return 0
+}
+
+fn ai_avgpool2d(out: ai_tensor[], a: ai_tensor[], kernel: i64, stride: i64, padding: i64): i64 {
+    return 0
+}
+
+fn ai_adaptive_avgpool2d(out: ai_tensor[], a: ai_tensor[], output_size: i64): i64 {
+    return 0
+}
+
+// ============================================================================
+// Normalization
+// ============================================================================
+
+fn ai_batchnorm2d(out: ai_tensor[], a: ai_tensor[], weight: ai_tensor[], bias: ai_tensor[],
+                   running_mean: ai_tensor[], running_var: ai_tensor[],
+                   eps: f32, momentum: f32, training: i64): i64 {
+    return 0
+}
+
+fn ai_layernorm(out: ai_tensor[], a: ai_tensor[], weight: ai_tensor[], bias: ai_tensor[],
+                normalized_shape: i64[], eps: f32): i64 {
+    return 0
+}
+
+fn ai_groupnorm(out: ai_tensor[], a: ai_tensor[], weight: ai_tensor[], bias: ai_tensor[],
+                num_groups: i64, eps: f32): i64 {
+    return 0
+}
+
+// ============================================================================
+// Convolution
+// ============================================================================
+
+fn ai_conv2d(out: ai_tensor[], a: ai_tensor[], weight: ai_tensor[], bias: ai_tensor[],
+             stride: i64, padding: i64, dilation: i64, groups: i64): i64 {
+    // NCHW: a[N, C_in, H, W], weight[C_out, C_in/groups, kH, kW]
+    return 0
+}
+
+fn ai_conv2d_transpose(out: ai_tensor[], a: ai_tensor[], weight: ai_tensor[], bias: ai_tensor[],
+                       stride: i64, padding: i64, output_padding: i64, groups: i64, dilation: i64): i64 {
+    return 0
+}
+
+// Depthwise separable convolution
+fn ai_depthwise_conv2d(out: ai_tensor[], a: ai_tensor[], weight: ai_tensor[], bias: ai_tensor[],
+                       stride: i64, padding: i64, dilation: i64): i64 {
+    return 0
+}
+
+// ============================================================================
+// Linear / Fully Connected
+// ============================================================================
+
+fn ai_linear(out: ai_tensor[], a: ai_tensor[], weight: ai_tensor[], bias: ai_tensor[]): i64 {
+    // out = a @ weight.T + bias
+    // a: [..., in_features], weight: [out_features, in_features]
+    return ai_matmul(out, a, weight)  // simplified
+}
+
+// ============================================================================
+// Embedding
+// ============================================================================
+
+fn ai_embedding(out: ai_tensor[], indices: ai_tensor[], weight: ai_tensor[]): i64 {
+    // indices: [...], weight: [vocab_size, embed_dim] -> out: [..., embed_dim]
+    return 0
+}
+
+// ============================================================================
+// Attention
+// ============================================================================
+
+// Scaled dot-product attention
+fn ai_scaled_dot_product_attention(
+    out: ai_tensor[],
+    query: ai_tensor[],
+    key: ai_tensor[],
+    value: ai_tensor[],
+    attn_mask: ai_tensor[],
+    dropout_p: f32,
+    is_causal: i64,
+    scale: f32
+): i64 {
+    // query: [batch, heads, seq_len, head_dim]
+    // key:   [batch, heads, seq_len, head_dim]
+    // value: [batch, heads, seq_len, head_dim]
+    // out:   [batch, heads, seq_len, head_dim]
+    return 0
+}
+
+// Multi-head attention
+fn ai_multihead_attention(
+    out: ai_tensor[],
+    query: ai_tensor[],
+    key: ai_tensor[],
+    value: ai_tensor[],
+    embed_dim: i64,
+    num_heads: i64,
+    in_proj_weight: ai_tensor[],
+    in_proj_bias: ai_tensor[],
+    out_proj_weight: ai_tensor[],
+    out_proj_bias: ai_tensor[],
+    attn_mask: ai_tensor[],
+    dropout_p: f32
+): i64 {
+    return 0
+}
+
+// ============================================================================
+// Loss Functions
+// ============================================================================
+
+fn ai_mse_loss(out: ai_tensor[], input: ai_tensor[], target: ai_tensor[], reduction: i64): i64 {
+    // reduction: 0=none, 1=mean, 2=sum
+    return 0
+}
+
+fn ai_cross_entropy_loss(out: ai_tensor[], input: ai_tensor[], target: ai_tensor[],
+                         weight: ai_tensor[], ignore_index: i64, reduction: i64): i64 {
+    return 0
+}
+
+fn ai_bce_loss(out: ai_tensor[], input: ai_tensor[], target: ai_tensor[],
+               weight: ai_tensor[], reduction: i64): i64 {
+    return 0
+}
+
+// ============================================================================
+// Optimizers (stateful)
+// ============================================================================
+
+struct ai_sgd_state {
+    params: ai_tensor[100],
+    param_count: i64,
+    lr: f32,
+    momentum: f32,
+    dampening: f32,
+    weight_decay: f32,
+    nesterov: i64,
+    buffers: ai_tensor[100]  // momentum buffers
+}
+
+fn ai_sgd_init(state: ai_sgd_state[], lr: f32, momentum: f32, dampening: f32,
+               weight_decay: f32, nesterov: i64): i64 {
+    state[0].lr = lr
+    state[0].momentum = momentum
+    state[0].dampening = dampening
+    state[0].weight_decay = weight_decay
+    state[0].nesterov = nesterov
+    state[0].param_count = 0
+    return 0
+}
+
+fn ai_sgd_add_param(state: ai_sgd_state[], param: ai_tensor[]): i64 {
+    let idx: i64 = state[0].param_count
+    state[0].params[idx] = param[0]
+    // Initialize momentum buffer
+    ai_tensor_create(state[0].buffers + idx, param[0].shape, param[0].ndim, param[0].dtype)
+    state[0].param_count = state[0].param_count + 1
+    return 0
+}
+
+fn ai_sgd_step(state: ai_sgd_state[], grads: ai_tensor[]): i64 {
+    // For each param: param = param - lr * grad (with momentum)
+    return 0
+}
+
+struct ai_adam_state {
+    params: ai_tensor[100],
+    param_count: i64,
+    lr: f32,
+    beta1: f32,
+    beta2: f32,
+    eps: f32,
+    weight_decay: f32,
+    step: i64,
+    exp_avg: ai_tensor[100],   // 1st moment
+    exp_avg_sq: ai_tensor[100] // 2nd moment
+}
+
+fn ai_adam_init(state: ai_adam_state[], lr: f32, beta1: f32, beta2: f32,
+                eps: f32, weight_decay: f32): i64 {
+    state[0].lr = lr
+    state[0].beta1 = beta1
+    state[0].beta2 = beta2
+    state[0].eps = eps
+    state[0].weight_decay = weight_decay
+    state[0].step = 0
+    state[0].param_count = 0
+    return 0
+}
+
+fn ai_adam_add_param(state: ai_adam_state[], param: ai_tensor[]): i64 {
+    let idx: i64 = state[0].param_count
+    state[0].params[idx] = param[0]
+    ai_tensor_create(state[0].exp_avg + idx, param[0].shape, param[0].ndim, param[0].dtype)
+    ai_tensor_create(state[0].exp_avg_sq + idx, param[0].shape, param[0].ndim, param[0].dtype)
+    state[0].param_count = state[0].param_count + 1
+    return 0
+}
+
+fn ai_adam_step(state: ai_adam_state[], grads: ai_tensor[]): i64 {
+    state[0].step = state[0].step + 1
+    // Adam update rule
+    return 0
+}
+
+// ============================================================================
+// Model Definition
+// ============================================================================
+
+struct ai_module {
+    name: u8[64],
+    parameters: ai_tensor[100],
+    param_count: i64,
+    buffers: ai_tensor[100],
+    buffer_count: i64,
+    children: ai_module[10],
+    child_count: i64
+}
+
+fn ai_module_init(m: ai_module[], name: u8[]): i64 {
+    let i: i64 = 0
+    while i < 64 && name[i] != 0 {
+        m[0].name[i] = name[i]
+        i = i + 1
+    }
+    m[0].name[i] = 0
+    m[0].param_count = 0
+    m[0].buffer_count = 0
+    m[0].child_count = 0
+    return 0
+}
+
+fn ai_module_register_param(m: ai_module[], param: ai_tensor[]): i64 {
+    let idx: i64 = m[0].param_count
+    m[0].parameters[idx] = param[0]
+    m[0].param_count = m[0].param_count + 1
+    return 0
+}
+
+fn ai_module_register_buffer(m: ai_module[], buffer: ai_tensor[]): i64 {
+    let idx: i64 = m[0].buffer_count
+    m[0].buffers[idx] = buffer[0]
+    m[0].buffer_count = m[0].buffer_count + 1
+    return 0
+}
+
+fn ai_module_add_child(m: ai_module[], child: ai_module[]): i64 {
+    let idx: i64 = m[0].child_count
+    m[0].children[idx] = child[0]
+    m[0].child_count = m[0].child_count + 1
+    return 0
+}
+
+// Forward pass (to be implemented by specific modules)
+fn ai_module_forward(m: ai_module[], input: ai_tensor[], output: ai_tensor[]): i64 {
+    return 0
+}
+
+// Get all parameters recursively
+fn ai_module_parameters(m: ai_module[], out: ai_tensor[], count: i64[]): i64 {
+    let idx: i64 = 0
+    let i: i64 = 0
+    while i < m[0].param_count {
+        out[idx] = m[0].parameters[i]
+        idx = idx + 1
+        i = i + 1
+    }
+    i = 0
+    while i < m[0].child_count {
+        let child_count: i64[1]
+        ai_module_parameters(m[0].children + i, out + idx, child_count)
+        idx = idx + child_count[0]
+        i = i + 1
+    }
+    count[0] = idx
+    return 0
+}
+
+// ============================================================================
+// Common Layers
+// ============================================================================
+
+struct ai_linear_layer {
+    base: ai_module,
+    weight: ai_tensor,
+    bias: ai_tensor,
+    in_features: i64,
+    out_features: i64
+}
+
+fn ai_linear_layer_init(layer: ai_linear_layer[], in_features: i64, out_features: i64, bias: i64): i64 {
+    ai_module_init(layer[0].base, "Linear")
+    layer[0].in_features = in_features
+    layer[0].out_features = out_features
+    
+    let w_shape: i64[2] = { out_features, in_features }
+    ai_tensor_create(layer[0].weight, w_shape, 2, ai_dtype_f32())
+    ai_module_register_param(layer[0].base, layer[0].weight)
+    
+    if bias != 0 {
+        let b_shape: i64[1] = { out_features }
+        ai_tensor_create(layer[0].bias, b_shape, 1, ai_dtype_f32())
+        ai_module_register_param(layer[0].base, layer[0].bias)
+    }
+    return 0
+}
+
+fn ai_linear_layer_forward(layer: ai_linear_layer[], input: ai_tensor[], output: ai_tensor[]): i64 {
+    ai_linear(output, input, layer[0].weight, layer[0].bias)
+    return 0
+}
+
+struct ai_conv2d_layer {
+    base: ai_module,
+    weight: ai_tensor,
+    bias: ai_tensor,
+    in_channels: i64,
+    out_channels: i64,
+    kernel_size: i64,
+    stride: i64,
+    padding: i64,
+    dilation: i64,
+    groups: i64
+}
+
+fn ai_conv2d_layer_init(layer: ai_conv2d_layer[], in_channels: i64, out_channels: i64,
+                        kernel_size: i64, stride: i64, padding: i64,
+                        dilation: i64, groups: i64, bias: i64): i64 {
+    ai_module_init(layer[0].base, "Conv2d")
+    layer[0].in_channels = in_channels
+    layer[0].out_channels = out_channels
+    layer[0].kernel_size = kernel_size
+    layer[0].stride = stride
+    layer[0].padding = padding
+    layer[0].dilation = dilation
+    layer[0].groups = groups
+    
+    let w_shape: i64[4] = { out_channels, in_channels / groups, kernel_size, kernel_size }
+    ai_tensor_create(layer[0].weight, w_shape, 4, ai_dtype_f32())
+    ai_module_register_param(layer[0].base, layer[0].weight)
+    
+    if bias != 0 {
+        let b_shape: i64[1] = { out_channels }
+        ai_tensor_create(layer[0].bias, b_shape, 1, ai_dtype_f32())
+        ai_module_register_param(layer[0].base, layer[0].bias)
+    }
+    return 0
+}
+
+fn ai_conv2d_layer_forward(layer: ai_conv2d_layer[], input: ai_tensor[], output: ai_tensor[]): i64 {
+    ai_conv2d(output, input, layer[0].weight, layer[0].bias,
+              layer[0].stride, layer[0].padding, layer[0].dilation, layer[0].groups)
+    return 0
+}
+
+struct ai_batchnorm2d_layer {
+    base: ai_module,
+    weight: ai_tensor,
+    bias: ai_tensor,
+    running_mean: ai_tensor,
+    running_var: ai_tensor,
+    num_features: i64,
+    eps: f32,
+    momentum: f32
+}
+
+fn ai_batchnorm2d_layer_init(layer: ai_batchnorm2d_layer[], num_features: i64, eps: f32, momentum: f32): i64 {
+    ai_module_init(layer[0].base, "BatchNorm2d")
+    layer[0].num_features = num_features
+    layer[0].eps = eps
+    layer[0].momentum = momentum
+    
+    let shape: i64[1] = { num_features }
+    ai_tensor_create(layer[0].weight, shape, 1, ai_dtype_f32())
+    ai_tensor_create(layer[0].bias, shape, 1, ai_dtype_f32())
+    ai_tensor_create(layer[0].running_mean, shape, 1, ai_dtype_f32())
+    ai_tensor_create(layer[0].running_var, shape, 1, ai_dtype_f32())
+    
+    ai_module_register_param(layer[0].base, layer[0].weight)
+    ai_module_register_param(layer[0].base, layer[0].bias)
+    ai_module_register_buffer(layer[0].base, layer[0].running_mean)
+    ai_module_register_buffer(layer[0].base, layer[0].running_var)
+    
+    // Initialize
+    // running_mean = 0, running_var = 1, weight = 1, bias = 0
+    return 0
+}
+
+fn ai_batchnorm2d_layer_forward(layer: ai_batchnorm2d_layer[], input: ai_tensor[], output: ai_tensor[], training: i64): i64 {
+    ai_batchnorm2d(output, input, layer[0].weight, layer[0].bias,
+                   layer[0].running_mean, layer[0].running_var,
+                   layer[0].eps, layer[0].momentum, training)
+    return 0
+}
+
+struct ai_layernorm_layer {
+    base: ai_module,
+    weight: ai_tensor,
+    bias: ai_tensor,
+    normalized_shape: i64[8],
+    normalized_ndim: i64,
+    eps: f32
+}
+
+fn ai_layernorm_layer_init(layer: ai_layernorm_layer[], normalized_shape: i64[], ndim: i64, eps: f32): i64 {
+    ai_module_init(layer[0].base, "LayerNorm")
+    let i: i64 = 0
+    while i < ndim {
+        layer[0].normalized_shape[i] = normalized_shape[i]
+        i = i + 1
+    }
+    layer[0].normalized_ndim = ndim
+    layer[0].eps = eps
+    
+    ai_tensor_create(layer[0].weight, normalized_shape, ndim, ai_dtype_f32())
+    ai_tensor_create(layer[0].bias, normalized_shape, ndim, ai_dtype_f32())
+    ai_module_register_param(layer[0].base, layer[0].weight)
+    ai_module_register_param(layer[0].base, layer[0].bias)
+    return 0
+}
+
+fn ai_layernorm_layer_forward(layer: ai_layernorm_layer[], input: ai_tensor[], output: ai_tensor[]): i64 {
+    ai_layernorm(output, input, layer[0].weight, layer[0].bias,
+                 layer[0].normalized_shape, layer[0].eps)
+    return 0
+}
+
+struct ai_dropout_layer {
+    base: ai_module,
+    p: f32,
+    inplace: i64
+}
+
+fn ai_dropout_layer_init(layer: ai_dropout_layer[], p: f32, inplace: i64): i64 {
+    ai_module_init(layer[0].base, "Dropout")
+    layer[0].p = p
+    layer[0].inplace = inplace
+    return 0
+}
+
+fn ai_dropout_layer_forward(layer: ai_dropout_layer[], input: ai_tensor[], output: ai_tensor[], training: i64): i64 {
+    if training == 0 || layer[0].p == 0.0 {
+        // Copy input to output
+        return 0
+    }
+    // Apply dropout mask
+    return 0
+}
+
+struct ai_embedding_layer {
+    base: ai_module,
+    weight: ai_tensor,
+    num_embeddings: i64,
+    embedding_dim: i64,
+    padding_idx: i64
+}
+
+fn ai_embedding_layer_init(layer: ai_embedding_layer[], num_embeddings: i64, embedding_dim: i64, padding_idx: i64): i64 {
+    ai_module_init(layer[0].base, "Embedding")
+    layer[0].num_embeddings = num_embeddings
+    layer[0].embedding_dim = embedding_dim
+    layer[0].padding_idx = padding_idx
+    
+    let shape: i64[2] = { num_embeddings, embedding_dim }
+    ai_tensor_create(layer[0].weight, shape, 2, ai_dtype_f32())
+    ai_module_register_param(layer[0].base, layer[0].weight)
+    return 0
+}
+
+fn ai_embedding_layer_forward(layer: ai_embedding_layer[], indices: ai_tensor[], output: ai_tensor[]): i64 {
+    ai_embedding(output, indices, layer[0].weight)
+    return 0
+}
+
+// ============================================================================
+// Transformer Components
+// ============================================================================
+
+struct ai_transformer_encoder_layer {
+    base: ai_module,
+    self_attn: ai_multihead_attention_layer,
+    linear1: ai_linear_layer,
+    linear2: ai_linear_layer,
+    norm1: ai_layernorm_layer,
+    norm2: ai_layernorm_layer,
+    dropout1: ai_dropout_layer,
+    dropout2: ai_dropout_layer,
+    activation: i64  // 0=relu, 1=gelu
+}
+
+struct ai_multihead_attention_layer {
+    base: ai_module,
+    embed_dim: i64,
+    num_heads: i64,
+    in_proj_weight: ai_tensor,
+    in_proj_bias: ai_tensor,
+    out_proj_weight: ai_tensor,
+    out_proj_bias: ai_tensor,
+    batch_first: i64
+}
+
+fn ai_multihead_attention_layer_init(layer: ai_multihead_attention_layer[],
+                                     embed_dim: i64, num_heads: i64, bias: i64, batch_first: i64): i64 {
+    ai_module_init(layer[0].base, "MultiheadAttention")
+    layer[0].embed_dim = embed_dim
+    layer[0].num_heads = num_heads
+    layer[0].batch_first = batch_first
+    
+    let proj_shape: i64[2] = { 3 * embed_dim, embed_dim }
+    ai_tensor_create(layer[0].in_proj_weight, proj_shape, 2, ai_dtype_f32())
+    ai_module_register_param(layer[0].base, layer[0].in_proj_weight)
+    
+    if bias != 0 {
+        let b_shape: i64[1] = { 3 * embed_dim }
+        ai_tensor_create(layer[0].in_proj_bias, b_shape, 1, ai_dtype_f32())
+        ai_module_register_param(layer[0].base, layer[0].in_proj_bias)
+    }
+    
+    let out_shape: i64[2] = { embed_dim, embed_dim }
+    ai_tensor_create(layer[0].out_proj_weight, out_shape, 2, ai_dtype_f32())
+    ai_module_register_param(layer[0].base, layer[0].out_proj_weight)
+    
+    let out_b_shape: i64[1] = { embed_dim }
+    ai_tensor_create(layer[0].out_proj_bias, out_b_shape, 1, ai_dtype_f32())
+    ai_module_register_param(layer[0].base, layer[0].out_proj_bias)
+    return 0
+}
+
+struct ai_transformer_encoder {
+    base: ai_module,
+    layers: ai_transformer_encoder_layer[32],
+    num_layers: i64,
+    norm: ai_layernorm_layer
+}
+
+struct ai_transformer_decoder_layer {
+    base: ai_module,
+    self_attn: ai_multihead_attention_layer,
+    multihead_attn: ai_multihead_attention_layer,
+    linear1: ai_linear_layer,
+    linear2: ai_linear_layer,
+    norm1: ai_layernorm_layer,
+    norm2: ai_layernorm_layer,
+    norm3: ai_layernorm_layer,
+    dropout1: ai_dropout_layer,
+    dropout2: ai_dropout_layer,
+    dropout3: ai_dropout_layer,
+    activation: i64
+}
+
+struct ai_transformer_decoder {
+    base: ai_module,
+    layers: ai_transformer_decoder_layer[32],
+    num_layers: i64,
+    norm: ai_layernorm_layer
+}
+
+// ============================================================================
+// Model Loading / Serialization
+// ============================================================================
+
+// Save tensor to file (simple binary format)
+fn ai_tensor_save(t: ai_tensor[], path: u8[]): i64 {
+    // Header: magic, dtype, ndim, shape[], data
+    return 0
+}
+
+fn ai_tensor_load(t: ai_tensor[], path: u8[]): i64 {
+    return 0
+}
+
+// Save model state dict
+fn ai_save_state_dict(module: ai_module[], path: u8[]): i64 {
+    return 0
+}
+
+fn ai_load_state_dict(module: ai_module[], path: u8[]): i64 {
+    return 0
+}
+
+// ============================================================================
+// Quantization (INT8)
+// ============================================================================
+
+struct ai_qparams {
+    scale: f32,
+    zero_point: i32
+}
+
+fn ai_quantize_per_tensor(out: ai_tensor[], input: ai_tensor[], scale: f32, zero_point: i32): i64 {
+    // FP32 -> INT8
+    return 0
+}
+
+fn ai_dequantize_per_tensor(out: ai_tensor[], input: ai_tensor[], scale: f32, zero_point: i32): i64 {
+    // INT8 -> FP32
+    return 0
+}
+
+fn ai_quantize_dynamic(out: ai_tensor[], input: ai_tensor[]): i64 {
+    // Dynamic per-tensor quantization
+    return 0
+}
+
+// ============================================================================
+// Inference Engine
+// ============================================================================
+
+struct ai_inference_engine {
+    modules: ai_module[100],
+    module_count: i64,
+    inputs: ai_tensor[10],
+    input_count: i64,
+    outputs: ai_tensor[10],
+    output_count: i64,
+    workspace: u8[1048576]  // 1MB workspace
+}
+
+fn ai_engine_init(engine: ai_inference_engine[]): i64 {
+    engine[0].module_count = 0
+    engine[0].input_count = 0
+    engine[0].output_count = 0
+    return 0
+}
+
+fn ai_engine_add_module(engine: ai_inference_engine[], module: ai_module[]): i64 {
+    let idx: i64 = engine[0].module_count
+    engine[0].modules[idx] = module[0]
+    engine[0].module_count = engine[0].module_count + 1
+    return 0
+}
+
+fn ai_engine_set_input(engine: ai_inference_engine[], name: u8[], tensor: ai_tensor[]): i64 {
+    let idx: i64 = engine[0].input_count
+    engine[0].inputs[idx] = tensor[0]
+    engine[0].input_count = engine[0].input_count + 1
+    return 0
+}
+
+fn ai_engine_run(engine: ai_inference_engine[]): i64 {
+    // Execute modules in order
+    return 0
+}
+
+fn ai_engine_get_output(engine: ai_inference_engine[], name: u8[], out: ai_tensor[]): i64 {
+    return 0
+}
+
+// ============================================================================
+// ONNX Runtime Compatibility (subset)
+// ============================================================================
+
+fn ai_onnx_load_model(engine: ai_inference_engine[], model_path: u8[]): i64 {
+    // Parse ONNX model, create modules
+    return 0
+}
+
+// ============================================================================
+// Example: Simple MLP
+// ============================================================================
+
+struct ai_mlp {
+    base: ai_module,
+    layers: ai_linear_layer[8],
+    activations: i64[8],
+    num_layers: i64,
+    dropout: f32
+}
+
+fn ai_mlp_init(mlp: ai_mlp[], layer_sizes: i64[], num_layers: i64, dropout: f32): i64 {
+    ai_module_init(mlp[0].base, "MLP")
+    mlp[0].num_layers = num_layers - 1
+    mlp[0].dropout = dropout
+    
+    let i: i64 = 0
+    while i < mlp[0].num_layers {
+        ai_linear_layer_init(mlp[0].layers + i, layer_sizes[i], layer_sizes[i + 1], 1)
+        ai_module_add_child(mlp[0].base, mlp[0].layers[i].base)
+        if i < mlp[0].num_layers - 1 {
+            mlp[0].activations[i] = 1  // ReLU
+        } else {
+            mlp[0].activations[i] = 0  // Linear
+        }
+        i = i + 1
+    }
+    return 0
+}
+
+fn ai_mlp_forward(mlp: ai_mlp[], input: ai_tensor[], output: ai_tensor[]): i64 {
+    let current: ai_tensor = input[0]
+    let next: ai_tensor
+    
+    let i: i64 = 0
+    while i < mlp[0].num_layers {
+        ai_linear_layer_forward(mlp[0].layers + i, current, next)
+        if mlp[0].activations[i] == 1 {
+            ai_relu(current, next)
+        }
+        current = next
+        i = i + 1
+    }
+    output[0] = current
+    return 0
+}
+
+// ============================================================================
+// Example: Simple CNN
+// ============================================================================
+
+struct ai_simple_cnn {
+    base: ai_module,
+    conv1: ai_conv2d_layer,
+    bn1: ai_batchnorm2d_layer,
+    pool1: ai_maxpool2d_layer,
+    conv2: ai_conv2d_layer,
+    bn2: ai_batchnorm2d_layer,
+    pool2: ai_maxpool2d_layer,
+    fc: ai_linear_layer
+}
+
+// ============================================================================
+// Constants for Tests
+// ============================================================================
+
+fn ai_dtype_f32_test(): i64 { return ai_dtype_f32() }
+fn ai_dtype_i32_test(): i64 { return ai_dtype_i32() }
+fn ai_dtype_size_f32(): i64 { return ai_dtype_size(ai_dtype_f32()) }
+fn ai_dtype_size_i32(): i64 { return ai_dtype_size(ai_dtype_i32()) }
+fn ai_dtype_size_i64(): i64 { return ai_dtype_size(ai_dtype_i64()) }
+fn ai_dtype_size_u8(): i64 { return ai_dtype_size(ai_dtype_u8()) }
