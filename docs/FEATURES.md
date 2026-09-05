@@ -197,7 +197,7 @@ native type keyword parsing). `as` width casts (`x as T`) are done (0.0.90).
 | bit/byte extras | parity, bitfield, per-size swap (bswap16/32/64) | ✅ 0.0.107 — parity(x)=odd-bit-count?1:0; bitfield(x,off,wid)=(x>>off)&((1<<wid)-1); bswap16/32/64. Gated by bitops_test.quanta (rc=0). NOTE: bitfield wid==64 is the documented exception (result 0, mirrors rotl/rotr &63 shift-count behavior). |
 | intrinsics | prefetch, pause, lfence, sfence, mfence | ✅ 0.0.108 — `prefetch(addr)`=prefetchnta[rax] (0F 18 08); `pause()`=F3 90; `fence()`=mfence (0F AE F0); `lfence()`=0F AE E8; `sfence()`=0F AE F8. All void builtins, gated by intrinsic_test.quanta (rc=0, byte-emission verified via objdump). Branch-hint intrinsics (likely/unlikely) deliberately OUT OF SCOPE — conditional jumps emit centrally in the shared IR_BR backend, not at call sites, so a builtin cannot prefix a following branch. |
 
-## J. Standard Library (`lib/std/*.quanta`) — native libraries
+## I. Standard Library (`lib/std/*.quanta`) — native libraries
 
 Source-of-truth inventory of the shipped stdlib. Every `lib/std/*.quanta` is a
 real implementation (not a stub). The "Test?" column: ✅ gate = a gated test covers
@@ -229,7 +229,7 @@ it; 🟡 file-only = a test file exists on disk but is NOT in the gate; ❌ none
 
 **Stdlib status (source-verified 0.0.149):** 12 libs present + gated (big/crypto/fs/io/linalg/map/math/quantum/str/vec + crypto/quantum/linalg tested + x25519/ml_kem/ml_dsa/slh_dsa/tls13/quic/h3/ai/generics). AI/QC-era crypto chain: `json`(0.0.132) ✅ DONE, `secure` full FIPS 202 (0.0.134), AES-GCM (0.0.135), X25519 (0.0.141), ML-KEM hybrid (0.0.142), ML-DSA hybrid (0.0.143), SLH-DSA (0.0.144), TLS 1.3 handshake (0.0.145), `quic`(0.146), `http`(0.147), `ai`(0.148), `generics`(0.149) (QUIC ahead of HTTP/2); `chain` = first Quanta App (0.1.1+); `physics` optional 0.1.1+. Extern-C variadic + closure self-recursion (partial cores) fixed 0.0.130/0.0.131. SHA3-256 foundation for `secure` completed in 0.0.133 (IR_CAP=1B/40GB, TOK_CAP=48M/1.92GB, CODE_CAP=512MB, fn_btok fix).
 
-## H. Tooling
+## J. Tooling
 
 | Item | Status | Test? | Notes |
 |---|---|---|---|
@@ -238,7 +238,7 @@ it; 🟡 file-only = a test file exists on disk but is NOT in the gate; ❌ none
 | package manager | ❌ todo | ❌ none | |
 | build system (beyond `qc src bin`) | ❌ todo | ❌ none | |
 
-## I. Known issues (tracked, not blocking promotion)
+## K. Known issues (tracked, not blocking promotion)
 - **fs-meta path-string remap (stat/unlink/mkdir/chdir/rename): BROKEN.** These
   builtins call `newfstatat`/`unlinkat`/etc. with the path pointer taken from the
   string *length-prefix base* (off by 8) and/or a faulty `rr`-based register
@@ -254,13 +254,13 @@ it; 🟡 file-only = a test file exists on disk but is NOT in the gate; ❌ none
 - **`debugbreak()` = `int3`** → SIGTRAP (rc=133). Works but not in the gate
   (would need a harness that tolerates the trap). `abort()` → `exit(134)` is gated.
 
-## Summary counts (source-derived, current at 0.0.133)
+## L. Summary counts (source-derived, current at 0.0.133)
 
 - **Core tests in gate: 163** (`test_suites/EXPECTED.tsv`, 163 rows). Covers all cores through 0.0.133 (includes `big_test` 0.0.114, `rsp_test` 0.0.115, `quantum_test`/`linalg_test`/`trig_test` 0.0.116, `big_ops_test` 0.0.117, `closure_named_fn` 0.0.123, `futex_wait_test` 0.0.124, `extern_var_test` 0.0.130, `closure_selfrec_test` 0.0.131, `std_json_test` 0.0.132). `std_*` tests live in a SEPARATE `test_suites/EXPECTED_STDLIB.tsv` (**8 rows**, wired in as the stdlib layer) and are NOT in the core gate. `mtu_*` multi-translation-unit fixtures are gated as their own MULTI-TU layer (`test_suites/scripts/multi_tu_tests.sh`, **3/3**).
 - **Builtins:** enumerated in `compiler/0.0.133/src/x86/emitter.quanta` (per-name dispatch branches). **Keywords:** enumerated in `compiler/0.0.133/src/x86/tokens.quanta` (`ktext` hash table). Both are authoritative; counts are derived from source, not a fixed audit number.
 - **Test framework note:** tests `return`/`exit` a *computed value* (not just 0); EXPECTED.tsv's `expected_rc` is that computed answer. Non-zero `expected_rc` entries are correct results, not hidden failures (e.g. `array_test.quanta` returns 200 = a.1; `simple_fadd.quanta` returns 7 = 3.0+4.0). The gate is genuinely green.
 
-## Build order & sequencing
+## M. Build order & sequencing
 
 The authoritative build order to 0.1.0 now lives in **`docs/ROADMAP.md` §3** (single source of truth). It is no longer duplicated here to prevent version-number drift.
 
