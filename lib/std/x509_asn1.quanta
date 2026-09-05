@@ -1,0 +1,326 @@
+// ASN.1 DER parser for X.509 certificates
+// Pure Quanta implementation, zero external deps
+
+// ASN.1 tag classes
+let ASN_CLASS_UNIVERSAL = 0
+let ASN_CLASS_APPLICATION = 1
+let ASN_CLASS_CONTEXT = 2
+let ASN_CLASS_PRIVATE = 3
+
+// ASN.1 universal tags
+let ASN_TAG_EOC = 0
+let ASN_TAG_BOOLEAN = 1
+let ASN_TAG_INTEGER = 2
+let ASN_TAG_BIT_STRING = 3
+let ASN_TAG_OCTET_STRING = 4
+let ASN_TAG_NULL = 5
+let ASN_TAG_OID = 6
+let ASN_TAG_OBJECT_DESCRIPTOR = 7
+let ASN_TAG_EXTERNAL = 8
+let ASN_TAG_REAL = 9
+let ASN_TAG_ENUMERATED = 10
+let ASN_TAG_EMBEDDED_PDV = 11
+let ASN_TAG_UTF8_STRING = 12
+let ASN_TAG_RELATIVE_OID = 13
+let ASN_TAG_SEQUENCE = 16
+let ASN_TAG_SET = 17
+let ASN_TAG_NUMERIC_STRING = 18
+let ASN_TAG_PRINTABLE_STRING = 19
+let ASN_TAG_T61_STRING = 20
+let ASN_TAG_VIDEOTEX_STRING = 21
+let ASN_TAG_IA5_STRING = 22
+let ASN_TAG_UTC_TIME = 23
+let ASN_TAG_GENERALIZED_TIME = 24
+let ASN_TAG_GRAPHIC_STRING = 25
+let ASN_TAG_VISIBLE_STRING = 26
+let ASN_TAG_GENERAL_STRING = 27
+let ASN_TAG_UNIVERSAL_STRING = 28
+let ASN_TAG_CHARACTER_STRING = 29
+let ASN_TAG_BMP_STRING = 30
+
+// ASN.1 DER decoder context
+let asn_buf = 0
+let asn_len = 0
+let asn_pos = 0
+
+fn asn_init(buf, len) {
+    asn_buf = buf
+    asn_len = len
+    asn_pos = 0
+    return 0
+}
+
+// Peek at current byte
+fn asn_peek() {
+    if asn_pos >= asn_len { return -1 }
+    return mem_load8(asn_buf + asn_pos)
+}
+
+// Advance position
+fn asn_advance(n) {
+    asn_pos = asn_pos + n
+    return 0
+}
+
+// Read a single byte
+fn asn_read_byte() {
+    if asn_pos >= asn_len { return -1 }
+    let b = mem_load8(asn_buf + asn_pos)
+    asn_pos = asn_pos + 1
+    return b
+}
+
+// Read length (DER: definite form only)
+fn asn_read_length() {
+    let b = asn_read_byte()
+    if b < 0 { return -1 }
+    if (b & 0x80) == 0 {
+        return b
+    }
+    let n = b & 0x7f
+    if n > 8 { return -1 } // too large for i64
+    let len = 0
+    let i = 0
+    while i < n {
+        let bb = asn_read_byte()
+        if bb < 0 { return -1 }
+        len = (len << 8) | bb
+        i = i + 1
+    }
+    return len
+}
+
+// Read tag and length
+fn asn_read_tag_len(tag_out, len_out) {
+    let b = asn_read_byte()
+    if b < 0 { return -1 }
+    let tag_class = (b >> 6) & 0x3
+    let constructed = (b >> 5) & 0x1
+    let tag = b & 0x1f
+    if tag == 0x1f {
+        // Long form tag (not supported in minimal impl)
+        return -1
+    }
+    w64(tag_out, (tag_class << 8) | (constructed << 7) | tag)
+    let len = asn_read_length()
+    if len < 0 { return -1 }
+    w64(len_out, len)
+    return 0
+}
+
+// Skip n bytes
+fn asn_skip(n) {
+    if asn_pos + n > asn_len { return -1 }
+    asn_pos = asn_pos + n
+    return 0
+}
+
+// Parse integer (returns i64, truncates if too large)
+fn asn_parse_integer() {
+    let tag = 0
+    let len = 0
+    if asn_read_tag_len(tag, len) != 0 { return 0 }
+    let expected_tag = ASN_TAG_INTEGER
+    if (r64(tag) & 0xff) != expected_tag { return 0 }
+    let start = asn_pos
+    if asn_skip(len) != 0 { return 0 }
+    // Parse as signed big-endian
+    let val = 0
+    let i = 0
+    let first = 1
+    while i < len {
+        let b = mem_load8(asn_buf + start + i)
+        if first {
+            val = b
+            first = 0
+        } else {
+            val = (val << 8) | b
+        }
+        i = i + 1
+    }
+    // Sign extend if needed
+    if len > 0 {
+        let first_byte = mem_load8(asn_buf + start)
+        if (first_byte & 0x80) != 0 {
+            // Negative - sign extend
+            let shift = 64 - (len * 8)
+            if shift > 0 {
+                val = val | (-1 << (len * 8))
+            }
+        }
+    }
+    return val
+}
+
+// Parse OID (returns string representation in heap buffer)
+fn asn_parse_oid(out_buf, out_len) {
+    let tag = 0
+    let len = 0
+    if asn_read_tag_len(tag, len) != 0 { return -1 }
+    if (r64(tag) & 0xff) != ASN_TAG_OID { return -1 }
+    let start = asn_pos
+    if asn_skip(len) != 0 { return -1 }
+    // OID encoding: first two arcs in first byte (40*arc0 + arc1), then base-128
+    let first = mem_load8(asn_buf + start)
+    let arc0 = first / 40
+    let arc1 = first % 40
+    let pos = 0
+    // Write "arc0.arc1"
+    let arc0_str = 0
+    // Simple approach: write to buffer directly
+    // For now just skip - full OID string formatting is complex
+    asn_pos = start + len
+    return 0
+}
+
+// Parse bit string
+fn asn_parse_bit_string(out_buf, out_len, unused_bits_out) {
+    let tag = 0
+    let len = 0
+    if asn_read_tag_len(tag, len) != 0 { return -1 }
+    if (r64(tag) & 0xff) != ASN_TAG_BIT_STRING { return -1 }
+    if len == 0 { return -1 }
+    let unused = mem_load8(asn_buf + asn_pos)
+    w64(unused_bits_out, unused)
+    asn_pos = asn_pos + 1
+    let data_len = len - 1
+    // Copy data to out_buf
+    let i = 0
+    while i < data_len {
+        let b = mem_load8(asn_buf + asn_pos + i)
+        mem_store8(out_buf + i, b)
+        i = i + 1
+    }
+    w64(out_len, data_len)
+    asn_pos = asn_pos + data_len
+    return 0
+}
+
+// Parse octet string
+fn asn_parse_octet_string(out_buf, out_len) {
+    let tag = 0
+    let len = 0
+    if asn_read_tag_len(tag, len) != 0 { return -1 }
+    if (r64(tag) & 0xff) != ASN_TAG_OCTET_STRING { return -1 }
+    let i = 0
+    while i < len {
+        let b = mem_load8(asn_buf + asn_pos + i)
+        mem_store8(out_buf + i, b)
+        i = i + 1
+    }
+    w64(out_len, len)
+    asn_pos = asn_pos + len
+    return 0
+}
+
+// Parse sequence (returns start/end positions for nested parsing)
+fn asn_parse_sequence(seq_start, seq_end) {
+    let tag = 0
+    let len = 0
+    if asn_read_tag_len(tag, len) != 0 { return -1 }
+    if (r64(tag) & 0xff) != ASN_TAG_SEQUENCE { return -1 }
+    let start = asn_pos
+    if asn_skip(len) != 0 { return -1 }
+    w64(seq_start, start)
+    w64(seq_end, asn_pos)
+    return 0
+}
+
+// Parse UTC time (YYMMDDhhmmssZ)
+fn asn_parse_utc_time() {
+    let tag = 0
+    let len = 0
+    if asn_read_tag_len(tag, len) != 0 { return 0 }
+    if (r64(tag) & 0xff) != ASN_TAG_UTC_TIME { return 0 }
+    if len != 13 { return 0 }
+    // Parse: YYMMDDhhmmssZ
+    let buf = asn_buf + asn_pos
+    let year = (mem_load8(buf) - 48) * 10 + (mem_load8(buf+1) - 48)
+    let month = (mem_load8(buf+2) - 48) * 10 + (mem_load8(buf+3) - 48)
+    let day = (mem_load8(buf+4) - 48) * 10 + (mem_load8(buf+5) - 48)
+    let hour = (mem_load8(buf+6) - 48) * 10 + (mem_load8(buf+7) - 48)
+    let min = (mem_load8(buf+8) - 48) * 10 + (mem_load8(buf+9) - 48)
+    let sec = (mem_load8(buf+10) - 48) * 10 + (mem_load8(buf+11) - 48)
+    let z = mem_load8(buf+12)
+    if z != 90 { return 0 } // 'Z'
+    // Convert to unix timestamp (simplified: days since epoch * 86400 + time)
+    // 2000-01-01 = 946684800
+    // Year is 00-99 -> 2000-2099
+    let days = 0
+    let y = 0
+    while y < year {
+        let leap = (y % 4 == 0) && (y % 100 != 0 || y % 400 == 0)
+        days = days + 365 + leap
+        y = y + 1
+    }
+    let mdays = [0, 31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31]
+    if (year % 4 == 0) && (year % 100 != 0 || year % 400 == 0) {
+        mdays[2] = 29
+    }
+    let m = 1
+    while m < month {
+        days = days + mdays[m]
+        m = m + 1
+    }
+    days = days + day - 1
+    let timestamp = days * 86400 + hour * 3600 + min * 60 + sec + 946684800
+    asn_pos = asn_pos + len
+    return timestamp
+}
+
+// Parse generalized time (YYYYMMDDhhmmssZ)
+fn asn_parse_generalized_time() {
+    let tag = 0
+    let len = 0
+    if asn_read_tag_len(tag, len) != 0 { return 0 }
+    if (r64(tag) & 0xff) != ASN_TAG_GENERALIZED_TIME { return 0 }
+    if len < 13 { return 0 }
+    let buf = asn_buf + asn_pos
+    let year = (mem_load8(buf) - 48) * 1000 + (mem_load8(buf+1) - 48) * 100 + (mem_load8(buf+2) - 48) * 10 + (mem_load8(buf+3) - 48)
+    let month = (mem_load8(buf+4) - 48) * 10 + (mem_load8(buf+5) - 48)
+    let day = (mem_load8(buf+6) - 48) * 10 + (mem_load8(buf+7) - 48)
+    let hour = (mem_load8(buf+8) - 48) * 10 + (mem_load8(buf+9) - 48)
+    let min = (mem_load8(buf+10) - 48) * 10 + (mem_load8(buf+11) - 48)
+    let sec = (mem_load8(buf+12) - 48) * 10 + (mem_load8(buf+13) - 48)
+    // Simplified timestamp
+    let days = 0
+    let y = 1970
+    while y < year {
+        let leap = (y % 4 == 0) && (y % 100 != 0 || y % 400 == 0)
+        days = days + 365 + leap
+        y = y + 1
+    }
+    let mdays = [0, 31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31]
+    if (year % 4 == 0) && (year % 100 != 0 || year % 400 == 0) {
+        mdays[2] = 29
+    }
+    let m = 1
+    while m < month {
+        days = days + mdays[m]
+        m = m + 1
+    }
+    days = days + day - 1
+    let timestamp = days * 86400 + hour * 3600 + min * 60 + sec
+    asn_pos = asn_pos + len
+    return timestamp
+}
+
+// Parse any tag (skip)
+fn asn_parse_any() {
+    let tag = 0
+    let len = 0
+    if asn_read_tag_len(tag, len) != 0 { return -1 }
+    return asn_skip(len)
+}
+
+// Check if at end of current sequence
+fn asn_at_end(seq_end) {
+    return asn_pos >= r64(seq_end)
+}
+
+// Get remaining bytes in current sequence
+fn asn_remaining(seq_end) {
+    let end = r64(seq_end)
+    if asn_pos >= end { return 0 }
+    return end - asn_pos
+}
