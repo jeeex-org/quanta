@@ -196,37 +196,53 @@ Next core = **0.0.136** (`self-sufficiency` — native `printf` / variadic forma
 - 0.0.138 `self-sufficiency` — Remove `gcc` from CI (FIX-0.0.53) — `--emit-obj` + native link only
 - 0.0.139 `self-sufficiency` — `qc --link` built-in replaces `quanta_link.sh` (FIX-0.0.54)
 - 0.0.140 `self-sufficiency` — Static PIE option (FIX-0.0.55) — no PT_INTERP, no dynamic linker — `ldd qc` → `not a dynamic executable`
-- 0.0.141 `linker` — **Pure Quanta dynamic ELF: PT_INTERP + PLT/GOT + .dynamic in `write_elf`** (standalone extern-C EXE without `ld`/`gcc`) — **⚠️ NOT VIABLE AS "PURE QUANTA": still depends on system dynamic linker (`/lib64/ld-linux-x86-64.so.2`) and libc. True zero-dependency self-sufficiency requires static PIE (0.0.140).**
-- 0.0.142 `secure` — X25519 (ECDH for TLS 1.3)
-- 0.0.143 `secure` — ML-KEM (FIPS 203, Kyber) + hybrid X25519+ML-KEM KEM
-- 0.0.144 `secure` — ML-DSA (FIPS 204, Dilithium) + hybrid X25519+ML-DSA sig
-- 0.0.145 `secure` — SLH-DSA (FIPS 205, SPHINCS+)
-- 0.0.146 `secure` — TLS 1.3 handshake (hybrid PQC)
-- 0.0.147 `quic` — HTTP/3 (UDP+TLS 1.3, hybrid PQ) — modern transport, ahead of HTTP/2
-- 0.0.148 `http` — HTTP/2-over-TLS (no plaintext shipped)
-- 0.0.149 `ai` — tensor ops + inference (AI-age, promoted into core chain)
-- 0.0.150 `lang` — generics type constraints (FIX-0.0.33; `where` bounds enforced) — classical type-system
-- 0.0.151 `lang` — borrow-check (language safety pass) — core, hardest
-
-| Version | Core | Work |
-|---------|------|------|
-| 0.0.136 | `self-sufficiency` | Native `printf` / variadic formatting (FIX-0.0.50) — replace libc `printf` |
-| 0.0.137 | `self-sufficiency` | Quanta-native ELF linker (FIX-0.0.51) — emit PLT/GOT/DYNAMIC/INTERP in `write_elf` |
-| 0.0.138 | `self-sufficiency` | Remove `gcc` from CI (FIX-0.0.53) — `--emit-obj` + native link only |
-| 0.0.139 | `self-sufficiency` | `qc --link` built-in replaces `quanta_link.sh` (FIX-0.0.54) |
-| 0.0.140 | `self-sufficiency` | Static PIE option (FIX-0.0.55) — no PT_INTERP, no dynamic linker — `ldd qc` → `not a dynamic executable` |
-| 0.0.141 | `linker` | **Pure Quanta dynamic ELF: PT_INTERP + PLT/GOT + .dynamic in `write_elf`** — standalone extern-C EXE without `ld`/`gcc` — **⚠️ NOT VIABLE AS "PURE QUANTA": still depends on system dynamic linker (`/lib64/ld-linux-x86-64.so.2`) and libc** |
-| 0.0.142 | `secure` | X25519 (ECDH for TLS 1.3) |
-| 0.0.143 | `secure` | ML-KEM (FIPS 203, Kyber) + hybrid X25519+ML-KEM KEM |
-| 0.0.144 | `secure` | ML-DSA (FIPS 204, Dilithium) + hybrid X25519+ML-DSA sig |
-| 0.0.145 | `secure` | SLH-DSA (FIPS 205, SPHINCS+) |
-| 0.0.146 | `secure` | TLS 1.3 handshake (hybrid PQC) |
-| 0.0.147 | `quic` | HTTP/3 (UDP+TLS 1.3, hybrid PQ) — modern transport, ahead of HTTP/2 |
-| 0.0.148 | `http` | HTTP/2-over-TLS (no plaintext shipped) |
-| 0.0.149 | `ai` | tensor ops + inference (AI-age, promoted into core chain) |
-| 0.0.150 | `lang` | generics type constraints (FIX-0.0.33; `where` bounds enforced) — classical type-system |
-| 0.0.151 | `lang` | borrow-check (language safety pass) — core, hardest |
-| 0.1.0 | STABLE | **100% self-sufficient, zero external dependencies** — `ldd qc` → `not a dynamic executable`; `readelf -d qc` → no `libc.so.6`; CI uses only `qc`. `chain` = first Quanta App (0.1.1+); `physics` optional 0.1.1+. |
+- 0.0.141 `secure` — X25519 (ECDH for TLS 1.3)
+- 0.0.142 `secure` — ML-KEM (FIPS 203, Kyber) + hybrid X25519+ML-KEM KEM
+- 0.0.143 `secure` — ML-DSA (FIPS 204, Dilithium) + hybrid X25519+ML-DSA sig
+- 0.0.144 `secure` — SLH-DSA (FIPS 205, SPHINCS+)
+- 0.0.145 `secure` — TLS 1.3 handshake (hybrid PQC)
+- 0.0.146 `quic` — HTTP/3 (UDP+TLS 1.3, hybrid PQ) — modern transport, ahead of HTTP/2
+- 0.0.147 `http` — HTTP/2-over-TLS (no plaintext shipped)
+|| 0.0.148 | `ai` | tensor ops + inference (AI-age, promoted into core chain) |
+|| 0.0.149 | `lang` | generics type constraints (FIX-0.0.33; `where` bounds enforced) — classical type-system |
+|| 0.0.150 | `lang` | borrow-check (language safety pass) — core, hardest |
+|| 0.0.151 | `secure` | X.509 / PKI — ASN.1 DER parser, cert chain validation, SAN/IP/CN verification, expiry, revocation (CRL/OCSP), trust store (platform roots + custom CA), cert/key PEM/DER load/save |
+|| 0.0.152 | `secure` | Certificate Transparency — SCT parsing/verification (RFC 6962), log list management, inclusion proof verification, stapled SCT validation |
+|| 0.0.153 | `secure` | OCSP Stapling — server-side OCSP response fetch, caching, stapling in TLS handshake, client-side verification |
+|| 0.0.154 | `secure` | TLS Resumption — session tickets (RFC 5077), PSK (RFC 8446), 0-RTT with replay protection (anti-replay window + single-use tickets) |
+|| 0.0.155 | `secure` | mTLS / SPIFFE — X.509-SVID / JWT-SVID parsing, workload identity, trust domain federation, automatic rotation via SPIRE agent API |
+|| 0.0.156 | `secure` | Hardware Security Module — PKCS#11 (Cryptoki) interface, TPM 2.0 (ESAPI), secure enclave (SGX/SEV) attestation, key generation/storage/signing in HSM |
+|| 0.0.157 | `secure` | Key Derivation / Secrets at Rest — Argon2id (RFC 9106), Scrypt, PBKDF2, HKDF (RFC 5869), encrypted keystore (AES-256-GCM + Argon2id), key rotation policies |
+|| 0.0.158 | `secure` | Side-Channel Hardening — constant-time comparators (all PQC ops), masking/blinding for ML-KEM/ML-DSA/SLH-DSA, cache-line alignment, timing-safe memory access |
+|| 0.0.159 | `secure` | Audit & Tamper-Evident Logging — Merkle-tree log (RFC 6962), Trillian-compatible, signed checkpoints, inclusion/consistency proofs, sigstore/cosign integration |
+|| 0.0.160 | `secure` | Supply Chain Security — in-toto/SLSA provenance, sigstore/cosign signing & verification, reproducible build attestation, SBOM (SPDX/CycloneDX) generation |
+|| 0.0.161 | `secure` | Compliance Artifacts — FIPS 140-3 Level 1 module boundary, Common Criteria EAL4+ evidence (FPT, FPT_FLS, FPT_TST), ISO 27001 control mapping, NIST 800-53 traceability |
+|| 0.0.162 | `secure` | Policy Engine — OPA/Rego-compatible policy language, runtime evaluation (TLS config, cert pinning, cipher suite enforcement, mTLS requirements), audit trail |
+|| 0.0.163 | `ai` | LLM Foundations — RoPE (rotary position embeddings), RMSNorm, SwiGLU/GeGLU, Grouped-Query Attention (GQA), Multi-Query Attention (MQA) |
+|| 0.0.164 | `ai` | Autoregressive Decoding — KV cache (paged/continuous), sliding window attention, speculative decoding (draft+verify), prefix caching |
+|| 0.0.165 | `ai` | Fused Kernels & Mixed Precision — FlashAttention-2/3 (tiling, online softmax), BF16/FP16 tensor cores (WMMA/PTX), quantization (GPTQ/AWQ/INT4/INT8 per-channel), kernel fusion (bias+act+dropout) |
+|| 0.0.166 | `ai` | Memory Optimization — Gradient checkpointing (activation recomputation), activation offloading (CPU/NVMe), ZeRO-1/2/3 (optimizer/grad/param sharding), pipeline parallelism |
+|| 0.0.167 | `ai` | Distributed Training — NCCL-compatible all-reduce/all-gather/reduce-scatter/broadcast, ring/tree/butterfly topologies, FSDP (fully sharded data parallel), tensor parallelism (column/row), sequence parallelism |
+|| 0.0.168 | `ai` | Tokenization — BPE (byte-pair encoding), WordPiece, Unigram, SentencePiece, TikToken-compatible, fast Rust-style tokenizer (SIMD), chat templates (HuggingFace/llama.cpp) |
+|| 0.0.169 | `ai` | Training Infrastructure — Cosine/warmup/linear/constant LR schedulers, gradient accumulation, gradient clipping (norm/value), EMA weights, mixed precision (AMP), loss scaling, checkpointing (sharded/distributed) |
+|| 0.0.170 | `ai` | Model Architecture Library — LLaMA/Gemma/Qwen/Mistral/Phi/GPT-2/3/NeoX/BERT/T5/Whisper configs, weight tying (embed↔output), RoPE scaling (NTK/YaRN/LongRoPE), sliding window (Mistral), ALiBi |
+|| 0.0.171 | `ai` | Inference Engine — Continuous batching, paged attention (vLLM-style), prefix caching, chunked prefill, structured output (JSON schema guided decoding), speculative decoding (EAGLE/Medusa), TensorRT-LLM compatible |
+|| 0.0.172 | `ai` | ONNX / Export — ONNX opset 18+ export/import, dynamic axes, quantization annotation (QDQ), TensorRT / CoreML / ORT / llama.cpp GGUF conversion |
+|| 0.0.173 | `chain` | Blockchain Core — UTXO model + account model, Merkle-Patricia Trie (MPT), RLP/SSZ serialization, Patricia proofs, state root computation, bloom filters |
+|| 0.0.174 | `chain` | Consensus — BFT (Tendermint/CometBFT), Nakamoto (PoW/PoS), Gasper (Ethereum PoS), Casper FFG, HotStuff, Narwhal/Tusk, consensus-critical types |
+|| 0.0.175 | `chain` | Smart Contract VM — EVM (EIP-1559, Shanghai, Cancun), WASM (Wasmi/Wasmtime-compatible), RISC-V (CKB-VM), FuelVM, MoveVM, gas metering, precompiles |
+|| 0.0.176 | `chain` | Cryptography — BLS12-381 (pairing, aggregation), BN254, secp256k1 (libsecp256k1-compatible), Ed25519, Poseidon hash, KZG commitments, Verkle trees |
+|| 0.0.177 | `chain` | Networking — libp2p (GossipSub, Kademlia, identify, ping), devp2p (RLPx), QUIC transport, peer scoring, NAT traversal (ICE/STUN/TURN), DHT |
+|| 0.0.178 | `chain` | Storage — LSM-tree (RocksDB-compatible), snapshots, pruning, archive nodes, state sync (fast/snap/warp), erasure coding, light client proofs |
+|| 0.0.179 | `chain` | Standards — ERC-20/721/1155/4337/4844, EIP-1559/2930/4844, CAIP-2/10/19, SLIP-44, BIP-32/39/44/85, multisig (Safe/Gnosis), account abstraction |
+|| 0.0.180 | `quantum` | Quantum Algorithms — QFT, Grover, Shor (factor/dlog), VQE, QAOA, Hamiltonian simulation, quantum error correction (surface code, Steane, color codes) |
+|| 0.0.181 | `quantum` | Quantum-Safe Standards — NIST PQC migration (hybrid KEM/sig), CNSA 2.0, RFC 9180 (HPKE), RFC 9380 (HPKE for PQC), IETF PQC transitions |
+|| 0.0.182 | `quantum` | Quantum Networking — BB84/QKD (E91, MDI-QKD), entanglement swapping, quantum repeaters, quantum internet protocols (CQC, SQNP) |
+|| 0.0.183 | `lang` | Effect System — algebraic effects/handlers, async/await as effect, linear types (affine/uniqueness), region-based memory, capability types |
+|| 0.0.184 | `lang` | Dependent Types — Pi/Σ types, type-level computation, proof terms, refinement types, SMT-backed verification (Z3/CVC5), liquid types |
+|| 0.0.185 | `lang` | Metaprogramming — compile-time reflection, AST macros, procedural macros, const eval (full interpreter), JIT (Cranelift/LLVM), incremental compilation |
+|| 0.0.186 | `lang` | Package Manager — `chain` (first Quanta App): dependency resolution (SAT solver), lockfiles, reproducible builds, workspace/monorepo, private registries, cargo-compatible |
+|| 0.1.0 | STABLE | **100% self-sufficient, zero external dependencies** — `ldd qc` → `not a dynamic executable`; `readelf -d qc` → no `libc.so.6`; CI uses only `qc`. `chain` = first Quanta App (0.1.1+); `physics` optional 0.1.1+. |
 
 **0.0.117 (prior stable seed):** `big` completion. Ordering (`< > <= >=`) + bitwise (`& | ^ << >>`) routed to sign-aware `big_cmp`/`big_and`/`big_or`/`big_xor`/`big_shl_signed`/`big_shr_signed`. **Also fixed: `big_add`/`big_sub`/`big_mul` were MAGNITUDE-ONLY** (negative operands silently miscomputed — e.g. `(-5)+3`→8) — now sign-aware via `big_add_signed`/`big_sub_signed`/`big_mul_signed`; `+ - *` operators route to them. `: big` annotation with int-literal RHS now promotes via `big_from_i64`. Gate: **152/152 functional + 7/7 stdlib + 3/3 multi-tu + extern-c/security/perf/valgrind/fuzz/differential/generics (all GREEN)**. **Self-host fixpoint BYTE-VERIFIED** (md5 `8b8a1e21573f12b5742a64f695a50b85`).
 
