@@ -179,45 +179,48 @@ Next core = **0.0.136** (`self-sufficiency` — native `printf` / variadic forma
 
 **0.0.130 (stable seed):** extern-C variadic (partial core). Variadic decl + args 0–5 in regs, 6+ spill after rsp-align. `extern_var_test.quanta` sentinel EXTERN_VAR_OK, both gcc + gcc-free ld. Fixpoint byte-verified (md5 `85f4122ae7b9626fe529d2b94eb79158`). Gate 162/162 GREEN. Built from 0.0.129 seed.
 
-### 0.0.125→0.0.148 (core sequence, per 2026-08-30 — cores do NOT go into 0.1.0; ALL PARTIAL cores first after `process`, then AI/QC-era crypto foundations, then TLS/hybrid, then classical/hardest):
-- 0.0.125 `time` (clock/now/sleep/nanosleep) — ✅ **DONE** (fixpoint md5 `350e156a7e4d5615f9df4e3780151010`, gate 158/158)
-- 0.0.126 `process` (fork/exec/wait/kill) — ✅ **DONE** (fixpoint md5 `2504e5b10d4fcbe812199b6f2e56679b`, gate 159/159, process_test rc=4)
-- 0.0.127 `pty` (open/slave/name/dup2/ioctl) — ✅ **DONE** (fixpoint md5 `e1d5ed96d9df41f69297c4bcd2b50b4c`, gate 160/160, pty_test rc=2)
-- 0.0.128 `big` div-by-zero guard (FIX-0.0.19) — ✅ **DONE** (big_div/big_mod guard b==0 → exit(1); big_divzero_test rc=1, big_test rc=0, gate 161/161)
-- 0.0.129 `fs` missing ops (stat/unlink/mkdir/chdir/rename/rmdir) — ✅ **DONE** (6 new file_* builtins + fs.quanta wrappers; fs_ops_test rc=0, gate 162/162)
-- 0.0.130 extern-C variadic (partial core — `printf(fmt,...)` not modeled; extern-C shipped 0.0.98/122) — ✅ **DONE** (variadic decl + args 0–5 in regs, 6+ spill after rsp-align; extern_var_test sentinel EXTERN_VAR_OK, both gcc + gcc-free ld; fixpoint md5 `85f4122ae7b9626fe529d2b94eb79158`, gate 162/162)
-- 0.0.131 closure self-recursion by name (partial core — `findfn` doesn't resolve name in closure body; closures shipped 0.0.65→123) — ✅ **DONE** (self-name bound as real enclosing local type-11 + captured into body; self-call routes via IR_CLOSURE_CALL; closure_selfrec_test rc=0 fact(5)=120; fixpoint md5 `8e1bb23fc7e626ee4b8513dc690197c1`, gate 163/163)
-- 0.0.132 `json` (data/AI interchange) — ✅ **DONE** (parse + stringify; tagged heap-node tree; arrays via std/vec, objects via std/map; std_json_test rc=0; fixpoint md5 `8e1bb23fc7e626ee4b8513dc690197c1`, gate 163/163 + stdlib 8/8)
-- 0.0.133 SHA3-256 foundation — ✅ **DONE** (IR_CAP=1B/40GB, TOK_CAP=48M/1.92GB, CODE_CAP=512MB, fn_btok fix for bare function declarations; all 11 gates GREEN, self-host fixpoint byte-verified)
-- 0.0.134 `secure` — full FIPS 202: SHA3-224/256/384/512 + SHAKE128/256
-- 0.0.135 `secure` — AES-GCM (TLS 1.3 AEAD)
-- 0.0.136 `self-sufficiency` — Native `printf` / variadic formatting (FIX-0.0.50) — replace libc `printf`
-- 0.0.137 `self-sufficiency` — Quanta-native ELF linker (FIX-0.0.51) — emit PLT/GOT/DYNAMIC/INTERP in `write_elf`
-- 0.0.138 `self-sufficiency` — Remove `gcc` from CI (FIX-0.0.53) — `--emit-obj` + native link only
-- 0.0.139 `self-sufficiency` — `qc --link` built-in replaces `quanta_link.sh` (FIX-0.0.54)
-- 0.0.140 `self-sufficiency` — Static PIE option (FIX-0.0.55) — no PT_INTERP, no dynamic linker — `ldd qc` → `not a dynamic executable`
-- 0.0.141 `secure` — X25519 (ECDH for TLS 1.3)
-- 0.0.142 `secure` — ML-KEM (FIPS 203, Kyber) + hybrid X25519+ML-KEM KEM
-- 0.0.143 `secure` — ML-DSA (FIPS 204, Dilithium) + hybrid X25519+ML-DSA sig
-- 0.0.144 `secure` — SLH-DSA (FIPS 205, SPHINCS+)
-- 0.0.145 `secure` — TLS 1.3 handshake (hybrid PQC)
-- 0.0.146 `quic` — HTTP/3 (UDP+TLS 1.3, hybrid PQ) — modern transport, ahead of HTTP/2
-- 0.0.147 `http` — HTTP/2-over-TLS (no plaintext shipped)
-|| 0.0.148 | `ai` | tensor ops + inference (AI-age, promoted into core chain) |
-|| 0.0.149 | `lang` | generics type constraints (FIX-0.0.33; `where` bounds enforced) — classical type-system |
-|| 0.0.150 | `lang` | borrow-check (language safety pass) — core, hardest |
-|| 0.0.151 | `secure` | X.509 / PKI — ASN.1 DER parser, cert chain validation, SAN/IP/CN verification, expiry, revocation (CRL/OCSP), trust store (platform roots + custom CA), cert/key PEM/DER load/save |
-|| 0.0.152 | `secure` | Certificate Transparency — SCT parsing/verification (RFC 6962), log list management, inclusion proof verification, stapled SCT validation |
-|| 0.0.153 | `secure` | OCSP Stapling — server-side OCSP response fetch, caching, stapling in TLS handshake, client-side verification |
-|| 0.0.154 | `secure` | TLS Resumption — session tickets (RFC 5077), PSK (RFC 8446), 0-RTT with replay protection (anti-replay window + single-use tickets) |
-|| 0.0.155 | `secure` | mTLS / SPIFFE — X.509-SVID / JWT-SVID parsing, workload identity, trust domain federation, automatic rotation via SPIRE agent API |
-|| 0.0.156 | `secure` | Hardware Security Module — PKCS#11 (Cryptoki) interface, TPM 2.0 (ESAPI), secure enclave (SGX/SEV) attestation, key generation/storage/signing in HSM |
-|| 0.0.157 | `secure` | Key Derivation / Secrets at Rest — Argon2id (RFC 9106), Scrypt, PBKDF2, HKDF (RFC 5869), encrypted keystore (AES-256-GCM + Argon2id), key rotation policies |
-|| 0.0.158 | `secure` | Side-Channel Hardening — constant-time comparators (all PQC ops), masking/blinding for ML-KEM/ML-DSA/SLH-DSA, cache-line alignment, timing-safe memory access |
-|| 0.0.159 | `secure` | Audit & Tamper-Evident Logging — Merkle-tree log (RFC 6962), Trillian-compatible, signed checkpoints, inclusion/consistency proofs, sigstore/cosign integration |
-|| 0.0.160 | `secure` | Supply Chain Security — in-toto/SLSA provenance, sigstore/cosign signing & verification, reproducible build attestation, SBOM (SPDX/CycloneDX) generation |
-|| 0.0.161 | `secure` | Compliance Artifacts — FIPS 140-3 Level 1 module boundary, Common Criteria EAL4+ evidence (FPT, FPT_FLS, FPT_TST), ISO 27001 control mapping, NIST 800-53 traceability |
-|| 0.0.162 | `secure` | Policy Engine — OPA/Rego-compatible policy language, runtime evaluation (TLS config, cert pinning, cipher suite enforcement, mTLS requirements), audit trail |
+### 0.0.125→0.162 (core sequence — cores do NOT go into 0.1.0; ALL PARTIAL cores first after `process`, then AI/QC-era crypto foundations, then TLS/hybrid, then classical/hardest):
+
+| Version | Domain | Core |
+|---------|--------|------|
+| 0.0.125 | `time` | clock/now/sleep/nanosleep |
+| 0.0.126 | `process` | fork/exec/wait/kill |
+| 0.0.127 | `pty` | open/slave/name/dup2/ioctl |
+| 0.0.128 | `big` | div-by-zero guard (FIX-0.0.19) |
+| 0.0.129 | `fs` | missing ops (stat/unlink/mkdir/chdir/rename/rmdir) |
+| 0.0.130 | `lang` | extern-C variadic (partial core) |
+| 0.0.131 | `lang` | closure self-recursion by name (partial core) |
+| 0.0.132 | `lang` | `json` (data/AI interchange) |
+| 0.0.133 | `lang` | SHA3-256 foundation (IR/TOK/CODE caps, fn_btok fix) |
+| 0.0.134 | `secure` | full FIPS 202: SHA3-224/256/384/512 + SHAKE128/256 |
+| 0.0.135 | `secure` | AES-GCM (TLS 1.3 AEAD) |
+| 0.0.136 | `self-sufficiency` | Native `printf` / variadic formatting (FIX-0.0.50) |
+| 0.0.137 | `self-sufficiency` | Quanta-native ELF linker (FIX-0.0.51) |
+| 0.0.138 | `self-sufficiency` | Remove `gcc` from CI (FIX-0.0.53) |
+| 0.0.139 | `self-sufficiency` | `qc --link` built-in replaces `quanta_link.sh` (FIX-0.0.54) |
+| 0.0.140 | `self-sufficiency` | Static PIE option (FIX-0.0.55) |
+| 0.0.141 | `secure` | X25519 (ECDH for TLS 1.3) |
+| 0.0.142 | `secure` | ML-KEM (FIPS 203, Kyber) + hybrid X25519+ML-KEM KEM |
+| 0.0.143 | `secure` | ML-DSA (FIPS 204, Dilithium) + hybrid X25519+ML-DSA sig |
+| 0.0.144 | `secure` | SLH-DSA (FIPS 205, SPHINCS+) |
+| 0.0.145 | `secure` | TLS 1.3 handshake (hybrid PQC) |
+| 0.0.146 | `quic` | HTTP/3 (UDP+TLS 1.3, hybrid PQ) — modern transport, ahead of HTTP/2 |
+| 0.0.147 | `http` | HTTP/2-over-TLS (no plaintext shipped) |
+| 0.0.148 | `ai` | tensor ops + inference (AI-age, promoted into core chain) |
+| 0.0.149 | `lang` | generics type constraints (FIX-0.0.33; `where` bounds enforced) |
+| 0.0.150 | `lang` | borrow-check (language safety pass) — core, hardest |
+| 0.0.151 | `secure` | X.509 / PKI — ASN.1 DER parser, cert chain validation, SAN/IP/CN, expiry, revocation (CRL/OCSP), trust store, cert/key PEM/DER load/save |
+| 0.0.152 | `secure` | Certificate Transparency — SCT parsing/verification (RFC 6962), log list management, inclusion proof verification, stapled SCT validation |
+| 0.0.153 | `secure` | OCSP Stapling — server-side OCSP response fetch, caching, stapling in TLS handshake, client-side verification |
+| 0.0.154 | `secure` | TLS Resumption — session tickets (RFC 5077), PSK (RFC 8446), 0-RTT with replay protection |
+| 0.0.155 | `secure` | mTLS / SPIFFE — X.509-SVID / JWT-SVID parsing, workload identity, trust domain federation, automatic rotation via SPIRE agent API |
+| 0.0.156 | `secure` | Hardware Security Module — PKCS#11 (Cryptoki) interface, TPM 2.0 (ESAPI), secure enclave (SGX/SEV) attestation, key generation/storage/signing in HSM |
+| 0.0.157 | `secure` | Key Derivation / Secrets at Rest — Argon2id (RFC 9106), Scrypt, PBKDF2, HKDF (RFC 5869), encrypted keystore (AES-256-GCM + Argon2id), key rotation policies |
+| 0.0.158 | `secure` | Side-Channel Hardening — constant-time comparators (all PQC ops), masking/blinding for ML-KEM/ML-DSA/SLH-DSA, cache-line alignment, timing-safe memory access |
+| 0.0.159 | `secure` | Audit & Tamper-Evident Logging — Merkle-tree log (RFC 6962), Trillian-compatible, signed checkpoints, inclusion/consistency proofs, sigstore/cosign integration |
+| 0.0.160 | `secure` | Supply Chain Security — in-toto/SLSA provenance, sigstore/cosign signing & verification, reproducible build attestation, SBOM (SPDX/CycloneDX) generation |
+| 0.0.161 | `secure` | Compliance Artifacts — FIPS 140-3 Level 1 module boundary, Common Criteria EAL4+ evidence, ISO 27001 control mapping, NIST 800-53 traceability |
+| 0.0.162 | `secure` | Policy Engine — OPA/Rego-compatible policy language, runtime evaluation (TLS config, cert pinning, cipher suite enforcement, mTLS requirements), audit trail |
 || 0.0.163 | `ai` | LLM Foundations — RoPE (rotary position embeddings), RMSNorm, SwiGLU/GeGLU, Grouped-Query Attention (GQA), Multi-Query Attention (MQA) |
 || 0.0.164 | `ai` | Autoregressive Decoding — KV cache (paged/continuous), sliding window attention, speculative decoding (draft+verify), prefix caching |
 || 0.0.165 | `ai` | Fused Kernels & Mixed Precision — FlashAttention-2/3 (tiling, online softmax), BF16/FP16 tensor cores (WMMA/PTX), quantization (GPTQ/AWQ/INT4/INT8 per-channel), kernel fusion (bias+act+dropout) |
