@@ -1,0 +1,211 @@
+// ML-KEM (Kyber) FIPS 203 constants
+// Module-LWE parameters for ML-KEM-768
+// Using functions instead of const for Quanta compatibility
+
+// Prime modulus q = 3329 = 256 * 13 + 1 (256-th root of unity exists)
+fn ml_kem_q(): i64 { return 3329 }
+fn ml_kem_n(): i64 { return 256 }           // polynomial degree
+fn ml_kem_k(): i64 { return 3 }             // module rank (768: k=3, 512: k=2, 1024: k=4)
+fn ml_kem_eta1(): i64 { return 2 }          // noise parameter for key gen
+fn ml_kem_eta2(): i64 { return 2 }          // noise parameter for encapsulation
+
+// Symmetric primitive parameters
+fn ml_kem_symbytes(): i64 { return 32 }     // seed length
+fn ml_kem_ssbytes(): i64 { return 32 }      // shared secret length
+fn ml_kem_polybytes(): i64 { return 384 }   // 256 * 12 / 8 = 384 bytes per polynomial
+fn ml_kem_polyvecbytes(): i64 { return 1152 } // k * POLYBYTES = 3 * 384
+
+// Compression parameters
+fn ml_kem_polycompressedbytes(): i64 { return 128 }  // 256 * 4 / 8
+fn ml_kem_polyveccompressedbytes(): i64 { return 384 } // k * 128
+
+// Public key / ciphertext sizes
+fn ml_kem_indcpa_publickeybytes(): i64 { return 416 } // 384 + 32
+fn ml_kem_indcpa_secretkeybytes(): i64 { return 1152 }
+fn ml_kem_indcpa_bytes(): i64 { return 512 } // 384 + 128
+
+fn ml_kem_publickeybytes(): i64 { return 416 }
+fn ml_kem_secretkeybytes(): i64 { return 1632 } // 1152 + 416 + 64
+fn ml_kem_ciphertextbytes(): i64 { return 544 } // 512 + 32
+
+// NTT constants
+fn ml_kem_qinv(): i64 { return 62209 }      // -q^{-1} mod 2^16
+fn ml_kem_mont(): i64 { return 1441 }       // 2^16 mod q
+fn ml_kem_root_of_unity(): i64 { return 17 } // primitive 256-th root of unity mod q
+fn ml_kem_root_of_unity_inv(): i64 { return 1753 } // inverse of root_of_unity mod q
+
+// NTT ninv = 256^{-1} mod q = 1255
+fn ml_kem_ninv(): i64 { return 1255 }
+
+// Barrett reduction for q=3329
+// a in [0, 2*q) -> a mod q
+fn ml_kem_barrett_reduce(a: i64): i64 {
+    let t: i64 = a - ml_kem_q()
+    if t >= 0 {
+        return t
+    }
+    return a
+}
+
+// Montgomery reduction for q=3329
+// a in [0, q^2) -> a * R^{-1} mod q where R=2^16
+fn ml_kem_montgomery_reduce(a: i64): i64 {
+    let t: i64 = (a * ml_kem_qinv()) & 0xFFFF
+    let u: i64 = (a + t * ml_kem_q()) >> 16
+    if u >= ml_kem_q() {
+        u = u - ml_kem_q()
+    }
+    return u
+}
+
+// Simple mod reduction for small values
+fn ml_kem_mod_q(a: i64): i64 {
+    let r: i64 = a % ml_kem_q()
+    if r < 0 {
+        r = r + ml_kem_q()
+    }
+    return r
+}
+
+// Centered binomial distribution sampler for eta=2
+// Uses 128 bytes (1024 bits) for 256 coefficients * 4 bits each
+fn ml_kem_cbd2(buf: u8[128]): i64[256] {
+    let coeffs: i64[256]
+    let i: i64 = 0
+    while i < 256 {
+        let byte_idx: i64 = i / 2
+        let bit_pos: i64 = (i % 2) * 4
+        let b: i64 = buf[byte_idx] as i64
+        let bits: i64 = (b >> bit_pos) & 0xF  // 4 bits
+        let a0: i64 = bits & 1
+        let b0: i64 = (bits >> 1) & 1
+        let a1: i64 = (bits >> 2) & 1
+        let b1: i64 = (bits >> 3) & 1
+        coeffs[i] = (a0 + a1) - (b0 + b1)
+        i = i + 1
+    }
+    return coeffs
+}
+
+// PRF (pseudorandom function) using SHAKE256
+// prf(seed_ptr, seed_len, counter, output_ptr)
+// Uses shake256(input_ptr, input_len, output_ptr, output_len)
+fn ml_kem_prf(seed_ptr: u64, seed_len: i64, counter: u8, out_ptr: u64) {
+    let input: u8[33]
+    let i: i64 = 0
+    while i < seed_len {
+        input[i] = mem_load8(seed_ptr + i)
+        i = i + 1
+    }
+    input[32] = counter
+    // Need to allocate temp input buffer
+    let input_buf: u64 = mem_alloc(4) + 8  // 33 bytes = 5 qwords
+    i = 0
+    while i < 33 {
+        mem_store8(input_buf + i, input[i])
+        i = i + 1
+    }
+    shake256(input_buf, 33, out_ptr, 64)
+}
+
+// H function: SHA3-256(input_ptr, input_len, output_ptr)
+fn ml_kem_h(input_ptr: u64, input_len: i64, out_ptr: u64) {
+    sha3_256(input_ptr, input_len, out_ptr)
+}
+
+// G function: SHA3-512(input_ptr, input_len, output_ptr)
+// Returns 64 bytes, we split into two 32-byte outputs
+fn ml_kem_g(input_ptr: u64, input_len: i64, out1_ptr: u64, out2_ptr: u64) {
+    let hash_buf: u64 = mem_alloc(8) + 8  // 64 bytes
+    sha3_512(input_ptr, input_len, hash_buf)
+    let i: i64 = 0
+    while i < 32 {
+        let b: u8 = mem_load8(hash_buf + i)
+        mem_store8(out1_ptr + i, b)
+        let b2: u8 = mem_load8(hash_buf + 32 + i)
+        mem_store8(out2_ptr + i, b2)
+        i = i + 1
+    }
+}
+
+// KDF: SHAKE256(input_ptr, input_len, output_ptr, 32)
+fn ml_kem_kdf(input_ptr: u64, input_len: i64, out_ptr: u64) {
+    shake256(input_ptr, input_len, out_ptr, 32)
+}
+
+// Sample polynomial from CBD using SHAKE128
+// seed_ptr, seed_len, nonce -> out_ptr (256 i64 = 2048 bytes)
+fn ml_kem_sample_poly_eta1(seed_ptr: u64, seed_len: i64, nonce: u8, out_ptr: u64) {
+    let input_buf: u64 = mem_alloc(5) + 8  // 33 bytes
+    let i: i64 = 0
+    while i < seed_len {
+        mem_store8(input_buf + i, mem_load8(seed_ptr + i))
+        i = i + 1
+    }
+    mem_store8(input_buf + 32, nonce)
+    let shake_out: u64 = mem_alloc(16) + 8  // 128 bytes
+    shake128(input_buf, 33, shake_out, 128)
+    let coeffs: i64[256] = ml_kem_cbd2_from_bytes(shake_out)
+    // Store coefficients
+    i = 0
+    while i < 256 {
+        mem_store(out_ptr + i * 8, coeffs[i])
+        i = i + 1
+    }
+}
+
+// Helper: cbd2 from byte buffer
+fn ml_kem_cbd2_from_bytes(buf: u64): i64[256] {
+    let coeffs: i64[256]
+    let i: i64 = 0
+    while i < 256 {
+        let byte_idx: i64 = i / 2
+        let bit_pos: i64 = (i % 2) * 4
+        let b: i64 = mem_load8(buf + byte_idx) as i64
+        let bits: i64 = (b >> bit_pos) & 0xF
+        let a0: i64 = bits & 1
+        let b0: i64 = (bits >> 1) & 1
+        let a1: i64 = (bits >> 2) & 1
+        let b1: i64 = (bits >> 3) & 1
+        coeffs[i] = (a0 + a1) - (b0 + b1)
+        i = i + 1
+    }
+    return coeffs
+}
+
+// Sample polynomial vector (k polynomials)
+fn ml_kem_sample_polyvec_eta1(seed_ptr: u64, seed_len: i64, out_vec_ptr: u64) {
+    let i: i64 = 0
+    while i < 3 {
+        let poly_out: u64 = out_vec_ptr + i * 2048
+        ml_kem_sample_poly_eta1(seed_ptr, seed_len, i as u8, poly_out)
+        i = i + 1
+    }
+}
+
+fn ml_kem_sample_poly_eta2(seed_ptr: u64, seed_len: i64, nonce: u8, out_ptr: u64) {
+    let input_buf: u64 = mem_alloc(5) + 8  // 33 bytes
+    let i: i64 = 0
+    while i < seed_len {
+        mem_store8(input_buf + i, mem_load8(seed_ptr + i))
+        i = i + 1
+    }
+    mem_store8(input_buf + 32, nonce)
+    let shake_out: u64 = mem_alloc(16) + 8  // 128 bytes
+    shake128(input_buf, 33, shake_out, 128)
+    let coeffs: i64[256] = ml_kem_cbd2_from_bytes(shake_out)
+    i = 0
+    while i < 256 {
+        mem_store(out_ptr + i * 8, coeffs[i])
+        i = i + 1
+    }
+}
+
+fn ml_kem_sample_polyvec_eta2(seed_ptr: u64, seed_len: i64, out_vec_ptr: u64) {
+    let i: i64 = 0
+    while i < 3 {
+        let poly_out: u64 = out_vec_ptr + i * 2048
+        ml_kem_sample_poly_eta2(seed_ptr, seed_len, i as u8, poly_out)
+        i = i + 1
+    }
+}
