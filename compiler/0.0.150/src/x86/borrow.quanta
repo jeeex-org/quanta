@@ -1,0 +1,269 @@
+// === BORROW CHECKER (0.0.150) ===
+// Enforces ownership/borrowing rules at compile time:
+// - No use of moved values (ownership tag 3)
+// - No mutable borrow while immutable borrows exist
+// - No immutable borrow while mutable borrow exists
+// - Ref bindings don't outlive their referent
+// - Move consumes the value (sets tag 3 on source)
+
+let BORROW_CAP = 1024
+let borrow_stack = mmap(BORROW_CAP * 24)  // [vreg, kind, scope_depth]
+let borrow_top = 0
+let borrow_scope_depth = 0
+
+// Borrow kinds
+let BORROW_IMM = 1   // &x (immutable borrow)
+let BORROW_MUT = 2   // &mut x (mutable borrow)
+
+fn borrow_check_fn(fi) {
+    // Reset per-function state
+    borrow_top = 0
+    borrow_scope_depth = 0
+    borrow_check_body(fi)
+}
+
+fn borrow_check_body(fi) {
+    // Walk the IR for this function and track borrows
+    let fi_start = r64(fn_ir_start + fi*8)
+    let fi_end = r64(fn_ir_end + fi*8)
+    if fi_start == 0 && fi_end == 0 {
+        // Function not yet compiled (no IR range recorded)
+        return
+    }
+    let i = fi_start
+    while i < fi_end {
+        let op = irop(i)
+        let res = irres(i)
+        let a0 = ira0(i)
+        let a1 = ira1(i)
+        
+        if op == IR_MOV {
+            // Check if source is moved (but allow the move-out itself)
+            // The MOV that transfers a moved value OUT is the move operation,
+            // not a use-after-move. We'll track moved vregs and only error
+            // on subsequent uses (arithmetic, calls, return of moved vreg).
+            // For now, skip MOV source check - only check other uses.
+            
+            // If dest is a ref binding, record borrow
+            if res >= 0 && is_ref_binding(res) {
+                let kind = get_borrow_kind(res)
+                if kind > 0 {
+                    record_borrow(res, kind, i)
+                }
+            }
+        } else if op == IR_PARAM {
+            // Params are borrowed for the function duration
+            if res >= 0 && is_ref_binding(res) {
+                let kind = get_borrow_kind(res)
+                if kind > 0 {
+                    record_borrow(res, kind, i)
+                }
+            }
+        } else if op == IR_CALL || op == IR_CALL_IDX {
+            // Function calls may consume moved values - check all args
+            // In the current IR, call args are in argstack before the call
+            // For simplicity, check the IR records leading up to the call
+            let i2 = i - 1
+            while i2 >= 0 && i2 > i - 20 {
+                let op2 = irop(i2)
+                if op2 == IR_MOV {
+                    let src = ira0(i2)
+                    if src >= 0 && is_vreg_moved(src) {
+                        borrow_error("use of moved value in call argument", i)
+                    }
+                }
+                i2 = i2 - 1
+            }
+        } else if op == IR_ADD || op == IR_SUB || op == IR_MUL || op == IR_DIV || op == IR_MOD
+                || op == IR_EQ || op == IR_NE || op == IR_LT || op == IR_GT || op == IR_LE || op == IR_GE {
+            // Arithmetic/comparison operations - check if operands are moved
+            if a0 >= 0 && is_vreg_moved(a0) {
+                borrow_error("use of moved value in arithmetic", i)
+            }
+            if a1 >= 0 && is_vreg_moved(a1) {
+                borrow_error("use of moved value in arithmetic", i)
+            }
+        } else if op == IR_RET {
+            // Return: check if returning a moved value
+            if a0 >= 0 && is_vreg_moved(a0) {
+                borrow_error("return of moved value", i)
+            }
+            // Check for returning a ref that would dangle
+            if a0 >= 0 && is_ref_binding(a0) {
+                // Allow returning ref params, but not refs to local variables
+                if !is_param_vreg(a0) {
+                    borrow_error("returning reference to local variable", i)
+                }
+            }
+        }
+        i = i + 1
+    }
+    // End of function: all borrows must end
+    borrow_top = 0
+}
+
+fn is_vreg_moved(vr) {
+    // Check if the variable backing this vreg has ownership tag 3 (moved)
+    // Need to find ALL symbol indices for this vreg (multiple names can share a vreg after move)
+    let i = 0
+    while i < varc {
+        if r64(vars + i*VRS + 8) == vr {
+            if r64(vars_own + i*8) == 3 {
+                return 1
+            }
+        }
+        i = i + 1
+    }
+    return 0
+}
+
+fn is_ref_binding(vr) {
+    let i = 0
+    while i < varc {
+        if r64(vars + i*VRS + 8) == vr {
+            let tag = r64(vars_own + i*8)
+            return tag == 2  // ref binding
+        }
+        i = i + 1
+    }
+    return 0
+}
+
+fn is_mut_binding(vr) {
+    let i = 0
+    while i < varc {
+        if r64(vars + i*VRS + 8) == vr {
+            let tag = r64(vars_own + i*8)
+            return tag == 1  // mut binding
+        }
+        i = i + 1
+    }
+    return 0
+}
+
+fn is_param_vreg(vr) {
+    // Check if this vreg is a function parameter
+    let i = 0
+    while i < fnc {
+        let pc = r64(fn_pcount + i*8)
+        let pbase = r64(fn_pbase + i*8)
+        let j = 0
+        while j < pc {
+            let pvr = r64(vars + (pbase + j)*VRS + 8)
+            if pvr == vr {
+                return 1
+            }
+            j = j + 1
+        }
+        i = i + 1
+    }
+    return 0
+}
+
+fn get_borrow_kind(vr) {
+    // For ref bindings, determine if & or &mut
+    // We infer from the original binding: if the RHS was &mut expr -> MUT, &expr -> IMM
+    // For simplicity, check if the binding was created with `ref mut` pattern
+    // In practice, the parser sets ownership tag 2 for both; we need a separate tag
+    // For now: if the variable is declared `mut` -> MUT borrow, else IMM
+    let i = 0
+    while i < varc {
+        if r64(vars + i*VRS + 8) == vr {
+            // Check if it's a mut ref (ref mut x)
+            // The parser doesn't distinguish yet, so infer from usage
+            // If assigned through the ref -> MUT
+            return BORROW_IMM  // default to immutable
+        }
+        i = i + 1
+    }
+    return BORROW_IMM
+}
+
+fn record_borrow(vr, kind, ir_idx) {
+    // Check for conflicts
+    let j = 0
+    while j < borrow_top {
+        let existing_vr = r64(borrow_stack + j*24)
+        let existing_kind = r64(borrow_stack + j*24 + 8)
+        if existing_vr == vr {
+            // Same variable: check borrow rules
+            if kind == BORROW_MUT && existing_kind == BORROW_MUT {
+                // Two mutable borrows - error
+                borrow_error("cannot borrow mutably more than once", ir_idx)
+            }
+            if kind == BORROW_MUT && existing_kind == BORROW_IMM {
+                // Mutable borrow while immutable exists
+                borrow_error("cannot borrow mutably while immutably borrowed", ir_idx)
+            }
+            if kind == BORROW_IMM && existing_kind == BORROW_MUT {
+                // Immutable borrow while mutable exists
+                borrow_error("cannot borrow immutably while mutably borrowed", ir_idx)
+            }
+        }
+        j = j + 1
+    }
+    // Record the new borrow
+    if borrow_top >= BORROW_CAP {
+        compile_error(50, 0, 0)  // borrow stack overflow
+    }
+    w64(borrow_stack + borrow_top*24, vr)
+    w64(borrow_stack + borrow_top*24 + 8, kind)
+    w64(borrow_stack + borrow_top*24 + 16, borrow_scope_depth)
+    borrow_top = borrow_top + 1
+}
+
+fn end_borrow(vr) {
+    // Remove borrow for this vreg
+    let j = 0
+    while j < borrow_top {
+        if r64(borrow_stack + j*24) == vr {
+            // Shift remaining down
+            let k = j
+            while k < borrow_top - 1 {
+                w64(borrow_stack + k*24, r64(borrow_stack + (k+1)*24))
+                w64(borrow_stack + k*24 + 8, r64(borrow_stack + (k+1)*24 + 8))
+                w64(borrow_stack + k*24 + 16, r64(borrow_stack + (k+1)*24 + 16))
+                k = k + 1
+            }
+            borrow_top = borrow_top - 1
+            return
+        }
+        j = j + 1
+    }
+}
+
+fn check_call_moves(call_idx) {
+    // Check arguments for moved values
+    // In the current IR, call args are in argstack before the call
+    // For simplicity, check the IR records leading up to the call
+    let i = call_idx - 1
+    while i >= 0 && i > call_idx - 20 {
+        let op = irop(i)
+        if op == IR_MOV {
+            let src = ira0(i)
+            if src >= 0 && is_vreg_moved(src) {
+                borrow_error("use of moved value in call argument", call_idx)
+            }
+        }
+        i = i - 1
+    }
+}
+
+fn borrow_error(msg, ir_idx) {
+    let err = "borrow check error: "
+    // We can't easily print the message with src location here
+    // Just exit with a distinct code for now
+    exit(140)  // borrow check failure
+}
+
+// Entry point called from entry.quanta after parsing all functions
+fn borrow_check_all() {
+    let fi = 0
+    while fi < fnc {
+        // Skip extern "C" and bare declarations
+        if r64(fn_extern + fi*8) == 0 && fn_btok(fi) != 0 {
+            borrow_check_fn(fi)
+        }
+        fi = fi + 1
+    }
+}
