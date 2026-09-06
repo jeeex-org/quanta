@@ -1,0 +1,714 @@
+// OCSP (Online Certificate Status Protocol) — RFC 6960
+// Pure Quanta implementation, zero external deps
+// Uses lib/std/x509_asn1.quanta for ASN.1 DER decoding
+
+include "x509_asn1.quanta"
+
+// OCSP response status
+let OCSP_RESPONSE_SUCCESSFUL = 0
+let OCSP_RESPONSE_MALFORMED = 1
+let OCSP_RESPONSE_INTERNAL_ERROR = 2
+let OCSP_RESPONSE_TRY_LATER = 3
+let OCSP_RESPONSE_SIG_REQUIRED = 5
+let OCSP_RESPONSE_UNAUTHORIZED = 6
+
+// OCSP cert status
+let OCSP_CERT_GOOD = 0
+let OCSP_CERT_REVOKED = 1
+let OCSP_CERT_UNKNOWN = 2
+
+// OCSP request structure offsets
+let OCSP_REQ_OFF_VERSION = 0
+let OCSP_REQ_OFF_REQUESTOR = 8
+let OCSP_REQ_OFF_REQUEST_LIST = 16
+let OCSP_REQ_OFF_EXTENSIONS = 24
+let OCSP_REQ_STRUCT_SIZE = 32
+
+// OCSP single request (CertID)
+let OCSP_CERTID_OFF_HASH_ALGO = 0
+let OCSP_CERTID_OFF_ISSUER_NAME_HASH = 8
+let OCSP_CERTID_OFF_ISSUER_KEY_HASH = 40
+let OCSP_CERTID_OFF_SERIAL_NUMBER = 72
+let OCSP_CERTID_STRUCT_SIZE = 80
+
+// OCSP response structure offsets
+let OCSP_RESP_OFF_STATUS = 0
+let OCSP_RESP_OFF_RESPONSE_BYTES = 8
+let OCSP_RESP_STRUCT_SIZE = 16
+
+// Basic OCSP response
+let OCSP_BASIC_OFF_TBS_RESP_DATA = 0
+let OCSP_BASIC_OFF_SIG_ALGO = 8
+let OCSP_BASIC_OFF_SIGNATURE = 16
+let OCSP_BASIC_OFF_CERTS = 24
+let OCSP_BASIC_STRUCT_SIZE = 32
+
+// Response data
+let OCSP_RESPDATA_OFF_VERSION = 0
+let OCSP_RESPDATA_OFF_RESPONDER_ID = 8
+let OCSP_RESPDATA_OFF_PRODUCED_AT = 40
+let OCSP_RESPDATA_OFF_RESPONSES = 48
+let OCSP_RESPDATA_OFF_EXTENSIONS = 56
+let OCSP_RESPDATA_STRUCT_SIZE = 64
+
+// Single response
+let OCSP_SINGLERESP_OFF_CERT_ID = 0
+let OCSP_SINGLERESP_OFF_CERT_STATUS = 80
+let OCSP_SINGLERESP_OFF_THIS_UPDATE = 88
+let OCSP_SINGLERESP_OFF_NEXT_UPDATE = 96
+let OCSP_SINGLERESP_OFF_EXTENSIONS = 104
+let OCSP_SINGLERESP_STRUCT_SIZE = 112
+
+// OCSP nonce extension OID
+let OID_OCSP_NONCE = "1.3.6.1.5.5.7.48.1.2"
+
+// OCSP context
+let ocsp_buf = 0
+let ocsp_len = 0
+let ocsp_pos = 0
+
+fn ocsp_init(buf, len) {
+    ocsp_buf = buf
+    ocsp_len = len
+    ocsp_pos = 0
+    return 0
+}
+
+fn ocsp_peek() {
+    if ocsp_pos >= ocsp_len { return -1 }
+    return mem_load8(ocsp_buf + ocsp_pos)
+}
+
+fn ocsp_advance(n) {
+    ocsp_pos = ocsp_pos + n
+    return 0
+}
+
+fn ocsp_read_byte() {
+    if ocsp_pos >= ocsp_len { return -1 }
+    let b = mem_load8(ocsp_buf + ocsp_pos)
+    ocsp_pos = ocsp_pos + 1
+    return b
+}
+
+// Parse OCSP request
+fn ocsp_parse_request(req_buf, req_len, req_out) {
+    asn_init(req_buf, req_len)
+    
+    let seq_start = 0
+    let seq_end = 0
+    if asn_parse_sequence(seq_start, seq_end) != 0 { return -1 }
+    
+    let saved = asn_pos
+    asn_pos = r64(seq_start)
+    
+    // Version (optional, default v1) - [0] EXPLICIT
+    let tag = 0
+    let len = 0
+    let version = 0
+    if asn_read_tag_len(tag, len) == 0 {
+        let t = r64(tag)
+        if (t & 0xff) == (ASN_CLASS_CONTEXT | 0x00) && (t & 0x80) != 0 {
+            let inner_start = 0
+            let inner_end = 0
+            if asn_parse_sequence(inner_start, inner_end) == 0 {
+                asn_pos = r64(inner_start)
+                version = asn_parse_integer()
+            }
+        }
+    }
+    
+    // Requestor name (optional) - [1] EXPLICIT
+    let requestor = 0
+    let requestor_len = 0
+    if asn_read_tag_len(tag, len) == 0 {
+        let t = r64(tag)
+        if (t & 0xff) == (ASN_CLASS_CONTEXT | 0x01) && (t & 0x80) != 0 {
+            let inner_start = 0
+            let inner_end = 0
+            if asn_parse_sequence(inner_start, inner_end) == 0 {
+                requestor = r64(inner_start)
+                requestor_len = r64(inner_end) - r64(inner_start)
+            }
+        }
+    }
+    
+    // Request list (SEQUENCE OF Request)
+    let req_list_start = 0
+    let req_list_end = 0
+    if asn_parse_sequence(req_list_start, req_list_end) != 0 { return -1 }
+    
+    // Extensions (optional) - [2] EXPLICIT
+    let ext_buf = 0
+    let ext_len = 0
+    if asn_read_tag_len(tag, len) == 0 {
+        let t = r64(tag)
+        if (t & 0xff) == (ASN_CLASS_CONTEXT | 0x02) && (t & 0x80) != 0 {
+            let inner_start = 0
+            let inner_end = 0
+            if asn_parse_sequence(inner_start, inner_end) == 0 {
+                ext_buf = r64(inner_start)
+                ext_len = r64(inner_end) - r64(inner_start)
+            }
+        }
+    }
+    
+    let req = mem_alloc(OCSP_REQ_STRUCT_SIZE)
+    if req == 0 { return -1 }
+    w64(req + OCSP_REQ_OFF_VERSION, version)
+    w64(req + OCSP_REQ_OFF_REQUESTOR, requestor)
+    w64(req + OCSP_REQ_OFF_REQUESTOR + 8, requestor_len)
+    w64(req + OCSP_REQ_OFF_REQUEST_LIST, r64(req_list_start))
+    w64(req + OCSP_REQ_OFF_REQUEST_LIST + 8, r64(req_list_end) - r64(req_list_start))
+    w64(req + OCSP_REQ_OFF_EXTENSIONS, ext_buf)
+    w64(req + OCSP_REQ_OFF_EXTENSIONS + 8, ext_len)
+    
+    w64(req_out, req)
+    asn_pos = saved
+    asn_pos = r64(seq_end)
+    return 0
+}
+
+// Parse CertID from request
+fn ocsp_parse_certid(req_list_start, req_list_end, certid_out, count_out) {
+    asn_init(ocsp_buf, ocsp_len)
+    asn_pos = r64(req_list_start)
+    let end = r64(req_list_end)
+    
+    let count = 0
+    let certids = mem_alloc(256)
+    if certids == 0 { return -1 }
+    
+    while asn_pos < end {
+        let req_seq_start = 0
+        let req_seq_end = 0
+        if asn_parse_sequence(req_seq_start, req_seq_end) != 0 { break }
+        
+        let req_saved = asn_pos
+        asn_pos = r64(req_seq_start)
+        
+        // CertID is a SEQUENCE
+        let certid_seq_start = 0
+        let certid_seq_end = 0
+        if asn_parse_sequence(certid_seq_start, certid_seq_end) != 0 {
+            asn_pos = r64(req_seq_end)
+            continue
+        }
+        
+        let certid_saved = asn_pos
+        asn_pos = r64(certid_seq_start)
+        
+        // Hash algorithm (AlgorithmIdentifier)
+        let algo_seq_start = 0
+        let algo_seq_end = 0
+        if asn_parse_sequence(algo_seq_start, algo_seq_end) == 0 {
+            let algo_saved = asn_pos
+            asn_pos = r64(algo_seq_start)
+            let algo_oid_buf = mem_alloc(64)
+            let algo_oid_len = 0
+            asn_parse_oid(algo_oid_buf, algo_oid_len)
+            asn_pos = algo_saved
+            asn_pos = r64(algo_seq_end)
+            // Could store hash algo
+        }
+        
+        // Issuer name hash (OCTET STRING)
+        let issuer_hash = mem_alloc(32)
+        let issuer_hash_len = 0
+        asn_parse_octet_string(issuer_hash, issuer_hash_len)
+        
+        // Issuer key hash (OCTET STRING)
+        let issuer_key_hash = mem_alloc(32)
+        let issuer_key_hash_len = 0
+        asn_parse_octet_string(issuer_key_hash, issuer_key_hash_len)
+        
+        // Serial number (INTEGER)
+        let serial = mem_alloc(32)
+        let serial_len = 0
+        asn_parse_integer_raw(serial, serial_len)
+        
+        let certid = mem_alloc(OCSP_CERTID_STRUCT_SIZE)
+        if certid != 0 {
+            w64(certid + OCSP_CERTID_OFF_HASH_ALGO, 0) // placeholder
+            w64(certid + OCSP_CERTID_OFF_ISSUER_NAME_HASH, issuer_hash)
+            w64(certid + OCSP_CERTID_OFF_ISSUER_NAME_HASH + 8, issuer_hash_len)
+            w64(certid + OCSP_CERTID_OFF_ISSUER_KEY_HASH, issuer_key_hash)
+            w64(certid + OCSP_CERTID_OFF_ISSUER_KEY_HASH + 8, issuer_key_hash_len)
+            w64(certid + OCSP_CERTID_OFF_SERIAL_NUMBER, serial)
+            w64(certid + OCSP_CERTID_OFF_SERIAL_NUMBER + 8, serial_len)
+            w64(certids + count * 8, certid)
+            count = count + 1
+        }
+        
+        asn_pos = certid_saved
+        asn_pos = r64(certid_seq_end)
+        asn_pos = r64(req_seq_end)
+    }
+    
+    w64(certid_out, certids)
+    w64(count_out, count)
+    return 0
+}
+
+// Build OCSP request for a cert
+// issuer_cert: issuer's parsed cert
+// subject_cert: cert to check
+// nonce: optional nonce buffer
+// nonce_len: length of nonce
+// Returns DER-encoded request buffer and length
+fn ocsp_build_request(issuer_cert, subject_cert, nonce, nonce_len, req_out, req_len_out) {
+    // Would need to:
+    // 1. Compute issuer name hash (SHA-1 of issuer's subject DN)
+    // 2. Compute issuer key hash (SHA-1 of issuer's public key)
+    // 3. Get subject cert serial number
+    // 4. Encode as CertID
+    // 5. Build Request SEQUENCE
+    // 6. Wrap in OCSPRequest
+    // For now return empty
+    w64(req_out, 0)
+    w64(req_len_out, 0)
+    return -1
+}
+
+// Parse OCSP response
+fn ocsp_parse_response(resp_buf, resp_len, resp_out) {
+    asn_init(resp_buf, resp_len)
+    
+    let seq_start = 0
+    let seq_end = 0
+    if asn_parse_sequence(seq_start, seq_end) != 0 { return -1 }
+    
+    let saved = asn_pos
+    asn_pos = r64(seq_start)
+    
+    // ResponseStatus (ENUMERATED)
+    let status = asn_parse_integer()
+    
+    if status != OCSP_RESPONSE_SUCCESSFUL {
+        // Parse error response
+        let resp = mem_alloc(OCSP_RESP_STRUCT_SIZE)
+        if resp == 0 { return -1 }
+        w64(resp + OCSP_RESP_OFF_STATUS, status)
+        w64(resp + OCSP_RESP_OFF_RESPONSE_BYTES, 0)
+        w64(resp_out, resp)
+        asn_pos = saved
+        asn_pos = r64(seq_end)
+        return 0
+    }
+    
+    // ResponseBytes
+    let resp_bytes_tag = 0
+    let resp_bytes_len = 0
+    if asn_read_tag_len(resp_bytes_tag, resp_bytes_len) != 0 { return -1 }
+    
+    let resp_bytes_start = asn_pos
+    let resp_bytes_end = asn_pos + resp_bytes_len
+    
+    // ResponseBytes is SEQUENCE of responseType (OID) + response (OCTET STRING)
+    asn_init(ocsp_buf + resp_bytes_start, resp_bytes_len)
+    let rb_seq_start = 0
+    let rb_seq_end = 0
+    if asn_parse_sequence(rb_seq_start, rb_seq_end) != 0 { return -1 }
+    
+    let rb_saved = asn_pos
+    asn_pos = r64(rb_seq_start)
+    
+    // responseType OID
+    let oid_buf = mem_alloc(64)
+    let oid_len = 0
+    asn_parse_oid(oid_buf, oid_len)
+    
+    // response (OCTET STRING containing BasicOCSPResponse)
+    let resp_tag = 0
+    let resp_tag_len = 0
+    if asn_read_tag_len(resp_tag, resp_tag_len) != 0 { return -1 }
+    if (r64(resp_tag) & 0xff) != ASN_TAG_OCTET_STRING { return -1 }
+    
+    let basic_start = asn_pos
+    let basic_end = asn_pos + resp_tag_len
+    
+    asn_pos = rb_saved
+    asn_pos = r64(rb_seq_end)
+    
+    // Parse BasicOCSPResponse
+    asn_init(ocsp_buf + basic_start, basic_end - basic_start)
+    let basic_seq_start = 0
+    let basic_seq_end = 0
+    if asn_parse_sequence(basic_seq_start, basic_seq_end) != 0 { return -1 }
+    
+    let basic_saved = asn_pos
+    asn_pos = r64(basic_seq_start)
+    
+    // tbsResponseData
+    let tbs_seq_start = 0
+    let tbs_seq_end = 0
+    if asn_parse_sequence(tbs_seq_start, tbs_seq_end) != 0 { return -1 }
+    
+    let tbs_saved = asn_pos
+    asn_pos = r64(tbs_seq_start)
+    
+    // version (optional) [0] EXPLICIT
+    let version = 0
+    if asn_read_tag_len(tag, len) == 0 {
+        let t = r64(tag)
+        if (t & 0xff) == (ASN_CLASS_CONTEXT | 0x00) && (t & 0x80) != 0 {
+            let inner_start = 0
+            let inner_end = 0
+            if asn_parse_sequence(inner_start, inner_end) == 0 {
+                asn_pos = r64(inner_start)
+                version = asn_parse_integer()
+            }
+        }
+    }
+    
+    // responderID - CHOICE { byName [1] Name, byKey [2] OCTET STRING }
+    let responder_id = 0
+    let responder_id_len = 0
+    if asn_read_tag_len(tag, len) == 0 {
+        let t = r64(tag)
+        if (t & 0xff) == (ASN_CLASS_CONTEXT | 0x01) {
+            // byName - SEQUENCE
+            let inner_start = 0
+            let inner_end = 0
+            asn_parse_sequence(inner_start, inner_end)
+            responder_id = r64(inner_start)
+            responder_id_len = r64(inner_end) - r64(inner_start)
+        } else if (t & 0xff) == (ASN_CLASS_CONTEXT | 0x02) {
+            // byKey - OCTET STRING
+            let key_buf = mem_alloc(len)
+            let key_len = 0
+            asn_parse_octet_string(key_buf, key_len)
+            responder_id = key_buf
+            responder_id_len = key_len
+        }
+    }
+    
+    // producedAt (GeneralizedTime)
+    let produced_at = asn_parse_generalized_time()
+    
+    // responses (SEQUENCE OF SingleResponse)
+    let resp_seq_start = 0
+    let resp_seq_end = 0
+    if asn_parse_sequence(resp_seq_start, resp_seq_end) != 0 { return -1 }
+    
+    // extensions (optional) [1] EXPLICIT
+    let ext_buf = 0
+    let ext_len = 0
+    if asn_read_tag_len(tag, len) == 0 {
+        let t = r64(tag)
+        if (t & 0xff) == (ASN_CLASS_CONTEXT | 0x01) && (t & 0x80) != 0 {
+            let inner_start = 0
+            let inner_end = 0
+            if asn_parse_sequence(inner_start, inner_end) == 0 {
+                ext_buf = r64(inner_start)
+                ext_len = r64(inner_end) - r64(inner_start)
+            }
+        }
+    }
+    
+    asn_pos = tbs_saved
+    asn_pos = r64(tbs_seq_end)
+    
+    // signatureAlgorithm
+    let sig_algo_seq_start = 0
+    let sig_algo_seq_end = 0
+    asn_parse_sequence(sig_algo_seq_start, sig_algo_seq_end)
+    
+    // signature (BIT STRING)
+    let sig_buf = mem_alloc(512)
+    let sig_len = 0
+    let sig_unused = 0
+    asn_parse_bit_string(sig_buf, sig_len, sig_unused)
+    
+    // certs (optional) [0] EXPLICIT SEQUENCE
+    let certs_buf = 0
+    let certs_len = 0
+    if asn_read_tag_len(tag, len) == 0 {
+        let t = r64(tag)
+        if (t & 0xff) == (ASN_CLASS_CONTEXT | 0x00) && (t & 0x80) != 0 {
+            let inner_start = 0
+            let inner_end = 0
+            asn_parse_sequence(inner_start, inner_end)
+            certs_buf = r64(inner_start)
+            certs_len = r64(inner_end) - r64(inner_start)
+        }
+    }
+    
+    let resp = mem_alloc(OCSP_BASIC_STRUCT_SIZE)
+    if resp == 0 { return -1 }
+    w64(resp + OCSP_BASIC_OFF_TBS_RESP_DATA, r64(tbs_seq_start))
+    w64(resp + OCSP_BASIC_OFF_TBS_RESP_DATA + 8, r64(tbs_seq_end) - r64(tbs_seq_start))
+    w64(resp + OCSP_BASIC_OFF_SIG_ALGO, 0)
+    w64(resp + OCSP_BASIC_OFF_SIGNATURE, sig_buf)
+    w64(resp + OCSP_BASIC_OFF_SIGNATURE + 8, sig_len)
+    w64(resp + OCSP_BASIC_OFF_CERTS, certs_buf)
+    w64(resp + OCSP_BASIC_OFF_CERTS + 8, certs_len)
+    
+    // Now parse SingleResponse(s) from tbsResponseData
+    asn_init(ocsp_buf, ocsp_len)
+    asn_pos = r64(tbs_seq_start) + (r64(produced_at) - r64(tbs_seq_start)) // skip to responses
+    // Actually need to re-parse properly
+    
+    let ocsp_resp = mem_alloc(OCSP_RESP_STRUCT_SIZE)
+    if ocsp_resp == 0 { return -1 }
+    w64(ocsp_resp + OCSP_RESP_OFF_STATUS, OCSP_RESPONSE_SUCCESSFUL)
+    w64(ocsp_resp + OCSP_RESP_OFF_RESPONSE_BYTES, resp)
+    
+    w64(resp_out, ocsp_resp)
+    asn_pos = saved
+    asn_pos = r64(seq_end)
+    return 0
+}
+
+// Parse SingleResponse to get cert status
+fn ocsp_parse_single_response(basic_resp, single_resp_out, count_out) {
+    let tbs_start = r64(basic_resp + OCSP_BASIC_OFF_TBS_RESP_DATA)
+    let tbs_len = r64(basic_resp + OCSP_BASIC_OFF_TBS_RESP_DATA + 8)
+    
+    asn_init(ocsp_buf + tbs_start, tbs_len)
+    asn_pos = 0
+    
+    // Skip to responses SEQUENCE
+    // version (optional) [0] EXPLICIT
+    let tag = 0
+    let len = 0
+    asn_read_tag_len(tag, len)
+    let t = r64(tag)
+    if (t & 0xff) == (ASN_CLASS_CONTEXT | 0x00) && (t & 0x80) != 0 {
+        let inner_start = 0
+        let inner_end = 0
+        asn_parse_sequence(inner_start, inner_end)
+    }
+    
+    // responderID
+    asn_read_tag_len(tag, len)
+    asn_skip(len)
+    
+    // producedAt
+    asn_read_tag_len(tag, len)
+    asn_skip(len)
+    
+    // responses SEQUENCE
+    let resp_seq_start = 0
+    let resp_seq_end = 0
+    if asn_parse_sequence(resp_seq_start, resp_seq_end) != 0 {
+        w64(single_resp_out, 0)
+        w64(count_out, 0)
+        return -1
+    }
+    
+    let saved = asn_pos
+    asn_pos = r64(resp_seq_start)
+    let end = r64(resp_seq_end)
+    
+    let count = 0
+    let resps = mem_alloc(256)
+    if resps == 0 { return -1 }
+    
+    while asn_pos < end {
+        let single_seq_start = 0
+        let single_seq_end = 0
+        if asn_parse_sequence(single_seq_start, single_seq_end) != 0 { break }
+        
+        let single_saved = asn_pos
+        asn_pos = r64(single_seq_start)
+        
+        // CertID
+        let certid_seq_start = 0
+        let certid_seq_end = 0
+        asn_parse_sequence(certid_seq_start, certid_seq_end)
+        
+        // CertStatus - CHOICE { good [0] IMPLICIT NULL, revoked [1] IMPLICIT RevokedInfo, unknown [2] IMPLICIT UnknownInfo }
+        let status_tag = 0
+        let status_len = 0
+        let cert_status = OCSP_CERT_UNKNOWN
+        if asn_read_tag_len(status_tag, status_len) == 0 {
+            let st = r64(status_tag) & 0xff
+            if st == (ASN_CLASS_CONTEXT | 0x00) {
+                cert_status = OCSP_CERT_GOOD
+            } else if st == (ASN_CLASS_CONTEXT | 0x01) {
+                cert_status = OCSP_CERT_REVOKED
+                // Could parse RevokedInfo (revocationTime, revocationReason)
+            } else if st == (ASN_CLASS_CONTEXT | 0x02) {
+                cert_status = OCSP_CERT_UNKNOWN
+            }
+        }
+        
+        // thisUpdate (GeneralizedTime)
+        let this_update = asn_parse_generalized_time()
+        
+        // nextUpdate (optional) [0] EXPLICIT GeneralizedTime
+        let next_update = 0
+        if asn_read_tag_len(tag, len) == 0 {
+            let t = r64(tag)
+            if (t & 0xff) == (ASN_CLASS_CONTEXT | 0x00) && (t & 0x80) != 0 {
+                let inner_start = 0
+                let inner_end = 0
+                asn_parse_sequence(inner_start, inner_end)
+                next_update = asn_parse_generalized_time()
+            } else {
+                // Not nextUpdate, rewind
+                asn_pos = asn_pos - 1
+            }
+        }
+        
+        // extensions (optional)
+        asn_read_tag_len(tag, len)
+        asn_skip(len)
+        
+        let single = mem_alloc(OCSP_SINGLERESP_STRUCT_SIZE)
+        if single != 0 {
+            w64(single + OCSP_SINGLERESP_OFF_CERT_STATUS, cert_status)
+            w64(single + OCSP_SINGLERESP_OFF_THIS_UPDATE, this_update)
+            w64(single + OCSP_SINGLERESP_OFF_NEXT_UPDATE, next_update)
+            w64(resps + count * 8, single)
+            count = count + 1
+        }
+        
+        asn_pos = single_saved
+        asn_pos = r64(single_seq_end)
+    }
+    
+    asn_pos = saved
+    asn_pos = r64(resp_seq_end)
+    
+    w64(single_resp_out, resps)
+    w64(count_out, count)
+    return 0
+}
+
+// Verify OCSP response signature (stub)
+fn ocsp_verify_signature(basic_resp, responder_cert, now) {
+    // Would verify the signature on tbsResponseData using responder_cert's public key
+    // Also check producedAt is recent, thisUpdate/nextUpdate validity
+    return 0
+}
+
+// Check if OCSP response indicates cert is good
+fn ocsp_is_good(basic_resp, cert_index, now) {
+    let resps = 0
+    let count = 0
+    ocsp_parse_single_response(basic_resp, resps, count)
+    
+    if cert_index >= count { return -1 }
+    let single = r64(resps + cert_index * 8)
+    let status = r64(single + OCSP_SINGLERESP_OFF_CERT_STATUS)
+    let this_update = r64(single + OCSP_SINGLERESP_OFF_THIS_UPDATE)
+    let next_update = r64(single + OCSP_SINGLERESP_OFF_NEXT_UPDATE)
+    
+    // Check validity window
+    if now < this_update { return -1 }
+    if next_update > 0 && now > next_update { return -1 }
+    
+    if status == OCSP_CERT_GOOD { return 0 }
+    return -1
+}
+
+// Free OCSP request
+fn ocsp_free_request(req) {
+    if req == 0 { return }
+    mem_free(req)
+}
+
+// Free OCSP response
+fn ocsp_free_response(resp) {
+    if resp == 0 { return }
+    let basic = r64(resp + OCSP_RESP_OFF_RESPONSE_BYTES)
+    if basic != 0 {
+        let sig = r64(basic + OCSP_BASIC_OFF_SIGNATURE)
+        if sig != 0 { mem_free(sig) }
+        mem_free(basic)
+    }
+    mem_free(resp)
+}
+
+// Free CertID array
+fn ocsp_free_certids(certids, count) {
+    if certids == 0 { return }
+    let i = 0
+    while i < count {
+        let certid = r64(certids + i * 8)
+        if certid != 0 {
+            let issuer_hash = r64(certid + OCSP_CERTID_OFF_ISSUER_NAME_HASH)
+            if issuer_hash != 0 { mem_free(issuer_hash) }
+            let issuer_key_hash = r64(certid + OCSP_CERTID_OFF_ISSUER_KEY_HASH)
+            if issuer_key_hash != 0 { mem_free(issuer_key_hash) }
+            let serial = r64(certid + OCSP_CERTID_OFF_SERIAL_NUMBER)
+            if serial != 0 { mem_free(serial) }
+            mem_free(certid)
+        }
+        i = i + 1
+    }
+    mem_free(certids)
+}
+
+// Free SingleResponse array
+fn ocsp_free_single_responses(resps, count) {
+    if resps == 0 { return }
+    let i = 0
+    while i < count {
+        let single = r64(resps + i * 8)
+        if single != 0 { mem_free(single) }
+        i = i + 1
+    }
+    mem_free(resps)
+}
+
+// Build OCSP stapling extension for TLS handshake
+// Takes parsed OCSP response and returns DER-encoded extension
+fn ocsp_build_stapling_extension(basic_resp, ext_out, ext_len_out) {
+    // Would encode the OCSP response as a TLS CertificateStatus message
+    // For now return empty
+    w64(ext_out, 0)
+    w64(ext_len_out, 0)
+    return -1
+}
+
+// Parse OCSP stapling extension from TLS handshake
+fn ocsp_parse_stapling_extension(ext_buf, ext_len, basic_resp_out) {
+    // Would parse the CertificateStatus message
+    w64(basic_resp_out, 0)
+    return -1
+}
+
+// OCSP stapling cache entry
+let ocsp_cache = 0
+let ocsp_cache_count = 0
+let ocsp_cache_capacity = 0
+
+fn ocsp_cache_init(capacity) {
+    ocsp_cache_capacity = capacity
+    ocsp_cache = mem_alloc(capacity * 24) // 8 cert hash + 8 response + 8 expiry
+    ocsp_cache_count = 0
+    return 0
+}
+
+fn ocsp_cache_put(cert_hash, basic_resp, expiry) {
+    if ocsp_cache_count >= ocsp_cache_capacity { return -1 }
+    let idx = ocsp_cache_count
+    w64(ocsp_cache + idx * 24, cert_hash)
+    w64(ocsp_cache + idx * 24 + 8, basic_resp)
+    w64(ocsp_cache + idx * 24 + 16, expiry)
+    ocsp_cache_count = ocsp_cache_count + 1
+    return 0
+}
+
+fn ocsp_cache_get(cert_hash, now) {
+    let i = 0
+    while i < ocsp_cache_count {
+        let h = r64(ocsp_cache + i * 24)
+        let expiry = r64(ocsp_cache + i * 24 + 16)
+        if h == cert_hash && now <= expiry {
+            return r64(ocsp_cache + i * 24 + 8)
+        }
+        i = i + 1
+    }
+    return 0
+}
+
+fn ocsp_cache_free() {
+    if ocsp_cache != 0 { mem_free(ocsp_cache) }
+    ocsp_cache = 0
+    ocsp_cache_count = 0
+    ocsp_cache_capacity = 0
+}
