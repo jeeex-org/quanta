@@ -38,6 +38,17 @@ let ASN_TAG_UNIVERSAL_STRING = 28
 let ASN_TAG_CHARACTER_STRING = 29
 let ASN_TAG_BMP_STRING = 30
 
+// GeneralName types for SAN (RFC 5280)
+let GEN_NAME_OTHER = 0
+let GEN_NAME_RFC822 = 1
+let GEN_NAME_DNS = 2
+let GEN_NAME_X400 = 3
+let GEN_NAME_DIRECTORY = 4
+let GEN_NAME_EDI_PARTY = 5
+let GEN_NAME_URI = 6
+let GEN_NAME_IP = 7
+let GEN_NAME_OID = 8
+
 // ASN.1 DER decoder context
 let asn_buf = 0
 let asn_len = 0
@@ -166,10 +177,77 @@ fn asn_parse_oid(out_buf, out_len) {
     let arc1 = first % 40
     let pos = 0
     // Write "arc0.arc1"
-    let arc0_str = 0
-    // Simple approach: write to buffer directly
-    // For now just skip - full OID string formatting is complex
-    asn_pos = start + len
+    let out = r64(out_buf)
+    // Format arc0
+    let arc0_tmp = arc0
+    let arc0_digits = 0
+    while arc0_tmp > 0 {
+        arc0_tmp = arc0_tmp / 10
+        arc0_digits = arc0_digits + 1
+    }
+    if arc0_digits == 0 { arc0_digits = 1 }
+    let i = arc0_digits - 1
+    arc0_tmp = arc0
+    while i >= 0 {
+        let digit = arc0_tmp % 10
+        mem_store8(out + i, digit + 48)
+        arc0_tmp = arc0_tmp / 10
+        i = i - 1
+    }
+    mem_store8(out + arc0_digits, 46) // '.'
+    pos = arc0_digits + 1
+    // Format arc1
+    let arc1_tmp = arc1
+    let arc1_digits = 0
+    while arc1_tmp > 0 {
+        arc1_tmp = arc1_tmp / 10
+        arc1_digits = arc1_digits + 1
+    }
+    if arc1_digits == 0 { arc1_digits = 1 }
+    i = arc1_digits - 1
+    arc1_tmp = arc1
+    while i >= 0 {
+        let digit = arc1_tmp % 10
+        mem_store8(out + pos + i, digit + 48)
+        arc1_tmp = arc1_tmp / 10
+        i = i - 1
+    }
+    pos = pos + arc1_digits
+    // Parse remaining arcs (base-128)
+    let i = 1
+    while i < len {
+        let val = 0
+        let b = mem_load8(asn_buf + start + i)
+        while (b & 0x80) != 0 {
+            val = (val << 7) | (b & 0x7f)
+            i = i + 1
+            if i >= len { break }
+            b = mem_load8(asn_buf + start + i)
+        }
+        val = (val << 7) | (b & 0x7f)
+        // Format this arc
+        mem_store8(out + pos, 46) // '.'
+        pos = pos + 1
+        let arc_tmp = val
+        let arc_digits = 0
+        while arc_tmp > 0 {
+            arc_tmp = arc_tmp / 10
+            arc_digits = arc_digits + 1
+        }
+        if arc_digits == 0 { arc_digits = 1 }
+        let j = arc_digits - 1
+        arc_tmp = val
+        while j >= 0 {
+            let digit = arc_tmp % 10
+            mem_store8(out + pos + j, digit + 48)
+            arc_tmp = arc_tmp / 10
+            j = j - 1
+        }
+        pos = pos + arc_digits
+        i = i + 1
+    }
+    mem_store8(out + pos, 0) // null terminator
+    w64(out_len, pos + 1)
     return 0
 }
 
@@ -323,4 +401,105 @@ fn asn_remaining(seq_end) {
     let end = r64(seq_end)
     if asn_pos >= end { return 0 }
     return end - asn_pos
+}
+
+// Base64 decode (RFC 4648 standard alphabet)
+fn base64_decode(src, src_len, out, out_len) {
+    let b64_chars = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/"
+    let i = 0
+    let out_pos = 0
+    while i < src_len {
+        // Skip whitespace
+        let c = mem_load8(src + i)
+        if c == 10 || c == 13 || c == 32 || c == 9 { // \n \r space \t
+            i = i + 1
+            continue
+        }
+        if c == 61 { // '=' padding
+            break
+        }
+        // Find char in alphabet
+        let val = -1
+        let j = 0
+        while j < 64 {
+            if mem_load8(b64_chars + j) == c {
+                val = j
+                break
+            }
+            j = j + 1
+        }
+        if val == -1 { return -1 }
+        let v0 = val
+        
+        i = i + 1
+        if i >= src_len { return -1 }
+        c = mem_load8(src + i)
+        if c == 61 { return -1 }
+        val = -1
+        j = 0
+        while j < 64 {
+            if mem_load8(b64_chars + j) == c {
+                val = j
+                break
+            }
+            j = j + 1
+        }
+        if val == -1 { return -1 }
+        let v1 = val
+        
+        i = i + 1
+        if i >= src_len { return -1 }
+        c = mem_load8(src + i)
+        let v2 = 0
+        if c != 61 {
+            val = -1
+            j = 0
+            while j < 64 {
+                if mem_load8(b64_chars + j) == c {
+                    val = j
+                    break
+                }
+                j = j + 1
+            }
+            if val == -1 { return -1 }
+            v2 = val
+        }
+        
+        i = i + 1
+        if i >= src_len { return -1 }
+        c = mem_load8(src + i)
+        let v3 = 0
+        if c != 61 {
+            val = -1
+            j = 0
+            while j < 64 {
+                if mem_load8(b64_chars + j) == c {
+                    val = j
+                    break
+                }
+                j = j + 1
+            }
+            if val == -1 { return -1 }
+            v3 = val
+        }
+        
+        // Output 3 bytes
+        let b0 = (v0 << 2) | (v1 >> 4)
+        let b1 = ((v1 & 0xf) << 4) | (v2 >> 2)
+        let b2 = ((v2 & 0x3) << 6) | v3
+        
+        mem_store8(r64(out) + out_pos, b0)
+        out_pos = out_pos + 1
+        if c != 61 || mem_load8(src + i - 1) != 61 {
+            mem_store8(r64(out) + out_pos, b1)
+            out_pos = out_pos + 1
+        }
+        if c != 61 {
+            mem_store8(r64(out) + out_pos, b2)
+            out_pos = out_pos + 1
+        }
+        i = i + 1
+    }
+    w64(out_len, out_pos)
+    return 0
 }

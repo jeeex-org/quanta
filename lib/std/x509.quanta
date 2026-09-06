@@ -323,18 +323,314 @@ fn x509_get_key_usage(cert, usage_out) {
     return 0
 }
 
+// Parse Subject Alternative Name extension
+// Returns array of (type, value) pairs in heap buffer, count in count_out
+// type: GEN_NAME_DNS (2), GEN_NAME_IP (7), etc.
+// value: string buffer (for DNS) or 4-byte IP (for IP)
+fn x509_parse_san(cert, san_out, count_out) {
+    let ext_buf = r64(cert + X509_OFF_EXTENSIONS)
+    let ext_len = r64(cert + X509_OFF_EXTENSIONS + 8)
+    if ext_buf == 0 || ext_len == 0 {
+        w64(san_out, 0)
+        w64(count_out, 0)
+        return 0
+    }
+    
+    asn_init(ext_buf, ext_len)
+    
+    // Extensions is a SEQUENCE OF Extension
+    let seq_start = 0
+    let seq_end = 0
+    if asn_parse_sequence(seq_start, seq_end) != 0 {
+        w64(san_out, 0)
+        w64(count_out, 0)
+        return -1
+    }
+    
+    let saved_pos = asn_pos
+    asn_pos = r64(seq_start)
+    let seq_end_pos = r64(seq_end)
+    
+    let san_count = 0
+    let san_buf = mem_alloc(256) // array of 16-byte entries (8 type + 8 value ptr)
+    if san_buf == 0 {
+        w64(san_out, 0)
+        w64(count_out, 0)
+        return -1
+    }
+    
+    while asn_pos < seq_end_pos {
+        // Parse Extension (SEQUENCE of 3: OID, critical, value)
+        let ext_seq_start = 0
+        let ext_seq_end = 0
+        if asn_parse_sequence(ext_seq_start, ext_seq_end) != 0 { break }
+        
+        let ext_saved = asn_pos
+        asn_pos = r64(ext_seq_start)
+        
+        // Parse OID
+        let oid_buf = mem_alloc(64)
+        let oid_len = 0
+        if asn_parse_oid(oid_buf, oid_len) != 0 {
+            asn_pos = r64(ext_seq_end)
+            continue
+        }
+        
+        // Check if it's subjectAltName OID (2.5.29.17)
+        let is_san = 0
+        let oid_str = r64(oid_buf)
+        // Simple check for "2.5.29.17"
+        if mem_load8(oid_str) == 50 && mem_load8(oid_str+1) == 46 && mem_load8(oid_str+2) == 53 &&
+           mem_load8(oid_str+3) == 46 && mem_load8(oid_str+4) == 50 && mem_load8(oid_str+5) == 57 &&
+           mem_load8(oid_str+6) == 46 && mem_load8(oid_str+7) == 49 && mem_load8(oid_str+8) == 55 {
+            is_san = 1
+        }
+        mem_free(oid_buf)
+        
+        // Skip critical flag (BOOLEAN)
+        let tag = 0
+        let len = 0
+        asn_read_tag_len(tag, len)
+        asn_skip(len)
+        
+        // Parse value (OCTET STRING containing the SAN sequence)
+        let val_tag = 0
+        let val_len = 0
+        if asn_read_tag_len(val_tag, val_len) != 0 {
+            asn_pos = r64(ext_seq_end)
+            continue
+        }
+        if (r64(val_tag) & 0xff) != ASN_TAG_OCTET_STRING {
+            asn_pos = r64(ext_seq_end)
+            continue
+        }
+        
+        let octet_start = asn_pos
+        let octet_end = asn_pos + val_len
+        
+        if is_san == 1 {
+            // Parse the inner SEQUENCE OF GeneralName
+            asn_init(asn_buf + octet_start, val_len)
+            let san_seq_start = 0
+            let san_seq_end = 0
+            if asn_parse_sequence(san_seq_start, san_seq_end) == 0 {
+                let san_saved = asn_pos
+                asn_pos = r64(san_seq_start)
+                let san_seq_end_pos = r64(san_seq_end)
+                
+                while asn_pos < san_seq_end_pos {
+                    // Parse GeneralName (context-specific tag)
+                    let gn_tag = 0
+                    let gn_len = 0
+                    if asn_read_tag_len(gn_tag, gn_len) != 0 { break }
+                    
+                    let gn_type = r64(gn_tag) & 0xff
+                    let gn_data_start = asn_pos
+                    
+                    if gn_type == GEN_NAME_DNS || gn_type == GEN_NAME_URI || gn_type == GEN_NAME_RFC822 {
+                        // IA5String / UTF8String - copy as string
+                        let val_buf = mem_alloc(gn_len + 1)
+                        if val_buf != 0 {
+                            let k = 0
+                            while k < gn_len {
+                                mem_store8(val_buf + k, mem_load8(asn_buf + gn_data_start + k))
+                                k = k + 1
+                            }
+                            mem_store8(val_buf + gn_len, 0)
+                            w64(san_buf + san_count * 16, gn_type)
+                            w64(san_buf + san_count * 16 + 8, val_buf)
+                            san_count = san_count + 1
+                        }
+                    } else if gn_type == GEN_NAME_IP {
+                        // IP address - 4 bytes (IPv4) or 16 bytes (IPv6)
+                        let val_buf = mem_alloc(16)
+                        if val_buf != 0 {
+                            let k = 0
+                            let copy_len = gn_len
+                            if copy_len > 16 { copy_len = 16 }
+                            while k < copy_len {
+                                mem_store8(val_buf + k, mem_load8(asn_buf + gn_data_start + k))
+                                k = k + 1
+                            }
+                            w64(san_buf + san_count * 16, gn_type)
+                            w64(san_buf + san_count * 16 + 8, val_buf)
+                            san_count = san_count + 1
+                        }
+                    }
+                    
+                    asn_pos = gn_data_start + gn_len
+                }
+            }
+        }
+        
+        asn_pos = octet_end
+        asn_init(ext_buf, ext_len)
+        asn_pos = r64(ext_seq_end)
+    }
+    
+    asn_pos = saved_pos
+    asn_pos = r64(seq_end)
+    
+    w64(san_out, san_buf)
+    w64(count_out, san_count)
+    return 0
+}
+
+// Free SAN array returned by x509_parse_san
+fn x509_free_san(san_buf, count) {
+    if san_buf == 0 { return }
+    let i = 0
+    while i < count {
+        let val = r64(san_buf + i * 16 + 8)
+        if val != 0 { mem_free(val) }
+        i = i + 1
+    }
+    mem_free(san_buf)
+}
+
+// Verify certificate chain
+// certs: array of cert pointers (leaf first, then intermediates, root last)
+// count: number of certs in array
+// now: current timestamp for validity checks
+// Returns 0 on success, -1 on failure
+fn x509_verify_chain(certs, count, now) {
+    if count < 2 { return -1 } // Need at least leaf + root
+    
+    let i = 0
+    while i < count - 1 {
+        let leaf = r64(certs + i * 8)
+        let issuer = r64(certs + (i + 1) * 8)
+        
+        // Check validity period
+        if x509_is_expired(leaf, now) != 0 { return -1 }
+        if x509_not_yet_valid(leaf, now) != 0 { return -1 }
+        
+        // Check issuer matches subject of next cert
+        let leaf_issuer = r64(leaf + X509_OFF_ISSUER)
+        let leaf_issuer_len = r64(leaf + X509_OFF_ISSUER + 8)
+        let issuer_subject = r64(issuer + X509_OFF_SUBJECT)
+        let issuer_subject_len = r64(issuer + X509_OFF_SUBJECT + 8)
+        
+        if leaf_issuer_len != issuer_subject_len { return -1 }
+        let j = 0
+        while j < leaf_issuer_len {
+            if mem_load8(leaf_issuer + j) != mem_load8(issuer_subject + j) {
+                return -1
+            }
+            j = j + 1
+        }
+        
+        // Verify signature (simplified - would need actual crypto)
+        // For now just check key usage allows cert signing
+        let usage = 0
+        x509_get_key_usage(issuer, usage)
+        if (usage & KU_KEY_CERT_SIGN) == 0 && i < count - 2 { return -1 }
+        
+        i = i + 1
+    }
+    
+    // Check root cert validity
+    let root = r64(certs + (count - 1) * 8)
+    if x509_is_expired(root, now) != 0 { return -1 }
+    if x509_not_yet_valid(root, now) != 0 { return -1 }
+    
+    return 0
+}
+
+// CRL (Certificate Revocation List) parsing
+// Returns 0 if cert is revoked, 1 if not revoked, -1 on error
+fn x509_check_crl(cert, crl_der, crl_len, now) {
+    // Simplified CRL parsing - full implementation would parse the CRL
+    // and check if the cert's serial number is in the revoked list
+    // For now return 1 (not revoked)
+    return 1
+}
+
+// OCSP (Online Certificate Status Protocol) - stub for online checking
+// In a real implementation this would make HTTP requests to OCSP responder
+fn x509_check_ocsp(cert, ocsp_url, now) {
+    // Stub - would need HTTP client
+    return 1
+}
+
 // Parse PEM format (-----BEGIN CERTIFICATE----- ... -----END CERTIFICATE-----)
 // Returns DER buffer and length
 fn x509_parse_pem(pem_buf, pem_len, der_out, der_len_out) {
-    // Find BEGIN marker
     let begin_marker = "-----BEGIN CERTIFICATE-----"
     let end_marker = "-----END CERTIFICATE-----"
     let begin_len = 27
     let end_len = 25
     
-    // Simple base64 decode would go here
-    // For now return error
-    return -1
+    // Find BEGIN marker
+    let i = 0
+    let begin_pos = -1
+    while i + begin_len <= pem_len {
+        let match = 1
+        let j = 0
+        while j < begin_len {
+            if mem_load8(pem_buf + i + j) != mem_load8(begin_marker + j) {
+                match = 0
+                break
+            }
+            j = j + 1
+        }
+        if match == 1 {
+            begin_pos = i
+            break
+        }
+        i = i + 1
+    }
+    if begin_pos == -1 { return -1 }
+    
+    // Find END marker
+    let data_start = begin_pos + begin_len
+    i = data_start
+    let end_pos = -1
+    while i + end_len <= pem_len {
+        let match = 1
+        let j = 0
+        while j < end_len {
+            if mem_load8(pem_buf + i + j) != mem_load8(end_marker + j) {
+                match = 0
+                break
+            }
+            j = j + 1
+        }
+        if match == 1 {
+            end_pos = i
+            break
+        }
+        i = i + 1
+    }
+    if end_pos == -1 { return -1 }
+    
+    // Extract base64 data
+    let b64_len = end_pos - data_start
+    let b64_buf = mem_alloc(b64_len)
+    if b64_buf == 0 { return -1 }
+    i = 0
+    while i < b64_len {
+        mem_store8(b64_buf + i, mem_load8(pem_buf + data_start + i))
+        i = i + 1
+    }
+    
+    // Decode base64
+    let der_buf = mem_alloc((b64_len * 3) / 4 + 4)
+    if der_buf == 0 {
+        mem_free(b64_buf)
+        return -1
+    }
+    let der_len = 0
+    if base64_decode(b64_buf, b64_len, der_buf, der_len) != 0 {
+        mem_free(b64_buf)
+        mem_free(der_buf)
+        return -1
+    }
+    mem_free(b64_buf)
+    
+    w64(der_out, der_buf)
+    w64(der_len_out, r64(der_len))
+    return 0
 }
 
 // Free certificate struct and all allocated buffers
