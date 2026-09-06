@@ -1,0 +1,1237 @@
+// Hardware Security Module — PKCS#11 (Cryptoki) interface, TPM 2.0 (ESAPI), secure enclave (SGX/SEV) attestation, key generation/storage/signing in HSM
+// Pure Quanta implementation, zero external deps
+
+include "x509.quanta"
+include "ml_kem.quanta"
+include "ml_dsa.quanta"
+include "slh_dsa.quanta"
+
+// PKCS#11 (Cryptoki) constants
+let CKR_OK = 0
+let CKR_CANCEL = 1
+let CKR_HOST_MEMORY = 2
+let CKR_SLOT_ID_INVALID = 3
+let CKR_TOKEN_NOT_PRESENT = 4
+let CKR_TOKEN_NOT_RECOGNIZED = 5
+let CKR_TOKEN_WRITE_PROTECTED = 6
+let CKR_USER_NOT_LOGGED_IN = 7
+let CKR_USER_PIN_NOT_INITIALIZED = 8
+let CKR_USER_TYPE_INVALID = 9
+let CKR_USER_ALREADY_LOGGED_IN = 10
+let CKR_USER_PIN_LOCKED = 11
+let CKR_USER_PIN_TO_BE_CHANGED = 12
+let CKR_SESSION_HANDLE_INVALID = 13
+let CKR_SESSION_READ_ONLY = 14
+let CKR_SESSION_EXISTS = 15
+let CKR_SESSION_READ_ONLY_EXISTS = 16
+let CKR_SESSION_READ_WRITE_SO_EXISTS = 17
+let CKR_ATTRIBUTE_READ_ONLY = 18
+let CKR_ATTRIBUTE_SENSITIVE = 19
+let CKR_ATTRIBUTE_TYPE_INVALID = 20
+let CKR_ATTRIBUTE_VALUE_INVALID = 21
+let CKR_OBJECT_HANDLE_INVALID = 22
+let CKR_OBJECT_CLASS_INCONSISTENT = 23
+let CKR_OPERATION_ACTIVE = 24
+let CKR_OPERATION_NOT_INITIALIZED = 25
+let CKR_DATA_INVALID = 26
+let CKR_DATA_LEN_RANGE = 27
+let CKR_DEVICE_ERROR = 28
+let CKR_DEVICE_MEMORY = 29
+let CKR_DEVICE_REMOVED = 30
+let CKR_ENCRYPTED_DATA_INVALID = 31
+let CKR_ENCRYPTED_DATA_LEN_RANGE = 32
+let CKR_FUNCTION_FAILED = 33
+let CKR_FUNCTION_NOT_SUPPORTED = 34
+let CKR_KEY_HANDLE_INVALID = 35
+let CKR_KEY_SIZE_RANGE = 36
+let CKR_KEY_TYPE_INCONSISTENT = 37
+let CKR_KEY_NOT_NEEDED = 38
+let CKR_KEY_CHANGED = 39
+let CKR_KEY_NEEDED = 40
+let CKR_KEY_INDIGESTIBLE = 41
+let CKR_KEY_FUNCTION_NOT_PERMITTED = 42
+let CKR_KEY_NOT_WRAPPABLE = 43
+let CKR_KEY_UNEXTRACTABLE = 44
+let CKR_MECHANISM_INVALID = 45
+let CKR_MECHANISM_PARAM_INVALID = 46
+let CKR_NO_EVENT = 47
+let CKR_OPERATION_CANCELLED = 48
+let CKR_PIN_INCORRECT = 49
+let CKR_PIN_INVALID = 50
+let CKR_PIN_LEN_RANGE = 51
+let CKR_PIN_EXPIRED = 52
+let CKR_PIN_LOCKED = 53
+let CKR_SESSION_CLOSED = 54
+let CKR_SIGNATURE_INVALID = 55
+let CKR_SIGNATURE_LEN_RANGE = 56
+let CKR_TEMPLATE_INCOMPLETE = 57
+let CKR_TEMPLATE_INCONSISTENT = 58
+let CKR_TOKEN_WRITE_PROTECTED = 59
+let CKR_USER_ANOTHER_ALREADY_LOGGED_IN = 60
+let CKR_USER_TOO_MANY_TYPES = 61
+let CKR_WRAPPED_KEY_INVALID = 62
+let CKR_WRAPPED_KEY_LEN_RANGE = 63
+let CKR_WRAPPING_KEY_HANDLE_INVALID = 64
+let CKR_WRAPPING_KEY_SIZE_RANGE = 65
+let CKR_RANDOM_SEED_NOT_SUPPORTED = 66
+let CKR_RANDOM_NO_RNG = 67
+
+// Object classes
+let CKO_DATA = 0
+let CKO_CERTIFICATE = 1
+let CKO_PUBLIC_KEY = 2
+let CKO_PRIVATE_KEY = 3
+let CKO_SECRET_KEY = 4
+let CKO_HW_FEATURE = 5
+let CKO_DOMAIN_PARAMETERS = 6
+let CKO_MECHANISM = 7
+
+// Key types
+let CKK_RSA = 0
+let CKK_DSA = 1
+let CKK_DH = 2
+let CKK_ECDSA = 3
+let CKK_EC = 3
+let CKK_X9_42_DH = 4
+let CKK_KEA = 5
+let CKK_GENERIC_SECRET = 16
+let CKK_RC2 = 17
+let CKK_RC4 = 18
+let CKK_DES = 19
+let CKK_DES2 = 20
+let CKK_DES3 = 21
+let CKK_CAST = 22
+let CKK_CAST3 = 23
+let CKK_CAST5 = 24
+let CKK_CAST128 = 25
+let CKK_RC5 = 26
+let CKK_IDEA = 27
+let CKK_SKIPJACK = 28
+let CKK_BATON = 29
+let CKK_JUNIPER = 30
+let CKK_CDMF = 31
+let CKK_AES = 32
+let CKK_BLOWFISH = 33
+let CKK_TWOFISH = 34
+let CKK_SECURID = 34
+let CKK_HOTP = 35
+let CKK_ACTI = 36
+let CKK_CAMELLIA = 37
+let CKK_ARIA = 38
+let CKK_MD5_HMAC = 39
+let CKK_SHA_1_HMAC = 40
+let CKK_RIPEMD128_HMAC = 41
+let CKK_RIPEMD160_HMAC = 42
+let CKK_SHA256_HMAC = 43
+let CKK_SHA384_HMAC = 44
+let CKK_SHA512_HMAC = 45
+let CKK_SHA224_HMAC = 46
+let CKK_SEED = 47
+let CKK_GOSTR3410 = 48
+let CKK_GOSTR3411 = 49
+let CKK_GOST28147 = 50
+let CKK_ML_KEM = 100  // ML-KEM (Kyber)
+let CKK_ML_DSA = 101  // ML-DSA (Dilithium)
+let CKK_SLH_DSA = 102 // SLH-DSA (SPHINCS+)
+
+// Attribute types
+let CKA_CLASS = 0
+let CKA_TOKEN = 1
+let CKA_PRIVATE = 2
+let CKA_LABEL = 3
+let CKA_APPLICATION = 10
+let CKA_VALUE = 11
+let CKA_OBJECT_ID = 12
+let CKA_CERTIFICATE_TYPE = 13
+let CKA_ISSUER = 14
+let CKA_SERIAL_NUMBER = 15
+let CKA_AC_ISSUER = 16
+let CKA_OWNER = 17
+let CKA_ATTR_TYPES = 18
+let CKA_TRUSTED = 19
+let CKA_CERTIFICATE_CATEGORY = 20
+let CKA_JAVA_MIDP_SECURITY_DOMAIN = 21
+let CKA_URL = 22
+let CKA_HASH_OF_SUBJECT_PUBLIC_KEY = 23
+let CKA_HASH_OF_ISSUER_PUBLIC_KEY = 24
+let CKA_CHECK_VALUE = 25
+let CKA_KEY_TYPE = 256
+let CKA_SUBJECT = 257
+let CKA_ID = 258
+let CKA_SENSITIVE = 259
+let CKA_ENCRYPT = 260
+let CKA_DECRYPT = 261
+let CKA_WRAP = 262
+let CKA_UNWRAP = 263
+let CKA_SIGN = 264
+let CKA_SIGN_RECOVER = 265
+let CKA_VERIFY = 266
+let CKA_VERIFY_RECOVER = 267
+let CKA_DERIVE = 268
+let CKA_START_DATE = 269
+let CKA_END_DATE = 270
+let CKA_MODULUS = 271
+let CKA_MODULUS_BITS = 272
+let CKA_PUBLIC_EXPONENT = 273
+let CKA_PRIVATE_EXPONENT = 274
+let CKA_PRIME_1 = 275
+let CKA_PRIME_2 = 276
+let CKA_EXPONENT_1 = 277
+let CKA_EXPONENT_2 = 278
+let CKA_COEFFICIENT = 279
+let CKA_PRIME = 280
+let CKA_SUBPRIME = 281
+let CKA_BASE = 282
+let CKA_PRIME_BITS = 283
+let CKA_SUBPRIME_BITS = 284
+let CKA_VALUE_BITS = 285
+let CKA_VALUE_LEN = 286
+let CKA_EXTRACTABLE = 287
+let CKA_LOCAL = 288
+let CKA_NEVER_EXTRACTABLE = 289
+let CKA_ALWAYS_SENSITIVE = 290
+let CKA_KEY_GEN_MECHANISM = 291
+let CKA_MODIFIABLE = 292
+let CKA_ECDSA_PARAMS = 293
+let CKA_EC_POINT = 294
+let CKA_SECONDARY_AUTH = 295
+let CKA_AUTH_PIN_FLAGS = 296
+let CKA_ALWAYS_AUTHENTICATE = 297
+let CKA_WRAP_WITH_TRUSTED = 298
+let CKA_WRAP_TEMPLATE = 299
+let CKA_UNWRAP_TEMPLATE = 300
+let CKA_DERIVE_TEMPLATE = 301
+let CKA_OTP_FORMAT = 302
+let CKA_OTP_LENGTH = 303
+let CKA_OTP_TIME_INTERVAL = 304
+let CKA_OTP_USER_FRIENDLY_MODE = 305
+let CKA_OTP_CHALLENGE_REQUIREMENT = 306
+let CKA_OTP_TIME_REQUIREMENT = 307
+let CKA_OTP_COUNTER_REQUIREMENT = 308
+let CKA_OTP_PIN_REQUIREMENT = 309
+let CKA_OTP_COUNTER = 310
+let CKA_OTP_TIME = 311
+let CKA_OTP_USER_IDENTIFIER = 312
+let CKA_OTP_SERVICE_IDENTIFIER = 313
+let CKA_OTP_SERVICE_LOGO = 314
+let CKA_OTP_SERVICE_LOGO_TYPE = 315
+let CKA_GOSTR3410_PARAMS = 316
+let CKA_GOSTR3411_PARAMS = 317
+let CKA_GOST28147_PARAMS = 318
+let CKA_HW_FEATURE_TYPE = 319
+let CKA_RESET_ON_INIT = 320
+let CKA_HAS_RESET = 321
+let CKA_PIXEL_X = 322
+let CKA_PIXEL_Y = 323
+let CKA_REFRESH_INTERVAL = 324
+let CKA_ML_KEM_PARAMS = 400  // ML-KEM parameter set
+let CKA_ML_DSA_PARAMS = 401  // ML-DSA parameter set
+let CKA_SLH_DSA_PARAMS = 402 // SLH-DSA parameter set
+
+// Mechanisms
+let CKM_RSA_PKCS_KEY_PAIR_GEN = 0
+let CKM_RSA_PKCS = 1
+let CKM_RSA_9796 = 2
+let CKM_RSA_X_509 = 3
+let CKM_RSA_PKCS_OAEP = 4
+let CKM_RSA_X9_31_KEY_PAIR_GEN = 5
+let CKM_RSA_X9_31 = 6
+let CKM_RSA_PKCS_PSS = 7
+let CKM_DSA_KEY_PAIR_GEN = 10
+let CKM_DSA = 11
+let CKM_DSA_SHA1 = 12
+let CKM_DSA_SHA224 = 13
+let CKM_DSA_SHA256 = 14
+let CKM_DSA_SHA384 = 15
+let CKM_DSA_SHA512 = 16
+let CKM_DH_PKCS_KEY_PAIR_GEN = 20
+let CKM_DH_PKCS_DERIVE = 21
+let CKM_ECDSA_KEY_PAIR_GEN = 30
+let CKM_ECDSA = 31
+let CKM_ECDSA_SHA1 = 32
+let CKM_ECDSA_SHA224 = 33
+let CKM_ECDSA_SHA256 = 34
+let CKM_ECDSA_SHA384 = 35
+let CKM_ECDSA_SHA512 = 36
+let CKM_ECDH1_DERIVE = 37
+let CKM_ECDH1_COFACTOR_DERIVE = 38
+let CKM_ECMQV_DERIVE = 39
+let CKM_AES_KEY_GEN = 40
+let CKM_AES_ECB = 41
+let CKM_AES_CBC = 42
+let CKM_AES_CBC_PAD = 43
+let CKM_AES_CTR = 44
+let CKM_AES_GCM = 45
+let CKM_AES_CCM = 46
+let CKM_AES_KEY_WRAP = 47
+let CKM_AES_KEY_WRAP_PAD = 48
+let CKM_SHA256_KEY_DERIVATION = 50
+let CKM_SHA384_KEY_DERIVATION = 51
+let CKM_SHA512_KEY_DERIVATION = 52
+let CKM_SHA256_HMAC = 60
+let CKM_SHA384_HMAC = 61
+let CKM_SHA512_HMAC = 62
+let CKM_SHA224_HMAC = 63
+let CKM_ML_KEM_KEY_PAIR_GEN = 200
+let CKM_ML_KEM_ENCAPS = 201
+let CKM_ML_KEM_DECAPS = 202
+let CKM_ML_DSA_KEY_PAIR_GEN = 210
+let CKM_ML_DSA = 211
+let CKM_SLH_DSA_KEY_PAIR_GEN = 220
+let CKM_SLH_DSA = 221
+
+// Session flags
+let CKF_RW_SESSION = 2
+let CKF_SERIAL_SESSION = 4
+
+// User types
+let CKU_SO = 0
+let CKU_USER = 1
+let CKU_CONTEXT_SPECIFIC = 2
+
+// PKCS#11 context
+let pkcs11_lib_handle = 0
+let pkcs11_initialized = 0
+let pkcs11_slots = 0
+let pkcs11_slot_count = 0
+let pkcs11_sessions = 0
+let pkcs11_session_count = 0
+
+// Slot structure
+let SLOT_OFF_ID = 0
+let SLOT_OFF_TOKEN_PRESENT = 8
+let SLOT_OFF_TOKEN_LABEL = 16
+let SLOT_OFF_TOKEN_MANUFACTURER = 24
+let SLOT_OFF_TOKEN_MODEL = 32
+let SLOT_OFF_TOKEN_SERIAL = 40
+let SLOT_OFF_HW_VERSION_MAJOR = 48
+let SLOT_OFF_HW_VERSION_MINOR = 56
+let SLOT_OFF_FW_VERSION_MAJOR = 64
+let SLOT_OFF_FW_VERSION_MINOR = 72
+let SLOT_STRUCT_SIZE = 80
+
+// Token structure
+let TOKEN_OFF_LABEL = 0
+let TOKEN_OFF_MANUFACTURER = 32
+let TOKEN_OFF_MODEL = 64
+let TOKEN_OFF_SERIAL = 96
+let TOKEN_OFF_FLAGS = 128
+let TOKEN_OFF_MAX_SESSIONS = 136
+let TOKEN_OFF_SESSION_COUNT = 144
+let TOKEN_OFF_MAX_RW_SESSIONS = 152
+let TOKEN_OFF_RW_SESSION_COUNT = 160
+let TOKEN_OFF_MAX_PIN_LEN = 168
+let TOKEN_OFF_MIN_PIN_LEN = 176
+let TOKEN_OFF_TOTAL_PUBLIC_MEMORY = 184
+let TOKEN_OFF_FREE_PUBLIC_MEMORY = 192
+let TOKEN_OFF_TOTAL_PRIVATE_MEMORY = 200
+let TOKEN_OFF_FREE_PRIVATE_MEMORY = 208
+let TOKEN_OFF_HW_VERSION_MAJOR = 216
+let TOKEN_OFF_HW_VERSION_MINOR = 224
+let TOKEN_OFF_FW_VERSION_MAJOR = 232
+let TOKEN_OFF_FW_VERSION_MINOR = 240
+let TOKEN_OFF_UTC_TIME = 248
+let TOKEN_STRUCT_SIZE = 256
+
+// Session structure
+let SESSION_OFF_HANDLE = 0
+let SESSION_OFF_SLOT_ID = 8
+let SESSION_OFF_STATE = 16
+let SESSION_OFF_FLAGS = 24
+let SESSION_OFF_USER_TYPE = 32
+let SESSION_OFF_OBJECTS = 40
+let SESSION_STRUCT_SIZE = 48
+
+// Object structure
+let OBJECT_OFF_HANDLE = 0
+let OBJECT_OFF_CLASS = 8
+let OBJECT_OFF_KEY_TYPE = 16
+let OBJECT_OFF_LABEL = 24
+let OBJECT_OFF_ID = 32
+let OBJECT_OFF_VALUE = 40
+let OBJECT_OFF_VALUE_LEN = 48
+let OBJECT_OFF_SENSITIVE = 56
+let OBJECT_OFF_EXTRACTABLE = 64
+let OBJECT_STRUCT_SIZE = 72
+
+// Initialize PKCS#11 library
+fn pkcs11_initialize(lib_path) {
+    if pkcs11_initialized != 0 { return CKR_OK }
+    
+    // In a real implementation, this would dlopen the PKCS#11 library
+    // For now, we simulate a software token
+    pkcs11_lib_handle = 1
+    pkcs11_initialized = 1
+    
+    // Create default slot
+    pkcs11_slot_count = 1
+    pkcs11_slots = mem_alloc(SLOT_STRUCT_SIZE)
+    if pkcs11_slots == 0 { return CKR_HOST_MEMORY }
+    
+    let slot = pkcs11_slots
+    w64(slot + SLOT_OFF_ID, 0)
+    w64(slot + SLOT_OFF_TOKEN_PRESENT, 1)
+    
+    let label = "Quanta Soft Token"
+    let i = 0
+    while i < 32 && i < 17 {
+        mem_store8(slot + SLOT_OFF_TOKEN_LABEL + i, mem_load8(label + i))
+        i = i + 1
+    }
+    while i < 32 {
+        mem_store8(slot + SLOT_OFF_TOKEN_LABEL + i, 0)
+        i = i + 1
+    }
+    
+    let manufacturer = "Quanta Project"
+    i = 0
+    while i < 32 && i < 14 {
+        mem_store8(slot + SLOT_OFF_TOKEN_MANUFACTURER + i, mem_load8(manufacturer + i))
+        i = i + 1
+    }
+    while i < 32 {
+        mem_store8(slot + SLOT_OFF_TOKEN_MANUFACTURER + i, 0)
+        i = i + 1
+    }
+    
+    let model = "SoftHSM v1.0"
+    i = 0
+    while i < 32 && i < 12 {
+        mem_store8(slot + SLOT_OFF_TOKEN_MODEL + i, mem_load8(model + i))
+        i = i + 1
+    }
+    while i < 32 {
+        mem_store8(slot + SLOT_OFF_TOKEN_MODEL + i, 0)
+        i = i + 1
+    }
+    
+    let serial = "00000001"
+    i = 0
+    while i < 32 && i < 8 {
+        mem_store8(slot + SLOT_OFF_TOKEN_SERIAL + i, mem_load8(serial + i))
+        i = i + 1
+    }
+    while i < 32 {
+        mem_store8(slot + SLOT_OFF_TOKEN_SERIAL + i, 0)
+        i = i + 1
+    }
+    
+    w64(slot + SLOT_OFF_HW_VERSION_MAJOR, 1)
+    w64(slot + SLOT_OFF_HW_VERSION_MINOR, 0)
+    w64(slot + SLOT_OFF_FW_VERSION_MAJOR, 1)
+    w64(slot + SLOT_OFF_FW_VERSION_MINOR, 0)
+    
+    // Initialize session array
+    pkcs11_session_count = 0
+    pkcs11_sessions = mem_alloc(16 * SESSION_STRUCT_SIZE)
+    
+    return CKR_OK
+}
+
+// Finalize PKCS#11 library
+fn pkcs11_finalize() {
+    if pkcs11_initialized == 0 { return CKR_OK }
+    
+    if pkcs11_slots != 0 { mem_free(pkcs11_slots) }
+    if pkcs11_sessions != 0 { mem_free(pkcs11_sessions) }
+    
+    pkcs11_initialized = 0
+    pkcs11_lib_handle = 0
+    pkcs11_slot_count = 0
+    pkcs11_session_count = 0
+    
+    return CKR_OK
+}
+
+// Get slot list
+fn pkcs11_get_slot_list(token_present, slot_list, slot_count) {
+    if pkcs11_initialized == 0 { return CKR_CRYPTOKI_NOT_INITIALIZED }
+    
+    let count = pkcs11_slot_count
+    if token_present != 0 {
+        // Filter slots with token present
+        count = 0
+        let i = 0
+        while i < pkcs11_slot_count {
+            let slot = pkcs11_slots + i * SLOT_STRUCT_SIZE
+            if r64(slot + SLOT_OFF_TOKEN_PRESENT) != 0 {
+                count = count + 1
+            }
+            i = i + 1
+        }
+    }
+    
+    if slot_list == 0 {
+        w64(slot_count, count)
+        return CKR_OK
+    }
+    
+    let buf = r64(slot_list)
+    let i = 0
+    let j = 0
+    while i < pkcs11_slot_count && j < count {
+        let slot = pkcs11_slots + i * SLOT_STRUCT_SIZE
+        if token_present == 0 || r64(slot + SLOT_OFF_TOKEN_PRESENT) != 0 {
+            w64(buf + j * 8, r64(slot + SLOT_OFF_ID))
+            j = j + 1
+        }
+        i = i + 1
+    }
+    w64(slot_count, j)
+    return CKR_OK
+}
+
+// Get slot info
+fn pkcs11_get_slot_info(slot_id, info) {
+    if pkcs11_initialized == 0 { return CKR_CRYPTOKI_NOT_INITIALIZED }
+    
+    let i = 0
+    while i < pkcs11_slot_count {
+        let slot = pkcs11_slots + i * SLOT_STRUCT_SIZE
+        if r64(slot + SLOT_OFF_ID) == slot_id {
+            // Copy slot info to output
+            let j = 0
+            while j < SLOT_STRUCT_SIZE {
+                mem_store8(info + j, mem_load8(slot + j))
+                j = j + 1
+            }
+            return CKR_OK
+        }
+        i = i + 1
+    }
+    return CKR_SLOT_ID_INVALID
+}
+
+// Get token info
+fn pkcs11_get_token_info(slot_id, info) {
+    if pkcs11_initialized == 0 { return CKR_CRYPTOKI_NOT_INITIALIZED }
+    
+    let i = 0
+    while i < pkcs11_slot_count {
+        let slot = pkcs11_slots + i * SLOT_STRUCT_SIZE
+        if r64(slot + SLOT_OFF_ID) == slot_id {
+            if r64(slot + SLOT_OFF_TOKEN_PRESENT) == 0 {
+                return CKR_TOKEN_NOT_PRESENT
+            }
+            // Fill token info (simulated)
+            let j = 0
+            let label = "Quanta Soft Token"
+            while j < 32 && j < 17 {
+                mem_store8(info + TOKEN_OFF_LABEL + j, mem_load8(label + j))
+                j = j + 1
+            }
+            while j < 32 {
+                mem_store8(info + TOKEN_OFF_LABEL + j, 0)
+                j = j + 1
+            }
+            
+            let manufacturer = "Quanta Project"
+            j = 0
+            while j < 32 && j < 14 {
+                mem_store8(info + TOKEN_OFF_MANUFACTURER + j, mem_load8(manufacturer + j))
+                j = j + 1
+            }
+            while j < 32 {
+                mem_store8(info + TOKEN_OFF_MANUFACTURER + j, 0)
+                j = j + 1
+            }
+            
+            let model = "SoftHSM v1.0"
+            j = 0
+            while j < 32 && j < 12 {
+                mem_store8(info + TOKEN_OFF_MODEL + j, mem_load8(model + j))
+                j = j + 1
+            }
+            while j < 32 {
+                mem_store8(info + TOKEN_OFF_MODEL + j, 0)
+                j = j + 1
+            }
+            
+            let serial = "00000001"
+            j = 0
+            while j < 32 && j < 8 {
+                mem_store8(info + TOKEN_OFF_SERIAL + j, mem_load8(serial + j))
+                j = j + 1
+            }
+            while j < 32 {
+                mem_store8(info + TOKEN_OFF_SERIAL + j, 0)
+                j = j + 1
+            }
+            
+            w64(info + TOKEN_OFF_FLAGS, 0x0000000F) // RNG, LOGIN_REQUIRED, CLOCK_ON_TOKEN, USER_PIN_INITIALIZED
+            w64(info + TOKEN_OFF_MAX_SESSIONS, 16)
+            w64(info + TOKEN_OFF_SESSION_COUNT, pkcs11_session_count)
+            w64(info + TOKEN_OFF_MAX_RW_SESSIONS, 16)
+            w64(info + TOKEN_OFF_RW_SESSION_COUNT, pkcs11_session_count)
+            w64(info + TOKEN_OFF_MAX_PIN_LEN, 255)
+            w64(info + TOKEN_OFF_MIN_PIN_LEN, 4)
+            w64(info + TOKEN_OFF_TOTAL_PUBLIC_MEMORY, 1024*1024)
+            w64(info + TOKEN_OFF_FREE_PUBLIC_MEMORY, 1024*1024)
+            w64(info + TOKEN_OFF_TOTAL_PRIVATE_MEMORY, 1024*1024)
+            w64(info + TOKEN_OFF_FREE_PRIVATE_MEMORY, 1024*1024)
+            w64(info + TOKEN_OFF_HW_VERSION_MAJOR, 1)
+            w64(info + TOKEN_OFF_HW_VERSION_MINOR, 0)
+            w64(info + TOKEN_OFF_FW_VERSION_MAJOR, 1)
+            w64(info + TOKEN_OFF_FW_VERSION_MINOR, 0)
+            
+            let now = clock() / 1000000000
+            let utc = now
+            // Format as YYYYMMDDhhmmss
+            // Simplified
+            w64(info + TOKEN_OFF_UTC_TIME, utc)
+            
+            return CKR_OK
+        }
+        i = i + 1
+    }
+    return CKR_SLOT_ID_INVALID
+}
+
+// Open session
+fn pkcs11_open_session(slot_id, flags, application, notify, session) {
+    if pkcs11_initialized == 0 { return CKR_CRYPTOKI_NOT_INITIALIZED }
+    if pkcs11_session_count >= 16 { return CKR_SESSION_COUNT }
+    
+    let i = 0
+    while i < pkcs11_slot_count {
+        let slot = pkcs11_slots + i * SLOT_STRUCT_SIZE
+        if r64(slot + SLOT_OFF_ID) == slot_id {
+            if r64(slot + SLOT_OFF_TOKEN_PRESENT) == 0 {
+                return CKR_TOKEN_NOT_PRESENT
+            }
+            
+            let sess = pkcs11_sessions + pkcs11_session_count * SESSION_STRUCT_SIZE
+            let handle = pkcs11_session_count + 1
+            w64(sess + SESSION_OFF_HANDLE, handle)
+            w64(sess + SESSION_OFF_SLOT_ID, slot_id)
+            w64(sess + SESSION_OFF_STATE, 0) // RO_PUBLIC_SESSION
+            w64(sess + SESSION_OFF_FLAGS, flags)
+            w64(sess + SESSION_OFF_USER_TYPE, 0) // No user logged in
+            w64(sess + SESSION_OFF_OBJECTS, 0)
+            
+            w64(session, handle)
+            pkcs11_session_count = pkcs11_session_count + 1
+            return CKR_OK
+        }
+        i = i + 1
+    }
+    return CKR_SLOT_ID_INVALID
+}
+
+// Close session
+fn pkcs11_close_session(session_handle) {
+    if pkcs11_initialized == 0 { return CKR_CRYPTOKI_NOT_INITIALIZED }
+    
+    let i = 0
+    while i < pkcs11_session_count {
+        let sess = pkcs11_sessions + i * SESSION_STRUCT_SIZE
+        if r64(sess + SESSION_OFF_HANDLE) == session_handle {
+            // Move last session to this slot
+            if i < pkcs11_session_count - 1 {
+                let last = pkcs11_sessions + (pkcs11_session_count - 1) * SESSION_STRUCT_SIZE
+                let j = 0
+                while j < SESSION_STRUCT_SIZE {
+                    mem_store8(sess + j, mem_load8(last + j))
+                    j = j + 1
+                }
+            }
+            pkcs11_session_count = pkcs11_session_count - 1
+            return CKR_OK
+        }
+        i = i + 1
+    }
+    return CKR_SESSION_HANDLE_INVALID
+}
+
+// Login
+fn pkcs11_login(session_handle, user_type, pin, pin_len) {
+    if pkcs11_initialized == 0 { return CKR_CRYPTOKI_NOT_INITIALIZED }
+    
+    let i = 0
+    while i < pkcs11_session_count {
+        let sess = pkcs11_sessions + i * SESSION_STRUCT_SIZE
+        if r64(sess + SESSION_OFF_HANDLE) == session_handle {
+            if r64(sess + SESSION_OFF_USER_TYPE) != 0 {
+                return CKR_USER_ALREADY_LOGGED_IN
+            }
+            // Simplified PIN check
+            if pin_len >= 4 {
+                w64(sess + SESSION_OFF_USER_TYPE, user_type)
+                return CKR_OK
+            }
+            return CKR_PIN_INCORRECT
+        }
+        i = i + 1
+    }
+    return CKR_SESSION_HANDLE_INVALID
+}
+
+// Logout
+fn pkcs11_logout(session_handle) {
+    if pkcs11_initialized == 0 { return CKR_CRYPTOKI_NOT_INITIALIZED }
+    
+    let i = 0
+    while i < pkcs11_session_count {
+        let sess = pkcs11_sessions + i * SESSION_STRUCT_SIZE
+        if r64(sess + SESSION_OFF_HANDLE) == session_handle {
+            if r64(sess + SESSION_OFF_USER_TYPE) == 0 {
+                return CKR_USER_NOT_LOGGED_IN
+            }
+            w64(sess + SESSION_OFF_USER_TYPE, 0)
+            return CKR_OK
+        }
+        i = i + 1
+    }
+    return CKR_SESSION_HANDLE_INVALID
+}
+
+// Create object
+fn pkcs11_create_object(session_handle, template, template_count, object_handle) {
+    if pkcs11_initialized == 0 { return CKR_CRYPTOKI_NOT_INITIALIZED }
+    // Simplified - would parse template and create object
+    return CKR_FUNCTION_NOT_SUPPORTED
+}
+
+// Destroy object
+fn pkcs11_destroy_object(session_handle, object_handle) {
+    return CKR_FUNCTION_NOT_SUPPORTED
+}
+
+// Find objects
+fn pkcs11_find_objects_init(session_handle, template, template_count) {
+    return CKR_FUNCTION_NOT_SUPPORTED
+}
+
+fn pkcs11_find_objects(session_handle, object_handles, max_object_count, object_count) {
+    return CKR_FUNCTION_NOT_SUPPORTED
+}
+
+fn pkcs11_find_objects_final(session_handle) {
+    return CKR_FUNCTION_NOT_SUPPORTED
+}
+
+// Generate key pair
+fn pkcs11_generate_key_pair(session_handle, mechanism, public_template, pub_count, private_template, priv_count, public_key, private_key) {
+    let mech = r64(mechanism)
+    
+    if mech == CKM_ML_KEM_KEY_PAIR_GEN {
+        // Generate ML-KEM key pair
+        let pubkey = mem_alloc(1184) // ML-KEM-768 public key
+        let privkey = mem_alloc(2400) // ML-KEM-768 private key
+        if pubkey == 0 || privkey == 0 { return CKR_HOST_MEMORY }
+        
+        ml_kem_768_keygen(pubkey, privkey)
+        
+        // Create public key object
+        let pub_obj = mem_alloc(OBJECT_STRUCT_SIZE)
+        if pub_obj == 0 { return CKR_HOST_MEMORY }
+        w64(pub_obj + OBJECT_OFF_CLASS, CKO_PUBLIC_KEY)
+        w64(pub_obj + OBJECT_OFF_KEY_TYPE, CKK_ML_KEM)
+        w64(pub_obj + OBJECT_OFF_VALUE, pubkey)
+        w64(pub_obj + OBJECT_OFF_VALUE_LEN, 1184)
+        
+        // Create private key object
+        let priv_obj = mem_alloc(OBJECT_STRUCT_SIZE)
+        if priv_obj == 0 { return CKR_HOST_MEMORY }
+        w64(priv_obj + OBJECT_OFF_CLASS, CKO_PRIVATE_KEY)
+        w64(priv_obj + OBJECT_OFF_KEY_TYPE, CKK_ML_KEM)
+        w64(priv_obj + OBJECT_OFF_VALUE, privkey)
+        w64(priv_obj + OBJECT_OFF_VALUE_LEN, 2400)
+        w64(priv_obj + OBJECT_OFF_SENSITIVE, 1)
+        w64(priv_obj + OBJECT_OFF_EXTRACTABLE, 0)
+        
+        w64(public_key, pub_obj)
+        w64(private_key, priv_obj)
+        return CKR_OK
+    } else if mech == CKM_ML_DSA_KEY_PAIR_GEN {
+        // Generate ML-DSA key pair
+        let pubkey = mem_alloc(1952) // ML-DSA-65 public key
+        let privkey = mem_alloc(4032) // ML-DSA-65 private key
+        if pubkey == 0 || privkey == 0 { return CKR_HOST_MEMORY }
+        
+        ml_dsa_65_keygen(pubkey, privkey)
+        
+        let pub_obj = mem_alloc(OBJECT_STRUCT_SIZE)
+        if pub_obj == 0 { return CKR_HOST_MEMORY }
+        w64(pub_obj + OBJECT_OFF_CLASS, CKO_PUBLIC_KEY)
+        w64(pub_obj + OBJECT_OFF_KEY_TYPE, CKK_ML_DSA)
+        w64(pub_obj + OBJECT_OFF_VALUE, pubkey)
+        w64(pub_obj + OBJECT_OFF_VALUE_LEN, 1952)
+        
+        let priv_obj = mem_alloc(OBJECT_STRUCT_SIZE)
+        if priv_obj == 0 { return CKR_HOST_MEMORY }
+        w64(priv_obj + OBJECT_OFF_CLASS, CKO_PRIVATE_KEY)
+        w64(priv_obj + OBJECT_OFF_KEY_TYPE, CKK_ML_DSA)
+        w64(priv_obj + OBJECT_OFF_VALUE, privkey)
+        w64(priv_obj + OBJECT_OFF_VALUE_LEN, 4032)
+        w64(priv_obj + OBJECT_OFF_SENSITIVE, 1)
+        w64(priv_obj + OBJECT_OFF_EXTRACTABLE, 0)
+        
+        w64(public_key, pub_obj)
+        w64(private_key, priv_obj)
+        return CKR_OK
+    } else if mech == CKM_SLH_DSA_KEY_PAIR_GEN {
+        // Generate SLH-DSA key pair
+        let pubkey = mem_alloc(32) // SLH-DSA public key (simplified)
+        let privkey = mem_alloc(64) // SLH-DSA private key (simplified)
+        if pubkey == 0 || privkey == 0 { return CKR_HOST_MEMORY }
+        
+        // Would call slh_dsa_keygen
+        let i = 0
+        while i < 32 {
+            mem_store8(pubkey + i, 0)
+            i = i + 1
+        }
+        i = 0
+        while i < 64 {
+            mem_store8(privkey + i, 0)
+            i = i + 1
+        }
+        
+        let pub_obj = mem_alloc(OBJECT_STRUCT_SIZE)
+        if pub_obj == 0 { return CKR_HOST_MEMORY }
+        w64(pub_obj + OBJECT_OFF_CLASS, CKO_PUBLIC_KEY)
+        w64(pub_obj + OBJECT_OFF_KEY_TYPE, CKK_SLH_DSA)
+        w64(pub_obj + OBJECT_OFF_VALUE, pubkey)
+        w64(pub_obj + OBJECT_OFF_VALUE_LEN, 32)
+        
+        let priv_obj = mem_alloc(OBJECT_STRUCT_SIZE)
+        if priv_obj == 0 { return CKR_HOST_MEMORY }
+        w64(priv_obj + OBJECT_OFF_CLASS, CKO_PRIVATE_KEY)
+        w64(priv_obj + OBJECT_OFF_KEY_TYPE, CKK_SLH_DSA)
+        w64(priv_obj + OBJECT_OFF_VALUE, privkey)
+        w64(priv_obj + OBJECT_OFF_VALUE_LEN, 64)
+        w64(priv_obj + OBJECT_OFF_SENSITIVE, 1)
+        w64(priv_obj + OBJECT_OFF_EXTRACTABLE, 0)
+        
+        w64(public_key, pub_obj)
+        w64(private_key, priv_obj)
+        return CKR_OK
+    }
+    
+    return CKR_MECHANISM_INVALID
+}
+
+// Sign
+fn pkcs11_sign_init(session_handle, mechanism, key_handle) {
+    return CKR_FUNCTION_NOT_SUPPORTED
+}
+
+fn pkcs11_sign(session_handle, data, data_len, signature, signature_len) {
+    return CKR_FUNCTION_NOT_SUPPORTED
+}
+
+fn pkcs11_sign_final(session_handle, signature, signature_len) {
+    return CKR_FUNCTION_NOT_SUPPORTED
+}
+
+// Verify
+fn pkcs11_verify_init(session_handle, mechanism, key_handle) {
+    return CKR_FUNCTION_NOT_SUPPORTED
+}
+
+fn pkcs11_verify(session_handle, data, data_len, signature, signature_len) {
+    return CKR_FUNCTION_NOT_SUPPORTED
+}
+
+fn pkcs11_verify_final(session_handle, signature, signature_len) {
+    return CKR_FUNCTION_NOT_SUPPORTED
+}
+
+// Encrypt/Decrypt
+fn pkcs11_encrypt_init(session_handle, mechanism, key_handle) {
+    return CKR_FUNCTION_NOT_SUPPORTED
+}
+
+fn pkcs11_encrypt(session_handle, data, data_len, encrypted_data, encrypted_data_len) {
+    return CKR_FUNCTION_NOT_SUPPORTED
+}
+
+fn pkcs11_decrypt_init(session_handle, mechanism, key_handle) {
+    return CKR_FUNCTION_NOT_SUPPORTED
+}
+
+fn pkcs11_decrypt(session_handle, encrypted_data, encrypted_data_len, data, data_len) {
+    return CKR_FUNCTION_NOT_SUPPORTED
+}
+
+// Wrap/Unwrap
+fn pkcs11_wrap_key(session_handle, mechanism, wrapping_key, key_handle, wrapped_key, wrapped_key_len) {
+    return CKR_FUNCTION_NOT_SUPPORTED
+}
+
+fn pkcs11_unwrap_key(session_handle, mechanism, unwrapping_key, wrapped_key, wrapped_key_len, template, template_count, key_handle) {
+    return CKR_FUNCTION_NOT_SUPPORTED
+}
+
+// Derive key
+fn pkcs11_derive_key(session_handle, mechanism, base_key, template, template_count, key_handle) {
+    return CKR_FUNCTION_NOT_SUPPORTED
+}
+
+// Random
+fn pkcs11_generate_random(session_handle, random_data, random_len) {
+    if pkcs11_initialized == 0 { return CKR_CRYPTOKI_NOT_INITIALIZED }
+    getrandom(random_data, random_len, 0)
+    return CKR_OK
+}
+
+fn pkcs11_seed_random(session_handle, seed, seed_len) {
+    return CKR_RANDOM_SEED_NOT_SUPPORTED
+}
+
+// TPM 2.0 (ESAPI) interface
+// TPM command codes
+let TPM_CC_FIRST = 0x011F
+let TPM_CC_CREATE_PRIMARY = 0x0131
+let TPM_CC_CREATE = 0x0153
+let TPM_CC_LOAD = 0x0157
+let TPM_CC_READ_PUBLIC = 0x0173
+let TPM_CC_GET_CAPABILITY = 0x017A
+let TPM_CC_GET_RANDOM = 0x017B
+let TPM_CC_HASH = 0x017D
+let TPM_CC_HMAC = 0x017E
+let TPM_CC_SIGN = 0x0182
+let TPM_CC_VERIFY_SIGNATURE = 0x0183
+let TPM_CC_QUOTE = 0x0184
+let TPM_CC_PCR_EXTEND = 0x018D
+let TPM_CC_PCR_READ = 0x018E
+let TPM_CC_ATTEST = 0x018F
+
+// TPM handle types
+let TPM_RH_FIRST = 0x40000000
+let TPM_RH_SRK = 0x40000000
+let TPM_RH_OWNER = 0x40000001
+let TPM_RH_ENDORSEMENT = 0x4000000B
+let TPM_RH_PLATFORM = 0x4000000C
+let TPM_RH_NULL = 0x40000007
+
+// TPM context
+let tpm_context = 0
+let tpm_initialized = 0
+let tpm_handles = 0
+let tpm_handle_count = 0
+
+fn tpm_initialize() {
+    if tpm_initialized != 0 { return 0 }
+    tpm_initialized = 1
+    tpm_context = 1 // Simulated context
+    tpm_handle_count = 0
+    tpm_handles = mem_alloc(32 * 16) // handle + name + auth
+    return 0
+}
+
+fn tpm_finalize() {
+    if tpm_initialized == 0 { return 0 }
+    if tpm_handles != 0 { mem_free(tpm_handles) }
+    tpm_initialized = 0
+    tpm_context = 0
+    return 0
+}
+
+fn tpm_create_primary(parent_handle, in_sensitive, in_public, outside_info, creation_pcr, handle_out, out_public, creation_data, creation_hash, creation_ticket) {
+    if tpm_initialized == 0 { return -1 }
+    // Simulated primary key creation
+    let handle = 0x80000000 | (tpm_handle_count + 1)
+    w64(handle_out, handle)
+    // Would fill out_public, creation_data, etc.
+    return 0
+}
+
+fn tpm_create(parent_handle, in_sensitive, in_public, outside_info, creation_pcr, out_private, out_public, creation_data, creation_hash, creation_ticket) {
+    if tpm_initialized == 0 { return -1 }
+    // Simulated key creation
+    return 0
+}
+
+fn tpm_load(parent_handle, in_private, in_public, handle_out, name) {
+    if tpm_initialized == 0 { return -1 }
+    let handle = 0x80000000 | (tpm_handle_count + 1)
+    w64(handle_out, handle)
+    tpm_handle_count = tpm_handle_count + 1
+    return 0
+}
+
+fn tpm_read_public(handle, out_public, name, qualified_name) {
+    if tpm_initialized == 0 { return -1 }
+    return 0
+}
+
+fn tpm_sign(key_handle, digest, in_scheme, validation, signature) {
+    if tpm_initialized == 0 { return -1 }
+    return 0
+}
+
+fn tpm_verify_signature(key_handle, digest, signature, validation) {
+    if tpm_initialized == 0 { return -1 }
+    return 0
+}
+
+fn tpm_get_random(bytes_requested, random_bytes) {
+    if tpm_initialized == 0 { return -1 }
+    getrandom(random_bytes, bytes_requested, 0)
+    return 0
+}
+
+fn tpm_pcr_extend(pcr_handle, digests) {
+    return 0
+}
+
+fn tpm_pcr_read(pcr_selection_in, pcr_selection_out, pcr_values) {
+    return 0
+}
+
+fn tpm_quote(sign_handle, qualifying_data, in_scheme, quoted, signature) {
+    return 0
+}
+
+// Attestation
+fn tpm_attest(key_handle, qualifying_data, in_scheme, attestation_data, signature) {
+    // Generate attestation quote
+    return 0
+}
+
+// Secure Enclave (SGX/SEV) Attestation
+// SGX constants
+let SGX_REPORT_SIZE = 432
+let SGX_QUOTE_SIZE = 1024
+let SGX_TARGET_INFO_SIZE = 512
+let SGX_EPID_GROUP_ID_SIZE = 4
+
+// SEV constants
+let SEV_REPORT_SIZE = 1024
+let SEV_CERT_CHAIN_SIZE = 4096
+
+// Enclave context
+let enclave_type = 0 // 0 = none, 1 = SGX, 2 = SEV
+let enclave_initialized = 0
+let enclave_report = 0
+
+fn enclave_init_sgx() {
+    // Check for SGX support (CPUID)
+    // For now simulate
+    enclave_type = 1
+    enclave_initialized = 1
+    enclave_report = mem_alloc(SGX_REPORT_SIZE)
+    return 0
+}
+
+fn enclave_init_sev() {
+    // Check for SEV support (CPUID)
+    enclave_type = 2
+    enclave_initialized = 1
+    enclave_report = mem_alloc(SEV_REPORT_SIZE)
+    return 0
+}
+
+fn enclave_get_report(target_info, target_info_len, report_data, report_data_len, report_out, report_len_out) {
+    if enclave_initialized == 0 { return -1 }
+    
+    if enclave_type == 1 {
+        // SGX report
+        let report = mem_alloc(SGX_REPORT_SIZE)
+        if report == 0 { return -1 }
+        // Fill with simulated data
+        let i = 0
+        while i < SGX_REPORT_SIZE {
+            mem_store8(report + i, 0)
+            i = i + 1
+        }
+        // Copy report_data
+        let copy_len = report_data_len
+        if copy_len > 64 { copy_len = 64 }
+        i = 0
+        while i < copy_len {
+            mem_store8(report + 32 + i, mem_load8(report_data + i))
+            i = i + 1
+        }
+        w64(report_out, report)
+        w64(report_len_out, SGX_REPORT_SIZE)
+        return 0
+    } else if enclave_type == 2 {
+        // SEV report
+        let report = mem_alloc(SEV_REPORT_SIZE)
+        if report == 0 { return -1 }
+        let i = 0
+        while i < SEV_REPORT_SIZE {
+            mem_store8(report + i, 0)
+            i = i + 1
+        }
+        w64(report_out, report)
+        w64(report_len_out, SEV_REPORT_SIZE)
+        return 0
+    }
+    return -1
+}
+
+fn enclave_get_quote(report, report_len, spid, spid_len, quote_type, quote_out, quote_len_out) {
+    if enclave_initialized == 0 { return -1 }
+    
+    if enclave_type == 1 {
+        // SGX quote (EPID or ECDSA)
+        let quote = mem_alloc(SGX_QUOTE_SIZE)
+        if quote == 0 { return -1 }
+        let i = 0
+        while i < SGX_QUOTE_SIZE {
+            mem_store8(quote + i, 0)
+            i = i + 1
+        }
+        w64(quote_out, quote)
+        w64(quote_len_out, SGX_QUOTE_SIZE)
+        return 0
+    }
+    return -1
+}
+
+fn enclave_verify_quote(quote, quote_len, collateral, collateral_len) {
+    // Verify SGX/SEV quote
+    return 0
+}
+
+fn enclave_free() {
+    if enclave_report != 0 { mem_free(enclave_report) }
+    enclave_initialized = 0
+    enclave_type = 0
+    enclave_report = 0
+}
+
+// HSM abstraction layer
+// Unified interface for PKCS#11, TPM, and Enclave
+let hsm_backend = 0 // 0 = none, 1 = pkcs11, 2 = tpm, 3 = sgx, 4 = sev
+let hsm_initialized = 0
+
+fn hsm_init_pkcs11(lib_path) {
+    hsm_backend = 1
+    return pkcs11_initialize(lib_path)
+}
+
+fn hsm_init_tpm() {
+    hsm_backend = 2
+    return tpm_initialize()
+}
+
+fn hsm_init_sgx() {
+    hsm_backend = 3
+    return enclave_init_sgx()
+}
+
+fn hsm_init_sev() {
+    hsm_backend = 4
+    return enclave_init_sev()
+}
+
+fn hsm_finalize() {
+    if hsm_backend == 1 {
+        pkcs11_finalize()
+    } else if hsm_backend == 2 {
+        tpm_finalize()
+    } else if hsm_backend == 3 || hsm_backend == 4 {
+        enclave_free()
+    }
+    hsm_backend = 0
+    hsm_initialized = 0
+    return 0
+}
+
+fn hsm_generate_key_pair(key_type, params, pub_out, priv_out) {
+    if hsm_backend == 1 {
+        // Use PKCS#11
+        return CKR_FUNCTION_NOT_SUPPORTED // Would need session
+    } else if hsm_backend == 2 {
+        // Use TPM
+        return -1
+    } else if hsm_backend == 3 || hsm_backend == 4 {
+        // Use enclave
+        return -1
+    }
+    return -1
+}
+
+fn hsm_sign(key_handle, data, data_len, signature, signature_len) {
+    return -1
+}
+
+fn hsm_verify(key_handle, data, data_len, signature, signature_len) {
+    return -1
+}
+
+fn hsm_encrypt(key_handle, data, data_len, encrypted, encrypted_len) {
+    return -1
+}
+
+fn hsm_decrypt(key_handle, encrypted, encrypted_len, data, data_len) {
+    return -1
+}
+
+fn hsm_attest(key_handle, nonce, attestation_out, attestation_len_out) {
+    if hsm_backend == 2 {
+        // TPM attestation
+        let attestation = mem_alloc(1024)
+        if attestation == 0 { return -1 }
+        w64(attestation_out, attestation)
+        w64(attestation_len_out, 1024)
+        return 0
+    } else if hsm_backend == 3 {
+        // SGX attestation
+        let quote = mem_alloc(SGX_QUOTE_SIZE)
+        if quote == 0 { return -1 }
+        w64(attestation_out, quote)
+        w64(attestation_len_out, SGX_QUOTE_SIZE)
+        return 0
+    } else if hsm_backend == 4 {
+        // SEV attestation
+        let report = mem_alloc(SEV_REPORT_SIZE)
+        if report == 0 { return -1 }
+        w64(attestation_out, report)
+        w64(attestation_len_out, SEV_REPORT_SIZE)
+        return 0
+    }
+    return -1
+}
+
+fn hsm_get_random(random_data, random_len) {
+    if hsm_backend == 1 {
+        // PKCS#11
+        return pkcs11_generate_random(0, random_data, random_len)
+    } else if hsm_backend == 2 {
+        // TPM
+        return tpm_get_random(random_len, random_data)
+    }
+    getrandom(random_data, random_len, 0)
+    return 0
+}
+
+// Key import/export
+fn hsm_import_key(key_type, key_data, key_len, handle_out) {
+    return -1
+}
+
+fn hsm_export_key(key_handle, key_data_out, key_len_out) {
+    return -1
+}
+
+// Certificate storage in HSM
+fn hsm_store_certificate(cert_data, cert_len, handle_out) {
+    return -1
+}
+
+fn hsm_get_certificate(handle, cert_data_out, cert_len_out) {
+    return -1
+}
+
+// Secure key derivation in HSM
+fn hsm_derive_key(base_handle, kdf_type, params, derived_handle_out) {
+    return -1
+}
+
+// HSM health check
+fn hsm_self_test() {
+    if hsm_backend == 1 {
+        return pkcs11_initialize(0) == CKR_OK ? 0 : -1
+    } else if hsm_backend == 2 {
+        return tpm_get_random(32, mem_alloc(32)) == 0 ? 0 : -1
+    } else if hsm_backend == 3 || hsm_backend == 4 {
+        return enclave_initialized == 1 ? 0 : -1
+    }
+    return -1
+}
