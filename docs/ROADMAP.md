@@ -209,17 +209,17 @@ Next core = **0.0.136** (`self-sufficiency` — native `printf` / variadic forma
 | 0.0.148 | `ai` | tensor ops + inference (AI-age, promoted into core chain) |
 | 0.0.149 | `lang` | generics type constraints (FIX-0.0.33; `where` bounds enforced) |
 | 0.0.150 | `lang` | borrow-check (language safety pass) — core, hardest |
-|| 0.0.151 | `secure` | X.509 / PKI — ASN.1 DER parser, cert chain validation, SAN/IP/CN, expiry, revocation (CRL/OCSP), trust store, cert/key PEM/DER load/save |
-|| 0.0.152 | `secure` | Certificate Transparency — SCT parsing/verification (RFC 6962), log list management, inclusion proof verification, stapled SCT validation |
-|| 0.0.153 | `secure` | OCSP Stapling — server-side OCSP response fetch, caching, stapling in TLS handshake, client-side verification |
-|| 0.0.154 | `secure` | TLS Resumption — session tickets (RFC 5077), PSK (RFC 8446), 0-RTT with replay protection |
-|| 0.0.155 | `secure` | mTLS / SPIFFE — X.509-SVID / JWT-SVID parsing, workload identity, trust domain federation, automatic rotation via SPIRE agent API |
-|| 0.0.156 | `secure` | Hardware Security Module — PKCS#11 (Cryptoki) interface, TPM 2.0 (ESAPI), secure enclave (SGX/SEV) attestation, key generation/storage/signing in HSM |
-|| 0.0.157 | `secure` | Key Derivation / Secrets at Rest — Argon2id (RFC 9106), Scrypt, PBKDF2, HKDF (RFC 5869), encrypted keystore (AES-256-GCM + Argon2id), key rotation policies |
-|| 0.0.158 | `secure` | Side-Channel Hardening — constant-time comparators (all PQC ops), masking/blinding for ML-KEM/ML-DSA/SLH-DSA, cache-line alignment, timing-safe memory access |
-|| 0.0.159 | `secure` | Audit & Tamper-Evident Logging — Merkle-tree log (RFC 6962), Trillian-compatible, signed checkpoints, inclusion/consistency proofs, sigstore/cosign integration |
-|| 0.0.160 | `secure` | Supply Chain Security — in-toto/SLSA provenance, sigstore/cosign signing & verification, reproducible build attestation, SBOM (SPDX/CycloneDX) generation |
-|| 0.0.161 | `secure` | Compliance Artifacts — FIPS 140-3 Level 1 module boundary, Common Criteria EAL4+ evidence, ISO 27001 control mapping, NIST 800-53 traceability |
+| 0.0.151 | `secure` | X.509 / PKI — ASN.1 DER parser, cert chain validation, SAN/IP/CN, expiry, revocation (CRL/OCSP), trust store, cert/key PEM/DER load/save |
+| 0.0.152 | `secure` | Certificate Transparency — SCT parsing/verification (RFC 6962), log list management, inclusion proof verification, stapled SCT validation |
+| 0.0.153 | `secure` | OCSP Stapling — server-side OCSP response fetch, caching, stapling in TLS handshake, client-side verification |
+| 0.0.154 | `secure` | TLS Resumption — session tickets (RFC 5077), PSK (RFC 8446), 0-RTT with replay protection |
+| 0.0.155 | `secure` | mTLS / SPIFFE — X.509-SVID / JWT-SVID parsing, workload identity, trust domain federation, automatic rotation via SPIRE agent API |
+| 0.0.156 | `secure` | Hardware Security Module — PKCS#11 (Cryptoki) interface, TPM 2.0 (ESAPI), secure enclave (SGX/SEV) attestation, key generation/storage/signing in HSM |
+| 0.0.157 | `secure` | Key Derivation / Secrets at Rest — Argon2id (RFC 9106), Scrypt, PBKDF2, HKDF (RFC 5869), encrypted keystore (AES-256-GCM + Argon2id), key rotation policies |
+| 0.0.158 | `secure` | Side-Channel Hardening — constant-time comparators (all PQC ops), masking/blinding for ML-KEM/ML-DSA/SLH-DSA, cache-line alignment, timing-safe memory access |
+| 0.0.159 | `secure` | Audit & Tamper-Evident Logging — Merkle-tree log (RFC 6962), Trillian-compatible, signed checkpoints, inclusion/consistency proofs, sigstore/cosign integration |
+| 0.0.160 | `secure` | Supply Chain Security — in-toto/SLSA provenance, sigstore/cosign signing & verification, reproducible build attestation, SBOM (SPDX/CycloneDX) generation |
+| 0.0.161 | `secure` | Compliance Artifacts — FIPS 140-3 Level 1 module boundary, Common Criteria EAL4+ evidence, ISO 27001 control mapping, NIST 800-53 traceability |
 || 0.0.162 | `secure` | Policy Engine — OPA/Rego-compatible policy language, runtime evaluation (TLS config, cert pinning, cipher suite enforcement, mTLS requirements), audit trail |
 || 0.0.163 | `ai` | LLM Foundations — RoPE (rotary position embeddings), RMSNorm, SwiGLU/GeGLU, Grouped-Query Attention (GQA), Multi-Query Attention (MQA) |
 || 0.0.164 | `ai` | Autoregressive Decoding — KV cache (paged/continuous), sliding window attention, speculative decoding (draft+verify), prefix caching |
