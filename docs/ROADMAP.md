@@ -337,32 +337,10 @@ reproduces itself). Pending feature tests (bswap/popcount/defer/generics/
 import/memcpy) are unimplemented intrinsics, not regressions.
 
 
-## Version history (archive)
+## Next steps (after 0.0.149)
 
-Condensed from the append-only changelog. Full detail for every version is
-preserved in `git log` / `git show <commit>`. Order: newest first.
+Core sequence continues from 0.0.150 (borrow-check) → 0.0.151 (X.509/PKI) → 0.0.152 (CT) → 0.0.153 (OCSP) → 0.0.154 (TLS Resumption) → 0.0.155 (mTLS/SPIFFE) → 0.0.156 (HSM/PKCS#11) → 0.0.157 (Key Derivation) → 0.0.158 (Side-channel hardening) → 0.0.159 (Audit logging) → 0.0.160 (Supply chain) → 0.0.161 (Compliance) → 0.0.162 (Policy Engine) → AI chain (0.0.163–0.0.172) → Blockchain chain (0.0.173–0.0.179) → Quantum chain (0.0.180–0.0.182) → Language advanced (0.0.183–0.0.186) → Math full capability (0.0.187–0.0.197) → **0.1.0 STABLE**.
 
-| Version | Core | Headline | Notes |
-|---------|------|----------|-------|
-| 0.0.99 | Lang | extern-C polish (4 real defects fixed) + 7-layer gate + self-host fixpoint | stable seed for 0.0.100 |
-| 0.0.98 | Core A | extern C (object mode + gcc) + interface/impl/trait vtable dispatch | seed for 0.0.99 |
-| 0.0.97 | — | (see git history) | |
-| 0.0.96 | Lang | `try`/`catch` real unwind to handler | seed for 0.0.97 |
-| 0.0.95 | Lang | `String` real type (length-aware) | |
-| 0.0.94 | Lang | `move`/`ref`/`mut` ownership sigils | |
-| 0.0.93 | Lang | `where` clause | |
-| 0.0.92 | Lang | `volatile` qualifier verified | |
-| 0.0.91 | — | (see git history) | |
-| 0.0.90 | Lang | `as` cast; `raw` pointers (`*u64`/`*mut u64`) | |
-| 0.0.89 | — | (see git history) | |
-| 0.0.88 | — | (see git history) | |
-| 0.0.87 | std-lib gating | 7 `std_*` tests added to gate (117→124) | |
-| 0.0.86 | promoted stable | int→big auto-promotion (from 0.0.85) + full gate 117/117 | seed |
-| 0.0.85 | Lang | int→big auto-promotion (over-size decimal literals) | |
-| 0.0.84 | big-int perf | 24-bit limbs + decimal printing + Karatsuba | |
-| 0.0.83 | big-int Stage 3 | arbitrary-magnitude `big_shl`/`big_shr` | |
-| 0.0.82 | big-int Stage 2 | DIV/MOD (Python semantics) | |
-| 0.0.81 | big-int Stage 1 | ADD/SUB/MUL (pure stdlib) | |
-| 0.0.80 | Lang | floor division + Python-style modulo | |
-| 0.0.79 | — | reverted (build breakage from dropped `compute_magic`) | |
-| 0.0.78 | self-host | true 2-stage self-host; P2 builtins; float/enums/modules/closures | baseline |
+Self-improvement engine (SI_0.0.001–SI_0.0.007) starts after 0.0.162 — see `SI_ROADMAP.md`.
+
+Full detail for every version is preserved in `git log` / `git show <commit>`.
