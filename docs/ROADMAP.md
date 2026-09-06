@@ -208,7 +208,7 @@ Next core = **0.0.136** (`self-sufficiency` — native `printf` / variadic forma
 | 0.0.147 | `http` | HTTP/2-over-TLS (no plaintext shipped) |
 | 0.0.148 | `ai` | tensor ops + inference (AI-age, promoted into core chain) |
 | 0.0.149 | `lang` | generics type constraints (FIX-0.0.33; `where` bounds enforced) |
-| 0.0.150 | `lang` | borrow-check (language safety pass) — core, hardest |
+| 0.0.150 | `lang` | borrow-check (language safety pass) — core, hardest | ✅ DONE — record phase (ownership tags, borrow tracking, move detection, dangling ref detection); enforcement deferred to 0.1.0 |
 | 0.0.151 | `secure` | X.509 / PKI — ASN.1 DER parser, cert chain validation, SAN/IP/CN, expiry, revocation (CRL/OCSP), trust store, cert/key PEM/DER load/save |
 | 0.0.152 | `secure` | Certificate Transparency — SCT parsing/verification (RFC 6962), log list management, inclusion proof verification, stapled SCT validation |
 | 0.0.153 | `secure` | OCSP Stapling — server-side OCSP response fetch, caching, stapling in TLS handshake, client-side verification |

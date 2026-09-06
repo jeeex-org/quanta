@@ -666,10 +666,9 @@ fn main(argc, argv) {
         // body. Popped after the body is parsed.
         fn_push(fi)
 
-        // 0.0.150: record IR start for borrow checker
-        w64(fn_ir_start + fi*8, irc)
-
                     parse_block()
+        // 0.0.150: borrow check (record phase only, no enforcement)
+        borrow_check_fn(0, irc)
         iremit(IR_RET,0,-1,0,0)
         fn_pop()
         // P11 (0.0.67): snapshot this function's locals so any closure body
@@ -677,14 +676,6 @@ fn main(argc, argv) {
         // captured name to the vreg that held it in THIS frame.
         clo_scope_save(fi)
         cur_clo = 0 - 1
-
-        // 0.0.150: record IR end for borrow checker
-        w64(fn_ir_end + fi*8, irc)
-
-        // 0.0.150: borrow check this function now (before vclr clears symbol table)
-        if r64(fn_extern + fi*8) == 0 {
-            borrow_check_fn(fi)
-        }
 
         // Save IR start and param count
         sfn(fi,fn_name(fi),fn_nlen(fi),fn_btok(fi),0,pc,0,0)
