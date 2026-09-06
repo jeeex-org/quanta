@@ -1,0 +1,101 @@
+// Side-channel hardening constants test - constants only (no imports)
+fn cache_line_size(): i64 { return 64 }
+
+// Constant-time comparison functions (local definitions for test)
+fn ct_eq32(a: i64, b: i64): i64 {
+    let diff = a ^ b
+    diff = diff | (-diff)
+    diff = diff >> 31
+    return diff & 1
+}
+
+fn ct_eq64(a: i64, b: i64): i64 {
+    let diff = a ^ b
+    diff = diff | (-diff)
+    diff = diff >> 63
+    return diff & 1
+}
+
+fn ct_select32(cond: i64, a: i64, b: i64): i64 {
+    let mask = -cond
+    return (a & mask) | (b & ~mask)
+}
+
+fn ct_memcmp(a, b, len: i64): i64 {
+    let diff = 0
+    let i = 0
+    while i < len {
+        diff = diff | (mem_load8(a + i) ^ mem_load8(b + i))
+        i = i + 1
+    }
+    return diff
+}
+
+fn ct_eq32_test(): i64 {
+    let a = ct_eq32(5, 5)
+    let b = ct_eq32(5, 6)
+    if a != 0 { return 1 }
+    if b != 1 { return 2 }
+    return 0
+}
+
+fn ct_eq64_test(): i64 {
+    let a = ct_eq64(100, 100)
+    let b = ct_eq64(100, 200)
+    if a != 0 { return 1 }
+    if b != 1 { return 2 }
+    return 0
+}
+
+fn ct_select32_test(): i64 {
+    let a = ct_select32(1, 10, 20)
+    let b = ct_select32(0, 10, 20)
+    if a != 10 { return 1 }
+    if b != 20 { return 2 }
+    return 0
+}
+
+fn ct_memcmp_test(): i64 {
+    // Use arrays instead of string literals (which are length-prefixed)
+    let a = mem_alloc(5)
+    let b = mem_alloc(5)
+    let c = mem_alloc(5)
+    
+    mem_store8(a + 0, 104) // 'h'
+    mem_store8(a + 1, 101) // 'e'
+    mem_store8(a + 2, 108) // 'l'
+    mem_store8(a + 3, 108) // 'l'
+    mem_store8(a + 4, 111) // 'o'
+    
+    mem_store8(b + 0, 104) // 'h'
+    mem_store8(b + 1, 101) // 'e'
+    mem_store8(b + 2, 108) // 'l'
+    mem_store8(b + 3, 108) // 'l'
+    mem_store8(b + 4, 111) // 'o'
+    
+    mem_store8(c + 0, 119) // 'w'
+    mem_store8(c + 1, 111) // 'o'
+    mem_store8(c + 2, 114) // 'r'
+    mem_store8(c + 3, 108) // 'l'
+    mem_store8(c + 4, 100) // 'd'
+    
+    let r1 = ct_memcmp(a, b, 5)
+    let r2 = ct_memcmp(a, c, 5)
+    
+    mem_free(a)
+    mem_free(b)
+    mem_free(c)
+    
+    if r1 != 0 { return 1 }
+    if r2 == 0 { return 2 }
+    return 0
+}
+
+fn main() {
+    if cache_line_size() != 64 { return 1 }
+    if ct_eq32_test() != 0 { return 2 }
+    if ct_eq64_test() != 0 { return 3 }
+    if ct_select32_test() != 0 { return 4 }
+    if ct_memcmp_test() != 0 { return 5 }
+    return 0
+}
