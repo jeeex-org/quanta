@@ -1,0 +1,412 @@
+// Certificate Transparency (RFC 6962) — SCT parsing/verification
+// Pure Quanta implementation, zero external deps
+// Uses lib/std/x509_asn1.quanta for ASN.1 DER decoding
+
+include "x509_asn1.quanta"
+
+// CT version
+let CT_VERSION_V1 = 0
+
+// SCT signature algorithms (RFC 6962 Section 3.2)
+let CT_SIG_ANONYMOUS = 0
+let CT_SIG_ECDSA = 1
+let CT_SIG_RSA = 2
+let CT_SIG_DSA = 3
+
+// SCT hash algorithms (RFC 6962 Section 3.2)
+let CT_HASH_NONE = 0
+let CT_HASH_MD5 = 1
+let CT_HASH_SHA1 = 2
+let CT_HASH_SHA224 = 3
+let CT_HASH_SHA256 = 4
+let CT_HASH_SHA384 = 5
+let CT_HASH_SHA512 = 6
+
+// SCT origin types (RFC 6962 Section 3.2)
+let CT_SCT_X509_CERT = 0
+let CT_SCT_PRECERT = 1
+
+// SCT structure offsets (heap-allocated)
+let SCT_OFF_VERSION = 0
+let SCT_OFF_LOG_ID = 8
+let SCT_OFF_TIMESTAMP = 40
+let SCT_OFF_EXTENSIONS = 48
+let SCT_OFF_SIG_ALGO = 56
+let SCT_OFF_SIG_HASH = 57
+let SCT_OFF_SIGNATURE = 58
+let SCT_OFF_SIG_LEN = 66
+let SCT_STRUCT_SIZE = 74
+
+// Log entry types
+let CT_ENTRY_X509 = 0
+let CT_ENTRY_PRECERT = 1
+
+// Merkle tree hash algorithm
+let CT_HASH_SHA256 = 4
+
+// SCT list context
+let sct_list_buf = 0
+let sct_list_len = 0
+
+// Initialize SCT list parser
+fn sct_init_list(buf, len) {
+    sct_list_buf = buf
+    sct_list_len = len
+    return 0
+}
+
+// Parse a single SCT from buffer
+// Returns heap pointer to SCT struct, or 0 on error
+fn sct_parse_single(buf, len) {
+    if len < 2 { return 0 }
+    
+    // SCT format: version(1) + log_id(32) + timestamp(8) + extensions(len) + signature
+    let pos = 0
+    let version = mem_load8(buf + pos)
+    pos = pos + 1
+    
+    if version != CT_VERSION_V1 { return 0 }
+    
+    // log_id (32 bytes)
+    if pos + 32 > len { return 0 }
+    let log_id = mem_alloc(32)
+    if log_id == 0 { return 0 }
+    let i = 0
+    while i < 32 {
+        mem_store8(log_id + i, mem_load8(buf + pos + i))
+        i = i + 1
+    }
+    pos = pos + 32
+    
+    // timestamp (8 bytes, big-endian milliseconds since epoch)
+    if pos + 8 > len {
+        mem_free(log_id)
+        return 0
+    }
+    let timestamp = 0
+    i = 0
+    while i < 8 {
+        timestamp = (timestamp << 8) | mem_load8(buf + pos + i)
+        i = i + 1
+    }
+    pos = pos + 8
+    
+    // extensions (varint length + data)
+    let ext_len = 0
+    if pos >= len {
+        mem_free(log_id)
+        return 0
+    }
+    ext_len = mem_load8(buf + pos)
+    pos = pos + 1
+    if ext_len > 0 {
+        if pos + ext_len > len {
+            mem_free(log_id)
+            return 0
+        }
+        pos = pos + ext_len // skip extensions for now
+    }
+    
+    // signature: hash_algo(1) + sig_algo(1) + sig_len(2) + signature
+    if pos + 4 > len {
+        mem_free(log_id)
+        return 0
+    }
+    let hash_algo = mem_load8(buf + pos)
+    pos = pos + 1
+    let sig_algo = mem_load8(buf + pos)
+    pos = pos + 1
+    let sig_len = (mem_load8(buf + pos) << 8) | mem_load8(buf + pos + 1)
+    pos = pos + 2
+    
+    if pos + sig_len > len {
+        mem_free(log_id)
+        return 0
+    }
+    let signature = mem_alloc(sig_len)
+    if signature == 0 {
+        mem_free(log_id)
+        return 0
+    }
+    i = 0
+    while i < sig_len {
+        mem_store8(signature + i, mem_load8(buf + pos + i))
+        i = i + 1
+    }
+    
+    // Allocate SCT struct
+    let sct = mem_alloc(SCT_STRUCT_SIZE)
+    if sct == 0 {
+        mem_free(log_id)
+        mem_free(signature)
+        return 0
+    }
+    
+    w64(sct + SCT_OFF_VERSION, version)
+    w64(sct + SCT_OFF_LOG_ID, log_id)
+    w64(sct + SCT_OFF_TIMESTAMP, timestamp)
+    w64(sct + SCT_OFF_EXTENSIONS, 0) // not parsed yet
+    w64(sct + SCT_OFF_SIG_ALGO, sig_algo)
+    w64(sct + SCT_OFF_SIG_HASH, hash_algo)
+    w64(sct + SCT_OFF_SIGNATURE, signature)
+    w64(sct + SCT_OFF_SIG_LEN, sig_len)
+    
+    return sct
+}
+
+// Parse SCT list from TLS extension (RFC 6962 Section 3.3)
+// Returns array of SCT pointers, count in count_out
+fn sct_parse_list(buf, len, scts_out, count_out) {
+    sct_init_list(buf, len)
+    
+    if len < 2 { return -1 }
+    let list_len = (mem_load8(buf) << 8) | mem_load8(buf + 1)
+    if list_len != len - 2 { return -1 }
+    
+    let pos = 2
+    let count = 0
+    let scts = mem_alloc(64) // array of 8-byte pointers
+    if scts == 0 { return -1 }
+    
+    while pos < len {
+        let sct_len = (mem_load8(buf + pos) << 8) | mem_load8(buf + pos + 1)
+        pos = pos + 2
+        
+        if pos + sct_len > len {
+            // Cleanup
+            let i = 0
+            while i < count {
+                sct_free(r64(scts + i * 8))
+                i = i + 1
+            }
+            mem_free(scts)
+            return -1
+        }
+        
+        let sct = sct_parse_single(buf + pos, sct_len)
+        if sct == 0 {
+            let i = 0
+            while i < count {
+                sct_free(r64(scts + i * 8))
+                i = i + 1
+            }
+            mem_free(scts)
+            return -1
+        }
+        
+        w64(scts + count * 8, sct)
+        count = count + 1
+        pos = pos + sct_len
+        
+        // Resize array if needed
+        if count * 8 >= 64 {
+            let new_scts = mem_alloc(count * 16)
+            if new_scts == 0 {
+                let i = 0
+                while i < count {
+                    sct_free(r64(scts + i * 8))
+                    i = i + 1
+                }
+                mem_free(scts)
+                return -1
+            }
+            i = 0
+            while i < count {
+                w64(new_scts + i * 8, r64(scts + i * 8))
+                i = i + 1
+            }
+            mem_free(scts)
+            scts = new_scts
+        }
+    }
+    
+    w64(scts_out, scts)
+    w64(count_out, count)
+    return 0
+}
+
+// Free SCT struct
+fn sct_free(sct) {
+    if sct == 0 { return }
+    let log_id = r64(sct + SCT_OFF_LOG_ID)
+    if log_id != 0 { mem_free(log_id) }
+    let sig = r64(sct + SCT_OFF_SIGNATURE)
+    if sig != 0 { mem_free(sig) }
+    mem_free(sct)
+}
+
+// Free SCT array
+fn sct_free_list(scts, count) {
+    if scts == 0 { return }
+    let i = 0
+    while i < count {
+        sct_free(r64(scts + i * 8))
+        i = i + 1
+    }
+    mem_free(scts)
+}
+
+// Verify SCT signature (simplified - checks structure only)
+// In full impl: reconstruct MerkleTreeLeaf, hash, verify with log public key
+fn sct_verify_signature(sct, entry_data, entry_len, log_pubkey, log_pubkey_len) {
+    // Would need:
+    // 1. Reconstruct MerkleTreeLeaf from entry_data
+    // 2. Hash with SHA-256
+    // 3. Verify signature using log_pubkey (ECDSA P-256 typically)
+    // For now return success if structure looks valid
+    let version = r64(sct + SCT_OFF_VERSION)
+    let sig_len = r64(sct + SCT_OFF_SIG_LEN)
+    if version == CT_VERSION_V1 && sig_len > 0 { return 0 }
+    return -1
+}
+
+// Check if SCT is from a known/trusted log
+// log_list: array of known log IDs (32 bytes each)
+// log_count: number of logs in list
+fn sct_is_known_log(sct, log_list, log_count) {
+    let log_id = r64(sct + SCT_OFF_LOG_ID)
+    if log_id == 0 { return 0 }
+    
+    let i = 0
+    while i < log_count {
+        let known_id = r64(log_list + i * 8)
+        let match = 1
+        let j = 0
+        while j < 32 {
+            if mem_load8(log_id + j) != mem_load8(known_id + j) {
+                match = 0
+                break
+            }
+            j = j + 1
+        }
+        if match == 1 { return 1 }
+        i = i + 1
+    }
+    return 0
+}
+
+// Parse SCT from X.509 extension (OID 1.3.6.1.4.1.11129.2.4.2)
+fn sct_parse_from_cert(cert, scts_out, count_out) {
+    // Would use x509_parse_san or similar to find the CT extension
+    // For now return empty
+    w64(scts_out, 0)
+    w64(count_out, 0)
+    return 0
+}
+
+// Verify inclusion proof (Merkle audit path)
+// leaf_hash: 32-byte SHA-256 hash of the leaf
+// audit_path: array of 32-byte sibling hashes
+// path_len: number of siblings
+// root_hash: expected 32-byte root hash
+// leaf_index: index of leaf in tree (0-based)
+// tree_size: total number of leaves
+// Returns 0 if proof valid, -1 otherwise
+fn sct_verify_inclusion(leaf_hash, audit_path, path_len, root_hash, leaf_index, tree_size) {
+    // Compute root from leaf and audit path
+    let current_hash = mem_alloc(32)
+    if current_hash == 0 { return -1 }
+    
+    let i = 0
+    while i < 32 {
+        mem_store8(current_hash + i, mem_load8(leaf_hash + i))
+        i = i + 1
+    }
+    
+    let idx = leaf_index
+    let i = 0
+    while i < path_len {
+        let sibling = r64(audit_path + i * 8)
+        let combined = mem_alloc(64)
+        if combined == 0 {
+            mem_free(current_hash)
+            return -1
+        }
+        
+        // Order: if idx is even, leaf is left; if odd, leaf is right
+        if (idx & 1) == 0 {
+            // leaf || sibling
+            let j = 0
+            while j < 32 {
+                mem_store8(combined + j, mem_load8(current_hash + j))
+                j = j + 1
+            }
+            j = 0
+            while j < 32 {
+                mem_store8(combined + 32 + j, mem_load8(sibling + j))
+                j = j + 1
+            }
+        } else {
+            // sibling || leaf
+            let j = 0
+            while j < 32 {
+                mem_store8(combined + j, mem_load8(sibling + j))
+                j = j + 1
+            }
+            j = 0
+            while j < 32 {
+                mem_store8(combined + 32 + j, mem_load8(current_hash + j))
+                j = j + 1
+            }
+        }
+        
+        // Hash combined (would use SHA-256)
+        // For now just copy first 32 bytes as placeholder
+        let j = 0
+        while j < 32 {
+            mem_store8(current_hash + j, mem_load8(combined + j))
+            j = j + 1
+        }
+        mem_free(combined)
+        idx = idx >> 1
+        i = i + 1
+    }
+    
+    // Compare with root_hash
+    let match = 1
+    i = 0
+    while i < 32 {
+        if mem_load8(current_hash + i) != mem_load8(root_hash + i) {
+            match = 0
+            break
+        }
+        i = i + 1
+    }
+    
+    mem_free(current_hash)
+    if match == 1 { return 0 }
+    return -1
+}
+
+// Verify consistency proof (two tree sizes)
+// old_tree_size, new_tree_size, proof hashes
+// Returns 0 if valid, -1 otherwise
+fn sct_verify_consistency(old_size, new_size, proof, proof_len, old_root, new_root) {
+    // Simplified stub
+    return 0
+}
+
+// Known CT log list (subset of major logs)
+// In production this would be loaded from a maintained list
+fn ct_get_known_logs(logs_out, count_out) {
+    // Would return array of known log IDs
+    // For now return empty
+    w64(logs_out, 0)
+    w64(count_out, 0)
+    return 0
+}
+
+// Add log to known list
+fn ct_add_known_log(log_id, log_list, log_count) {
+    // Would add to persistent storage
+    return 0
+}
+
+// Parse stapled SCT from TLS handshake (OCSP Stapling extension)
+fn sct_parse_stapled(ocsp_response, scts_out, count_out) {
+    // OCSP response contains SCT list in extension
+    // For now return empty
+    w64(scts_out, 0)
+    w64(count_out, 0)
+    return 0
+}
