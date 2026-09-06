@@ -1,15 +1,14 @@
-# Quanta Language Specification (v0.0.55)
+# Quanta Language Specification (v0.0.169)
 
 > Status: DRAFT / WORKING SPECIFICATION. Derived from the self-hosting
-> compiler source at `compiler/0.0.55/` (x86-64 native AOT; AArch64 backend planned POST-0.1.0).
+> compiler source at `compiler/0.0.169/` (x86-64 native AOT; AArch64 backend planned POST-0.1.0).
 > This document is the authoritative definition of Quanta semantics for
 > the purpose of tool qualification (ISO/IEC 26262-8, IEC 61508-3).
 > Where the prose and the compiler diverge, the compiler is currently
 > authoritative and the discrepancy is a SPEC BUG to be filed.
 
-Last updated: 2026-08-22. Scope: native AOT backend (x86-64; AArch64 backend planned POST-0.1.0).
-Interpreter/JIT/WASM backends are NOT specified here (see LANGUAGE_DESIGN.md
-Stages 1/3/5 — not yet built).
+> Last updated: 2026-09-06. Scope: native AOT backend (x86-64; AArch64 backend planned POST-0.1.0).
+> Interpreter/JIT/WASM backends are NOT specified here (not yet built).
 
 ---
 
@@ -28,8 +27,8 @@ Stages 1/3/5 — not yet built).
   Comments are whitespace for the purpose of token separation.
 - **Statement separator**: BOTH `;` and newline separate statements. `;` is
   optional; a `let`/`return`/expression statement may be newline-terminated.
-  (Verified: grammar `tree-sitter-quanta` parses all 15 module files with
-  0 errors at v0.0.53.)
+  (Verified: grammar `tree-sitter-quanta` parses all 17 module files with
+  0 errors at v0.0.169.)
 
 ### 1.2 Operators (precedence, high→low)
 | Precedence | Operators | Assoc |
@@ -45,15 +44,15 @@ Stages 1/3/5 — not yet built).
 `=?` is the `?` propagation operator (IR_TRY early-return on Err/None).
 Assignment (`=`) binds LESS tightly than binary operators, so `a = b + 1`
 parses as `a = (b + 1)`, not `(a = b) + 1`. (Precedence verified by grammar
-at v0.0.53 after the assignment-vs-binary conflict was resolved.)
+at v0.0.169 after the assignment-vs-binary conflict was resolved.)
 
 ### 1.3 Keyword hashing (lexer contract)
 Keywords are NOT matched by string compare in the hot path; the lexer folds
 each identifier through a djb2-style hash:
 `h = (((c0*31 + c1)*31 + c2) ... )` and compares the integer.
-**The hash constants are a STABLE CONTRACT.** At v0.0.53 the following were
+**The hash constants are a STABLE CONTRACT.** At v0.0.169 the following were
 verified paren-balanced (a prior imbalance caused silent wrong-hash bugs,
-fixed in 0.0.53):
+fixed in 0.0.169):
 - `H_ENUM` (enum), `H_MATCH` (match), `H_MUT` (mut), `H_MOVE` (move),
   `H_REF` (ref), `H_TYPE` (type), `H_INTERFACE` (interface),
   `H_OK` (Ok), `H_ERR` (Err), `H_STRING` (string), `H_RAW` (raw),
@@ -100,15 +99,16 @@ Expressions: primary (ident, int, char, string, bool, `( )`, array,
 Option/Result literals), unary, binary, call `f(a,b)`, index `a[i]`,
 field `a.b`, assignment `a = b`, closure, `mk_any`.
 
-(Exact grammar: `tree-sitter-quanta/grammar.js`. All 15 compiler modules
-parse with 0 errors at v0.0.53.)
+(Exact grammar: `tree-sitter-quanta/grammar.js`. All 17 compiler modules
+parse with 0 errors at v0.0.169.)
 
 ---
 
 ## 3. Type system (current)
 
 - **Scalars**: `i64` (default integer), `u64`, `u8`, `u32`, `f64` (float ops
-  exist in IR; float literals/syntax land in a later version per ROADMAP).
+  exist in IR; float literals parsed as `TT_FNUM` in lexer but parser
+  handling deferred; builtins operate on f64 bit-patterns via `i2f`/`f2i`).
 - **Composite**: `struct` (value type, field access `.`), arrays
   (`[T]` heap-allocated via `mem_alloc`, index `a[i]` with bounds trap),
   `Option<T>` (`Some`/`None`), `Result<T,E>` (`Ok`/`Err`).
@@ -193,10 +193,15 @@ properties, so every backend inherits them by construction.
 
 1. Formal denotational/operational semantics for the IR (currently defined
    by emitter behavior, not axioms).
-2. Float literal syntax (`3.14`) is still NOT parsed (lexer hard-errors). The
-   `feq`/`flt`/`fgt`/`fle`/`fge`/`fisnan`/`fisinf` comparison builtins and
-   `sqrt`/`floor`/`ceil`/`abs` math builtins ARE shipped at 0.0.55 (operate on
-   f64 bit-patterns via `i2f`/`f2i`); see §6 and `float_test.quanta`.
+2. Float literal syntax (`3.14`) IS parsed by the lexer as `TT_FNUM` (since 0.0.169+),
+   but the parser has NO arithmetic rule for TT_FNUM — `eval_const()`
+   and `ec_factor()` only match `TT_NUM`. A float literal in source
+   produces a lexer token the parser silently skips → the literal is
+   lost at the AST level.
+   Workaround: `fconst(M, scale)` (e.g., `fconst(314, 100)` = 3.14).
+   The float builtins (fadd/fsub/fmul/fdiv/feq/flt/fgt/fle/fge/fisnan/
+   fisinf/sqrt/floor/ceil/abs/i2f/f2i) ARE shipped and operate on
+   f64 bit-patterns.
 3. Generic instantiation semantics (syntax present, instantiation deferred).
 4. `match` exhaustiveness rules (parser accepts; semantic exhaustiveness
    check not yet specified).
@@ -209,6 +214,6 @@ IEC 61508 SIL 3/4 until closed. See SAFETY_MANUAL.md §6.
 
 ## 8. Version
 
-Spec corresponds to compiler `0.0.55` (commit chain `...4653d32`).
+Spec corresponds to compiler `0.0.169` (current self-hosting fixpoint).
 Update this document in lockstep with any semantic change; every change
 MUST reference the committing version and the test that proves it.

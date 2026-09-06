@@ -1,4 +1,4 @@
-# Quanta Memory-Safety Argument (v0.0.53)
+# Quanta Memory-Safety Argument (v0.0.169)
 
 > Companion to `docs/SAFETY_MANUAL.md` (§6.3) and `docs/SECURITY_TOOLING.md`
 > (§6). This document states, rigorously and honestly, what memory-safety
@@ -8,7 +8,7 @@
 > Standard: this follows the shape of a **software safety argument** (a
 > structured claim → evidence → assumption chain), not a formal proof.
 
-Last updated: 2026-08-17. Compiler: 0.0.53.
+Last updated: 2026-09-06. Compiler: 0.0.169.
 
 ---
 
@@ -42,7 +42,7 @@ the gap that Stage-6 borrow checking would close (SAFETY_MANUAL §6.3).
 | E5 | `eb`/`ei`/`eq` guarded by `CODE_CAP` (exit(1)) | self-host clean; guards unreachable for normal input (IR_CAP binds first at exit(17)) | Defense-in-depth; primary boundary is E6. |
 | E6 | 60k-function input → `exit(17)` (IR/token overflow) | clean exit, no SIGSEGV | Primary reachable memory boundary is fail-closed. |
 
-E1–E3 were run 2026-08-17 against `compiler/0.0.53/bin/x86/qc`.
+E1–E3 were run 2026-08-17 against `compiler/0.0.169/bin/x86/qc`.
 
 ---
 
@@ -109,6 +109,6 @@ scorecard.
 
 ## 7. Version
 
-Argument corresponds to compiler `0.0.53` (commit `dd79554`).
+Argument corresponds to compiler `0.0.169`.
 Update on any memory-safety-relevant change; re-run E1–E6 and record
 results.

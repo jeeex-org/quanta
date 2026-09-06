@@ -14,12 +14,12 @@ but only the native AOT backend is built.
   `unsafe{}` opt-out; MAP_FAILED -> abort rc=1 (NOT SIGSEGV 139, fixed 0.0.49);
   undeclared fn / cyclic struct -> compile error rc=7 (fixed 0.0.48).
 - Valgrind-clean: 0 errors on self-compile and all crash-repro programs.
-- Grammar: `tree-sitter-quanta` parses ALL 15 compiler modules with 0 errors
-  (v0.0.53). Enables CodeRabbit / CI static review.
-- Latent-defect caught & fixed (0.0.53): keyword-hash constants H_ENUM/H_MUT/
+- Grammar: `tree-sitter-quanta` parses ALL 17 compiler modules with 0 errors
+  (v0.0.169). Enables CodeRabbit / CI static review.
+- Latent-defect caught & fixed (0.0.169): keyword-hash constants H_ENUM/H_MUT/
   H_MOVE had mismatched parens -> wrong lexer hashes for enum/mut/move
   (silent corruption). Now balanced + verified.
-- **New (standards work):** `docs/SPEC.md` (language spec, v0.0.53) and
+- **New (standards work):** `docs/SPEC.md` (language spec, v0.0.169) and
   `docs/SAFETY_MANUAL.md` (ISO 26262-8 / IEC 61508-3 qualification status).
   Quanta is at the documentation + partial-validation stage — NOT yet a
   qualified tool. See SAFETY_MANUAL.md §6 for blockers (formal semantics,
@@ -45,7 +45,7 @@ ONE IR, N BACKENDS. Front-end + optimizer written once; modes are backends:
   run/interp (Stage 1), codegen/x86_64 (DONE), codegen/aarch64 (Stage 4),
   run/jit (Stage 5), run/wasm (Stage 3), precompile (Stage 2).
 The IR (ops/accessors at src/x86/main.quanta ~L120-L150, IRS=40 record)
-is the STABILITY BOUNDARY every backend agrees on. See docs/LANGUAGE_DESIGN.md.
+is the STABILITY BOUNDARY every backend agrees on. See docs/SPEC.md §5.
 
 ## WHERE WE LEFT OFF
 - Multi-mode architecture designed; only the x86 AOT backend is built.
@@ -55,7 +55,7 @@ is the STABILITY BOUNDARY every backend agrees on. See docs/LANGUAGE_DESIGN.md.
 - Interpreter (Stage 1) still NOT implemented.
 
 ## HOW TO RESUME
-1. Read docs/ARCHITECTURE.md (this file), docs/LANGUAGE_DESIGN.md, docs/SYNTAX.md, docs/FEATURES.md.
+1. Read docs/ARCHITECTURE.md (this file), docs/SPEC.md, docs/SYNTAX.md, docs/roadmap/quanta.md.
 2. Re-establish green state: run `bash test_suites/scripts/run_tests.sh` (expect
    110/110 functional + 8/8 security + 3/3 perf, exit 0). Self-host: see INVARIANTS #1.
 3. Next concrete task = Stage 1 interpreter. Mirror emit_bltn builtin

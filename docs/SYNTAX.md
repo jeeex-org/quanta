@@ -5,9 +5,9 @@ Quanta is designed to be simple and supports multiple modes—interpreter, WASM,
 This document describes the language as implemented by the current compiler in
 `compiler/` (x86-64; AArch64 deferred POST-0.1.0). It is a description of the
 language surface only — it carries no version or gate numbers, because those
-rot. For what landed when, and the current gate status, see `docs/ROADMAP.md`;
+rot. For what landed when, and the current gate status, see `docs/roadmap/quanta.md`;
 for per-feature implementation status and the tests covering each, see
-`docs/FEATURES.md`.
+`docs/roadmap/quanta.md`.
 
 ---
 
@@ -44,7 +44,7 @@ and   or   not   true   false
 | Kind   | Syntax                              | Notes |
 |--------|-------------------------------------|-------|
 | Integer| `42`, `-7`, `0xFF` (hex)            | Signed 64‑bit two’s complement |
-| Float  | `3.14`                              | IEEE‑754 binary64 |
+| Float  | `3.14`                              | Lexed as `TT_FNUM` since 0.0.169; parser implemented: literal decoded to `fconst(M, scale)` and emitted as IEEE-754 f64 tagged float |
 | Char   | Not a distinct type; use `u8` values| – |
 | String | `"hello\n"`                         | UTF‑8 bytes with a length prefix (see §4) |
 | Boolean| `true`, `false`                     | Stored as `1` / `0` |

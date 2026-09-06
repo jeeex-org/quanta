@@ -6,7 +6,7 @@
 > tree-sitter grammar). Records what is in place, what is planned, and the
 > gap each tool closes.
 
-Last updated: 2026-08-16. Compiler version: 0.0.53.
+Last updated: 2026-09-06. Compiler version: 0.0.169.
 
 ---
 
@@ -16,8 +16,8 @@ Last updated: 2026-08-16. Compiler version: 0.0.53.
 |------|---------------|--------|
 | **Valgrind** (memcheck) | compiler own memory safety (leaks/UB) | Active; 0 errors on self-compile + crash-repros |
 | **CodeRabbit** | PR review of `main.quanta` (entry point) | Active; module-file review blocked until grammar landed |
-| **tree-sitter-quanta** | parse/static-analysis surface for all 15 modules | **Active v0.0.53 — 0 errors on every module** |
-| **110-test gate** | functional regression (110/110 + 8 sec + 3 perf) | Active (LANGUAGE_DESIGN.md) |
+| **tree-sitter-quanta** | parse/static-analysis surface for all 17 modules | **Active v0.0.169 — 0 errors on every module** |
+|| **110-test gate** | functional regression (110/110 + 8 sec + 3 perf) | Active |
 | **Self-host invariant** | committed `compiler/$(cat VERSION)/bin/x86/qc` → source → qc, byte-identical fixed point | Active (ARCHITECTURE.md INVARIANTS #1) |
 
 Gap: Valgrind is the ONLY dynamic analyzer; no fuzzing, no static
@@ -44,8 +44,8 @@ analyzer beyond CodeRabbit, no sanitizers, no differential backend test.
 ### Tier 3 — behavioral / input safety (Closes §6.5 untested-input gap)
 | Tool | Buys | Notes |
 |------|-------|-------|
-| **AFL++ / libFuzzer** | fuzz `qc` with random `.quanta` → prove fail-closed (clean rc, no SIGSEGV) | **DONE** (self-contained harness, v0.0.53): 20K iters, 0 crashes. See §3.5. |
-| **Differential x86↔ARM64** | compile same prog on both emitters → compare exit codes | **PARTIAL** (v0.0.53): tools/diff_test compares CURRENT qc vs independent bootstrap-SEED qc (two artifacts from different eras) → 5/5 behavioral parity. Full x86↔ARM64 when Stage-4 backend lands. See §7. |
+| **AFL++ / libFuzzer** | fuzz `qc` with random `.quanta` → prove fail-closed (clean rc, no SIGSEGV) | **DONE** (self-contained harness, v0.0.169): 20K iters, 0 crashes. See §3.5. |
+| **Differential x86↔ARM64** | compile same prog on both emitters → compare exit codes | **PARTIAL** (v0.0.169): tools/diff_test compares CURRENT qc vs independent bootstrap-SEED qc (two artifacts from different eras) → 5/5 behavioral parity. Full x86↔ARM64 when Stage-4 backend lands. See §7. |
 
 ### Tier 4 — supply chain / process (ISO 26262-8 §11.4)
 | Tool | Buys |
@@ -85,8 +85,8 @@ structure to mutate from.
 - 24h fuzz run → 0 crashes on valid-signal handling (only clean rcs).
 - Any crash → file defect (SAFETY_MANUAL §5 table), minimize, fix, re-fuzz.
 
-### 3.5 Result (2026-08-17, v0.0.53)
-`tools/fuzz/fuzz_qc.py` run against `compiler/0.0.53/bin/x86/qc`:
+### 3.5 Result (2026-08-17, v0.0.169)
+`tools/fuzz/fuzz_qc.py` run against `compiler/0.0.169/bin/x86/qc`:
 - **20,000 iterations, 0 crashes.** All exits were defined codes:
   rc=1 (internal/MAP_FAILED, 970 hits), rc=16 (import resolution
   failed, 19030 hits). No signal deaths (SIGSEGV/SIGILL/SIGABRT), no
@@ -130,7 +130,7 @@ grammar) — the grammar work (point 5) is what unlocks this.
 
 ---
 
-## 6. Memory-safety hardening (POINT #1) — v0.0.53
+## 6. Memory-safety hardening (POINT #1) — v0.0.169
 
 The native backend emits raw bytes into `mmap` buffers via `w8/w32/w64`
 with no write-side bounds check (SAFETY_MANUAL §6.3). Two layers added:
@@ -154,15 +154,17 @@ defense-in-depth that would bind if buffers are later rebalanced.
 ### 6.3 Honest limitation
 These are RUNTIME traps (fail-closed), not COMPILE-TIME proofs. Quanta's
 memory model remains manually-managed (SAFETY_MANUAL §6.3). True memory
-SAFETY (no UB possible) requires Stage-6 borrow checking — out of scope
-for v0.0.53.
+SAFETY (no UB possible) requires borrow checking — in progress.
+`borrow.quanta` exists (0.0.150+) and records ownership/borrow
+rules but enforcement is a NO-OP (`borrow_error` is empty).
+Full enforcement deferred to 0.1.0.
 
 ---
 
-## 7. Independent-implementation evidence (POINT #2) — v0.0.53
+## 7. Independent-implementation evidence (POINT #2) — v0.0.169
 
-Quanta has ONE self-hosting compiler. Full independent implementation
-(second hand-written compiler) is a multi-month effort (SAFETY_MANUAL §6.2).
+Quanta has ONE self-hosting compiler. A second, independently
+implemented compiler is a multi-month effort (SAFETY_MANUAL §6.2).
 Interim, runnable cross-check delivered:
 
 ### 7.1 Differential test (tools/diff_test/diff_qc.py)
@@ -189,6 +191,6 @@ That is the strong form of independent implementation for qualification.
 
 ## 6. Version
 
-Tooling plan corresponds to compiler `0.0.53` (commit `be00162`).
+Tooling plan corresponds to compiler `0.0.169`.
 Update when a tool is added/removed; each addition MUST record the gap
 it closes (§5) and the evidence it produced.

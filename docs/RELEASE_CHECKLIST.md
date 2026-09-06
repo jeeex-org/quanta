@@ -33,7 +33,7 @@ These are non-negotiable. Violating any of them is a gate failure by itself.
    from `VERSION`.
 2. **`VERSION` is the pointer to the latest stable.** `compiler/$(cat VERSION)/`
    is the live compiler. Never refer to a stale version as "current".
-3. **ROADMAP "Current compiler:" header MUST equal `cat VERSION`** after every
+3. **roadmap/quanta.md "Current compiler:" header MUST equal `cat VERSION`** after every
    version — and the on-disk value must be the live compiler, not a stale one.
    ("Current compiler: 0.0.100 -- why the fuck?" / "fuckhead know the fucking
    rules.") If you ever report or write "current compiler: X" where X != VERSION,
@@ -55,9 +55,9 @@ These are non-negotiable. Violating any of them is a gate failure by itself.
    necessary. Keep the fix moving forward; a passed version is a stable seed, not
    a fallback to downgrade to. ("Make sure you keep fix forward... never revert
    to older version unless absolutely necessary.")
-9. **All docs in sync after EVERY version.** ROADMAP, FEATURES, SPEC,
-   STATE.md, and this checklist must agree on version numbers, status, and
-   feature claims. ("ROADMAP and FEATURES in sync. All docs must be in sync
+9. **All docs in sync after EVERY version.** roadmap/quanta.md, SPEC,
+   STATE.md, and this checklist must agree on version numbers, status,
+   feature claims. ("roadmap/quanta.md and SPEC in sync. All docs must be in sync
    after completing each version." / "every in sync?")
 10. **Mandatory gate layers — never drop any.** functional, extern-c, security,
     performance, **valgrind**, **fuzz (fail-closed, 0 crashes)**,
@@ -97,22 +97,23 @@ These are non-negotiable. Violating any of them is a gate failure by itself.
     Copy the previous stable (`cp -r compiler/<PREV> compiler/<VER>`) and bump `VERSION`
     for EVERY released version, regardless of whether there is a source change. A
     gate-only version (no `src/` change) is still a real release: it exists so its
-    ROADMAP ✅ maps to a verifiable on-disk artifact. **Never mark a version ✅ in
+    ROADMAP ✅ maps to a verifiable on-disk artifact (roadmap/quanta.md
+    or docs/roadmap/domains/*.md). **Never mark a version ✅ in
     ROADMAP/docs unless a `compiler/<VER>/` folder exists on disk.** No folder = no
     release = the ✅ is a lie.
 
 ---
 
 ## Terminology (derive from `VERSION`, never hardcode)
-- `<VER>`   = released/live stable   -> `cat VERSION`        (currently **0.0.103**)
+- `<VER>`   = released/live stable   -> `cat VERSION`        (currently **0.0.169**)
 - `<NEXT>`  = the version being built -> exactly ONE patch above `<VER>`
 - `<PRIOR>` = `<VER>` itself; its committed golden `compiler/<VER>/bin/x86/qc`
   is the seed for `<NEXT>`. There is NO separate `bootstrap/` directory.
 - Golden binary: `compiler/<X>/bin/x86/qc` (committed). NEVER in `/tmp`.
 
 ## LIVE STATE (advance this on every promotion)
-- Current stable compiler: **0.0.102** (2026-08-27)
-- Golden binary: `compiler/0.0.102/bin/x86/qc`
+- Current stable compiler: **0.0.169** (2026-08-27)
+- Golden binary: `compiler/0.0.169/bin/x86/qc`
 - Self-host fixpoint md5: `a4affa951d64304946862358316240c1` (B==C byte-identical)
 - Per-version state is recorded in `compiler/<VER>/STATE.md` and MUST be updated
   each promotion.
@@ -121,7 +122,7 @@ These are non-negotiable. Violating any of them is a gate failure by itself.
 
 ## 0. Ground truth
 - [ ] `cat VERSION` -> <VER>; work tree `compiler/<NEXT>/` exists; <NEXT> == <VER>+1 patch.
-- [ ] ROADMAP.md header `Current compiler: <VER>` == `cat VERSION` (no stale value).
+- [ ] roadmap/quanta.md header `Current compiler: <VER>` == `cat VERSION` (no stale value).
 
 ## 1. Seed location — project folder, never /tmp
 - [ ] `compiler/<VER>/bin/x86/qc` exists on disk (this IS the seed for <NEXT>).
@@ -195,9 +196,9 @@ QC=./compiler/$(cat VERSION)/bin/x86/qc bash test_suites/scripts/run_tests.sh
       than `cat VERSION`) is a divergence-in-waiting — fix it on every release.
 
 ## 8. Doc/rule sync (after each version — rule #9)
-- [ ] ROADMAP.md header `Current compiler: <VER>` == `cat VERSION`; the version's
+- [ ] roadmap/quanta.md header `Current compiler: <VER>` == `cat VERSION`; the version's
       row is marked done with what was ACTUALLY verified (no stale "BLOCKED").
-- [ ] FEATURES.md, SPEC.md, and `compiler/<VER>/STATE.md` agree with ROADMAP on
+- [ ] roadmap/quanta.md, SPEC.md, and `compiler/<VER>/STATE.md` agree on
       version numbers, status, and feature claims.
 - [ ] No dangling references to removed paths (old `bootstrap/`, root `bin/`,
       stale `qc-bootstrap-*` seeds).
