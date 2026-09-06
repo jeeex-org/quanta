@@ -1,0 +1,48 @@
+fn print_i64(x) { print(x) }
+fn print_str(s) { prints(s) }
+fn print_newline() { newline() }
+fn print_space() { prints(" ") }
+fn print_indent(level) {
+    let i = 0
+    while i < level { prints("    "); i = i + 1 }
+}
+
+fn print_type(ty) {
+    let b = ty & 0xFF
+    if b == 0 { prints("void"); return }
+    if b == 1 { prints("i8"); return }
+    if b == 2 { prints("i16"); return }
+    if b == 3 { prints("i32"); return }
+    if b == 4 { prints("i64"); return }
+    if b == 5 { prints("u8"); return }
+    if b == 6 { prints("u16"); return }
+    if b == 7 { prints("u32"); return }
+    if b == 8 { prints("u64"); return }
+    if b == 9 { prints("f32"); return }
+    if b == 10 { prints("f64"); return }
+    if b == 11 { prints("bool"); return }
+    if b == 12 { prints("str"); return }
+    if b == 13 { prints("*i64"); return }
+    if b == 14 { prints("*mut i64"); return }
+    prints("?")
+}
+
+fn print_ir_inst(inst) {
+    let op = inst >> 56
+    let a0 = (inst >> 48) & 0xFF
+    let a1 = (inst >> 40) & 0xFF
+    let a2 = (inst >> 32) & 0xFF
+    let dst = (inst >> 24) & 0xFF
+    let src = (inst >> 16) & 0xFF
+    let flags = (inst >> 8) & 0xFF
+    
+    if op == 0 { prints("const "); print_i64(dst); prints(" = "); print_i64(a0); print_newline(); return }
+    if op == 1 { prints("mov "); print_i64(dst); prints(" = "); print_i64(a0); print_newline(); return }
+    if op == 2 { prints("add "); print_i64(dst); prints(" = "); print_i64(a0); prints(" + "); print_i64(a1); print_newline(); return }
+    if op == 3 { prints("sub "); print_i64(dst); prints(" = "); print_i64(a0); prints(" - "); print_i64(a1); print_newline(); return }
+    if op == 17 { prints("call "); print_i64(a0); print_newline(); return }
+    if op == 19 { prints("jmp "); print_i64(a0); print_newline(); return }
+    if op == 20 { prints("br "); print_i64(a0); prints(" "); print_i64(dst); print_newline(); return }
+    if op == 21 { prints("ret"); print_newline(); return }
+    prints("// IR op "); print_i64(op); print_newline()
+}

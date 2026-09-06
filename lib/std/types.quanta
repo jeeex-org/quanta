@@ -1,0 +1,29 @@
+// std/types — Quanta type system
+const TYPE_VOID = 0; const TYPE_I8 = 1; const TYPE_I16 = 2; const TYPE_I32 = 3; const TYPE_I64 = 4
+const TYPE_U8 = 5; const TYPE_U16 = 6; const TYPE_U32 = 7; const TYPE_U64 = 8
+const TYPE_F32 = 9; const TYPE_F64 = 10; const TYPE_BOOL = 11; const TYPE_STR = 12
+const TYPE_PTR = 13; const TYPE_MUT_PTR = 14; const TYPE_ARRAY = 15; const TYPE_SLICE = 16
+const TYPE_STRUCT = 17; const TYPE_ENUM = 18; const TYPE_TUPLE = 19; const TYPE_FN = 20
+const TYPE_GENERIC = 21; const TYPE_TRAIT = 22; const TYPE_DYN = 23; const TYPE_NEVER = 24
+
+// Type flags
+const TYPE_FLAG_CONST = 1; const TYPE_FLAG_MUT = 2; const TYPE_FLAG_REF = 4; const TYPE_FLAG_OWNED = 8
+
+fn type_make(base, flags) { base | (flags << 8) }
+fn type_base(t) { t & 0xFF }
+fn type_flags(t) { t >> 8 }
+fn type_is_float(t) { let b = type_base(t); b == TYPE_F32 || b == TYPE_F64 }
+fn type_is_int(t) { let b = type_base(t); b >= TYPE_I8 && b <= TYPE_U64 }
+fn type_is_ptr(t) { let b = type_base(t); b == TYPE_PTR || b == TYPE_MUT_PTR }
+fn type_size(t) {
+    let b = type_base(t)
+    if b == TYPE_VOID { return 0 }
+    if b == TYPE_I8 || b == TYPE_U8 { return 1 }
+    if b == TYPE_I16 || b == TYPE_U16 { return 2 }
+    if b == TYPE_I32 || b == TYPE_U32 { return 4 }
+    if b == TYPE_F32 { return 4 }
+    if b == TYPE_I64 || b == TYPE_U64 || b == TYPE_F64 || b == TYPE_PTR || b == TYPE_MUT_PTR { return 8 }
+    if b == TYPE_BOOL { return 1 }
+    if b == TYPE_STR { return 16 } // header + ptr + len
+    return 8
+}
