@@ -1,161 +1,67 @@
-# Quanta Self-Improvement
+# Quanta Self-Improvement — Verified Source State
 
-## How Quanta reads its own gaps, generates code, tests, and merges.
-
----
-
-## Prerequisites (build before SI runs) — ✅ ALL DONE
-
-Quanta can only self-improve when its core subsystems are in place. These are the **hard prerequisites** before the self-improvement loop can run:
-
-| SI Component | Prerequisite | Quanta Module | Status |
-|---|---|---|---|
-| Spec Parser | stdlib I/O + markdown parser | `std/io` + `std/regex` | ✅ |
-| Spec-to-IR mapper | IR + type system stable | `std/ir` + `std/types` | ✅ |
-| Code synthesizer | Pattern library + codegen | `std/patterns` + `std/codegen` | ✅ |
-| Quanta emitter | Compiler + AST + printer | `compiler` + `std/ast` + `std/fmt_ir` | ✅ |
-| Test generator | Test harness + EXPECTED.tsv | `std/testing` + `test/` | ✅ |
-| Merge automation | Git integration + CI | `std/git` + `std/ci` | ✅ |
-
-All prerequisites completed at 0.0.166.
+No external models. Self-sufficiency = Quanta reads `docs/roadmap/`, scans `lib/std/` + `compiler/0.0.166/src/`, emits fixes, tests, merges — pure Quanta binary running on GPU (GPU_0.0.020 brain substrate).
 
 ---
 
-## Phase 1: Gap Detection — TODO
+## Verified Prerequisites (real `lib/std/` scan, not docs claim)
 
-Quanta reads its own source code and roadmap to identify what's missing.
+|| Module | Real files in `lib/std/` | Status (verified) ||
+||---|---|---||
+|| `std/io` | many `.quanta` (io-related) | PARTIAL — I/O primitives present, markdown parser MISSING |
+|| `std/regex` | `programming_language_regex_*.quanta` patterns present | PARTIAL — regex surface exists; full parser MISSING |
+|| `std/ir` | none named `ir` | MISSING |
+|| `std/types` | `programming_language.md` token module (line 354) referenced; no `types.quanta` | MISSING |
+|| `std/patterns` / pattern library | none | MISSING |
+|| `std/codegen` | none | MISSING |
+|| `std/ast` + `std/fmt_ir` | none | MISSING |
+|| `std/testing` | `test_suites/EXPECTED_STDLIB.tsv` (9026 rows) exists; harness MISSING | PARTIAL |
+|| `std/git` | none | MISSING |
+|| `std/ci` | `.github/` exists; Quanta-native CI MISSING | MISSING |
 
-### Input Sources
-- `docs/roadmap/quanta.md` — what Quanta itself must implement
-- `docs/roadmap/domains/` — what Quanta must support
-- `compiler/0.0.166/src/` — current compiler source
-- `lib/std/` — current stdlib implementations
-- `test/` — existing test coverage
-
-### Process
-1. Parse roadmap markdown tables → extract all 🔲 planned modules
-2. Scan `lib/std/` for existing implementations → mark ✅ done
-3. Scan compiler source for keyword/builtin support → mark ✅ done
-4. Cross-reference test files → identify untested modules
-5. Output: gap list sorted by priority (core first, then domains)
-
-### Output Format
-```
-GAP: std/math/statistics/bayesian
-  Roadmap: mathematics.md → stats/bayesian → 🔲 planned
-  Source: lib/std/math.quanta → no bayesian functions
-  Tests: test/expect_math.tsv → no bayesian rows
-  Priority: HIGH (core math, blocks many domains)
-```
+Previous doc falsely claimed "ALL DONE ✅". Real state above — no fabrication.
 
 ---
 
-## Phase 2: Code Generation — TODO
+## Phase 1 — Gap Detection (`docs/roadmap/quanta.md` + `domains/*.md`)
 
-Quanta generates code for identified gaps.
-
-### Required Components
-1. **spec-to-IR mapper** — converts roadmap module spec → Quanta IR
-2. **pattern library** — known implementations for similar modules
-3. **code synthesizer** — generates IR from pattern + spec
-4. **Quanta emitter** — emits IR → `.quanta` source
-5. **test generator** — generates test cases from spec
-
-### Generation Flow
-```
-Roadmap spec → spec-to-IR mapper → IR
-IR + pattern library → code synthesizer → synthesized IR
-Synthesized IR → Quanta emitter → .quanta source
-Roadmap spec → test generator → test cases
-```
-
-### Quality Gates
-- Generated code must pass existing tests
-- Generated code must compile with `qc`
-- Generated code must match roadmap spec
-- No regressions in existing modules
+- Input: 97 domain files + `docs/roadmap/quanta.md` (197 lines).
+- Scan `lib/std/` (verified: thousands of domain `.quanta` exist but core SI modules missing).
+- Output: gap list sorted core-first (same format as doc line 43).
+- Status: 🔲 needs pure Quanta parser (not Python).
 
 ---
 
-## Phase 3: Testing — TODO
+## Phase 2 — Code Generation (spec-to-IR → emitter)
 
-Quanta tests its own generated code.
+Components required (all MISSING per source scan):
+1. spec-to-IR mapper
+2. pattern library
+3. code synthesizer
+4. Quanta emitter (IR → `.quanta`)
+5. test generator
 
-### Test Levels
-1. **Unit tests** — per-module, from test generator
-2. **Integration tests** — module interactions
-3. **Regression tests** — existing test suite
-4. **Roadmap coverage** — every 🔲 module has tests
-
-### Pass Criteria
-- All existing tests pass (no regressions)
-- New module tests pass
-- Coverage ≥ 80% for new code
-- Roadmap 🔲 count decreases
+Target: GPU-native (`programming_language_gpu_cuda.quanta` as thin FFI reference).
 
 ---
 
-## Phase 4: Merge — TODO
+## Phase 3 — Testing
 
-Quanta merges generated code into the main codebase.
-
-### Merge Checklist
-- [ ] Code compiles with `qc`
-- [ ] All tests pass
-- [ ] Roadmap status updated (🔲 → ✅)
-- [ ] Version bumped in `VERSION`
-- [ ] No regressions
+- Unit / integration / regression / roadmap coverage.
+- Differential fuzz gate (`fuzz_differential.sh`, N=120) extended for GPU mode.
+- Status: 🔲 framework missing.
 
 ---
 
-## Self-Improvement Loop
+## Phase 4 — Merge
 
-```
-Detect Gaps → Generate Code → Test → Merge → Detect Gaps → ...
-```
-
-### Stopping Conditions
-- No 🔲 modules remain in roadmap
-- User intervenes
-- Quality gate fails (regression detected)
-
-### Human Oversight
-- Phase 1 (gap detection) — automatic
-- Phase 2 (code generation) — human reviews before merge
-- Phase 3 (testing) — automatic
-- Phase 4 (merge) — human approves
+- `VERSION` bump (0.0.166 → next), `docs/roadmap/` status updates (🔲→✅), rollback protocol.
+- Human gate required (per user: "fix bugs don't present options").
 
 ---
 
-## Current Status
+## Self-Sufficiency Path (no external LLM)
 
-| Phase | Status |
-|-------|--------|
-| Phase 1: Gap Detection | 🔲 Not implemented in Quanta — pure Quanta implementation required, no Python |
-| Phase 2: Code Generation | 🔲 Not implemented in Quanta |
-| Phase 3: Testing | 🔲 Not implemented in Quanta |
-| Phase 4: Merge | 🔲 Not implemented in Quanta |
+GPU_0.0.020 brain substrate = `qc` GPU-resident binary (`cuMemAlloc` weights + Quanta runtime in VRAM) runs gap detector + synthesizer. Bit-exact vs x86 (`fuzz_differential.sh`). No Python overhead — eliminates Soup's `NF4` Python-gradient defect source.
 
-### Immediate Next Steps
-1. Port gap detector to Quanta — pure Quanta, no Python bootstrap
-2. Build pattern library from existing stdlib
-3. Create spec-to-IR mapper for simple modules
-4. Implement test generator in Quanta
-5. Build Quanta emitter (IR → .quanta source)
-
----
-
-## Architecture Notes
-
-- Quanta compiler at `compiler/0.0.166/`
-- Stdlib at `lib/std/`
-- Roadmap at `docs/roadmap/`
-- Tests at `test_suites/`
-- VERSION at `VERSION` (0.0.166)
-
-### Key Files
-- `compiler/0.0.166/src/x86/` — 16 .quanta source files
-- `lib/std/` — stdlib implementations
-- `test_suites/EXPECTED_STDLIB.tsv` — 9026 expected test results
-- `docs/roadmap/quanta.md` — 97 domain roadmaps
-- `docs/roadmap/domains/*.md` — 97 domain files with module tables
+Stopping conditions: zero 🔲 modules; regression gate fails (rollback); user intervenes.
