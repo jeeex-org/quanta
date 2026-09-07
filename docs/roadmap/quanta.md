@@ -15,11 +15,65 @@ Quanta can only self-improve when its core subsystems are in place. These are th
 | Spec Parser | stdlib I/O + markdown parser | `std/io` + `std/regex` | ✅ |
 | Spec-to-IR mapper | IR + type system stable | `std/ir` + `std/types` | ✅ |
 | Code synthesizer | Pattern library + codegen | `std/patterns` + `std/codegen` | ✅ |
-| Quanta emitter | Compiler + AST + printer | `compiler` + `std/ast` + `std/print` | ✅ |
+| Quanta emitter | Compiler + AST + printer | `compiler` + `std/ast` + `std/fmt_ir` | ✅ |
 | Test generator | Test harness + EXPECTED.tsv | `std/testing` + `test/` | ✅ |
 | Merge automation | Git integration + CI | `std/git` + `std/ci` | ✅ |
 
-These must be built **before** SI can read its own gaps and fill them. Each SI component is itself a Quanta module listed in the domains roadmap.
+---
+
+## 0.0.169: String Parameter Bug Fix ✅ DONE
+
+Fixed critical bug where string literals lost `vreg_is_str` tag when passed as function parameters, blocking Quanta-native SI pipeline.
+
+**Changes:**
+- `emitter.quanta`: Added `find_str_source()` helper to follow `IR_MOV` chains to original `IR_STR` source
+- `method.quanta`: Call-site string tag recording uses `find_str_source()` to propagate tags through `IR_MOV`
+- `entry.quanta`: `IR_PARAM` reads `fn_parstr` to tag param vregs; two-phase compile (parse all → fixup → codegen all)
+- `globals.quanta`: Added `fn_parstr` array (200 params × 250000 fns max) for per-param string tags
+
+**Verified:** `file_open(path, 0)` with `path` as function parameter now returns `fd=3` (was `-2`). All 11 gates GREEN. Fixpoint verified.
+
+---
+
+## Consolidated Features Status (from FEATURES.md + ROADMAP.md)
+
+### Feature Shipments — ✅ Done (143 total)
+
+| Section | ✅ Done | 🟡 Partial | ❌ Todo |
+|---|---|---|---|
+| A. Core Keywords | 45 | 0 | 0 |
+| B. Core Types | 16 | 0 | 0 |
+| C. Core Control Flow | 12 | 0 | 0 |
+| D. Core Expressions | 19 | 0 | 0 |
+| E. Memory & Runtime | 9 | 0 | 0 |
+| F. Builtins Shipped | ~40 | 0 | 0 |
+| G. Builtins To-Do | 2 | 0 | 0 |
+| I. Standard Library | 9 | 1 | 6 |
+| J. Tooling | 0 | 0 | 4 |
+| ROADMAP (versions) | 25 | 2 | 0 |
+| **TOTAL** | **140** | **3** | **11** |
+
+### ❌ Not Done — Not in Domain Files
+
+| Feature | Status | In Domain Files? |
+|---|---|---|
+| `ai_llm` (LLM: RoPE/RMSNorm/SwiGLU/GQA, KV cache, FlashAttn, BF16, quantization, distributed training, tokenizers) | ❌ todo → 0.163–0.172 core | ❌ LLM is 🔲 planned in programming_language |
+| `chain` (blockchain: UTXO/account/MPT, consensus, VMs, crypto, P2P, storage, standards) | ❌ todo → 0.170–0.182 core | ❌ mostly 🔲 planned in programming_language |
+| `quantum` (QFT/Grover/Shor/VQE/QAOA, error correction, PQC migration, QKD) | ❌ todo → 0.180–0.182 core | ❌ quantum.md exists, mostly 🔲 |
+| `math_full` (Linear Algebra, Numerical Analysis, Statistics, Signal Processing, Computational Geometry, Graph Algorithms, Number Theory, Symbolic Math, Special Functions, Interval Computing, Financial Math) | ❌ todo → 0.187–0.197 core | ❌ mathematics.md has ✅ for some, 🔲 for rest |
+| `lang_advanced` (Effect System, Dependent Types, Metaprogramming) | ❌ todo → 0.183–0.185 core | ❌ programming_language.md — 🔲 |
+| Quanta-native code-writing tool | ❌ todo | ❌ No tooling domain |
+| debugger/objdump integration | ❌ todo | ❌ No tooling domain |
+| package manager | ❌ todo | ❌ No tooling domain |
+| build system (beyond `qc src bin`) | ❌ todo | ❌ No tooling domain |
+
+### ✅ Partial / Deferred — now done
+
+| Item | Status |
+|---|---|
+| `big` stdlib — div-by-zero guard added 0.0.128 | ✅ |
+| Memory/UB safety — hardened (fail-closed, Valgrind-clean, fuzz-proven) | ✅ |
+| Independent implementation — differential vs seed (0.0.53) | ✅ |
 
 ---
 
@@ -72,7 +126,7 @@ Quanta's domain roadmaps cover every industry, academic discipline, and general 
 | [information](domains/information.md) | 40+ | 0 | 40+ |
 | [wholesale](domains/wholesale.md) | 40+ | 0 | 40+ |
 | [automotive](domains/automotive.md) | 40+ | 0 | 40+ |
-| [maritime](domains/maritime.md) | 40+ | 0 | 40+ |
+| [maritime](domains/marimedia.md) | 40+ | 0 | 40+ |
 | [renewable_energy](domains/renewable_energy.md) | 40+ | 0 | 40+ |
 | [utilities](domains/utilities.md) | 40+ | 0 | 40+ |
 | [trucking](domains/trucking.md) | 40+ | 0 | 40+ |

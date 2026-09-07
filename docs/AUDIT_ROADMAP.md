@@ -126,7 +126,7 @@
 
 | | |
 |---|---|
-| **Location** | `docs/ROADMAP.md:98` |
+| **Location** | `docs/roadmap/quanta.md:98` |
 | **Issues** | ROADMAP correctly says stack_trace reads `[rbp+8]`. **But `rsp()` is missing from the ROADMAP row entirely** — only stack_trace is mentioned. `stack_trace_test.quanta` IS gated (EXPECTED.tsv, rc=0). |
 | **Fix** | Update ROADMAP row to mention `rsp()` builtin; add `rsp_test.quanta` to gate. |
 | **Verification** | ROADMAP mentions both builtins; `grep -rn 'rsp()' test_suites/codes/` returns gate test. |
@@ -148,7 +148,7 @@
 
 | | |
 |---|---|
-| **Location** | `docs/FEATURES.md:153` vs `emitter.quanta:762` (comment admits "old block is simply leaked") |
+| **Location** | `docs/roadmap/quanta.md:153` vs `emitter.quanta:762` (comment admits "old block is simply leaked") |
 | **Fix** | Sync doc to code, or implement list pop in `mem_alloc` (larger change). |
 | **Verification** | Doc matches behavior. |
 

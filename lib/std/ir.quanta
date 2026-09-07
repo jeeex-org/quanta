@@ -1,41 +1,105 @@
-// std/ir — Quanta IR representation
-// IR opcodes (from globals.quanta)
-const IR_CONST = 0; const IR_MOV = 1; const IR_ADD = 2; const IR_SUB = 3
-const IR_MUL = 4; const IR_DIV = 5; const IR_MOD = 6
-const IR_EQ = 7; const IR_NE = 8; const IR_LT = 9; const IR_GT = 10
-const IR_LE = 11; const IR_GE = 12; const IR_AND = 13; const IR_OR = 14
-const IR_NEG = 15; const IR_NOT = 16; const IR_CALL = 17; const IR_LABEL = 18
-const IR_CALL_IDX = 78; const IR_JMP = 19; const IR_BR = 20; const IR_RET = 21; const IR_PARAM = 22
-const IR_STR = 23; const IR_BAND = 24; const IR_BOR = 25; const IR_BXOR = 26; const IR_BNOT = 27; const IR_SHL = 28; const IR_SHR = 29
-const IR_LOADG = 30; const IR_STOREG = 31; const IR_CLOSURE_CALL = 36; const IR_FNPTR = 35
-const IR_FREE = 37; const IR_FCONST = 38; const IR_FADD = 39; const IR_FSUB = 40; const IR_FMUL = 41; const IR_FDIV = 42
-const IR_F2I = 43; const IR_I2F = 44; const IR_ENUM = 45; const IR_MATCH = 46; const IR_SOME = 47; const IR_NONE = 48
-const IR_OK = 49; const IR_ERR = 50; const IR_UNWRAP = 51; const IR_TRY = 74
-const IR_VTABLE = 52; const IR_DYN = 53; const IR_RAW_PTR = 54; const IR_MUT_PTR = 55; const IR_DEREF = 56
-const IR_DEREF_MUT = 57; const IR_PTR_ADD = 58; const IR_PTR_SUB = 59; const IR_PTR_DIFF = 60; const IR_PTR_CAST = 61
-const IR_IS_NULL = 62; const IR_VOLATILE_LOAD = 63; const IR_VOLATILE_STORE = 64; const IR_ASM = 65; const IR_FFI_CALL = 66
-const IR_VEC128 = 67; const IR_UNSAFE_BLOCK = 68; const IR_ARRAY_LEN = 69; const IR_GENERIC_INST = 70
-const IR_FNVAL = 71; const IR_APUSH = 72; const IR_ARRNEW = 73; const IR_CLOSURE = 76; const IR_CAPREAD = 77
+// std/ir.quanta - IR representation for Quanta
+// IR opcodes and data structures
 
-// IR instruction structure
-const IR_OP_SHIFT = 56; const IR_A0_SHIFT = 48; const IR_A1_SHIFT = 40; const IR_A2_SHIFT = 32
-const IR_DST_SHIFT = 24; const IR_SRC_SHIFT = 16; const IR_FLAGS_SHIFT = 8; const IR_PAD_SHIFT = 0
+const IR_NOP = 0;
+const IR_CONST = 1;
+const IR_PARAM = 2;
+const IR_MOV = 3;
+const IR_ADD = 4;
+const IR_SUB = 5;
+const IR_MUL = 6;
+const IR_DIV = 7;
+const IR_MOD = 8;
+const IR_NEG = 9;
+const IR_NOT = 10;
+const IR_AND = 11;
+const IR_OR = 12;
+const IR_XOR = 13;
+const IR_SHL = 14;
+const IR_SHR = 15;
+const IR_CMP = 16;
+const IR_JMP = 17;
+const IR_BR = 18;
+const IR_CALL = 19;
+const IR_CALL_IDX = 20;
+const IR_RET = 21;
+const IR_LABEL = 22;
+const IR_STR = 23;
+const IR_STOREG = 24;
+const IR_LOADG = 25;
+const IR_ALLOCA = 26;
+const IR_FREE = 27;
+const IR_CAPREAD = 28;
+const IR_CLOSURE_CALL = 29;
+const IR_F2I = 30;
+const IR_I2F = 31;
+const IR_FADD = 32;
+const IR_FSUB = 33;
+const IR_FMUL = 34;
+const IR_FDIV = 35;
+const IR_FCMP = 36;
 
-fn ir_make(op, a0, a1, a2, dst, src, flags) {
-    let op_part = op << IR_OP_SHIFT
-    let a0_part = a0 << IR_A0_SHIFT
-    let a1_part = a1 << IR_A1_SHIFT
-    let a2_part = a2 << IR_A2_SHIFT
-    let dst_part = dst << IR_DST_SHIFT
-    let src_part = src << IR_SRC_SHIFT
-    let flags_part = flags << IR_FLAGS_SHIFT
-    op_part | a0_part | a1_part | a2_part | dst_part | src_part | flags_part
+module std_ir;
+
+const IR_MAX_ARGS = 4;
+
+fn opcode_name(op) {
+    if op == IR_NOP { return "NOP"; }
+    if op == IR_CONST { return "CONST"; }
+    if op == IR_PARAM { return "PARAM"; }
+    if op == IR_MOV { return "MOV"; }
+    if op == IR_ADD { return "ADD"; }
+    if op == IR_SUB { return "SUB"; }
+    if op == IR_MUL { return "MUL"; }
+    if op == IR_DIV { return "DIV"; }
+    if op == IR_MOD { return "MOD"; }
+    if op == IR_NEG { return "NEG"; }
+    if op == IR_NOT { return "NOT"; }
+    if op == IR_AND { return "AND"; }
+    if op == IR_OR { return "OR"; }
+    if op == IR_XOR { return "XOR"; }
+    if op == IR_SHL { return "SHL"; }
+    if op == IR_SHR { return "SHR"; }
+    if op == IR_CMP { return "CMP"; }
+    if op == IR_JMP { return "JMP"; }
+    if op == IR_BR { return "BR"; }
+    if op == IR_CALL { return "CALL"; }
+    if op == IR_CALL_IDX { return "CALL_IDX"; }
+    if op == IR_RET { return "RET"; }
+    if op == IR_LABEL { return "LABEL"; }
+    if op == IR_STR { return "STR"; }
+    if op == IR_STOREG { return "STOREG"; }
+    if op == IR_LOADG { return "LOADG"; }
+    if op == IR_ALLOCA { return "ALLOCA"; }
+    if op == IR_FREE { return "FREE"; }
+    if op == IR_CAPREAD { return "CAPREAD"; }
+    if op == IR_CLOSURE_CALL { return "CLOSURE_CALL"; }
+    if op == IR_F2I { return "F2I"; }
+    if op == IR_I2F { return "I2F"; }
+    if op == IR_FADD { return "FADD"; }
+    if op == IR_FSUB { return "FSUB"; }
+    if op == IR_FMUL { return "FMUL"; }
+    if op == IR_FDIV { return "FDIV"; }
+    if op == IR_FCMP { return "FCMP"; }
+    return "UNKNOWN";
 }
 
-fn ir_op(inst) { inst >> IR_OP_SHIFT }
-fn ir_a0(inst) { (inst >> IR_A0_SHIFT) & 0xFF }
-fn ir_a1(inst) { (inst >> IR_A1_SHIFT) & 0xFF }
-fn ir_a2(inst) { (inst >> IR_A2_SHIFT) & 0xFF }
-fn ir_dst(inst) { (inst >> IR_DST_SHIFT) & 0xFF }
-fn ir_src(inst) { (inst >> IR_SRC_SHIFT) & 0xFF }
-fn ir_flags(inst) { (inst >> IR_FLAGS_SHIFT) & 0xFF }
+fn is_arith(op) {
+    return op >= IR_ADD && op <= IR_MOD;
+}
+
+fn is_float_arith(op) {
+    return op >= IR_FADD && op <= IR_FDIV;
+}
+
+fn is_branch(op) {
+    return op == IR_JMP || op == IR_BR;
+}
+
+fn is_call(op) {
+    return op == IR_CALL || op == IR_CALL_IDX || op == IR_CLOSURE_CALL;
+}
+
+fn init() -> i64 {
+    return 0;
+}
