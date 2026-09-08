@@ -5,12 +5,256 @@ module std_code_synthesizer;
 
 const SYNTH_CAP = 10000;
 
+fn sanitize_ident(name) {
+    let len_n = len(name);
+    let out = mmap(len_n + 1);
+    let i = 0;
+    while i < len_n {
+        let c = mem_load8(name + 8 + i);
+        if (c >= 48 && c <= 57) || (c >= 65 && c <= 90) || (c >= 97 && c <= 122) {
+            mem_store8(out + i, c);
+        } else {
+            mem_store8(out + i, 95);
+        }
+        i = i + 1;
+    }
+    mem_store8(out + len_n, 0);
+    return out;
+}
+
 fn emit_quanta_module(domain, category, module) -> i64 {
+    let clean_domain = sanitize_ident(domain);
+    let clean_category = sanitize_ident(category);
+    let clean_module = sanitize_ident(module);
+
+    let out_path = mmap(512);
+    let base = "generated/";
+    let i = 0;
+    while i < len(base) {
+        mem_store8(out_path + i, mem_load8(base + 8 + i));
+        i = i + 1;
+    }
+    let j = 0;
+    while j < len(clean_domain) {
+        mem_store8(out_path + i + j, mem_load8(clean_domain + 8 + j));
+        j = j + 1;
+    }
+    i = i + j;
+    mem_store8(out_path + i, 95); i = i + 1;
+    j = 0;
+    while j < len(clean_category) {
+        mem_store8(out_path + i + j, mem_load8(clean_category + 8 + j));
+        j = j + 1;
+    }
+    i = i + j;
+    mem_store8(out_path + i, 95); i = i + 1;
+    j = 0;
+    while j < len(clean_module) {
+        mem_store8(out_path + i + j, mem_load8(clean_module + 8 + j));
+        j = j + 1;
+    }
+    i = i + j;
+    let ext = ".quanta";
+    j = 0;
+    while j < len(ext) {
+        mem_store8(out_path + i + j, mem_load8(ext + 8 + j));
+        j = j + 1;
+    }
+    i = i + j;
+    mem_store8(out_path + i, 0);
+
+    let fd = file_open(out_path, 577);
+    if fd < 0 { return 0; }
+
+    file_write(fd, "module std_", len("module std_"));
+    file_write(fd, clean_domain, len(clean_domain));
+    file_write(fd, "_", 1);
+    file_write(fd, clean_category, len(clean_category));
+    file_write(fd, "_", 1);
+    file_write(fd, clean_module, len(clean_module));
+    file_write(fd, ";\n\n", 2);
+
+    // Check for programming_language (20 chars)
+    let c0 = mem_load8(clean_domain + 0);
+    let c1 = mem_load8(clean_domain + 1);
+    let c2 = mem_load8(clean_domain + 2);
+    let c3 = mem_load8(clean_domain + 3);
+    let c4 = mem_load8(clean_domain + 4);
+    let c5 = mem_load8(clean_domain + 5);
+    let c6 = mem_load8(clean_domain + 6);
+    let c7 = mem_load8(clean_domain + 7);
+    let c8 = mem_load8(clean_domain + 8);
+    let c9 = mem_load8(clean_domain + 9);
+    let c10 = mem_load8(clean_domain + 10);
+    let c11 = mem_load8(clean_domain + 11);
+    let c12 = mem_load8(clean_domain + 12);
+    let c13 = mem_load8(clean_domain + 13);
+    let c14 = mem_load8(clean_domain + 14);
+    let c15 = mem_load8(clean_domain + 15);
+    let c16 = mem_load8(clean_domain + 16);
+    let c17 = mem_load8(clean_domain + 17);
+    let c18 = mem_load8(clean_domain + 18);
+    let c19 = mem_load8(clean_domain + 19);
+    let is_pl = 0;
+    if c0==112 && c1==114 && c2==111 && c3==103 && c4==114 && c5==97 && c6==109 && c7==109 &&
+       c8==105 && c9==110 && c10==103 && c11==95 && c12==108 && c13==97 && c14==110 &&
+       c15==103 && c16==117 && c17==97 && c18==103 && c19==101 { is_pl = 1; }
+
+    // Check for mathematics (11 chars)
+    let d0 = mem_load8(clean_domain + 0);
+    let d1 = mem_load8(clean_domain + 1);
+    let d2 = mem_load8(clean_domain + 2);
+    let d3 = mem_load8(clean_domain + 3);
+    let d4 = mem_load8(clean_domain + 4);
+    let d5 = mem_load8(clean_domain + 5);
+    let d6 = mem_load8(clean_domain + 6);
+    let d7 = mem_load8(clean_domain + 7);
+    let d8 = mem_load8(clean_domain + 8);
+    let d9 = mem_load8(clean_domain + 9);
+    let d10 = mem_load8(clean_domain + 10);
+    let is_math = 0;
+    if d0==109 && d1==97 && d2==116 && d3==104 && d4==101 && d5==109 && d6==97 && d7==116 &&
+       d8==105 && d9==99 && d10==115 { is_math = 1; }
+
+    if is_pl {
+        file_write(fd, "import std/ir;\n", len("import std/ir;\n"));
+        file_write(fd, "import std/types;\n", len("import std/types;\n"));
+        file_write(fd, "import std/patterns;\n\n", len("import std/patterns;\n\n"));
+    } else if is_math {
+        file_write(fd, "import std/types;\n", len("import std/types;\n"));
+        file_write(fd, "import std/patterns;\n\n", len("import std/patterns;\n\n"));
+    } else {
+        file_write(fd, "import std/types;\n\n", len("import std/types;\n\n"));
+    }
+
+    file_write(fd, "// Domain: ", len("// Domain: "));
+    file_write(fd, domain, len(domain));
+    file_write(fd, ", Category: ", len(", Category: "));
+    file_write(fd, category, len(category));
+    file_write(fd, ", Module: ", len(", Module: "));
+    file_write(fd, module, len(module));
+    file_write(fd, "\n\n", 2);
+
+    file_write(fd, "fn init() -> i64 {\n    return 0;\n}\n\n", len("fn init() -> i64 {\n    return 0;\n}\n\n"));
+    file_write(fd, "fn main() -> i64 {\n    return init();\n}\n", len("fn main() -> i64 {\n    return init();\n}\n"));
+
+    file_close(fd);
     return 1;
 }
 
+fn synthesize_priority(specs_path) -> i64 {
+    let fd = file_open(specs_path, 0);
+    if fd < 0 { return 0; }
+    let buf = mmap(16777216);
+    let n = file_read(fd, buf, 16777216);
+    file_close(fd);
+    if n <= 0 { return 0; }
+
+    let i = 0;
+    while i < n && buf[i] != 91 { i = i + 1 }
+    i = i + 1;
+    let count = 0;
+    while i < n {
+        while i < n && (buf[i] == 32 || buf[i] == 10 || buf[i] == 9) { i = i + 1 }
+        if i >= n || buf[i] == 93 { break }
+        if buf[i] != 123 { break }
+
+        let domain_val = 0;
+        let cat_val = 0;
+        let mod_val = 0;
+        i = i + 1;
+        while i < n && buf[i] != 125 {
+            while i < n && (buf[i] == 32 || buf[i] == 10 || buf[i] == 9) { i = i + 1 }
+            if i >= n || buf[i] == 125 { break }
+            if buf[i] != 34 { break }
+            i = i + 1;
+            let key_start = i;
+            while i < n && buf[i] != 34 { i = i + 1 }
+            let key_len = i - key_start;
+            let key = mmap(key_len + 1);
+            let k = 0;
+            while k < key_len { mem_store8(key + k, buf[key_start + k]); k = k + 1 }
+            mem_store8(key + key_len, 0);
+            i = i + 1;
+            while i < n && (buf[i] == 32 || buf[i] == 9) { i = i + 1 }
+            if i < n && buf[i] == 58 { i = i + 1 }
+            while i < n && (buf[i] == 32 || buf[i] == 9) { i = i + 1 }
+            if i >= n { break }
+            let val = 0;
+            let val_len = 0;
+            if buf[i] == 34 {
+                i = i + 1;
+                let val_start = i;
+                while i < n && buf[i] != 34 { i = i + 1 }
+                val_len = i - val_start;
+                val = mmap(val_len + 1);
+                let k = 0;
+                while k < val_len { mem_store8(val + k, buf[val_start + k]); k = k + 1 }
+                mem_store8(val + val_len, 0);
+                i = i + 1;
+            } else {
+                let val_start = i;
+                while i < n && buf[i] != 44 && buf[i] != 125 { i = i + 1 }
+                val_len = i - val_start;
+                val = mmap(val_len + 1);
+                let k = 0;
+                while k < val_len { mem_store8(val + k, buf[val_start + k]); k = k + 1 }
+                mem_store8(val + val_len, 0);
+            }
+
+            // Check key: "domain" -> domain_val, "category" -> cat_val, "module" -> mod_val
+            let k0 = mem_load8(key + 0);
+            if k0 == 100 { // 'd' for domain
+                domain_val = val;
+            } else if k0 == 99 { // 'c' for category
+                cat_val = val;
+            } else if k0 == 109 { // 'm' for module
+                mod_val = val;
+            }
+
+            while i < n && (buf[i] == 32 || buf[i] == 9) { i = i + 1 }
+            if i < n && buf[i] == 44 { i = i + 1 }
+        }
+        if i < n && buf[i] == 125 { i = i + 1 }
+
+        // Check if domain_val is "programming_language"
+        if domain_val != 0 {
+            let c0 = mem_load8(domain_val + 0);
+            let c1 = mem_load8(domain_val + 1);
+            let c2 = mem_load8(domain_val + 2);
+            let c3 = mem_load8(domain_val + 3);
+            let c4 = mem_load8(domain_val + 4);
+            let c5 = mem_load8(domain_val + 5);
+            let c6 = mem_load8(domain_val + 6);
+            let c7 = mem_load8(domain_val + 7);
+            let c8 = mem_load8(domain_val + 8);
+            let c9 = mem_load8(domain_val + 9);
+            let c10 = mem_load8(domain_val + 10);
+            let c11 = mem_load8(domain_val + 11);
+            let c12 = mem_load8(domain_val + 12);
+            let c13 = mem_load8(domain_val + 13);
+            let c14 = mem_load8(domain_val + 14);
+            let c15 = mem_load8(domain_val + 15);
+            let c16 = mem_load8(domain_val + 16);
+            let c17 = mem_load8(domain_val + 17);
+            let c18 = mem_load8(domain_val + 18);
+            let c19 = mem_load8(domain_val + 19);
+            if c0==112 && c1==114 && c2==111 && c3==103 && c4==114 && c5==97 && c6==109 && c7==109 &&
+               c8==105 && c9==110 && c10==103 && c11==95 && c12==108 && c13==97 && c14==110 &&
+               c15==103 && c16==117 && c17==97 && c18==103 && c19==101 {
+                emit_quanta_module(domain_val, cat_val, mod_val);
+                count = count + 1;
+            }
+        }
+
+        while i < n && (buf[i] == 32 || buf[i] == 10 || buf[i] == 9) { i = i + 1 }
+        if i < n && buf[i] == 44 { i = i + 1 }
+    }
+    return count;
+}
+
 fn synthesize_all(specs_path) -> i64 {
-    return 1;
+    return synthesize_priority(specs_path);
 }
 
 fn init() -> i64 {
@@ -18,6 +262,8 @@ fn init() -> i64 {
 }
 
 fn main() -> i64 {
-    prints("Code synthesizer ready\n");
+    prints("Code synthesizer running...\n");
+    let count = synthesize_all("gap_specs.json");
+    prints("Generated modules: \n");
     return 0;
 }
