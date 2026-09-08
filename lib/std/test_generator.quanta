@@ -1,7 +1,81 @@
 // std/test_generator.quanta — Phase 2: Test Generator
+// Generates const test files for synthesized Quanta modules
 
 module std_test_generator;
 
-fn main() {
+const TEST_CAP = 10000;
+
+fn generate_const_test(domain, category, module) -> i64 {
+    // Generate a const test file for the synthesized module
+    // Returns 1 on success
+    let test_path = mmap(256);
+    // test_suites/codes/std_domain_category_module_const_test.quanta
+    let base = "test_suites/codes/std_";
+    let i = 0;
+    while i < len(base) {
+        mem_store8(test_path + i, mem_load8(base + 8 + i));
+        i = i + 1;
+    }
+    // domain
+    let j = 0;
+    while j < len(domain) {
+        mem_store8(test_path + i + j, mem_load8(domain + 8 + j));
+        j = j + 1;
+    }
+    i = i + j;
+    mem_store8(test_path + i, 95); i = i + 1;  // '_'
+    j = 0;
+    while j < len(category) {
+        mem_store8(test_path + i + j, mem_load8(category + 8 + j));
+        j = j + 1;
+    }
+    i = i + j;
+    mem_store8(test_path + i, 95); i = i + 1;
+    j = 0;
+    while j < len(module) {
+        mem_store8(test_path + i + j, mem_load8(module + 8 + j));
+        j = j + 1;
+    }
+    i = i + j;
+    let suffix = "_const_test.quanta";
+    j = 0;
+    while j < len(suffix) {
+        mem_store8(test_path + i + j, mem_load8(suffix + 8 + j));
+        j = j + 1;
+    }
+    i = i + j;
+    mem_store8(test_path + i, 0);
+
+    let fd = file_open(test_path, 577);
+    if fd < 0 { return 0; }
+
+    file_write(fd, "// Auto-generated const test for std_", len("// Auto-generated const test for std_"));
+    file_write(fd, domain, len(domain));
+    file_write(fd, "_", 1);
+    file_write(fd, category, len(category));
+    file_write(fd, "_", 1);
+    file_write(fd, module, len(module));
+    file_write(fd, "\nimport std/", len("import std/"));
+    file_write(fd, domain, len(domain));
+    file_write(fd, "_", 1);
+    file_write(fd, category, len(category));
+    file_write(fd, "_", 1);
+    file_write(fd, module, len(module));
+    file_write(fd, "\nfn main() {\n    return 0\n}\n", len("\nfn main() {\n    return 0\n}\n"));
+
+    file_close(fd);
+    return 1;
+}
+
+fn generate_all(specs_path) -> i64 {
+    return 1;
+}
+
+fn init() -> i64 {
+    return 0;
+}
+
+fn main() -> i64 {
+    prints("Test generator ready\n");
     return 0;
 }
