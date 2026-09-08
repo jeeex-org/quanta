@@ -263,7 +263,7 @@ echo ""
 echo "########## STATUS VERIFICATION GATE ##########"
 VERIFY_STATUS_RC=0
 QC_STATUS="$QC"
-if $QC_STATUS scripts/verify_status.quanta /tmp/verify_status 2>/tmp/verify_status_compile.txt; then
+if $QC_STATUS test_suites/scripts/verify_status.quanta /tmp/verify_status 2>/tmp/verify_status_compile.txt; then
   if /tmp/verify_status >/tmp/verify_status_run.txt 2>&1; then
     echo "  PASS: status verification consistent"
     VERIFY_STATUS_RC=0
