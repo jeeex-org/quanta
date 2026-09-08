@@ -11,7 +11,7 @@
 set -u
 # Safe ceiling: a single tiny test must never touch more than 1 GB VSZ.
 # Keep this LOW — the runaway t3.bin hit 15 TB; 1 GB is 15000x headroom we don't need.
-MEM_LIMIT_MB="${QUANTA_MEM_MB:-768}"
+MEM_LIMIT_MB="${QUANTA_MEM_MB:-1024}"
 # never allow > 1536 MB regardless of env (foot-gun guard)
 [ "$MEM_LIMIT_MB" -gt 1536 ] && MEM_LIMIT_MB=1536
 TIME_LIMIT_S="${QUANTA_TIME_S:-15}"

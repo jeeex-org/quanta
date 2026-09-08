@@ -3,7 +3,7 @@
 
 module std_pattern_library;
 
-import std.ir;
+import std/io
 
 const PAT_LIB_CAP = 1000;
 
@@ -57,10 +57,10 @@ const IR_FCMP = 36;
 
 fn ir_emit(op, a, b, c) -> i64 {
     let idx = ir_pool_ptr;
-    w64(ir_pool + idx * 8, op);
-    w64(ir_pool + idx * 8 + 8, a);
-    w64(ir_pool + idx * 8 + 16, b);
-    w64(ir_pool + idx * 8 + 24, c);
+    mem_store(ir_pool + idx * 8, op);
+    mem_store(ir_pool + idx * 8 + 8, a);
+    mem_store(ir_pool + idx * 8 + 16, b);
+    mem_store(ir_pool + idx * 8 + 24, c);
     ir_pool_ptr = ir_pool_ptr + 1;
     return idx;
 }
@@ -80,8 +80,8 @@ fn str_copy(src) -> i64 {
 fn register_pattern(name, ir_head) -> i64 {
     if pattern_count >= PAT_LIB_CAP { return 0; }
     let name_copy = str_copy(name);
-    w64(pattern_names + pattern_count * 8, name_copy);
-    w64(pattern_ir + pattern_count * 8, ir_head);
+    mem_store(pattern_names + pattern_count * 8, name_copy);
+    mem_store(pattern_ir + pattern_count * 8, ir_head);
     pattern_count = pattern_count + 1;
     return 1;
 }
@@ -89,7 +89,7 @@ fn register_pattern(name, ir_head) -> i64 {
 fn get_pattern(name) -> i64 {
     let i = 0;
     while i < pattern_count {
-        let pn = r64(pattern_names + i * 8);
+        let pn = mem_load(pattern_names + i * 8);
         let eq = 1;
         let na = len(name);
         let nb = len(pn);
@@ -101,7 +101,7 @@ fn get_pattern(name) -> i64 {
                 j = j + 1;
             }
         }
-        if eq { return r64(pattern_ir + i * 8); }
+        if eq { return mem_load(pattern_ir + i * 8); }
         i = i + 1;
     }
     return 0;
