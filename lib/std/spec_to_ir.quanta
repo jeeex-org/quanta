@@ -3,9 +3,26 @@
 
 module std_spec_to_ir;
 
+import std/json
+import std/str
+import std/vec
+import std/map
+import std/fs
+
 const SPEC_CAP = 10000;
 
-fn str_equals(a, b) {
+// IR types for specs
+const IR_SPEC = 1;
+const IR_SPEC_DOMAIN = 8;
+const IR_SPEC_CATEGORY = 16;
+const IR_SPEC_MODULE = 24;
+const IR_SPEC_STATUS = 32;
+const IR_SPEC_VERSION = 40;
+const IR_SPEC_STDLIB = 48;
+const IR_SPEC_NOTES = 56;
+const IR_SPEC_SIZE = 64;
+
+fn str_equals(a, b) -> i64 {
     let la = len(a);
     let lb = len(b);
     if la != lb { return 0; }
@@ -17,23 +34,125 @@ fn str_equals(a, b) {
     return 1;
 }
 
+// Load and parse gap_specs.json using std/json
 fn load_gap_specs(path) -> i64 {
-    let fd = file_open(path, 0);
+    let fd = file_open("/opt/tali/quanta/gap_specs.json", 0);
     if fd < 0 { return 0; }
-    let buf = mmap(16777216);
-    let n = file_read(fd, buf, 16777216);
+    let buf = mmap(2097152);
+    let n = file_read(fd, buf + 8, 16777216);
     file_close(fd);
     if n <= 0 { return 0; }
+    mem_store(buf, n);
 
-    return 1;
+    let parsed = json_parse(buf);
+    if parsed < 0 { return 0; }
+    
+    let typ = json_get_type(parsed);
+    if typ != 5 { return 0; }
+    
+    let obj = json_get_object(parsed);
+    let specs = json_object_get(obj, "specs");
+    if specs < 0 { return 0; }
+    let specs_typ = json_get_type(specs);
+    if specs_typ != 4 { return 0; }
+    
+    let arr = json_get_array(specs);
+    return arr;  // Return the array pointer
 }
 
-fn spec_to_ir(spec_idx) -> i64 {
-    return 1;
+// Get spec count from array
+fn get_spec_count(specs_arr) -> i64 {
+    if specs_arr == 0 { return 0; }
+    return json_array_len(specs_arr);
 }
 
-fn get_spec_count() -> i64 {
+// Get spec object at index
+fn get_spec(specs_arr, idx) -> i64 {
+    if specs_arr == 0 { return 0; }
+    let spec_val = json_array_get(specs_arr, idx);
+    if spec_val < 0 { return 0; }
+    return json_get_object(spec_val);
+}
+
+// Extract string field from spec object
+fn spec_get_field(spec_obj, field_name) -> i64 {
+    if spec_obj == 0 { return 0; }
+    return json_object_get(spec_obj, field_name);
+}
+
+// Map spec to IR
+fn spec_to_ir(spec_obj) -> i64 {
+    if spec_obj == 0 { return 0; }
+    
+    let domain = spec_get_field(spec_obj, "domain");
+    let category = spec_get_field(spec_obj, "category");
+    let module = spec_get_field(spec_obj, "module");
+    let status = spec_get_field(spec_obj, "status");
+    let version = spec_get_field(spec_obj, "version");
+    let stdlib = spec_get_field(spec_obj, "stdlib");
+    let notes = spec_get_field(spec_obj, "notes");
+    
+    // Allocate IR spec struct
+    let ir = mem_alloc(IR_SPEC_SIZE);
+    
+    // Store type tag
+    mem_store(ir, IR_SPEC);
+    
+    // Store string pointers
+    mem_store(ir + IR_SPEC_DOMAIN, domain);
+    mem_store(ir + IR_SPEC_CATEGORY, category);
+    mem_store(ir + IR_SPEC_MODULE, module);
+    mem_store(ir + IR_SPEC_STATUS, status);
+    mem_store(ir + IR_SPEC_VERSION, version);
+    mem_store(ir + IR_SPEC_STDLIB, stdlib);
+    mem_store(ir + IR_SPEC_NOTES, notes);
+    
+    return ir;
+}
+
+// Print IR spec for debugging
+fn print_ir_spec(ir) -> i64 {
+    if ir == 0 { return 0; }
+    let typ = mem_load(ir);
+    if typ != IR_SPEC { return 0; }
+    
+    let domain = mem_load(ir + IR_SPEC_DOMAIN);
+    let category = mem_load(ir + IR_SPEC_CATEGORY);
+    let module = mem_load(ir + IR_SPEC_MODULE);
+    let status = mem_load(ir + IR_SPEC_STATUS);
+    
+    if domain >= 0 {
+        prints("  domain: "); prints(json_get_string(domain)); prints("\n");
+    }
+    if category >= 0 {
+        prints("  category: "); prints(json_get_string(category)); prints("\n");
+    }
+    if module >= 0 {
+        prints("  module: "); prints(json_get_string(module)); prints("\n");
+    }
+    if status >= 0 {
+        prints("  status: "); prints(json_get_string(status)); prints("\n");
+    }
     return 0;
+}
+
+// Get all IR specs as array
+fn get_all_ir_specs(specs_arr, out_arr) -> i64 {
+    let count = get_spec_count(specs_arr);
+    let i = 0;
+    let added = 0;
+    while i < count {
+        let spec_obj = get_spec(specs_arr, i);
+        if spec_obj != 0 {
+            let ir = spec_to_ir(spec_obj);
+            if ir != 0 {
+                vec_push(out_arr, ir);
+                added = added + 1;
+            }
+        }
+        i = i + 1;
+    }
+    return added;
 }
 
 fn init() -> i64 {
@@ -41,7 +160,30 @@ fn init() -> i64 {
 }
 
 fn main() -> i64 {
-    load_gap_specs("gap_specs.json");
-    prints("Loaded specs\n");
-    return 0;
+    prints("spec_to_ir: loading gap_specs.json\n");
+    let specs_arr = load_gap_specs("gap_specs.json");
+    if specs_arr == 0 {
+        prints("Failed to load specs\n");
+        return 1;
+    }
+    
+    let total = get_spec_count(specs_arr);
+    prints("Total specs: "); printi(total); prints("\n");
+    
+    let ir_specs = vec_new();
+    let count = get_all_ir_specs(specs_arr, ir_specs);
+    prints("Mapped to IR: "); printi(count); prints("\n");
+    
+    // Print first 5 for verification
+    let i = 0;
+    let show = 5;
+    if count < show { show = count; }
+    while i < show {
+        let ir = vec_at(ir_specs, i);
+        prints("IR Spec "); printi(i); prints(":\n");
+        print_ir_spec(ir);
+        i = i + 1;
+    }
+    
+    return count;
 }

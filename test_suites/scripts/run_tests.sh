@@ -258,23 +258,45 @@ else
   echo "  SKIP: multi_tu_tests.sh missing"
 fi
 
+# --- Stage 12: STATUS VERIFICATION (docs vs source consistency) --------------
+echo ""
+echo "########## STATUS VERIFICATION GATE ##########"
+VERIFY_STATUS_RC=0
+QC_STATUS="$QC"
+if $QC_STATUS scripts/verify_status.quanta /tmp/verify_status 2>/tmp/verify_status_compile.txt; then
+  if /tmp/verify_status >/tmp/verify_status_run.txt 2>&1; then
+    echo "  PASS: status verification consistent"
+    VERIFY_STATUS_RC=0
+  else
+    echo "  FAIL: status verification found inconsistencies"
+    cat /tmp/verify_status_run.txt
+    VERIFY_STATUS_RC=1
+  fi
+else
+  echo "  FAIL: verify_status failed to compile"
+  cat /tmp/verify_status_compile.txt
+  VERIFY_STATUS_RC=1
+fi
+
 echo "=== GATE SUMMARY ==="
-echo "  functional : $([ $FUNCTIONAL_RC = 0 ] && echo GREEN || echo RED)"
-echo "  extern-c  : $([ $EXTERN_RC = 0 ] && echo GREEN || echo RED)  (object-mode + gcc libc link)"
-echo "  extern-ld : $([ $EXTERN_LD_RC = 0 ] && echo GREEN || echo RED)  (object-mode + ld, GCC-FREE 0.0.122)"
-echo "  security   : $([ $SECURITY_RC = 0 ] && echo GREEN || echo RED)  (KNOWN bugs reported by script, not blocking)"
-echo "  performance: $([ $PERF_RC = 0 ] && echo GREEN || echo RED)"
-echo "  valgrind   : $([ $VALGRIND_RC = 0 ] && echo GREEN || echo RED)  (compiler binary leak/error scan)"
-echo "  fuzz       : $([ $FUZZ_RC = 0 ] && echo GREEN || echo RED)  (fail-closed: 0 crashes)"
-echo "  differential: $([ $DIFF_RC = 0 ] && echo GREEN || echo RED)  (opt -O==no-O + vs-seed)"
-echo "  generics    : $([ $GENERICS_RC = 0 ] && echo GREEN || echo RED)  (negative type-arg checks fail closed)"
-echo "  stdlib      : $([ $STDLIB_RC = 0 ] && echo GREEN || echo RED)  (lib/std/* via import, EXPECTED_STDLIB.tsv)"
-echo "  multi-tu    : $([ $MTU_RC = 0 ] && echo GREEN || echo RED)  (cross-TU call + global, --emit-obj + gcc link)"
-# Block promotion on a real functional/security/perf/valgrind/fuzz/diff/stdlib/mtu regression.
+echo "  functional     : $([ $FUNCTIONAL_RC = 0 ] && echo GREEN || echo RED)"
+echo "  extern-c      : $([ $EXTERN_RC = 0 ] && echo GREEN || echo RED)  (object-mode + gcc libc link)"
+echo "  extern-ld     : $([ $EXTERN_LD_RC = 0 ] && echo GREEN || echo RED)  (object-mode + ld, GCC-FREE 0.0.122)"
+echo "  security      : $([ $SECURITY_RC = 0 ] && echo GREEN || echo RED)  (KNOWN bugs reported by script, not blocking)"
+echo "  performance   : $([ $PERF_RC = 0 ] && echo GREEN || echo RED)"
+echo "  valgrind      : $([ $VALGRIND_RC = 0 ] && echo GREEN || echo RED)  (compiler binary leak/error scan)"
+echo "  fuzz          : $([ $FUZZ_RC = 0 ] && echo GREEN || echo RED)  (fail-closed: 0 crashes)"
+echo "  differential  : $([ $DIFF_RC = 0 ] && echo GREEN || echo RED)  (opt -O==no-O + vs-seed)"
+echo "  generics      : $([ $GENERICS_RC = 0 ] && echo GREEN || echo RED)  (negative type-arg checks fail closed)"
+echo "  stdlib        : $([ $STDLIB_RC = 0 ] && echo GREEN || echo RED)  (lib/std/* via import, EXPECTED_STDLIB.tsv)"
+echo "  multi-tu      : $([ $MTU_RC = 0 ] && echo GREEN || echo RED)  (cross-TU call + global, --emit-obj + gcc link)"
+echo "  verify-status : $([ $VERIFY_STATUS_RC = 0 ] && echo GREEN || echo RED)  (docs/status.json consistency)"
+# Block promotion on a real functional/security/perf/valgrind/fuzz/diff/stdlib/mtu/verify-status regression.
 # Security KNOWN issues are surfaced by the script but do not turn the gate red.
 if [ $FUNCTIONAL_RC -ne 0 ] || [ $SECURITY_RC -ne 0 ] || [ $PERF_RC -ne 0 ] \
    || [ $VALGRIND_RC -ne 0 ] || [ $FUZZ_RC -ne 0 ] || [ $DIFF_RC -ne 0 ] \
-   || [ $GENERICS_RC -ne 0 ] || [ $STDLIB_RC -ne 0 ] || [ $MTU_RC -ne 0 ]; then
+   || [ $GENERICS_RC -ne 0 ] || [ $STDLIB_RC -ne 0 ] || [ $MTU_RC -ne 0 ] \
+   || [ $VERIFY_STATUS_RC -ne 0 ]; then
   exit 1
 fi
 exit 0

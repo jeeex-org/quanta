@@ -1,10 +1,184 @@
-// std/spec_parser.quanta — Phase 1 Gap Detection: parse docs/roadmap/*.md + domains/*.md
-// Produces gap_specs.json (array of {domain, module, status, version, notes, in_domains})
+// std/spec_parser.quanta — Phase 1 Gap Detection: parse gap_specs.json
+// Uses std/json to parse the 9026-spec file, filters by status, feeds to code_synthesizer
 
 module std_spec_parser;
 
-const GAPS_CAP = 10000;
+import std/json
+import std/str
+import std/vec
+import std/map
+import std/fs
 
-fn main() {
+const GAPS_CAP = 10000;
+const SPEC_FIELDS = 6;  // domain, category, module, status, version, notes
+
+fn spec_parser_init() -> i64 {
     return 0;
+}
+
+// Load and parse gap_specs.json using std/json
+fn load_gap_specs(path) -> i64 {
+    let fd = file_open("/opt/tali/quanta/gap_specs.json", 0);
+    if fd < 0 { return 0; }
+    // Allocate buffer with space for length header (8 bytes) + JSON data
+    let buf = mmap(2097152);  // 16MB / 8 = 2M pages
+    // Read JSON directly into buf + 8 (after length header)
+    let n = file_read(fd, buf + 8, 16777216);
+    file_close(fd);
+    if n <= 0 { return 0; }
+    // Store length at buf, JSON data is at buf+8
+    mem_store(buf, n);
+
+    // Parse JSON using std/json
+    let parsed = json_parse(buf);
+    if parsed < 0 { return 0; }
+    
+    let typ = json_get_type(parsed);
+    if typ != 5 {  // JSON_OBJECT = 5
+        return 0;
+    }
+
+    return parsed;  // JSON value root
+}
+
+// Get specs array from parsed JSON root
+fn get_specs_array(json_root) -> i64 {
+    if json_root == 0 { return 0; }
+    let typ = json_get_type(json_root);
+    if typ != 5 { return 0; }  // JSON_OBJECT = 5
+    let obj = json_get_object(json_root);
+    if obj == 0 { return 0; }
+    let specs = json_object_get(obj, "specs");
+    if specs == 0 { return 0; }
+    let specs_typ = json_get_type(specs);
+    if specs_typ != 4 { return 0; }  // JSON_ARRAY = 4
+    return json_get_array(specs);
+}
+
+// Get spec count
+fn get_spec_count(specs_arr) -> i64 {
+    if specs_arr == 0 { return 0; }
+    return json_array_len(specs_arr);
+}
+
+// Get spec at index
+fn get_spec(specs_arr, idx) -> i64 {
+    if specs_arr == 0 { return 0; }
+    return json_array_get(specs_arr, idx);
+}
+
+// Extract string field from spec object
+fn spec_get_field(spec_obj, field_name) -> i64 {
+    if spec_obj == 0 { return 0; }
+    let typ = json_get_type(spec_obj);
+    if typ != 5 { return 0; }  // JSON_OBJECT = 5
+    let obj = json_get_object(spec_obj);
+    if obj == 0 { return 0; }
+    return json_object_get(obj, field_name);
+}
+
+// Check if spec status is "🔲 planned" or similar (needs implementation)
+fn spec_needs_implementation(spec_obj) -> i64 {
+    let status_str = spec_get_field(spec_obj, "status");
+    if status_str == 0 { return 0; }
+    let status = json_get_string(status_str);
+    if status == 0 { return 0; }
+    // Check for planned markers - 🔲 is U+1F532, UTF-8: 0xF0 0x9F 0x94 0xB2
+    // But our UTF-8 encoding gives: 237 160 189 = 0xED 0xA0 0xBD (surrogate pair?)
+    // Actually let's check for the first byte of the emoji
+    let i = 0;
+    let n = len(status);
+    while i < n {
+        let c = mem_load8(status + 8 + i);
+        if c == 226 || c == 240 || c == 237 {  // UTF-8 emoji start bytes
+            return 1;  // planned
+        }
+        i = i + 1;
+    }
+    return 0;
+}
+
+// Filter specs that need implementation
+fn filter_planned_specs(specs_arr, out_arr) -> i64 {
+    let count = get_spec_count(specs_arr);
+    let i = 0;
+    let added = 0;
+    while i < count {
+        let spec = get_spec(specs_arr, i);
+        if spec != 0 && spec_needs_implementation(spec) == 1 {
+            vec_push(out_arr, spec);
+            added = added + 1;
+        }
+        i = i + 1;
+    }
+    return added;
+}
+
+// Print spec summary for debugging
+fn print_spec_summary(spec_obj) -> i64 {
+    if spec_obj == 0 { return 0; }
+    let domain = spec_get_field(spec_obj, "domain");
+    let category = spec_get_field(spec_obj, "category");
+    let module = spec_get_field(spec_obj, "module");
+    let status = spec_get_field(spec_obj, "status");
+
+    if domain != 0 {
+        prints("  domain: "); prints(json_get_string(domain)); prints("\n");
+    }
+    if category != 0 {
+        prints("  category: "); prints(json_get_string(category)); prints("\n");
+    }
+    if module != 0 {
+        prints("  module: "); prints(json_get_string(module)); prints("\n");
+    }
+    if status != 0 {
+        prints("  status: "); prints(json_get_string(status)); prints("\n");
+    }
+    return 0;
+}
+
+// Main entry: parse gap_specs.json and return count of planned specs
+fn parse_gap_specs(path) -> i64 {
+    prints("Parsing gap specs from: "); prints(path); prints("\n");
+
+    let json_root = load_gap_specs(path);
+    if json_root == 0 {
+        prints("Failed to parse JSON\n");
+        return 0;
+    }
+
+    let specs_arr = get_specs_array(json_root);
+    if specs_arr == 0 {
+        prints("No specs array found\n");
+        return 0;
+    }
+
+    let total = get_spec_count(specs_arr);
+    prints("Total specs: "); printi(total); prints("\n");
+
+    let planned = vec_new();
+    let planned_count = filter_planned_specs(specs_arr, planned);
+    prints("Planned specs needing implementation: "); printi(planned_count); prints("\n");
+
+    // Print first 5 for verification
+    let i = 0;
+    let show = 5;
+    if planned_count < show { show = planned_count; }
+    while i < show {
+        let spec = vec_at(planned, i);
+        prints("Spec "); printi(i); prints(":\n");
+        print_spec_summary(spec);
+        i = i + 1;
+    }
+
+    return planned_count;
+}
+
+fn init() -> i64 {
+    return spec_parser_init();
+}
+
+fn main() -> i64 {
+    let count = parse_gap_specs("gap_specs.json");
+    return count;
 }

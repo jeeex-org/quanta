@@ -3,72 +3,155 @@
 
 module std_test_generator;
 
+import std/str
+import std/vec
+import std/map
+import std/fs
+import std/json
+
 const TEST_CAP = 10000;
 
-fn generate_const_test(domain, category, module) -> i64 {
-    // Generate a const test file for the synthesized module
-    // Returns 1 on success
-    let test_path = mmap(256);
-    // test_suites/codes/std_domain_category_module_const_test.quanta
+// Build path string using Quanta string format
+fn build_test_path(domain, category, module) -> i64 {
     let base = "test_suites/codes/std_";
+    let suffix = "_const_test.quanta";
+    
+    // Calculate total length
+    let len = len(base) + len(domain) + 1 + len(category) + 1 + len(module) + len(suffix);
+    
+    // Allocate Quanta string (8 bytes header + data + null)
+    let path = mem_alloc(len + 9);
+    mem_store(path, len);
+    let pos = 8;
+    
+    // Copy base
     let i = 0;
     while i < len(base) {
-        mem_store8(test_path + i, mem_load8(base + 8 + i));
+        mem_store8(path + pos, mem_load8(base + 8 + i));
+        pos = pos + 1;
         i = i + 1;
     }
-    // domain
-    let j = 0;
-    while j < len(domain) {
-        mem_store8(test_path + i + j, mem_load8(domain + 8 + j));
-        j = j + 1;
+    
+    // Copy domain
+    i = 0;
+    while i < len(domain) {
+        mem_store8(path + pos, mem_load8(domain + 8 + i));
+        pos = pos + 1;
+        i = i + 1;
     }
-    i = i + j;
-    mem_store8(test_path + i, 95); i = i + 1;  // '_'
-    j = 0;
-    while j < len(category) {
-        mem_store8(test_path + i + j, mem_load8(category + 8 + j));
-        j = j + 1;
+    mem_store8(path + pos, 95); pos = pos + 1;  // '_'
+    
+    // Copy category
+    i = 0;
+    while i < len(category) {
+        mem_store8(path + pos, mem_load8(category + 8 + i));
+        pos = pos + 1;
+        i = i + 1;
     }
-    i = i + j;
-    mem_store8(test_path + i, 95); i = i + 1;
-    j = 0;
-    while j < len(module) {
-        mem_store8(test_path + i + j, mem_load8(module + 8 + j));
-        j = j + 1;
+    mem_store8(path + pos, 95); pos = pos + 1;  // '_'
+    
+    // Copy module
+    i = 0;
+    while i < len(module) {
+        mem_store8(path + pos, mem_load8(module + 8 + i));
+        pos = pos + 1;
+        i = i + 1;
     }
-    i = i + j;
-    let suffix = "_const_test.quanta";
-    j = 0;
-    while j < len(suffix) {
-        mem_store8(test_path + i + j, mem_load8(suffix + 8 + j));
-        j = j + 1;
+    
+    // Copy suffix
+    i = 0;
+    while i < len(suffix) {
+        mem_store8(path + pos, mem_load8(suffix + 8 + i));
+        pos = pos + 1;
+        i = i + 1;
     }
-    i = i + j;
-    mem_store8(test_path + i, 0);
+    mem_store8(path + pos, 0);
+    
+    return path;
+}
 
-    let fd = file_open(test_path, 577);
+fn generate_const_test(domain, category, module) -> i64 {
+    let path = build_test_path(domain, category, module);
+    if path == 0 { return 0; }
+    
+    let fd = file_open(path, 577);
     if fd < 0 { return 0; }
-
-    file_write(fd, "// Auto-generated const test for std_", len("// Auto-generated const test for std_"));
-    file_write(fd, domain, len(domain));
+    
+    let header = "// Auto-generated const test for std_";
+    file_write(fd, header + 8, mem_load(header));
+    file_write(fd, domain + 8, len(domain));
     file_write(fd, "_", 1);
-    file_write(fd, category, len(category));
+    file_write(fd, category + 8, len(category));
     file_write(fd, "_", 1);
-    file_write(fd, module, len(module));
-    file_write(fd, "\nimport std/", len("import std/"));
-    file_write(fd, domain, len(domain));
+    file_write(fd, module + 8, len(module));
+    let import_str = "\nimport std/";
+    file_write(fd, import_str + 8, mem_load(import_str));
+    file_write(fd, domain + 8, len(domain));
     file_write(fd, "_", 1);
-    file_write(fd, category, len(category));
+    file_write(fd, category + 8, len(category));
     file_write(fd, "_", 1);
-    file_write(fd, module, len(module));
-    file_write(fd, "\nfn main() {\n    return 0\n}\n", len("\nfn main() {\n    return 0\n}\n"));
+    file_write(fd, module + 8, len(module));
+    let footer = "\nfn main() {\n    return 0\n}\n";
+    file_write(fd, footer + 8, mem_load(footer));
 
     file_close(fd);
     return 1;
 }
 
+// Generate tests from gap_specs.json
 fn generate_all(specs_path) -> i64 {
-    return 1;
+    prints("Generating tests from gap_specs.json\n");
+    
+    let fd = file_open("/opt/tali/quanta/gap_specs.json", 0);
+    if fd < 0 { return 0; }
+    let buf = mmap(2097152);
+    let n = file_read(fd, buf + 8, 16777216);
+    file_close(fd);
+    if n <= 0 { return 0; }
+    mem_store(buf, n);
+    
+    let parsed = json_parse(buf);
+    if parsed < 0 { return 0; }
+    
+    let typ = json_get_type(parsed);
+    if typ != 5 { return 0; }
+    
+    let obj = json_get_object(parsed);
+    let specs = json_object_get(obj, "specs");
+    if specs < 0 { return 0; }
+    let specs_typ = json_get_type(specs);
+    if specs_typ != 4 { return 0; }
+    
+    let arr = json_get_array(specs);
+    let count = json_array_len(arr);
+    
+    let i = 0;
+    let generated = 0;
+    while i < count {
+        let spec_val = json_array_get(arr, i);
+        if spec_val >= 0 {
+            let spec_obj = json_get_object(spec_val);
+            if spec_obj != 0 {
+                // json_object_get returns value pointers, need json_get_string to extract actual strings
+                let domain_val = json_object_get(spec_obj, "domain");
+                let category_val = json_object_get(spec_obj, "category");
+                let module_val = json_object_get(spec_obj, "module");
+                
+                let domain = json_get_string(domain_val);
+                let category = json_get_string(category_val);
+                let module = json_get_string(module_val);
+                
+                if domain >= 0 && category >= 0 && module >= 0 {
+                    let result = generate_const_test(domain, category, module);
+                    if result != 0 { generated = generated + 1; }
+                }
+            }
+        }
+        i = i + 1;
+    }
+    
+    prints("Generated "); printi(generated); prints(" const test files\n");
+    return generated;
 }
 
 fn init() -> i64 {
@@ -76,6 +159,7 @@ fn init() -> i64 {
 }
 
 fn main() -> i64 {
-    prints("Test generator ready\n");
-    return 0;
+    prints("Test generator: generating const tests from gap_specs.json\n");
+    let count = generate_all("gap_specs.json");
+    return count;
 }
