@@ -1,0 +1,144 @@
+// std/si_gap_scanner — Phase 1: Real Gap Detection (0.0.175)
+// Scans lib/std/ source files for stubs/partials
+// Stub: < 20 lines OR only main/init with no real exports
+
+module std_si_gap_scanner;
+
+import std/str
+import std/fs
+
+const MAX_LINE = 1048576;
+const ISSUE_STUB = 1;
+const ISSUE_PARTIAL = 2;
+
+// Scan a .quanta file for stubs
+// Returns: 0=verified, 1=stub, 2=partial
+fn scan_quanta_file(path) -> i64 {
+    let fd = file_open(path, 0);
+    if fd < 0 { return 0; }
+    let buf = mmap((MAX_LINE + 7) / 8);
+    let n = file_read(fd, buf, MAX_LINE);
+    file_close(fd);
+    if n <= 0 { return 0; }
+    mem_store(buf, n);
+    
+    let lines = 0;
+    let has_main = 0;
+    let has_init = 0;
+    let export_count = 0;
+    let i = 0;
+    
+    while i < n {
+        let c = mem_load8(buf + 8 + i);
+        if c == 10 { lines = lines + 1; }
+        if i < n - 3 {
+            if mem_load8(buf + 8 + i) == 102 && mem_load8(buf + 8 + i + 1) == 110 && mem_load8(buf + 8 + i + 2) == 32 {
+                let j = i + 3;
+                let name_start = j;
+                while j < n && mem_load8(buf + 8 + j) != 40 && mem_load8(buf + 8 + j) != 32 && mem_load8(buf + 8 + j) != 10 { j = j + 1; }
+                let name_len = j - name_start;
+                if name_len == 4 {
+                    let n0 = mem_load8(buf + 8 + name_start);
+                    let n1 = mem_load8(buf + 8 + name_start + 1);
+                    let n2 = mem_load8(buf + 8 + name_start + 2);
+                    let n3 = mem_load8(buf + 8 + name_start + 3);
+                    if n0==109 && n1==97 && n2==105 && n3==110 { has_main = 1; }
+                    if n0==105 && n1==110 && n2==105 && n3==116 { has_init = 1; }
+                }
+                export_count = export_count + 1;
+            }
+        }
+        i = i + 1;
+    }
+    
+    if lines < 20 { return ISSUE_STUB; }
+    if export_count == 0 && has_main == 1 { return ISSUE_STUB; }
+    if export_count < 3 { return ISSUE_PARTIAL; }
+    return 0;
+}
+
+// Check if a file exists and scan it
+fn check_module(name_len, name_ptr) -> i64 {
+    // Build path: lib/std/ + name + .quanta
+    let path = mmap(256);
+    let base = "lib/std/";
+    let i = 0;
+    while i < 8 {
+        mem_store8(path + i, mem_load8(base + 8 + i));
+        i = i + 1;
+    }
+    let j = 0;
+    while j < name_len {
+        mem_store8(path + i + j, mem_load8(name_ptr + j));
+        j = j + 1;
+    }
+    i = i + j;
+    let ext = ".quanta";
+    let k = 0;
+    while k < 7 {
+        mem_store8(path + i + k, mem_load8(ext + 8 + k));
+        k = k + 1;
+    }
+    i = i + k;
+    mem_store8(path + i, 0);
+    
+    let result = scan_quanta_file(path);
+    return result;
+}
+
+fn init() -> i64 { return 0 }
+
+fn main() -> i64 {
+    prints("SI Gap Scanner 0.0.175\n");
+    
+    // Scan key modules from roadmap
+    // spec_parser
+    let sp = "spec_parser";
+    let sp_res = check_module(11, sp);
+    prints("spec_parser: ");
+    if sp_res == 1 { prints("STUB\n"); }
+    else if sp_res == 2 { prints("PARTIAL\n"); }
+    else { prints("OK\n"); }
+    
+    // spec_to_ir
+    let sti = "spec_to_ir";
+    let sti_res = check_module(10, sti);
+    prints("spec_to_ir: ");
+    if sti_res == 1 { prints("STUB\n"); }
+    else if sti_res == 2 { prints("PARTIAL\n"); }
+    else { prints("OK\n"); }
+    
+    // test_generator
+    let tg = "test_generator";
+    let tg_res = check_module(14, tg);
+    prints("test_generator: ");
+    if tg_res == 1 { prints("STUB\n"); }
+    else if tg_res == 2 { prints("PARTIAL\n"); }
+    else { prints("OK\n"); }
+    
+    // pattern_library
+    let pl = "pattern_library";
+    let pl_res = check_module(15, pl);
+    prints("pattern_library: ");
+    if pl_res == 1 { prints("STUB\n"); }
+    else if pl_res == 2 { prints("PARTIAL\n"); }
+    else { prints("OK\n"); }
+    
+    // code_synthesizer
+    let cs = "code_synthesizer";
+    let cs_res = check_module(16, cs);
+    prints("code_synthesizer: ");
+    if cs_res == 1 { prints("STUB\n"); }
+    else if cs_res == 2 { prints("PARTIAL\n"); }
+    else { prints("OK\n"); }
+    
+    // si_main
+    let sm = "si_main";
+    let sm_res = check_module(7, sm);
+    prints("si_main: ");
+    if sm_res == 1 { prints("STUB\n"); }
+    else if sm_res == 2 { prints("PARTIAL\n"); }
+    else { prints("OK\n"); }
+    
+    return 0;
+}
