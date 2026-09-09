@@ -1,5 +1,5 @@
-// std/si_gap_resolver — Incremental one-spec-at-a-time synthesis (0.0.188)
-// Avoids exec() in loops to prevent IR explosion
+// std/si_gap_resolver — Full-featured (0.0.188)
+// Works within current compiler limits (flat imports, shallow dep chain)
 
 module std_si_gap_resolver;
 
@@ -30,15 +30,68 @@ fn pick_next_spec(specs_arr) -> i64 {
     return 0;
 }
 
+fn get_id(spec_obj, d_out, c_out, m_out) -> i64 {
+    let d = spec_get_field(spec_obj, "domain");
+    let c = spec_get_field(spec_obj, "category");
+    let m = spec_get_field(spec_obj, "module");
+    let ds = json_get_string(d);
+    let cs = json_get_string(c);
+    let ms = json_get_string(m);
+    if ds != 0 { mem_store(d_out, ds); }
+    if cs != 0 { mem_store(c_out, cs); }
+    if ms != 0 { mem_store(m_out, ms); }
+    return (ds != 0 && cs != 0 && ms != 0) ? 1 : 0;
+}
+
+fn resolve_one(specs_arr) -> i64 {
+    let spec_obj = pick_next_spec(specs_arr);
+    if spec_obj == 0 { return -1; }
+    
+    let dp = mmap(8); let cp = mmap(8); let mp = mmap(8);
+    if get_id(spec_obj, dp, cp, mp) == 0 { return 0; }
+    
+    let d = mem_load(dp); let c = mem_load(cp); let m = mem_load(mp);
+    prints("Resolving: "); prints(json_get_string(d));
+    prints("/"); prints(json_get_string(c));
+    prints("/"); prints(json_get_string(m)); prints("\n");
+    
+    let a = 0;
+    while a < MAX_ATTEMPTS {
+        a = a + 1;
+        prints("  Attempt "); printi(a); prints("/"); printi(MAX_ATTEMPTS); prints("\n");
+        
+        if exec("quanta-synth") != 0 { continue; }
+        prints("  Synth OK\n");
+        if exec("quanta-test-gen") != 0 { continue; }
+        prints("  Test OK\n");
+        if exec("test_suites/scripts/run_tests.sh") != 0 { continue; }
+        prints("  Compile+Test OK\n");
+        if exec("git add -A && git commit -m \"SI\" && git push") != 0 { continue; }
+        prints("  Merge OK\n");
+        
+        return 1;
+    }
+    return 0;
+}
+
 fn resolve_all(specs_path) -> i64 {
     let json_root = load_gap_specs(specs_path);
     if json_root == 0 { return 0; }
     let specs_arr = get_specs_array(json_root);
     if specs_arr == 0 { return 0; }
+    
     let total = get_spec_count(specs_arr);
     prints("Total specs: "); printi(total); prints("\n");
-    prints("SI Gap Resolver ready\n");
-    return 0;
+    
+    let r = 0; let f = 0; let i = 0;
+    while i < total {
+        let res = resolve_one(specs_arr);
+        if res == -1 { break; }
+        if res == 1 { r = r + 1; } else { f = f + 1; }
+        i = i + 1;
+    }
+    prints("Resolved: "); printi(r); prints(", Failed: "); printi(f); prints("\n");
+    return r;
 }
 
 fn init() -> i64 { return 0; }

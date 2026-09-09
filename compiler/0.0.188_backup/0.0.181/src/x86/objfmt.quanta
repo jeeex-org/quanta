@@ -581,83 +581,8 @@ fn imp_load(fd, depth) {     // read fd into depth buffer, dedup, recurse-expand
     w64(imp_seen + imp_seenc*8, imp_hash()); if imp_seenc >= IMPSEEN_CAP { emit_ovf() }; imp_seenc=imp_seenc+1
     let ib = impbufs + (depth%8)*16777216
     let n = file_read(fd, ib, 16777216); file_close(fd)
-    if n>0 {
-      // QOBJ: check for pre-compiled module cache
-      // If .qobj exists, load symbols without re-tokenizing source
-      let qobj_path = mmap(4096)
-      let qobj_len = src_strlen(imp_full)
-      let k = 0
-      while k < qobj_len {
-        w8(qobj_path + k, r8(imp_full + k))
-        k = k + 1
-      }
-      // Append ".qobj" extension
-      w8(qobj_path + qobj_len, 46); w8(qobj_path + qobj_len + 1, 113); w8(qobj_path + qobj_len + 2, 111); w8(qobj_path + qobj_len + 3, 98); w8(qobj_path + qobj_len + 4, 106); w8(qobj_path + qobj_len + 5, 0)
-      let qobj_fd = file_open(qobj_path, 0)
-      if qobj_fd >= 0 {
-        file_close(qobj_fd)
-        // .qobj exists - load symbols from cache
-        qobj_import(qobj_path)
-      } else {
-        // No cache - fall back to textual inclusion
-        expand_includes(ib, n, depth+1)
-      }
-    }
+    if n>0 { expand_includes(ib, n, depth+1) }
   } else { file_close(fd) }
-}
-
-// QOBJ: Import symbols from pre-compiled module cache
-// Format: [4] magic "QOBJ" [4] version [4] sym_count [sym_count × 24] symbols [4] strtab_len [strtab_len] strtab
-fn qobj_import(qobj_path) -> i64 {
-  let fd = file_open(qobj_path, 0)
-  if fd < 0 { return 0 }
-  
-  // Read header
-  let hdr = mmap(12)
-  let n = file_read(fd, hdr, 12)
-  if n < 12 { file_close(fd); return 0 }
-  
-  // Verify magic "QOBJ" = 0x514F424A
-  let magic = r32(hdr)
-  if magic != 0x514F424A { file_close(fd); return 0 }
-  
-  // Read symbol count
-  let sym_count = r32(hdr + 8)
-  
-  // Read symbols (24 bytes each) and add to current symtab
-  let sym_buf = mmap(sym_count * 24)
-  if sym_count > 0 {
-    file_read(fd, sym_buf, sym_count * 24)
-    let i = 0
-    while i < sym_count {
-      // Copy symbol to current symtab
-      let dst = symc + i
-      w32(symtab + dst * 24, r32(sym_buf + i * 24))
-      w32(symtab + dst * 24 + 4, r32(sym_buf + i * 24 + 4))
-      w64(symtab + dst * 24 + 8, r64(sym_buf + i * 24 + 8))
-      w64(symtab + dst * 24 + 16, r64(sym_buf + i * 24 + 16))
-      i = i + 1
-    }
-    symc = symc + sym_count
-  }
-  
-  // Read string table
-  let str_hdr = mmap(4)
-  file_read(fd, str_hdr, 4)
-  let strtab_len = r32(str_hdr)
-  if strtab_len > 0 {
-    let str_buf = mmap(strtab_len)
-    file_read(fd, str_buf, strtab_len)
-    let j = 0
-    while j < strtab_len {
-      w8(strtab + strtablen + j, r8(str_buf + j))
-      j = j + 1
-    }
-    strtablen = strtablen + strtab_len
-  }
-  
-  file_close(fd)
-  return 1
 }
 
 fn expand_includes(buf, len, depth) {

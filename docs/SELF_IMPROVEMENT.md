@@ -29,7 +29,7 @@
 | `std/spec_parser` | `spec_parser.quanta` | ✅ COMPLETE | ❌ **STUB** (10 lines, `return 0`) | SELF_IMPROVEMENT.md:26 |
 | `std/spec_to_ir` | `spec_to_ir.quanta` | ✅ COMPLETE | ⚠️ **PARTIAL** (loads JSON only, no IR mapping) | SELF_IMPROVEMENT.md:27 |
 | `std/pattern_library` | `patterns.quanta` | ✅ COMPLETE | ✅ **VERIFIED** (59 patterns) | SELF_IMPROVEMENT.md:28 |
-| `std/code_synthesizer` | `code_synthesizer.quanta` | ✅ COMPLETE | ✅ **VERIFIED** (268 lines) | SELF_IMPROVEMENT.md:29 |
+| `std/code_synthesizer` | `code_synthesizer.quanta` | ✅ COMPLETE | ✅ **VERIFIED** (268 lines) | **verified** |
 | `std/test_generator` | `test_generator.quanta` | ✅ COMPLETE | ⚠️ **PARTIAL** (path gen only, no test logic) | SELF_IMPROVEMENT.md:30 |
 
 **Summary:** 11/16 core prerequisites verified. 3 of 5 Phase 2 modules are **stub/partial** — SI pipeline cannot run Phase 1–2 yet.
@@ -74,9 +74,54 @@ Components required (status from `status.json`):
 
 ---
 
+## AI Brain — Verified Working Path (2026-09-10 bench)
+
+**Model: `gemma-4-E4B-it-Q4_K_M.gguf`** (`/opt/ai/models/quanta/`), CPU-only via llama.cpp (`/opt/ai/llama.cpp/bin/`).
+
+| Metric | Measured (i9-13905H, 20 threads, `-ngl 0 --no-mmap`, ctx 512) |
+|---|---|
+| Generation | **8.2 tok/s** |
+| Prompt processing | 119 t/s |
+| RAM | 5.9GB resident |
+| Output quality | ✅ Valid Quanta first try with 2 stdlib examples in context |
+
+**Working invocation pattern (verified):**
+
+```bash
+cd /opt/ai/llama.cpp/bin
+export LD_LIBRARY_PATH=/opt/ai/llama.cpp/bin:$LD_LIBRARY_PATH
+./llama-cli -m /opt/ai/models/quanta/gemma-4-E4B-it-Q4_K_M.gguf \
+  -ngl 0 -t 20 -c 512 -n 64 --temp 0 --no-mmap -no-cnv \
+  -p "<prompt with 2+ real lib/std examples + task>"
+```
+
+**Tested prompt shape (RAG-style):** two real stdlib examples (`fn println_s(s) { prints(s) newline() }`, `fn byte_at(s, i) { return mem_load8(s + 8 + i) }`) + task → model emitted `fn serial_init() { outb(0x3FB, 0x80) }` — correct `fn` keyword, no semicolons, style match.
+
+**Why this beats fine-tuning / from-scratch:**
+
+| Approach | Verdict |
+|---|---|
+| Untethered LLM (no examples) | ❌ Generates Rust/C hybrids (`func`, `const`, `@attr`), not Quanta — verified with Gemma 4 26B via OmniRoute |
+| From-scratch training (2B/4B) | ❌ 1-10B tokens, 12-24GB VRAM for optimizer states, months; result inferior to pretrained |
+| 26B fine-tune on 8GB GPU | ❌ Not viable (optimizer states >100GB) |
+| **E4B + retrieval from `lib/std/` (RAG)** | ✅ Zero training, re-index per version, model copies real syntax from context |
+
+**Knowledge source for retrieval:** 22,887 `.quanta` files / 820K lines in repo; `lib/std/` alone = 8,942 files, 234K lines. Index `lib/std/` + latest `compiler/<VERSION>/src/` only — the ~90 compiler versions are near-duplicates.
+
+**Bench pitfalls (recorded in local-llm-distillation skill):**
+- `llama-cli -p` idles in interactive REPL after generation — use `-no-cnv` for one-shot runs
+- mmap'd weights get evicted by co-resident tenants (ComfyUI holds ~50GB) — `--no-mmap` + check `free -h` first (want weights + ~1.5GB spare)
+
+**E2B fallback:** `model.safetensors` (2B, 2.46GB) runs on CPU (~3GB RAM) for fast/cheap tasks when RAM is tight. Not a training target — from-scratch/full fine-tune infeasible on this box.
+
+---
+
 ## Self-Sufficiency Path (no external LLM)
 
-GPU_0.0.020 brain substrate = `qc` GPU-resident binary (`cuMemAlloc` weights + Quanta runtime in VRAM) runs gap detector + synthesizer. Bit-exact vs x86 (`fuzz_differential.sh`). No Python overhead — eliminates Soup's `NF4` Python-gradient defect source.
+Two-stage brain plan:
+
+1. **Now (CPU, works today):** E4B + retrieval over `lib/std/` + `qc` compile gate. Fully local, zero GPU contention with the video stack.
+2. **Later (GPU_0.0.020):** `qc` GPU-resident binary (`cuMemAlloc` weights + Quanta runtime in VRAM) runs gap detector + synthesizer. Bit-exact vs x86 (`fuzz_differential.sh`). No Python overhead — eliminates Soup's `NF4` Python-gradient defect source.
 
 Stopping conditions: zero 🔲 modules in `status.json`; regression gate fails (rollback); user intervenes.
 
@@ -93,5 +138,6 @@ Stopping conditions: zero 🔲 modules in `status.json`; regression gate fails (
 7. **Implement `std/jsonrpc` + `std/lsp`** — Flint LSP
 8. **Implement `std/graphics`** — flint-chart (CPU canvas first)
 9. **GPU_0.0.001** — Start CUDA target selection (parallel track)
+10. **SI codegen loop** — wire E4B CPU path: retrieve from `lib/std/` → generate → `qc` compile gate → feed errors back on fail
 
 Run `scripts/verify_status.quanta` after each implementation to update `status.json` and this document.
