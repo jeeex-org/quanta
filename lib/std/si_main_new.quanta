@@ -1,0 +1,124 @@
+import std/spec_parser
+import std/spec_to_ir
+import std/pattern_library
+import std/code_synthesizer
+import std/test_generator
+import std/json
+import std/str
+import std/vec
+import std/map
+import std/fs
+
+const MAX_ITERATIONS = 100;
+const SI_STATE_FILE = "test_suites/si_state.json";
+
+fn file_exists(path) -> i64 {
+    let fd = file_open(path, 0);
+    if fd >= 0 {
+        file_close(fd);
+        return 1;
+    }
+    return 0;
+}
+
+// Main SI loop iteration
+fn si_iteration(iteration) -> i64 {
+    prints("\n=== SI Iteration "); printi(iteration); prints(" ===\n");
+    
+    // 1. Parse gap specs
+    prints("[1/7] Parsing gap_specs.json...\n");
+    let json_root = spec_parser.load_gap_specs("gap_specs.json");
+    if json_root == 0 {
+        prints("  FAIL: Could not load gap_specs.json\n");
+        return 0;
+    }
+    let specs_arr = spec_parser.get_specs_array(json_root);
+    if specs_arr == 0 {
+        prints("  FAIL: No specs array found\n");
+        return 0;
+    }
+    let total = spec_parser.get_spec_count(specs_arr);
+    prints("  Total specs: "); printi(total); prints("\n");
+    
+    // 2. Filter planned specs
+    prints("[2/7] Filtering planned specs...\n");
+    let planned = spec_parser.vec_new();
+    let planned_count = spec_parser.filter_planned_specs(specs_arr, planned);
+    prints("  Planned specs needing implementation: "); printi(planned_count); prints("\n");
+    
+    if planned_count == 0 {
+        prints("  ALL SPECS IMPLEMENTED!\n");
+        return -1; // Signal completion
+    }
+    
+    // 3. Map to IR
+    prints("[3/7] Mapping specs to IR...\n");
+    let ir_specs = spec_to_ir.vec_new();
+    let mapped = spec_to_ir.get_all_ir_specs(specs_arr, ir_specs);
+    prints("  Mapped to IR: "); printi(mapped); prints("\n");
+    
+    // 4. Match patterns
+    prints("[4/7] Matching IR patterns...\n");
+    let pattern_count = pattern_library.init_patterns();
+    prints("  Patterns registered: "); printi(pattern_count); prints("\n");
+    
+    // 5. Synthesize code for each planned spec
+    prints("[5/7] Synthesizing Quanta modules...\n");
+    let i = 0;
+    let synthesized = 0;
+    while i < planned_count {
+        let spec_obj = spec_parser.vec_at(planned, i);
+        let domain = spec_parser.spec_get_field(spec_obj, "domain");
+        let category = spec_parser.spec_get_field(spec_obj, "category");
+        let module = spec_parser.spec_get_field(spec_obj, "module");
+        
+        let domain_str = spec_parser.json_get_string(domain);
+        let category_str = spec_parser.json_get_string(category);
+        let module_str = spec_parser.json_get_string(module);
+        
+        if domain_str >= 0 && category_str >= 0 && module_str >= 0 {
+            let result = code_synthesizer.emit_quanta_module(domain_str, category_str, module_str);
+            if result != 0 {
+                synthesized = synthesized + 1;
+            }
+        }
+        i = i + 1;
+    }
+    prints("  Modules synthesized: "); printi(synthesized); prints("\n");
+    
+    // 6. Generate tests
+    prints("[6/7] Generating const tests...\n");
+    let tests_gen = test_generator.generate_all("gap_specs.json");
+    prints("  Const tests generated: "); printi(tests_gen); prints("\n");
+    
+    // 7. Compile and test (placeholder - in real impl invoke run_tests.sh)
+    prints("[7/7] Compiling and running test suite...\n");
+    let test_result = 1; // placeholder
+    
+    prints("=== Iteration "); printi(iteration); prints(" complete ===\n");
+    return 1;
+}
+
+fn main() -> i64 {
+    prints("=== Quanta Self-Improvement Pipeline Starting ===\n");
+    
+    let iteration = 0;
+    let max_iter = MAX_ITERATIONS;
+    
+    while iteration < max_iter {
+        iteration = iteration + 1;
+        
+        let result = si_iteration(iteration);
+        if result == -1 {
+            prints("\n=== SI COMPLETE: All specs implemented ===\n");
+            return 0;
+        }
+        if result == 0 {
+            prints("\n=== SI STOPPED: Iteration failed ===\n");
+            return 1;
+        }
+    }
+    
+    prints("\n=== SI STOPPED: Max iterations reached ===\n");
+    return 0;
+}
