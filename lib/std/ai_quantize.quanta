@@ -1,0 +1,28 @@
+// std/ai_quantize — INT8 Quantization (0.0.173)
+// Per-tensor quantize/dequantize for f64 tensors
+
+import std/ai_tensor
+
+fn ai_quant8(q: i64[], x: i64[], n: i64, scale: i64, zp: i64): i64 {
+    let i: i64 = 0
+    while i < n {
+        let v: i64 = mem_load(x[0] + i * 8)
+        let qv: i64 = f2i(fdiv(v, scale)) + zp
+        if qv > 127 { qv = 127 }
+        if qv < -128 { qv = -128 }
+        mem_store8(q[0] + i, qv + 128)
+        i = i + 1
+    }
+    return 0
+}
+
+fn ai_dequant8(x: i64[], q: i64[], n: i64, scale: i64, zp: i64): i64 {
+    let i: i64 = 0
+    while i < n {
+        let qv: i64 = mem_load8(q[0] + i) - 128
+        let v: i64 = fmul(i2f(qv - zp), scale)
+        mem_store(x[0] + i * 8, v)
+        i = i + 1
+    }
+    return 0
+}
