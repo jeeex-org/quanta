@@ -1,0 +1,51 @@
+// std/si_merge — Git commit/push/rollback automation (0.0.181)
+// Compact version to fit token limit
+
+module std_si_merge;
+
+fn stage_all() -> i64 { return exec("git add -A"); }
+fn push() -> i64 { return exec("git push"); }
+fn rollback() -> i64 { return exec("git reset --hard HEAD~1 && git checkout -- ."); }
+
+fn commit(msg) -> i64 {
+    let cmd = mmap(512);
+    let base = "git commit -m \"";
+    let i = 0;
+    while i < len(base) { mem_store8(cmd + i, mem_load8(base + 8 + i)); i = i + 1; }
+    let j = 0;
+    while j < len(msg) { mem_store8(cmd + i + j, mem_load8(msg + 8 + j)); j = j + 1; }
+    i = i + j;
+    mem_store8(cmd + i, 34); i = i + 1;
+    mem_store8(cmd + i, 0);
+    return exec(cmd);
+}
+
+fn merge(msg) -> i64 {
+    if stage_all() != 0 { return 0; }
+    if commit(msg) != 0 { return 0; }
+    if push() != 0 { rollback(); return 0; }
+    return 1;
+}
+
+fn merge_for_spec(domain, category, module) -> i64 {
+    let msg = mmap(256);
+    let prefix = "SI: Implement ";
+    let i = 0;
+    while i < len(prefix) { mem_store8(msg + i, mem_load8(prefix + 8 + i)); i = i + 1; }
+    let j = 0;
+    while j < len(domain) { mem_store8(msg + i + j, mem_load8(domain + 8 + j)); j = j + 1; }
+    i = i + j;
+    mem_store8(msg + i, 47); i = i + 1;
+    j = 0;
+    while j < len(category) { mem_store8(msg + i + j, mem_load8(category + 8 + j)); j = j + 1; }
+    i = i + j;
+    mem_store8(msg + i, 47); i = i + 1;
+    j = 0;
+    while j < len(module) { mem_store8(msg + i + j, mem_load8(module + 8 + j)); j = j + 1; }
+    i = i + j;
+    mem_store8(msg + i, 0);
+    return merge(msg);
+}
+
+fn init() -> i64 { return 0; }
+fn main() -> i64 { return init(); }
