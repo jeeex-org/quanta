@@ -1,14 +1,31 @@
-// std/si_gap_resolver — Incremental one-spec-at-a-time synthesis (0.0.180)
-// Ultra-minimal: no imports, just stub for const test
+// std/si_gap_resolver — Incremental one-spec-at-a-time synthesis (0.0.184)
+// NO IMPORTS - standalone to avoid token explosion
 
 module std_si_gap_resolver;
 
 const MAX_ATTEMPTS = 3;
+const GAP_SPECS = "gap_specs.json";
 
-fn pick_next_spec(specs_arr) -> i64 { return 0; }
-fn get_spec_identity(spec_obj, domain_out, category_out, module_out) -> i64 { return 0; }
-fn resolve_one_spec(specs_arr, json_root) -> i64 { return -1; }
-fn resolve_all(specs_path) -> i64 { return 0; }
+fn resolve_one() -> i64 {
+    prints("Resolving next spec...\n");
+    // Use external tools via exec
+    if exec("quanta-synth") != 0 { return 0; }
+    if exec("quanta-test-gen") != 0 { return 0; }
+    if exec("test_suites/scripts/run_tests.sh") != 0 { return 0; }
+    if exec("git add -A && git commit -m \"SI\" && git push") != 0 { return 0; }
+    return 1;
+}
+
+fn resolve_all() -> i64 {
+    let r = 0; let f = 0;
+    while 1 {
+        let res = resolve_one();
+        if res == -1 { break; }
+        if res == 1 { r = r + 1; } else { f = f + 1; }
+    }
+    prints("Resolved: "); printi(r); prints(", Failed: "); printi(f); prints("\n");
+    return r;
+}
 
 fn init() -> i64 { return 0; }
 fn main() -> i64 { return init(); }
