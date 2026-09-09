@@ -127,6 +127,64 @@ Stopping conditions: zero 🔲 modules in `status.json`; regression gate fails (
 
 ---
 
+## SI Codegen Loop — Implementation Steps (E4B path, pure Quanta)
+
+Every step below uses only verified 0.0.188 capabilities: `lib/std/fs` (open/read/write), `lib/std/regex` (keyword match), `fork()`/`execve()` builtins (emitter.quanta:557/1561), `$$("cmd")` shell-out (`qc_sys_cmd`), and `qc` itself. No Python at runtime.
+
+### Step 0 — Fix `std/json` allocation bug (prereq for spec-driven runs)
+- `mem_alloc` size calc OOMs on large inputs (status.json: partial)
+- Not needed if feeding OS_ROADMAP.md (markdown) directly — E4B reads text
+- Fix anyway: it gates `gap_specs.json` (9,026 specs, 2.2MB) consumption
+
+### Step 1 — Retriever (`si/retriever.quanta`)
+- Input: task keywords + domain (e.g. `serial`, `io`, `port`)
+- Walk `lib/std/` files matching domain prefix, regex keyword-match, score by hit count
+- Output: top-N (3-5) real function bodies → prompt examples
+- Corpus: `lib/std/` (8,942 files) + `compiler/0.0.188/src/x86/` only — dedupe ~90 compiler versions
+- ~200 lines Quanta; uses `fs.open/read_str/close`, `str_*` builtins
+
+### Step 2 — Prompt builder (`si/prompt.quanta`)
+- Template: `You are a code generator. Copy the style EXACTLY. Example: <fn A> Example: <fn B> Task: <spec text> Reply with code only:`
+- Example source: retriever output (Step 1)
+- Task source: OS_ROADMAP.md section for the target module
+- Output: prompt string written to `temp/si_prompt.txt`
+
+### Step 3 — Generator call (`si/generate.quanta`)
+- Shell out to benched llama-cli invocation:
+  `$$("cd /opt/ai/llama.cpp/bin && LD_LIBRARY_PATH=/opt/ai/llama.cpp/bin ./llama-cli -m /opt/ai/models/quanta/gemma-4-E4B-it-Q4_K_M.gguf -ngl 0 -t 20 -c 2048 -n 256 --temp 0 --no-mmap -no-cnv -f temp/si_prompt.txt > temp/si_gen.txt 2> temp/si_gen.err")`
+- `-no-cnv` + `-f` (file prompt) — the pitfall-avoidance flags
+- Guard: `free -h` check before run (weights 5.9GB + 1.5GB spare); skip/retry if low
+- Post: strip `> `/whitespace, extract first `fn ... }` block via regex
+
+### Step 4 — Compile gate (`si/gate.quanta`)
+- Wrap generated code with `import std/...` headers matching examples' domains
+- `$$("qc compile temp/si_candidate.quanta")` — binary produced at `temp/si_candidate.bin`
+- On fail: capture compiler error text, feed back into Step 2 prompt as
+  `Previous attempt failed: <error>. Fix and retry.` — up to 3 retries
+- On pass: record candidate path + spec provenance in `temp/si_log.txt`
+
+### Step 5 — Test gate (extend `si/gate.quanta`)
+- If a test exists for the domain (`lib/std/<domain>/tests/`), run it against candidate
+- Else: smoke-run the binary if it has `fn main` (exit code check)
+- Two-gate rule: compile gate alone insufficient; test/smoke mandatory before merge queue
+
+### Step 6 — Merge queue (`si/merge.quanta`, human gate)
+- Candidates that pass both gates → `temp/si_queue/` (one file per spec, with provenance header comment)
+- User reviews queue, says merge → copy into `lib/std/` (or domain dir), bump `VERSION`, run `scripts/verify_status.quanta`
+- NO auto-merge: human gate required (per "fix bugs don't present options" — merge decisions are presented, not acted)
+
+### Step 7 — Batch driver (`si/si_main.quanta`)
+- Loop over OS_ROADMAP.md unchecked sections (🔲), for each:
+  1. Parse section title + keywords → Step 1
+  2. Steps 2-5 with retry budget (3 compile-fail retries per spec)
+  3. Append results to `temp/si_log.txt` (spec, path, gates passed, retries used)
+- Stopping conditions: queue non-empty → pause for human gate; RAM low → abort; 3 consecutive compile fails → skip spec, log, continue
+- Resumable: on restart, skip specs already in `temp/si_log.txt`
+
+Implementation order: Steps 0-4 form the minimal verified loop (one spec → one candidate); Steps 5-7 add safety and scale. Each step is one `.quanta` file under `si/`, one script per prompt for reproducibility.
+
+---
+
 ## Immediate Next Steps (from `status.json` gaps)
 
 1. **Fix `std/json` allocation bug** (OOM on `mem_alloc` size calc) — `status.json`: partial

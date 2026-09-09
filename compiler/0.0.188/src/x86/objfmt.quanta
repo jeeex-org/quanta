@@ -579,30 +579,33 @@ fn imp_try_one(name, nl, pfx, pl, use_ext) {
 fn imp_load(fd, depth) {     // read fd into depth buffer, dedup, recurse-expand
   if imp_already()==0 {
     w64(imp_seen + imp_seenc*8, imp_hash()); if imp_seenc >= IMPSEEN_CAP { emit_ovf() }; imp_seenc=imp_seenc+1
-    let ib = impbufs + (depth%8)*16777216
-    let n = file_read(fd, ib, 16777216); file_close(fd)
-    if n>0 {
-      // QOBJ: check for pre-compiled module cache
-      // If .qobj exists, load symbols without re-tokenizing source
-      let qobj_path = mmap(4096)
-      let qobj_len = src_strlen(imp_full)
-      let k = 0
-      while k < qobj_len {
-        w8(qobj_path + k, r8(imp_full + k))
-        k = k + 1
-      }
-      // Append ".qobj" extension
-      w8(qobj_path + qobj_len, 46); w8(qobj_path + qobj_len + 1, 113); w8(qobj_path + qobj_len + 2, 111); w8(qobj_path + qobj_len + 3, 98); w8(qobj_path + qobj_len + 4, 106); w8(qobj_path + qobj_len + 5, 0)
-      let qobj_fd = file_open(qobj_path, 0)
-      if qobj_fd >= 0 {
-        file_close(qobj_fd)
-        // .qobj exists - load symbols from cache
+    
+    // QOBJ: check for pre-compiled module cache BEFORE tokenizing source
+    let qobj_path = mmap(4096)
+    let qobj_len = src_strlen(imp_full)
+    let k = 0
+    while k < qobj_len {
+      w8(qobj_path + k, r8(imp_full + k))
+      k = k + 1
+    }
+    w8(qobj_path + qobj_len, 46); w8(qobj_path + qobj_len + 1, 113); w8(qobj_path + qobj_len + 2, 111); w8(qobj_path + qobj_len + 3, 98); w8(qobj_path + qobj_len + 4, 106); w8(qobj_path + qobj_len + 5, 0)
+    let qobj_fd = file_open(qobj_path, 0)
+    if qobj_fd >= 0 {
+      let qobj_hdr = mmap(12)
+      file_read(qobj_fd, qobj_hdr, 12)
+      let qobj_sym_count = r32(qobj_hdr + 8)
+      file_close(qobj_fd)
+      if qobj_sym_count > 0 {
+        file_close(fd)
         qobj_import(qobj_path)
-      } else {
-        // No cache - fall back to textual inclusion
-        expand_includes(ib, n, depth+1)
+        return
       }
     }
+    
+    // No cache - fall back to textual inclusion
+    let ib = impbufs + (depth%8)*16777216
+    let n = file_read(fd, ib, 16777216); file_close(fd)
+    if n>0 { expand_includes(ib, n, depth+1) }
   } else { file_close(fd) }
 }
 

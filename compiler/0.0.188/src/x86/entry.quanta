@@ -443,9 +443,14 @@ fn main(argc, argv) {
         }
         mmi=mmi+1
     }
-    if has_main==0 && no_start==0 {
+    if has_main==0 && no_start==0 && emit_qobj==0 {
         let mm = "error: no 'main' function found\n"
         file_write(2, mm+8, len(mm)); had_error=1
+    }
+    // --emit-qobj mode: write .qobj module cache (skip main check)
+    if emit_qobj == 1 {
+        qobj_write(out_p)
+        exit(0)
     }
     // Startup stub at code offset 0: set up argc/argv, run global initializers,
     // then call main, then exit(rax). Suppressed in --no-start (secondary TU):
@@ -916,11 +921,6 @@ fn main(argc, argv) {
         // --link mode: link object file with libc using system ld
         // srcp = input .o file, out_p = output executable
         link_object_with_libc(srcp, out_p)
-        exit(0)
-    }
-    if emit_qobj == 1 {
-        // --emit-qobj mode: write .qobj module cache
-        qobj_write(out_p)
         exit(0)
     }
     w32(code+init_call+1, r64(func_code_starts+0)-(init_call+5))

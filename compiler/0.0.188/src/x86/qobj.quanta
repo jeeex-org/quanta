@@ -5,120 +5,130 @@
 // .qobj file format:
 // [4] magic = 0x514F424A ("QOBJ")
 // [4] version = 1
-// [4] ir_count
-// [ir_count × 40] IR records (op, res, a0, a1, a2)
 // [4] sym_count
 // [sym_count × 24] symbol records (same as ELF symtab)
-// [4] reloc_count
-// [reloc_count × 24] relocation records
 // [4] strtab_len
 // [strtab_len] string table bytes
 
 const QOBJ_MAGIC = 0x514F424A
 const QOBJ_VERSION = 1
 
+// Track which symbols are owned by current module vs imported
+// sym_owner[si*8] = 1 if owned by current module, 0 if imported
+let sym_owner = mmap(2000000)
+let module_symc_start = 0  // symc value at start of current module
+
+// Mark a symbol as owned by current module
+fn mark_owned(si) {
+  w64(sym_owner + si*8, 1)
+}
+
+// Check if symbol is owned by current module
+fn is_owned(si) -> i64 {
+  if r64(sym_owner + si*8) == 1 { return 1 }
+  return 0
+}
+
+// Set module boundary (call before importing/compiling current module)
+fn mark_module_start() {
+  module_symc_start = symc
+}
+
+// Mark all new symbols as owned by current module
+fn mark_new_owned() {
+  let si = module_symc_start
+  while si < symc {
+    mark_owned(si)
+    si = si + 1
+  }
+}
+
 // Write current compilation state to .qobj file
+// Writes ALL symbols (simpler than tracking owned/imported)
 fn qobj_write(path) -> i64 {
-    let fd = file_open(path, 577)
-    if fd < 0 { return 0 }
-    
-    // Magic + version
-    let hdr = mmap(12)
-    w32(hdr, QOBJ_MAGIC)
-    w32(hdr + 4, QOBJ_VERSION)
-    w32(hdr + 8, irc)
-    file_write(fd, hdr, 12)
-    
-    // IR stream
-    if irc > 0 {
-        let ir_buf = mmap(irc * 40)
-        let i = 0
-        while i < irc {
-            w64(ir_buf + i*40, r64(ir + i*IRS))
-            w64(ir_buf + i*40 + 8, r64(ir + i*IRS + 8))
-            w64(ir_buf + i*40 + 16, r64(ir + i*IRS + 16))
-            w64(ir_buf + i*40 + 24, r64(ir + i*IRS + 24))
-            w64(ir_buf + i*40 + 32, r64(ir + i*IRS + 32))
-            i = i + 1
-        }
-        file_write(fd, ir_buf, irc * 40)
+  let fd = file_open(path, 577)
+  if fd < 0 { return 0 }
+  
+  // Magic + version + sym_count
+  let hdr = mmap(12)
+  w32(hdr, QOBJ_MAGIC)
+  w32(hdr + 4, QOBJ_VERSION)
+  w32(hdr + 8, symc)
+  file_write(fd, hdr, 12)
+  
+  // Write all symbols
+  if symc > 0 {
+    let sym_buf = mmap(symc * 24)
+    let i = 0
+    while i < symc {
+      w32(sym_buf + i*24, r32(symtab + i*24))
+      w32(sym_buf + i*24 + 4, r32(symtab + i*24 + 4))
+      w64(sym_buf + i*24 + 8, r64(symtab + i*24 + 8))
+      w64(sym_buf + i*24 + 16, r64(symtab + i*24 + 16))
+      i = i + 1
     }
-    
-    // Symbol table
-    let sym_hdr = mmap(4)
-    w32(sym_hdr, symc)
-    file_write(fd, sym_hdr, 4)
-    if symc > 0 {
-        let sym_buf = mmap(symc * 24)
-        let i = 0
-        while i < symc {
-            w32(sym_buf + i*24, r32(symtab + i*24))
-            w32(sym_buf + i*24 + 4, r32(symtab + i*24 + 4))
-            w64(sym_buf + i*24 + 8, r64(symtab + i*24 + 8))
-            w64(sym_buf + i*24 + 16, r64(symtab + i*24 + 16))
-            i = i + 1
-        }
-        file_write(fd, sym_buf, symc * 24)
-    }
-    
-    // String table
-    let str_hdr = mmap(4)
-    w32(str_hdr, strtablen)
-    file_write(fd, str_hdr, 4)
-    if strtablen > 0 {
-        file_write(fd, strtab, strtablen)
-    }
-    
-    // Relocations
-    let reloc_hdr = mmap(4)
-    w32(reloc_hdr, relc)
-    file_write(fd, reloc_hdr, 4)
-    if relc > 0 {
-        let reloc_buf = mmap(relc * 24)
-        let i = 0
-        while i < relc {
-            w64(reloc_buf + i*24, r64(reldyn + i*24))
-            w64(reloc_buf + i*24 + 8, r64(reldyn + i*24 + 8))
-            w64(reloc_buf + i*24 + 16, r64(reldyn + i*24 + 16))
-            w64(reloc_buf + i*24 + 20, r64(reldyn + i*24 + 20))
-            i = i + 1
-        }
-        file_write(fd, reloc_buf, relc * 24)
-    }
-    
-    file_close(fd)
-    return 1
+    file_write(fd, sym_buf, symc * 24)
+  }
+  
+  // String table
+  let str_hdr = mmap(4)
+  w32(str_hdr, strtablen)
+  file_write(fd, str_hdr, 4)
+  if strtablen > 0 {
+    file_write(fd, strtab, strtablen)
+  }
+  
+  file_close(fd)
+  return 1
 }
 
-// Check if .qobj exists and is newer than source
-fn qobj_is_fresh(src_path, qobj_path) -> i64 {
-    // Check existence
-    let fd = file_open(qobj_path, 0)
-    if fd < 0 { return 0 }
-    file_close(fd)
-    // For now, assume fresh if exists (mtime check would need stat)
-    return 1
-}
-
-// Load .qobj into a temporary storage (doesn't affect current compilation)
-// Returns: 1 on success
-fn qobj_load_symbols(qobj_path) -> i64 {
-    let fd = file_open(qobj_path, 0)
-    if fd < 0 { return 0 }
-    
-    let hdr = mmap(12)
-    file_read(fd, hdr, 12)
-    
-    // Verify magic
-    let magic = r32(hdr)
-    if magic != QOBJ_MAGIC { file_close(fd); return 0 }
-    
-    // Skip IR stream
-    let ir_count = r32(hdr + 8)
-    // Seek past IR (we only need symbols for import resolution)
-    // For now, just close and return success
-    // Full implementation would parse and merge symbol tables
-    
-    file_close(fd)
-    return 1
+// Import symbols from pre-compiled module cache
+fn qobj_import(qobj_path) -> i64 {
+  let fd = file_open(qobj_path, 0)
+  if fd < 0 { return 0 }
+  
+  let hdr = mmap(12)
+  let n = file_read(fd, hdr, 12)
+  if n < 12 { file_close(fd); return 0 }
+  
+  let magic = r32(hdr)
+  if magic != QOBJ_MAGIC { file_close(fd); return 0 }
+  
+  let sym_count = r32(hdr + 8)
+  
+  // Read symbols and add to current symtab
+  let sym_buf = mmap(sym_count * 24)
+  if sym_count > 0 {
+    file_read(fd, sym_buf, sym_count * 24)
+    let i = 0
+    while i < sym_count {
+      let dst = symc
+      w32(symtab + dst * 24, r32(sym_buf + i * 24))
+      w32(symtab + dst * 24 + 4, r32(sym_buf + i * 24 + 4))
+      w64(symtab + dst * 24 + 8, r64(sym_buf + i * 24 + 8))
+      w64(symtab + dst * 24 + 16, r64(sym_buf + i * 24 + 16))
+      // Mark as imported (not owned)
+      w64(sym_owner + dst * 8, 0)
+      symc = symc + 1
+      i = i + 1
+    }
+  }
+  
+  // Read string table
+  let str_hdr = mmap(4)
+  file_read(fd, str_hdr, 4)
+  let strtab_len = r32(str_hdr)
+  if strtab_len > 0 {
+    let str_buf = mmap(strtab_len)
+    file_read(fd, str_buf, strtab_len)
+    let j = 0
+    while j < strtab_len {
+      w8(strtab + strtablen + j, r8(str_buf + j))
+      j = j + 1
+    }
+    strtablen = strtablen + strtab_len
+  }
+  
+  file_close(fd)
+  return 1
 }
