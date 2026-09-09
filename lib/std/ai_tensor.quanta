@@ -1,0 +1,79 @@
+// std/ai_tensor — Tensor operations (0.0.168)
+// f64 tensor: [8:len][bytes] header + data
+// Uses mem_load/mem_store for f64 bit-patterns
+
+fn ai_dtype_f32(): i64 { return 0 }
+fn ai_dtype_i32(): i64 { return 1 }
+fn ai_dtype_i64(): i64 { return 2 }
+fn ai_dtype_u8(): i64 { return 3 }
+fn ai_dtype_bf16(): i64 { return 4 }
+
+fn ai_shape_count(shape: i64[], ndim: i64): i64 {
+    let total: i64 = 1
+    let i: i64 = 0
+    while i < ndim { total = total * shape[i]; i = i + 1 }
+    return total
+}
+
+fn ai_tensor_create(out_data: i64[], out_shape: i64[], out_ndim: i64[], out_dtype: i64[], shape: i64[], ndim: i64, dtype: i64): i64 {
+    let total: i64 = ai_shape_count(shape, ndim)
+    let elem_sz: i64 = 8
+    if dtype == 3 { elem_sz = 1 }
+    if dtype == 4 { elem_sz = 2 }
+    let ptr: i64 = malloc(total * elem_sz)
+    out_data[0] = ptr; out_ndim[0] = ndim; out_dtype[0] = dtype
+    let i: i64 = 0
+    while i < ndim { out_shape[i] = shape[i]; i = i + 1 }
+    return 0
+}
+
+fn ai_tensor_free(data: i64[]): i64 {
+    if data[0] != 0 { free(data[0]); data[0] = 0 }
+    return 0
+}
+
+fn ai_tensor_get(data: i64[], idx: i64): i64 {
+    return mem_load(data[0] + idx * 8)
+}
+
+fn ai_tensor_set(data: i64[], idx: i64, val: i64): i64 {
+    mem_store(data[0] + idx * 8, val)
+    return 0
+}
+
+fn ai_add(out: i64[], a: i64[], b: i64[], n: i64): i64 {
+    let i: i64 = 0
+    while i < n {
+        mem_store(out[0]+i*8, fadd(mem_load(a[0]+i*8), mem_load(b[0]+i*8)))
+        i = i + 1
+    }
+    return 0
+}
+
+fn ai_mul(out: i64[], a: i64[], b: i64[], n: i64): i64 {
+    let i: i64 = 0
+    while i < n {
+        mem_store(out[0]+i*8, fmul(mem_load(a[0]+i*8), mem_load(b[0]+i*8)))
+        i = i + 1
+    }
+    return 0
+}
+
+fn ai_matmul(out: i64[], a: i64[], b: i64[], M: i64, K: i64, N: i64): i64 {
+    let i: i64 = 0
+    while i < M {
+        let j: i64 = 0
+        while j < N {
+            let sum: i64 = i2f(0)
+            let k: i64 = 0
+            while k < K {
+                sum = fadd(sum, fmul(mem_load(a[0]+(i*K+k)*8), mem_load(b[0]+(k*N+j)*8)))
+                k = k + 1
+            }
+            mem_store(out[0]+(i*N+j)*8, sum)
+            j = j + 1
+        }
+        i = i + 1
+    }
+    return 0
+}

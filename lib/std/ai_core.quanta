@@ -1,0 +1,148 @@
+// std/ai_core — Tensor ops, RoPE, RMSNorm, SwiGLU, KV cache, Quantization
+
+fn f64_read(ptr: i64): i64 { return mem_load(ptr) }
+fn f64_write(ptr: i64, bits: i64): i64 { mem_store(ptr, bits); return 0 }
+
+fn ai_shape_count(shape: i64[], ndim: i64): i64 {
+    let total: i64 = 1
+    let i: i64 = 0
+    while i < ndim { total = total * shape[i]; i = i + 1 }
+    return total
+}
+
+fn ai_tensor_create(out_data: i64[], out_shape: i64[], out_ndim: i64[], out_dtype: i64[], shape: i64[], ndim: i64, dtype: i64): i64 {
+    let total: i64 = ai_shape_count(shape, ndim)
+    let elem_sz: i64 = 8
+    if dtype == 3 { elem_sz = 1 }
+    if dtype == 4 { elem_sz = 2 }
+    let ptr: i64 = malloc(total * elem_sz)
+    out_data[0] = ptr; out_ndim[0] = ndim; out_dtype[0] = dtype
+    let i: i64 = 0
+    while i < ndim { out_shape[i] = shape[i]; i = i + 1 }
+    return 0
+}
+
+fn ai_tensor_free(data: i64[]): i64 { if data[0] != 0 { free(data[0]); data[0] = 0 }; return 0 }
+fn ai_tensor_get(data: i64[], idx: i64): i64 { return f64_read(data[0] + idx * 8) }
+fn ai_tensor_set(data: i64[], idx: i64, val: i64): i64 { f64_write(data[0] + idx * 8, val); return 0 }
+
+fn ai_add(out: i64[], a: i64[], b: i64[], n: i64): i64 {
+    let i: i64 = 0
+    while i < n { f64_write(out[0]+i*8, fadd(f64_read(a[0]+i*8), f64_read(b[0]+i*8))); i = i+1 }
+    return 0
+}
+
+fn ai_mul(out: i64[], a: i64[], b: i64[], n: i64): i64 {
+    let i: i64 = 0
+    while i < n { f64_write(out[0]+i*8, fmul(f64_read(a[0]+i*8), f64_read(b[0]+i*8))); i = i+1 }
+    return 0
+}
+
+fn ai_matmul(out: i64[], a: i64[], b: i64[], M: i64, K: i64, N: i64): i64 {
+    let i: i64 = 0
+    while i < M {
+        let j: i64 = 0
+        while j < N {
+            let sum: i64 = i2f(0)
+            let k: i64 = 0
+            while k < K { sum = fadd(sum, fmul(f64_read(a[0]+(i*K+k)*8), f64_read(b[0]+(k*N+j)*8))); k = k+1 }
+            f64_write(out[0]+(i*N+j)*8, sum)
+            j = j + 1
+        }
+        i = i + 1
+    }
+    return 0
+}
+
+fn ai_rope(x: i64[], seq_len: i64, head_dim: i64, base: i64): i64 {
+    let hd: i64 = head_dim / 2
+    let pos: i64 = 0
+    while pos < seq_len {
+        let i: i64 = 0
+        while i < hd {
+            let theta: i64 = pow(base, fdiv(i2f(-2*i), i2f(head_dim)))
+            let angle: i64 = fmul(i2f(pos), theta)
+            let ca: i64 = cos(angle); let sa: i64 = sin(angle)
+            let idx: i64 = pos * head_dim + i
+            let x0: i64 = f64_read(x[0]+idx*8); let x1: i64 = f64_read(x[0]+(idx+hd)*8)
+            f64_write(x[0]+idx*8, fsub(fmul(x0,ca), fmul(x1,sa)))
+            f64_write(x[0]+(idx+hd)*8, fadd(fmul(x0,sa), fmul(x1,ca)))
+            i = i + 1
+        }
+        pos = pos + 1
+    }
+    return 0
+}
+
+fn ai_rmsnorm(out: i64[], x: i64[], w: i64[], n: i64, eps: i64): i64 {
+    let ms: i64 = i2f(0)
+    let i: i64 = 0
+    while i < n { let v: i64 = f64_read(x[0]+i*8); ms = fadd(ms, fmul(v,v)); i = i+1 }
+    ms = fdiv(ms, i2f(n))
+    let ir: i64 = fdiv(i2f(1), sqrt(fadd(ms, eps)))
+    i = 0
+    while i < n { f64_write(out[0]+i*8, fmul(fmul(f64_read(x[0]+i*8), ir), f64_read(w[0]+i*8))); i = i+1 }
+    return 0
+}
+
+fn ai_swiglu(out: i64[], x: i64[], y: i64[], n: i64): i64 {
+    let i: i64 = 0
+    while i < n {
+        let xv: i64 = f64_read(x[0]+i*8); let yv: i64 = f64_read(y[0]+i*8)
+        let sig: i64 = fdiv(i2f(1), fadd(i2f(1), pow(i2f(2), fdiv(fsub(i2f(0),xv),i2f(1)))))
+        f64_write(out[0]+i*8, fmul(fmul(xv,sig), yv))
+        i = i + 1
+    }
+    return 0
+}
+
+fn ai_kv_create(k: i64[], v: i64[], pos: i64[], nkh: i64, msl: i64, hd: i64): i64 {
+    let bytes: i64 = nkh * msl * hd * 8
+    k[0] = malloc(bytes); v[0] = malloc(bytes); pos[0] = 0
+    return 0
+}
+
+fn ai_kv_free(k: i64[], v: i64[]): i64 { if k[0]!=0 { free(k[0]); k[0]=0 }; if v[0]!=0 { free(v[0]); v[0]=0 }; return 0 }
+
+fn ai_kv_append(k: i64[], v: i64[], pos: i64[], kn: i64[], vn: i64[], nkh: i64, hd: i64, sln: i64, msl: i64): i64 {
+    let p: i64 = pos[0]
+    let h: i64 = 0
+    while h < nkh {
+        let s: i64 = 0
+        while s < sln {
+            let d: i64 = 0
+            while d < hd {
+                let si: i64 = (h*sln+s)*hd+d
+                let di: i64 = (h*msl+p+s)*hd+d
+                f64_write(k[0]+di*8, f64_read(kn[0]+si*8))
+                f64_write(v[0]+di*8, f64_read(vn[0]+si*8))
+                d = d + 1
+            }
+            s = s + 1
+        }
+        h = h + 1
+    }
+    pos[0] = pos[0] + sln
+    return 0
+}
+
+fn ai_quant8(q: i64[], x: i64[], n: i64, scale: i64, zp: i64): i64 {
+    let i: i64 = 0
+    while i < n {
+        let qv: i64 = f2i(fdiv(f64_read(x[0]+i*8), scale)) + zp
+        if qv > 127 { qv = 127 }; if qv < -128 { qv = -128 }
+        mem_store8(q[0]+i, qv+128)
+        i = i + 1
+    }
+    return 0
+}
+
+fn ai_dequant8(x: i64[], q: i64[], n: i64, scale: i64, zp: i64): i64 {
+    let i: i64 = 0
+    while i < n {
+        let qv: i64 = mem_load8(q[0]+i) - 128
+        f64_write(x[0]+i*8, fmul(i2f(qv-zp), scale))
+        i = i + 1
+    }
+    return 0
+}
