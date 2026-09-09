@@ -1,20 +1,14 @@
-// std/si_gap_resolver — Incremental one-spec-at-a-time synthesis (0.0.186)
-// Standalone version - no imports to avoid token explosion
+// std/si_gap_resolver — Incremental one-spec-at-a-time synthesis (0.0.187)
+// Minimal standalone version that works within compiler limits
 
 module std_si_gap_resolver;
 
-const MAX_ATTEMPTS = 3;
-
 fn resolve_one() -> i64 {
-    prints("Resolving next spec...\n");
+    prints("Resolving...\n");
     if exec("quanta-synth") != 0 { return 0; }
-    prints("  Synth OK\n");
     if exec("quanta-test-gen") != 0 { return 0; }
-    prints("  Test OK\n");
     if exec("test_suites/scripts/run_tests.sh") != 0 { return 0; }
-    prints("  Compile+Test OK\n");
     if exec("git add -A && git commit -m \"SI\" && git push") != 0 { return 0; }
-    prints("  Merge OK\n");
     return 1;
 }
 
@@ -25,7 +19,7 @@ fn resolve_all() -> i64 {
         if res == -1 { break; }
         if res == 1 { r = r + 1; } else { f = f + 1; }
     }
-    prints("Resolved: "); printi(r); prints(", Failed: "); printi(f); prints("\n");
+    prints("Resolved: "); printi(r); prints("\n");
     return r;
 }
 
