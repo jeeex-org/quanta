@@ -1,0 +1,40 @@
+// std/ai_kv_cache — KV Cache (0.0.172)
+// Ring buffer for key/value tensors in attention
+
+import std/ai_tensor
+
+fn ai_kv_create(k: i64[], v: i64[], pos: i64[], nkh: i64, msl: i64, hd: i64): i64 {
+    let bytes: i64 = nkh * msl * hd * 8
+    k[0] = malloc(bytes)
+    v[0] = malloc(bytes)
+    pos[0] = 0
+    return 0
+}
+
+fn ai_kv_free(k: i64[], v: i64[]): i64 {
+    if k[0] != 0 { free(k[0]); k[0] = 0 }
+    if v[0] != 0 { free(v[0]); v[0] = 0 }
+    return 0
+}
+
+fn ai_kv_append(k: i64[], v: i64[], pos: i64[], kn: i64[], vn: i64[], nkh: i64, hd: i64, sln: i64, msl: i64): i64 {
+    let p: i64 = pos[0]
+    let h: i64 = 0
+    while h < nkh {
+        let s: i64 = 0
+        while s < sln {
+            let d: i64 = 0
+            while d < hd {
+                let si: i64 = (h * sln + s) * hd + d
+                let di: i64 = (h * msl + p + s) * hd + d
+                mem_store(k[0] + di * 8, mem_load(kn[0] + si * 8))
+                mem_store(v[0] + di * 8, mem_load(vn[0] + si * 8))
+                d = d + 1
+            }
+            s = s + 1
+        }
+        h = h + 1
+    }
+    pos[0] = pos[0] + sln
+    return 0
+}
