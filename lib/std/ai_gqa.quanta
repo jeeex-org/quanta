@@ -1,0 +1,34 @@
+// std/ai_gqa — Grouped Query Attention (0.0.174)
+// num_heads must be multiple of num_kv_heads
+
+import std/ai_tensor
+
+fn ai_gqa(out: i64[], q: i64[], k: i64[], v: i64[], nh: i64, nkh: i64, sl: i64, hd: i64): i64 {
+    let scale: i64 = fdiv(i2f(1), sqrt(i2f(hd)))
+    let hpk: i64 = nh / nkh
+    let h: i64 = 0
+    while h < nh {
+        let kh: i64 = h / hpk
+        let qi: i64 = 0
+        while qi < sl {
+            // Compute scores
+            let j: i64 = 0
+            while j < sl {
+                let score: i64 = i2f(0)
+                let d: i64 = 0
+                while d < hd {
+                    let qv: i64 = mem_load(q[0]+((h*sl+qi)*hd+d)*8)
+                    let kv: i64 = mem_load(k[0]+((kh*sl+j)*hd+d)*8)
+                    score = fadd(score, fmul(qv, kv))
+                    d = d + 1
+                }
+                score = fmul(score, scale)
+                mem_store(out[0]+((h*sl+qi)*sl+j)*8, score)
+                j = j + 1
+            }
+            qi = qi + 1
+        }
+        h = h + 1
+    }
+    return 0
+}
