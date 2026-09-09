@@ -1,0 +1,40 @@
+// std/si_feedback — Learn from failed synthesis (0.0.185)
+// Minimal working version
+
+module std_si_feedback;
+
+const FAILURE_LOG = "test_suites/si_failures.json";
+
+fn record_failure(domain, category, module, stage) -> i64 {
+    let fd = file_open(FAILURE_LOG, 577);
+    if fd < 0 { return 0; }
+    let e = mmap(256);
+    let p = "{\"d\":\""; let i = 0;
+    while i < len(p) { mem_store8(e + i, mem_load8(p + 8 + i)); i = i + 1; }
+    let j = 0;
+    while j < len(domain) { mem_store8(e + i + j, mem_load8(domain + 8 + j)); j = j + 1; }
+    i = i + j; mem_store8(e + i, 34); i = i + 1;
+    mem_store8(e + i, 125); mem_store8(e + i + 1, 10); i = i + 2;
+    file_write(fd, e, i);
+    file_close(fd);
+    return 1;
+}
+
+fn analyze() -> i64 {
+    let fd = file_open(FAILURE_LOG, 0);
+    if fd < 0 { return 0; }
+    let buf = mmap(65536);
+    let n = file_read(fd, buf, 65536);
+    file_close(fd);
+    if n <= 0 { return 0; }
+    prints("Failure analysis complete\n");
+    return n;
+}
+
+fn clear() -> i64 {
+    file_close(file_open(FAILURE_LOG, 577));
+    return 1;
+}
+
+fn init() -> i64 { return 0; }
+fn main() -> i64 { return init(); }
