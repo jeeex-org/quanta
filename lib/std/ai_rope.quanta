@@ -1,0 +1,30 @@
+// std/ai_rope — Rotary Position Embeddings (0.0.169)
+// Applies RoPE to f64 tensor data in-place
+// x: [seq_len, head_dim], dim must be even
+
+import std/ai_tensor
+
+fn ai_rope(x_data: i64[], seq_len: i64, head_dim: i64, base: i64): i64 {
+    let half_dim: i64 = head_dim / 2
+    let pos: i64 = 0
+    while pos < seq_len {
+        let i: i64 = 0
+        while i < half_dim {
+            // theta = base^(-2i/dim)
+            let exp_val: i64 = fdiv(i2f(-2 * i), i2f(head_dim))
+            let theta: i64 = pow(base, exp_val)
+            let angle: i64 = fmul(i2f(pos), theta)
+            let cos_a: i64 = cos(angle)
+            let sin_a: i64 = sin(angle)
+            let idx: i64 = pos * head_dim + i
+            let x0: i64 = mem_load(x_data[0] + idx * 8)
+            let x1: i64 = mem_load(x_data[0] + (idx + half_dim) * 8)
+            // [x0*cos - x1*sin, x0*sin + x1*cos]
+            mem_store(x_data[0] + idx * 8, fsub(fmul(x0, cos_a), fmul(x1, sin_a)))
+            mem_store(x_data[0] + (idx + half_dim) * 8, fadd(fmul(x0, sin_a), fmul(x1, cos_a)))
+            i = i + 1
+        }
+        pos = pos + 1
+    }
+    return 0
+}
