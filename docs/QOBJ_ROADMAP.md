@@ -1,136 +1,129 @@
-# Quanta .qobj Roadmap — Accurate (based on compiler/0.0.185 audit)
+# Quanta .qobj Roadmap — Current Status
 
-VERSION: 0.0.185
+VERSION: 0.0.188
 Last updated: 2026-09-09
 
 ---
 
-## Actual Compiler Structure
+## Current State
 
-### Compilation Pipeline
-```
-entry.main() → expand_includes() → tokenize() → scanfns() → parse_block() → ci_func() → p5_elf_obj()
-```
+**Problem**: Quanta imports use textual inclusion. Importing `std/spec_parser` re-lexes, re-parses, and re-IRs `std/json` + `std/str` + `std/vec` + `std/map` + `std/fs`. Deep dependency chains exceed `TOK_CAP`/`IR_CAP` (exit 17).
 
-### File Map
+**Affected modules**: Any stdlib module with >2 levels of transitive deps (e.g., `si_gap_resolver` → `spec_parser` → `json` → `str`).
 
-| File | Key Functions | Purpose |
-|------|---------------|---------|
-| `entry.quanta` | `main()`, `link_object_with_libc()` | Entry point, source loading, include expansion |
-| `lexer.quanta` | `tokenize()` | Lexer: source → tokens |
-| `funcscan.quanta` | `scanfns()`, `scantraits()`, `scanimpls()` | Pre-pass: scan function signatures |
-| `parse.quanta` | `parse_block()`, `parse_primary()`, `user_binop()` | Parser: tokens → IR via `iremit()` |
-| `features.quanta` | `findfn()`, `gfind()`, `emit_patch()`, `nv()`, `nl()` | Symbol lookup, vreg allocation, patches |
-| `method.quanta` | `parse_call()`, `resolve_fn()`, `build_str()` | Expression parsing, method calls |
-| `emitter.quanta` | `emit_bltn()` | Builtin emission |
-| `codegen.quanta` | `ci_func()`, `opt_func()`, `opt_tailcall()` | IR → machine code |
-| `globals.quanta` | IR opcodes (`IR_MOV`, `IR_CALL`, etc.), `findstruct()`, `scannenums()` | IR definitions, type scanning |
-| `helpers.quanta` | `iremit()`, `stok()`, `ktext()`, `emit_ovf()` | Core utilities |
-| `objfmt.quanta` | `p5_add_symbol_b()`, `p5_add_reloc()`, `p5_elf_obj()`, `expand_includes()`, `imp_already()` | ELF output, include expansion, symbol table |
-| `elf.quanta` | `STB_LOCAL`, `STB_GLOBAL` | ELF constants |
-
-### Actual Symbol Table (objfmt.quanta)
-- `symtab[idx*24 + 0]` = st_name (offset into strtab)
-- `symtab[idx*24 + 4]` = st_info (bind << 4 | type)
-- `symtab[idx*24 + 6]` = st_shndx
-- `symtab[idx*24 + 8]` = st_value
-- Functions: `p5_add_symbol_b()`, `p5_add_symbol_l()`, `p5_sym_for_name()`
-
-### Actual Relocations (objfmt.quanta)
-- `p5_add_reloc(po, symidx)` — generic RELA
-- `p5_add_reloc_pc32(po, symidx)` — PC-relative
-
-### Actual IR (helpers.quanta)
-- `iremit(op, res, a0, a1, a2)` — emit IR instruction
-- IR opcodes defined in `globals.quanta`
-
-### Actual Include Dedup (objfmt.quanta)
-- `imp_already()` — hash-based dedup
-- `imp_seen[]` — seen includes array
-- `imp_seenc` — count
+**Workaround**: Flat imports (no module prefix) work. `si_main` works because it uses `load_gap_specs()` not `spec_parser.load_gap_specs()`.
 
 ---
 
-## Fix Plan (Accurate)
+## Phase 1: .qobj Read/Write (DONE)
 
-### Phase 1: Module Boundaries
-**What**: Define module = file. Each `.quanta` → `.qobj` artifact.
-**Where**: `entry.quanta` — add module cache check
-**Effort**: 1 day
+### What was added
 
-### Phase 2: IR Serialization
-**What**: Serialize `ir[]` array to `.qobj`
-**Where**: `helpers.quanta` — add `qobj_write_ir()`, `qobj_read_ir()`
-**Functions**: 
-- `qobj_write_ir(fd, ir, irc)` — write IR stream
-- `qobj_read_ir(fd, &len)` — read IR stream
-**Effort**: 1 day
+| File | Change |
+|------|--------|
+| `qobj.quanta` | New file: `qobj_write()`, `qobj_import()` functions |
+| `globals.quanta` | Added `emit_qobj` flag |
+| `entry.quanta` | Added `--emit-qobj` flag parsing, `qobj_write()` call |
+| `main.quanta` | Added `include "qobj.quanta"` |
+| `objfmt.quanta` | Modified `imp_load()` to check `.qobj` before `expand_includes()` |
 
-### Phase 3: Symbol Table Serialization
-**What**: Serialize `symtab[]` to `.qobj`
-**Where**: `objfmt.quanta` — add `qobj_write_symtab()`, `qobj_read_symtab()`
-**Functions**:
-- `qobj_write_symtab(fd, symtab, symcount)` — write symtab
-- `qobj_read_symtab(fd, &count)` — read symtab
-- `qobj_merge_symtabs(base, imported)` — merge imports
-**Effort**: 1 day
+### What works
 
-### Phase 4: Import Resolution Rewrite
-**What**: Replace `expand_includes()` with `resolve_module()` that checks `.qobj` cache
-**Where**: `entry.quanta` — replace `expand_includes()` call
-**Algorithm**:
-```
-resolve_module(modname):
-    if .qobj exists AND .qobj newer than .quanta:
-        load .qobj (fast)
-    else:
-        expand_includes() + compile + emit .qobj (slow)
-```
-**Effort**: 2 days
+- `qc --emit-qobj module.quanta module.qobj` creates `.qobj` cache file
+- `qobj_import()` loads symbols from `.qobj` file
+- `imp_load()` checks for `.qobj` before textual inclusion
 
-### Phase 5: Linker Integration
-**What**: Cross-module symbol resolution
-**Where**: `objfmt.quanta` — extend `p5_elf_obj()`
-**Functions**:
-- `qobj_link(main, imported[])` — link multiple `.qobj`
-- `qobj_resolve_undefs(symtab, relocs)` — resolve undefined symbols
-**Effort**: 2 days
+### What doesn't work yet
 
-### Phase 6: Incremental Driver
-**What**: Track dirty modules, rebuild only changed
-**Where**: New file `qobj_driver.quanta`
-**Functions**:
-- `qobj_dep_graph(main)` — parse imports
-- `qobj_is_dirty(module)` — check mtime
-- `qobj_incremental_build(main)` — rebuild dirty only
-**Effort**: 1 day
+- `.qobj` contains ALL symbols (including from inlined deps), not just the module's own exports
+- Token explosion still occurs because source is tokenized BEFORE `.qobj` check
+- No IR linking (each module's IR is separate)
+
+---
+
+## Phase 2: Symbol Table Separation (TODO)
+
+### Goal
+
+Track which symbols are owned by the current module vs imported from deps. Write only owned symbols to `.qobj`. When importing, load only owned symbols.
+
+### Changes needed
+
+1. **Add symbol ownership tracking**:
+   - During `scanfns()`, mark symbols as `OWNED` (defined in current module) or `IMPORTED` (from deps)
+   - Add `sym_owner[]` array (parallel to `symtab[]`)
+
+2. **Modify `qobj_write()`**:
+   - Write only `OWNED` symbols to `.qobj`
+   - Write only the current module's string table entries
+
+3. **Modify `imp_load()`**:
+   - Check `.qobj` BEFORE tokenizing source
+   - If `.qobj` exists, load symbols directly (skip `expand_includes()` entirely)
+   - If not, fall back to textual inclusion + write `.qobj` after
+
+4. **Add post-compilation `.qobj` emission**:
+   - After successful compilation, write `.qobj` for the module
+   - This populates cache for future imports
+
+### Estimated effort: 1-2 days
+
+---
+
+## Phase 3: IR Linking (TODO)
+
+### Goal
+
+Compile each module to its own IR stream. Link multiple IR streams together. Resolve cross-module calls.
+
+### Changes needed
+
+1. **Per-module IR**:
+   - Each module compiled to separate `ir[]` array
+   - Track which IR entries belong to which module
+
+2. **Linker**:
+   - Combine per-module IR streams
+   - Resolve cross-module call targets
+   - Patch relocation entries
+
+3. **Incremental compilation**:
+   - Track dirty modules (source changed)
+   - Recompile only dirty modules
+   - Link all modules
+
+### Estimated effort: 2-3 days
+
+---
+
+## File Changes Summary
+
+| File | Phase 1 | Phase 2 | Phase 3 |
+|------|---------|---------|---------|
+| `qobj.quanta` | ✅ Added | Modify | Modify |
+| `globals.quanta` | ✅ `emit_qobj` flag | `sym_owner[]` | Module IR arenas |
+| `entry.quanta` | ✅ `--emit-qobj` flag | Post-compile `.qobj` | Link step |
+| `objfmt.quanta` | ✅ `qobj_import()` in `imp_load()` | Skip tokenize if `.qobj` | Symbol resolution |
+| `funcscan.quanta` | - | Mark `OWNED` vs `IMPORTED` | - |
+| `link.quanta` | - | - | **NEW** IR linker |
 
 ---
 
 ## Verification Gates
 
-| Gate | Test | Pass Criteria |
-|------|------|---------------|
-| G1 | Compile `lib/std/big.quanta` to `.qobj` | `.qobj` file created |
-| G2 | Load `.qobj` from another module | Symbols resolved |
-| G3 | Cross-module call | Call resolves via `.qobj` |
-| G4 | Stale `.qobj` detection | Recompiles when source newer |
-| G5 | Incremental build | Only changed modules recompile |
-| G6 | Self-host with `.qobj` | Quanta compiles itself |
+| Gate | Test | Pass Criteria | Status |
+|------|------|---------------|--------|
+| G1 | `--emit-qobj` creates `.qobj` | File created, readable | ✅ |
+| G2 | `qobj_import()` loads symbols | Symbols added to symtab | ✅ |
+| G3 | Import with `.qobj` cache | No token explosion | ⏳ |
+| G4 | Stale `.qobj` detection | Recompiles when source newer | ⏳ |
+| G5 | Cross-module call | Call resolves via `.qobj` | ⏳ |
+| G6 | Self-host with `.qobj` | Quanta compiles itself using cached modules | ⏳ |
 
 ---
 
-## File Changes
+## Conclusion
 
-| File | Action | Phase |
-|------|--------|-------|
-| `entry.quanta` | Replace `expand_includes()` with `resolve_module()` | 4 |
-| `helpers.quanta` | Add `qobj_write_ir()`, `qobj_read_ir()` | 2 |
-| `objfmt.quanta` | Add `qobj_write_symtab()`, `qobj_read_symtab()` | 3 |
-| `objfmt.quanta` | Add `qobj_link()`, `qobj_resolve_undefs()` | 5 |
-| `objfmt.quanta` | Remove `imp_already()`, `imp_seen[]` | 6 |
-| `qobj_driver.quanta` | **NEW** — incremental build | 6 |
+Phase 1 provides the foundation (`.qobj` read/write). Phases 2-3 are needed for the actual fix. Total remaining effort: ~3-4 days.
 
----
-
-Total effort: ~8 days (1 week+)
+Alternative: Document the flat-scope rule and continue building domain cores (blockchain/quantum/math) within current constraints.

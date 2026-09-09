@@ -246,7 +246,13 @@ fn main(argc, argv) {
                 while ol<4 { if r8(ap+2+ol) != r8(lstr+8+ol) { is_link=0; break }; ol=ol+1 }
                 if is_link==1 { do_link=1 }
                 
-                if !is_novf && !is_arm && !is_obj && !is_nostart && !is_dyn && !is_link {
+                // P5.4: try "--emit-qobj" (11 chars) — emit .qobj module cache
+                let is_qobj=1; let oq=0
+                let qobjstr = "emit-qobj"
+                while oq<9 { if r8(ap+2+oq) != r8(qobjstr+8+oq) { is_qobj=0; break }; oq=oq+1 }
+                if is_qobj==1 { emit_qobj=1 }
+                
+                if !is_novf && !is_arm && !is_obj && !is_nostart && !is_dyn && !is_link && !is_qobj {
                     if srcp==0 { srcp=ap } else if out_p==0 { out_p=ap }
                 }
                 // For --link, we do NOT capture the flag itself as srcp/out_p.
@@ -910,6 +916,11 @@ fn main(argc, argv) {
         // --link mode: link object file with libc using system ld
         // srcp = input .o file, out_p = output executable
         link_object_with_libc(srcp, out_p)
+        exit(0)
+    }
+    if emit_qobj == 1 {
+        // --emit-qobj mode: write .qobj module cache
+        qobj_write(out_p)
         exit(0)
     }
     w32(code+init_call+1, r64(func_code_starts+0)-(init_call+5))
