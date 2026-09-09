@@ -1,27 +1,85 @@
 // std/si_gap_resolver — Incremental one-spec-at-a-time synthesis (0.0.187)
-// Minimal standalone version that works within compiler limits
+// All logic in main() to ensure imports are resolved before use
 
 module std_si_gap_resolver;
 
-fn resolve_one() -> i64 {
-    prints("Resolving...\n");
-    if exec("quanta-synth") != 0 { return 0; }
-    if exec("quanta-test-gen") != 0 { return 0; }
-    if exec("test_suites/scripts/run_tests.sh") != 0 { return 0; }
-    if exec("git add -A && git commit -m \"SI\" && git push") != 0 { return 0; }
-    return 1;
-}
+import std/spec_parser
 
-fn resolve_all() -> i64 {
-    let r = 0; let f = 0;
-    while 1 {
-        let res = resolve_one();
-        if res == -1 { break; }
-        if res == 1 { r = r + 1; } else { f = f + 1; }
+const MAX_ATTEMPTS = 3;
+
+fn main() -> i64 {
+    prints("=== SI Gap Resolver Starting ===\n");
+    
+    // Parse gap specs
+    let json_root = load_gap_specs("gap_specs.json");
+    if json_root == 0 {
+        prints("FAIL: Could not load gap_specs.json\n");
+        return 1;
     }
-    prints("Resolved: "); printi(r); prints("\n");
-    return r;
+    let specs_arr = get_specs_array(json_root);
+    if specs_arr == 0 {
+        prints("FAIL: No specs array found\n");
+        return 1;
+    }
+    let total = get_spec_count(specs_arr);
+    prints("Total specs: "); printi(total); prints("\n");
+    
+    // Filter planned specs
+    let planned = vec_new();
+    let planned_count = filter_planned_specs(specs_arr, planned);
+    prints("Planned specs: "); printi(planned_count); prints("\n");
+    
+    if planned_count == 0 {
+        prints("ALL SPECS IMPLEMENTED!\n");
+        return 0;
+    }
+    
+    // Resolve each planned spec
+    let resolved = 0;
+    let failed = 0;
+    let i = 0;
+    while i < planned_count {
+        let spec_obj = vec_at(planned, i);
+        let domain = spec_get_field(spec_obj, "domain");
+        let category = spec_get_field(spec_obj, "category");
+        let module = spec_get_field(spec_obj, "module");
+        
+        let domain_str = json_get_string(domain);
+        let category_str = json_get_string(category);
+        let module_str = json_get_string(module);
+        
+        if domain_str >= 0 && category_str >= 0 && module_str >= 0 {
+            prints("Resolving: ");
+            prints(json_get_string(domain));
+            prints("/");
+            prints(json_get_string(category));
+            prints("/");
+            prints(json_get_string(module));
+            prints("\n");
+            
+            // Try to resolve this spec
+            let a = 0;
+            while a < MAX_ATTEMPTS {
+                a = a + 1;
+                prints("  Attempt "); printi(a); prints("\n");
+                
+                if exec("quanta-synth") != 0 { continue; }
+                if exec("quanta-test-gen") != 0 { continue; }
+                if exec("test_suites/scripts/run_tests.sh") != 0 { continue; }
+                if exec("git add -A && git commit -m \"SI\" && git push") != 0 { continue; }
+                
+                resolved = resolved + 1;
+                break;
+            }
+            if a >= MAX_ATTEMPTS {
+                failed = failed + 1;
+            }
+        }
+        i = i + 1;
+    }
+    
+    prints("Resolved: "); printi(resolved); prints(", Failed: "); printi(failed); prints("\n");
+    return 0;
 }
 
 fn init() -> i64 { return 0; }
-fn main() -> i64 { return init(); }
