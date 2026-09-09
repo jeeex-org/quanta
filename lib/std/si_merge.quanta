@@ -1,50 +1,92 @@
-// std/si_merge — Git commit/push/rollback automation (0.0.181)
-// Compact version to fit token limit
+// std/si_merge — Git commit/push/rollback automation (0.0.182)
+// Fully featured but token-efficient
 
 module std_si_merge;
 
-fn stage_all() -> i64 { return exec("git add -A"); }
-fn push() -> i64 { return exec("git push"); }
-fn rollback() -> i64 { return exec("git reset --hard HEAD~1 && git checkout -- ."); }
+fn stage_all() -> i64 {
+    prints("[SI Merge] Staging...\n");
+    return exec("git add -A");
+}
+
+fn show_diff() -> i64 {
+    return exec("git diff --cached");
+}
 
 fn commit(msg) -> i64 {
-    let cmd = mmap(512);
-    let base = "git commit -m \"";
+    let cmd = mmap(256);
+    let p = "git commit -m \"";
     let i = 0;
-    while i < len(base) { mem_store8(cmd + i, mem_load8(base + 8 + i)); i = i + 1; }
+    while i < len(p) { mem_store8(cmd + i, mem_load8(p + 8 + i)); i = i + 1; }
     let j = 0;
     while j < len(msg) { mem_store8(cmd + i + j, mem_load8(msg + 8 + j)); j = j + 1; }
     i = i + j;
-    mem_store8(cmd + i, 34); i = i + 1;
-    mem_store8(cmd + i, 0);
+    mem_store8(cmd + i, 34); mem_store8(cmd + i + 1, 0);
+    prints("[SI Merge] Commit: "); prints(msg); prints("\n");
+    return exec(cmd);
+}
+
+fn push() -> i64 {
+    prints("[SI Merge] Push...\n");
+    return exec("git push");
+}
+
+fn rollback() -> i64 {
+    prints("[SI Merge] Rollback...\n");
+    return exec("git reset --hard HEAD~1 && git checkout -- .");
+}
+
+fn verify_push() -> i64 {
+    return exec("git ls-remote --heads origin");
+}
+
+fn tag(d, c, m) -> i64 {
+    let t = mmap(128);
+    let p = "si-"; let i = 0;
+    while i < len(p) { mem_store8(t + i, mem_load8(p + 8 + i)); i = i + 1; }
+    let j = 0;
+    while j < len(d) { mem_store8(t + i + j, mem_load8(d + 8 + j)); j = j + 1; }
+    i = i + j; mem_store8(t + i, 45); i = i + 1;
+    j = 0;
+    while j < len(c) { mem_store8(t + i + j, mem_load8(c + 8 + j)); j = j + 1; }
+    i = i + j; mem_store8(t + i, 45); i = i + 1;
+    j = 0;
+    while j < len(m) { mem_store8(t + i + j, mem_load8(m + 8 + j)); j = j + 1; }
+    i = i + j; mem_store8(t + i, 0);
+    let cmd = mmap(256);
+    let p2 = "git tag "; i = 0;
+    while i < len(p2) { mem_store8(cmd + i, mem_load8(p2 + 8 + i)); i = i + 1; }
+    j = 0;
+    while j < len(t) { mem_store8(cmd + i + j, mem_load8(t + 8 + j)); j = j + 1; }
+    i = i + j; mem_store8(cmd + i, 0);
     return exec(cmd);
 }
 
 fn merge(msg) -> i64 {
     if stage_all() != 0 { return 0; }
+    show_diff();
     if commit(msg) != 0 { return 0; }
     if push() != 0 { rollback(); return 0; }
+    if verify_push() != 0 { rollback(); return 0; }
+    prints("[SI Merge] SUCCESS\n");
     return 1;
 }
 
-fn merge_for_spec(domain, category, module) -> i64 {
+fn merge_for_spec(d, c, m) -> i64 {
     let msg = mmap(256);
-    let prefix = "SI: Implement ";
-    let i = 0;
-    while i < len(prefix) { mem_store8(msg + i, mem_load8(prefix + 8 + i)); i = i + 1; }
+    let p = "SI: Implement "; let i = 0;
+    while i < len(p) { mem_store8(msg + i, mem_load8(p + 8 + i)); i = i + 1; }
     let j = 0;
-    while j < len(domain) { mem_store8(msg + i + j, mem_load8(domain + 8 + j)); j = j + 1; }
-    i = i + j;
-    mem_store8(msg + i, 47); i = i + 1;
+    while j < len(d) { mem_store8(msg + i + j, mem_load8(d + 8 + j)); j = j + 1; }
+    i = i + j; mem_store8(msg + i, 47); i = i + 1;
     j = 0;
-    while j < len(category) { mem_store8(msg + i + j, mem_load8(category + 8 + j)); j = j + 1; }
-    i = i + j;
-    mem_store8(msg + i, 47); i = i + 1;
+    while j < len(c) { mem_store8(msg + i + j, mem_load8(c + 8 + j)); j = j + 1; }
+    i = i + j; mem_store8(msg + i, 47); i = i + 1;
     j = 0;
-    while j < len(module) { mem_store8(msg + i + j, mem_load8(module + 8 + j)); j = j + 1; }
-    i = i + j;
-    mem_store8(msg + i, 0);
-    return merge(msg);
+    while j < len(m) { mem_store8(msg + i + j, mem_load8(m + 8 + j)); j = j + 1; }
+    i = i + j; mem_store8(msg + i, 0);
+    let r = merge(msg);
+    if r != 0 { tag(d, c, m); }
+    return r;
 }
 
 fn init() -> i64 { return 0; }
