@@ -1,5 +1,5 @@
 // === QOBJ: Module caching system ===
-// Phase 2: Import names via string bytes (portable across compilations)
+// Phase 3: IR linking - store and load function IR
 
 const QOBJ_MAGIC = 0x514F424A
 let sym_owner = mmap(2000000)
@@ -14,27 +14,30 @@ fn mark_new_owned() {
   while si < symc { mark_owned(si); si = si + 1 }
 }
 
-// Write functions to .qobj with names stored as string bytes
+// Write functions + IR to .qobj
 fn qobj_write(path) -> i64 {
   let fd = file_open(path, 577)
   if fd < 0 { return 0 }
   mark_new_owned()
   
-  // Magic + version + fn_count
-  let hdr = mmap(12)
+  // Magic + version + fn_count + ir_count
+  let hdr = mmap(16)
   w32(hdr, QOBJ_MAGIC)
-  w32(hdr + 4, 2)  // version 2
+  w32(hdr + 4, 3)  // version 3 (with IR)
   w32(hdr + 8, fnc)
-  file_write(fd, hdr, 12)
+  w32(hdr + 12, irc)
+  file_write(fd, hdr, 16)
   
-  // Write each function: [name_len, name_bytes, param_c, ret_len, ret_bytes]
+  // Write each function: [name_len, name_bytes, param_c, ret_len, ret_bytes, ir_start, ir_count]
   let i = 0
   while i < fnc {
     let name_ptr = r64(fns + i*FNS)
     let name_len = r64(fns + i*FNS + 8)
-    let param_c = r64(fns + i*FNS + 32)
-    let ret_ptr = r64(fns + i*FNS + 40)
-    let ret_len = r64(fns + i*FNS + 48)
+    let param_c = r64(fn_pcount + i*8)
+    let ret_ptr = r64(fn_rettype_name + i*8)
+    let ret_len = r64(fn_rettype_len + i*8)
+    let ir_start = r64(fn_ir_start + i*8)
+    let ir_count = r64(fn_ir_count + i*8)
     
     // Write name
     let nl_buf = mmap(8)
@@ -50,7 +53,7 @@ fn qobj_write(path) -> i64 {
       file_write(fd, name_buf, name_len)
     }
     
-    // Write param count and ret type
+    // Write param count, ret type, IR location
     let pc_buf = mmap(8)
     w64(pc_buf, param_c)
     file_write(fd, pc_buf, 8)
@@ -68,27 +71,58 @@ fn qobj_write(path) -> i64 {
       file_write(fd, ret_buf, ret_len)
     }
     
+    let irs_buf = mmap(8)
+    w64(irs_buf, ir_start)
+    file_write(fd, irs_buf, 8)
+    
+    let irc_buf = mmap(8)
+    w64(irc_buf, ir_count)
+    file_write(fd, irc_buf, 8)
+    
     i = i + 1
+  }
+  
+  // Write IR records
+  if irc > 0 {
+    let ir_buf = mmap(irc * 40)
+    let i = 0
+    while i < irc {
+      w64(ir_buf + i*40, r64(ir + i*IRS))
+      w64(ir_buf + i*40 + 8, r64(ir + i*IRS + 8))
+      w64(ir_buf + i*40 + 16, r64(ir + i*IRS + 16))
+      w64(ir_buf + i*40 + 24, r64(ir + i*IRS + 24))
+      w64(ir_buf + i*40 + 32, r64(ir + i*IRS + 32))
+      i = i + 1
+    }
+    file_write(fd, ir_buf, irc * 40)
   }
   
   file_close(fd)
   return 1
 }
 
-// Import functions from .qobj
+// Import functions + IR from .qobj
 fn qobj_import(qobj_path) -> i64 {
   let fd = file_open(qobj_path, 0)
   if fd < 0 { return 0 }
   
-  let hdr = mmap(12)
-  let n = file_read(fd, hdr, 12)
-  if n < 12 { file_close(fd); return 0 }
+  let hdr = mmap(16)
+  let n = file_read(fd, hdr, 16)
+  if n < 16 { file_close(fd); return 0 }
   
   let magic = r32(hdr)
   if magic != QOBJ_MAGIC { file_close(fd); return 0 }
   
   let fn_count = r32(hdr + 8)
+  let ir_count = r32(hdr + 12)
   
+  // Read IR records first
+  let imported_ir = mmap(ir_count * 40)
+  if ir_count > 0 {
+    file_read(fd, imported_ir, ir_count * 40)
+  }
+  
+  // Read functions and register them
   let i = 0
   while i < fn_count {
     // Read name
@@ -132,11 +166,40 @@ fn qobj_import(qobj_path) -> i64 {
     w8(strtab + strtablen + ret_len, 0)
     strtablen = strtablen + ret_len + 1
     
-    // Register function
+    // Read IR location
+    let irs_buf = mmap(8)
+    file_read(fd, irs_buf, 8)
+    let ir_start = r64(irs_buf)
+    
+    let ir_cnt_buf = mmap(8)
+    file_read(fd, ir_cnt_buf, 8)
+    let ir_count_fn = r64(ir_cnt_buf)
+    
+    // Register function with IR
+    let new_fi = fnc
     sfn(fnc, name_ptr, name_len, 0, 0, param_c, ret_ptr, ret_len)
     w64(fn_is_imported + fnc*8, 1)
-    fnc = fnc + 1
     
+    // Copy IR records for this function
+    if ir_count_fn > 0 {
+      w64(fn_ir_start + fnc*8, irc)
+      w64(fn_ir_count + fnc*8, ir_count_fn)
+      
+      let j = 0
+      while j < ir_count_fn {
+        let src_ir = imported_ir + (ir_start + j) * 40
+        let dst_ir = irc
+        w64(ir + dst_ir*IRS, r64(src_ir))
+        w64(ir + dst_ir*IRS + 8, r64(src_ir + 8))
+        w64(ir + dst_ir*IRS + 16, r64(src_ir + 16))
+        w64(ir + dst_ir*IRS + 24, r64(src_ir + 24))
+        w64(ir + dst_ir*IRS + 32, r64(src_ir + 32))
+        irc = irc + 1
+        j = j + 1
+      }
+    }
+    
+    fnc = fnc + 1
     i = i + 1
   }
   
