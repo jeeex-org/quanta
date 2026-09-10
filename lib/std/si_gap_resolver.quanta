@@ -1,25 +1,29 @@
-// std/si_gap_resolver — Standalone version (works within compiler limits)
-// All logic in main(), no imports needed
+// std/si_gap_resolver — Phase 2: Module-level import with .qobj caching
+// Uses flat function calls (no module prefix)
 
 module std_si_gap_resolver;
 
+// Import from spec_parser (will use .qobj if available)
+import std/spec_parser
+
+const MAX_ATTEMPTS = 3;
+
 fn main() -> i64 {
-    // Load gap_specs.json
-    let fd = file_open("gap_specs.json", 0);
-    if fd < 0 {
-        prints("FAIL: gap_specs.json not found\n");
-        return 1;
-    }
-    let buf = mmap(16777216);
-    let n = file_read(fd, buf + 8, 16777216);
-    file_close(fd);
-    if n <= 0 {
-        prints("FAIL: empty file\n");
-        return 1;
-    }
-    mem_store(buf, n);
+    prints("=== SI Gap Resolver ===\n");
     
-    prints("SI Gap Resolver: "); printi(n); prints(" bytes loaded\n");
+    // Parse gap specs
+    let json_root = load_gap_specs("gap_specs.json");
+    if json_root == 0 { return 1; }
+    let specs_arr = get_specs_array(json_root);
+    if specs_arr == 0 { return 1; }
+    let total = get_spec_count(specs_arr);
+    prints("Total: "); printi(total); prints("\n");
+    
+    // Resolve first spec
+    let planned = vec_new();
+    let count = filter_planned_specs(specs_arr, planned);
+    prints("Planned: "); printi(count); prints("\n");
+    
     return 0;
 }
 

@@ -116,6 +116,48 @@ export LD_LIBRARY_PATH=/opt/ai/llama.cpp/bin:$LD_LIBRARY_PATH
 
 ---
 
+## Live SI Brain — Usage for Any Session (2026-09-10)
+
+E4B runs as a persistent system service; every session (Hermes, SI driver, scripts) can use it with zero setup — no OmniRoute, no model loading, no GPU:
+
+| | |
+|---|---|
+| Service | `llama-server.service` (system unit, enabled — auto-starts at boot) |
+| Model | `/opt/ai/models/quanta/active` → `QUANTA-GG4-E4B-Q4_K_M.gguf` (swap = repoint symlink + `systemctl restart llama-server`) |
+| Endpoint | `http://127.0.0.1:1234/v1/chat/completions` (OpenAI-compatible), model name `quanta` |
+| Config | CPU-only (`-ngl 0`), 20 threads, ctx 16384, `--reasoning off` |
+| Health | `curl -s http://127.0.0.1:1234/health` → `{"status":"ok"}` |
+
+Verified call shape (few-shot is mandatory — this exact shape produced valid Quanta on first try):
+
+```bash
+curl -s http://127.0.0.1:1234/v1/chat/completions -H "Content-Type: application/json" -d '{
+  "model": "quanta",
+  "messages": [{"role": "user", "content": "You are a code generator. Copy the style EXACTLY. Example: fn println_s(s) { prints(s) newline() } Example: fn byte_at(s, i) { return mem_load8(s + 8 + i) } Task: <spec text>. Reply with code only:"}],
+  "max_tokens": 256,
+  "temperature": 0
+}'
+# answer: choices[0].message.content — reasoning_content is always absent (off server-side)
+```
+
+Caller rules:
+
+1. **Few-shot ALWAYS** — 2-3 real `lib/std/` examples in the prompt, or output degrades to Rust/C hybrids (`func`, `const`, `@attr`)
+2. **Stay inside 16k ctx** — ≤3 examples + one spec section + ≤500-char error feedback. Requests are stateless: on retries send only the latest attempt + latest error, never the whole history
+3. **`finish_reason` must be `stop`** — if `length`, the code is truncated: raise `max_tokens`, never use truncated output
+4. **`temperature: 0`** for codegen
+5. **RAM guard** — the server holds ~5.4GB; check `free -h` before starting other big tenants (ComfyUI/video stack)
+
+Measured on this box: 8.2 tok/s generation, 119 t/s prompt, 5.41GB RSS (~30s per 100-line function).
+
+Pitfalls (already paid for — do not rediscover):
+
+- `--cache-type-v q4_0` requires Flash Attention → GPU only. On CPU it kills the server at context init (was the 07:03 crash). Do not re-add cache-type flags to the CPU unit.
+- `llama-cli -p` one-shot runs need `-no-cnv` or they idle in the interactive REPL and look hung
+- E4B is a reasoning model: `--reasoning off` is baked into the unit. Never send client-side thinking toggles — thinking tokens eat `max_tokens` and can return empty `content`
+
+---
+
 ## Self-Sufficiency Path (no external LLM)
 
 Two-stage brain plan:
