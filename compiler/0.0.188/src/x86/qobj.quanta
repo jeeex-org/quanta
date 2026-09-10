@@ -1,139 +1,133 @@
 // === QOBJ: Module caching system ===
-// Phase 2: Import names via strtab (not src pointers)
+// Phase 2: Import names via string bytes (portable across compilations)
 
 const QOBJ_MAGIC = 0x514F424A
-const QOBJ_VERSION = 2
+let sym_owner = mmap(2000000)
+let module_symc_start = 0
 
-// Write current compilation state to .qobj file
-// Stores function names as string bytes (portable across compilations)
+fn mark_owned(si) { w64(sym_owner + si*8, 1) }
+fn is_owned(si) -> i64 { if r64(sym_owner + si*8) == 1 { return 1 }; return 0 }
+fn mark_module_start() { module_symc_start = symc }
+
+fn mark_new_owned() {
+  let si = module_symc_start
+  while si < symc { mark_owned(si); si = si + 1 }
+}
+
+// Write functions to .qobj with names stored as string bytes
 fn qobj_write(path) -> i64 {
   let fd = file_open(path, 577)
   if fd < 0 { return 0 }
+  mark_new_owned()
   
-  // Count total bytes needed for function names + ret types
-  let names_total_len = 0
+  // Magic + version + fn_count
+  let hdr = mmap(12)
+  w32(hdr, QOBJ_MAGIC)
+  w32(hdr + 4, 2)  // version 2
+  w32(hdr + 8, fnc)
+  file_write(fd, hdr, 12)
+  
+  // Write each function: [name_len, name_bytes, param_c, ret_len, ret_bytes]
   let i = 0
   while i < fnc {
-    names_total_len = names_total_len + r64(fns + i*FNS + 8) + 1  // name + NUL
-    names_total_len = names_total_len + r64(fns + i*FNS + 48) + 1  // ret type + NUL
-    i = i + 1
-  }
-  
-  // Magic + version + fn_count + names_total_len
-  let hdr = mmap(16)
-  w32(hdr, QOBJ_MAGIC)
-  w32(hdr + 4, QOBJ_VERSION)
-  w32(hdr + 8, fnc)
-  w32(hdr + 12, names_total_len)
-  file_write(fd, hdr, 16)
-  
-  // Write function entries: [name_offset, name_len, param_c, ret_offset, ret_len]
-  // Offsets are relative to the start of the names blob
-  if fnc > 0 {
-    let fn_buf = mmap(fnc * 24)  // 24 bytes per function entry
-    let names_blob = mmap(names_total_len)
-    let name_off = 0
-    i = 0
-    while i < fnc {
-      // Copy function name
-      let name_ptr = r64(fns + i*FNS)
-      let name_len = r64(fns + i*FNS + 8)
-      let param_c = r64(fns + i*FNS + 32)
-      let ret_ptr = r64(fns + i*FNS + 40)
-      let ret_len = r64(fns + i*FNS + 48)
-      
-      // Write name to blob
+    let name_ptr = r64(fns + i*FNS)
+    let name_len = r64(fns + i*FNS + 8)
+    let param_c = r64(fns + i*FNS + 32)
+    let ret_ptr = r64(fns + i*FNS + 40)
+    let ret_len = r64(fns + i*FNS + 48)
+    
+    // Write name
+    let nl_buf = mmap(8)
+    w64(nl_buf, name_len)
+    file_write(fd, nl_buf, 8)
+    if name_len > 0 {
+      let name_buf = mmap(name_len)
       let j = 0
       while j < name_len {
-        w8(names_blob + name_off + j, r8(name_ptr + j))
+        w8(name_buf + j, r8(name_ptr + j))
         j = j + 1
       }
-      w8(names_blob + name_off + name_len, 0)  // NUL terminate
-      
-      // Write ret type to blob
-      let ret_off = name_off + name_len + 1
-      j = 0
-      while j < ret_len {
-        w8(names_blob + ret_off + j, r8(ret_ptr + j))
-        j = j + 1
-      }
-      w8(names_blob + ret_off + ret_len, 0)  // NUL terminate
-      
-      // Write entry (offsets relative to names blob start)
-      w32(fn_buf + i*24, name_off)
-      w32(fn_buf + i*24 + 4, name_len)
-      w32(fn_buf + i*24 + 8, param_c)
-      w32(fn_buf + i*24 + 12, ret_off)
-      w32(fn_buf + i*24 + 16, ret_len)
-      w32(fn_buf + i*24 + 20, 0)  // padding
-      
-      name_off = ret_off + ret_len + 1
-      i = i + 1
+      file_write(fd, name_buf, name_len)
     }
-    file_write(fd, fn_buf, fnc * 24)
-    file_write(fd, names_blob, names_total_len)
+    
+    // Write param count and ret type
+    let pc_buf = mmap(8)
+    w64(pc_buf, param_c)
+    file_write(fd, pc_buf, 8)
+    
+    let rl_buf = mmap(8)
+    w64(rl_buf, ret_len)
+    file_write(fd, rl_buf, 8)
+    if ret_len > 0 {
+      let ret_buf = mmap(ret_len)
+      let j = 0
+      while j < ret_len {
+        w8(ret_buf + j, r8(ret_ptr + j))
+        j = j + 1
+      }
+      file_write(fd, ret_buf, ret_len)
+    }
+    
+    i = i + 1
   }
   
   file_close(fd)
   return 1
 }
 
-// Import functions from pre-compiled module cache
+// Import functions from .qobj
 fn qobj_import(qobj_path) -> i64 {
   let fd = file_open(qobj_path, 0)
   if fd < 0 { return 0 }
   
-  let hdr = mmap(16)
-  let n = file_read(fd, hdr, 16)
-  if n < 16 { file_close(fd); return 0 }
+  let hdr = mmap(12)
+  let n = file_read(fd, hdr, 12)
+  if n < 12 { file_close(fd); return 0 }
   
   let magic = r32(hdr)
   if magic != QOBJ_MAGIC { file_close(fd); return 0 }
   
   let fn_count = r32(hdr + 8)
-  let names_blob_len = r32(hdr + 12)
   
-  // Read function entries
-  let fn_buf = mmap(fn_count * 24)
-  if fn_count > 0 {
-    file_read(fd, fn_buf, fn_count * 24)
-  }
-  
-  // Read names blob
-  let names_blob = mmap(names_blob_len)
-  if names_blob_len > 0 {
-    file_read(fd, names_blob, names_blob_len)
-  }
-  
-  // Register functions
   let i = 0
   while i < fn_count {
-    let name_off = r32(fn_buf + i*24)
-    let name_len = r32(fn_buf + i*24 + 4)
-    let param_c = r32(fn_buf + i*24 + 8)
-    let ret_off = r32(fn_buf + i*24 + 12)
-    let ret_len = r32(fn_buf + i*24 + 16)
+    // Read name
+    let nl_buf = mmap(8)
+    file_read(fd, nl_buf, 8)
+    let name_len = r64(nl_buf)
     
-    // Name pointer = names_blob + name_off (will be added to strtab)
-    // For now, use names_blob directly as the name pointer
-    // This works because names_blob is mmap'd and persists
-    
-    // Copy name to current strtab
     let name_ptr = strtab + strtablen
-    let j = 0
-    while j < name_len {
-      w8(strtab + strtablen + j, r8(names_blob + name_off + j))
-      j = j + 1
+    if name_len > 0 {
+      let name_buf = mmap(name_len)
+      file_read(fd, name_buf, name_len)
+      let j = 0
+      while j < name_len {
+        w8(strtab + strtablen + j, r8(name_buf + j))
+        j = j + 1
+      }
     }
     w8(strtab + strtablen + name_len, 0)
     strtablen = strtablen + name_len + 1
     
-    // Copy ret type to current strtab
+    // Read param count
+    let pc_buf = mmap(8)
+    file_read(fd, pc_buf, 8)
+    let param_c = r64(pc_buf)
+    
+    // Read ret type
+    let rl_buf = mmap(8)
+    file_read(fd, rl_buf, 8)
+    let ret_len = r64(rl_buf)
+    
     let ret_ptr = strtab + strtablen
-    j = 0
-    while j < ret_len {
-      w8(strtab + strtablen + j, r8(names_blob + ret_off + j))
-      j = j + 1
+    if ret_len > 0 {
+      let ret_buf = mmap(ret_len)
+      file_read(fd, ret_buf, ret_len)
+      let j = 0
+      while j < ret_len {
+        w8(strtab + strtablen + j, r8(ret_buf + j))
+        j = j + 1
+      }
     }
     w8(strtab + strtablen + ret_len, 0)
     strtablen = strtablen + ret_len + 1
