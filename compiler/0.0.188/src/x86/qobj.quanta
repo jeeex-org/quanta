@@ -1,5 +1,5 @@
 // === QOBJ: Module caching system ===
-// Phase 3: IR linking - store and load function IR
+// Phase 3: IR linking with portable string-based function names
 
 const QOBJ_MAGIC = 0x514F424A
 let sym_owner = mmap(2000000)
@@ -14,78 +14,84 @@ fn mark_new_owned() {
   while si < symc { mark_owned(si); si = si + 1 }
 }
 
-// Write functions + IR to .qobj
+// Write functions + IR to .qobj with portable string format
 fn qobj_write(path) -> i64 {
   let fd = file_open(path, 577)
   if fd < 0 { return 0 }
   mark_new_owned()
   
-  // Magic + version + fn_count + ir_count
-  let hdr = mmap(16)
-  w32(hdr, QOBJ_MAGIC)
-  w32(hdr + 4, 3)  // version 3 (with IR)
-  w32(hdr + 8, fnc)
-  w32(hdr + 12, irc)
-  file_write(fd, hdr, 16)
-  
-  // Write each function: [name_len, name_bytes, param_c, ret_len, ret_bytes, ir_start, ir_count]
+  // Count total string bytes needed
+  let total_str_bytes = 0
   let i = 0
   while i < fnc {
-    let name_ptr = r64(fns + i*FNS)
-    let name_len = r64(fns + i*FNS + 8)
-    let param_c = r64(fn_pcount + i*8)
-    let ret_ptr = r64(fn_rettype_name + i*8)
-    let ret_len = r64(fn_rettype_len + i*8)
-    let ir_start = r64(fn_ir_start + i*8)
-    let ir_count = r64(fn_ir_count + i*8)
-    
-    // Write name
-    let nl_buf = mmap(8)
-    w64(nl_buf, name_len)
-    file_write(fd, nl_buf, 8)
-    if name_len > 0 {
-      let name_buf = mmap(name_len)
+    total_str_bytes = total_str_bytes + r64(fns + i*FNS + 8) + 1  // name + NUL
+    total_str_bytes = total_str_bytes + r64(fn_rettype_len + i*8) + 1  // ret + NUL
+    i = i + 1
+  }
+  
+  // Magic + version + fn_count + ir_count + total_str_bytes
+  let hdr = mmap(20)
+  w32(hdr, QOBJ_MAGIC)
+  w32(hdr + 4, 4)  // version 4
+  w32(hdr + 8, fnc)
+  w32(hdr + 12, irc)
+  w32(hdr + 16, total_str_bytes)
+  file_write(fd, hdr, 20)
+  
+  // Write function entries: [name_off, name_len, param_c, ret_off, ret_len, ir_start, ir_count]
+  // Offsets are relative to the start of the string blob
+  if fnc > 0 {
+    let fn_buf = mmap(fnc * 32)  // 32 bytes per function entry
+    let str_blob = mmap(total_str_bytes)
+    let str_off = 0
+    i = 0
+    while i < fnc {
+      let name_ptr = r64(fns + i*FNS)
+      let name_len = r64(fns + i*FNS + 8)
+      let param_c = r64(fn_pcount + i*8)
+      let ret_ptr = r64(fn_rettype_name + i*8)
+      let ret_len = r64(fn_rettype_len + i*8)
+      let ir_start = r64(fn_ir_start + i*8)
+      let ir_count = r64(fn_ir_count + i*8)
+      
+      // Copy name to blob
       let j = 0
       while j < name_len {
-        w8(name_buf + j, r8(name_ptr + j))
+        w8(str_blob + str_off + j, r8(name_ptr + j))
         j = j + 1
       }
-      file_write(fd, name_buf, name_len)
-    }
-    
-    // Write param count, ret type, IR location
-    let pc_buf = mmap(8)
-    w64(pc_buf, param_c)
-    file_write(fd, pc_buf, 8)
-    
-    let rl_buf = mmap(8)
-    w64(rl_buf, ret_len)
-    file_write(fd, rl_buf, 8)
-    if ret_len > 0 {
-      let ret_buf = mmap(ret_len)
-      let j = 0
+      w8(str_blob + str_off + name_len, 0)
+      
+      // Copy ret type to blob
+      let ret_off = str_off + name_len + 1
+      j = 0
       while j < ret_len {
-        w8(ret_buf + j, r8(ret_ptr + j))
+        w8(str_blob + ret_off + j, r8(ret_ptr + j))
         j = j + 1
       }
-      file_write(fd, ret_buf, ret_len)
+      w8(str_blob + ret_off + ret_len, 0)
+      
+      // Write entry
+      w32(fn_buf + i*32, str_off)         // name offset
+      w32(fn_buf + i*32 + 4, name_len)
+      w32(fn_buf + i*32 + 8, param_c)
+      w32(fn_buf + i*32 + 12, ret_off)    // ret offset
+      w32(fn_buf + i*32 + 16, ret_len)
+      w32(fn_buf + i*32 + 20, ir_start)
+      w32(fn_buf + i*32 + 24, ir_count)
+      w32(fn_buf + i*32 + 28, 0)  // padding
+      
+      str_off = ret_off + ret_len + 1
+      i = i + 1
     }
-    
-    let irs_buf = mmap(8)
-    w64(irs_buf, ir_start)
-    file_write(fd, irs_buf, 8)
-    
-    let irc_buf = mmap(8)
-    w64(irc_buf, ir_count)
-    file_write(fd, irc_buf, 8)
-    
-    i = i + 1
+    file_write(fd, fn_buf, fnc * 32)
+    file_write(fd, str_blob, total_str_bytes)
   }
   
   // Write IR records
   if irc > 0 {
     let ir_buf = mmap(irc * 40)
-    let i = 0
+    i = 0
     while i < irc {
       w64(ir_buf + i*40, r64(ir + i*IRS))
       w64(ir_buf + i*40 + 8, r64(ir + i*IRS + 8))
@@ -106,76 +112,67 @@ fn qobj_import(qobj_path) -> i64 {
   let fd = file_open(qobj_path, 0)
   if fd < 0 { return 0 }
   
-  let hdr = mmap(16)
-  let n = file_read(fd, hdr, 16)
-  if n < 16 { file_close(fd); return 0 }
+  let hdr = mmap(20)
+  let n = file_read(fd, hdr, 20)
+  if n < 20 { file_close(fd); return 0 }
   
   let magic = r32(hdr)
   if magic != QOBJ_MAGIC { file_close(fd); return 0 }
   
   let fn_count = r32(hdr + 8)
   let ir_count = r32(hdr + 12)
+  let total_str_bytes = r32(hdr + 16)
   
-  // Read IR records first
+  // Read function entries
+  let fn_buf = mmap(fn_count * 32)
+  if fn_count > 0 {
+    file_read(fd, fn_buf, fn_count * 32)
+  }
+  
+  // Read string blob
+  let str_blob = mmap(total_str_bytes)
+  if total_str_bytes > 0 {
+    file_read(fd, str_blob, total_str_bytes)
+  }
+  
+  // Read IR records
   let imported_ir = mmap(ir_count * 40)
   if ir_count > 0 {
     file_read(fd, imported_ir, ir_count * 40)
   }
   
-  // Read functions and register them
+  // Register functions
   let i = 0
   while i < fn_count {
-    // Read name
-    let nl_buf = mmap(8)
-    file_read(fd, nl_buf, 8)
-    let name_len = r64(nl_buf)
+    let name_off = r32(fn_buf + i*32)
+    let name_len = r32(fn_buf + i*32 + 4)
+    let param_c = r32(fn_buf + i*32 + 8)
+    let ret_off = r32(fn_buf + i*32 + 12)
+    let ret_len = r32(fn_buf + i*32 + 16)
+    let ir_start = r32(fn_buf + i*32 + 20)
+    let ir_count_fn = r32(fn_buf + i*32 + 24)
     
+    // Copy name to current strtab
     let name_ptr = strtab + strtablen
-    if name_len > 0 {
-      let name_buf = mmap(name_len)
-      file_read(fd, name_buf, name_len)
-      let j = 0
-      while j < name_len {
-        w8(strtab + strtablen + j, r8(name_buf + j))
-        j = j + 1
-      }
+    let j = 0
+    while j < name_len {
+      w8(strtab + strtablen + j, r8(str_blob + name_off + j))
+      j = j + 1
     }
     w8(strtab + strtablen + name_len, 0)
     strtablen = strtablen + name_len + 1
     
-    // Read param count
-    let pc_buf = mmap(8)
-    file_read(fd, pc_buf, 8)
-    let param_c = r64(pc_buf)
-    
-    // Read ret type
-    let rl_buf = mmap(8)
-    file_read(fd, rl_buf, 8)
-    let ret_len = r64(rl_buf)
-    
+    // Copy ret type to current strtab
     let ret_ptr = strtab + strtablen
-    if ret_len > 0 {
-      let ret_buf = mmap(ret_len)
-      file_read(fd, ret_buf, ret_len)
-      let j = 0
-      while j < ret_len {
-        w8(strtab + strtablen + j, r8(ret_buf + j))
-        j = j + 1
-      }
+    j = 0
+    while j < ret_len {
+      w8(strtab + strtablen + j, r8(str_blob + ret_off + j))
+      j = j + 1
     }
     w8(strtab + strtablen + ret_len, 0)
     strtablen = strtablen + ret_len + 1
     
-    // Read IR location
-    let irs_buf = mmap(8)
-    file_read(fd, irs_buf, 8)
-    let ir_start = r64(irs_buf)
-    
-    let ir_cnt_buf = mmap(8)
-    file_read(fd, ir_cnt_buf, 8)
-    let ir_count_fn = r64(ir_cnt_buf)
-    
-    // Register function with IR
+    // Register function
     let new_fi = fnc
     sfn(fnc, name_ptr, name_len, 0, 0, param_c, ret_ptr, ret_len)
     w64(fn_is_imported + fnc*8, 1)
@@ -185,7 +182,7 @@ fn qobj_import(qobj_path) -> i64 {
       w64(fn_ir_start + fnc*8, irc)
       w64(fn_ir_count + fnc*8, ir_count_fn)
       
-      let j = 0
+      j = 0
       while j < ir_count_fn {
         let src_ir = imported_ir + (ir_start + j) * 40
         let dst_ir = irc
