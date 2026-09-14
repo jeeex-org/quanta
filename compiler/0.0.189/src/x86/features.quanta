@@ -276,7 +276,13 @@ fn findfn(nm,nl) {
     while i<fnc {
         if fn_nlen(i)==nl {
             let ok=1; let j=0
-            while j<nl { if r8(src+fn_name(i)+j)!=r8(src+nm+j) { ok=0; break }; j=j+1 }
+            // Phase 2: handle imported functions (name in strtab, not src)
+            if r64(fn_is_imported + i*8) == 1 {
+                let name_ptr = fn_name(i)  // strtab pointer for imported
+                while j<nl { if r8(name_ptr+j)!=r8(src+nm+j) { ok=0; break }; j=j+1 }
+            } else {
+                while j<nl { if r8(src+fn_name(i)+j)!=r8(src+nm+j) { ok=0; break }; j=j+1 }
+            }
             if ok { return i }
         }
         i=i+1
