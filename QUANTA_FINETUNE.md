@@ -2,7 +2,68 @@
 
 ## Executive Summary
 
-QUANTA-4B is a 7.5B parameter language model (Q4_K_M quantized) currently trained on general code. To enable autonomous Self-Improvement (SI) in Quanta, the model must be fine-tuned on Quanta's specific syntax, builtins, and idioms. This document specifies the complete fine-tuning pipeline.
+QUANTA-4B is a 7.5B parameter language model (Q4_K_M quantized) currently trained on general code. To enable autonomous Self-Improvement (SI) in Quanta, the model needs Quanta-specific syntax, builtins, and idioms. This document specifies both the **fine-tuning pipeline** and the **RAG alternative**, with an honest tradeoff analysis.
+
+---
+
+## 0. Architecture Decision: RAG vs Fine-Tuning
+
+### Option A: RAG (Retrieval-Augmented Generation) — Works Now
+
+**How it works:**
+1. Given a gap spec (domain, category, module, notes)
+2. Retrieve 5-10 relevant `.quanta` examples from `lib/std/`
+3. Stuff them into the 16K context window as few-shot examples
+4. Model imitates the syntax patterns from examples
+5. Generate code → compile with `qc` → test → commit if green
+
+**Pros:**
+- Zero training cost — works immediately with current QUANTA-4B
+- Always uses latest stdlib examples (no stale weights)
+- Domain-specific retrieval (accounting examples for accounting specs)
+- `qc` compiler is the real gate — catches syntax AND semantic errors
+
+**Cons:**
+- Context window overhead (examples consume tokens)
+- Retrieval quality depends on embedding similarity
+- May still produce non-Quanta idioms without enough examples
+
+### Option B: Fine-Tuning — Bakes Syntax Into Weights
+
+**How it works:**
+1. Fine-tune QUANTA-4B on ~128K lines of Quanta source
+2. Model learns Quanta syntax permanently
+3. Generate code without retrieval examples
+4. Compile with `qc` → test → commit if green
+
+**Pros:**
+- No retrieval overhead at inference time
+- Consistent syntax without needing examples
+- Faster inference (no embedding search)
+
+**Cons:**
+- Training cost: 4-48 hours on GPU/CPU
+- Weights can become stale as Quanta evolves
+- Risk of catastrophic forgetting on general code
+- Requires retraining when language changes
+
+### Option C: Hybrid (Recommended)
+
+**Fine-tuned base + RAG for domain knowledge:**
+1. Fine-tune on core Quanta syntax (compiler + core stdlib)
+2. Use RAG for domain-specific patterns (accounting, quantum, etc.)
+3. Best of both worlds: baked syntax + fresh domain examples
+
+### The Key Insight
+
+**`qc` (the Quanta compiler) is the real gate — regardless of approach.**
+
+- Fine-tuning improves **syntax fidelity** (fewer compile errors)
+- Fine-tuning does NOT improve **semantic correctness** (logic bugs still compile)
+- RAG improves **domain relevance** (right patterns for the domain)
+- Only `qc` + tests catch semantic errors
+
+**Recommendation:** Start with RAG (Option A) for immediate results. Fine-tune (Option B) only if RAG's compile rate stays below 80% after prompt engineering.
 
 ---
 
