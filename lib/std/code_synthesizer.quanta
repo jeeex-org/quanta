@@ -1,12 +1,19 @@
-// std/code_synthesizer.quanta - Phase 2: Real Code Synthesis (0.0.177)
-// Generates working implementations from gap specs using pattern library
+// std/code_synthesizer.quanta - Phase 2: Code Synthesis
+// Generates Quanta module files from gap_specs.json
 
 module std_code_synthesizer;
 
-import std/pattern_library
-import std/chain_utxo_set
+import std/str
+import std/vec
+import std/map
+import std/fs
 
 const SYNTH_CAP = 10000;
+
+// Pattern registry
+let pattern_names = mmap(1024 * 8);
+let pattern_types = mmap(1024 * 8);
+let pattern_count = 0;
 
 fn sanitize_ident(name) {
     let len_n = len(name);
@@ -25,8 +32,35 @@ fn sanitize_ident(name) {
     return out;
 }
 
-// Emit real UTXO transaction validation implementation
-fn emit_chain_tx_validation(domain, category, module) -> i64 {
+fn register_pattern(name, ty) -> i64 {
+    if pattern_count >= 1024 { return 0; }
+    let name_copy = mem_alloc(len(name) + 9);
+    mem_store(name_copy, len(name));
+    let i = 0;
+    while i < len(name) {
+        mem_store8(name_copy + 8 + i, mem_load8(name + 8 + i));
+        i = i + 1;
+    }
+    mem_store(pattern_names + pattern_count * 8, name_copy);
+    mem_store(pattern_types + pattern_count * 8, ty);
+    pattern_count = pattern_count + 1;
+    return 1;
+}
+
+fn init_pattern_library() -> i64 {
+    register_pattern("accounting_gaap", 1);
+    register_pattern("accounting_ifrs", 1);
+    register_pattern("accounting_tax", 2);
+    register_pattern("chain_tx", 1);
+    register_pattern("chain_block", 1);
+    register_pattern("quantum_qft", 2);
+    register_pattern("ai_rope", 2);
+    register_pattern("math_linalg", 2);
+    register_pattern("crypto_aes_gcm", 2);
+    return pattern_count;
+}
+
+fn emit_quanta_module(domain, category, module) -> i64 {
     let clean_domain = sanitize_ident(domain);
     let clean_category = sanitize_ident(category);
     let clean_module = sanitize_ident(module);
@@ -36,177 +70,6 @@ fn emit_chain_tx_validation(domain, category, module) -> i64 {
     let i = 0;
     while i < len(base) { mem_store8(out_path + i, mem_load8(base + 8 + i)); i = i + 1; }
     let j = 0;
-    while j < len(clean_domain) { mem_store8(out_path + i + j, mem_load8(clean_domain + 8 + j)); j = j + 1; }
-    i = i + j;
-    mem_store8(out_path + i, 95); i = i + 1;
-    j = 0;
-    while j < len(clean_category) { mem_store8(out_path + i + j, mem_load8(clean_category + 8 + j)); j = j + 1; }
-    i = i + j;
-    mem_store8(out_path + i, 95); i = i + 1;
-    j = 0;
-    while j < len(clean_module) { mem_store8(out_path + i + j, mem_load8(clean_module + 8 + j)); j = j + 1; }
-    i = i + j;
-    let ext = ".quanta";
-    j = 0;
-    while j < len(ext) { mem_store8(out_path + i + j, mem_load8(ext + 8 + j)); j = j + 1; }
-    i = i + j;
-    mem_store8(out_path + i, 0);
-
-    let fd = file_open(out_path, 577);
-    if fd < 0 { return 0; }
-
-    // module header
-    file_write(fd, "module std_", len("module std_"));
-    file_write(fd, clean_domain, len(clean_domain));
-    file_write(fd, "_", 1);
-    file_write(fd, clean_category, len(clean_category));
-    file_write(fd, "_", 1);
-    file_write(fd, clean_module, len(clean_module));
-    file_write(fd, ";\n\n", 2);
-
-    // imports
-    file_write(fd, "import std/sha3_hash\n", len("import std/sha3_hash\n"));
-    file_write(fd, "import std_chain_utxo_set\n\n", len("import std_chain_utxo_set\n\n"));
-
-    // const
-    file_write(fd, "const TX_HASH_LEN = 32\n", len("const TX_HASH_LEN = 32\n"));
-    file_write(fd, "const ADDR_LEN = 32\n", len("const ADDR_LEN = 32\n"));
-    file_write(fd, "const MAX_INPUTS = 256\n", len("const MAX_INPUTS = 256\n"));
-    file_write(fd, "const MAX_OUTPUTS = 256\n\n", len("const MAX_OUTPUTS = 256\n\n"));
-
-    // tx_hash_equals function
-    file_write(fd, "fn tx_hash_equals(h1: i64, h2: i64): i64 {\n", len("fn tx_hash_equals(h1: i64, h2: i64): i64 {\n"));
-    file_write(fd, "    let i: i64 = 0;\n", len("    let i: i64 = 0;\n"));
-    file_write(fd, "    while i < TX_HASH_LEN {\n", len("    while i < TX_HASH_LEN {\n"));
-    file_write(fd, "        if mem_load8(h1 + i) != mem_load8(h2 + i) { return 0; }\n", len("        if mem_load8(h1 + i) != mem_load8(h2 + i) { return 0; }\n"));
-    file_write(fd, "        i = i + 1;\n", len("        i = i + 1;\n"));
-    file_write(fd, "    }\n", len("    }\n"));
-    file_write(fd, "    return 1;\n", len("    return 1;\n"));
-    file_write(fd, "}\n\n", len("}\n\n"));
-
-    // validate_tx function
-    file_write(fd, "fn validate_tx(tx_inputs: i64, tx_outputs: i64, utxo_set: i64, utxo_count: i64): i64 {\n", len("fn validate_tx(tx_inputs: i64, tx_outputs: i64, utxo_set: i64, utxo_count: i64): i64 {\n"));
-    file_write(fd, "    // Sum input amounts from UTXO set\n", len("    // Sum input amounts from UTXO set\n"));
-    file_write(fd, "    let total_in: i64 = 0;\n", len("    let total_in: i64 = 0;\n"));
-    file_write(fd, "    let inp_idx: i64 = 0;\n", len("    let inp_idx: i64 = 0;\n"));
-    file_write(fd, "    while inp_idx < MAX_INPUTS {\n", len("    while inp_idx < MAX_INPUTS {\n"));
-    file_write(fd, "        let in_offset = tx_inputs + inp_idx * (TX_HASH_LEN + 8 + ADDR_LEN + 8);\n", len("        let in_offset = tx_inputs + inp_idx * (TX_HASH_LEN + 8 + ADDR_LEN + 8);\n"));
-    file_write(fd, "        let tx_hash_ptr = in_offset;\n", len("        let tx_hash_ptr = in_offset;\n"));
-    file_write(fd, "        let out_idx_ptr = in_offset + TX_HASH_LEN;\n", len("        let out_idx_ptr = in_offset + TX_HASH_LEN;\n"));
-    file_write(fd, "        let addr_ptr = in_offset + TX_HASH_LEN + 8;\n", len("        let addr_ptr = in_offset + TX_HASH_LEN + 8;\n"));
-    file_write(fd, "        let amount_ptr = in_offset + TX_HASH_LEN + 8 + ADDR_LEN;\n\n", len("        let amount_ptr = in_offset + TX_HASH_LEN + 8 + ADDR_LEN;\n\n"));
-
-    file_write(fd, "        // Find matching UTXO\n", len("        // Find matching UTXO\n"));
-    file_write(fd, "        let u: i64 = 0;\n", len("        let u: i64 = 0;\n"));
-    file_write(fd, "        let found: i64 = 0;\n", len("        let found: i64 = 0;\n"));
-    file_write(fd, "        while u < utxo_count {\n", len("        while u < utxo_count {\n"));
-    file_write(fd, "            let utxo_off = u * 81;\n", len("            let utxo_off = u * 81;\n"));
-    file_write(fd, "            if tx_hash_equals(utxo_set + utxo_off, tx_hash_ptr) == 1 {\n", len("            if tx_hash_equals(utxo_set + utxo_off, tx_hash_ptr) == 1 {\n"));
-    file_write(fd, "                let stored_out = mem_load(utxo_set + utxo_off + 32);\n", len("                let stored_out = mem_load(utxo_set + utxo_off + 32);\n"));
-    file_write(fd, "                if stored_out == mem_load(out_idx_ptr) {\n", len("                if stored_out == mem_load(out_idx_ptr) {\n"));
-    file_write(fd, "                    let spent = mem_load8(utxo_set + utxo_off + 80);\n", len("                    let spent = mem_load8(utxo_set + utxo_off + 80);\n"));
-    file_write(fd, "                    if spent == 0 {\n", len("                    if spent == 0 {\n"));
-    file_write(fd, "                        total_in = total_in + mem_load(amount_ptr);\n", len("                        total_in = total_in + mem_load(amount_ptr);\n"));
-    file_write(fd, "                        found = 1;\n", len("                        found = 1;\n"));
-    file_write(fd, "                    }\n", len("                    }\n"));
-    file_write(fd, "                }\n", len("                }\n"));
-    file_write(fd, "            }\n", len("            }\n"));
-    file_write(fd, "            u = u + 1;\n", len("            u = u + 1;\n"));
-    file_write(fd, "        }\n", len("        }\n"));
-    file_write(fd, "        if found == 0 { return 0; }\n", len("        if found == 0 { return 0; }\n"));
-    file_write(fd, "        inp_idx = inp_idx + 1;\n", len("        inp_idx = inp_idx + 1;\n"));
-    file_write(fd, "    }\n\n", len("    }\n\n"));
-
-    file_write(fd, "    // Sum output amounts\n", len("    // Sum output amounts\n"));
-    file_write(fd, "    let total_out: i64 = 0;\n", len("    let total_out: i64 = 0;\n"));
-    file_write(fd, "    let out_idx: i64 = 0;\n", len("    let out_idx: i64 = 0;\n"));
-    file_write(fd, "    while out_idx < MAX_OUTPUTS {\n", len("    while out_idx < MAX_OUTPUTS {\n"));
-    file_write(fd, "        let out_amount = mem_load(tx_outputs + out_idx * 8);\n", len("        let out_amount = mem_load(tx_outputs + out_idx * 8);\n"));
-    file_write(fd, "        if out_amount > 0 { total_out = total_out + out_amount; }\n", len("        if out_amount > 0 { total_out = total_out + out_amount; }\n"));
-    file_write(fd, "        out_idx = out_idx + 1;\n", len("        out_idx = out_idx + 1;\n"));
-    file_write(fd, "    }\n\n", len("    }\n\n"));
-
-    file_write(fd, "    // Conservation: inputs >= outputs (fees)\n", len("    // Conservation: inputs >= outputs (fees)\n"));
-    file_write(fd, "    if total_in < total_out { return 0; }\n", len("    if total_in < total_out { return 0; }\n"));
-    file_write(fd, "    return 1;\n", len("    return 1;\n"));
-    file_write(fd, "}\n\n", len("}\n\n"));
-
-    // apply_tx function
-    file_write(fd, "fn apply_tx(tx_inputs: i64, tx_outputs: i64, utxo_set: i64, utxo_count: i64): i64 {\n", len("fn apply_tx(tx_inputs: i64, tx_outputs: i64, utxo_set: i64, utxo_count: i64): i64 {\n"));
-    file_write(fd, "    // Mark inputs as spent\n", len("    // Mark inputs as spent\n"));
-    file_write(fd, "    let inp_idx: i64 = 0;\n", len("    let inp_idx: i64 = 0;\n"));
-    file_write(fd, "    while inp_idx < MAX_INPUTS {\n", len("    while inp_idx < MAX_INPUTS {\n"));
-    file_write(fd, "        let in_offset = tx_inputs + inp_idx * (TX_HASH_LEN + 8 + ADDR_LEN + 8);\n", len("        let in_offset = tx_inputs + inp_idx * (TX_HASH_LEN + 8 + ADDR_LEN + 8);\n"));
-    file_write(fd, "        let tx_hash_ptr = in_offset;\n", len("        let tx_hash_ptr = in_offset;\n"));
-    file_write(fd, "        let out_idx_ptr = in_offset + TX_HASH_LEN;\n\n", len("        let out_idx_ptr = in_offset + TX_HASH_LEN;\n\n"));
-    file_write(fd, "        let u: i64 = 0;\n", len("        let u: i64 = 0;\n"));
-    file_write(fd, "        while u < utxo_count {\n", len("        while u < utxo_count {\n"));
-    file_write(fd, "            let utxo_off = u * 81;\n", len("            let utxo_off = u * 81;\n"));
-    file_write(fd, "            if tx_hash_equals(utxo_set + utxo_off, tx_hash_ptr) == 1 {\n", len("            if tx_hash_equals(utxo_set + utxo_off, tx_hash_ptr) == 1 {\n"));
-    file_write(fd, "                let stored_out = mem_load(utxo_set + utxo_off + 32);\n", len("                let stored_out = mem_load(utxo_set + utxo_off + 32);\n"));
-    file_write(fd, "                if stored_out == mem_load(out_idx_ptr) {\n", len("                if stored_out == mem_load(out_idx_ptr) {\n"));
-    file_write(fd, "                    mem_store8(utxo_set + utxo_off + 80, 1); // mark spent\n", len("                    mem_store8(utxo_set + utxo_off + 80, 1); // mark spent\n"));
-    file_write(fd, "                }\n", len("                }\n"));
-    file_write(fd, "            }\n", len("            }\n"));
-    file_write(fd, "            u = u + 1;\n", len("            u = u + 1;\n"));
-    file_write(fd, "        }\n", len("        }\n"));
-    file_write(fd, "        inp_idx = inp_idx + 1;\n", len("        inp_idx = inp_idx + 1;\n"));
-    file_write(fd, "    }\n\n", len("    }\n\n"));
-
-    file_write(fd,    // Add outputs as new UTXOs
-    file_write(fd, "    let new_count = utxo_count;\n", len("    let new_count = utxo_count;\n"));
-    file_write(fd, "    let out_idx: i64 = 0;\n", len("    let out_idx: i64 = 0;\n"));
-    file_write(fd, "    while out_idx < MAX_OUTPUTS {\n", len("    while out_idx < MAX_OUTPUTS {\n"));
-    file_write(fd, "        let out_amount = mem_load(tx_outputs + out_idx * 8);\n", len("        let out_amount = mem_load(tx_outputs + out_idx * 8);\n"));
-    file_write(fd, "        if out_amount > 0 {\n", len("        if out_amount > 0 {\n"));
-    file_write(fd, "            // Compute output hash = sha3(prev_hash || out_idx)\n", len("            let out_hash = mmap(TX_HASH_LEN);\n"));
-    file_write(fd, "            let i: i64 = 0;\n", len("            let i: i64 = 0;\n"));
-    file_write(fd, "            while i < TX_HASH_LEN { mem_store8(out_hash + i, mem_load8(tx_inputs + i)); i = i + 1; }\n", len("            while i < TX_HASH_LEN { mem_store8(out_hash + i, mem_load8(tx_inputs + i)); i = i + 1; }\n"));
-    file_write(fd, "            let out_idx_bytes = mmap(8);\n", len("            let out_idx_bytes = mmap(8);\n"));
-    file_write(fd, "            mem_store(out_idx_bytes, out_idx);\n", len("            mem_store(out_idx_bytes, out_idx);\n"));
-    file_write(fd, "            i = 0;\n", len("            i = 0;\n"));
-    file_write(fd, "            while i < 8 { mem_store8(out_hash + TX_HASH_LEN + i, mem_load8(out_idx_bytes + i)); i = i + 1; }\n", len("            while i < 8 { mem_store8(out_hash + TX_HASH_LEN + i, mem_load8(out_idx_bytes + i)); i = i + 1; }\n"));
-    file_write(fd, "            // Note: sha3 would go here; simplified for now\n", len("            // Note: sha3 would go here; simplified for now\n"));
-    file_write(fd, "            new_count = utxo_add(utxo_set, new_count, out_hash, out_idx, 0, out_amount);\n", len("            new_count = utxo_add(utxo_set, new_count, out_hash, out_idx, 0, out_amount);\n"));
-    file_write(fd, "        }\n", len("        }\n"));
-    file_write(fd, "        out_idx = out_idx + 1;\n", len("        out_idx = out_idx + 1;\n"));
-    file_write(fd, "    }\n", len("    }\n"));
-    file_write(fd, "    return new_count;\n", len("    return new_count;\n"));
-    file_write(fd, "}\n\n", len("}\n\n"));
-
-    // init and main
-    file_write(fd, "fn init() -> i64 { return 0; }\n\n", len("fn init() -> i64 { return 0; }\n\n"));
-    file_write(fd, "fn main() -> i64 { return init(); }\n", len("fn main() -> i64 { return init(); }\n"));
-
-    file_close(fd);
-    return 1;
-}
-
-fn emit_quanta_module(domain, category, module) -> i64 {
-    // Check for chain/transaction domain
-    let c0 = mem_load8(domain + 0);
-    if c0 == 99 { // 'c' for chain
-        let c1 = mem_load8(domain + 1);
-        let c2 = mem_load8(domain + 2);
-        let c3 = mem_load8(domain + 3);
-        let c4 = mem_load8(domain + 4);
-        if c1==104 && c2==97 && c3==105 && c4==110 { // "chain"
-            if mem_load8(category + 0) == 116 && mem_load8(category + 1) == 120 { // "tx"
-                return emit_chain_tx_validation(domain, category, module);
-            }
-        }
-    }
-
-    // Fallback: boilerplate
-    let clean_domain = sanitize_ident(domain);
-    let clean_category = sanitize_ident(category);
-    let clean_module = sanitize_ident(module);
-
-    let out_path = mmap(512);
-    let base = "lib/std/";
-    let i = 0;
-    while i < len(base) { mem_store8(out_path + i, mem_load8(base + 8 + i)); i = i + 1; }
-    j = 0;
     while j < len(clean_domain) { mem_store8(out_path + i + j, mem_load8(clean_domain + 8 + j)); j = j + 1; }
     i = i + j;
     mem_store8(out_path + i, 95); i = i + 1;
@@ -240,84 +103,131 @@ fn emit_quanta_module(domain, category, module) -> i64 {
     return 1;
 }
 
-fn synthesize_priority(specs_path) -> i64 {
+// Simple JSON parser: extract all "domain", "category", "module" triplets
+// by scanning for the key names and extracting the following quoted value
+fn synthesize_all(specs_path) -> i64 {
+    let pat_count = init_pattern_library();
+    prints("Pattern library initialized: "); printi(pat_count); prints(" patterns\n");
+
     let fd = file_open(specs_path, 0);
     if fd < 0 { return 0; }
-    let buf = mmap(16777216);
-    let n = file_read(fd, buf, 16777216);
+    let buf = mmap(2097152);
+    let n = file_read(fd, buf + 8, 16777216);
     file_close(fd);
     if n <= 0 { return 0; }
+    mem_store(buf, n);
 
     let i = 0;
-    while i < n && buf[i] != 91 { i = i + 1 }
-    i = i + 1;
-    let count = 0;
+    let generated = 0;
+    
     while i < n {
-        while i < n && (buf[i] == 32 || buf[i] == 10 || buf[i] == 9) { i = i + 1 }
-        if i >= n || buf[i] == 93 { break }
-        if buf[i] != 123 { break }
-        i = i + 1;
-        let domain_val = 0;
-        let cat_val = 0;
-        let mod_val = 0;
-        while i < n && buf[i] != 125 {
-            while i < n && (buf[i] == 32 || buf[i] == 10 || buf[i] == 9) { i = i + 1 }
-            if i >= n || buf[i] == 125 { break }
-            if buf[i] != 34 { break }
-            i = i + 1;
-            let key_start = i;
-            while i < n && buf[i] != 34 { i = i + 1 }
-            let key_len = i - key_start;
-            let key = mmap(key_len + 1);
-            let k = 0;
-            while k < key_len { mem_store8(key + k, buf[key_start + k]); k = k + 1 }
-            mem_store8(key + key_len, 0);
-            i = i + 1;
-            while i < n && (buf[i] == 32 || buf[i] == 9) { i = i + 1 }
-            if i < n && buf[i] == 58 { i = i + 1 }
-            while i < n && (buf[i] == 32 || buf[i] == 9) { i = i + 1 }
-            if i >= n { break }
-            let val = 0;
-            let val_len = 0;
-            if buf[i] == 34 {
-                i = i + 1;
-                let val_start = i;
-                while i < n && buf[i] != 34 { i = i + 1 }
-                val_len = i - val_start;
-                val = mmap(val_len + 1);
-                let k = 0;
-                while k < val_len { mem_store8(val + k, buf[val_start + k]); k = k + 1 }
-                mem_store8(val + val_len, 0);
-                i = i + 1;
-            } else {
-                let val_start = i;
-                while i < n && buf[i] != 44 && buf[i] != 125 { i = i + 1 }
-                val_len = i - val_start;
-                val = mmap(val_len + 1);
-                let k = 0;
-                while k < val_len { mem_store8(val + k, buf[val_start + k]); k = k + 1 }
-                mem_store8(val + val_len, 0);
+        // Scan for "domain" key
+        let found = 0;
+        while i < n - 10 {
+            if mem_load8(buf + 8 + i) == 34 && 
+               mem_load8(buf + 8 + i + 1) == 100 &&  // d
+               mem_load8(buf + 8 + i + 2) == 111 &&  // o
+               mem_load8(buf + 8 + i + 3) == 109 &&  // m
+               mem_load8(buf + 8 + i + 4) == 97 &&   // a
+               mem_load8(buf + 8 + i + 5) == 105 &&  // i
+               mem_load8(buf + 8 + i + 6) == 110 &&  // n
+               mem_load8(buf + 8 + i + 7) == 34 {    // "
+                found = 1;
+                i = i + 8;
+                break;
             }
-            let k0 = mem_load8(key + 0);
-            if k0 == 100 { domain_val = val; }
-            else if k0 == 99 { cat_val = val; }
-            else if k0 == 109 { mod_val = val; }
-            while i < n && (buf[i] == 32 || buf[i] == 9) { i = i + 1 }
-            if i < n && buf[i] == 44 { i = i + 1 }
+            i = i + 1;
         }
-        if i < n && buf[i] == 125 { i = i + 1 }
-        if domain_val != 0 && cat_val != 0 && mod_val != 0 {
-            emit_quanta_module(domain_val, cat_val, mod_val);
-            count = count + 1;
+        if found == 0 { break; }
+        
+        // Skip to value
+        while i < n && mem_load8(buf + 8 + i) != 34 { i = i + 1; }
+        if i >= n { break; }
+        i = i + 1;
+        let domain_start = i;
+        while i < n && mem_load8(buf + 8 + i) != 34 { i = i + 1; }
+        let domain_len = i - domain_start;
+        
+        // Now look for "category" key
+        found = 0;
+        while i < n - 12 {
+            if mem_load8(buf + 8 + i) == 34 && 
+               mem_load8(buf + 8 + i + 1) == 99 &&   // c
+               mem_load8(buf + 8 + i + 2) == 97 &&   // a
+               mem_load8(buf + 8 + i + 3) == 116 &&  // t
+               mem_load8(buf + 8 + i + 4) == 101 &&  // e
+               mem_load8(buf + 8 + i + 5) == 103 &&  // g
+               mem_load8(buf + 8 + i + 6) == 111 &&  // o
+               mem_load8(buf + 8 + i + 7) == 114 &&  // r
+               mem_load8(buf + 8 + i + 8) == 121 &&  // y
+               mem_load8(buf + 8 + i + 9) == 34 {    // "
+                found = 1;
+                i = i + 10;
+                break;
+            }
+            i = i + 1;
         }
-        while i < n && (buf[i] == 32 || buf[i] == 10 || buf[i] == 9) { i = i + 1 }
-        if i < n && buf[i] == 44 { i = i + 1 }
+        if found == 0 { break; }
+        
+        // Skip to value
+        while i < n && mem_load8(buf + 8 + i) != 34 { i = i + 1; }
+        if i >= n { break; }
+        i = i + 1;
+        let cat_start = i;
+        while i < n && mem_load8(buf + 8 + i) != 34 { i = i + 1; }
+        let cat_len = i - cat_start;
+        
+        // Now look for "module" key
+        found = 0;
+        while i < n - 10 {
+            if mem_load8(buf + 8 + i) == 34 && 
+               mem_load8(buf + 8 + i + 1) == 109 &&  // m
+               mem_load8(buf + 8 + i + 2) == 111 &&  // o
+               mem_load8(buf + 8 + i + 3) == 100 &&  // d
+               mem_load8(buf + 8 + i + 4) == 117 &&  // u
+               mem_load8(buf + 8 + i + 5) == 108 &&  // l
+               mem_load8(buf + 8 + i + 6) == 101 &&  // e
+               mem_load8(buf + 8 + i + 7) == 34 {    // "
+                found = 1;
+                i = i + 8;
+                break;
+            }
+            i = i + 1;
+        }
+        if found == 0 { break; }
+        
+        // Skip to value
+        while i < n && mem_load8(buf + 8 + i) != 34 { i = i + 1; }
+        if i >= n { break; }
+        i = i + 1;
+        let mod_start = i;
+        while i < n && mem_load8(buf + 8 + i) != 34 { i = i + 1; }
+        let mod_len = i - mod_start;
+        
+        // Create Quanta strings for domain, category, module
+        let domain_str = mmap(domain_len + 9);
+        mem_store(domain_str, domain_len);
+        let di = 0;
+        while di < domain_len { mem_store8(domain_str + 8 + di, mem_load8(buf + 8 + domain_start + di)); di = di + 1; }
+        mem_store8(domain_str + 8 + domain_len, 0);
+        
+        let cat_str = mmap(cat_len + 9);
+        mem_store(cat_str, cat_len);
+        let ci = 0;
+        while ci < cat_len { mem_store8(cat_str + 8 + ci, mem_load8(buf + 8 + cat_start + ci)); ci = ci + 1; }
+        mem_store8(cat_str + 8 + cat_len, 0);
+        
+        let mod_str = mmap(mod_len + 9);
+        mem_store(mod_str, mod_len);
+        let mi = 0;
+        while mi < mod_len { mem_store8(mod_str + 8 + mi, mem_load8(buf + 8 + mod_start + mi)); mi = mi + 1; }
+        mem_store8(mod_str + 8 + mod_len, 0);
+        
+        let result = emit_quanta_module(domain_str, cat_str, mod_str);
+        if result != 0 { generated = generated + 1; }
     }
-    return count;
-}
-
-fn synthesize_all(specs_path) -> i64 {
-    return synthesize_priority(specs_path);
+    
+    return generated;
 }
 
 fn init() -> i64 { return 0; }
@@ -325,6 +235,6 @@ fn init() -> i64 { return 0; }
 fn main() -> i64 {
     prints("Code synthesizer running...\n");
     let count = synthesize_all("gap_specs.json");
-    prints("Generated modules: ");
+    prints("Generated modules: "); printi(count); prints("\n");
     return 0;
 }

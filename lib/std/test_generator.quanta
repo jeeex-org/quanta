@@ -3,11 +3,11 @@
 
 module std_test_generator;
 
+import std/json
 import std/str
 import std/vec
 import std/map
 import std/fs
-import std/json
 
 const TEST_CAP = 10000;
 
@@ -77,23 +77,21 @@ fn generate_const_test(domain, category, module) -> i64 {
     let fd = file_open(path, 577);
     if fd < 0 { return 0; }
     
-    let header = "// Auto-generated const test for std_";
-    file_write(fd, header + 8, mem_load(header));
+    // Write header
+    file_write(fd, "// Auto-generated const test for std_", 37);
     file_write(fd, domain + 8, len(domain));
     file_write(fd, "_", 1);
     file_write(fd, category + 8, len(category));
     file_write(fd, "_", 1);
     file_write(fd, module + 8, len(module));
-    let import_str = "\nimport std/";
-    file_write(fd, import_str + 8, mem_load(import_str));
+    file_write(fd, "\nimport std/", 11);
     file_write(fd, domain + 8, len(domain));
     file_write(fd, "_", 1);
     file_write(fd, category + 8, len(category));
     file_write(fd, "_", 1);
     file_write(fd, module + 8, len(module));
-    let footer = "\nfn main() {\n    return 0\n}\n";
-    file_write(fd, footer + 8, mem_load(footer));
-
+    file_write(fd, "\nfn main() {\n    return 0\n}\n", 30);
+    
     file_close(fd);
     return 1;
 }
@@ -114,13 +112,13 @@ fn generate_all(specs_path) -> i64 {
     if parsed < 0 { return 0; }
     
     let typ = json_get_type(parsed);
-    if typ != 5 { return 0; }
+    if typ != 5 { return 0; }  // JSON_OBJECT = 5
     
     let obj = json_get_object(parsed);
     let specs = json_object_get(obj, "specs");
-    if specs < 0 { return 0; }
+    if specs == 0 { return 0; }
     let specs_typ = json_get_type(specs);
-    if specs_typ != 4 { return 0; }
+    if specs_typ != 4 { return 0; }  // JSON_ARRAY = 4
     
     let arr = json_get_array(specs);
     let count = json_array_len(arr);
@@ -129,19 +127,20 @@ fn generate_all(specs_path) -> i64 {
     let generated = 0;
     while i < count {
         let spec_val = json_array_get(arr, i);
-        if spec_val >= 0 {
+        if spec_val != 0 {
             let spec_obj = json_get_object(spec_val);
             if spec_obj != 0 {
-                // json_object_get returns value pointers, need json_get_string to extract actual strings
                 let domain_val = json_object_get(spec_obj, "domain");
                 let category_val = json_object_get(spec_obj, "category");
                 let module_val = json_object_get(spec_obj, "module");
                 
+                // json_get_string returns the Quanta string pointer (8-byte len header + data)
                 let domain = json_get_string(domain_val);
                 let category = json_get_string(category_val);
                 let module = json_get_string(module_val);
                 
-                if domain >= 0 && category >= 0 && module >= 0 {
+                // Check that we got valid pointers (non-zero)
+                if domain != 0 && category != 0 && module != 0 {
                     let result = generate_const_test(domain, category, module);
                     if result != 0 { generated = generated + 1; }
                 }
