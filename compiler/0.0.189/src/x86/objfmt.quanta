@@ -579,81 +579,153 @@ fn imp_try_one(name, nl, pfx, pl, use_ext) {
 fn imp_load(fd, depth) {     // read fd into depth buffer, dedup, recurse-expand
   if imp_already()==0 {
     w64(imp_seen + imp_seenc*8, imp_hash()); if imp_seenc >= IMPSEEN_CAP { emit_ovf() }; imp_seenc=imp_seenc+1
-    let ib = impbufs + (depth%8)*16777216
-    let n = file_read(fd, ib, 16777216); file_close(fd)
-    if n>0 {
-      // QOBJ: check for pre-compiled module cache
-      // If .qobj exists, load symbols without re-tokenizing source
-      let qobj_path = mmap(4096)
-      let qobj_len = src_strlen(imp_full)
-      let k = 0
-      while k < qobj_len {
-        w8(qobj_path + k, r8(imp_full + k))
-        k = k + 1
-      }
-      // Append ".qobj" extension
-      w8(qobj_path + qobj_len, 46); w8(qobj_path + qobj_len + 1, 113); w8(qobj_path + qobj_len + 2, 111); w8(qobj_path + qobj_len + 3, 98); w8(qobj_path + qobj_len + 4, 106); w8(qobj_path + qobj_len + 5, 0)
-      let qobj_fd = file_open(qobj_path, 0)
-      if qobj_fd >= 0 {
-        file_close(qobj_fd)
-        // .qobj exists - load symbols from cache
-        qobj_import(qobj_path)
-      } else {
-        // No cache - fall back to textual inclusion
-        expand_includes(ib, n, depth+1)
+    
+    // QOBJ: check for pre-compiled module cache BEFORE tokenizing source
+    // Use .qobj cache in BOTH exec and object mode (like 0.0.188)
+    // .qobj files are named like lib/std/str.qobj (strip .quanta from source path)
+    let qobj_path = mmap(4096)
+    let qobj_len = src_strlen(imp_full)
+    let k = 0
+    while k < qobj_len {
+      w8(qobj_path + k, r8(imp_full + k))
+      k = k + 1
+    }
+    // Strip ".quanta" (7 chars) if present, then append ".qobj"
+    if qobj_len >= 7 {
+      let qext = 0
+      if r8(imp_full + qobj_len - 7) == 46 { qext = qext + 1 }
+      if r8(imp_full + qobj_len - 6) == 113 { qext = qext + 1 }
+      if r8(imp_full + qobj_len - 5) == 117 { qext = qext + 1 }
+      if r8(imp_full + qobj_len - 4) == 97 { qext = qext + 1 }
+      if r8(imp_full + qobj_len - 3) == 110 { qext = qext + 1 }
+      if r8(imp_full + qobj_len - 2) == 116 { qext = qext + 1 }
+      if r8(imp_full + qobj_len - 1) == 97 { qext = qext + 1 }
+      if qext == 7 {
+        qobj_len = qobj_len - 7
       }
     }
+    w8(qobj_path + qobj_len, 46); w8(qobj_path + qobj_len + 1, 113); w8(qobj_path + qobj_len + 2, 111); w8(qobj_path + qobj_len + 3, 98); w8(qobj_path + qobj_len + 4, 106); w8(qobj_path + qobj_len + 5, 0)
+    let qobj_fd = file_open(qobj_path, 0)
+    if qobj_fd >= 0 {
+      let qobj_hdr = mmap(20)
+      file_read(qobj_fd, qobj_hdr, 20)
+      let qobj_fn_count = r32(qobj_hdr + 8)
+      file_close(qobj_fd)
+      if qobj_fn_count > 0 {
+        file_close(fd)
+        qobj_import(qobj_path)
+        return
+      }
+    }
+    
+    // No cache - fall back to textual inclusion
+    let ib = impbufs + (depth%8)*16777216
+    let n = file_read(fd, ib, 16777216); file_close(fd)
+    if n>0 { expand_includes(ib, n, depth+1) }
   } else { file_close(fd) }
 }
 
-// QOBJ: Import symbols from pre-compiled module cache
-// Format: [4] magic "QOBJ" [4] version [4] sym_count [sym_count × 24] symbols [4] strtab_len [strtab_len] strtab
+// QOBJ: Import symbols from pre-compiled module cache (v6 format)
+// Format v6: [4] magic [4] version [4] fn_count [4] ir_count [4] total_str_bytes [fn_count*32] fn_entries [total_str_bytes] str_blob [ir_count*40] ir_records
 fn qobj_import(qobj_path) -> i64 {
   let fd = file_open(qobj_path, 0)
   if fd < 0 { return 0 }
   
-  // Read header
-  let hdr = mmap(12)
-  let n = file_read(fd, hdr, 12)
-  if n < 12 { file_close(fd); return 0 }
+  // Read header (20 bytes for v6)
+  let hdr = mmap(20)
+  let n = file_read(fd, hdr, 20)
+  if n < 20 { file_close(fd); return 0 }
   
   // Verify magic "QOBJ" = 0x514F424A
   let magic = r32(hdr)
   if magic != 0x514F424A { file_close(fd); return 0 }
   
-  // Read symbol count
-  let sym_count = r32(hdr + 8)
+  let version = r32(hdr + 4)
+  let fn_count = r32(hdr + 8)
+  let ir_count = r32(hdr + 12)
+  let total_str_bytes = r32(hdr + 16)
   
-  // Read symbols (24 bytes each) and add to current symtab
-  let sym_buf = mmap(sym_count * 24)
-  if sym_count > 0 {
-    file_read(fd, sym_buf, sym_count * 24)
-    let i = 0
-    while i < sym_count {
-      // Copy symbol to current symtab
-      let dst = symc + i
-      w32(symtab + dst * 24, r32(sym_buf + i * 24))
-      w32(symtab + dst * 24 + 4, r32(sym_buf + i * 24 + 4))
-      w64(symtab + dst * 24 + 8, r64(sym_buf + i * 24 + 8))
-      w64(symtab + dst * 24 + 16, r64(sym_buf + i * 24 + 16))
-      i = i + 1
-    }
-    symc = symc + sym_count
+  // Read function entries
+  let fn_buf = mmap(fn_count * 32)
+  if fn_count > 0 {
+    file_read(fd, fn_buf, fn_count * 32)
   }
   
-  // Read string table
-  let str_hdr = mmap(4)
-  file_read(fd, str_hdr, 4)
-  let strtab_len = r32(str_hdr)
-  if strtab_len > 0 {
-    let str_buf = mmap(strtab_len)
-    file_read(fd, str_buf, strtab_len)
+  // Read string blob
+  let str_blob = mmap(total_str_bytes)
+  if total_str_bytes > 0 {
+    file_read(fd, str_blob, total_str_bytes)
+  }
+  
+  // Read IR records (needed for exec mode inlining!)
+  let imported_ir = mmap(ir_count * 40)
+  if ir_count > 0 {
+    file_read(fd, imported_ir, ir_count * 40)
+  }
+  
+  // Register functions (names go into imported_names buffer, NOT src)
+  let i = 0
+  while i < fn_count {
+    let name_off = r32(fn_buf + i*32)
+    let name_len = r32(fn_buf + i*32 + 4)
+    let param_c = r32(fn_buf + i*32 + 8)
+    let ret_off = r32(fn_buf + i*32 + 12)
+    let ret_len = r32(fn_buf + i*32 + 16)
+    let ir_start = r32(fn_buf + i*32 + 20)
+    let ir_count_fn = r32(fn_buf + i*32 + 24)
+    // padding at +28
+    
+    // Write name to imported_names buffer (so imported_names+fn_name(i) works)
+    let name_imported_off = imported_names_len
     let j = 0
-    while j < strtab_len {
-      w8(strtab + strtablen + j, r8(str_buf + j))
+    while j < name_len {
+      w8(imported_names + imported_names_len + j, r8(str_blob + name_off + j))
       j = j + 1
     }
-    strtablen = strtablen + strtab_len
+    w8(imported_names + imported_names_len + name_len, 0)  // NUL terminate
+    imported_names_len = imported_names_len + name_len + 1
+    
+    // Copy return type name to imported_names buffer if present
+    let ret_imported_off = 0
+    if ret_len > 0 {
+      ret_imported_off = imported_names_len
+      let j = 0
+      while j < ret_len {
+        w8(imported_names + imported_names_len + j, r8(str_blob + ret_off + j))
+        j = j + 1
+      }
+      w8(imported_names + imported_names_len + ret_len, 0)
+      imported_names_len = imported_names_len + ret_len + 1
+    }
+    
+    // Register function (name_ptr is imported_names offset for imported functions)
+    let new_fi = fnc
+    sfn(fnc, name_imported_off, name_len, 0, 0, param_c, ret_imported_off, ret_len)
+    w64(fn_is_imported + fnc*8, 1)
+    // Imported functions are top-level (parent = -1)
+    w64(fn_parent + fnc*8, 0-1)
+    
+    // COPY IR records for this function (needed for exec mode inlining!)
+    if ir_count_fn > 0 {
+      w64(fn_ir_start + fnc*8, irc)
+      w64(fn_ir_count + fnc*8, ir_count_fn)
+      
+      let j = 0
+      while j < ir_count_fn {
+        let src_ir = imported_ir + (ir_start + j) * 40
+        let dst_ir = irc
+        w64(ir + dst_ir*IRS, r64(src_ir))
+        w64(ir + dst_ir*IRS + 8, r64(src_ir + 8))
+        w64(ir + dst_ir*IRS + 16, r64(src_ir + 16))
+        w64(ir + dst_ir*IRS + 24, r64(src_ir + 24))
+        w64(ir + dst_ir*IRS + 32, r64(src_ir + 32))
+        irc = irc + 1
+        j = j + 1
+      }
+    }
+    
+    fnc = fnc + 1
+    i = i + 1
   }
   
   file_close(fd)

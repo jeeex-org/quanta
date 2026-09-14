@@ -24,7 +24,7 @@ fn tokln(i) { return r64(toks + i*TKS + 32) }
 // page -> SIGSEGV (a crafted ≤16MB source with very high token density could
 // trigger this). As of 1.1.0 each emitter bounds its counter and aborts with a
 // clean error (exit 17) instead of corrupting memory.
-let TOK_CAP = 500000000    // toks arena 20GB / 40B per token (raised for stdlib inlining)
+let TOK_CAP = 10000000000    // toks arena 400GB / 40B per token (raised for self-hosting)
 let IR_CAP  = 1000000000   // ir arena 40GB / 40B per record (raised for SHA3)
 let VAR_CAP = 250000       // vars arena 2MB / 24B (VRS=24? keep headroom)
 let FN_CAP  = 250000       // fns arena 2MB / 40B (FNS=40)
@@ -199,6 +199,13 @@ fn ira1(i) { return r64(ir + i*IRS + 24) }
 fn ira2(i) { return r64(ir + i*IRS + 32) }
 
 fn fn_name(i) { return r64(fns + i*FNS) }
+fn fn_name_ptr(i) -> i64 {
+  let nm = r64(fns + i*FNS)
+  if r64(fn_is_imported + i*8) == 1 {
+    return imported_names + nm
+  }
+  return src + nm
+}
 fn fn_nlen(i) { return r64(fns + i*FNS + 8) }
 fn fn_btok(i) { return r64(fns + i*FNS + 16) }
 fn fn_cofs(i) { return r64(fns + i*FNS + 24) }
@@ -214,6 +221,27 @@ fn sfn(i,nm,nl,bt,co,pc,ret_nm,ret_nl) {
     w64(fns + i*FNS + 48, ret_nl)
     w64(fn_rettype_name + i*8, ret_nm)
     w64(fn_rettype_len + i*8, ret_nl)
+    // IR tracking:
+    // scanfns call: irc=0, bt!=0 for functions with bodies, co=0 → do NOT record (irc=0)
+    // Compilation first call (before parse): bt!=0, co=0 → record IR start if not set
+    // Compilation second call (after codegen): irc > fn_ir_start[i] → record IR count
+    let ir_start = r64(fn_ir_start + i*8)
+    if bt != 0 && ir_start == 0 {
+        // First compilation call - record IR start (current irc IS the start for this function)
+        w64(fn_ir_start + i*8, irc)
+    }
+    if irc > r64(fn_ir_start + i*8) {
+        // Second call (after codegen) - record IR count
+        if r64(fn_ir_count + i*8) == 0 {
+            w64(fn_ir_count + i*8, irc - r64(fn_ir_start + i*8))
+        }
+    }
+    // Also reset IR tracking when irc is reset (new function compilation)
+    // This handles the case where irc was reset to 0 before parsing this function
+    if irc == 0 {
+        w64(fn_ir_start + i*8, 0)
+        w64(fn_ir_count + i*8, 0)
+    }
 }
 
 // P11: register a closure body as a synthetic function.

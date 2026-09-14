@@ -424,6 +424,7 @@ fn main(argc, argv) {
         file_write(2, mb+8, len(mb)); had_error=1
     }
     scantraits()
+    mark_module_start()  // Mark module start for symbol ownership tracking
     scanfns()
     scanstructs()
     rewrite_struct_literals()
@@ -443,14 +444,18 @@ fn main(argc, argv) {
         }
         mmi=mmi+1
     }
-    if has_main==0 && no_start==0 {
+    if has_main==0 && no_start==0 && emit_qobj==0 {
         let mm = "error: no 'main' function found\n"
         file_write(2, mm+8, len(mm)); had_error=1
     }
+    // --emit-qobj mode: write .qobj module cache (skip main check)
+    // Do NOT exit early - need to compile functions to get IR first
+    // The actual write happens after function compilation loop
     // Startup stub at code offset 0: set up argc/argv, run global initializers,
     // then call main, then exit(rax). Suppressed in --no-start (secondary TU):
     // the TU is a library exporting functions; the entry TU's _start calls them.
-    if no_start == 0 {
+    // ALSO skip startup stub when --emit-qobj (no main needed, no binary emitted)
+    if no_start == 0 && emit_qobj == 0 {
         eb(95)                       // pop rdi          (argc)
         eb(72); eb(137); eb(230)     // mov rsi, rsp     (argv)
         // Stack relocation: under `setarch -R` (ADDR_NO_RANDOMIZE, used by the
@@ -672,6 +677,9 @@ fn main(argc, argv) {
         // body. Popped after the body is parsed.
         fn_push(fi)
 
+        // Save IR start for this function (before parsing body)
+        sfn(fi,fn_name(fi),fn_nlen(fi),fn_btok(fi),0,pc,r64(fn_rettype_name+fi*8),r64(fn_rettype_len+fi*8))
+
                     parse_block()
         // 0.0.150: borrow check (record phase only, no enforcement)
         borrow_check_fn(0, irc)
@@ -683,21 +691,26 @@ fn main(argc, argv) {
         clo_scope_save(fi)
         cur_clo = 0 - 1
 
-        // Save IR start and param count
-        sfn(fi,fn_name(fi),fn_nlen(fi),fn_btok(fi),0,pc,0,0)
         cur_fnname=fn_name(fi); cur_fnnlen=fn_nlen(fi)
 
         // Compile IR to code.  fn_cofs must be the START offset of the code.
         let cstart=codelen
         w64(func_code_starts+(fi+1)*8,cstart)
         // P4: record main's code offset for the startup-stub bl patch (global, unshadowable)
-        if fn_nlen(fi)==4 && r8(src+fn_name(fi))==109 && r8(src+fn_name(fi)+1)==97 && r8(src+fn_name(fi)+2)==105 && r8(src+fn_name(fi)+3)==110 { g_main_ofs = cstart }
+        if fn_nlen(fi)==4 && r8(fn_name_ptr(fi))==109 && r8(fn_name_ptr(fi)+1)==97 && r8(fn_name_ptr(fi)+2)==105 && r8(fn_name_ptr(fi)+3)==110 { g_main_ofs = cstart }
         opt_func()      // Tier-1 IR opt (constant folding). No-op when opt_on==0.
         cur_fnname=fn_name(fi); cur_fnnlen=fn_nlen(fi)
+        // IR count updated by sfn() when irc > fn_ir_start[fi]
+        sfn(fi,fn_name(fi),fn_nlen(fi),fn_btok(fi),cstart,pc,r64(fn_rettype_name+fi*8),r64(fn_rettype_len+fi*8))
         ci_func(fi,0)
-        sfn(fi,fn_name(fi),fn_nlen(fi),fn_btok(fi),cstart,pc,0,0)
 
         fi=fi+1
+    }
+
+    // --emit-qobj mode: write .qobj module cache after all functions compiled (IR captured)
+    if emit_qobj == 1 {
+        qobj_write(out_p)
+        exit(0)
     }
 
     // 0.0.121: deferred escape-hazard verification. Captures are registered
@@ -916,11 +929,6 @@ fn main(argc, argv) {
         // --link mode: link object file with libc using system ld
         // srcp = input .o file, out_p = output executable
         link_object_with_libc(srcp, out_p)
-        exit(0)
-    }
-    if emit_qobj == 1 {
-        // --emit-qobj mode: write .qobj module cache
-        qobj_write(out_p)
         exit(0)
     }
     w32(code+init_call+1, r64(func_code_starts+0)-(init_call+5))
