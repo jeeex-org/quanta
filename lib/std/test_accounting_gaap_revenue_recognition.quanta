@@ -1,0 +1,106 @@
+include "accounting_gaap_revenue_recognition.quanta"
+// Test: Revenue Recognition (ASC 606)
+// Verifies percentage-of-completion, variable consideration, allocation, material rights
+
+fn main() {
+    let failed = 0
+    
+    // Test recognize_revenue: 0 obligations done
+    let r1 = recognize_revenue(1000, 4, 0)
+    if r1 != 0 {
+        prints("FAIL: recognize_revenue(1000,4,0)=")
+        printi(r1)
+        prints(" expected 0\n")
+        failed = failed + 1
+    }
+    
+    // Test: 2 of 4 obligations → 50% = $500
+    let r2 = recognize_revenue(1000, 4, 2)
+    if r2 != 500 {
+        prints("FAIL: recognize_revenue(1000,4,2)=")
+        printi(r2)
+        prints(" expected 500\n")
+        failed = failed + 1
+    }
+    
+    // Test: all obligations satisfied → full price
+    let r3 = recognize_revenue(1000, 4, 4)
+    if r3 != 1000 {
+        prints("FAIL: recognize_revenue(1000,4,4)=")
+        printi(r3)
+        prints(" expected 1000\n")
+        failed = failed + 1
+    }
+    
+    // Test: over-delivery (done > total) → capped at total_price
+    let r4 = recognize_revenue(1000, 4, 10)
+    if r4 != 1000 {
+        prints("FAIL: recognize_revenue(1000,4,10)=")
+        printi(r4)
+        prints(" expected 1000\n")
+        failed = failed + 1
+    }
+    
+    // Test: variable consideration - high threshold (80%+) → include all
+    let v1 = constrain_variable_consideration(500, 80)
+    if v1 != 500 {
+        prints("FAIL: constrain_variable_consideration(500,80)=")
+        printi(v1)
+        prints(" expected 500\n")
+        failed = failed + 1
+    }
+    
+    // Test: variable consideration - medium threshold (50-79%) → half
+    let v2 = constrain_variable_consideration(500, 60)
+    if v2 != 250 {
+        prints("FAIL: constrain_variable_consideration(500,60)=")
+        printi(v2)
+        prints(" expected 250\n")
+        failed = failed + 1
+    }
+    
+    // Test: variable consideration - low threshold (<50%) → exclude
+    let v3 = constrain_variable_consideration(500, 30)
+    if v3 != 0 {
+        prints("FAIL: constrain_variable_consideration(500,30)=")
+        printi(v3)
+        prints(" expected 0\n")
+        failed = failed + 1
+    }
+    
+    // Test: deferred revenue = billed - recognized
+    let d1 = deferred_revenue(1200, 500)
+    if d1 != 700 {
+        prints("FAIL: deferred_revenue(1200,500)=")
+        printi(d1)
+        prints(" expected 700\n")
+        failed = failed + 1
+    }
+    
+    // Test: price allocation on SSP basis
+    let a1 = allocate_price(1000, 300, 1000)
+    if a1 != 300 {
+        prints("FAIL: allocate_price(1000,300,1000)=")
+        printi(a1)
+        prints(" expected 300\n")
+        failed = failed + 1
+    }
+    
+    // Test: material right liability
+    let m1 = material_right_liability(10000, 1, 70)
+    if m1 != 7000 {
+        prints("FAIL: material_right_liability(10000,1,70)=")
+        printi(m1)
+        prints(" expected 7000\n")
+        failed = failed + 1
+    }
+    
+    if failed == 0 {
+        prints("REVENUE RECOGNITION: ALL TESTS PASSED\n")
+        return 0
+    }
+    prints("REVENUE RECOGNITION: ")
+    printi(failed)
+    prints(" TEST(S) FAILED\n")
+    return 1
+}

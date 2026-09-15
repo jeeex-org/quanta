@@ -1,0 +1,96 @@
+include "accounting_gaap_leases.quanta"
+// Test: Leases (ASC 842)
+// Verifies classification, liability calculation, ROU asset, expense patterns
+
+fn main() {
+    let failed = 0
+    
+    // Test: finance lease (ownership transfer)
+    let c1 = classify_lease(50, 70, 1, 0)
+    if c1 != 1 {
+        prints("FAIL: classify_lease ownership_transfer\n")
+        failed = failed + 1
+    }
+    
+    // Test: finance lease (bargain purchase option)
+    let c2 = classify_lease(50, 70, 0, 1)
+    if c2 != 1 {
+        prints("FAIL: classify_lease bargain_purchase\n")
+        failed = failed + 1
+    }
+    
+    // Test: finance lease (lease term >= 75%)
+    let c3 = classify_lease(80, 70, 0, 0)
+    if c3 != 1 {
+        prints("FAIL: classify_lease term_80pct\n")
+        failed = failed + 1
+    }
+    
+    // Test: finance lease (PV >= 90%)
+    let c4 = classify_lease(50, 95, 0, 0)
+    if c4 != 1 {
+        prints("FAIL: classify_lease pv_95pct\n")
+        failed = failed + 1
+    }
+    
+    // Test: operating lease (none of criteria met)
+    let c5 = classify_lease(50, 70, 0, 0)
+    if c5 != 0 {
+        prints("FAIL: classify_lease operating\n")
+        failed = failed + 1
+    }
+    
+    // Test: lease liability = annual * term
+    let l1 = lease_liability(12000, 5)
+    if l1 != 60000 {
+        prints("FAIL: lease_liability(12000,5)=")
+        printi(l1)
+        prints(" expected 60000\n")
+        failed = failed + 1
+    }
+    
+    // Test: ROU asset calculation
+    let rou1 = right_of_use_asset(60000, 5000, 2000, 1000)
+    if rou1 != 66000 {
+        prints("FAIL: right_of_use_asset(60000,5000,2000,1000)=")
+        printi(rou1)
+        prints(" expected 66000\n")
+        failed = failed + 1
+    }
+    
+    // Test: finance lease interest (front-loaded)
+    let i1 = finance_lease_interest(1, 60000, 5)
+    if i1 != 3000 {
+        prints("FAIL: finance_lease_interest(60000,5pct)=")
+        printi(i1)
+        prints(" expected 3000\n")
+        failed = failed + 1
+    }
+    
+    // Test: operating lease straight-line expense
+    let e1 = operating_lease_expense(60000, 12)
+    if e1 != 5000 {
+        prints("FAIL: operating_lease_expense(60000,12)=")
+        printi(e1)
+        prints(" expected 5000\n")
+        failed = failed + 1
+    }
+    
+    // Test: lease amortization
+    let a1 = amortize_lease_liability(60000, 12000, 3000)
+    if a1 != 51000 {
+        prints("FAIL: amortize_lease_liability(60000,12000,3000)=")
+        printi(a1)
+        prints(" expected 51000\n")
+        failed = failed + 1
+    }
+    
+    if failed == 0 {
+        prints("LEASES: ALL TESTS PASSED\n")
+        return 0
+    }
+    prints("LEASES: ")
+    printi(failed)
+    prints(" TEST(S) FAILED\n")
+    return 1
+}

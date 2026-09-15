@@ -1,0 +1,115 @@
+include "accounting_gaap_consolidation.quanta"
+// Test: Consolidation (ASC 810)
+// Verifies VIE determination, beneficiary, voting interest, eliminations, NCI
+
+fn main() {
+    let failed = 0
+    
+    // Test: VIE (equity < expected losses)
+    let v1 = is_vie(50000, 100000, 5)
+    if v1 != 1 {
+        prints("FAIL: is_vie expected_losses\n")
+        failed = failed + 1
+    }
+    
+    // Test: VIE (equity at risk < 10%)
+    let v2 = is_vie(100000, 50000, 8)
+    if v2 != 1 {
+        prints("FAIL: is_vie equity_at_risk\n")
+        failed = failed + 1
+    }
+    
+    // Test: NOT VIE (sufficient equity)
+    let v3 = is_vie(100000, 50000, 15)
+    if v3 != 0 {
+        prints("FAIL: is_vie not_vie\n")
+        failed = failed + 1
+    }
+    
+    // Test: VIE beneficiary (power + absorbs losses)
+    let b1 = vie_beneficiary(1, 1, 0)
+    if b1 != 1 {
+        prints("FAIL: vie_beneficiary power_losses\n")
+        failed = failed + 1
+    }
+    
+    // Test: VIE beneficiary (power + receives benefits)
+    let b2 = vie_beneficiary(1, 0, 1)
+    if b2 != 1 {
+        prints("FAIL: vie_beneficiary power_benefits\n")
+        failed = failed + 1
+    }
+    
+    // Test: not beneficiary (no power)
+    let b3 = vie_beneficiary(0, 1, 1)
+    if b3 != 0 {
+        prints("FAIL: vie_beneficiary no_power\n")
+        failed = failed + 1
+    }
+    
+    // Test: voting interest consolidation (>50%)
+    let c1 = consolidate_voting_interest(51)
+    if c1 != 1 {
+        prints("FAIL: consolidate 51pct\n")
+        failed = failed + 1
+    }
+    
+    // Test: no consolidation (<=50%)
+    let c2 = consolidate_voting_interest(50)
+    if c2 != 0 {
+        prints("FAIL: no_consolidate 50pct\n")
+        failed = failed + 1
+    }
+    
+    // Test: NCI in net income
+    let n1 = nci_net_income(1000000, 20)
+    if n1 != 200000 {
+        prints("FAIL: nci_net_income(1M,20pct)=")
+        printi(n1)
+        prints(" expected 200000\n")
+        failed = failed + 1
+    }
+    
+    // Test: step acquisition gain
+    let sg1 = step_acquisition_gain(80000, 100000)
+    if sg1 != 20000 {
+        prints("FAIL: step_acquisition_gain(80k,100k)=")
+        printi(sg1)
+        prints(" expected 20000\n")
+        failed = failed + 1
+    }
+    
+    // Test: no step gain (fair value < carrying)
+    let sg2 = step_acquisition_gain(100000, 80000)
+    if sg2 != 0 {
+        prints("FAIL: step_acquisition_gain none\n")
+        failed = failed + 1
+    }
+    
+    // Test: intercompany debt elimination
+    let ed1 = eliminate_intercompany_debt(50000, 75000)
+    if ed1 != 50000 {
+        prints("FAIL: eliminate_intercompany_debt(50k,75k)=")
+        printi(ed1)
+        prints(" expected 50000\n")
+        failed = failed + 1
+    }
+    
+    // Test: residual returns allocation
+    let ra1 = allocate_residual_returns(30, 100000)
+    if ra1 != 30000 {
+        prints("FAIL: allocate_residual_returns(30pct,100k)=")
+        printi(ra1)
+        prints(" expected 30000\n")
+        failed = failed + 1
+    }
+    
+    if failed == 0 {
+        prints("CONSOLIDATION: ALL TESTS PASSED\n")
+        return 0
+    }
+    prints("CONSOLIDATION: ")
+    printi(failed)
+    prints(" TEST(S) FAILED\n")
+    return 1
+}
