@@ -87,8 +87,8 @@ QUANTA-4B is a 7.5B parameter language model (Q4_K_M quantized) currently traine
 
 | Path | Files | Lines | Description |
 |------|-------|-------|-------------|
-| `compiler/0.0.189/src/x86/*.quanta` | 19 | 14,116 | Full x86-64 compiler backend |
-| `compiler/0.0.188/src/x86/*.quanta` | 19 | ~14,000 | Previous stable compiler |
+| `compiler/0.0.190/src/x86/*.quanta` | 19 | 14,116 | Full x86-64 compiler backend |
+| `compiler/0.0.189/src/x86/*.quanta` | 19 | 14,116 | Previous stable compiler |
 
 **Key files:**
 - `parse.quanta` — Parser (1547 lines)
@@ -172,9 +172,11 @@ for i = 0; i < 10; i = i + 1 {
 }
 
 // Include other modules
+// Both forms compile (trailing semicolon stripped — fixed in 0.0.190):
 import std/str
 import std/vec
 import std/json
+// Also valid: import std/str; import std/vec;
 
 // String literal
 let msg = "hello"
