@@ -1225,6 +1225,7 @@ fn emit_bltn2(nmi,nl,ii) {
         if nl==10&&r8(nm+5)=='c'&&r8(nm+6)=='h'&&r8(nm+7)=='d'&&r8(nm+8)=='i'&&r8(nm+9)=='r' { eb(184); ei(80); sysc(); return 1 }   // chdir(path)  sc 80
         if nl==11&&r8(nm+5)=='r'&&r8(nm+6)=='e'&&r8(nm+7)=='n'&&r8(nm+8)=='a'&&r8(nm+9)=='m'&&r8(nm+10)=='e' { eb(184); ei(82); sysc(); return 1 }  // rename(old,new) sc 82
         if nl==10&&r8(nm+5)=='r'&&r8(nm+6)=='m'&&r8(nm+7)=='d'&&r8(nm+8)=='i'&&r8(nm+9)=='r' { eb(184); ei(84); sysc(); return 1 }   // rmdir(path)  sc 84
+        if nl==5&&r8(nm)=='l'&&r8(nm+1)=='s'&&r8(nm+2)=='e'&&r8(nm+3)=='e'&&r8(nm+4)=='k' { flush_all(); ri(0,8); sysc(); return 1 }
         let c5=r8(nm+5)
         if c5=='o' {                   // open(path, flags, mode)
             // path may be a Quanta string literal (needs +8 to skip the
@@ -1253,18 +1254,7 @@ fn emit_bltn2(nmi,nl,ii) {
         if c5=='c' { eb(184); ei(3); sysc(); return 1 }                    // close
         if c5=='s' { eb(184); ei(4); sysc(); return 1 }                    // stat(path, buf) -> 0/-errno  (sc 4)
         if c5=='u' { eb(184); ei(87); sysc(); return 1 }                   // unlink(path) -> 0/-errno  (sc 87)
-        if c5=='l' {                    // lseek(fd, offset, whence) -> new_offset (sc 8)
-            flush_all()
-            let sc_base = ira2(ii)
-            let a0 = irres(sc_base)
-            let a1 = irres(sc_base + 1)
-            let a2 = irres(sc_base + 2)
-            // Load args from vregs into syscall registers
-            lbase(spill_home(a0), 7)   // rdi = fd
-            lbase(spill_home(a1), 6)   // rsi = offset
-            lbase(spill_home(a2), 2)   // rdx = whence
-            ri(0,8); sysc(); return 1
-        }
+        if c5=='l' { ri(0,8); sysc(); return 1 }  // lseek: args already in rdi/rsi/rdx from IR_CALL
         if c5=='f' { flush_all(); ri(0,5); sysc(); return 1 }  // fstat: rdi/rsi already set by IR_CALL
         if c5=='m' && nl==4 {         // mmap(addr, len, prot, flags, fd, offset) -> addr (sc 9)
             // "mmap" is 4 chars, so c5 is out of bounds (0). mkdir is 5 chars.

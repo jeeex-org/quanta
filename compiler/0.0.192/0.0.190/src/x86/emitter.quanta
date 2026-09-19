@@ -85,17 +85,8 @@ fn sysc() { eb(15); eb(5) }
 fn callr(r) { if r<8 { eb(255); mr(3,2,r) } else { eb(65); eb(255); mr(3,2,r%8) } }
 fn sbi(imm) { eb(72); eb(129); mr(3,5,4); ei(imm) }
 fn abi(imm) { eb(72); eb(129); mr(3,0,4); ei(imm) }
-fn wbp(d,r) { rw(r,5); eb(137); if r>=8 { mr(2,r%8,4); eb(37) } else { mr(2,r%8,4); eb(37) }; ei(d) }
-fn rbp(r,d) {
-    // mov r64, [rbp+disp32] - RBP with mod=00 is RIP-relative, so we must use mod=10 (disp32)
-    let rex = 72  // 0x48: W=1
-    if r >= 8 { rex = 76 }  // 0x4C: W=1, R=1 (extended reg in ModRM reg field)
-    eb(rex)
-    eb(139)  // MOV r64, r/m64
-    // ModRM: mod=10 (disp32), reg=r%8, rm=101 (rbp)
-    eb(0x85 + (r%8)*8)
-    ei(d)
-}
+fn wbp(d,r) { rw(r,5); eb(137); if r>=8 { mr(2,r%8,4); eb(37) } else { mr(2,r%8,5) }; ei(d) }
+fn rbp(r,d) { rw(r,5); eb(139); if r>=8 { mr(2,r%8,4); eb(37) } else { mr(2,r%8,5) }; ei(d) }
 fn wsp(d,r) { rw(r,4); eb(137); mr(2,r%8,4); eb(36); ei(d) }
 fn rsp(r,d) { rw(r,4); eb(139); mr(2,r%8,4); eb(36); ei(d) }
 // wbase(d, vr): mov [r11+d], vr  -- r11 is an explicit base reg (NOT rbp), so it
@@ -1204,21 +1195,6 @@ fn emit_bltn2(nmi,nl,ii) {
         if findfn(nmi,nl)>=0 { return 0 }
     }
 
-    // file_lseek (10 chars) - must come BEFORE file_ prefix check
-    if nl==10&&r8(nm)=='f'&&r8(nm+1)=='i'&&r8(nm+2)=='l'&&r8(nm+3)=='e'&&r8(nm+4)=='_'&&r8(nm+5)=='l'&&r8(nm+6)=='s'&&r8(nm+7)=='e'&&r8(nm+8)=='e'&&r8(nm+9)=='k' {
-        flush_all()
-        let sc_base = ira2(ii)
-        let sk = 0
-        while sk < 3 {
-            let sv = irres(sc_base + sk)
-            if sk == 0 { rbp(7, spill_home(sv)) }   // rdi = fd
-            if sk == 1 { rbp(6, spill_home(sv)) }   // rsi = offset
-            if sk == 2 { rbp(2, spill_home(sv)) }   // rdx = whence
-            sk = sk + 1
-        }
-        ri(0,8); sysc(); return 1
-    }
-
     // file_open / file_read / file_write / file_close
     if nl>=8&&r8(nm)=='f'&&r8(nm+1)=='i'&&r8(nm+2)=='l'&&r8(nm+3)=='e'&&r8(nm+4)=='_' {
         // Full-name dispatch FIRST for names whose 6th char collides with read/close:
@@ -1253,36 +1229,6 @@ fn emit_bltn2(nmi,nl,ii) {
         if c5=='c' { eb(184); ei(3); sysc(); return 1 }                    // close
         if c5=='s' { eb(184); ei(4); sysc(); return 1 }                    // stat(path, buf) -> 0/-errno  (sc 4)
         if c5=='u' { eb(184); ei(87); sysc(); return 1 }                   // unlink(path) -> 0/-errno  (sc 87)
-        if c5=='l' {                    // lseek(fd, offset, whence) -> new_offset (sc 8)
-            flush_all()
-            let sc_base = ira2(ii)
-            let a0 = irres(sc_base)
-            let a1 = irres(sc_base + 1)
-            let a2 = irres(sc_base + 2)
-            // Load args from vregs into syscall registers
-            lbase(spill_home(a0), 7)   // rdi = fd
-            lbase(spill_home(a1), 6)   // rsi = offset
-            lbase(spill_home(a2), 2)   // rdx = whence
-            ri(0,8); sysc(); return 1
-        }
-        if c5=='f' { flush_all(); ri(0,5); sysc(); return 1 }  // fstat: rdi/rsi already set by IR_CALL
-        if c5=='m' && nl==4 {         // mmap(addr, len, prot, flags, fd, offset) -> addr (sc 9)
-            // "mmap" is 4 chars, so c5 is out of bounds (0). mkdir is 5 chars.
-            flush_all()
-            let sc_base = ira2(ii)
-            let sk = 0
-            while sk < 6 {
-                let sv = irres(sc_base + sk)
-                if sk == 0 { rbp(7, spill_home(sv)) }   // rdi = addr
-                if sk == 1 { rbp(6, spill_home(sv)) }   // rsi = len
-                if sk == 2 { rbp(2, spill_home(sv)) }   // rdx = prot
-                if sk == 3 { rbp(10, spill_home(sv)) }  // r10 = flags
-                if sk == 4 { rbp(8, spill_home(sv)) }   // r8 = fd
-                if sk == 5 { rbp(9, spill_home(sv)) }   // r9 = offset
-                sk = sk + 1
-            }
-            ri(0,9); sysc(); return 1
-        }
         if c5=='m' { eb(184); ei(83); sysc(); return 1 }                   // mkdir(path, mode) -> 0/-errno (sc 83)
     }
     // 0.0.106: networking builtins (raw Linux syscalls). IR_CALL already loaded
