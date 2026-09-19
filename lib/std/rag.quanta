@@ -1,0 +1,210 @@
+// std/rag - RAG (Retrieval-Augmented Generation) for Quanta
+// Usage:
+//   import std/rag
+//   rag_query("What is IR_CALL?")
+//   rag_query("pattern matching syntax", "e4b")
+//
+// Architecture: Quanta orchestrates, external tools do heavy lifting
+//   - python3: sentence-transformers embedding
+//   - sqlite3: vector search
+//   - curl: llama-server inference
+
+import std/str
+import std/io
+
+// Query embedding via Python helper
+fn rag_embed(query) -> str {
+    // Write query to temp file (handles special chars safely)
+    file_write("/tmp/rag_query.txt", query)
+    let cmd = "python3 /opt/tali/quanta/scripts/rag_embed_file.py /tmp/rag_query.txt"
+    return exec(cmd)
+}
+
+// Search for similar chunks using sqlite3 + sqlite-vec
+fn rag_search(embedding_hex, top_k) -> str {
+    // Use sqlite3 with vec0 extension
+    let cmd = "sqlite3 /opt/tali/quanta/rag/vectors.db \""
+    cmd = cmd = cmd + "SELECT source, type, chunk_index, content "
+    cmd = cmd = cmd + "FROM chunks "
+    cmd = cmd = cmd + "WHERE embedding IS NOT NULL "
+    cmd = cmd = cmd + "ORDER BY vec_distance_euclidean(embedding, X'" + embedding_hex + "') "
+    cmd = cmd = cmd + "LIMIT " + str(top_k)
+    cmd = cmd = cmd + "\""
+    return exec(cmd)
+}
+
+// Call llama-server for answer generation
+fn rag_generate(prompt, model_port) -> str {
+    // Build JSON payload
+    let escaped = prompt
+    escaped = str_replace(escaped, "\\", "\\\\")
+    escaped = str_replace(escaped, "\"", "\\\"")
+    escaped = str_replace(escaped, "\n", "\\n")
+    
+    let json = "{\"messages\":[{\"role\":\"user\",\"content\":\"" + escaped + "\"}],"
+    json = json + "\"max_tokens\":256,"
+    json = json + "\"temperature\":0.3,"
+    json = json + "\"top_p\":0.95,"
+    json = json + "\"chat_template_kwargs\":{\"enable_thinking\":false}}"
+    
+    let cmd = "curl -s -X POST http://localhost:" + model_port + "/v1/chat/completions "
+    cmd = cmd + "-H 'Content-Type: application/json' "
+    cmd = cmd + "-d '" + json + "'"
+    
+    return exec(cmd)
+}
+
+// Main RAG query function
+fn rag_query(query, model) {
+    // Default to e2b
+    if str_len(model) == 0 { model = "e2b" }
+    
+    let port = "1235"
+    if model == "e4b" { port = "1236" }
+    
+    print("Quanta RAG Query: " + query)
+    print("Model: " + str_upper(model))
+    print("")
+    
+    // Step 1: Get embedding
+    print("[1/4] Computing embedding...")
+    let emb_hex = rag_embed(query)
+    
+    // Step 2: Search
+    print("[2/4] Searching knowledge base...")
+    let results = rag_search(emb_hex, 5)
+    
+    // Step 3: Parse and build prompt
+    print("[3/4] Building context...")
+    let context = rag_parse_results(results)
+    let prompt = rag_build_prompt(query, context)
+    
+    // Step 4: Generate
+    print("[4/4] Generating answer...")
+    let response = rag_generate(prompt, port)
+    let answer = rag_extract_answer(response)
+    
+    // Display
+    print("\n" + str_repeat("=", 70))
+    print("ANSWER")
+    print(str_repeat("=", 70))
+    print(answer)
+    print(str_repeat("=", 70))
+}
+
+// Parse sqlite3 results into context chunks
+fn rag_parse_results(raw) -> vec {
+    let lines = str_split(raw, "\n")
+    let chunks = vec_new()
+    let i = 0
+    while i < vec_len(lines) {
+        let line = lines[i]
+        if str_len(line) > 0 {
+            // Format: source|type|chunk_index|content
+            let parts = str_split(line, "|")
+            if vec_len(parts) >= 4 {
+                let chunk = parts[0] + "|" + parts[3]  // source|content
+                vec_push(chunks, chunk)
+            }
+        }
+        i = i + 1
+    }
+    return chunks
+}
+
+// Build RAG prompt with context
+fn rag_build_prompt(query, context) -> str {
+    let prompt = "You are a Quanta programming language expert.\n"
+    prompt = prompt + "Use ONLY the following context to answer the question.\n"
+    prompt = prompt + "DO NOT reference Python, Rust, C++, Go, or other languages.\n"
+    prompt = prompt + "DO NOT make up information.\n\n"
+    prompt = prompt + "CONTEXT FROM QUANTA SOURCE:\n"
+    
+    let i = 0
+    while i < vec_len(context) {
+        let chunk = context[i]
+        let parts = str_split(chunk, "|")
+        if vec_len(parts) >= 2 {
+            prompt = prompt + "\n--- " + parts[0] + " ---\n"
+            prompt = prompt + parts[1]
+        }
+        i = i + 1
+        if i >= 3 { break }  // Limit context to 3 chunks
+    }
+    
+    prompt = prompt + "\n\nQUESTION: " + query + "\n\nANSWER:"
+    return prompt
+}
+
+// Extract answer from JSON response
+fn rag_extract_answer(json_str) -> str {
+    // Find "content":"..." in JSON response
+    let key = "\"content\":\""
+    let start = str_index(json_str, key)
+    if start == -1 { return "[Error: no content in response]" }
+    
+    start = start + str_len(key)
+    let end = str_find_escape(json_str, start)
+    if end == -1 { return "[Error: unterminated content]" }
+    
+    let raw = str_substring(json_str, start, end)
+    // Unescape JSON strings
+    raw = str_replace(raw, "\\n", "\n")
+    raw = str_replace(raw, "\\\"", "\"")
+    raw = str_replace(raw, "\\\\", "\\")
+    return raw
+}
+
+// Find next unescaped quote
+fn str_find_escape(s, from) -> i64 {
+    let i = from
+    let n = len(s)
+    while i < n {
+        let c = mem_load8(s + 8 + i)
+        if c == 34 {  // double quote
+            // Check if escaped
+            if i > from && mem_load8(s + 8 + i - 1) == 92 {
+                // Escaped, skip
+            } else {
+                return i
+            }
+        }
+        i = i + 1
+    }
+    return -1
+}
+
+// Helper: repeat string
+fn str_repeat(s, n) -> str {
+    let result = ""
+    let i = 0
+    while i < n {
+        result = result + s
+        i = i + 1
+    }
+    return result
+}
+
+// Helper: uppercase
+fn str_upper(s) -> str {
+    let n = len(s)
+    let result = ""
+    let i = 0
+    while i < n {
+        let c = mem_load8(s + 8 + i)
+        if c >= 97 && c <= 122 {  // a-z
+            c = c - 32  // to uppercase
+        }
+        result = result + str_from_byte(c)
+        i = i + 1
+    }
+    return result
+}
+
+// Helper: byte to string
+fn str_from_byte(b) -> str {
+    let buf = mem_alloc(2)
+    mem_store8(buf + 8, b)
+    mem_store8(buf + 9, 0)
+    return buf
+}

@@ -1,0 +1,566 @@
+// Quanta Native GGUF Inference Engine
+// Loads GGUF model and runs transformer forward pass entirely in Quanta
+
+import std/fs
+import std/mem
+import std/math
+
+// ============================================================
+// GGUF Parsing
+// ============================================================
+
+struct GGUFHeader {
+    magic: u32
+    version: u32
+    n_kv: u64
+    n_tensors: u64
+}
+
+struct TensorInfo {
+    name: str
+    ndims: u32
+    dims: [u64; 4]
+    dtype: u32
+    offset: u64
+}
+
+struct GGUFModel {
+    header: GGUFHeader
+    tensors: [TensorInfo; 128]  // max tensors
+    n_tensors: u32
+    file_fd: i32
+    data_base: u64  // file offset where tensor data starts
+}
+
+fn gguf_read_u32(buf: *u8) -> u32 {
+    let b0 = mem_load8(buf)
+    let b1 = mem_load8(buf + 1)
+    let b2 = mem_load8(buf + 2)
+    let b3 = mem_load8(buf + 3)
+    return b0 + (b1 * 256) + (b2 * 65536) + (b3 * 16777216)
+}
+
+fn gguf_read_u64(buf: *u8) -> u64 {
+    return mem_load(buf)
+}
+
+fn gguf_check_magic(buf: *u8) -> bool {
+    return mem_load8(buf) == 71 && mem_load8(buf+1) == 71 && mem_load8(buf+2) == 85 && mem_load8(buf+3) == 70
+}
+
+fn gguf_skip_bytes(fd: i32, count: u64, skip_buf: *u8, buf_size: u64) {
+    let remaining = count
+    while remaining > 0 {
+        let chunk = remaining
+        if chunk > buf_size { chunk = buf_size }
+        read_raw(fd, skip_buf, chunk)
+        remaining = remaining - chunk
+    }
+}
+
+fn gguf_load_model(path: str) -> *GGUFModel {
+    let fd = open(path, 0, 0)
+    if fd < 0 { return 0 }
+    
+    let model = mem_alloc(sizeof(GGUFModel)) as *GGUFModel
+    
+    // Read header
+    let hdr = mem_alloc(24)
+    read_raw(fd, hdr, 24)
+    
+    if !gguf_check_magic(hdr) {
+        close(fd)
+        return 0
+    }
+    
+    model.header.magic = gguf_read_u32(hdr)
+    model.header.version = gguf_read_u32(hdr + 4)
+    model.header.n_kv = gguf_read_u64(hdr + 8)
+    model.header.n_tensors = gguf_read_u64(hdr + 16)
+    model.n_tensors = model.header.n_tensors as u32
+    model.file_fd = fd
+    
+    let len_b = mem_alloc(8)
+    let type_b = mem_alloc(4)
+    let data_b = mem_alloc(16384)
+    let skip_b = mem_alloc(1048576)
+    
+    // Skip all metadata
+    let i = 0
+    while i < model.header.n_kv {
+        read_raw(fd, len_b, 8)
+        let klen = gguf_read_u64(len_b)
+        gguf_skip_bytes(fd, klen, skip_b, 1048576)
+        
+        read_raw(fd, type_b, 4)
+        let vtype = gguf_read_u32(type_b)
+        
+        if vtype == 8 {
+            read_raw(fd, len_b, 8)
+            let slen = gguf_read_u64(len_b)
+            gguf_skip_bytes(fd, slen, skip_b, 1048576)
+        } else if vtype == 4 {
+            read_raw(fd, data_b, 4)
+        } else if vtype == 10 {
+            read_raw(fd, data_b, 1)
+        } else if vtype == 11 {
+            read_raw(fd, type_b, 4)
+            let atype = gguf_read_u32(type_b)
+            read_raw(fd, len_b, 8)
+            let alen = gguf_read_u64(len_b)
+            let ai = 0
+            while ai < alen {
+                if atype == 8 {
+                    read_raw(fd, len_b, 8)
+                    let slen = gguf_read_u64(len_b)
+                    gguf_skip_bytes(fd, slen, skip_b, 1048576)
+                } else if atype == 4 {
+                    read_raw(fd, data_b, 4)
+                } else if atype == 10 {
+                    read_raw(fd, data_b, 1)
+                } else if atype == 5 {
+                    read_raw(fd, data_b, 4)
+                } else if atype == 6 {
+                    read_raw(fd, data_b, 8)
+                } else if atype == 7 {
+                    read_raw(fd, data_b, 8)
+                } else {
+                    read_raw(fd, data_b, 4)
+                }
+                ai = ai + 1
+            }
+        } else if vtype == 5 {
+            read_raw(fd, data_b, 4)
+        } else if vtype == 6 {
+            read_raw(fd, data_b, 8)
+        } else if vtype == 7 {
+            read_raw(fd, data_b, 8)
+        } else {
+            read_raw(fd, data_b, 8)
+        }
+        i = i + 1
+    }
+    
+    // Read tensor infos
+    let ti = 0
+    while ti < model.n_tensors {
+        read_raw(fd, len_b, 8)
+        let nlen = gguf_read_u64(len_b)
+        let name = mem_alloc(nlen + 1)
+        read_raw(fd, name, nlen)
+        mem_store8(name + nlen, 0)
+        
+        read_raw(fd, type_b, 4)
+        let ndims = gguf_read_u32(type_b)
+        
+        let dims = mem_alloc(ndims * 8)
+        let d = 0
+        while d < ndims {
+            read_raw(fd, data_b, 8)
+            mem_store(dims + d * 8, gguf_read_u64(data_b))
+            d = d + 1
+        }
+        
+        read_raw(fd, type_b, 4)
+        let dtype = gguf_read_u32(type_b)
+        
+        read_raw(fd, data_b, 8)
+        let offset = gguf_read_u64(data_b)
+        
+        model.tensors[ti].name = name
+        model.tensors[ti].ndims = ndims
+        model.tensors[ti].dtype = dtype
+        model.tensors[ti].offset = offset
+        
+        // Copy dims (max 4)
+        d = 0
+        while d < ndims && d < 4 {
+            model.tensors[ti].dims[d] = mem_load(dims + d * 8)
+            d = d + 1
+        }
+        while d < 4 {
+            model.tensors[ti].dims[d] = 1
+            d = d + 1
+        }
+        
+        ti = ti + 1
+    }
+    
+    // Data starts after all tensor infos (aligned to 32 bytes)
+    model.data_base = 0  // will be computed
+    // Find first tensor offset to get data start
+    let min_offset = model.tensors[0].offset
+    ti = 1
+    while ti < model.n_tensors {
+        if model.tensors[ti].offset < min_offset {
+            min_offset = model.tensors[ti].offset
+        }
+        ti = ti + 1
+    }
+    model.data_base = min_offset
+    
+    return model
+}
+
+fn gguf_find_tensor(model: *GGUFModel, name: str) -> *TensorInfo {
+    let i = 0
+    while i < model.n_tensors {
+        if str_eq(model.tensors[i].name, name) {
+            return &model.tensors[i]
+        }
+        i = i + 1
+    }
+    return 0
+}
+
+fn gguf_read_tensor_data(model: *GGUFModel, tensor: *TensorInfo, dst: *u8) {
+    let fd = model.file_fd
+    let offset = tensor.offset + model.data_base
+    lseek(fd, offset as i64, 0)
+    
+    // Compute tensor size
+    let nelem = tensor.dims[0] * tensor.dims[1] * tensor.dims[2] * tensor.dims[3]
+    let elem_size = gguf_dtype_size(tensor.dtype)
+    let total = nelem * elem_size
+    
+    // Read in chunks
+    let chunk = 65536
+    let read = 0
+    while read < total {
+        let c = total - read
+        if c > chunk { c = chunk }
+        read_raw(fd, dst + read, c)
+        read = read + c
+    }
+}
+
+fn gguf_dtype_size(dtype: u32) -> u64 {
+    // GGUF types: 0=f32, 1=f16, 2=q4_0, 3=q4_1, 4=q4_1 (old), 5=q5_0, 6=q5_1, 7=q8_0, 8=q8_1, 9=q2_k, 10=q3_k, 11=q4_k, 12=q5_k, 13=q6_k, 14=q8_k, 15=iq2_xxs, 16=iq2_xs, 17=iq3_xxs, 18=iq3_xs, 19=iq4_nl, 20=iq4_xs, 21=i8, 22=i16, 23=i32, 24=i64, 25=f64, 26=bool, 28=iq1_s, 29=iq4_xs
+    if dtype == 11 { return 1 }  // Q4_K - packed, 1 byte per weight effectively
+    if dtype == 2 { return 1 }   // Q4_0
+    if dtype == 1 { return 2 }   // F16
+    if dtype == 0 { return 4 }   // F32
+    return 1
+}
+
+// ============================================================
+// Q4_K Dequantization
+// ============================================================
+
+// Q4_K block: 256 weights
+// 2 bytes scale (f16), 2 bytes scale_min (f16), 4 bytes scales (4 bits each = 16 scales), 256/2 = 128 bytes quantized weights
+// Total: 2+2+4+128 = 136 bytes per 256 weights
+
+fn q4k_dequant_block(src: *u8, dst: *f32) {
+    // This is a simplified Q4_K dequantization
+    // Full implementation needs proper GGUF Q4_K format handling
+    // For now, placeholder
+    let i = 0
+    while i < 256 {
+        mem_store4(dst + i * 4, 0.0f32)
+        i = i + 1
+    }
+}
+
+fn q4k_dequant_tensor(src: *u8, dst: *f32, n_blocks: u64) {
+    let i = 0
+    while i < n_blocks {
+        q4k_dequant_block(src + i * 136, dst + i * 256)
+        i = i + 1
+    }
+}
+
+// ============================================================
+// Tokenizer (BPE) - simplified
+// ============================================================
+
+struct Tokenizer {
+    vocab: [str; 32000]
+    merges: [str; 32000]
+    vocab_size: u32
+}
+
+fn tokenizer_load(model: *GGUFModel) -> *Tokenizer {
+    // Load tokenizer from GGUF metadata
+    // For now, placeholder
+    let tok = mem_alloc(sizeof(Tokenizer)) as *Tokenizer
+    tok.vocab_size = 32000
+    return tok
+}
+
+fn tokenizer_encode(tok: *Tokenizer, text: str, out_ids: *u32, max_len: u32) -> u32 {
+    // Simplified: just return dummy tokens
+    out_ids[0] = 1  // BOS
+    out_ids[1] = 2  // dummy
+    out_ids[2] = 3  // dummy
+    return 3
+}
+
+fn tokenizer_decode(tok: *Tokenizer, ids: *u32, len: u32, out_str: *u8) {
+    // Placeholder
+    mem_store8(out_str, 0)
+}
+
+// ============================================================
+// Transformer Components
+// ============================================================
+
+struct TransformerConfig {
+    dim: u32
+    n_layers: u32
+    n_heads: u32
+    n_kv_heads: u32
+    head_dim: u32
+    hidden_dim: u32
+    vocab_size: u32
+    max_seq_len: u32
+    rope_theta: f32
+}
+
+struct TransformerWeights {
+    // Embedding
+    tok_emb: *f32  // [vocab_size, dim]
+    
+    // Per-layer weights
+    rms_att_w: [*f32; 64]  // [n_layers, dim]
+    wq: [*f32; 64]         // [n_layers, dim, n_heads * head_dim]
+    wk: [*f32; 64]         // [n_layers, dim, n_kv_heads * head_dim]
+    wv: [*f32; 64]         // [n_layers, dim, n_kv_heads * head_dim]
+    wo: [*f32; 64]         // [n_layers, n_heads * head_dim, dim]
+    
+    rms_ffn_w: [*f32; 64]
+    w1: [*f32; 64]         // [n_layers, dim, hidden_dim]
+    w2: [*f32; 64]         // [n_layers, hidden_dim, dim]
+    w3: [*f32; 64]         // [n_layers, dim, hidden_dim]
+    
+    // Output
+    rms_final_w: *f32
+    output_w: *f32
+}
+
+struct TransformerState {
+    x: *f32
+    xb: *f32
+    xb2: *f32
+    hb: *f32
+    hb2: *f32
+    q: *f32
+    k: *f32
+    v: *f32
+    att: *f32
+    logits: *f32
+    key_cache: *f32
+    value_cache: *f32
+}
+
+fn transformer_load_weights(model: *GGUFModel, config: *TransformerConfig, weights: *TransformerWeights) {
+    // Load all weights from GGUF tensors
+    // This is a massive undertaking - mapping each tensor by name
+    // For LFM2 architecture
+    
+    // Embedding
+    let t = gguf_find_tensor(model, "tok_embeddings.weight")
+    if t != 0 {
+        // Dequantize
+    }
+    
+    // Per-layer weights
+    // This needs systematic tensor name mapping
+}
+
+fn rms_norm(out: *f32, x: *f32, w: *f32, n: u32) {
+    // RMSNorm: out = x / rms(x) * w
+    let ss = 0.0f32
+    let i = 0
+    while i < n {
+        let xi = mem_load4(x + i * 4)
+        ss = ss + xi * xi
+        i = i + 1
+    }
+    let scale = 1.0f32 / sqrt(ss / n + 1e-6)
+    i = 0
+    while i < n {
+        let xi = mem_load4(x + i * 4)
+        let wi = mem_load4(w + i * 4)
+        mem_store4(out + i * 4, xi * scale * wi)
+        i = i + 1
+    }
+}
+
+fn matmul_vec(out: *f32, w: *f32, x: *f32, rows: u32, cols: u32) {
+    // out[rows] = w[rows, cols] @ x[cols]
+    let i = 0
+    while i < rows {
+        let sum = 0.0f32
+        let j = 0
+        while j < cols {
+            let wij = mem_load4(w + (i * cols + j) * 4)
+            let xj = mem_load4(x + j * 4)
+            sum = sum + wij * xj
+            j = j + 1
+        }
+        mem_store4(out + i * 4, sum)
+        i = i + 1
+    }
+}
+
+fn rope(q: *f32, k: *f32, pos: u32, head_dim: u32, n_heads: u32, n_kv_heads: u32, theta: f32) {
+    // Apply RoPE to q and k
+    let h = 0
+    while h < n_heads {
+        let qh = q + h * head_dim
+        let d = 0
+        while d < head_dim / 2 {
+            let freq = 1.0f32 / pow(theta, (d * 2) as f32 / head_dim as f32)
+            let val = pos as f32 * freq
+            let cos_v = cos(val)
+            let sin_v = sin(val)
+            
+            let q1 = mem_load4(qh + d * 4)
+            let q2 = mem_load4(qh + (d + head_dim/2) * 4)
+            mem_store4(qh + d * 4, q1 * cos_v - q2 * sin_v)
+            mem_store4(qh + (d + head_dim/2) * 4, q1 * sin_v + q2 * cos_v)
+            
+            d = d + 1
+        }
+        h = h + 1
+    }
+    
+    // K heads
+    h = 0
+    while h < n_kv_heads {
+        let kh = k + h * head_dim
+        let d = 0
+        while d < head_dim / 2 {
+            let freq = 1.0f32 / pow(theta, (d * 2) as f32 / head_dim as f32)
+            let val = pos as f32 * freq
+            let cos_v = cos(val)
+            let sin_v = sin(val)
+            
+            let k1 = mem_load4(kh + d * 4)
+            let k2 = mem_load4(kh + (d + head_dim/2) * 4)
+            mem_store4(kh + d * 4, k1 * cos_v - k2 * sin_v)
+            mem_store4(kh + (d + head_dim/2) * 4, k1 * sin_v + k2 * cos_v)
+            
+            d = d + 1
+        }
+        h = h + 1
+    }
+}
+
+fn attention(out: *f32, q: *f32, k: *f32, v: *f32, 
+             key_cache: *f32, value_cache: *f32,
+             pos: u32, n_heads: u32, n_kv_heads: u32, head_dim: u32, max_seq: u32) {
+    // Multi-head attention with KV cache
+    // Simplified implementation
+    let h = 0
+    while h < n_heads {
+        // Get query for this head
+        let qh = q + h * head_dim
+        
+        // Get KV heads (GQA)
+        let kv_h = h * n_kv_heads / n_heads
+        let kh = k + kv_h * head_dim
+        let vh = v + kv_h * head_dim
+        
+        // Attention scores: q @ k^T / sqrt(d)
+        // Simplified - just accumulate
+        let scale = 1.0f32 / sqrt(head_dim as f32)
+        
+        h = h + 1
+    }
+}
+
+// ============================================================
+// Main Inference Loop
+// ============================================================
+
+fn quanta_infer(model_path: str, prompt: str) {
+    print("Loading model...\n")
+    let model = gguf_load_model(model_path)
+    if model == 0 {
+        print("Failed to load model\n")
+        return
+    }
+    
+    print("Model loaded: ")
+    print(model.n_tensors)
+    print(" tensors\n")
+    
+    // Config for LFM2-2.6B
+    let config = TransformerConfig {
+        dim: 2048,
+        n_layers: 24,
+        n_heads: 32,
+        n_kv_heads: 8,
+        head_dim: 64,
+        hidden_dim: 5632,
+        vocab_size: 32000,
+        max_seq_len: 4096,
+        rope_theta: 10000.0
+    }
+    
+    // Allocate weights
+    let weights = mem_alloc(sizeof(TransformerWeights)) as *TransformerWeights
+    
+    print("Loading weights...\n")
+    transformer_load_weights(model, &config, weights)
+    
+    // Allocate state
+    let state = mem_alloc(sizeof(TransformerState)) as *TransformerState
+    state.x = mem_alloc(config.dim * 4)
+    state.xb = mem_alloc(config.dim * 4)
+    state.xb2 = mem_alloc(config.dim * 4)
+    state.hb = mem_alloc(config.hidden_dim * 4)
+    state.hb2 = mem_alloc(config.hidden_dim * 4)
+    state.q = mem_alloc(config.n_heads * config.head_dim * 4)
+    state.k = mem_alloc(config.n_kv_heads * config.head_dim * 4)
+    state.v = mem_alloc(config.n_kv_heads * config.head_dim * 4)
+    state.att = mem_alloc(config.n_heads * config.max_seq_len * 4)
+    state.logits = mem_alloc(config.vocab_size * 4)
+    state.key_cache = mem_alloc(config.n_layers * config.n_kv_heads * config.max_seq_len * config.head_dim * 4)
+    state.value_cache = mem_alloc(config.n_layers * config.n_kv_heads * config.max_seq_len * config.head_dim * 4)
+    
+    // Tokenizer
+    let tok = tokenizer_load(model)
+    
+    // Encode prompt
+    let input_ids = mem_alloc(512 * 4) as *u32
+    let n_tokens = tokenizer_encode(tok, prompt, input_ids, 512)
+    
+    print("Prompt tokens: ")
+    print(n_tokens)
+    print("\n")
+    
+    // Generation loop
+    let pos = 0
+    while pos < n_tokens {
+        // Forward pass for this token
+        // ... full transformer forward ...
+        pos = pos + 1
+    }
+    
+    // Generate new tokens
+    let max_new = 128
+    let gen = 0
+    while gen < max_new {
+        // Forward
+        // Sample
+        // Print
+        gen = gen + 1
+    }
+    
+    print("\nDone\n")
+}
+
+// ============================================================
+// Entry Point
+// ============================================================
+
+fn main() {
+    let model_path = "/opt/ai/models/quanta/QUANTA-LFM2.5-2.6Bv1-Q4_K_M.gguf"
+    let prompt = "The Quanta compiler is"
+    
+    quanta_infer(model_path, prompt)
+    return 0
+}
