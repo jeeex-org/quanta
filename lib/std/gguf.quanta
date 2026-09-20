@@ -63,22 +63,29 @@ fn gguf_load(path) {
     let fd = open(path, 0, 0)
     if fd < 0 { return -1 }
     gguf_fd = fd
+    
     let hdr = mem_alloc(24)
     let n = read_raw(fd, hdr, 24)
     if n < 24 { close(fd); gguf_fd = -1; return -2 }
+    
     let b0 = mem_load8(hdr)
     if b0 != 71 { close(fd); gguf_fd = -1; return -3 }
+    
     gguf_n_kv = mem_load(hdr + 8)
     gguf_n_tensors = mem_load(hdr + 16)
+    
     let klen_buf = mem_alloc(8)
     let vtype_buf = mem_alloc(4)
+    
     let i = 0
     while i < gguf_n_kv {
         read_raw(fd, klen_buf, 8)
         let klen = mem_load(klen_buf)
+        
         if klen > 100000 {
             i = gguf_n_kv
         } else {
+            // Skip key using read
             let skip_buf = mem_alloc(1024)
             let remaining = klen
             while remaining > 0 {
@@ -87,25 +94,32 @@ fn gguf_load(path) {
                 read_raw(fd, skip_buf, chunk)
                 remaining = remaining - chunk
             }
+            
             read_raw(fd, vtype_buf, 4)
             let vtype = mem_load(vtype_buf)
             gguf_skip_value_read(fd, vtype)
             i = i + 1
         }
     }
+    
+    // Use lseek to jump to tensor info
     let meta_end = lseek(fd, 0, 1)
     let tensor_info_pos = meta_end + 80
     lseek(fd, tensor_info_pos, 0)
+    
     gguf_tensors = mem_alloc(gguf_n_tensors * TINFO_SIZE)
+    
     let ti = 0
     while ti < gguf_n_tensors {
         let name = gguf_read_string(fd)
+        
         if name == 0 {
             ti = gguf_n_tensors
         } else {
             let ndims_buf = mem_alloc(4)
             read_raw(fd, ndims_buf, 4)
             let ndims = mem_load(ndims_buf)
+            
             if ndims > 10 {
                 ti = gguf_n_tensors
             } else {
@@ -117,21 +131,26 @@ fn gguf_load(path) {
                     mem_store(dims + d * 8, mem_load(dval))
                     d = d + 1
                 }
+                
                 let dtype_buf = mem_alloc(4)
                 read_raw(fd, dtype_buf, 4)
                 let dtype = mem_load(dtype_buf)
+                
                 let offset_buf = mem_alloc(8)
                 read_raw(fd, offset_buf, 8)
                 let offset = mem_load(offset_buf)
+                
                 mem_store(gguf_tensors + ti * TINFO_SIZE, name)
                 mem_store(gguf_tensors + ti * TINFO_SIZE + 8, ndims)
                 mem_store(gguf_tensors + ti * TINFO_SIZE + 16, dims)
                 mem_store(gguf_tensors + ti * TINFO_SIZE + 24, dtype)
                 mem_store(gguf_tensors + ti * TINFO_SIZE + 32, offset)
+                
                 ti = ti + 1
             }
         }
     }
+    
     return 0
 }
 
@@ -144,11 +163,13 @@ fn gguf_skip_array_read(fd) {
     let alen = mem_load(alen_buf)
     
     if atype == 8 {
+        // String array - read each string
         let j = 0
         while j < alen {
             let len_buf = mem_alloc(8)
             read_raw(fd, len_buf, 8)
             let slen = mem_load(len_buf)
+            // Skip string bytes in chunks
             let skip_buf = mem_alloc(1024)
             let remaining = slen
             while remaining > 0 {
@@ -160,6 +181,7 @@ fn gguf_skip_array_read(fd) {
             j = j + 1
         }
     } else if atype == 0 {
+        // UINT8 array - skip in chunks
         let skip_buf = mem_alloc(4096)
         let remaining = alen
         while remaining > 0 {
@@ -275,6 +297,7 @@ fn gguf_skip_value_read(fd, vtype) {
         let len_buf = mem_alloc(8)
         read_raw(fd, len_buf, 8)
         let slen = mem_load(len_buf)
+        // Skip string bytes in chunks
         let skip_buf = mem_alloc(1024)
         let remaining = slen
         while remaining > 0 {
@@ -322,6 +345,13 @@ fn gguf_skip_value_read(fd, vtype) {
         let skip = mem_alloc(4)
         read_raw(fd, skip, 4)
     }
+}
+
+fn gguf_read_string_from_buf(klen) {
+    let buf = mem_alloc(klen + 1)
+    read_raw(gguf_fd, buf, klen)
+    mem_store8(buf + klen, 0)
+    return buf
 }
 
 fn gguf_skip_value(fd, vtype) {
@@ -392,6 +422,56 @@ fn gguf_print_info() {
     }
 }
 
+fn gguf_read_tensor(idx) {
+    let name_ptr = gguf_tensor_name(idx)
+    let ndims = gguf_tensor_ndims(idx)
+    let dtype = gguf_tensor_dtype(idx)
+    let offset = gguf_tensor_offset(idx)
+    let nelements = gguf_tensor_nelements(idx)
+    
+    // Calculate byte size based on dtype
+    let elem_size = 4
+    if dtype == 0 { elem_size = 1 }
+    else if dtype == 1 { elem_size = 1 }
+    else if dtype == 2 { elem_size = 2 }
+    else if dtype == 3 { elem_size = 2 }
+    else if dtype == 6 { elem_size = 2 }
+    else if dtype == 7 { elem_size = 1 }
+    else if dtype == 8 { elem_size = 2 }
+    else if dtype == 9 { elem_size = 2 }
+    else if dtype == 10 { elem_size = 8 }
+    else if dtype == 11 { elem_size = 8 }
+    else if dtype == 12 { elem_size = 2 }
+    else if dtype == 14 { elem_size = 2 }
+    else if dtype == 15 { elem_size = 2 }
+    else if dtype == 16 { elem_size = 2 }
+    else if dtype == 17 { elem_size = 2 }
+    else if dtype == 18 { elem_size = 2 }
+    
+    let data_size = nelements * elem_size
+    let buf = mem_alloc(data_size)
+    
+    print("DBG: fd=")
+    print(gguf_fd)
+    print(" off=")
+    print(offset)
+    print(" sz=")
+    print(data_size)
+    print("\n")
+    
+    let rc = lseek(gguf_fd, offset, 0)
+    print("DBG: seek rc=")
+    print(rc)
+    print("\n")
+    
+    let n = read_raw(gguf_fd, buf, data_size)
+    print("DBG: read n=")
+    print(n)
+    print("\n")
+    
+    return buf
+}
+
 fn gguf_skip_array(fd) {
     let atype_buf = mem_alloc(4)
     read_raw(fd, atype_buf, 4)
@@ -399,7 +479,7 @@ fn gguf_skip_array(fd) {
     let alen_buf = mem_alloc(8)
     read_raw(fd, alen_buf, 8)
     let alen = mem_load(alen_buf)
-    
+
     if atype == 8 {
         let j = 0
         while j < alen {
@@ -471,27 +551,26 @@ fn gguf_find_tensor(name) {
     let i = 0
     while i < gguf_n_tensors {
         let tname = gguf_tensor_name(i)
-        if tname != 0 {
-            let match = 1
-            let j = 0
-            while j < name_len {
-                let tc = mem_load8(tname + j)
-                let nc = mem_load8(name + 8 + j)
-                if tc != nc {
-                    match = 0
-                    j = name_len
-                }
-                j = j + 1
-            }
-            if match == 1 {
-                if mem_load8(tname + name_len) == 0 {
-                    return i
-                }
-            }
+        let tlen = len(tname)
+        if tlen == name_len {
+            if gguf_str_eq(tname, name, tlen) { return i }
         }
         i = i + 1
     }
     return -1
+}
+
+fn gguf_str_eq(a, b, len) {
+    let j = 0
+    let ok = 1
+    while j < len {
+        if mem_load8(a + 8 + j) != mem_load8(b + 8 + j) {
+            ok = 0
+            j = len
+        }
+        j = j + 1
+    }
+    return ok
 }
 
 fn gguf_close() {
@@ -503,94 +582,3 @@ fn gguf_close() {
 
 fn gguf_num_tensors() { return gguf_n_tensors }
 fn gguf_get_fd() { return gguf_fd }
-
-fn gguf_read_tensor(idx) {
-    let ndims = gguf_tensor_ndims(idx)
-    let dtype = gguf_tensor_dtype(idx)
-    let offset = gguf_tensor_offset(idx)
-    let nelements = gguf_tensor_nelements(idx)
-    
-    let elem_size = 4
-    if dtype == 0 { elem_size = 1 }
-    else if dtype == 1 { elem_size = 1 }
-    else if dtype == 2 { elem_size = 2 }
-    else if dtype == 3 { elem_size = 2 }
-    else if dtype == 6 { elem_size = 2 }
-    else if dtype == 7 { elem_size = 1 }
-    else if dtype == 8 { elem_size = 2 }
-    else if dtype == 9 { elem_size = 2 }
-    else if dtype == 10 { elem_size = 8 }
-    else if dtype == 11 { elem_size = 8 }
-    else if dtype == 12 { elem_size = 2 }
-    else if dtype == 14 { elem_size = 2 }
-    else if dtype == 15 { elem_size = 2 }
-    else if dtype == 16 { elem_size = 2 }
-    else if dtype == 17 { elem_size = 2 }
-    else if dtype == 18 { elem_size = 2 }
-    
-    let data_size = nelements * elem_size
-    let buf = mem_alloc(data_size)
-    
-    lseek(gguf_fd, offset, 0)
-    read_raw(gguf_fd, buf, data_size)
-    
-    return buf
-}
-
-// Q4_K_M dequantization
-fn gguf_dequant_q4km(raw, nelements) {
-    let out = mem_alloc(nelements * 4)
-    let n_blocks = nelements / 256
-    
-    let bi = 0
-    while bi < n_blocks {
-        let bo = bi * 132
-        
-        let s0 = mem_load8(raw + bo)
-        let s1 = mem_load8(raw + bo + 1)
-        let scale = s0 + s1 * 256
-        
-        let m0 = mem_load8(raw + bo + 2)
-        let m1 = mem_load8(raw + bo + 3)
-        let min_val = m0 + m1 * 256
-        
-        let vi = 0
-        while vi < 256 {
-            let byte_idx = vi / 2
-            let byte_val = mem_load8(raw + bo + 4 + byte_idx)
-            
-            let nibble = 0
-            if vi % 2 == 0 {
-                nibble = byte_val / 16
-            } else {
-                nibble = byte_val % 16
-            }
-            
-            let val = (scale * nibble / 15) + min_val
-            mem_store(out + (bi * 256 + vi) * 4, val)
-            
-            vi = vi + 1
-        }
-        
-        bi = bi + 1
-    }
-    
-    return out
-}
-
-// Matrix-vector multiplication: y = A * x
-fn gguf_matvec(A, x, rows, cols, y) {
-    let i = 0
-    while i < rows {
-        let sum = 0
-        let j = 0
-        while j < cols {
-            let a_val = mem_load(A + (i * cols + j) * 4)
-            let x_val = mem_load(x + j * 4)
-            sum = sum + a_val * x_val
-            j = j + 1
-        }
-        mem_store(y + i * 4, sum)
-        i = i + 1
-    }
-}
