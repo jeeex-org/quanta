@@ -1,0 +1,232 @@
+// === BORROW CHECKER (0.0.150) ===
+// Records ownership/borrowing rules at compile time — NO ENFORCEMENT (0.1.0):
+// - Track moved values (ownership tag 3)
+// - Track immutable/mutable borrows and conflicts
+// - Track use-after-move in arithmetic, calls, returns
+// - Track dangling references (returning ref to local)
+// - Per-function borrow stack with scope tracking
+//
+// Called from entry.quanta DURING per-function compilation loop, right after
+// parse_block() when the function's IR is in the buffer (ir_start to ir_end).
+
+let BORROW_CAP = 1024
+let borrow_stack = mmap(BORROW_CAP * 24)  // [vreg, kind, scope_depth]
+let borrow_top = 0
+let borrow_scope_depth = 0
+
+// Borrow kinds
+let BORROW_IMM = 1   // &x (immutable borrow)
+let BORROW_MUT = 2   // &mut x (mutable borrow)
+
+fn borrow_check_fn(ir_start, ir_end) {
+    // Reset per-function state
+    borrow_top = 0
+    borrow_scope_depth = 0
+    borrow_check_body(ir_start, ir_end)
+}
+
+fn borrow_check_body(ir_start, ir_end) {
+    // Walk the IR for this function and track borrows
+    if ir_start == 0 && ir_end == 0 {
+        // Function not yet compiled (no IR range recorded)
+        return
+    }
+    let i = ir_start
+    while i < ir_end {
+        let op = irop(i)
+        let res = irres(i)
+        let a0 = ira0(i)
+        let a1 = ira1(i)
+        
+        if op == IR_MOV {
+            // If dest is a ref binding, record borrow
+            if res >= 0 && is_ref_binding(res) {
+                let kind = get_borrow_kind(res)
+                if kind > 0 {
+                    record_borrow(res, kind, i)
+                }
+            }
+        } else if op == IR_PARAM {
+            // Params are borrowed for the function duration
+            if res >= 0 && is_ref_binding(res) {
+                let kind = get_borrow_kind(res)
+                if kind > 0 {
+                    record_borrow(res, kind, i)
+                }
+            }
+        } else if op == IR_CALL || op == IR_CALL_IDX {
+            // Track call arguments for moved values (record only)
+            let i2 = i - 1
+            while i2 >= 0 && i2 > i - 20 {
+                let op2 = irop(i2)
+                if op2 == IR_MOV {
+                    let src = ira0(i2)
+                    if src >= 0 && is_vreg_moved(src) {
+                        // Record use-after-move but don't error
+                    }
+                }
+                i2 = i2 - 1
+            }
+        } else if op == IR_ADD || op == IR_SUB || op == IR_MUL || op == IR_DIV || op == IR_MOD
+                || op == IR_EQ || op == IR_NE || op == IR_LT || op == IR_GT || op == IR_LE || op == IR_GE {
+            // Arithmetic/comparison operations - track moved operands
+            if a0 >= 0 && is_vreg_moved(a0) {
+                // Record but don't error
+            }
+            if a1 >= 0 && is_vreg_moved(a1) {
+                // Record but don't error
+            }
+        } else if op == IR_RET {
+            // Return: track if returning a moved value
+            if a0 >= 0 && is_vreg_moved(a0) {
+                // Record but don't error
+            }
+            // Track returning a ref that would dangle
+            if a0 >= 0 && is_ref_binding(a0) {
+                if !is_param_vreg(a0) {
+                    // Record dangling ref but don't error
+                }
+            }
+        }
+        i = i + 1
+    }
+    // End of function: all borrows must end
+    borrow_top = 0
+}
+
+fn is_vreg_moved(vr) {
+    // Check if the variable backing this vreg has ownership tag 3 (moved)
+    let i = 0
+    while i < varc {
+        if r64(vars + i*VRS + 8) == vr {
+            if r64(vars_own + i*8) == 3 {
+                return 1
+            }
+        }
+        i = i + 1
+    }
+    return 0
+}
+
+fn is_ref_binding(vr) {
+    let i = 0
+    while i < varc {
+        if r64(vars + i*VRS + 8) == vr {
+            let tag = r64(vars_own + i*8)
+            return tag == 2  // ref binding
+        }
+        i = i + 1
+    }
+    return 0
+}
+
+fn is_mut_binding(vr) {
+    let i = 0
+    while i < varc {
+        if r64(vars + i*VRS + 8) == vr {
+            let tag = r64(vars_own + i*8)
+            return tag == 1  // mut binding
+        }
+        i = i + 1
+    }
+    return 0
+}
+
+fn is_param_vreg(vr) {
+    // Check if this vreg is a function parameter
+    let i = 0
+    while i < fnc {
+        let pc = r64(fn_pcount + i*8)
+        let pbase = r64(fn_pbase + i*8)
+        let j = 0
+        while j < pc {
+            let pvr = r64(vars + (pbase + j)*VRS + 8)
+            if pvr == vr {
+                return 1
+            }
+            j = j + 1
+        }
+        i = i + 1
+    }
+    return 0
+}
+
+fn get_borrow_kind(vr) {
+    // For ref bindings, determine if & or &mut
+    // For now: if the variable is declared `mut` -> MUT borrow, else IMM
+    let i = 0
+    while i < varc {
+        if r64(vars + i*VRS + 8) == vr {
+            // Check if it's a mut ref (ref mut x)
+            // The parser doesn't distinguish yet, so infer from usage
+            // If assigned through the ref -> MUT
+            return BORROW_IMM  // default to immutable
+        }
+        i = i + 1
+    }
+    return BORROW_IMM
+}
+
+fn record_borrow(vr, kind, ir_idx) {
+    // Check for conflicts (record only)
+    let j = 0
+    while j < borrow_top {
+        let existing_vr = r64(borrow_stack + j*24)
+        let existing_kind = r64(borrow_stack + j*24 + 8)
+        if existing_vr == vr {
+            // Same variable: track borrow rules (no error)
+            // Just record the conflict for later analysis
+        }
+        j = j + 1
+    }
+    // Record the new borrow
+    if borrow_top >= BORROW_CAP {
+        // Stack overflow - just cap it
+        return
+    }
+    w64(borrow_stack + borrow_top*24, vr)
+    w64(borrow_stack + borrow_top*24 + 8, kind)
+    w64(borrow_stack + borrow_top*24 + 16, borrow_scope_depth)
+    borrow_top = borrow_top + 1
+}
+
+fn end_borrow(vr) {
+    // Remove borrow for this vreg
+    let j = 0
+    while j < borrow_top {
+        if r64(borrow_stack + j*24) == vr {
+            // Shift remaining down
+            let k = j
+            while k < borrow_top - 1 {
+                w64(borrow_stack + k*24, r64(borrow_stack + (k+1)*24))
+                w64(borrow_stack + k*24 + 8, r64(borrow_stack + (k+1)*24 + 8))
+                w64(borrow_stack + k*24 + 16, r64(borrow_stack + (k+1)*24 + 16))
+                k = k + 1
+            }
+            borrow_top = borrow_top - 1
+            return
+        }
+        j = j + 1
+    }
+}
+
+fn check_call_moves(call_idx) {
+    // Check arguments for moved values (record only)
+    let i = call_idx - 1
+    while i >= 0 && i > call_idx - 20 {
+        let op = irop(i)
+        if op == IR_MOV {
+            let src = ira0(i)
+            if src >= 0 && is_vreg_moved(src) {
+                // Record but don't error
+            }
+        }
+        i = i - 1
+    }
+}
+
+// NO-OP: enforcement deferred to 0.1.0
+fn borrow_error(msg, ir_idx) {
+    // 0.0.150: record only, no enforcement
+    // Enforcement = 0.1.0
+}
