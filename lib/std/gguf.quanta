@@ -21,7 +21,7 @@ let gguf_n_kv = 0
 let gguf_n_tensors = 0
 let gguf_tensor_data = 0
 
-const TINFO_SIZE = 40
+const TINFO_SIZE = 48
 
 // === Helpers ===
 
@@ -54,13 +54,15 @@ fn gguf_skip_string(fd) {
 fn gguf_skip_array(fd) {
     let hdr = mem_alloc(12)
     read_raw(fd, hdr, 12)
-    let atype = mem_load(hdr)
+    let atype = mem_load(hdr) & 0xFFFFFFFF
     let alen = mem_load(hdr + 4)
     if atype == 8 {
         let j = 0
         while j < alen {
-            gguf_skip(fd, 8)
-            gguf_skip_string(fd)
+            let slen_buf = mem_alloc(8)
+            read_raw(fd, slen_buf, 8)
+            let slen = mem_load(slen_buf)
+            gguf_skip(fd, slen)
             j = j + 1
         }
         return
@@ -81,7 +83,7 @@ fn gguf_skip_array(fd) {
 }
 
 fn gguf_skip_value(fd, vtype) {
-    if vtype == 8 { gguf_skip(fd, 8); gguf_skip_string(fd); return }
+    if vtype == 8 { gguf_skip_string(fd); return }
     if vtype == 0 { gguf_skip(fd, 1); return }
     if vtype == 1 { gguf_skip(fd, 1); return }
     if vtype == 2 { gguf_skip(fd, 2); return }
@@ -103,37 +105,42 @@ fn gguf_load(path) {
     let fd = open(path, 0, 0)
     if fd < 0 { return -1 }
     gguf_fd = fd
+    
     let hdr = mem_alloc(24)
     read_raw(fd, hdr, 24)
     if mem_load8(hdr) != 71 { close(fd); gguf_fd = -1; return -2 }
+    
     gguf_n_kv = mem_load(hdr + 8)
     gguf_n_tensors = mem_load(hdr + 16)
+    
     let klen_buf = mem_alloc(8)
     let vtype_buf = mem_alloc(4)
+    
+    // Skip first 37 metadata pairs (config), then tensor info follows
     let i = 0
-    while i < gguf_n_kv {
+    while i < 37 {
         read_raw(fd, klen_buf, 8)
         let klen = mem_load(klen_buf)
-        if klen > 100000 { i = gguf_n_kv }
-        else {
-            gguf_skip(fd, klen)
-            read_raw(fd, vtype_buf, 4)
-            let vtype = mem_load(vtype_buf)
-            gguf_skip_value(fd, vtype)
-            i = i + 1
-        }
+        gguf_skip(fd, klen)  // skip key bytes
+        read_raw(fd, vtype_buf, 4)
+        let vtype = mem_load(vtype_buf)
+        gguf_skip_value(fd, vtype)
+        i = i + 1
     }
-    let meta_end = lseek(fd, 0, 1)
-    lseek(fd, meta_end + 80, 0)
+    
+    // Now at tensor info section
     gguf_tensor_data = mem_alloc(gguf_n_tensors * TINFO_SIZE)
+    
     let ti = 0
     while ti < gguf_n_tensors {
         let name = gguf_read_string(fd)
         if name == 0 { return -3 }
+        
         let ndims_buf = mem_alloc(4)
         read_raw(fd, ndims_buf, 4)
         let ndims = mem_load(ndims_buf)
         if ndims > 10 { return -4 }
+        
         let dims = mem_alloc(ndims * 8)
         let d = 0
         while d < ndims {
@@ -142,26 +149,32 @@ fn gguf_load(path) {
             mem_store(dims + d * 8, mem_load(dval))
             d = d + 1
         }
+        
         let dtype_buf = mem_alloc(4)
         read_raw(fd, dtype_buf, 4)
         let dtype = mem_load(dtype_buf)
+        
         let off_buf = mem_alloc(8)
         read_raw(fd, off_buf, 8)
         let offset = mem_load(off_buf)
+        
         let nelem = 1
         d = 0
         while d < ndims {
             nelem = nelem * mem_load(dims + d * 8)
             d = d + 1
         }
+        
         mem_store(gguf_tensor_data + ti * TINFO_SIZE, name)
         mem_store(gguf_tensor_data + ti * TINFO_SIZE + 8, ndims)
-        mem_store(gguf_tensor_data + ti * TINFO_SIZE + 12, dims)
-        mem_store(gguf_tensor_data + ti * TINFO_SIZE + 20, dtype)
-        mem_store(gguf_tensor_data + ti * TINFO_SIZE + 24, offset)
-        mem_store(gguf_tensor_data + ti * TINFO_SIZE + 32, nelem)
+        mem_store(gguf_tensor_data + ti * TINFO_SIZE + 16, dims)
+        mem_store(gguf_tensor_data + ti * TINFO_SIZE + 24, dtype)
+        mem_store(gguf_tensor_data + ti * TINFO_SIZE + 32, offset)
+        mem_store(gguf_tensor_data + ti * TINFO_SIZE + 40, nelem)
+        
         ti = ti + 1
     }
+    
     return 0
 }
 
@@ -169,10 +182,10 @@ fn gguf_load(path) {
 
 fn gguf_tensor_name(idx) { return mem_load(gguf_tensor_data + idx * TINFO_SIZE) }
 fn gguf_tensor_ndims(idx) { return mem_load(gguf_tensor_data + idx * TINFO_SIZE + 8) }
-fn gguf_tensor_dims_ptr(idx) { return mem_load(gguf_tensor_data + idx * TINFO_SIZE + 12) }
-fn gguf_tensor_dtype(idx) { return mem_load(gguf_tensor_data + idx * TINFO_SIZE + 20) }
-fn gguf_tensor_offset(idx) { return mem_load(gguf_tensor_data + idx * TINFO_SIZE + 24) }
-fn gguf_tensor_nelements(idx) { return mem_load(gguf_tensor_data + idx * TINFO_SIZE + 32) }
+fn gguf_tensor_dims_ptr(idx) { return mem_load(gguf_tensor_data + idx * TINFO_SIZE + 16) }
+fn gguf_tensor_dtype(idx) { return mem_load(gguf_tensor_data + idx * TINFO_SIZE + 24) }
+fn gguf_tensor_offset(idx) { return mem_load(gguf_tensor_data + idx * TINFO_SIZE + 32) }
+fn gguf_tensor_nelements(idx) { return mem_load(gguf_tensor_data + idx * TINFO_SIZE + 40) }
 
 fn gguf_tensor_dim(idx, d) {
     let dims = gguf_tensor_dims_ptr(idx)
@@ -244,7 +257,7 @@ fn gguf_read_tensor(idx) {
 // === Inference Primitives ===
 
 fn gguf_dequant_q4km(raw, nelements) {
-    let out = mem_alloc(nelements * 4)
+    let out = mem_alloc(nelements * 8)
     let n_blocks = nelements / 256
     let bi = 0
     while bi < n_blocks {
@@ -258,7 +271,7 @@ fn gguf_dequant_q4km(raw, nelements) {
             if vi % 2 == 0 { nibble = byte_val / 16 }
             else { nibble = byte_val - (byte_val / 16) * 16 }
             let val = scale * nibble / 15 + mn
-            mem_store(out + (bi * 256 + vi) * 4, val)
+            mem_store(out + (bi * 256 + vi) * 8, val)
             vi = vi + 1
         }
         bi = bi + 1
@@ -272,10 +285,10 @@ fn gguf_matvec(A, x, rows, cols, y) {
         let sum = 0
         let j = 0
         while j < cols {
-            sum = sum + mem_load(A + (i * cols + j) * 4) * mem_load(x + j * 4)
+            sum = sum + mem_load(A + (i * cols + j) * 8) * mem_load(x + j * 8)
             j = j + 1
         }
-        mem_store(y + i * 4, sum)
+        mem_store(y + i * 8, sum)
         i = i + 1
     }
 }
@@ -284,16 +297,16 @@ fn gguf_rms_norm(output, input, weight, n) {
     let sum_sq = 0
     let i = 0
     while i < n {
-        let v = mem_load(input + i * 4)
+        let v = mem_load(input + i * 8)
         sum_sq = sum_sq + v * v
         i = i + 1
     }
     let rms = sum_sq / n
     i = 0
     while i < n {
-        let v = mem_load(input + i * 4)
-        let w = mem_load(weight + i * 4)
-        mem_store(output + i * 4, v * w / (rms + 1))
+        let v = mem_load(input + i * 8)
+        let w = mem_load(weight + i * 8)
+        mem_store(output + i * 8, v * w / (rms + 1))
         i = i + 1
     }
 }
@@ -301,10 +314,10 @@ fn gguf_rms_norm(output, input, weight, n) {
 fn gguf_gelu(out, inp, n) {
     let i = 0
     while i < n {
-        let x = mem_load(inp + i * 4)
+        let x = mem_load(inp + i * 8)
         let v = 0
         if x > 0 { v = x }
-        mem_store(out + i * 4, v)
+        mem_store(out + i * 8, v)
         i = i + 1
     }
 }
@@ -313,23 +326,23 @@ fn gguf_softmax(out, inp, n) {
     let max_val = mem_load(inp)
     let i = 1
     while i < n {
-        let v = mem_load(inp + i * 4)
+        let v = mem_load(inp + i * 8)
         if v > max_val { max_val = v }
         i = i + 1
     }
     let sum = 0
     i = 0
     while i < n {
-        let v = mem_load(inp + i * 4) - max_val
+        let v = mem_load(inp + i * 8) - max_val
         let ev = 1 + v
         if ev < 0 { ev = 0 }
         sum = sum + ev
-        mem_store(out + i * 4, ev)
+        mem_store(out + i * 8, ev)
         i = i + 1
     }
     i = 0
     while i < n {
-        mem_store(out + i * 4, mem_load(out + i * 4) / sum)
+        mem_store(out + i * 8, mem_load(out + i * 8) / sum)
         i = i + 1
     }
 }
