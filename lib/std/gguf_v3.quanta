@@ -1,0 +1,30 @@
+import std/fs
+
+let GGUF_TYPE_F32 = 0
+let GGUF_TYPE_F16 = 1
+let GGUF_TYPE_Q4_K = 12
+
+let gguf_fd = -1
+let gguf_n_kv = 0
+let gguf_n_tensors = 0
+let gguf_tensors = 0
+
+const TINFO_SIZE = 64
+
+fn gguf_read_string(fd) {
+    let len_buf = mem_alloc(8)
+    let n = file_read(fd, len_buf, 8)
+    if n < 8 { return 0 }
+    let len = mem_load(len_buf)
+    if len == 0 { return 0 }
+    let buf = mem_alloc(len + 1)
+    let r = file_read(fd, buf, len)
+    if r < len { return 0 }
+    mem_store8(buf + len, 0)
+    return buf
+}
+
+fn gguf_skip(fd, n) {
+    if n <= 0 { return }
+    lseek(fd, n, 1)
+}
