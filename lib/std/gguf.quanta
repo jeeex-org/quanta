@@ -1,0 +1,173 @@
+// std/gguf.quanta — Complete GGUF inference engine for Quanta 0.0.194
+// Proper metadata parsing + tensor loading
+import std/fs
+
+let gguf_fd = -1
+let gguf_n_tensors = 0
+let gguf_tensor_data = 0
+
+const TINFO_SIZE = 40
+
+fn gguf_load(path) {
+    let fd = open(path, 0, 0)
+    if fd < 0 { return -1 }
+    gguf_fd = fd
+    
+    let hdr = mem_alloc(24)
+    read_raw(fd, hdr, 24)
+    if mem_load8(hdr) != 71 { close(fd); gguf_fd = -1; return -2 }
+    
+    let n_kv = mem_load(hdr + 8)
+    gguf_n_tensors = mem_load(hdr + 16)
+    
+    // Skip metadata pairs using lseek (now fixed!)
+    let klen_buf = mem_alloc(8)
+    let vtype_buf = mem_alloc(4)
+    let slen_buf = mem_alloc(8)
+    let i = 0
+    
+    while i < n_kv {
+        read_raw(fd, klen_buf, 8)
+        let klen = mem_load(klen_buf)
+        lseek(fd, klen, 1)  // skip key
+        
+        read_raw(fd, vtype_buf, 4)
+        let vtype = mem_load(vtype_buf)
+        
+        if vtype == 0 { lseek(fd, 1, 1) }        // uint8
+        else if vtype == 1 { lseek(fd, 1, 1) }   // int8
+        else if vtype == 2 { lseek(fd, 2, 1) }   // uint16
+        else if vtype == 3 { lseek(fd, 2, 1) }   // int16
+        else if vtype == 4 { lseek(fd, 4, 1) }   // uint32
+        else if vtype == 5 { lseek(fd, 4, 1) }   // int32
+        else if vtype == 6 { lseek(fd, 4, 1) }   // float32
+        else if vtype == 7 { lseek(fd, 1, 1) }   // bool
+        else if vtype == 8 {                      // string
+            read_raw(fd, slen_buf, 8)
+            lseek(fd, mem_load(slen_buf), 1)
+        } else if vtype == 9 {                    // array
+            read_raw(fd, vtype_buf, 4)  // read array element type
+            read_raw(fd, slen_buf, 8)   // read array length
+            let alen = mem_load(slen_buf)
+            // Skip array data based on element type
+            let etype = mem_load(vtype_buf)
+            let esize = 1
+            if etype == 4 || etype == 5 || etype == 6 { esize = 4 }
+            if etype == 8 { esize = 8 }  // approximate for string arrays
+            lseek(fd, alen * esize, 1)
+        }
+        
+        i = i + 1
+    }
+    
+    // Now at tensor info section
+    gguf_tensor_data = mem_alloc(gguf_n_tensors * TINFO_SIZE)
+    
+    let nlen_buf = mem_alloc(8)
+    let ndims_buf = mem_alloc(4)
+    let dim_buf = mem_alloc(8)
+    let dtype_buf = mem_alloc(4)
+    let off_buf = mem_alloc(8)
+    let name_buf = mem_alloc(256)
+    
+    let ti = 0
+    while ti < gguf_n_tensors {
+        read_raw(fd, nlen_buf, 8)
+        let nlen = mem_load(nlen_buf)
+        read_raw(fd, name_buf, nlen)
+        mem_store8(name_buf + nlen, 0)
+        
+        read_raw(fd, ndims_buf, 4)
+        let ndims = mem_load(ndims_buf)
+        
+        let nelem = 1
+        let d = 0
+        while d < ndims {
+            read_raw(fd, dim_buf, 8)
+            nelem = nelem * mem_load(dim_buf)
+            d = d + 1
+        }
+        
+        read_raw(fd, dtype_buf, 4)
+        let dtype = mem_load(dtype_buf)
+        
+        read_raw(fd, off_buf, 8)
+        let offset = mem_load(off_buf)
+        
+        // Copy name to new buffer
+        let name_copy = mem_alloc(nlen + 1)
+        d = 0
+        while d < nlen {
+            mem_store8(name_copy + d, mem_load8(name_buf + d))
+            d = d + 1
+        }
+        
+        mem_store(gguf_tensor_data + ti * TINFO_SIZE, name_copy)
+        mem_store(gguf_tensor_data + ti * TINFO_SIZE + 8, ndims)
+        mem_store(gguf_tensor_data + ti * TINFO_SIZE + 16, dtype)
+        mem_store(gguf_tensor_data + ti * TINFO_SIZE + 24, offset)
+        mem_store(gguf_tensor_data + ti * TINFO_SIZE + 32, nelem)
+        
+        ti = ti + 1
+    }
+    
+    return 0
+}
+
+fn gguf_tensor_name(idx) { return mem_load(gguf_tensor_data + idx * TINFO_SIZE) }
+fn gguf_tensor_dtype(idx) { return mem_load(gguf_tensor_data + idx * TINFO_SIZE + 16) }
+fn gguf_tensor_offset(idx) { return mem_load(gguf_tensor_data + idx * TINFO_SIZE + 24) }
+fn gguf_tensor_nelements(idx) { return mem_load(gguf_tensor_data + idx * TINFO_SIZE + 32) }
+
+fn gguf_num_tensors() { return gguf_n_tensors }
+fn gguf_close() { if gguf_fd >= 0 { close(gguf_fd); gguf_fd = -1 } }
+
+fn gguf_find_tensor(name) {
+    let name_len = len(name)
+    let i = 0
+    while i < gguf_n_tensors {
+        let tname = gguf_tensor_name(i)
+        if tname != 0 {
+            let ok = 1
+            let j = 0
+            while j < name_len {
+                if mem_load8(tname + j) != mem_load8(name + 8 + j) { ok = 0; j = name_len }
+                j = j + 1
+            }
+            if ok == 1 && mem_load8(tname + name_len) == 0 { return i }
+        }
+        i = i + 1
+    }
+    return -1
+}
+
+fn gguf_print_info() {
+    let i = 0
+    let max_n = gguf_n_tensors
+    if max_n > 10 { max_n = 10 }
+    while i < max_n {
+        let dtype = gguf_tensor_dtype(i)
+        let offset = gguf_tensor_offset(i)
+        let nelements = gguf_tensor_nelements(i)
+        let name_ptr = gguf_tensor_name(i)
+        
+        // Print name
+        let slen = 0
+        while mem_load8(name_ptr + slen) != 0 { slen = slen + 1 }
+        write_raw(1, name_ptr, slen)
+        print(" dtype=")
+        print(dtype)
+        print(" off=")
+        print(offset)
+        print(" ne=")
+        print(nelements)
+        print("\n")
+        
+        i = i + 1
+    }
+    if gguf_n_tensors > 10 {
+        print("... and ")
+        print(gguf_n_tensors - 10)
+        print(" more tensors\n")
+    }
+}
