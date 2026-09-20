@@ -547,13 +547,31 @@ fn gguf_tensor_nelements(idx) {
 }
 
 fn gguf_find_tensor(name) {
+    // name is a Quanta string (8-byte length prefix + bytes)
+    // Tensor names are C strings (null-terminated, no prefix)
     let name_len = len(name)
     let i = 0
     while i < gguf_n_tensors {
         let tname = gguf_tensor_name(i)
-        let tlen = len(tname)
-        if tlen == name_len {
-            if gguf_str_eq(tname, name, tlen) { return i }
+        if tname != 0 {
+            // Compare: check if C string tname matches Quanta string name
+            let match = 1
+            let j = 0
+            while j < name_len {
+                let tc = mem_load8(tname + j)
+                let nc = mem_load8(name + 8 + j)
+                if tc != nc {
+                    match = 0
+                    j = name_len
+                }
+                j = j + 1
+            }
+            if match == 1 {
+                // Check that tname is also terminated at same position
+                if mem_load8(tname + name_len) == 0 {
+                    return i
+                }
+            }
         }
         i = i + 1
     }
