@@ -578,6 +578,18 @@ fn emit_bltn(nmi,nl,ii) {
         ri(7,127); ri(0,60); sysc()
         return 1
     }
+    // lseek(fd, offset, whence) -> new_offset (sc 8)
+    if nl==5&&r8(nm)=='l'&&r8(nm+1)=='s'&&r8(nm+2)=='e'&&r8(nm+3)=='e'&&r8(nm+4)=='k' {
+        flush_all()
+        let sc_base = ira2(ii)
+        let a0 = irres(sc_base)
+        let a1 = irres(sc_base + 1)
+        let a2 = irres(sc_base + 2)
+        lbase(spill_home(a0), 7)   // rdi = fd
+        lbase(spill_home(a1), 6)   // rsi = offset
+        lbase(spill_home(a2), 2)   // rdx = whence
+        ri(0,8); sysc(); return 1
+    }
     // free(ptr): munmap(ptr, len) where len = *(ptr) (the header = element count).
     //   mmap rounds the base up to a page, so the region starting at the user
     //   pointer (mapped length n*8+8) is exactly one page; unmapping len bytes
