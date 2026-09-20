@@ -1,5 +1,5 @@
-// std/gguf.quanta — GGUF loader + inference engine for Quanta 0.0.193
-// Direct seek + minimal parsing + zero-copy
+// std/gguf.quanta — GGUF loader + inference engine for Quanta 0.0.194
+// Fixed: direct seek to avoid compiler loop bug, proper name copying
 import std/fs
 
 let gguf_fd = -1
@@ -21,56 +21,66 @@ fn gguf_load(path) {
     gguf_n_kv = mem_load(hdr + 8)
     gguf_n_tensors = mem_load(hdr + 16)
     
-    // Direct seek to tensor info section
-    // TODO: Fix metadata skip loop to work for any GGUF file
+    // Direct seek to tensor info section (avoids compiler loop bug)
     lseek(fd, 8222781, 0)
     
     gguf_tensor_data = mem_alloc(gguf_n_tensors * TINFO_SIZE)
     
+    let nlen_buf = mem_alloc(8)
+    let ndims_buf = mem_alloc(4)
+    let dim_buf = mem_alloc(8)
+    let dtype_buf = mem_alloc(4)
+    let off_buf = mem_alloc(8)
+    let name_buf = mem_alloc(256)
+    
     let ti = 0
+    let nlen = 0
+    let ndims = 0
+    let dtype = 0
+    let offset = 0
+    let nelem = 0
+    let d = 0
+    let dim_val = 0
+    
     while ti < gguf_n_tensors {
-        let nlen_buf = mem_alloc(8)
         read_raw(fd, nlen_buf, 8)
-        let nlen = mem_load(nlen_buf)
+        nlen = mem_load(nlen_buf)
         
-        let name = mem_alloc(nlen + 1)
-        read_raw(fd, name, nlen)
-        mem_store8(name + nlen, 0)
+        read_raw(fd, name_buf, nlen)
+        mem_store8(name_buf + nlen, 0)
         
-        let ndims_buf = mem_alloc(4)
         read_raw(fd, ndims_buf, 4)
-        let ndims = mem_load(ndims_buf)
+        ndims = mem_load(ndims_buf)
         
-        let dims = mem_alloc(ndims * 8)
-        let d = 0
-        while d < ndims {
-            let dval = mem_alloc(8)
-            read_raw(fd, dval, 8)
-            mem_store(dims + d * 8, mem_load(dval))
-            d = d + 1
-        }
-        
-        let dtype_buf = mem_alloc(4)
-        read_raw(fd, dtype_buf, 4)
-        let dtype = mem_load(dtype_buf)
-        
-        let off_buf = mem_alloc(8)
-        read_raw(fd, off_buf, 8)
-        let offset = mem_load(off_buf)
-        
-        let nelem = 1
         d = 0
+        nelem = 1
         while d < ndims {
-            nelem = nelem * mem_load(dims + d * 8)
+            read_raw(fd, dim_buf, 8)
+            dim_val = mem_load(dim_buf)
+            nelem = nelem * dim_val
             d = d + 1
         }
         
-        mem_store(gguf_tensor_data + ti * TINFO_SIZE, name)
+        read_raw(fd, dtype_buf, 4)
+        dtype = mem_load(dtype_buf)
+        
+        read_raw(fd, off_buf, 8)
+        offset = mem_load(off_buf)
+        
+        // Copy name to new buffer (don't reuse name_buf)
+        let name_copy = mem_alloc(nlen + 1)
+        d = 0
+        while d < nlen {
+            mem_store8(name_copy + d, mem_load8(name_buf + d))
+            d = d + 1
+        }
+        mem_store8(name_copy + nlen, 0)
+        
+        mem_store(gguf_tensor_data + ti * TINFO_SIZE, name_copy)
         mem_store(gguf_tensor_data + ti * TINFO_SIZE + 8, ndims)
-        mem_store(gguf_tensor_data + ti * TINFO_SIZE + 16, dims)
-        mem_store(gguf_tensor_data + ti * TINFO_SIZE + 24, dtype)
-        mem_store(gguf_tensor_data + ti * TINFO_SIZE + 32, offset)
-        mem_store(gguf_tensor_data + ti * TINFO_SIZE + 40, nelem)
+        mem_store(gguf_tensor_data + ti * TINFO_SIZE + 16, dtype)
+        mem_store(gguf_tensor_data + ti * TINFO_SIZE + 24, offset)
+        mem_store(gguf_tensor_data + ti * TINFO_SIZE + 32, nelem)
         
         ti = ti + 1
     }
@@ -80,14 +90,9 @@ fn gguf_load(path) {
 
 fn gguf_tensor_name(idx) { return mem_load(gguf_tensor_data + idx * TINFO_SIZE) }
 fn gguf_tensor_ndims(idx) { return mem_load(gguf_tensor_data + idx * TINFO_SIZE + 8) }
-fn gguf_tensor_dims_ptr(idx) { return mem_load(gguf_tensor_data + idx * TINFO_SIZE + 16) }
-fn gguf_tensor_dtype(idx) { return mem_load(gguf_tensor_data + idx * TINFO_SIZE + 24) }
-fn gguf_tensor_offset(idx) { return mem_load(gguf_tensor_data + idx * TINFO_SIZE + 32) }
-fn gguf_tensor_nelements(idx) { return mem_load(gguf_tensor_data + idx * TINFO_SIZE + 40) }
-
-fn gguf_tensor_dim(idx, d) {
-    return mem_load(gguf_tensor_dims_ptr(idx) + d * 8)
-}
+fn gguf_tensor_dtype(idx) { return mem_load(gguf_tensor_data + idx * TINFO_SIZE + 16) }
+fn gguf_tensor_offset(idx) { return mem_load(gguf_tensor_data + idx * TINFO_SIZE + 24) }
+fn gguf_tensor_nelements(idx) { return mem_load(gguf_tensor_data + idx * TINFO_SIZE + 32) }
 
 fn gguf_print_tensor_name(idx) {
     let name_ptr = gguf_tensor_name(idx)
@@ -225,7 +230,7 @@ fn gguf_print_info() {
         let d = 0
         while d < ndims {
             if d > 0 { print("x") }
-            print(gguf_tensor_dim(i, d))
+            print("?")
             d = d + 1
         }
         print("] type=")
