@@ -63,95 +63,413 @@ fn gguf_load(path) {
     let fd = open(path, 0, 0)
     if fd < 0 { return -1 }
     gguf_fd = fd
-
+    
     let hdr = mem_alloc(24)
     let n = read_raw(fd, hdr, 24)
     if n < 24 { close(fd); gguf_fd = -1; return -2 }
-
+    
     let b0 = mem_load8(hdr)
     if b0 != 71 { close(fd); gguf_fd = -1; return -3 }
-
+    
     gguf_n_kv = mem_load(hdr + 8)
     gguf_n_tensors = mem_load(hdr + 16)
-
+    
+    let klen_buf = mem_alloc(8)
+    let vtype_buf = mem_alloc(4)
+    
     let i = 0
     while i < gguf_n_kv {
-        let key = gguf_read_string(fd)
-        if key != 0 {
-            let vtype_buf = mem_alloc(4)
+        read_raw(fd, klen_buf, 8)
+        let klen = mem_load(klen_buf)
+        
+        if klen > 100000 {
+            i = gguf_n_kv
+        } else {
+            // Skip key using read
+            let skip_buf = mem_alloc(1024)
+            let remaining = klen
+            while remaining > 0 {
+                let chunk = 1024
+                if remaining < chunk { chunk = remaining }
+                read_raw(fd, skip_buf, chunk)
+                remaining = remaining - chunk
+            }
+            
             read_raw(fd, vtype_buf, 4)
             let vtype = mem_load(vtype_buf)
-
-            if vtype == 8 {
-                gguf_read_string(fd)
-            } else if vtype == 0 {
-                gguf_skip(fd, 1)
-            } else if vtype == 1 {
-                gguf_skip(fd, 1)
-            } else if vtype == 2 {
-                gguf_skip(fd, 2)
-            } else if vtype == 3 {
-                gguf_skip(fd, 2)
-            } else if vtype == 4 {
-                gguf_skip(fd, 4)
-            } else if vtype == 5 {
-                gguf_skip(fd, 4)
-            } else if vtype == 6 {
-                gguf_skip(fd, 4)
-            } else if vtype == 7 {
-                gguf_skip(fd, 1)
-            } else if vtype == 9 {
-                gguf_skip_array(fd)
-            } else if vtype == 10 {
-                gguf_skip(fd, 8)
-            } else if vtype == 11 {
-                gguf_skip(fd, 8)
-            } else if vtype == 12 {
-                gguf_skip(fd, 8)
-            } else {
-                gguf_skip(fd, 4)
-            }
+            gguf_skip_value_read(fd, vtype)
+            i = i + 1
         }
-        i = i + 1
     }
-
+    
+    // Use lseek to jump to tensor info
+    let meta_end = lseek(fd, 0, 1)
+    let tensor_info_pos = meta_end + 80
+    lseek(fd, tensor_info_pos, 0)
+    
     gguf_tensors = mem_alloc(gguf_n_tensors * TINFO_SIZE)
-
+    
     let ti = 0
     while ti < gguf_n_tensors {
         let name = gguf_read_string(fd)
+        
+        if name == 0 {
+            ti = gguf_n_tensors
+        } else {
+            let ndims_buf = mem_alloc(4)
+            read_raw(fd, ndims_buf, 4)
+            let ndims = mem_load(ndims_buf)
+            
+            if ndims > 10 {
+                ti = gguf_n_tensors
+            } else {
+                let dims = mem_alloc(ndims * 8)
+                let d = 0
+                while d < ndims {
+                    let dval = mem_alloc(8)
+                    read_raw(fd, dval, 8)
+                    mem_store(dims + d * 8, mem_load(dval))
+                    d = d + 1
+                }
+                
+                let dtype_buf = mem_alloc(4)
+                read_raw(fd, dtype_buf, 4)
+                let dtype = mem_load(dtype_buf)
+                
+                let offset_buf = mem_alloc(8)
+                read_raw(fd, offset_buf, 8)
+                let offset = mem_load(offset_buf)
+                
+                mem_store(gguf_tensors + ti * TINFO_SIZE, name)
+                mem_store(gguf_tensors + ti * TINFO_SIZE + 8, ndims)
+                mem_store(gguf_tensors + ti * TINFO_SIZE + 16, dims)
+                mem_store(gguf_tensors + ti * TINFO_SIZE + 24, dtype)
+                mem_store(gguf_tensors + ti * TINFO_SIZE + 32, offset)
+                
+                ti = ti + 1
+            }
+        }
+    }
+    
+    return 0
+}
 
-        let ndims_buf = mem_alloc(4)
-        read_raw(fd, ndims_buf, 4)
-        let ndims = mem_load(ndims_buf)
+fn gguf_skip_array_read(fd) {
+    let atype_buf = mem_alloc(4)
+    read_raw(fd, atype_buf, 4)
+    let atype = mem_load(atype_buf)
+    let alen_buf = mem_alloc(8)
+    read_raw(fd, alen_buf, 8)
+    let alen = mem_load(alen_buf)
+    
+    if atype == 8 {
+        // String array - read each string
+        let j = 0
+        while j < alen {
+            let len_buf = mem_alloc(8)
+            read_raw(fd, len_buf, 8)
+            let slen = mem_load(len_buf)
+            // Skip string bytes in chunks
+            let skip_buf = mem_alloc(1024)
+            let remaining = slen
+            while remaining > 0 {
+                let chunk = 1024
+                if remaining < chunk { chunk = remaining }
+                read_raw(fd, skip_buf, chunk)
+                remaining = remaining - chunk
+            }
+            j = j + 1
+        }
+    } else if atype == 0 {
+        // UINT8 array - skip in chunks
+        let skip_buf = mem_alloc(4096)
+        let remaining = alen
+        while remaining > 0 {
+            let chunk = 4096
+            if remaining < chunk { chunk = remaining }
+            read_raw(fd, skip_buf, chunk)
+            remaining = remaining - chunk
+        }
+    } else if atype == 1 {
+        let skip_buf = mem_alloc(4096)
+        let remaining = alen
+        while remaining > 0 {
+            let chunk = 4096
+            if remaining < chunk { chunk = remaining }
+            read_raw(fd, skip_buf, chunk)
+            remaining = remaining - chunk
+        }
+    } else if atype == 2 {
+        let skip_buf = mem_alloc(4096)
+        let remaining = alen * 2
+        while remaining > 0 {
+            let chunk = 4096
+            if remaining < chunk { chunk = remaining }
+            read_raw(fd, skip_buf, chunk)
+            remaining = remaining - chunk
+        }
+    } else if atype == 3 {
+        let skip_buf = mem_alloc(4096)
+        let remaining = alen * 2
+        while remaining > 0 {
+            let chunk = 4096
+            if remaining < chunk { chunk = remaining }
+            read_raw(fd, skip_buf, chunk)
+            remaining = remaining - chunk
+        }
+    } else if atype == 4 {
+        let skip_buf = mem_alloc(4096)
+        let remaining = alen * 4
+        while remaining > 0 {
+            let chunk = 4096
+            if remaining < chunk { chunk = remaining }
+            read_raw(fd, skip_buf, chunk)
+            remaining = remaining - chunk
+        }
+    } else if atype == 5 {
+        let skip_buf = mem_alloc(4096)
+        let remaining = alen * 4
+        while remaining > 0 {
+            let chunk = 4096
+            if remaining < chunk { chunk = remaining }
+            read_raw(fd, skip_buf, chunk)
+            remaining = remaining - chunk
+        }
+    } else if atype == 6 {
+        let skip_buf = mem_alloc(4096)
+        let remaining = alen * 4
+        while remaining > 0 {
+            let chunk = 4096
+            if remaining < chunk { chunk = remaining }
+            read_raw(fd, skip_buf, chunk)
+            remaining = remaining - chunk
+        }
+    } else if atype == 7 {
+        let skip_buf = mem_alloc(4096)
+        let remaining = alen
+        while remaining > 0 {
+            let chunk = 4096
+            if remaining < chunk { chunk = remaining }
+            read_raw(fd, skip_buf, chunk)
+            remaining = remaining - chunk
+        }
+    } else if atype == 10 {
+        let skip_buf = mem_alloc(4096)
+        let remaining = alen * 8
+        while remaining > 0 {
+            let chunk = 4096
+            if remaining < chunk { chunk = remaining }
+            read_raw(fd, skip_buf, chunk)
+            remaining = remaining - chunk
+        }
+    } else if atype == 11 {
+        let skip_buf = mem_alloc(4096)
+        let remaining = alen * 8
+        while remaining > 0 {
+            let chunk = 4096
+            if remaining < chunk { chunk = remaining }
+            read_raw(fd, skip_buf, chunk)
+            remaining = remaining - chunk
+        }
+    } else if atype == 12 {
+        let skip_buf = mem_alloc(4096)
+        let remaining = alen * 8
+        while remaining > 0 {
+            let chunk = 4096
+            if remaining < chunk { chunk = remaining }
+            read_raw(fd, skip_buf, chunk)
+            remaining = remaining - chunk
+        }
+    } else {
+        let skip_buf = mem_alloc(4096)
+        let remaining = alen * 4
+        while remaining > 0 {
+            let chunk = 4096
+            if remaining < chunk { chunk = remaining }
+            read_raw(fd, skip_buf, chunk)
+            remaining = remaining - chunk
+        }
+    }
+}
 
-        let dims = mem_alloc(ndims * 8)
+fn gguf_skip_value_read(fd, vtype) {
+    if vtype == 8 {
+        let len_buf = mem_alloc(8)
+        read_raw(fd, len_buf, 8)
+        let slen = mem_load(len_buf)
+        // Skip string bytes in chunks
+        let skip_buf = mem_alloc(1024)
+        let remaining = slen
+        while remaining > 0 {
+            let chunk = 1024
+            if remaining < chunk { chunk = remaining }
+            read_raw(fd, skip_buf, chunk)
+            remaining = remaining - chunk
+        }
+    } else if vtype == 0 {
+        let skip = mem_alloc(1)
+        read_raw(fd, skip, 1)
+    } else if vtype == 1 {
+        let skip = mem_alloc(1)
+        read_raw(fd, skip, 1)
+    } else if vtype == 2 {
+        let skip = mem_alloc(2)
+        read_raw(fd, skip, 2)
+    } else if vtype == 3 {
+        let skip = mem_alloc(2)
+        read_raw(fd, skip, 2)
+    } else if vtype == 4 {
+        let skip = mem_alloc(4)
+        read_raw(fd, skip, 4)
+    } else if vtype == 5 {
+        let skip = mem_alloc(4)
+        read_raw(fd, skip, 4)
+    } else if vtype == 6 {
+        let skip = mem_alloc(4)
+        read_raw(fd, skip, 4)
+    } else if vtype == 7 {
+        let skip = mem_alloc(1)
+        read_raw(fd, skip, 1)
+    } else if vtype == 9 {
+        gguf_skip_array_read(fd)
+    } else if vtype == 10 {
+        let skip = mem_alloc(8)
+        read_raw(fd, skip, 8)
+    } else if vtype == 11 {
+        let skip = mem_alloc(8)
+        read_raw(fd, skip, 8)
+    } else if vtype == 12 {
+        let skip = mem_alloc(8)
+        read_raw(fd, skip, 8)
+    } else {
+        let skip = mem_alloc(4)
+        read_raw(fd, skip, 4)
+    }
+}
+
+fn gguf_read_string_from_buf(klen) {
+    let buf = mem_alloc(klen + 1)
+    read_raw(gguf_fd, buf, klen)
+    mem_store8(buf + klen, 0)
+    return buf
+}
+
+fn gguf_skip_value(fd, vtype) {
+    if vtype == 8 {
+        let s = gguf_read_string(fd)
+    } else if vtype == 0 {
+        gguf_skip(fd, 1)
+    } else if vtype == 1 {
+        gguf_skip(fd, 1)
+    } else if vtype == 2 {
+        gguf_skip(fd, 2)
+    } else if vtype == 3 {
+        gguf_skip(fd, 2)
+    } else if vtype == 4 {
+        gguf_skip(fd, 4)
+    } else if vtype == 5 {
+        gguf_skip(fd, 4)
+    } else if vtype == 6 {
+        gguf_skip(fd, 4)
+    } else if vtype == 7 {
+        gguf_skip(fd, 1)
+    } else if vtype == 9 {
+        gguf_skip_array(fd)
+    } else if vtype == 10 {
+        gguf_skip(fd, 8)
+    } else if vtype == 11 {
+        gguf_skip(fd, 8)
+    } else if vtype == 12 {
+        gguf_skip(fd, 8)
+    } else {
+        gguf_skip(fd, 4)
+    }
+}
+
+fn gguf_print_info() {
+    let i = 0
+    let max_n = gguf_n_tensors
+    if max_n > 20 { max_n = 20 }
+    
+    while i < max_n {
+        let ndims = gguf_tensor_ndims(i)
+        let dtype = gguf_tensor_dtype(i)
+        let offset = gguf_tensor_offset(i)
+        let nelements = gguf_tensor_nelements(i)
+        
+        gguf_print_tensor_name(i)
+        print(" [")
         let d = 0
         while d < ndims {
-            let dval = mem_alloc(8)
-            read_raw(fd, dval, 8)
-            mem_store(dims + d * 8, mem_load(dval))
+            if d > 0 { print("x") }
+            print(gguf_tensor_dim(i, d))
             d = d + 1
         }
-
-        let dtype_buf = mem_alloc(4)
-        read_raw(fd, dtype_buf, 4)
-        let dtype = mem_load(dtype_buf)
-
-        let offset_buf = mem_alloc(8)
-        read_raw(fd, offset_buf, 8)
-        let offset = mem_load(offset_buf)
-
-        mem_store(gguf_tensors + ti * TINFO_SIZE, name)
-        mem_store(gguf_tensors + ti * TINFO_SIZE + 8, ndims)
-        mem_store(gguf_tensors + ti * TINFO_SIZE + 16, dims)
-        mem_store(gguf_tensors + ti * TINFO_SIZE + 24, dtype)
-        mem_store(gguf_tensors + ti * TINFO_SIZE + 32, offset)
-
-        ti = ti + 1
+        print("] type=")
+        print(dtype)
+        print(" off=")
+        print(offset)
+        print(" ne=")
+        print(nelements)
+        print("\n")
+        i = i + 1
     }
+    
+    if gguf_n_tensors > 20 {
+        print("... and ")
+        print(gguf_n_tensors - 20)
+        print(" more tensors\n")
+    }
+}
 
-    return 0
+fn gguf_read_tensor(idx) {
+    let name_ptr = gguf_tensor_name(idx)
+    let ndims = gguf_tensor_ndims(idx)
+    let dtype = gguf_tensor_dtype(idx)
+    let offset = gguf_tensor_offset(idx)
+    let nelements = gguf_tensor_nelements(idx)
+    
+    // Calculate byte size based on dtype
+    let elem_size = 4
+    if dtype == 0 { elem_size = 1 }
+    else if dtype == 1 { elem_size = 1 }
+    else if dtype == 2 { elem_size = 2 }
+    else if dtype == 3 { elem_size = 2 }
+    else if dtype == 6 { elem_size = 2 }
+    else if dtype == 7 { elem_size = 1 }
+    else if dtype == 8 { elem_size = 2 }
+    else if dtype == 9 { elem_size = 2 }
+    else if dtype == 10 { elem_size = 8 }
+    else if dtype == 11 { elem_size = 8 }
+    else if dtype == 12 { elem_size = 2 }
+    else if dtype == 14 { elem_size = 2 }
+    else if dtype == 15 { elem_size = 2 }
+    else if dtype == 16 { elem_size = 2 }
+    else if dtype == 17 { elem_size = 2 }
+    else if dtype == 18 { elem_size = 2 }
+    
+    let data_size = nelements * elem_size
+    let buf = mem_alloc(data_size)
+    
+    print("DBG: fd=")
+    print(gguf_fd)
+    print(" off=")
+    print(offset)
+    print(" sz=")
+    print(data_size)
+    print("\n")
+    
+    let rc = lseek(gguf_fd, offset, 0)
+    print("DBG: seek rc=")
+    print(rc)
+    print("\n")
+    
+    let n = read_raw(gguf_fd, buf, data_size)
+    print("DBG: read n=")
+    print(n)
+    print("\n")
+    
+    return buf
 }
 
 fn gguf_skip_array(fd) {
@@ -200,6 +518,17 @@ fn gguf_tensor_ndims(idx) { return mem_load(gguf_tensors + idx * TINFO_SIZE + 8)
 fn gguf_tensor_dims(idx) { return mem_load(gguf_tensors + idx * TINFO_SIZE + 16) }
 fn gguf_tensor_dtype(idx) { return mem_load(gguf_tensors + idx * TINFO_SIZE + 24) }
 fn gguf_tensor_offset(idx) { return mem_load(gguf_tensors + idx * TINFO_SIZE + 32) }
+
+fn gguf_print_tensor_name(idx) {
+    let name_ptr = gguf_tensor_name(idx)
+    if name_ptr != 0 {
+        let slen = 0
+        while mem_load8(name_ptr + slen) != 0 {
+            slen = slen + 1
+        }
+        write_raw(1, name_ptr, slen)
+    }
+}
 
 fn gguf_tensor_dim(idx, d) {
     let dims = gguf_tensor_dims(idx)

@@ -1248,7 +1248,17 @@ fn emit_bltn2(nmi,nl,ii) {
             // else rdi already holds the raw pointer from IR_CALL arg load
             eb(184); ei(2); sysc(); return 1
         }
-        if c5=='r' { eb(184); ei(0); sysc(); return 1 }                    // read
+        if c5=='r' {                    // read(fd, buf, count) -> bytes_read (sc 0)
+            flush_all()
+            let sc_base = ira2(ii)
+            let a0 = irres(sc_base)
+            let a1 = irres(sc_base + 1)
+            let a2 = irres(sc_base + 2)
+            lbase(spill_home(a0), 7)   // rdi = fd
+            lbase(spill_home(a1), 6)   // rsi = buf
+            lbase(spill_home(a2), 2)   // rdx = count
+            ri(0,0); sysc(); return 1
+        }
         if c5=='w' { eb(184); ei(1); sysc(); return 1 }                    // write
         if c5=='c' { eb(184); ei(3); sysc(); return 1 }                    // close
         if c5=='s' { eb(184); ei(4); sysc(); return 1 }                    // stat(path, buf) -> 0/-errno  (sc 4)
