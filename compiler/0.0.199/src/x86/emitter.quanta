@@ -85,7 +85,17 @@ fn sysc() { eb(15); eb(5) }
 fn callr(r) { if r<8 { eb(255); mr(3,2,r) } else { eb(65); eb(255); mr(3,2,r%8) } }
 fn sbi(imm) { eb(72); eb(129); mr(3,5,4); ei(imm) }
 fn abi(imm) { eb(72); eb(129); mr(3,0,4); ei(imm) }
-fn wbp(d,r) { rw(r,5); eb(137); if r>=8 { mr(2,r%8,4); eb(37) } else { mr(2,r%8,4); eb(37) }; ei(d) }
+fn wbp(d,r) {
+    // mov [rbp+disp32], r64 - RBP with mod=00 is RIP-relative, so we must use mod=10 (disp32)
+    let rex = 72  // 0x48: W=1
+    if r >= 8 { rex = 76 }  // 0x4C: W=1, R=1 (extended reg in ModRM reg field)
+    eb(rex)
+    eb(137)  // MOV r/m64, r64
+    // ModRM: mod=10 (disp32), reg=r%8, rm=101 (rbp)
+    eb(0x85 + (r%8)*8)
+    ei(d)
+}
+
 fn rbp(r,d) {
     // mov r64, [rbp+disp32] - RBP with mod=00 is RIP-relative, so we must use mod=10 (disp32)
     let rex = 72  // 0x48: W=1
@@ -1454,7 +1464,22 @@ fn emit_bltn2(nmi,nl,ii) {
         if nl==10&&r8(nm+5)=='c'&&r8(nm+6)=='h'&&r8(nm+7)=='d'&&r8(nm+8)=='i'&&r8(nm+9)=='r' { eb(184); ei(80); sysc(); return 1 }   // chdir(path)  sc 80
         if nl==11&&r8(nm+5)=='r'&&r8(nm+6)=='e'&&r8(nm+7)=='n'&&r8(nm+8)=='a'&&r8(nm+9)=='m'&&r8(nm+10)=='e' { eb(184); ei(82); sysc(); return 1 }  // rename(old,new) sc 82
         if nl==10&&r8(nm+5)=='r'&&r8(nm+6)=='m'&&r8(nm+7)=='d'&&r8(nm+8)=='i'&&r8(nm+9)=='r' { eb(184); ei(84); sysc(); return 1 }   // rmdir(path)  sc 84
-        if nl==5&&r8(nm)=='l'&&r8(nm+1)=='s'&&r8(nm+2)=='e'&&r8(nm+3)=='e'&&r8(nm+4)=='k' { flush_all(); ri(0,6); sysc(); return 1 }
+        if nl==5&&r8(nm)=='l'&&r8(nm+1)=='s'&&r8(nm+2)=='e'&&r8(nm+3)=='e'&&r8(nm+4)=='k' {
+            // lseek(fd, offset, whence) -> new_offset (sc 8)
+            flush_all()
+            let sc_base = ira2(ii)
+            let a0 = irres(sc_base)
+            let a1 = irres(sc_base + 1)
+            let a2 = irres(sc_base + 2)
+            rbp(7, spill_home(a0))   // rdi = fd
+            rbp(6, spill_home(a1))   // rsi = offset
+            rbp(2, spill_home(a2))   // rdx = whence
+            ri(0,8); sysc()
+            let rd = aphys(irres(ii))
+            if rd != 0 { rr(rd, 0) }
+            sdef(irres(ii), rd)
+            return 1
+        }
         let c5=r8(nm+5)
         if c5=='o' {                   // open(path, flags, mode)
             // path may be a Quanta string literal (needs +8 to skip the
@@ -1503,7 +1528,7 @@ fn emit_bltn2(nmi,nl,ii) {
         if c5=='c' { eb(184); ei(3); sysc(); return 1 }                    // close
         if c5=='s' { eb(184); ei(4); sysc(); return 1 }                    // stat(path, buf) -> 0/-errno  (sc 4)
         if c5=='u' { eb(184); ei(87); sysc(); return 1 }                   // unlink(path) -> 0/-errno  (sc 87)
-        if c5=='l' {                    // lseek(fd, offset, whence) -> new_offset (sc 6)
+        if c5=='l' {                    // lseek(fd, offset, whence) -> new_offset (sc 8)
             flush_all()
             let sc_base = ira2(ii)
             let a0 = irres(sc_base)
