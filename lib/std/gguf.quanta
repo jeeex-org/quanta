@@ -22,7 +22,7 @@ fn gguf_load(path) {
     let n_kv = mem_load(hdr + 8)
     gguf_n_tensors = mem_load(hdr + 16)
     
-    // Skip metadata pairs with proper alignment tracking
+    // Skip metadata pairs
     let klen_buf = mem_alloc(8)
     let vtype_buf = mem_alloc(4)
     let slen_buf = mem_alloc(8)
@@ -56,9 +56,9 @@ fn gguf_load(path) {
             lseek(fd, slen, 1)
             meta_size = meta_size + 8 + slen
         } else if vtype == 9 {
-            read_raw(fd, vtype_buf, 4)
+            read_raw(fd, vtype_buf, 4)  // etype
             meta_size = meta_size + 4
-            read_raw(fd, slen_buf, 8)
+            read_raw(fd, slen_buf, 8)   // alen
             meta_size = meta_size + 8
             let alen = mem_load(slen_buf)
             let etype = mem_load(vtype_buf)
