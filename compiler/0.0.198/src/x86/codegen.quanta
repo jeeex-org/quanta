@@ -1161,26 +1161,16 @@ fn ci_func(fi, is_main) {
             }
         }
         else if op==IR_LABEL {
-            // Phase 5: selective flush — keep live vregs in regs, spill dead ones
-            let lb_bn = r64(label2block + a0*8)
-            let live = block_live_in + lb_bn * vreg_n
-            flush_selective(live)
+            flush_all()
             lbladd(a0,codelen)
         }
         else if op==IR_JMP {
-            let lb_bn = r64(label2block + a0*8)
-            let live = block_live_in + lb_bn * vreg_n
-            flush_selective(live)
+            // No flush needed — target label has flush_all when reached
             let po=codelen; jmp32(0)
             w64(patches+patchc*PCS,po); w64(patches+patchc*PCS+8,a0); w64(patches+patchc*PCS+16,0); patchc=patchc+1
         }
         else if op==IR_BR {
-            // Phase 5: selective flush — union of both successors' live-in sets
-            let lb_bn = r64(label2block + a1*8)
-            let live = block_live_in + lb_bn * vreg_n
-            let ft_bn = r64(block_of + (ii+1)*8)
-            let j=0; while j<vreg_n { if r8(block_live_in+ft_bn*vreg_n+j)==1 { w8(live+j,1) }; j=j+1 }
-            flush_selective(live)
+            // No flush needed — both targets (fallthrough + branch) have flush_all
             let cv=aphys(a0); rtest(cv,cv)
             let po1=codelen; jcc32(0,0)
             w64(patches+patchc*PCS,po1); w64(patches+patchc*PCS+8,a1); w64(patches+patchc*PCS+16,1); patchc=patchc+1
@@ -2055,6 +2045,12 @@ fn compute_live_in(bn) {
     }
 }
 fn build_cfg() {
+    // Clear label2block for all vregs used by this function
+    let clr_lv = 0
+    while clr_lv <= maxvr {
+        w64(label2block + clr_lv * 8, -1)
+        clr_lv = clr_lv + 1
+    }
     block_count=0
     let i=0
     while i<irc {
@@ -2071,6 +2067,16 @@ fn build_cfg() {
     }
     // Clear liveness arrays for the range we'll use (bounded by current function)
     let clr_max = block_count * vreg_n
+    if clr_max > 0 {
+        let clr_i = 0
+        while clr_i < clr_max {
+            w8(block_live_in + clr_i, 0)
+            w8(block_live_out + clr_i, 0)
+            w8(block_def + clr_i, 0)
+            w8(block_use + clr_i, 0)
+            clr_i = clr_i + 1
+        }
+    }
     let bn=0
     while bn<block_count {
         let ms=r64(block_start+bn*8)
