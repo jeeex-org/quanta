@@ -562,6 +562,7 @@ fn ci_func(fi, is_main) {
         psi=psi+1
     }
     vreg_n = maxvr + 1
+    g_maxvr = maxvr
     aclr()
     fclr()
     build_cfg()  // Phase 5: compute per-block liveness for selective flush
@@ -2051,28 +2052,12 @@ fn compute_live_in(bn) {
     }
 }
 fn build_cfg() {
-    // Clear liveness arrays to prevent stale data from previous functions
-    // Only clear the range used by the previous function (not irc*vreg_n)
-    let clr_max = prev_block_count * prev_vreg_n
-    let clr_i = 0
-    while clr_i < clr_max {
-        w8(block_live_in + clr_i, 0)
-        w8(block_live_out + clr_i, 0)
-        w8(block_def + clr_i, 0)
-        w8(block_use + clr_i, 0)
-        clr_i = clr_i + 1
-    }
-    // Clear label2block for max vreg used by previous function
-    let clr_lbl = 0
-    while clr_lbl <= prev_maxvr {
-        w64(label2block + clr_lbl * 8, -1)
-        clr_lbl = clr_lbl + 1
-    }
     block_count=0
     let i=0
     while i<irc {
         if irop(i)==IR_LABEL {
-            w64(label2block+ira0(i)*8, block_count)
+            let lv = ira0(i)
+            w64(label2block+lv*8, block_count)
             w64(block_start+block_count*8, i)
             w64(block_of + i*8, block_count)
             block_count=block_count+1
@@ -2081,6 +2066,8 @@ fn build_cfg() {
         }
         i=i+1
     }
+    // Clear liveness arrays for the range we'll use (bounded by current function)
+    let clr_max = block_count * vreg_n
     let bn=0
     while bn<block_count {
         let ms=r64(block_start+bn*8)
@@ -2129,5 +2116,8 @@ fn build_cfg() {
             }
         }
     }
+    prev_block_count = block_count
+    prev_vreg_n = vreg_n
+    prev_maxvr = g_maxvr
 }
 
