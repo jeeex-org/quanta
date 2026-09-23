@@ -390,6 +390,25 @@ fn flush_all() {
     allocfc=0
 }
 
+// flush_selective(live_mask): selective flush at block boundaries.
+// live_mask is a bitmap indexed by vreg number; vregs marked live are kept in regs.
+fn flush_selective(live_mask) {
+    let i=0
+    while i<allocfc {
+        let vr=r64(alloc+i*16); let pr=r64(alloc+i*16+8)
+        if r8(live_mask+vr)==0 {
+            // dead: spill to home and remove from alloc
+            if r8(vr_init+vr)!=0 { wbp(spill_home(vr), pr) }
+            w8(vr_spill+vr, 1)
+            allocfc=allocfc-1
+            w64(alloc+i*16, r64(alloc+allocfc*16))
+            w64(alloc+i*16+8, r64(alloc+allocfc*16+8))
+        } else {
+            i=i+1
+        }
+    }
+}
+
 // flush_clob(r0,r1,r2): target clobber-save for arithmetic ops (idiv/shl/shr)
 // that only destroy the given physical regs (rax=0, rcx=1, rdx=2). Spills just
 // those vregs to their home slots (already current via sdef) and frees the

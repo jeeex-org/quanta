@@ -564,6 +564,7 @@ fn ci_func(fi, is_main) {
     vreg_n = maxvr + 1
     aclr()
     fclr()
+    build_cfg()  // Phase 5: compute per-block liveness for selective flush
     // RE-MARK float vregs (vfloat was cleared by aclr). i2f(x) yields a float
     // result; follow IR_MOV chains so the float flag reaches the MUL/ADD/SUB
     // operands. Iterate to a fixpoint (multi-level MOV chains). Runs after aclr.
@@ -1159,18 +1160,28 @@ fn ci_func(fi, is_main) {
             }
         }
         else if op==IR_LABEL {
-            flush_all()
+            // Phase 5: selective flush — keep live vregs in regs, spill dead ones
+            let lb_bn = r64(label2block + a0*8)
+            let live = block_live_in + lb_bn * vreg_n
+            flush_selective(live)
             lbladd(a0,codelen)
         }
         else if op==IR_JMP {
-            flush_all()
+            let lb_bn = r64(label2block + a0*8)
+            let live = block_live_in + lb_bn * vreg_n
+            flush_selective(live)
             let po=codelen; jmp32(0)
             w64(patches+patchc*PCS,po); w64(patches+patchc*PCS+8,a0); w64(patches+patchc*PCS+16,0); patchc=patchc+1
         }
         else if op==IR_BR {
-            flush_all()
+            // Phase 5: selective flush — union of both successors' live-in sets
+            let lb_bn = r64(label2block + a1*8)
+            let live = block_live_in + lb_bn * vreg_n
+            let ft_bn = r64(block_of + (ii+1)*8)
+            let j=0; while j<vreg_n { if r8(block_live_in+ft_bn*vreg_n+j)==1 { w8(live+j,1) }; j=j+1 }
+            flush_selective(live)
             let cv=aphys(a0); rtest(cv,cv)
-            let po1=codelen; jcc32(0,0)  // je a1
+            let po1=codelen; jcc32(0,0)
             w64(patches+patchc*PCS,po1); w64(patches+patchc*PCS+8,a1); w64(patches+patchc*PCS+16,1); patchc=patchc+1
         }
         else if op==IR_RET {
@@ -2018,4 +2029,105 @@ fn init_cglobals() {
 }
 
 let CALLER_SAVED = call_saved
+
+// === Phase 5: build_cfg() ===
+fn compute_live_out(bn) {
+    let s=r64(block_succ+bn*16); if s!=-1 {
+        let i=0; while i<vreg_n { if r8(block_live_in+s*vreg_n+i)==1 { w8(block_live_out+bn*vreg_n+i,1) }; i=i+1 }
+    }
+    let s2=r64(block_succ+bn*16+8); if s2!=-1 {
+        let i=0; while i<vreg_n { if r8(block_live_in+s2*vreg_n+i)==1 { w8(block_live_out+bn*vreg_n+i,1) }; i=i+1 }
+    }
+}
+fn compute_live_in(bn) {
+    let i=0
+    while i<vreg_n {
+        let live_out=r8(block_live_out+bn*vreg_n+i)
+        let def=r8(block_def+bn*vreg_n+i)
+        let use=r8(block_use+bn*vreg_n+i)
+        if live_out==1 { w8(block_live_in+bn*vreg_n+i,1) }
+        if use==1 && def==0 { w8(block_live_in+bn*vreg_n+i,1) }
+        i=i+1
+    }
+}
+fn build_cfg() {
+    // Clear liveness arrays to prevent stale data from previous functions
+    // Only clear the range used by the previous function (not irc*vreg_n)
+    let clr_max = prev_block_count * prev_vreg_n
+    let clr_i = 0
+    while clr_i < clr_max {
+        w8(block_live_in + clr_i, 0)
+        w8(block_live_out + clr_i, 0)
+        w8(block_def + clr_i, 0)
+        w8(block_use + clr_i, 0)
+        clr_i = clr_i + 1
+    }
+    // Clear label2block for max vreg used by previous function
+    let clr_lbl = 0
+    while clr_lbl <= prev_maxvr {
+        w64(label2block + clr_lbl * 8, -1)
+        clr_lbl = clr_lbl + 1
+    }
+    block_count=0
+    let i=0
+    while i<irc {
+        if irop(i)==IR_LABEL {
+            w64(label2block+ira0(i)*8, block_count)
+            w64(block_start+block_count*8, i)
+            w64(block_of + i*8, block_count)
+            block_count=block_count+1
+        } else {
+            if block_count>0 { w64(block_of + i*8, block_count-1) }
+        }
+        i=i+1
+    }
+    let bn=0
+    while bn<block_count {
+        let ms=r64(block_start+bn*8)
+        let me2=irc
+        if bn+1<block_count { me2=r64(block_start+(bn+1)*8) }
+        w64(block_end+bn*8, me2)
+        let succ0=-1; let succ1=-1
+        let j=ms
+        while j<me2 {
+            if irop(j)==IR_BR {
+                succ0=r64(label2block+ira1(j)*8); succ1=r64(label2block+ira0(j)*8)
+            } else if irop(j)==IR_JMP {
+                succ0=r64(label2block+ira0(j)*8)
+            }
+            j=j+1
+        }
+        w64(block_succ+bn*16, succ0)
+        w64(block_succ+bn*16+8, succ1)
+        let k=ms
+        while k<me2 {
+            let op=irop(k); let res=irres(k); let a0=ira0(k); let a1=ira1(k); let a2=ira2(k)
+            if op!=IR_CONST && op!=IR_LABEL && op!=IR_JMP { w8(block_use+bn*vreg_n+a0,1); w8(block_def+bn*vreg_n+res,1) }
+            if op!=IR_BR && op!=IR_JMP && op!=IR_STR && op!=IR_STOREG && op!=IR_FREE { w8(block_use+bn*vreg_n+a1,1) }
+            if op==IR_BR { w8(block_use+bn*vreg_n+a0,1); w8(block_def+bn*vreg_n+res,1) }
+            if op==IR_CALL {
+                let c=0; let ac=a1; let as2=a2; while c<ac { let ci=as2+c; if ci<irc { w8(block_use+bn*vreg_n+irres(ci),1) }; c=c+1 }
+            }
+            if op==IR_RET { w8(block_use+bn*vreg_n+a0,1) }
+            if op==IR_PARAM { w8(block_def+bn*vreg_n+a0,1) }
+            if op==IR_STOREG { w8(block_use+bn*vreg_n+a0,1); w8(block_def+bn*vreg_n+res,1) }
+            k=k+1
+        }
+        bn=bn+1
+    }
+    {
+        let changed=1
+        while changed==1 {
+            changed=0
+            let bn=0
+            while bn<block_count {
+                let old=block_live_in+bn*vreg_n
+                compute_live_out(bn)
+                compute_live_in(bn)
+                let j=0; while j<vreg_n { if r8(block_live_in+bn*vreg_n+j)!=r8(old+j) { changed=1 }; j=j+1 }
+                bn=bn+1
+            }
+        }
+    }
+}
 
