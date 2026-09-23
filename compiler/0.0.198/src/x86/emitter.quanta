@@ -159,10 +159,10 @@ fn faddf_avx2(dst_ptr, a_ptr, b_ptr) {
     flush_all()
     // Load 4 doubles from [rsi] into ymm0
     eb(196); eb(225); eb(121); eb(16); eb(6)      // vmovupd ymm0, [rsi] (C4 E1 79 10 06)
-    // Load 4 doubles from [rdx] into ymm1  
-    eb(196); eb(225); eb(121); eb(16); eb(10)     // vmovupd ymm1, [rdx] (C4 E1 79 10 0A)
+    // Load 4 doubles from [rdx] into ymm1 
+    eb(196); eb(225); eb(121); eb(16); eb(18)     // vmovupd ymm1, [rdx] (C4 E1 79 10 12) - reg=1
     // Add: ymm0 = ymm0 + ymm1
-    eb(197); eb(249); eb(88); eb(193)               // vaddpd ymm0, ymm0, ymm1 (C5 F9 58 C1)
+    eb(197); eb(248); eb(88); eb(193)               // vaddpd ymm0, ymm0, ymm1 (C5 F8 58 C1) - vvvv=1110=ymm1
     // Store ymm0 to [rdi]
     eb(196); eb(225); eb(121); eb(17); eb(7)       // vmovupd [rdi], ymm0 (C4 E1 79 11 07)
     // Return dst_ptr
@@ -173,8 +173,8 @@ fn faddf_avx2(dst_ptr, a_ptr, b_ptr) {
 fn fmulf_avx2(dst_ptr, a_ptr, b_ptr) {
     flush_all()
     eb(196); eb(225); eb(121); eb(16); eb(6)      // vmovupd ymm0, [rsi]
-    eb(196); eb(225); eb(121); eb(16); eb(10)     // vmovupd ymm1, [rdx]
-    eb(197); eb(249); eb(89); eb(193)               // vmulpd ymm0, ymm0, ymm1
+    eb(196); eb(225); eb(121); eb(16); eb(18)     // vmovupd ymm1, [rdx] - reg=1
+    eb(197); eb(248); eb(89); eb(193)               // vmulpd ymm0, ymm0, ymm1 - vvvv=1110
     eb(196); eb(225); eb(121); eb(17); eb(7)       // vmovupd [rdi], ymm0
     eb(72); eb(137); eb(248)
     return 1
@@ -183,8 +183,8 @@ fn fmulf_avx2(dst_ptr, a_ptr, b_ptr) {
 fn fsubf_avx2(dst_ptr, a_ptr, b_ptr) {
     flush_all()
     eb(196); eb(225); eb(121); eb(16); eb(6)      // vmovupd ymm0, [rsi]
-    eb(196); eb(225); eb(121); eb(16); eb(10)     // vmovupd ymm1, [rdx]
-    eb(197); eb(249); eb(92); eb(193)               // vsubpd ymm0, ymm0, ymm1
+    eb(196); eb(225); eb(121); eb(16); eb(18)     // vmovupd ymm1, [rdx] - reg=1
+    eb(197); eb(248); eb(92); eb(193)               // vsubpd ymm0, ymm0, ymm1 - vvvv=1110
     eb(196); eb(225); eb(121); eb(17); eb(7)       // vmovupd [rdi], ymm0
     eb(72); eb(137); eb(248)
     return 1
@@ -193,8 +193,8 @@ fn fsubf_avx2(dst_ptr, a_ptr, b_ptr) {
 fn fdivf_avx2(dst_ptr, a_ptr, b_ptr) {
     flush_all()
     eb(196); eb(225); eb(121); eb(16); eb(6)      // vmovupd ymm0, [rsi]
-    eb(196); eb(225); eb(121); eb(16); eb(10)     // vmovupd ymm1, [rdx]
-    eb(197); eb(249); eb(94); eb(193)               // vdivpd ymm0, ymm0, ymm1
+    eb(196); eb(225); eb(121); eb(16); eb(18)     // vmovupd ymm1, [rdx] - reg=1
+    eb(197); eb(248); eb(94); eb(193)               // vdivpd ymm0, ymm0, ymm1 - vvvv=1110
     eb(196); eb(225); eb(121); eb(17); eb(7)       // vmovupd [rdi], ymm0
     eb(72); eb(137); eb(248)
     return 1
@@ -429,6 +429,12 @@ fn fphys(vr) {
     let f=ffind(vr); if f>=0 { return f }
     let p=ffree()
     if r8(fvr_init+vr)!=0 { frld(p, fspill_home(vr)) }
+    else if r8(vfloat+vr)==1 {
+        // Result from emit_bltn stored in GP spill_home, movq to xmm
+        rbp(0, spill_home(vr))
+        fld_x(0, p)
+        w8(fvr_spill+vr, 1)
+    }
     fset(vr,p); return p
 }
 fn fdistinct(res, a1, a2) {
@@ -507,6 +513,8 @@ fn fflush_all() {
 fn fdef(vr, reg) { frld(reg, fspill_home(vr)); w8(fvr_init+vr, 1) }
 // frld(xmm, off): movsd xmm, [rbp+off]  (REX.W F2 0F 10 /r with rbp base)
 fn frld(xmm, off) { eb(0xF2); eb(73); eb(15); eb(16); mr(2, xmm, 5); ei(off) }
+// fsst(off, xmm): movsd [rbp+off], xmm  (REX.W F2 0F 11 /r with rbp base)
+fn fsst(off, xmm) { eb(0xF2); eb(72); eb(15); eb(17); mr(2, xmm, 5); ei(off) }
 
 // x86 SSE emit helpers (target_arch==0)
 // xmm reg encoding in ModRM/reg fields: just the index 0-7.
@@ -578,6 +586,7 @@ fn compute_magic(d) {
 // sdef(vr, reg): store result to home slot AND mark vreg defined (so later
 // aphys reloads the correct value after a flush_all).
 fn sdef(vr, reg) { wbp(spill_home(vr), reg); w8(vr_init+vr, 1) }
+fn fsdef(vr, reg) { fsst(fspill_home(vr), reg); w8(fvr_init+vr, 1) }
 // === BUILD IN NAME CHECK ===
 
 // argp8(reg, base, k): load arg k's spill-home pointer + 8 (skip the 8-byte
@@ -758,7 +767,6 @@ fn emit_bltn(nmi,nl,ii) {
     }
     // fdivf: float-preserving div
     if nl==5&&r8(nm)=='f'&&r8(nm+1)=='d'&&r8(nm+2)=='i'&&r8(nm+3)=='v'&&r8(nm+4)=='f' {
-        flush_all()
         eb(102); eb(72); eb(15); eb(110); eb(199) // movq xmm0, rdi
         eb(102); eb(72); eb(15); eb(110); eb(206) // movq xmm1, rsi
         eb(242); eb(15); eb(94); eb(193)          // divsd xmm0, xmm1
@@ -858,10 +866,10 @@ fn emit_bltn(nmi,nl,ii) {
         // Args: rdi=dst, rsi=a, rdx=b (pointers to 4 doubles each)
         // vmovupd ymm0, [rsi]
         eb(196); eb(225); eb(121); eb(16); eb(6)
-        // vmovupd ymm1, [rdx]
-        eb(196); eb(225); eb(121); eb(16); eb(10)
-        // vaddpd ymm0, ymm0, ymm1
-        eb(197); eb(249); eb(88); eb(193)
+        // vmovupd ymm1, [rdx] - reg=1 (rdx is second source)
+        eb(196); eb(225); eb(121); eb(16); eb(18)
+        // vaddpd ymm0, ymm0, ymm1 - vvvv=1110 (ymm1)
+        eb(197); eb(248); eb(88); eb(193)
         // vmovupd [rdi], ymm0
         eb(196); eb(225); eb(121); eb(17); eb(7)
         // return dst
@@ -872,8 +880,8 @@ fn emit_bltn(nmi,nl,ii) {
     if nl==6&&r8(nm)=='f'&&r8(nm+1)=='m'&&r8(nm+2)=='u'&&r8(nm+3)=='l'&&r8(nm+4)=='f'&&r8(nm+5)=='2' {
         flush_all()
         eb(196); eb(225); eb(121); eb(16); eb(6)
-        eb(196); eb(225); eb(121); eb(16); eb(10)
-        eb(197); eb(249); eb(89); eb(193)
+        eb(196); eb(225); eb(121); eb(16); eb(18)
+        eb(197); eb(248); eb(89); eb(193)
         eb(196); eb(225); eb(121); eb(17); eb(7)
         eb(72); eb(137); eb(248)
         return 1
@@ -882,8 +890,8 @@ fn emit_bltn(nmi,nl,ii) {
     if nl==6&&r8(nm)=='f'&&r8(nm+1)=='s'&&r8(nm+2)=='u'&&r8(nm+3)=='b'&&r8(nm+4)=='f'&&r8(nm+5)=='2' {
         flush_all()
         eb(196); eb(225); eb(121); eb(16); eb(6)
-        eb(196); eb(225); eb(121); eb(16); eb(10)
-        eb(197); eb(249); eb(92); eb(193)
+        eb(196); eb(225); eb(121); eb(16); eb(18)
+        eb(197); eb(248); eb(92); eb(193)
         eb(196); eb(225); eb(121); eb(17); eb(7)
         eb(72); eb(137); eb(248)
         return 1
@@ -892,8 +900,8 @@ fn emit_bltn(nmi,nl,ii) {
     if nl==6&&r8(nm)=='f'&&r8(nm+1)=='d'&&r8(nm+2)=='i'&&r8(nm+3)=='v'&&r8(nm+4)=='f'&&r8(nm+5)=='2' {
         flush_all()
         eb(196); eb(225); eb(121); eb(16); eb(6)
-        eb(196); eb(225); eb(121); eb(16); eb(10)
-        eb(197); eb(249); eb(94); eb(193)
+        eb(196); eb(225); eb(121); eb(16); eb(18)
+        eb(197); eb(248); eb(94); eb(193)
         eb(196); eb(225); eb(121); eb(17); eb(7)
         eb(72); eb(137); eb(248)
         return 1
@@ -1454,7 +1462,6 @@ fn emit_bltn2(nmi,nl,ii) {
         if nl==10&&r8(nm+5)=='c'&&r8(nm+6)=='h'&&r8(nm+7)=='d'&&r8(nm+8)=='i'&&r8(nm+9)=='r' { eb(184); ei(80); sysc(); return 1 }   // chdir(path)  sc 80
         if nl==11&&r8(nm+5)=='r'&&r8(nm+6)=='e'&&r8(nm+7)=='n'&&r8(nm+8)=='a'&&r8(nm+9)=='m'&&r8(nm+10)=='e' { eb(184); ei(82); sysc(); return 1 }  // rename(old,new) sc 82
         if nl==10&&r8(nm+5)=='r'&&r8(nm+6)=='m'&&r8(nm+7)=='d'&&r8(nm+8)=='i'&&r8(nm+9)=='r' { eb(184); ei(84); sysc(); return 1 }   // rmdir(path)  sc 84
-        if nl==5&&r8(nm)=='l'&&r8(nm+1)=='s'&&r8(nm+2)=='e'&&r8(nm+3)=='e'&&r8(nm+4)=='k' { flush_all(); ri(0,6); sysc(); return 1 }
         let c5=r8(nm+5)
         if c5=='o' {                   // open(path, flags, mode)
             // path may be a Quanta string literal (needs +8 to skip the

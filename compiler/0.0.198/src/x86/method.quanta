@@ -445,25 +445,23 @@ fn parse_primary() {
         w64(vreg_is_big + bvr*8, 1)   // 0.0.114: big literal result is a big
         return bvr
     }
+
     if peek()==TT_FNUM {
         let v=pval(); adv()
-        // Float value encoded by lexer as (M << 8) | frac_digits
         let M = v >> 8
         let frac_digits = v & 255
-        // scale = 10^frac_digits (fits i64 for any sane literal)
         let scale = 1
         let k = frac_digits
         while k > 0 { scale = scale * 10; k = k - 1 }
-        // Emit fconst(M, scale) -> IEEE-754 bits of M/scale, tagged float.
         let cnm = srclen
-        w8(src+cnm, 102); w8(src+cnm+1, 99); w8(src+cnm+2, 111); w8(src+cnm+3, 110); w8(src+cnm+4, 115); w8(src+cnm+5, 116); w8(src+cnm+6, 0)  // "fconst\0"
+        w8(src+cnm, 102); w8(src+cnm+1, 99); w8(src+cnm+2, 111); w8(src+cnm+3, 110); w8(src+cnm+4, 115); w8(src+cnm+5, 116); w8(src+cnm+6, 0)
         srclen = cnm + 7
         let cavs = irc
         let cm = nv(); iremit(IR_CONST, cm, M, 0, 0)
         let cs = nv(); iremit(IR_CONST, cs, scale, 0, 0)
         let cr = nv()
         iremit(IR_CALL, cr, cnm, 2, cavs)
-        w64(vfloat + cr*8, 1)   // fconst result is a float vreg
+        w64(vfloat + cr*8, 1)
         return cr
     }
     if peek()==TT_STR {

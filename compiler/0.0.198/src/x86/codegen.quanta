@@ -151,11 +151,14 @@ fn opt_func() {
     if had_error==1 { return }
     // PRE-PASS: mark float vregs so constfold/emit handle them as floats.
     // i2f(x): int64 -> f64. Any IR_CALL named "i2f" yields a float result vreg.
+    // fconst(M, scale): float literal = M/scale -> float result vreg.
     let pp=0
     while pp<irc {
         if irop(pp)==IR_CALL {
             let nm = ira0(pp)
             if r8(src+nm)=='i' && r8(src+nm+1)=='2' && r8(src+nm+2)=='f' {
+                w8(vfloat+irres(pp), 1)
+            } else if r8(src+nm)=='f' && r8(src+nm+1)=='c' && r8(src+nm+2)=='o' && r8(src+nm+3)=='n' && r8(src+nm+4)=='s' && r8(src+nm+5)=='t' && (r8(src+nm+6)==0||r8(src+nm+6)==40) {
                 w8(vfloat+irres(pp), 1)
             }
         }
@@ -574,7 +577,11 @@ fn ci_func(fi, is_main) {
             while mp<irc {
                 if irop(mp)==IR_CALL {
                     let mnm = ira0(mp)
-                    if r8(src+mnm)=='i' && r8(src+mnm+1)=='2' && r8(src+mnm+2)=='f' {
+                    // Match all float-producing builtins: i2f, fconst, fadd, fsub, fmul, fdiv, faddf, fsubf, fmulf, fdivf
+                    let c0=r8(src+mnm)
+                    if c0=='i' && r8(src+mnm+1)=='2' && r8(src+mnm+2)=='f' {
+                        if r8(vfloat+irres(mp))!=1 { w8(vfloat+irres(mp), 1); changed=1 }
+                    } else if c0=='f' {
                         if r8(vfloat+irres(mp))!=1 { w8(vfloat+irres(mp), 1); changed=1 }
                     }
                 } else if irop(mp)==IR_MOV {
@@ -654,47 +661,50 @@ fn ci_func(fi, is_main) {
     while ii<irc {
         let op=irop(ii); let res=irres(ii); let a0=ira0(ii); let a1=ira1(ii); let a2=ira2(ii)
         if op==IR_CONST { let rd=aphys(res); if a0<0||a0>4294967295 { ri64(rd,a0) } else { ri(rd,a0) }; sdef(res, rd) }
-        else if op==IR_MOV { let rd=aphys(res); let rs=aphys(a0); if rd!=rs { rr(rd,rs) }; sdef(res, rd); w8(vfloat+res, r8(vfloat+a0)) }
+        else if op==IR_MOV {
+            if r8(vfloat+a0)==1 {
+                let rs=fphys(a0)
+                let rd=fdistinct(res, rs, rs)
+                if rd!=rs { frr(rd, rs) }
+                fsdef(res, rd); w8(vfloat+res, 1)
+            } else {
+                let rd=aphys(res); let rs=aphys(a0); if rd!=rs { rr(rd,rs) }; sdef(res, rd); w8(vfloat+res, r8(vfloat+a0))
+            }
+        }
 
         else if op==IR_ADD {
             if r8(vfloat+a0)==1 && r8(vfloat+a1)==1 {
-                let r1=aphys(a0); let r2=aphys(a1); let rd=adistinct(res,r1,r2)
-                fld_x(r1, 0); fld_x(r2, 1)
-                eb(242); eb(15); eb(88); eb(193)      // addsd xmm0, xmm1 (inline)
-                fst_x(rd, 0)
-                sdef(res, rd); w8(vfloat+res, 1)
+                let r1=fphys(a0); let r2=fphys(a1); let rd=fdistinct(res,r1,r2)
+                if rd!=r1 { frr(rd, r1) }
+                fadd(rd, r2)
+                fsdef(res, rd); w8(vfloat+res, 1)
             } else {
             let r1=aphys(a0); let r2=aphys(a1); let rd=adistinct(res,r1,r2); if rd!=r1 { rr(rd,r1) }; ra(rd,r2); ovf_trap_emit(ii); sdef(res, rd); width_mask(a0, a1, rd) }
         }
         else if op==IR_SUB {
             if r8(vfloat+a0)==1 && r8(vfloat+a1)==1 {
-                let r1=aphys(a0); let r2=aphys(a1); let rd=adistinct(res,r1,r2)
-                fld_x(r1, 0); fld_x(r2, 1)
-                eb(242); eb(15); eb(92); eb(193)       // subsd xmm0, xmm1 (inline; fsub is reserved)
-                fst_x(rd, 0)
-                sdef(res, rd); w8(vfloat+res, 1)
+                let r1=fphys(a0); let r2=fphys(a1); let rd=fdistinct(res,r1,r2)
+                if rd!=r1 { frr(rd, r1) }
+                fsub(rd, r2)
+                fsdef(res, rd); w8(vfloat+res, 1)
             } else {
             let r1=aphys(a0); let r2=aphys(a1); let rd=adistinct(res,r1,r2); if rd!=r1 { rr(rd,r1) }; rs(rd,r2); ovf_trap_emit(ii); sdef(res, rd); width_mask(a0, a1, rd) }
         }
         else if op==IR_MUL {
-            // float * float: both operands are float bit-patterns in GP regs -> SSE
             if r8(vfloat+a0)==1 && r8(vfloat+a1)==1 {
-                let r1=aphys(a0); let r2=aphys(a1); let rd=adistinct(res,r1,r2)
-                fld_x(r1, 0); fld_x(r2, 1)          // movq xmm0/1, gp (raw float bits)
-                eb(242); eb(15); eb(89); eb(193)      // mulsd xmm0, xmm1 (inline; fmul is reserved)
-                fst_x(rd, 0)                         // movq rd, xmm0 (raw float bits)
-                sdef(res, rd); w8(vfloat+res, 1)
+                let r1=fphys(a0); let r2=fphys(a1); let rd=fdistinct(res,r1,r2)
+                if rd!=r1 { frr(rd, r1) }
+                fmul(rd, r2)
+                fsdef(res, rd); w8(vfloat+res, 1)
             } else {
             let r1=aphys(a0); let r2=aphys(a1); let rd=adistinct(res,r1,r2); if rd!=r1 { rr(rd,r1) }; rm(rd,r2); ovf_trap_emit(ii); sdef(res, rd); width_mask(a0, a1, rd) }
         }
         else if op==IR_DIV {
-          // float / float: both operands are float bit-patterns in GP regs -> SSE
           if r8(vfloat+a0)==1 && r8(vfloat+a1)==1 {
-            let r1=aphys(a0); let r2=aphys(a1); let rd=adistinct(res,r1,r2)
-            fld_x(r1, 0); fld_x(r2, 1)          // movq xmm0/1, gp (raw float bits)
-            eb(242); eb(15); eb(94); eb(193)      // divsd xmm0, xmm1 (inline; fdiv is reserved)
-            fst_x(rd, 0)                         // movq rd, xmm0 (raw float bits)
-            sdef(res, rd); w8(vfloat+res, 1)
+            let r1=fphys(a0); let r2=fphys(a1); let rd=fdistinct(res,r1,r2)
+            if rd!=r1 { frr(rd, r1) }
+            fdiv(rd, r2)
+            fsdef(res, rd); w8(vfloat+res, 1)
           } else {
           // P3: power-of-2 division → arithmetic shift right (1 instruction vs 30)
           let div_const = 0
