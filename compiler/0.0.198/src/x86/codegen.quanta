@@ -2041,13 +2041,16 @@ fn compute_live_out(bn) {
     }
 }
 fn compute_live_in(bn) {
+    // Per-block backward liveness: live_in = use ∪ (live_out - def)
     let i=0
     while i<vreg_n {
         let live_out=r8(block_live_out+bn*vreg_n+i)
         let def=r8(block_def+bn*vreg_n+i)
         let use=r8(block_use+bn*vreg_n+i)
-        if live_out==1 { w8(block_live_in+bn*vreg_n+i,1) }
-        if use==1 && def==0 { w8(block_live_in+bn*vreg_n+i,1) }
+        // v is live at entry if: used in block, OR (live at exit AND not defined in block)
+        if use==1 { w8(block_live_in+bn*vreg_n+i,1) }
+        else if live_out==1 && def==0 { w8(block_live_in+bn*vreg_n+i,1) }
+        else { w8(block_live_in+bn*vreg_n+i,0) }
         i=i+1
     }
 }

@@ -391,7 +391,9 @@ fn flush_all() {
 }
 
 // flush_selective(live_mask): selective flush at block boundaries.
-// live_mask is a bitmap indexed by vreg number; vregs marked live are kept in regs.
+// live_mask is a bitmap indexed by vreg number; vregs marked live are kept in phys regs.
+// Dead vregs are spilled and removed. Live vregs have their home slots updated (so if
+// their phys reg is evicted later, the home value is current) but stay in the alloc table.
 fn flush_selective(live_mask) {
     let i=0
     while i<allocfc {
@@ -404,6 +406,8 @@ fn flush_selective(live_mask) {
             w64(alloc+i*16, r64(alloc+allocfc*16))
             w64(alloc+i*16+8, r64(alloc+allocfc*16+8))
         } else {
+            // live: update home slot so it's current if phys reg is evicted later
+            if r8(vr_init+vr)!=0 { wbp(spill_home(vr), pr) }
             i=i+1
         }
     }
