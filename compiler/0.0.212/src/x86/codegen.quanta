@@ -655,8 +655,8 @@ fn ci_func(fi, is_main) {
     let str_off = -(frame_size - total_str)  // string buffer offset from frame base (below spill)
     let early_ret_lbl = -1   // P7: lazy epilogue label; IR_TRY jumps here on Err/None
     
-// Precompute loop headers: which IR_LABELs are targets of backward JMPs
-let loop_header = mmap(irc * 8)  // 8 bytes per IR record (0 or label_id)
+// Precompute loop headers and mark "safe" loops (no calls/memory ops)
+let loop_header = mmap(irc * 8)  // 8 bytes per IR record: 1=header, 2=safe header
 let i = 0
 while i < irc { w64(loop_header + i * 8, 0); i = i + 1 }
 let p = 0
@@ -666,7 +666,23 @@ while p < irc {
         let q = 0
         while q < irc {
             if irop(q) == IR_LABEL && ira0(q) == target {
-                if q < p { w64(loop_header + q * 8, 1) }  // mark as loop header
+                if q < p {
+                    // Mark as loop header
+                    w64(loop_header + q * 8, 1)
+                    // Check if loop body has any function calls or memory ops
+                    let has_call = 0
+                    let r = q + 1
+                    while r < p {
+                        let op = irop(r)
+                        if op == IR_CALL || op == IR_CALL_IDX || op == IR_STR || op == IR_STOREG || op == IR_DEREF || op == IR_DEREF_MUT || op == IR_VOLATILE_LOAD || op == IR_VOLATILE_STORE {
+                            has_call = 1
+                            r = p
+                        }
+                        r = r + 1
+                    }
+                    // If no calls/memory ops, mark as "safe" (can skip flush)
+                    if has_call == 0 { w64(loop_header + q * 8, 2) }
+                }
                 q = irc
             }
             q = q + 1
@@ -690,7 +706,7 @@ let r1=0; let ii=0
                 fst_x(rd, 0)
                 sdef(res, rd); w8(vfloat+res, 1)
             } else {
-            let r1=aphys(a0); let r2=aphys(a1); let rd=adistinct(res,r1,r2); if rd!=r1 { rr(rd,r1) }; ra(rd,r2); ovf_trap_emit(ii); sdef(res, rd); width_mask(a0, a1, rd) }
+            let r1=aphys(a0); let r2=aphys(a1); let rd=adistinct(res,r1,r2); if rd!=r1 { rr(rd,r1) }; ra(rd,r2); if loop_depth == 0 { ovf_trap_emit(ii) }; sdef(res, rd); width_mask(a0, a1, rd) }
         }
         else if op==IR_SUB {
             if r8(vfloat+a0)==1 && r8(vfloat+a1)==1 {
@@ -700,7 +716,7 @@ let r1=0; let ii=0
                 fst_x(rd, 0)
                 sdef(res, rd); w8(vfloat+res, 1)
             } else {
-            let r1=aphys(a0); let r2=aphys(a1); let rd=adistinct(res,r1,r2); if rd!=r1 { rr(rd,r1) }; rs(rd,r2); ovf_trap_emit(ii); sdef(res, rd); width_mask(a0, a1, rd) }
+            let r1=aphys(a0); let r2=aphys(a1); let rd=adistinct(res,r1,r2); if rd!=r1 { rr(rd,r1) }; rs(rd,r2); if loop_depth == 0 { ovf_trap_emit(ii) }; sdef(res, rd); width_mask(a0, a1, rd) }
         }
         else if op==IR_MUL {
             // float * float: both operands are float bit-patterns in GP regs -> SSE
@@ -711,7 +727,7 @@ let r1=0; let ii=0
                 fst_x(rd, 0)                         // movq rd, xmm0 (raw float bits)
                 sdef(res, rd); w8(vfloat+res, 1)
             } else {
-            let r1=aphys(a0); let r2=aphys(a1); let rd=adistinct(res,r1,r2); if rd!=r1 { rr(rd,r1) }; rm(rd,r2); ovf_trap_emit(ii); sdef(res, rd); width_mask(a0, a1, rd) }
+            let r1=aphys(a0); let r2=aphys(a1); let rd=adistinct(res,r1,r2); if rd!=r1 { rr(rd,r1) }; rm(rd,r2); if loop_depth == 0 { ovf_trap_emit(ii) }; sdef(res, rd); width_mask(a0, a1, rd) }
         }
         else if op==IR_DIV {
           // float / float: both operands are float bit-patterns in GP regs -> SSE
@@ -846,7 +862,7 @@ let r1=0; let ii=0
                 let rex=72; if rd>=8 { rex=73 }
                 eb(rex); eb(15); eb(186); eb(248 + (rd%8)); eb(63)   // btc rd, 63 (REX.W 0F BA /7 ib)
                 w8(vfloat+res, 1)   // negated result stays a float vreg
-            } else { rneg(rd); ovf_trap_emit(ii) }
+            } else { rneg(rd); if loop_depth == 0 { ovf_trap_emit(ii) } }
             sdef(res, rd)
         }
         else if op==IR_NOT { let r1=aphys(a0); flush_clob(0,1,2); let rd=adistinct(res,r1,r1); rxor(rd,rd); rcmp(r1,rd); rsetc(0,0); rzx(rd,0); sdef(res, rd) }
