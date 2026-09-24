@@ -423,7 +423,7 @@ fn init_fregs() {
 let falloc = mmap(2000000); let fallocfc = 0
 let fvr_init = mmap(400000)
 let fvr_spill = mmap(400000)
-fn fspill_home(v) { return spill_home(v) }
+fn fspill_home(v) { return -(SPILL_BASE + 8192 + (v + 1) * 8) }
 
 fn fphys(vr) {
     let f=ffind(vr); if f>=0 { return f }
@@ -501,6 +501,13 @@ fn ffree() {
     return ev_pr
 }
 fn fflush_all() {
+    let i=0
+    while i<fallocfc {
+        let vr=r64(falloc+i*16); let pr=r64(falloc+i*16+8)
+        if r8(fvr_init+vr)!=0 { frld(pr, fspill_home(vr)) }
+        w8(fvr_spill+vr, 1)
+        i=i+1
+    }
     fallocfc=0
 }
 fn fdef(vr, reg) { frld(reg, fspill_home(vr)); w8(fvr_init+vr, 1) }
