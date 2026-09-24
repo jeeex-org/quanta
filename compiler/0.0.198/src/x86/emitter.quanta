@@ -340,7 +340,6 @@ fn is_float_vr(vr) {
                 let nm=ira0(k)
                 if r8(src+nm)=='i'&&r8(src+nm+1)=='2'&&r8(src+nm+2)=='f' { return 1 }  // i2f -> float bits
                 if r8(src+nm)=='f'&&r8(src+nm+1)=='c'&&r8(src+nm+2)=='o' { return 1 }  // fconst -> float bits
-                if r8(src+nm)=='f'&&r8(src+nm+1)=='2'&&r8(src+nm+2)=='i' { return 0 }  // f2i -> int, NOT float
                 return 0
             }
             if op==IR_MOV {
@@ -424,15 +423,16 @@ fn init_fregs() {
 let falloc = mmap(2000000); let fallocfc = 0
 let fvr_init = mmap(400000)
 let fvr_spill = mmap(400000)
-fn fspill_home(v) { return spill_home(v) }
+fn fspill_home(v) { return -(SPILL_BASE + 8192 + (v + 1) * 8) }
 
 fn fphys(vr) {
     let f=ffind(vr); if f>=0 { return f }
     let p=ffree()
     if r8(fvr_init+vr)!=0 { frld(p, fspill_home(vr)) }
     else if r8(vfloat+vr)==1 {
-        // Result from emit_bltn stored in GP spill_home, load directly to xmm
-        frld(p, spill_home(vr))
+        // Result from emit_bltn stored in GP spill_home, movq to xmm
+        rbp(0, spill_home(vr))
+        fld_x(0, p)
         w8(fvr_spill+vr, 1)
     }
     fset(vr,p); return p
@@ -668,7 +668,7 @@ fn emit_bltn(nmi,nl,ii) {
         // NO flush_all — uses only xmm0, result in rax
         eb(102); eb(242); eb(72); eb(15); eb(42); eb(199)  // cvtsi2sd xmm0, rdi
         eb(102); eb(72); eb(15); eb(126); eb(192) // movq rax, xmm0
-        fsdef(irres(ii), 0)
+        sdef(irres(ii), 0)
         w8(vfloat+irres(ii), 1)
         return 1
     }
@@ -676,7 +676,7 @@ fn emit_bltn(nmi,nl,ii) {
         // NO flush_all — uses only xmm0
         eb(102); eb(72); eb(15); eb(110); eb(199) // movq xmm0, rdi
         eb(242); eb(72); eb(15); eb(44); eb(192)  // cvttsd2si rax, xmm0
-        w8(vfloat+irres(ira2(ii)), 0)
+        w8(vfloat+irres(ii), 0)
         return 1
     }
     if nl==6&&r8(nm)=='f'&&r8(nm+1)=='c'&&r8(nm+2)=='o'&&r8(nm+3)=='n'&&r8(nm+4)=='s'&&r8(nm+5)=='t' {  // fconst(M, scale): float literal = M/scale
