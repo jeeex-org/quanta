@@ -423,15 +423,16 @@ fn init_fregs() {
 let falloc = mmap(2000000); let fallocfc = 0
 let fvr_init = mmap(400000)
 let fvr_spill = mmap(400000)
-fn fspill_home(v) { return spill_home(v) }
+fn fspill_home(v) { return -(SPILL_BASE + 8192 + (v + 1) * 8) }
 
 fn fphys(vr) {
     let f=ffind(vr); if f>=0 { return f }
     let p=ffree()
     if r8(fvr_init+vr)!=0 { frld(p, fspill_home(vr)) }
     else if r8(vfloat+vr)==1 {
-        // Result from emit_bltn stored in GP spill_home, load directly to xmm
-        frld(p, spill_home(vr))
+        // Result from emit_bltn stored in GP spill_home, movq to xmm
+        rbp(0, spill_home(vr))
+        fld_x(0, p)
         w8(fvr_spill+vr, 1)
     }
     fset(vr,p); return p
@@ -510,28 +511,18 @@ fn fflush_all() {
     fallocfc=0
 }
 fn fdef(vr, reg) { frld(reg, fspill_home(vr)); w8(fvr_init+vr, 1) }
-// frld(xmm, off): movsd xmm, [rbp+disp32]  (F2 0F 10 /r, SIB base=rbp)
-fn frld(xmm, off) {
-    eb(0xF2); eb(0x0F); eb(0x10)
-    eb(0x80 | ((xmm&7)<<3) | 4)  // ModRM: mod=10, reg=xmm, rm=4 (SIB follows)
-    eb(0x24)                       // SIB: scale=00, index=100 (none), base=101 (rbp)
-    ei(off)
-}
-// fsst(off, xmm): movsd [rbp+disp32], xmm  (F2 0F 11 /r, SIB base=rbp)
-fn fsst(off, xmm) {
-    eb(0xF2); eb(0x0F); eb(0x11)
-    eb(0x80 | ((xmm&7)<<3) | 4)  // ModRM: mod=10, reg=xmm, rm=4 (SIB follows)
-    eb(0x24)                       // SIB: scale=00, index=100 (none), base=101 (rbp)
-    ei(off)
-}
+// frld(xmm, off): movsd xmm, [rbp+off]  (REX.W F2 0F 10 /r with rbp base)
+fn frld(xmm, off) { eb(0xF2); eb(73); eb(15); eb(16); mr(2, xmm, 5); ei(off) }
+// fsst(off, xmm): movsd [rbp+off], xmm  (REX.W F2 0F 11 /r with rbp base)
+fn fsst(off, xmm) { eb(0xF2); eb(72); eb(15); eb(17); mr(2, xmm, 5); ei(off) }
 
 // x86 SSE emit helpers (target_arch==0)
 // xmm reg encoding in ModRM/reg fields: just the index 0-7.
 fn frr(d,s) { if d==s { return }; eb(0xF2); eb(15); eb(16); mr(3,d,s) }   // movsd xmm(d), xmm(s)
-fn fadd(d,s) { eb(0xF2); eb(15); eb(88); mr(3,d,s) }   // addsd xmm(d), xmm(s)  (F2 0F 58)
-fn fsub(d,s) { eb(0xF2); eb(15); eb(92); mr(3,d,s) }   // subsd xmm(d), xmm(s)  (F2 0F 5C)
-fn fmul(d,s) { eb(0xF2); eb(15); eb(89); mr(3,d,s) }   // mulsd xmm(d), xmm(s)  (F2 0F 59)
-fn fdiv(d,s) { eb(0xF2); eb(15); eb(94); mr(3,d,s) }   // divsd xmm(d), xmm(s)  (F2 0F 5E)
+fn fadd(d,s) { eb(0xF2); eb(15); eb(88); mr(3,d,s) }   // addsd xmm(d), xmm(s)
+fn fsub(d,s) { eb(0xF2); eb(15); eb(92); mr(3,d,s) }   // subsd xmm(d), xmm(s)
+fn fmul(d,s) { eb(0xF2); eb(15); eb(89); mr(3,d,s) }   // mulsd xmm(d), xmm(s)
+fn fdiv(d,s) { eb(0xF2); eb(15); eb(94); mr(3,d,s) }   // divsd xmm(d), xmm(s)
 fn fld_x(rdx_gp, xmm) { eb(0x66); eb(0x48); eb(15); eb(110); mr(3, xmm, rdx_gp%8) }   // movq xmm, gp   (66 48 0F 6E /r, mod=3 register)
 fn fst_x(gp, xmm) { eb(0x66); eb(0x48); eb(15); eb(126); mr(3, xmm, gp%8) }           // movq gp, xmm   (66 48 0F 7E /r, mod=3 register)
 fn fi2f(xmm, gp) { eb(0xF2); eb(0x48); eb(15); eb(42); mr(2, xmm, gp%8) }  // cvtsi2sd xmm, gp  (F2 REX.W 0F 2A /r, 64-bit)
@@ -684,7 +675,7 @@ fn emit_bltn(nmi,nl,ii) {
         // NO flush_all — uses only xmm0
         eb(102); eb(72); eb(15); eb(110); eb(199) // movq xmm0, rdi
         eb(242); eb(72); eb(15); eb(44); eb(192)  // cvttsd2si rax, xmm0
-        w8(vfloat+irres(ii), 0)
+        w8(vfloat+irres(ira2(ii)), 0)
         return 1
     }
     if nl==6&&r8(nm)=='f'&&r8(nm+1)=='c'&&r8(nm+2)=='o'&&r8(nm+3)=='n'&&r8(nm+4)=='s'&&r8(nm+5)=='t' {  // fconst(M, scale): float literal = M/scale
