@@ -506,7 +506,7 @@ fn fflush_all() {
 }
 fn fdef(vr, reg) { frld(reg, fspill_home(vr)); w8(fvr_init+vr, 1) }
 // frld(xmm, off): movsd xmm, [rbp+off]  (REX.W F2 0F 10 /r with rbp base)
-fn frld(xmm, off) { eb(0xF2); eb(73); eb(15); eb(16); mr(2, xmm, 5); ei(off) }
+fn frld(xmm, off) { eb(0xF2); eb(72); eb(15); eb(16); mr(2, xmm, 5); ei(off) }
 
 // x86 SSE emit helpers (target_arch==0)
 // xmm reg encoding in ModRM/reg fields: just the index 0-7.
@@ -659,6 +659,7 @@ fn emit_bltn(nmi,nl,ii) {
         // NO flush_all — uses only xmm0, result in rax
         eb(102); eb(242); eb(72); eb(15); eb(42); eb(199)  // cvtsi2sd xmm0, rdi
         eb(102); eb(72); eb(15); eb(126); eb(192) // movq rax, xmm0
+        sdef(irres(ii), 0)
         w8(vfloat+irres(ii), 1)
         return 1
     }
@@ -666,7 +667,8 @@ fn emit_bltn(nmi,nl,ii) {
         // NO flush_all — uses only xmm0
         eb(102); eb(72); eb(15); eb(110); eb(199) // movq xmm0, rdi
         eb(242); eb(72); eb(15); eb(44); eb(192)  // cvttsd2si rax, xmm0
-        w8(vfloat+irres(ira2(ii)), 0)
+        sdef(irres(ii), 0)
+        w8(vfloat+irres(ii), 0)
         return 1
     }
     if nl==6&&r8(nm)=='f'&&r8(nm+1)=='c'&&r8(nm+2)=='o'&&r8(nm+3)=='n'&&r8(nm+4)=='s'&&r8(nm+5)=='t' {  // fconst(M, scale): float literal = M/scale
@@ -675,6 +677,7 @@ fn emit_bltn(nmi,nl,ii) {
         eb(102); eb(242); eb(72); eb(15); eb(42); eb(206)  // cvtsi2sd xmm1, rsi
         eb(242); eb(15); eb(94); eb(193)                  // divsd xmm0, xmm1
         eb(102); eb(72); eb(15); eb(126); eb(192)         // movq rax, xmm0
+        sdef(irres(ii), 0)
         w8(vfloat+irres(ii), 1)
         return 1
     }
@@ -724,6 +727,7 @@ fn emit_bltn(nmi,nl,ii) {
         eb(102); eb(72); eb(15); eb(110); eb(206) // movq xmm1, rsi
         eb(242); eb(15); eb(88); eb(193)          // addsd xmm0, xmm1
         eb(102); eb(72); eb(15); eb(126); eb(192) // movq rax, xmm0
+        sdef(irres(ii), 0)
         w8(vfloat+irres(ii), 1)
         return 1
     }
@@ -733,6 +737,7 @@ fn emit_bltn(nmi,nl,ii) {
         eb(102); eb(72); eb(15); eb(110); eb(206) // movq xmm1, rsi
         eb(242); eb(15); eb(92); eb(193)          // subsd xmm0, xmm1
         eb(102); eb(72); eb(15); eb(126); eb(192) // movq rax, xmm0
+        sdef(irres(ii), 0)
         w8(vfloat+irres(ii), 1)
         return 1
     }
@@ -742,6 +747,7 @@ fn emit_bltn(nmi,nl,ii) {
         eb(102); eb(72); eb(15); eb(110); eb(206) // movq xmm1, rsi
         eb(242); eb(15); eb(89); eb(193)          // mulsd xmm0, xmm1
         eb(102); eb(72); eb(15); eb(126); eb(192) // movq rax, xmm0
+        sdef(irres(ii), 0)
         w8(vfloat+irres(ii), 1)
         return 1
     }
@@ -762,6 +768,7 @@ fn emit_bltn(nmi,nl,ii) {
         eb(102); eb(72); eb(15); eb(110); eb(206) // movq xmm1, rsi
         eb(242); eb(15); eb(94); eb(193)          // divsd xmm0, xmm1
         eb(102); eb(72); eb(15); eb(126); eb(192) // movq rax, xmm0
+        sdef(irres(ii), 0)
         w8(vfloat+irres(ii), 1)
         return 1
     }    // q4k_dot(W_q4, x_q8, n_blocks): fused Q4_K dot product
