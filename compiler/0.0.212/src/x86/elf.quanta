@@ -1,0 +1,642 @@
+// ============================================================================
+
+
+// === ELF WRITER ===
+let BASE = 4194304
+
+// PT_LOAD flags
+let PF_X = 1
+let PF_W = 2
+let PF_R = 4
+
+// Program header types
+let PT_NULL = 0
+let PT_LOAD = 1
+let PT_DYNAMIC = 2
+let PT_INTERP = 3
+let PT_NOTE = 4
+let PT_SHLIB = 5
+let PT_PHDR = 6
+let PT_TLS = 7
+let PT_GNU_STACK = 0x6474e551
+
+// Dynamic tags
+let DT_NULL = 0
+let DT_NEEDED = 1
+let DT_PLTRELSZ = 2
+let DT_PLTGOT = 3
+let DT_HASH = 4
+let DT_STRTAB = 5
+let DT_SYMTAB = 6
+let DT_RELA = 7
+let DT_RELASZ = 8
+let DT_RELAENT = 9
+let DT_STRSZ = 10
+let DT_SYMENT = 11
+let DT_INIT = 12
+let DT_FINI = 13
+let DT_SONAME = 14
+let DT_RPATH = 15
+let DT_SYMBOLIC = 16
+let DT_REL = 17
+let DT_RELSZ = 18
+let DT_RELENT = 19
+let DT_PLTREL = 20
+let DT_DEBUG = 21
+let DT_TEXTREL = 22
+let DT_JMPREL = 23
+let DT_BIND_NOW = 24
+let DT_INIT_ARRAY = 25
+let DT_FINI_ARRAY = 26
+let DT_INIT_ARRAYSZ = 27
+let DT_FLAGS = 30
+let DT_FLAGS_1 = 0x6ffffffb
+let DT_VERDEF = 0x6ffffffc
+let DT_VERDEFNUM = 0x6ffffffd
+let DT_VERNEED = 0x6ffffffe
+let DT_VERNEEDNUM = 0x6fffffff
+
+// Symbol bindings/types
+let STB_LOCAL = 0
+let STB_GLOBAL = 1
+let STT_NOTYPE = 0
+let STT_FUNC = 2
+
+// Relocation types (x86-64)
+let R_X86_64_NONE = 0
+let R_X86_64_64 = 1
+let R_X86_64_PC32 = 2
+let R_X86_64_GOT32 = 3
+let R_X86_64_PLT32 = 4
+let R_X86_64_COPY = 5
+let R_X86_64_GLOB_DAT = 6
+let R_X86_64_JUMP_SLOT = 7
+let R_X86_64_RELATIVE = 8
+let R_X86_64_GOTPCREL = 9
+let R_X86_64_32 = 10
+let R_X86_64_32S = 11
+let R_X86_64_16 = 12
+let R_X86_64_PC16 = 13
+let R_X86_64_8 = 14
+let R_X86_64_PC8 = 15
+let R_X86_64_DTPMOD64 = 16
+let R_X86_64_DTPOFF64 = 17
+let R_X86_64_TPOFF64 = 18
+
+// Section header types
+let SHT_NULL = 0
+let SHT_PROGBITS = 1
+let SHT_SYMTAB = 2
+let SHT_STRTAB = 3
+let SHT_RELA = 4
+let SHT_HASH = 5
+let SHT_DYNAMIC = 6
+let SHT_NOTE = 7
+let SHT_NOBITS = 8
+let SHT_REL = 9
+let SHT_SHLIB = 10
+let SHT_DYNSYM = 11
+let SHT_INIT_ARRAY = 14
+let SHT_FINI_ARRAY = 15
+let SHT_PREINIT_ARRAY = 16
+let SHT_GROUP = 17
+let SHT_SYMTAB_SHNDX = 18
+
+// Section header flags
+let SHF_WRITE = 1
+let SHF_ALLOC = 2
+let SHF_EXECINSTR = 4
+
+// ELF constants
+let ELFCLASS64 = 2
+let ELFDATA2LSB = 1
+let EV_CURRENT = 1
+let ET_EXEC = 2
+let ET_DYN = 3
+let EM_X86_64 = 62
+let EI_NIDENT = 16
+
+fn write_elf(outp) {
+    let hsz = 64
+    let phsz = 56
+    let phc = 6  // PT_PHDR, LOAD_RX, LOAD_RW, PT_INTERP, PT_DYNAMIC, GNU_STACK
+    if emit_dynamic == 0 {
+        // Static PIE mode: 4 program headers (PHDR, LOAD_RX, LOAD_RW, GNU_STACK)
+        // No PT_INTERP, no PT_DYNAMIC
+        phc = 4
+    }
+    let ht = hsz + phsz * phc
+    // Export ht so entry.quanta can use it for PLT call patching
+    g_elf_ht = ht
+    let tsz = ht + codelen
+    let pg = 4096
+    let tp = tsz + data_off
+    { let trm = tp % pg; if trm > 0 { tp = tp + (pg - trm) } }
+    
+    // --- gdata calculations (always needed) ---
+    let gdata_size = (INTERNAL_GLOBAL_COUNT + gvarc) * 8
+    let gdata_vaddr = GDATA
+    
+    let gsz = (gvarc + INTERNAL_GLOBAL_COUNT) * 8 + data_off
+    let grm = gsz % pg
+    if grm > 0 { gsz = gsz + (pg - grm) }
+    if gsz < pg { gsz = pg }
+    
+    // --- Dynamic linking data structures (in RW segment tail) ---
+    // We'll place these at the end of the RW segment (after globals + string literals)
+    // Layout in RW segment:
+    //   [globals (gdata_size)][string literals (data_off)][.interp][.dynstr][.dynsym][.hash][.gnu.hash][.dynamic][.got][.got.plt][.plt][.rela.plt]
+    
+    // Count extern "C" functions (for PLT/GOT sizing)
+    let num_extern = 0
+    let fi = 0
+    while fi < fnc {
+        if r64(fn_extern + fi * 8) == 1 { num_extern = num_extern + 1 }
+        fi = fi + 1
+    }
+    
+    // Dynamic linking data sizes (only for emit_dynamic==1)
+    let dyn_total = 0
+    let interp_len = 0
+    let dynstr_size = 0
+    let dynsym_count = 0
+    let dynsym_size = 0
+    let hash_size = 0
+    let gnu_hash_size = 0
+    let dynamic_size = 0
+    let got_size = 0
+    let got_plt_size = 0
+    let plt_size = 0
+    let rela_plt_size = 0
+    let dynamic_off = 0
+    let dynamic_vaddr = 0
+    
+    if emit_dynamic == 1 {
+        // Sizes
+        interp_len = 28  // "/lib64/ld-linux-x86-64.so.2\0"
+        dynstr_size = 1 + 10  // empty + "libc.so.6\0"
+        let k = 0
+        while k < num_extern {
+            dynstr_size = dynstr_size + 16
+            k = k + 1
+        }
+        dynsym_count = num_extern + 1  // +1 for NULL symbol
+        dynsym_size = dynsym_count * 24
+        hash_size = 8 + 4*2 + 4*dynsym_count
+        gnu_hash_size = 48  // minimal
+        dynamic_size = 16 * 12
+        got_size = 24 + num_extern * 8
+        got_plt_size = 24 + num_extern * 8
+        plt_size = 16 + num_extern * 16
+        rela_plt_size = num_extern * 24
+        
+        dyn_total = interp_len + dynstr_size + dynsym_size + hash_size + gnu_hash_size + dynamic_size + got_size + got_plt_size + plt_size + rela_plt_size
+        // Align dyn_total to 16 bytes
+        let dyn_pad = dyn_total % 16
+        if dyn_pad > 0 { dyn_total = dyn_total + (16 - dyn_pad) }
+        
+        // Dynamic section will be placed in RW segment after gdata + string literals
+        dynamic_off = tp + gdata_size + data_off
+        dynamic_vaddr = gdata_vaddr + gdata_size + data_off
+    }
+    
+    // RW segment must include dynamic data (or just gdata + string literals for static PIE)
+    let gdata_filesz = gdata_size + data_off + dyn_total
+    let gdata_memsz = gdata_filesz
+    if gdata_memsz < gsz { gdata_memsz = gsz }
+    
+    // Total file size: code segment (tp) + RW segment (gdata_filesz)
+    let elf_total = tp + gdata_filesz
+    let elfb = mmap(elf_total)
+    // Zero the ELF buffer
+    let zi0 = 0
+    while zi0 < elf_total { w8(elfb + zi0, 0); zi0 = zi0 + 1 }
+    
+    // ============================================================
+    // ELF Header
+    // ============================================================
+    w8(elfb, 127); w8(elfb + 1, 69); w8(elfb + 2, 76); w8(elfb + 3, 70)
+    w8(elfb + 4, ELFCLASS64); w8(elfb + 5, ELFDATA2LSB); w8(elfb + 6, EV_CURRENT)
+    w8(elfb + 7, 0); w8(elfb + 8, 0); w8(elfb + 9, 0); w8(elfb + 10, 0); w8(elfb + 11, 0); w8(elfb + 12, 0); w8(elfb + 13, 0); w8(elfb + 14, 0); w8(elfb + 15, 0)
+    w16(elfb + 16, ET_EXEC)
+    w16(elfb + 18, EM_X86_64)
+    w32(elfb + 20, EV_CURRENT)
+    w64(elfb + 24, BASE + ht)  // e_entry = _start
+    w64(elfb + 32, hsz)         // e_phoff
+    w64(elfb + 40, 0)           // e_shoff (no sections)
+    w32(elfb + 48, 0)           // e_flags
+    w16(elfb + 52, hsz)
+    w16(elfb + 54, phsz)
+    w16(elfb + 56, phc)
+    w16(elfb + 58, 0)           // e_shentsize
+    w16(elfb + 60, 0)           // e_shnum
+    w16(elfb + 62, 0)           // e_shstrndx
+    
+    // ============================================================
+    // Program Headers
+    // ============================================================
+    let pho = hsz
+    
+    // PH 0: PT_PHDR (always)
+    w64(elfb + pho + 0, PT_PHDR)
+    w64(elfb + pho + 4, PF_R)
+    w64(elfb + pho + 8, hsz)
+    w64(elfb + pho + 16, BASE + hsz)
+    w64(elfb + pho + 24, BASE + hsz)
+    w64(elfb + pho + 32, phsz * phc)
+    w64(elfb + pho + 40, phsz * phc)
+    w64(elfb + pho + 48, pg)
+    
+    // PH 1: PT_LOAD (code) R|X (always)
+    let phco = pho + phsz
+    w64(elfb + phco + 0, PT_LOAD)
+    w64(elfb + phco + 4, PF_R | PF_X)
+    w64(elfb + phco + 8, 0)
+    w64(elfb + phco + 16, BASE)
+    w64(elfb + phco + 24, BASE)
+    w64(elfb + phco + 32, tp)
+    w64(elfb + phco + 40, tp)
+    w64(elfb + phco + 48, pg)
+    
+    let ph_next = phco + phsz
+    
+    if emit_dynamic == 1 {
+        // PH 2: PT_INTERP - must be in first LOAD segment
+        // The interpreter string is in the RW segment (with dynamic data), so point to it there
+        let interp_off = dynamic_off  // in RW segment
+        let interp_vaddr = dynamic_vaddr
+        let ph_interp = ph_next
+        w64(elfb + ph_interp + 0, PT_INTERP)
+        w64(elfb + ph_interp + 4, PF_R)
+        w64(elfb + ph_interp + 8, interp_off)
+        w64(elfb + ph_interp + 16, interp_vaddr)
+        w64(elfb + ph_interp + 24, interp_vaddr)
+        w64(elfb + ph_interp + 32, interp_len)
+        w64(elfb + ph_interp + 40, interp_len)
+        w64(elfb + ph_interp + 48, 1)
+        
+        ph_next = ph_interp + phsz
+        
+        // PH 3: PT_LOAD (data) R|W - includes dynamic section
+        let phdo = ph_next
+        w64(elfb + phdo + 0, PT_LOAD)
+        w64(elfb + phdo + 4, PF_R | PF_W)
+        w64(elfb + phdo + 8, tp)
+        w64(elfb + phdo + 16, gdata_vaddr)
+        w64(elfb + phdo + 24, gdata_vaddr)
+        w64(elfb + phdo + 32, gdata_filesz)
+        w64(elfb + phdo + 40, gdata_memsz)
+        w64(elfb + phdo + 48, pg)
+        
+        ph_next = phdo + phsz
+        
+        // PH 4: PT_DYNAMIC - inside RW segment, points to .dynamic section
+        let dynamic_off_abs = dynamic_off + interp_len + dynstr_size + dynsym_size + hash_size + gnu_hash_size
+        let ph_dyn = ph_next
+        w64(elfb + ph_dyn + 0, PT_DYNAMIC)
+        w64(elfb + ph_dyn + 4, PF_R | PF_W)
+        w64(elfb + ph_dyn + 8, dynamic_off_abs)
+        w64(elfb + ph_dyn + 16, dynamic_vaddr + interp_len + dynstr_size + dynsym_size + hash_size + gnu_hash_size)
+        w64(elfb + ph_dyn + 24, dynamic_vaddr + interp_len + dynstr_size + dynsym_size + hash_size + gnu_hash_size)
+        w64(elfb + ph_dyn + 32, dynamic_size)
+        w64(elfb + ph_dyn + 40, dynamic_size)
+        w64(elfb + ph_dyn + 48, 8)
+        
+        ph_next = ph_dyn + phsz
+        
+        // PH 5: GNU_STACK
+        let ph_gnu = ph_next
+        w64(elfb + ph_gnu + 0, PT_GNU_STACK)
+        w64(elfb + ph_gnu + 4, PF_R | PF_W)
+        w64(elfb + ph_gnu + 8, 0)
+        w64(elfb + ph_gnu + 16, 0)
+        w64(elfb + ph_gnu + 24, 0)
+        w64(elfb + ph_gnu + 32, 0)
+        w64(elfb + ph_gnu + 40, pg)
+        w64(elfb + ph_gnu + 48, pg)
+    } else {
+        // Static PIE mode: PT_LOAD (data) R|W after code segment, then GNU_STACK
+        let phdo = ph_next
+        w64(elfb + phdo + 0, PT_LOAD)
+        w64(elfb + phdo + 4, PF_R | PF_W)
+        w64(elfb + phdo + 8, tp)
+        w64(elfb + phdo + 16, gdata_vaddr)
+        w64(elfb + phdo + 24, gdata_vaddr)
+        w64(elfb + phdo + 32, gdata_filesz)
+        w64(elfb + phdo + 40, gdata_memsz)
+        w64(elfb + phdo + 48, pg)
+        
+        ph_next = phdo + phsz
+        
+        // PH: GNU_STACK
+        let ph_gnu = ph_next
+        w64(elfb + ph_gnu + 0, PT_GNU_STACK)
+        w64(elfb + ph_gnu + 4, PF_R | PF_W)
+        w64(elfb + ph_gnu + 8, 0)
+        w64(elfb + ph_gnu + 16, 0)
+        w64(elfb + ph_gnu + 24, 0)
+        w64(elfb + ph_gnu + 32, 0)
+        w64(elfb + ph_gnu + 40, pg)
+        w64(elfb + ph_gnu + 48, pg)
+        
+        ph_next = ph_gnu + phsz
+    }
+    
+    // ============================================================
+    // Copy code segment
+    // ============================================================
+    let dst = elfb + ht
+    let i3 = 0
+    while i3 < codelen { w8(dst + i3, r8(code + i3)); i3 = i3 + 1 }
+    while i3 < tp - ht { w8(dst + i3, 0); i3 = i3 + 1 }
+    
+    // ============================================================
+    // Copy string literals to data segment
+    // ============================================================
+    let src_globals = gvarc
+    if src_globals > INTERNAL_GLOBAL_COUNT { src_globals = src_globals - INTERNAL_GLOBAL_COUNT }
+    let src_data_off = data_off
+    let dstd = elfb + tp + gdata_size
+    let i4 = 0
+    while i4 < src_data_off { w8(dstd + i4, r8(data + i4)); i4 = i4 + 1 }
+    
+    // ============================================================
+    // Write g_code_end (internal global 41)
+    // ============================================================
+    w64(elfb + tp + g_code_end * 8, CODE_VBASE + codelen)
+    
+    // ============================================================
+    // Build dynamic section in RW segment tail (only for emit_dynamic==1)
+    // ============================================================
+    if emit_dynamic == 1 {
+        let dyn_ptr = dynamic_off
+        
+            // .interp string
+            let interp_src = mmap(interp_len)
+            w8(interp_src + 0, 47);   // '/'
+            w8(interp_src + 1, 108);  // 'l'
+            w8(interp_src + 2, 105);  // 'i'
+            w8(interp_src + 3, 98);   // 'b'
+            w8(interp_src + 4, 54);   // '6'
+            w8(interp_src + 5, 52);   // '4'
+            w8(interp_src + 6, 47);   // '/'
+            w8(interp_src + 7, 108);  // 'l'
+            w8(interp_src + 8, 100);  // 'd'
+            w8(interp_src + 9, 45);   // '-'
+            w8(interp_src + 10, 108); // 'l'
+            w8(interp_src + 11, 105); // 'i'
+            w8(interp_src + 12, 110); // 'n'
+            w8(interp_src + 13, 117); // 'u'
+            w8(interp_src + 14, 120); // 'x'
+            w8(interp_src + 15, 45);  // '-'
+            w8(interp_src + 16, 120); // 'x'
+            w8(interp_src + 17, 56);  // '8'
+            w8(interp_src + 18, 54);  // '6'
+            w8(interp_src + 19, 45);  // '-'
+            w8(interp_src + 20, 54);  // '6'
+            w8(interp_src + 21, 52);  // '4'
+            w8(interp_src + 22, 46);  // '.'
+            w8(interp_src + 23, 115); // 's'
+            w8(interp_src + 24, 111); // 'o'
+            w8(interp_src + 25, 46);  // '.'
+            w8(interp_src + 26, 50);  // '2'
+            w8(interp_src + 27, 0);   // '\0'
+            let k = 0
+            while k < interp_len { w8(elfb + dyn_ptr + k, r8(interp_src + k)); k = k + 1 }
+            let interp_off_abs = dyn_ptr
+            dyn_ptr = dyn_ptr + interp_len
+        
+            // .dynstr - string table for dynamic symbols
+            let dynstr_off = dyn_ptr
+            let dynstr_ptr = dyn_ptr
+            w8(elfb + dynstr_ptr, 0); dynstr_ptr = dynstr_ptr + 1  // empty first entry
+        
+            // "libc.so.6\0"
+            let libc_str = "libc.so.6\0"
+            let k2 = 0
+            while k2 < 10 { w8(elfb + dynstr_ptr + k2, r8(libc_str + k2 + 8)); k2 = k2 + 1 }
+            dynstr_ptr = dynstr_ptr + 10
+        
+            // extern function names - will add below
+            let dynstr_base = dynstr_ptr
+        
+            // Reserve space, will fill later
+            dyn_ptr = dyn_ptr + dynstr_size
+        
+            // .dynsym - dynamic symbol table
+            let dynsym_off = dyn_ptr
+            // NULL symbol (index 0)
+            w64(elfb + dyn_ptr + 0, 0)   // st_name
+            w8(elfb + dyn_ptr + 8, 0)    // st_info
+            w8(elfb + dyn_ptr + 9, 0)    // st_other
+            w16(elfb + dyn_ptr + 10, 0)  // st_shndx
+            w64(elfb + dyn_ptr + 16, 0)  // st_value
+            w64(elfb + dyn_ptr + 24, 0)  // st_size
+            dyn_ptr = dyn_ptr + 24
+        
+            // extern symbols - will fill below
+            let dynsym_start = dyn_ptr
+            dyn_ptr = dyn_ptr + dynsym_size - 24
+        
+            // .hash - simple SYSV hash (2 buckets, minimal)
+            let hash_off = dyn_ptr
+            w32(elfb + dyn_ptr, 2)   // nbucket
+            w32(elfb + dyn_ptr + 4, dynsym_count)  // nchain
+            w32(elfb + dyn_ptr + 8, 0)  // bucket[0]
+            w32(elfb + dyn_ptr + 12, 0) // bucket[1]
+            w32(elfb + dyn_ptr + 16, 0) // chain[0]
+            w32(elfb + dyn_ptr + 20, 0) // chain[1]
+            w32(elfb + dyn_ptr + 24, 0) // chain[2]
+            w32(elfb + dyn_ptr + 28, 0) // chain[3]
+            dyn_ptr = dyn_ptr + 32
+        
+            // .gnu.hash - minimal
+            let gnu_hash_off = dyn_ptr
+            w32(elfb + dyn_ptr, 2)    // nbuckets
+            w32(elfb + dyn_ptr + 4, 0) // symndx
+            w32(elfb + dyn_ptr + 8, 0) // maskwords
+            w32(elfb + dyn_ptr + 12, 0) // shift2
+            w64(elfb + dyn_ptr + 16, 0) // bloom[0]
+            w64(elfb + dyn_ptr + 24, 0) // bloom[1]
+            w32(elfb + dyn_ptr + 32, 0) // bucket[0]
+            w32(elfb + dyn_ptr + 36, 0) // bucket[1]
+            // chains follow
+            dyn_ptr = dyn_ptr + 48
+        
+            // .dynamic
+            let dynamic_off_abs = dyn_ptr
+            let dyn_idx = 0
+            // DT_NEEDED -> "libc.so.6" offset in .dynstr (offset 1 after empty first entry)
+            w64(elfb + dyn_ptr + dyn_idx * 16, DT_NEEDED)
+            w64(elfb + dyn_ptr + dyn_idx * 16 + 8, 1)
+            dyn_idx = dyn_idx + 1
+            // DT_PLTRELSZ
+            w64(elfb + dyn_ptr + dyn_idx * 16, DT_PLTRELSZ)
+            w64(elfb + dyn_ptr + dyn_idx * 16 + 8, rela_plt_size)
+            dyn_idx = dyn_idx + 1
+            // DT_PLTGOT -> .got.plt address
+            w64(elfb + dyn_ptr + dyn_idx * 16, DT_PLTGOT)
+            w64(elfb + dyn_ptr + dyn_idx * 16 + 8, dynamic_vaddr + interp_len + dynstr_size + dynsym_size + hash_size + gnu_hash_size + dynamic_size + got_size + got_plt_size + plt_size)
+            dyn_idx = dyn_idx + 1
+            // DT_HASH -> .hash address
+            w64(elfb + dyn_ptr + dyn_idx * 16, DT_HASH)
+            w64(elfb + dyn_ptr + dyn_idx * 16 + 8, dynamic_vaddr + interp_len + dynstr_size + dynsym_size)
+            dyn_idx = dyn_idx + 1
+            // DT_STRTAB -> .dynstr address
+            w64(elfb + dyn_ptr + dyn_idx * 16, DT_STRTAB)
+            w64(elfb + dyn_ptr + dyn_idx * 16 + 8, dynamic_vaddr + interp_len)
+            dyn_idx = dyn_idx + 1
+            // DT_SYMTAB -> .dynsym address
+            w64(elfb + dyn_ptr + dyn_idx * 16, DT_SYMTAB)
+            w64(elfb + dyn_ptr + dyn_idx * 16 + 8, dynamic_vaddr + interp_len + dynstr_size)
+            dyn_idx = dyn_idx + 1
+            // DT_RELA -> .rela.plt address
+            w64(elfb + dyn_ptr + dyn_idx * 16, DT_RELA)
+            w64(elfb + dyn_ptr + dyn_idx * 16 + 8, dynamic_vaddr + interp_len + dynstr_size + dynsym_size + hash_size + gnu_hash_size + dynamic_size + got_size + got_plt_size + plt_size)
+            dyn_idx = dyn_idx + 1
+            // DT_RELASZ
+            w64(elfb + dyn_ptr + dyn_idx * 16, DT_RELASZ)
+            w64(elfb + dyn_ptr + dyn_idx * 16 + 8, rela_plt_size)
+            dyn_idx = dyn_idx + 1
+            // DT_RELAENT
+            w64(elfb + dyn_ptr + dyn_idx * 16, DT_RELAENT)
+            w64(elfb + dyn_ptr + dyn_idx * 16 + 8, 24)
+            dyn_idx = dyn_idx + 1
+            // DT_STRSZ -> .dynstr size
+            w64(elfb + dyn_ptr + dyn_idx * 16, DT_STRSZ)
+            w64(elfb + dyn_ptr + dyn_idx * 16 + 8, dynstr_size)
+            dyn_idx = dyn_idx + 1
+            // DT_SYMENT
+            w64(elfb + dyn_ptr + dyn_idx * 16, DT_SYMENT)
+            w64(elfb + dyn_ptr + dyn_idx * 16 + 8, 24)
+            dyn_idx = dyn_idx + 1
+            // DT_JMPREL -> .rela.plt address
+            w64(elfb + dyn_ptr + dyn_idx * 16, DT_JMPREL)
+            w64(elfb + dyn_ptr + dyn_idx * 16 + 8, dynamic_vaddr + interp_len + dynstr_size + dynsym_size + hash_size + gnu_hash_size + dynamic_size + got_size + got_plt_size + plt_size)
+            dyn_idx = dyn_idx + 1
+            // DT_PLTREL (RELA)
+            w64(elfb + dyn_ptr + dyn_idx * 16, DT_PLTREL)
+            w64(elfb + dyn_ptr + dyn_idx * 16 + 8, 7)  // DT_RELA
+            dyn_idx = dyn_idx + 1
+            // DT_FLAGS_1 (BIND_NOW)
+            w64(elfb + dyn_ptr + dyn_idx * 16, DT_FLAGS_1)
+            w64(elfb + dyn_ptr + dyn_idx * 16 + 8, 0x00000001)  // DF_1_NOW
+            dyn_idx = dyn_idx + 1
+            // DT_NULL terminator
+            w64(elfb + dyn_ptr + dyn_idx * 16, DT_NULL)
+            w64(elfb + dyn_ptr + dyn_idx * 16 + 8, 0)
+            dyn_ptr = dyn_ptr + dynamic_size
+        
+            // .got
+            let got_off = dyn_ptr
+            let got_vaddr = dynamic_vaddr + interp_len + dynstr_size + dynsym_size + hash_size + gnu_hash_size + dynamic_size
+            // 3 reserved entries: [0] = .dynamic addr, [1] = link_map, [2] = _dl_runtime_resolve
+            w64(elfb + got_off + 0, dynamic_vaddr)
+            w64(elfb + got_off + 8, 0)
+            w64(elfb + got_off + 16, 0)
+            dyn_ptr = dyn_ptr + got_size
+        
+            // .got.plt
+            let got_plt_off = dyn_ptr
+            let got_plt_vaddr = got_vaddr + got_size
+            // 3 reserved entries
+            w64(elfb + got_plt_off + 0, dynamic_vaddr)
+            w64(elfb + got_plt_off + 8, 0)
+            w64(elfb + got_plt_off + 16, 0)
+            dyn_ptr = dyn_ptr + got_plt_size
+        
+            // .plt
+            let plt_off = dyn_ptr
+            let plt_vaddr = got_plt_vaddr + got_plt_size
+            // PLT0: push QWORD PTR [got.plt+8]; jmp QWORD PTR [got.plt+16]
+            w8(elfb + plt_off + 0, 0xFF); w8(elfb + plt_off + 1, 0x35);  // push qword [rip+disp32]
+            w32(elfb + plt_off + 2, got_plt_vaddr + 8 - (plt_vaddr + 6))  // disp32 to got.plt+8
+            w8(elfb + plt_off + 6, 0xFF); w8(elfb + plt_off + 7, 0x25);  // jmp qword [rip+disp32]
+            w32(elfb + plt_off + 10, got_plt_vaddr + 16 - (plt_vaddr + 14))
+            // Pad to 16 bytes
+            w8(elfb + plt_off + 14, 0x90); w8(elfb + plt_off + 15, 0x90)
+            dyn_ptr = dyn_ptr + plt_size
+        
+            // .rela.plt
+            let rela_plt_off = dyn_ptr
+            let rela_plt_vaddr = plt_vaddr + plt_size
+            dyn_ptr = dyn_ptr + rela_plt_size
+        
+            // ============================================================
+            // Fill in extern symbols in .dynsym and .dynstr
+            // ============================================================
+            let dynsym_ptr = dynsym_start
+            let dynstr_fill_ptr = dynstr_base
+            let rela_plt_ptr = rela_plt_off
+            let got_plt_entry_ptr = got_plt_off + 24  // skip 3 reserved
+            let plt_entry_ptr = plt_off + 16  // skip PLT0
+            let extern_idx = 1  // symbol index (0 is NULL)
+        
+            fi = 0
+            while fi < fnc {
+                if r64(fn_extern + fi * 8) == 1 {
+                    let nm = fn_name(fi)
+                    let nl = fn_nlen(fi)
+                
+                    // Write symbol name to .dynstr
+                    let name_off = dynstr_fill_ptr - dynstr_off
+                    let k3 = 0
+                    while k3 < nl { w8(elfb + dynstr_fill_ptr + k3, r8(nm + k3)); k3 = k3 + 1 }
+                    w8(elfb + dynstr_fill_ptr + nl, 0)
+                    dynstr_fill_ptr = dynstr_fill_ptr + nl + 1
+                
+                    // Write .dynsym entry
+                    w64(elfb + dynsym_ptr + 0, name_off)  // st_name
+                    w8(elfb + dynsym_ptr + 8, 0x12)       // STT_FUNC | STB_GLOBAL (0x12)
+                    w8(elfb + dynsym_ptr + 9, 0)          // st_other
+                    w16(elfb + dynsym_ptr + 10, 0)        // st_shndx = SHN_UNDEF
+                    w64(elfb + dynsym_ptr + 16, 0)        // st_value
+                    w64(elfb + dynsym_ptr + 24, 0)        // st_size
+                    dynsym_ptr = dynsym_ptr + 24
+                
+                    // Write .rela.plt entry (R_X86_64_JUMP_SLOT)
+                    // r_offset = .got.plt entry for this symbol
+                    let got_plt_entry_vaddr = got_plt_vaddr + 24 + (extern_idx - 1) * 8
+                    w64(elfb + rela_plt_ptr + 0, got_plt_entry_vaddr)
+                    w64(elfb + rela_plt_ptr + 8, (extern_idx << 32) | R_X86_64_JUMP_SLOT)
+                    w64(elfb + rela_plt_ptr + 16, 0)
+                    rela_plt_ptr = rela_plt_ptr + 24
+                
+                    // Write .got.plt entry (initially points to PLT resolver stub)
+                    // Will be filled by dynamic linker
+                    w64(elfb + got_plt_entry_ptr, plt_entry_ptr + 6)  // points to jmp in PLT entry
+                    got_plt_entry_ptr = got_plt_entry_ptr + 8
+                
+                    // Write PLT entry (16 bytes each)
+                    // jmp QWORD PTR [got.plt + X]
+                    w8(elfb + plt_entry_ptr, 0xFF); w8(elfb + plt_entry_ptr + 1, 0x25)
+                    let got_entry_for_this = got_plt_vaddr + 24 + (extern_idx - 1) * 8
+                    w32(elfb + plt_entry_ptr + 2, got_entry_for_this - (plt_entry_ptr + 6))
+                    // pushq $reloc_index
+                    w8(elfb + plt_entry_ptr + 6, 0x68)
+                    w32(elfb + plt_entry_ptr + 7, extern_idx - 1)
+                    // jmp PLT0
+                    w8(elfb + plt_entry_ptr + 11, 0xE9)
+                    let plt0_addr = plt_vaddr
+                    w32(elfb + plt_entry_ptr + 12, plt0_addr - (plt_entry_ptr + 16))
+                    // Pad to 16 bytes
+                    w8(elfb + plt_entry_ptr + 14, 0x90); w8(elfb + plt_entry_ptr + 15, 0x90)
+                
+                    plt_entry_ptr = plt_entry_ptr + 16
+                    extern_idx = extern_idx + 1
+                }
+                fi = fi + 1
+            }
+        }
+    
+    // ============================================================
+    // Write file
+    // ============================================================
+    let ofd = 1
+    let outbuf = mmap(16)
+    w8(outbuf, 111); w8(outbuf + 1, 117); w8(outbuf + 2, 116); w8(outbuf + 3, 46)
+    w8(outbuf + 4, 101); w8(outbuf + 5, 120); w8(outbuf + 6, 101); w8(outbuf + 7, 0)
+    
+    if outp == 0 { ofd = file_open(outbuf, 577, 493) } else { ofd = file_open(outp, 577, 493) }
+    if ofd >= 0 { file_write(ofd, elfb, elf_total); file_close(ofd) }
+}
