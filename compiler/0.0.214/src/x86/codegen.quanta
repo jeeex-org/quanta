@@ -150,84 +150,6 @@ fn width_mask(o0, o1, rd) {
 }
 
 
-// Loop register pinning: find vregs used before redefined in loop body
-// (loop-carried variables like induction vars, accumulators) and pin them
-// to callee-saved registers (rbx=3, r12=12, r13=13, r14=14, r15=15)
-fn opt_loop_pin() {
-    if opt_on == 0 { return }
-    if had_error == 1 { return }
-    
-    // loop_pinned[vreg] = pinned physical register (0=none)
-    loop_pinned = mmap(vreg_n * 8)
-    let i = 0
-    while i < vreg_n { w64(loop_pinned + i * 8, 0); i = i + 1 }
-    
-    // For each loop header (marked by loop_header), find loop-carried vregs
-    let p = 0
-    while p < irc {
-        if irop(p) == IR_LABEL && r64(loop_header + p * 8) == 1 {
-            let header_label = ira0(p)
-            // Find matching backward JMP
-            let loop_end = -1
-            let q = p + 1
-            while q < irc {
-                if irop(q) == IR_JMP && ira0(q) == header_label {
-                    if q > p { loop_end = q; q = irc }
-                }
-                q = q + 1
-            }
-            if loop_end > 0 {
-                // Scan loop body for first use and last def of each vreg
-                let first_use = mmap(vreg_n * 8)
-                let last_def = mmap(vreg_n * 8)
-                let vr = 0
-                while vr < vreg_n { w64(first_use + vr * 8, -1); w64(last_def + vr * 8, -1); vr = vr + 1 }
-                
-                let r = p + 1
-                while r < loop_end {
-                    let op3 = irop(r)
-                    let res3 = irres(r)
-                    let a03 = ira0(r)
-                    let a13 = ira1(r)
-                    if res3 >= 0 && res3 < vreg_n {
-                        w64(last_def + res3 * 8, r)
-                    }
-                    if a03 >= 0 && a03 < vreg_n && r64(first_use + a03 * 8) == -1 {
-                        w64(first_use + a03 * 8, r)
-                    }
-                    if a13 >= 0 && a13 < vreg_n && r64(first_use + a13 * 8) == -1 {
-                        w64(first_use + a13 * 8, r)
-                    }
-                    r = r + 1
-                }
-                
-                // Pin vregs used before redefined (loop-carried)
-                let vr2 = 0
-                while vr2 < vreg_n {
-                    let fu = r64(first_use + vr2 * 8)
-                    let ld = r64(last_def + vr2 * 8)
-                    if fu != -1 && ld != -1 && fu < ld {
-                        // Used before redefined in loop -> loop-carried
-                        // Pin to callee-saved registers: rbx(3), r12(12), r13(13), r14(14), r15(15)
-                        let pin_reg = 0
-                        if r64(loop_pinned + 3 * 8) == 0 { pin_reg = 3 }
-                        else if r64(loop_pinned + 12 * 8) == 0 { pin_reg = 12 }
-                        else if r64(loop_pinned + 13 * 8) == 0 { pin_reg = 13 }
-                        else if r64(loop_pinned + 14 * 8) == 0 { pin_reg = 14 }
-                        else if r64(loop_pinned + 15 * 8) == 0 { pin_reg = 15 }
-                        if pin_reg != 0 {
-                            w64(loop_pinned + vr2 * 8, pin_reg)
-                            w64(loop_pinned + pin_reg * 8, vr2)  // reverse map
-                        }
-                    }
-                    vr2 = vr2 + 1
-                }
-            }
-        }
-        p = p + 1
-    }
-}
-
 fn opt_func() {
     if opt_on==0 { return }
     if had_error==1 { return }
@@ -331,9 +253,6 @@ fn opt_func() {
 
     // --- D: loop strength reduction (arithmetic-progression `while` loops) ---
     opt_loop_strength()
-
-    // --- E: loop register pinning (pin loop-carried vregs to callee-saved regs) ---
-    opt_loop_pin()
 
     // --- C: dead-code elimination (best-effort, index-safe, no record deletion) ---
     // A vreg V is LIVE if it is read by any op other than its defining op, or is
