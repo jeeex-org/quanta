@@ -390,29 +390,6 @@ fn flush_all() {
     allocfc=0
 }
 
-// flush_selective(live_mask): selective flush at block boundaries.
-// live_mask is a bitmap indexed by vreg number; vregs marked live are kept in phys regs.
-// Dead vregs are spilled and removed. Live vregs have their home slots updated (so if
-// their phys reg is evicted later, the home value is current) but stay in the alloc table.
-fn flush_selective(live_mask) {
-    let i=0
-    while i<allocfc {
-        let vr=r64(alloc+i*16); let pr=r64(alloc+i*16+8)
-        if r8(live_mask+vr)==0 {
-            // dead: spill to home and remove from alloc
-            if r8(vr_init+vr)!=0 { wbp(spill_home(vr), pr) }
-            w8(vr_spill+vr, 1)
-            allocfc=allocfc-1
-            w64(alloc+i*16, r64(alloc+allocfc*16))
-            w64(alloc+i*16+8, r64(alloc+allocfc*16+8))
-        } else {
-            // live: update home slot so it's current if phys reg is evicted later
-            if r8(vr_init+vr)!=0 { wbp(spill_home(vr), pr) }
-            i=i+1
-        }
-    }
-}
-
 // flush_clob(r0,r1,r2): target clobber-save for arithmetic ops (idiv/shl/shr)
 // that only destroy the given physical regs (rax=0, rcx=1, rdx=2). Spills just
 // those vregs to their home slots (already current via sdef) and frees the
@@ -707,7 +684,7 @@ fn emit_bltn(nmi,nl,ii) {
         // NO flush_all — uses only xmm0
         eb(102); eb(72); eb(15); eb(110); eb(199) // movq xmm0, rdi
         eb(242); eb(72); eb(15); eb(44); eb(192)  // cvttsd2si rax, xmm0
-        w8(vfloat+irres(ira2(ii)), 0)
+        w8(vfloat+irres(ii), 0)
         return 1
     }
     if nl==6&&r8(nm)=='f'&&r8(nm+1)=='c'&&r8(nm+2)=='o'&&r8(nm+3)=='n'&&r8(nm+4)=='s'&&r8(nm+5)=='t' {  // fconst(M, scale): float literal = M/scale
