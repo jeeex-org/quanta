@@ -9,6 +9,13 @@
 
 | Benchmark | Quanta | C (gcc -O2) | Ratio | Status |
 |-----------|--------|-------------|-------|--------|
+| Heavy Int (50M) | 0.324s | 0.022s | 14.8× | ⚠️ |
+| Heavy Float (10M) | 0.083s | 0.008s | 10.1× | ⚠️ |
+| Int Ops (1M) | 0.001s | 0.001s | 0.9× | ✅ Near parity |
+| Arith (20M) | 0.161s | 0.012s | 13.2× | ⚠️ |
+| Div Const (10M) | 0.103s | 0.006s | 15.8× | ⚠️ |
+| Float Ops | 0.001s | 0.001s | 1.1× | ✅ Near parity |
+| Fib (40) | 0.001s | 0.001s | 0.7× | ✅ Near parity |
 | Heavy Int (50M) | 0.340s | 0.020s | 16.7× | ⚠️ |
 | Heavy Float (10M) | 0.092s | 0.009s | 10.7× | ⚠️ |
 | Int Ops (1M) | 0.001s | 0.001s | 0.8× | ✅ Near parity |
@@ -41,6 +48,13 @@
 
 | Benchmark | Ratio | Likely Cause |
 |-----------|-------|--------------|
+| Heavy Int (50M) | 0.324s | 0.022s | 14.8× | ⚠️ |
+| Heavy Float (10M) | 0.083s | 0.008s | 10.1× | ⚠️ |
+| Int Ops (1M) | 0.001s | 0.001s | 0.9× | ✅ Near parity |
+| Arith (20M) | 0.161s | 0.012s | 13.2× | ⚠️ |
+| Div Const (10M) | 0.103s | 0.006s | 15.8× | ⚠️ |
+| Float Ops | 0.001s | 0.001s | 1.1× | ✅ Near parity |
+| Fib (40) | 0.001s | 0.001s | 0.7× | ✅ Near parity |
 | Heavy Int (50M) | 0.340s | 0.020s | 16.7× | ⚠️ |
 | Heavy Float (10M) | 0.092s | 0.009s | 10.7× | ⚠️ |
 | Int Ops (1M) | 0.001s | 0.001s | 0.8× | ✅ Near parity |
