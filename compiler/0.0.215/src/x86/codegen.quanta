@@ -1,8 +1,6 @@
 // === COMPILE IR → X86-64 ===
 // Per function - emits code, records labels and patches
 let func_code_starts = mmap(2000000)  // start offset of each func's code
-let loop_header = 0
-let loop_depth = 0
 
 // === OPTIMIZER (Tier-1, behind -O) ===
 
@@ -652,29 +650,9 @@ fn ci_func(fi, is_main) {
 
     let str_off = -(frame_size - total_str)  // string buffer offset from frame base (below spill)
     let early_ret_lbl = -1   // P7: lazy epilogue label; IR_TRY jumps here on Err/None
-
-// Precompute loop headers: which IR_LABELs are targets of backward JMPs
-let loop_header = mmap(irc * 8)  // 8 bytes per IR record (0 or label_id)
-let i = 0
-while i < irc { w64(loop_header + i * 8, 0); i = i + 1 }
-let p = 0
-while p < irc {
-    if irop(p) == IR_JMP {
-        let target = ira0(p)
-        let q = 0
-        while q < irc {
-            if irop(q) == IR_LABEL && ira0(q) == target {
-                if q < p { w64(loop_header + q * 8, 1) }  // mark as loop header
-                q = irc
-            }
-            q = q + 1
-        }
-    }
-    p = p + 1
-}
-let loop_depth = 0
-
-let r1=0; let ii=0
+    let r1=0; let ii=0
+  let loop_depth = 0
+  let loop_pinned = 0
     while ii<irc {
         let op=irop(ii); let res=irres(ii); let a0=ira0(ii); let a1=ira1(ii); let a2=ira2(ii)
         if op==IR_CONST { let rd=aphys(res); if a0<0||a0>4294967295 { ri64(rd,a0) } else { ri(rd,a0) }; sdef(res, rd) }
@@ -710,7 +688,16 @@ let r1=0; let ii=0
                 sdef(res, rd); w8(vfloat+res, 1)
             } else {
             let r1=aphys(a0); let r2=aphys(a1); let rd=adistinct(res,r1,r2); if rd!=r1 { rr(rd,r1) }
-                rm(rd,r2); if loop_depth == 0 { ovf_trap_emit(ii) }; sdef(res, rd); width_mask(a0, a1, rd)
+                // Constant strength reduction: mul by power of 2 -> shift
+                if op_is_const(a1)==1 {
+                    let mc = op_const_val(a1)
+                    if mc == 0 { ri(rd, 0); sdef(res, rd) }
+                    else if mc == 1 { sdef(res, rd) }
+                    else if mc == 2 { ra(rd, rd); sdef(res, rd) }
+                    else if mc == 4 { eb(72); eb(193); eb(224 + (rd%8)); eb(2); sdef(res, rd) }
+                    else if mc == 8 { eb(72); eb(193); eb(224 + (rd%8)); eb(3); sdef(res, rd) }
+                    else { rm(rd,r2); if loop_depth == 0 { ovf_trap_emit(ii) }; sdef(res, rd); width_mask(a0, a1, rd) }
+                } else { rm(rd,r2); if loop_depth == 0 { ovf_trap_emit(ii) }; sdef(res, rd); width_mask(a0, a1, rd) }
             }
         }
         else if op==IR_DIV {
@@ -1177,42 +1164,16 @@ let r1=0; let ii=0
             }
         }
         else if op==IR_LABEL {
-            // If this is a loop header, increment depth and flush (entry)
-            if r64(loop_header + ii * 8) == 1 {
-                loop_depth = loop_depth + 1
-                flush_all()
-            } else if loop_depth == 0 {
-                // Non-loop label at top level
-                flush_all()
-            }
-            // Inside loop body (loop_depth > 0, not header): NO flush
+            flush_all()
             lbladd(a0,codelen)
         }
         else if op==IR_JMP {
-            // Check if this is a backward jump (loop back-edge)
-            let is_backward = 0
-            let q = 0
-            while q < irc {
-                if irop(q) == IR_LABEL && ira0(q) == a0 {
-                    if q < ii { is_backward = 1 }
-                    q = irc
-                }
-                q = q + 1
-            }
-            if is_backward == 1 {
-                // Loop back-edge: flush before jumping back, then decrement depth
-                flush_all()
-                loop_depth = loop_depth - 1
-            } else {
-                // Forward jump (if/else, break): flush at top level
-                if loop_depth == 0 { flush_all() }
-            }
+            flush_all()
             let po=codelen; jmp32(0)
             w64(patches+patchc*PCS,po); w64(patches+patchc*PCS+8,a0); w64(patches+patchc*PCS+16,0); patchc=patchc+1
         }
         else if op==IR_BR {
-            // Branch inside loop: don't flush (values kept in registers across iterations)
-            if loop_depth == 0 { flush_all() }
+            flush_all()
             let cv=aphys(a0); rtest(cv,cv)
             let po1=codelen; jcc32(0,0)  // je a1
             w64(patches+patchc*PCS,po1); w64(patches+patchc*PCS+8,a1); w64(patches+patchc*PCS+16,1); patchc=patchc+1
