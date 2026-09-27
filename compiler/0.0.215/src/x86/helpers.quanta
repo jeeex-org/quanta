@@ -214,8 +214,32 @@ fn sfn(i,nm,nl,bt,co,pc,ret_nm,ret_nl) {
     w64(fns + i*FNS + 48, ret_nl)
     w64(fn_rettype_name + i*8, ret_nm)
     w64(fn_rettype_len + i*8, ret_nl)
+    // IR slice tracking. The compile loop calls sfn() twice per function:
+    // once BEFORE parse_block() with co==0 (record where the IR starts) and
+    // once AFTER ci_func() with co==cstart (record the record count). Without
+    // this, fn_ir_count stays 0 and qobj_write emits a bare header with no
+    // function table and no IR.
+    if co == 0 {
+        // pre-parse: this function's IR begins at the end of the accumulated
+        // qobj buffer (the live `ir` buffer is reset per function).
+        w64(fn_ir_start + i*8, qir_len)
+    } else {
+        // post-codegen: copy this function's live IR into the accumulated
+        // buffer and record the slice.
+        let s0 = r64(fn_ir_start + i*8)
+        let j = 0
+        while j < irc {
+            w64(qir + (s0 + j)*IRS, r64(ir + j*IRS))
+            w64(qir + (s0 + j)*IRS + 8, r64(ir + j*IRS + 8))
+            w64(qir + (s0 + j)*IRS + 16, r64(ir + j*IRS + 16))
+            w64(qir + (s0 + j)*IRS + 24, r64(ir + j*IRS + 24))
+            w64(qir + (s0 + j)*IRS + 32, r64(ir + j*IRS + 32))
+            j = j + 1
+        }
+        w64(fn_ir_count + i*8, irc)
+        qir_len = s0 + irc
+    }
 }
-
 // P11: register a closure body as a synthetic function.
 // Closure bodies are registered like regular functions but with:
 // - name = empty (anonymous), length = 0
