@@ -114,11 +114,28 @@ Compile each module to its own IR stream. Link multiple IR streams together. Res
 | Gate | Test | Pass Criteria | Status |
 |------|------|---------------|--------|
 | G1 | `--emit-qobj` creates `.qobj` | File created, readable | ✅ |
-| G2 | `qobj_import()` loads symbols | Symbols added to symtab | ✅ |
-| G3 | Import with `.qobj` cache | No token explosion | ⏳ |
-| G4 | Stale `.qobj` detection | Recompiles when source newer | ⏳ |
-| G5 | Cross-module call | Call resolves via `.qobj` | ⏳ |
-| G6 | Self-host with `.qobj` | Quanta compiles itself using cached modules | ⏳ |
+| G2 | `qobj_import()` parses the v6 format and registers functions | Functions + IR loaded, cross-module call resolves | ✅ |
+| G3 | Import with `.qobj` cache | Cache is consumed; no token explosion | ✅ |
+| G5 | Cross-module call | Call resolves via `.qobj` | 🔄 in progress |
+| G4 | Stale `.qobj` detection | Recompiles when source newer | ⏳ blocked on G5 |
+| G6 | Self-host with `.qobj` | Quanta compiles itself using cached modules | ⏳ blocked on G5, G4 |
+
+**Order is G5 -> G4 -> G6, not the numeric order.** G5 must land before G4:
+today the cache is consumed (G3) but produces binaries that segfault because
+call targets are not relocated, so a cache is currently a *liability*. Adding
+mtime staleness to a broken feature guards a door that should not be open, and
+a staleness check cannot be validated until we know what a valid cache emits.
+G4 then makes the cache trustworthy; G6 (self-compile) is only meaningful once
+both hold.
+
+Notes on the earlier rows:
+- G2 was marked done when `qobj_import` existed but was **dead code** with a
+  stale on-disk format ([4] magic [4] ver [4] sym_count [sym*24] [4] strtab_len
+  [strtab]) that the writer never produced, and it fed the ELF object-mode
+  `symtab`, which has no role in EXEC-mode import. Rewritten in 4e3315ac.
+- G3 could not work until the import ran *after* `scanfns()` (which resets
+  `fnc=0` and rebuilds `fns[]`), and until the cache lookup stopped requiring
+  the `.quanta` to exist.
 
 ---
 
