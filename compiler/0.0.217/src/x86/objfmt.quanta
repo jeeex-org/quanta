@@ -587,58 +587,182 @@ fn imp_load(fd, depth) {     // read fd into depth buffer, dedup, recurse-expand
   } else { file_close(fd) }
 }
 
-// QOBJ: Import symbols from pre-compiled module cache
-// Format: [4] magic "QOBJ" [4] version [4] sym_count [sym_count × 24] symbols [4] strtab_len [strtab_len] strtab
-fn qobj_import(qobj_path) -> i64 {
-  let fd = file_open(qobj_path, 0)
+// G3 helper: try to import "<pfx><name>.quanta"'s .qobj cache (with and
+// without the .quanta extension in the name). Returns 1 if a cache was
+// consumed, 0 otherwise. Builds the path directly so it does NOT require the
+// .quanta source to exist.
+fn qobj_stage_bare(name, nl, pfx, pl) -> i64 {
+  if pl + nl + 16 >= 4095 { return 0 }
+  let k = 0
+  while k < pl { w8(qobj_try_buf+k, r8(pfx+k)); k = k + 1 }
+  let j = 0
+  while j < nl { w8(qobj_try_buf+k, r8(name+j)); k = k + 1; j = j + 1 }
+  // Form A: name already ends in ".quanta" -> derive .qobj directly.
+  if k >= 7 {
+    let q = qobj_path_for(qobj_try_buf, k)
+    if q != 0 {
+      let probe = file_open(q, 0)
+      if probe >= 0 { file_close(probe); qimp_path = q; return 1 }
+    }
+  }
+  // Form B: bare module name -> append ".quanta" then derive .qobj.
+  w8(qobj_try_buf+k, 46); w8(qobj_try_buf+k+1, 113); w8(qobj_try_buf+k+2, 117)
+  w8(qobj_try_buf+k+3, 97); w8(qobj_try_buf+k+4, 110); w8(qobj_try_buf+k+5, 116)
+  w8(qobj_try_buf+k+6, 97); w8(qobj_try_buf+k+7, 0)
+  let q2 = qobj_path_for(qobj_try_buf, k+7)
+  if q2 == 0 { return 0 }
+  let probe2 = file_open(q2, 0)
+  if probe2 >= 0 { file_close(probe2); qimp_path = q2; return 1 }
+  return 0
+}
+
+// G3 helper: derive "<path>.qobj" from a resolved .quanta path into qobj_path_buf.
+// Returns the buffer on success, or 0 if the path is too long / has no room.
+// Does NOT check existence -- qobj_import does that and falls back on failure.
+fn qobj_path_for(path, plen) -> i64 {
+  if plen <= 0 || plen >= 4000 { return 0 }
+  let k = 0
+  while k < plen { w8(qobj_path_buf+k, r8(path+k)); k = k + 1 }
+  // Only derive a cache for real .quanta modules. k == plen, and the last 7
+  // bytes are ".quanta", so they live at k-7 .. k-1.
+  if !(k >= 7 && r8(qobj_path_buf+k-7)==46 && r8(qobj_path_buf+k-6)==113
+     && r8(qobj_path_buf+k-5)==117 && r8(qobj_path_buf+k-4)==97
+     && r8(qobj_path_buf+k-3)==110 && r8(qobj_path_buf+k-2)==116
+     && r8(qobj_path_buf+k-1)==97) { return 0 }
+  // .quanta -> .qobj  (overwrite the 7-byte tail: '.','q','o','b','j',0)
+  w8(qobj_path_buf+k-7, 46); w8(qobj_path_buf+k-6, 113); w8(qobj_path_buf+k-5, 111)
+  w8(qobj_path_buf+k-4, 98); w8(qobj_path_buf+k-3, 106)
+  w8(qobj_path_buf+k-2, 0)
+  return qobj_path_buf
+}
+
+// QOBJ: Import a pre-compiled module cache (G3).
+//
+// Format MUST match qobj_write exactly (v6):
+//   [4] magic "QOBJ" [4] version [4] fn_count [4] ir_count [4] total_name_bytes
+//   [fn_count * 32] fn entries   (str_off, name_len, pcount, reserved*5)
+//   [total_name_bytes]           name blobs, NUL-terminated
+//   [ir_count * 40]              IR records
+//
+// The import is TEXTUAL-equivalent to including the .quanta source: each
+// function's IR is appended to the live `ir` buffer, its body token offset is
+// recorded in fn_btok so a cross-module CALL can still find and parse the body,
+// and its name/param count are registered in fns[]. That is what makes G5 work.
+// We deliberately do NOT use `symtab` (the ELF .o symbol table) -- it belongs to
+// object-mode output and has no role in EXEC-mode module import.
+// QOBJ: Import a pre-compiled module cache (G3).
+//
+// Format MUST match qobj_write exactly (v6):
+//   [4] magic "QOBJ" [4] version [4] fn_count [4] ir_count [4] total_name_bytes
+//   [fn_count * 32] fn entries   (str_off, name_len, pcount, ir_count, reserved*4)
+//   [total_name_bytes]           name blobs, NUL-terminated
+//   [ir_count * 40]              IR records
+//
+// CONTRACT: qobj_import must be called AFTER scanfns() (which resets fnc=0 and
+// rebuilds fns[]). expand_includes() runs BEFORE that, so calling it there would
+// register functions that are immediately discarded. The caller stages the path
+// in qobj_stage_path and calls qobj_import_pending() after scanfns().
+//
+// Imported functions are registered with a NON-ZERO sentinel body token so the
+// normal compile loop (which skips fn_btok==0) still visits them: ci_func() emits
+// their code from the IR we appended, and parse never runs on them.
+fn qobj_import(path) -> i64 {
+  let fd = file_open(path, 0)
   if fd < 0 { return 0 }
-  
-  // Read header
-  let hdr = mmap(12)
-  let n = file_read(fd, hdr, 12)
-  if n < 12 { file_close(fd); return 0 }
-  
-  // Verify magic "QOBJ" = 0x514F424A
-  let magic = r32(hdr)
-  if magic != 0x514F424A { file_close(fd); return 0 }
-  
-  // Read symbol count
-  let sym_count = r32(hdr + 8)
-  
-  // Read symbols (24 bytes each) and add to current symtab
-  let sym_buf = mmap(sym_count * 24)
-  if sym_count > 0 {
-    file_read(fd, sym_buf, sym_count * 24)
-    let i = 0
-    while i < sym_count {
-      // Copy symbol to current symtab
-      let dst = symc + i
-      w32(symtab + dst * 24, r32(sym_buf + i * 24))
-      w32(symtab + dst * 24 + 4, r32(sym_buf + i * 24 + 4))
-      w64(symtab + dst * 24 + 8, r64(sym_buf + i * 24 + 8))
-      w64(symtab + dst * 24 + 16, r64(sym_buf + i * 24 + 16))
-      i = i + 1
-    }
-    symc = symc + sym_count
+
+  let hdr = mmap(24)
+  let n = file_read(fd, hdr, 20)
+  if n < 20 { file_close(fd); return 0 }
+  if r32(hdr) != 0x514F424A { file_close(fd); return 0 }
+  let version    = r32(hdr + 4)
+  let fn_count   = r32(hdr + 8)
+  let ir_count   = r32(hdr + 12)
+  let name_bytes = r32(hdr + 16)
+  if version != 6 || fn_count == 0 { file_close(fd); return 0 }
+  if fn_count > 100000 || name_bytes > 16777216 || ir_count > 400000 {
+    file_close(fd); return 0
   }
-  
-  // Read string table
-  let str_hdr = mmap(4)
-  file_read(fd, str_hdr, 4)
-  let strtab_len = r32(str_hdr)
-  if strtab_len > 0 {
-    let str_buf = mmap(strtab_len)
-    file_read(fd, str_buf, strtab_len)
-    let j = 0
-    while j < strtab_len {
-      w8(strtab + strtablen + j, r8(str_buf + j))
-      j = j + 1
-    }
-    strtablen = strtablen + strtab_len
-  }
-  
+
+  let ent = mmap(fn_count * 32 + 8)
+  if file_read(fd, ent, fn_count * 32) < fn_count * 32 { file_close(fd); return 0 }
+  let names = mmap(name_bytes + 8)
+  if name_bytes > 0 && file_read(fd, names, name_bytes) < name_bytes { file_close(fd); return 0 }
+  let irb = mmap(ir_count * 40 + 8)
+  if ir_count > 0 && file_read(fd, irb, ir_count * 40) < ir_count * 40 { file_close(fd); return 0 }
   file_close(fd)
+
+  let base = fnc
+  let i = 0
+  while i < fn_count {
+    let str_off = r32(ent + i * 32)
+    let name_len = r32(ent + i * 32 + 4)
+    let pcount   = r32(ent + i * 32 + 8)
+    let firn     = r32(ent + i * 32 + 12)
+    if name_len == 0 || str_off + name_len > name_bytes { i = i + 1; continue }
+
+    // Name must live in `src` so fn_name()/IR_CALL comparisons work identically
+    // to source-parsed functions.
+    let nm = srclen
+    let j = 0
+    while j < name_len { w8(src+nm+j, r8(names+str_off+j)); j = j + 1 }
+    w8(src+nm+name_len, 0)
+    srclen = srclen + name_len + 1
+
+    if fnc >= FN_CAP { emit_ovf() }
+    w64(fns + fnc*FNS,     nm)
+    w64(fns + fnc*FNS + 8, name_len)
+    w64(fns + fnc*FNS + 16, 1)      // fn_btok: SENTINEL 1 (non-zero => visited by
+                                    // the compile loop; never parsed, see below)
+    w64(fns + fnc*FNS + 24, 0)
+    w64(fns + fnc*FNS + 32, pcount)
+    w64(fns + fnc*FNS + 40, 0)
+    w64(fns + fnc*FNS + 48, 0)
+    w64(fn_rettype_name + fnc*8, 0)
+    w64(fn_rettype_len + fnc*8, 0)
+    w64(fn_extern + fnc*8, 0)
+    w64(fn_parent  + fnc*8, 0-1)
+    w64(fn_pcount  + fnc*8, pcount)
+    w64(fn_pbase   + fnc*8, 0)
+    w64(fn_ir_count + fnc*8, firn)
+    // Mark this function as cache-imported: the compile loop must emit code from
+    // the IR we append rather than parsing a body.
+    w64(qimp_is_cache + fnc*8, 1)
+    w64(qimp_local_i + fnc*8, i)
+    fnc = fnc + 1
+    i = i + 1
+  }
+
+  // Append IR records to the live buffer, splitting per function by entry counts.
+  let rec = 0
+  i = 0
+  while i < fn_count {
+    let firn = r32(ent + i * 32 + 12)
+    if firn == 0 { i = i + 1; continue }
+    w64(fn_ir_start + (base + i)*8, irc)
+    let k = 0
+    while k < firn {
+      let so = (rec + k) * 40
+      w64(ir + irc*IRS,      r64(irb + so))
+      w64(ir + irc*IRS + 8,  r64(irb + so + 8))
+      w64(ir + irc*IRS + 16, r64(irb + so + 16))
+      w64(ir + irc*IRS + 24, r64(irb + so + 24))
+      w64(ir + irc*IRS + 32, r64(irb + so + 32))
+      irc = irc + 1
+      k = k + 1
+    }
+    rec = rec + firn
+    i = i + 1
+  }
   return 1
+}
+
+// G3: consume a staged cache AFTER scanfns() has built fns[]. Returns 1 if a
+// cache was imported. Called from entry.quanta immediately after scanfns().
+fn qobj_import_pending() -> i64 {
+  if qimp_pending == 0 || qimp_path == 0 { return 0 }
+  let r = qobj_import(qimp_path)
+  if r == 1 { qimp_pending = 0; qimp_path = 0 }
+  return r
 }
 
 fn expand_includes(buf, len, depth) {
@@ -713,15 +837,25 @@ fn expand_includes(buf, len, depth) {
                 while m<ql { w8(imp_full+k+m, r8(buf+j+1+m)); m=m+1 }
                 w8(imp_full+k+m, 0)
               }
-              let fd = file_open(imp_full, 0)
-              if fd>=0 {
-                // save parent dir, switch to this file's dir for nested includes,
-                // load (recurse), then restore the parent dir.
-                imp_dir_save(depth)
-                imp_dir_from(imp_full, src_strlen(imp_full))
-                imp_load(fd, depth)
-                imp_dir_restore(depth)
-              } else { imp_err=1 }
+              // G3: stage this path's cache if present; import happens later.
+              if qimp_pending == 0 {
+                let qp = qobj_path_for(imp_full, src_strlen(imp_full))
+                if qp != 0 {
+                  let probe = file_open(qp, 0)
+                  if probe >= 0 { file_close(probe); qimp_path = qp; qimp_pending = 1 }
+                }
+              }
+              {
+                let fd = file_open(imp_full, 0)
+                if fd>=0 {
+                  // save parent dir, switch to this file's dir for nested includes,
+                  // load (recurse), then restore the parent dir.
+                  imp_dir_save(depth)
+                  imp_dir_from(imp_full, src_strlen(imp_full))
+                  imp_load(fd, depth)
+                  imp_dir_restore(depth)
+                } else { imp_err=1 }
+              }
             } else { imp_err=1 }
             i=q+1
           } else {
@@ -730,11 +864,22 @@ fn expand_includes(buf, len, depth) {
             while j<len && r8(buf+j)!=32 && r8(buf+j)!=9 && r8(buf+j)!=10 && r8(buf+j)!=0 { nl=nl+1; j=j+1 }
             // Strip trailing semicolons from import name
             while nl > 0 && r8(buf+ns+nl-1)==59 { nl=nl-1 }
-            let fd = imp_try(buf+ns, nl, 0, 0)
-            if fd<0 { fd = imp_try(buf+ns, nl, imp_std_pfx, 4) }
-            if fd<0 { fd = imp_try(buf+ns, nl, imp_ext_pfx, 4) }
-            if fd<0 { fd = imp_try(buf+ns, nl, imp_lib_pfx, 4) }   // F8/0.0.30: lib/ capability modules
-            if fd>=0 { imp_load(fd, depth) } else { imp_err=1 }
+            // G3: stage the first candidate that HAS a .qobj cache. The actual
+            // import runs after scanfns() (see qobj_import_pending) because
+            // scanfns resets fnc=0 and would discard anything registered earlier.
+            if qimp_pending == 0 {
+              if qobj_stage_bare(buf+ns, nl, 0, 0) == 1 { qimp_pending = 1 }
+              else if qobj_stage_bare(buf+ns, nl, imp_std_pfx, 4) == 1 { qimp_pending = 1 }
+              else if qobj_stage_bare(buf+ns, nl, imp_ext_pfx, 4) == 1 { qimp_pending = 1 }
+              else if qobj_stage_bare(buf+ns, nl, imp_lib_pfx, 4) == 1 { qimp_pending = 1 }
+            }
+            if qimp_pending == 0 {
+              let fd = imp_try(buf+ns, nl, 0, 0)
+              if fd<0 { fd = imp_try(buf+ns, nl, imp_std_pfx, 4) }
+              if fd<0 { fd = imp_try(buf+ns, nl, imp_ext_pfx, 4) }
+              if fd<0 { fd = imp_try(buf+ns, nl, imp_lib_pfx, 4) }   // F8/0.0.30: lib/ capability modules
+              if fd>=0 { imp_load(fd, depth) } else { imp_err=1 }
+            }
             i=j
           }
         } else {

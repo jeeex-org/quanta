@@ -179,6 +179,22 @@ let fn_ir_count = mmap(2000000)
 // qobj_write serializes.
 let qir = mmap(16777216)
 let qir_len = 0
+// G3 qobj_import scratch: per-function IR record counts, indexed by the module's
+// local function index while its fn entries are registered.
+let qimp_ircnt = mmap(400000)
+// G3: scratch buffer for the derived "<module>.qobj" path.
+let qobj_path_buf = mmap(4096)
+// G3: scratch buffer for a candidate "<pfx><name>" path during cache probing.
+let qobj_try_buf = mmap(4096)
+// G3: qimp_is_cache[fi]=1 for a function registered by qobj_import (its IR is
+// already in the buffer; the compile loop must NOT parse a body for it).
+let qimp_is_cache = mmap(2000000)
+// G3: qimp_local_i[fi] = the function's index within its source .qobj file.
+let qimp_local_i = mmap(2000000)
+// G3: staged cache path + pending flag. Set during expand_includes (which runs
+// before scanfns); consumed by qobj_import_pending() right after scanfns().
+let qimp_path = 0
+let qimp_pending = 0
 // t4: param names for named-argument call resolution.
 let fn_pnames = mmap(4000000)   // flat [name_ptr,name_len] per param, fn_pbase-indexed
 let fn_pncnt = mmap(2000000)    // per-fn param count
