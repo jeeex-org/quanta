@@ -1009,7 +1009,10 @@ fn main(argc, argv) {
     // emitted -- for source functions AND for cache-imported ones. Reading it
     // here is authoritative; re-deriving the offset from the slot table can
     // pick a different function when imported slots are interleaved.
-    if g_main_ofs > 0 { w32(code+stub_call+1, g_main_ofs-(stub_call+5)) } else { w32(code+stub_call+1, r64(func_code_starts+(mfi+1)*8)-(stub_call+5)) }
+    // func_code_starts[(mfi+1)] is the recorded start of main's code, and mfi is
+    // resolved above over NON-cache slots only, so this is the entry point for
+    // both source and cache-imported layouts.
+    w32(code+stub_call+1, r64(func_code_starts+(mfi+1)*8)-(stub_call+5))
     write_elf(out_p)
     exit(0)
 }

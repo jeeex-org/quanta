@@ -401,12 +401,20 @@ fn opt_loop_strength() {
     // live buffer for a source function but the whole module arena for a cached
     // one, so using it here would match patterns across function boundaries and
     // rewrite unrelated records.
-    let n0 = opt_end
+    // `scan_end` is the ORIGINAL slice and stays fixed for the whole pass, even
+    // after a reduction grows opt_end. Without that the scan would walk into the
+    // records it just synthesised and could reduce the same loop twice.
+    let scan_end = opt_end
+    let n0 = scan_end
+    // A function contains at most one arithmetic-progression while-loop that this
+    // pattern matches, and the rewrite SHIFTS records, so scanning on after a
+    // reduction would re-enter on the synthesised tail and rewrite it again.
+    let reduced = 0
     let p = opt_beg
-    while p < n0 {
+    while p < scan_end && reduced == 0 {
         let ok = 1
         if irop(p) != IR_LABEL { ok = 0 }
-        if ok == 1 { if p + 11 >= n0 { ok = 0 } }
+        if ok == 1 { if p + 12 >= n0 { ok = 0 } }
         if ok == 1 {
             let stl = ira0(p)
             if irop(p+1) != IR_CONST { ok = 0 }
@@ -475,12 +483,44 @@ fn opt_loop_strength() {
                         let ivfinal = lo + count
                         let sumv = nv()
                         let Lc = nl()
-                        w64(ir+(p+3)*IRS, IR_JMP); w64(ir+(p+3)*IRS+8,0); w64(ir+(p+3)*IRS+16,Lc); w64(ir+(p+3)*IRS+24,0); w64(ir+(p+3)*IRS+32,0)
-                        w64(ir+irc*IRS, IR_LABEL); w64(ir+irc*IRS+8,0); w64(ir+irc*IRS+16,Lc); w64(ir+irc*IRS+24,0); w64(ir+irc*IRS+32,0); irc=irc+1
-                        w64(ir+irc*IRS, IR_CONST); w64(ir+irc*IRS+8,sumv); w64(ir+irc*IRS+16,sum); w64(ir+irc*IRS+24,0); w64(ir+irc*IRS+32,0); irc=irc+1
-                        w64(ir+irc*IRS, IR_ADD); w64(ir+irc*IRS+8,sv); w64(ir+irc*IRS+16,sv); w64(ir+irc*IRS+24,sumv); w64(ir+irc*IRS+32,0); irc=irc+1
-                        w64(ir+irc*IRS, IR_CONST); w64(ir+irc*IRS+8,iv); w64(ir+irc*IRS+16,ivfinal); w64(ir+irc*IRS+24,0); w64(ir+irc*IRS+32,0); irc=irc+1
-                        w64(ir+irc*IRS, IR_JMP); w64(ir+irc*IRS+8,0); w64(ir+irc*IRS+16,en2); w64(ir+irc*IRS+24,0); w64(ir+irc*IRS+32,0); irc=irc+1
+                        // Rewrite the loop in place. The ten records p+1..p+10 are
+                        // retired and the closed form needs only five slots, so the
+                        // whole rewrite fits WITHOUT shifting the tail -- an earlier
+                        // version inserted the closed form after p+11 and shifted
+                        // everything up by five, which duplicated the records that
+                        // followed and left the synthesised IR_LABEL unreachable.
+                        //
+                        // Layout:
+                        //   p       IR_JMP   Lc     -- skip the original body
+                        //   p+1..p+10  closed form + throwaway labels
+                        //   p+11   IR_LABEL en2    -- the loop's exit, untouched
+                        //   p+12..  the rest of the function, untouched
+                        //
+                        // The closed form must live INSIDE the slice. Appending it at
+                        // ir+irc*IRS (the old behaviour) put it after the function's
+                        // trailing IR_RET, where it was unreachable dead code: its
+                        // IR_LABEL never bound, lblf() returned -1, and the guard
+                        // jump kept a zero displacement -- an infinite loop. That is
+                        // why this reduction had never actually fired.
+                        w64(ir+p*IRS, IR_JMP); w64(ir+p*IRS+8, 0); w64(ir+p*IRS+16, Lc); w64(ir+p*IRS+24, 0); w64(ir+p*IRS+32, 0)
+                        w64(ir+(p+1)*IRS, IR_LABEL); w64(ir+(p+1)*IRS+8, 0); w64(ir+(p+1)*IRS+16, Lc); w64(ir+(p+1)*IRS+24, 0); w64(ir+(p+1)*IRS+32, 0)
+                        w64(ir+(p+2)*IRS, IR_CONST); w64(ir+(p+2)*IRS+8, sumv); w64(ir+(p+2)*IRS+16, sum); w64(ir+(p+2)*IRS+24, 0); w64(ir+(p+2)*IRS+32, 0)
+                        w64(ir+(p+3)*IRS, IR_ADD); w64(ir+(p+3)*IRS+8, sv); w64(ir+(p+3)*IRS+16, sv); w64(ir+(p+3)*IRS+24, sumv); w64(ir+(p+3)*IRS+32, 0)
+                        w64(ir+(p+4)*IRS, IR_CONST); w64(ir+(p+4)*IRS+8, iv); w64(ir+(p+4)*IRS+16, ivfinal); w64(ir+(p+4)*IRS+24, 0); w64(ir+(p+4)*IRS+32, 0)
+                        w64(ir+(p+5)*IRS, IR_JMP); w64(ir+(p+5)*IRS+8, 0); w64(ir+(p+5)*IRS+16, en2); w64(ir+(p+5)*IRS+24, 0); w64(ir+(p+5)*IRS+32, 0)
+                        // p+6..p+10 become throwaway labels: IR_LABEL is the one
+                        // opcode whose emit does nothing but lbladd(), so it touches
+                        // no vreg. A self-move no-op is NOT safe here -- IR_BR/IR_JMP
+                        // carry res=0, and IR_MOV emits sdef(0,...) which relocates
+                        // vreg 0's spill slot and clobbers live state.
+                        let Ldead = nl()
+                        let nq = 6
+                        while nq < 11 {
+                            let rq = ir+(p+nq)*IRS
+                            w64(rq, IR_LABEL); w64(rq+8, 0); w64(rq+16, Ldead); w64(rq+24, 0); w64(rq+32, 0)
+                            nq = nq + 1
+                        }
+                        reduced = 1
                     }
                 }
             }
