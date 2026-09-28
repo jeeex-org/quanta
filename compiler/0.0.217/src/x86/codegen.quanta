@@ -628,6 +628,39 @@ fn ci_func(fi, is_main) {
       lblc = 0
       cur_clo = 0 - 1
       overload_suppressed = 0
+      // The source path allocates every vreg through nv(), which initialises
+      // vreg_is_str / vreg_is_big / vreg_clo / vreg_to_param / vreg_type as it
+      // goes. A cached function REUSES the vreg numbers baked into its serialised
+      // IR and never calls nv(), so those tables still held the PREVIOUS
+      // function's values. codegen then read them: op_is_const() and the
+      // is_str/is_big tests took the wrong branch, an ADD operand resolved to a
+      // stale float/type tag, and the emitted code overflowed into its own
+      // ovf_trap ud2 -- a SIGILL inside the compiler.
+      //
+      // Initialise the whole vreg range this function's IR actually touches to
+      // the same defaults nv() uses, before anything reads them.
+      let mv = 0
+      let mvmax = 0
+      while mv < ir_end {
+        let rv = irres(mv)
+        if rv > mvmax { mvmax = rv }
+        let u0 = ira0(mv)
+        if u0 > mvmax && (irop(mv)==IR_CONST || irop(mv)==IR_PARAM) { mvmax = u0 }
+        let u1 = ira1(mv)
+        if u1 > mvmax && irop(mv)!=IR_CONST { mvmax = u1 }
+        mv = mv + 1
+      }
+      if mvmax > VREG_CAP { mvmax = VREG_CAP }
+      let mi2 = 0
+      while mi2 <= mvmax {
+        w8(vreg_is_str + mi2*8, 0-1)
+        w8(vreg_is_big + mi2*8, 0-1)
+        w8(vreg_clo    + mi2*8, 0-1)
+        w8(vreg_to_param + mi2*8, 0)
+        w64(vreg_type + mi2*8, 0)
+        mi2 = mi2 + 1
+      }
+      vreg_n = mvmax + 1
       if r64(OPFN_SUPP + fi*8) == 1 { overload_suppressed = 1 }
       // Re-bind parameter names to their vregs. The cached slice carries the
       // IR_PARAM records (op 21) with the vreg each parameter occupies, but a

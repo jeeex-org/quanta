@@ -856,6 +856,20 @@ fn qobj_import(path) -> i64 {
     // non-variadic, not-imported, not-a-param defaults.
     w64(fn_var + fnc*8, 0)
     w64(fn_is_imported + fnc*8, 0)
+    // These six per-function tables are filled by funcscan for a SOURCE
+    // function. A cached function never reaches the pre-scan, so they kept
+    // whatever the arena held. fn_pdfixed is read by the post-parse arity
+    // check, fn_parfn by parameter handling, and the rest by generic-parameter
+    // and default-argument logic -- all of them indexed by function index, so a
+    // stale value there is silently the wrong function's data.
+    // Defaults: no defaults, not generic, no generic parameters, all params
+    // required, no per-param function tags.
+    w64(fn_defargs + fnc*8, 0)
+    w64(fn_generic + fnc*8, 0)
+    w64(fn_genparam_base + fnc*8, 0)
+    w64(fn_genparam_names + fnc*8, 0)
+    w64(fn_parfn + fnc*8, 0-1)
+    w64(fn_pdfixed + fnc*8, 0)
     w64(qimp_is_cache + fnc*8, 1)
     w64(qimp_local_i + fnc*8, i)
     w64(qimp_slot + i*8, fnc)
@@ -947,6 +961,15 @@ fn qobj_import(path) -> i64 {
       if qir_mod_n >= 26843545 { return 0 }
       w64(qir_mod + qir_mod_n*IRS,      op)
       w64(qir_mod + qir_mod_n*IRS + 8,  r64(irb + so + 8))
+      // ir_unsafe[i] is written ONLY by iremit(), the source path's IR appender.
+      // A cached module's records are copied in here instead, so their unsafe
+      // flag was never written and ovf_trap_emit()/shl_trap_emit()/
+      // idx_trap_emit() read whatever the page held. A record that read 0 got a
+      // ud2 trap injected -- that is the SIGILL this cache-only build died with,
+      // and it depended on page contents, so it looked non-deterministic.
+      // 0 = "not inside unsafe{}": the conservative default, because 0 is the
+      // value that INJECTS a trap rather than silently removing one.
+      w8(ir_unsafe + qir_mod_n, 0)
       let a0v = r64(irb + so + 16)
       // IR_CALL.a0 and IR_STR.a0 are byte offsets into the WRITER's `src` buffer.
       // Copy the referenced bytes into this process's `src` and repoint a0 at the
