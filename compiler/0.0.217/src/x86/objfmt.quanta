@@ -582,6 +582,22 @@ fn imp_load(fd, depth) {     // read fd into depth buffer, dedup, recurse-expand
   // v7 cache exists we stage it and skip textual inclusion entirely -- that is
   // the whole point of the cache, and it is what allows a module to be consumed
   // with its .quanta absent from disk.
+  //
+  // DEDUP MUST HAPPEN BEFORE THE CACHE BRANCH. The old order recorded
+  // imp_seen only on the source path, below, so a module consumed through its
+  // cache was never marked seen. Any second route to the same module (a
+  // diamond import, or a cycle A->B->A) re-entered here, re-staged, and
+  // re-expanded forever: imp_seenc climbed to IMPSEEN_CAP and the compile died
+  // with "source too many tokens/IR limit" (rc=17). That is the import-cycle
+  // handling the G5 plan called for and which had never been implemented.
+  //
+  // imp_hash() reads imp_full, which is still valid here, and dedup is by
+  // resolved path, so it covers cache and source routes for the same module.
+  if imp_already() == 1 { file_close(fd); return }
+  w64(imp_seen + imp_seenc*8, imp_hash())
+  if imp_seenc >= IMPSEEN_CAP { emit_ovf() }
+  imp_seenc = imp_seenc + 1
+
   let qp0 = qobj_path_for(imp_full, src_strlen(imp_full))
   if qp0 != 0 {
     let probe0 = file_open(qp0, 0)
@@ -592,14 +608,11 @@ fn imp_load(fd, depth) {     // read fd into depth buffer, dedup, recurse-expand
       return
     }
   }
-  if imp_already()==0 {
-    w64(imp_seen + imp_seenc*8, imp_hash()); if imp_seenc >= IMPSEEN_CAP { emit_ovf() }; imp_seenc=imp_seenc+1
-    
-    // Textual inclusion (like 0.0.188) - inline the referenced source into 'src'
-    let ib = impbufs + (depth%8)*16777216
-    let n = file_read(fd, ib, 16777216); file_close(fd)
-    if n>0 { expand_includes(ib, n, depth+1) }
-  } else { file_close(fd) }
+
+  // Textual inclusion (like 0.0.188) - inline the referenced source into 'src'
+  let ib = impbufs + (depth%8)*16777216
+  let n = file_read(fd, ib, 16777216); file_close(fd)
+  if n>0 { expand_includes(ib, n, depth+1) }
 }
 
 // G3 helper: try to import "<pfx><name>.quanta"'s .qobj cache (with and
@@ -626,7 +639,10 @@ fn qimp_stage_push(path) {
     if same == 1 { return }
     i = i + 1
   }
-  if qimp_n >= 4000 { return }
+  // Fail closed rather than silently dropping the module: a dropped cache
+  // surfaces later as "call to undeclared function", which points at the wrong
+  // file entirely. 4000 modules is far past any real program.
+  if qimp_n >= 4000 { imp_err=1; return }
   let d = qimp_paths + qimp_n*4096
   let k = 0
   while k < 4095 { w8(d+k, r8(path+k)); k = k + 1 }
@@ -989,21 +1005,24 @@ fn expand_includes(buf, len, depth) {
               }
               // G3: stage this path's cache if present; import happens later.
               let qp = qobj_path_for(imp_full, src_strlen(imp_full))
+              let cache_here = 0
               if qp != 0 {
                 let probe = file_open(qp, 0)
-                if probe >= 0 { file_close(probe); qimp_stage_push(qp) }
+                if probe >= 0 { file_close(probe); qimp_stage_push(qp); cache_here = 1 }
               }
-              {
-                let fd = file_open(imp_full, 0)
-                if fd>=0 {
-                  // save parent dir, switch to this file's dir for nested includes,
-                  // load (recurse), then restore the parent dir.
-                  imp_dir_save(depth)
-                  imp_dir_from(imp_full, src_strlen(imp_full))
-                  imp_load(fd, depth)
-                  imp_dir_restore(depth)
-                } else { imp_err=1 }
-              }
+              let fd = file_open(imp_full, 0)
+              if fd>=0 {
+                // save parent dir, switch to this file's dir for nested includes,
+                // load (recurse), then restore the parent dir.
+                imp_dir_save(depth)
+                imp_dir_from(imp_full, src_strlen(imp_full))
+                imp_load(fd, depth)
+                imp_dir_restore(depth)
+              } else if cache_here == 0 { imp_err=1 }
+              // else: cache staged, source absent -- that is a supported qobj
+              // build, not a missing include. imp_err here used to abort the
+              // whole compile and is the reason a cache-only build could never
+              // succeed.
             } else { imp_err=1 }
             i=q+1
           } else {
