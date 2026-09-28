@@ -726,26 +726,25 @@ fn qobj_import(path) -> i64 {
   if file_read(fd, names, name_bytes) < name_bytes { file_close(fd); return 0 }
   let meta = mmap(meta_bytes + 8)
   if file_read(fd, meta, meta_bytes) < meta_bytes { file_close(fd); return 0 }
+  // File order is entries, names, meta, param blobs, string pool, IR -- so the
+  // param and pool regions MUST be consumed before the IR records. Reading IR
+  // straight after meta lands on the pool bytes and yields garbage opcodes.
+  // Read the param and pool regions into their real buffers here rather than
+  // into one scratch allocation, so no oversized throwaway mapping is needed.
+  let prms = mmap(param_bytes + 8)
+  if param_bytes > 0 && file_read(fd, prms, param_bytes) < param_bytes { file_close(fd); return 0 }
+  let pool = mmap(pool_bytes + 8)
+  if pool_bytes > 0 && file_read(fd, pool, pool_bytes) < pool_bytes { file_close(fd); return 0 }
   let irb = mmap(ir_count * 40 + 8)
   if ir_count > 0 && file_read(fd, irb, ir_count * 40) < ir_count * 40 { file_close(fd); return 0 }
   file_close(fd)
 
-  // The param-name blob is the remainder of the file after the meta region; its
-  // length is (file size - header - entries - names - meta - ir).
-  let pfd = file_open(path, 0)
-  if pfd < 0 { return 0 }
   // Every region length is declared in the header, so read them exactly -- no
   // guessing and no dependence on the file size. Order: entries, names, meta,
   // param blobs, string pool, IR.
-  let prms = mmap(param_bytes + 8)
-  file_read(pfd, hdr, 32)
-  file_read(pfd, ent, fn_count * 32)
-  file_read(pfd, names, name_bytes)
-  file_read(pfd, meta, meta_bytes)
-  if param_bytes > 0 && file_read(pfd, prms, param_bytes) < param_bytes { file_close(pfd); return 0 }
-  let pool = mmap(pool_bytes + 8)
-  if pool_bytes > 0 && file_read(pfd, pool, pool_bytes) < pool_bytes { file_close(pfd); return 0 }
-  file_close(pfd)
+  // Region order MUST match qobj_write exactly: entries, names, meta, param-name
+  // blobs, string pool, IR. Reading the pool before the params shifts every
+  // subsequent offset and reads IR bytes as pool entries.
   let prm_len = param_bytes
 
   if qimp_pbase_next == 0 {
@@ -772,6 +771,7 @@ fn qobj_import(path) -> i64 {
       continue
     }
 
+    if srclen + name_len + 1 > SRC_CAP { w64(qimp_slot + i*8, 0-1); i = i + 1; continue }
     let nm = srclen
     let j = 0
     while j < name_len { w8(src+nm+j, r8(names+str_off+j)); j = j + 1 }
@@ -800,6 +800,7 @@ fn qobj_import(path) -> i64 {
     let rtn = r64(meta + mo)
     let rtl = r64(meta + mo + 8)
     if rtl > 0 && rtn != 0 {
+      if srclen + rtl + 1 > SRC_CAP { return 0 }
       let rn = srclen
       let y = 0
       while y < rtl { w8(src+rn+y, r8(src+rtn+y)); y = y + 1 }
@@ -830,6 +831,7 @@ fn qobj_import(path) -> i64 {
     while z < pcount {
       let pl2 = 0
       while pl2 < prm_len && r8(prms+pl2) != 0 { pl2 = pl2 + 1 }
+      if srclen + pl2 + 1 > SRC_CAP { return 0 }
       let pn2 = srclen
       let y2 = 0
       while y2 < pl2 { w8(src+pn2+y2, r8(prms+y2)); y2 = y2 + 1 }
@@ -874,6 +876,10 @@ fn qobj_import(path) -> i64 {
         let L = 0
         while L < 4096 && pool + pool_cur + L < pool + pool_bytes && r8(pool + pool_cur + L) != 0 { L = L + 1 }
         if L > 0 {
+          // Appending into `src` must respect the buffer's cap: an unchecked
+          // write past the end of the arena is a silent heap corruption that
+          // surfaces much later as an unrelated crash.
+          if srclen + L + 1 > SRC_CAP { return 0 }
           let np = srclen
           let y = 0
           while y < L { w8(src + np + y, r8(pool + pool_cur + y)); y = y + 1 }

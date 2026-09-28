@@ -294,7 +294,9 @@ fn opt_func() {
                 call_ai=call_ai+1
             }
         }
-        if op==IR_RET { w8(live_bits+o0,1) }
+        // A void IR_RET carries o0 = -1; live_bits+(-1) writes one byte BEFORE
+        // the table. Only mark a real vreg.
+        if op==IR_RET && o0>=0 { w8(live_bits+o0,1) }
         if op==IR_PARAM { w8(live_bits+o0,1) }   // PARAM target vreg is live
         if op==IR_STOREG { w8(live_bits+o0,1) }  // STOREG reads o0
         // NOTE: a defining op's own res is not auto-live; only marked if read above
@@ -395,8 +397,12 @@ fn opt_loop_strength() {
     unsafe {
     if opt_on == 0 { return }
     if had_error == 1 { return }
-    let n0 = irc
-    let p = 0
+    // Bound the pattern search to THIS function's IR slice: `irc` is the whole
+    // live buffer for a source function but the whole module arena for a cached
+    // one, so using it here would match patterns across function boundaries and
+    // rewrite unrelated records.
+    let n0 = opt_end
+    let p = opt_beg
     while p < n0 {
         let ok = 1
         if irop(p) != IR_LABEL { ok = 0 }
@@ -489,12 +495,12 @@ fn opt_tailcall() {
     if had_error==1 { return }
     if cur_fnname==0 { return }
     // Find a RETURN whose operand is the result vreg of a self CALL.
-    let ri=0
-    while ri<irc {
+    let ri=opt_beg
+    while ri<opt_end {
         if irop(ri)==IR_RET {
             let rv=ira0(ri)
-            let ci2=0
-            while ci2<irc {
+            let ci2=opt_beg
+            while ci2<opt_end {
                 if irop(ci2)==IR_CALL && irres(ci2)==rv {
                     if sname_eq(ira0(ci2))==1 {
                         // === transform ===
@@ -507,7 +513,7 @@ fn opt_tailcall() {
                         while w<acnt {
                             let argrec=avs+w
                             let argvr=0
-                            if argrec>=0 && argrec<irc { argvr=ira0(argrec) }
+                            if argrec>=opt_beg && argrec<opt_end { argvr=ira0(argrec) }
                             let ph=param_home_of(w)
                             if ph<0 { bad=1 }
                             w64(ir+argrec*IRS, IR_MOV); w64(ir+argrec*IRS+8, ph); w64(ir+argrec*IRS+16, argvr); w64(ir+argrec*IRS+24,0); w64(ir+argrec*IRS+32,0)
@@ -522,8 +528,8 @@ fn opt_tailcall() {
                         // the param-from-stack reload (otherwise it clobbers our args).
                         // Single safe shift (+1) at (lastparam+1) <= front of body.
                         let lastparam=-1
-                        let pp=0
-                        while pp<irc {
+                        let pp=opt_beg
+                        while pp<opt_end {
                             if irop(pp)==IR_PARAM { lastparam=pp }
                             pp=pp+1
                         }
@@ -575,22 +581,36 @@ fn ci_func(fi, is_main) {
       cur_clo = 0 - 1
       overload_suppressed = 0
       if r64(OPFN_SUPP + fi*8) == 1 { overload_suppressed = 1 }
-      // Generic type parameters are vregs tagged type 10 that the body references.
-      // A source function gets them from the parse-time binding loop; a cached
-      // one has no parse, so recreate them here in the same order.
-      let gcount = r64(fn_genparams + fi*8)
-      if gcount > 0 {
-        let gbase = r64(fn_genparam_base + fi*8)
-        let gz = 0
-        while gz < gcount {
-          let gnm = r64(fn_genparam_names + gbase + gz*16)
-          let gnl = r64(fn_genparam_names + gbase + gz*16 + 8)
-          let gvr = nv()
-          w64(vreg_type + gvr*8, 10)
-          vadd(gnm, gnl, gvr)
-          gz = gz + 1
+      // Re-bind parameter names to their vregs. The cached slice carries the
+      // IR_PARAM records (op 21) with the vreg each parameter occupies, but a
+      // cache file stores no live scope table -- without this, vfind() cannot
+      // resolve any parameter name and the body reads uninitialised vregs.
+      // The name comes from the serialised param-name blob via fn_pnames.
+      let pcount_c = r64(fn_pcount + fi*8)
+      let pbase_c = r64(fn_pbase + fi*8)
+      let ci2 = ir_beg
+      let pseen = 0
+      while ci2 < ir_end && pseen < pcount_c {
+        if irop(ci2) == IR_PARAM {
+          let pvr = ira0(ci2)
+          let ppi = ira1(ci2)
+          if ppi >= 0 && ppi < 8 {
+            let pnm_c = r64(fn_pnames + pbase_c + ppi*16)
+            let pnl_c = r64(fn_pnames + pbase_c + ppi*16 + 8)
+            if pnl_c > 0 { vadd(pnm_c, pnl_c, pvr) }
+          }
+          pseen = pseen + 1
         }
+        ci2 = ci2 + 1
       }
+      // NOTE: generic type parameters are deliberately NOT re-allocated here.
+      // Their IR_CONST marker records are already inside the cached function's
+      // own IR slice, and their vreg numbers were fixed when that IR was first
+      // parsed. Re-allocating them would shift every subsequent nv() and make the
+      // cached function's vreg numbering disagree with the numbers baked into
+      // its own records -- which is what produced null string pointers at run
+      // time. The same applies to IR_PARAM: the cached slice carries those
+      // records, so params are bound by re-walking the slice, not by re-emitting.
     }
     let pstart = patchc
     // Pre-scan IR to compute total string buffer size AND the true max vreg,

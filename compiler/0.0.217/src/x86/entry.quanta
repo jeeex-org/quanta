@@ -592,6 +592,7 @@ fn main(argc, argv) {
     qobj_import_pending()
 
 
+
     // For each fn: parse body → IR, then compile IR → code, record offset
     let fi=0
     while fi<fnc {
@@ -610,9 +611,20 @@ fn main(argc, argv) {
       // for the duration of this function so irop()/ira0() and every other IR
       // reader resolve against the right buffer, then restore. A source function
       // further down the loop must see the live buffer again.
+      // Point the IR accessors at the module arena for this function. `irc` is
+      // NOT swapped back afterwards on purpose: the source path re-derives its
+      // own `irc` from 0 on every parse (`vclr(); irc=0`), so leaving the arena
+      // count in place cannot leak into a later source function -- but restoring
+      // a stale value would, and a cached function that follows a source one
+      // would then see irc=0 and abort as an empty IR buffer.
+      // Save and restore only the IR base. `irc` is set from the arena size for
+      // this call and restored afterwards, because a following source function
+      // re-derives its own count via `vclr(); irc=0` and must not see the
+      // arena's -- while a following CACHED function must see the arena's
+      // again, which this call's own assignment guarantees.
       let ir_saved = ir
-      ir = qir_mod
       let irc_saved = irc
+      ir = qir_mod
       irc = qir_mod_n
       let cc = codelen
       w64(func_code_starts+(fi+1)*8, cc)
@@ -634,6 +646,14 @@ fn main(argc, argv) {
         // Parse params and body
         tokp=fn_btok(fi)+1  // skip {
         vclr(); irc=0; lblc=0
+        // Mark where THIS function's IR begins in the qobj accumulation buffer
+        // BEFORE emitting anything for it. The param-binding loop below emits
+        // IR_PARAM (and the generic-type markers emit IR_CONST) into the live `ir`
+        // buffer, and the post-codegen sfn() call copies `ir[0..irc)` verbatim.
+        // Setting the start marker after those emits would place them outside the
+        // function's slice -- they would land in the PREVIOUS function's range, and
+        // a cache built from that would bind the wrong vregs.
+        sfn(fi,fn_name(fi),fn_nlen(fi),fn_btok(fi),0,0,r64(fn_rettype_name+fi*8),r64(fn_rettype_len+fi*8))
 
         // Bind params from the canonical record (fn_pnames/fn_pcount) written by
         // scanfns.  Re-scanning the signature tokens here is fragile: a call-valued
@@ -721,8 +741,9 @@ fn main(argc, argv) {
         // body. Popped after the body is parsed.
         fn_push(fi)
 
-        // Save IR start for this function (before parsing body)
-        sfn(fi,fn_name(fi),fn_nlen(fi),fn_btok(fi),0,pc,r64(fn_rettype_name+fi*8),r64(fn_rettype_len+fi*8))
+        // IR start was already marked immediately after vclr(); irc=0 above,
+        // before the param-binding and generic-marker emits. Only the body is
+        // parsed from here.
 
                     parse_block()
         // 0.0.150: borrow check (record phase only, no enforcement)
@@ -952,14 +973,21 @@ fn main(argc, argv) {
     }
 
     // Patch the startup stub's call to __init and main's code offset.
-    let mfi=0; let mk=0
+    // Pick main's slot. Scan only NON-cache slots: an imported module may
+    // legitimately define a function the local file also imports, and matching
+    // a cached slot here would patch the startup stub to an imported function
+    // instead of the entry point.
+    let mfi=0-1; let mk=0
     while mk<fnc {
-        if fn_nlen(mk)==4 {
+        if r64(qimp_is_cache + mk*8)==0 {
+          if fn_nlen(mk)==4 {
             let mnm=fn_name(mk)
             if r8(src+mnm)==109&&r8(src+mnm+1)==97&&r8(src+mnm+2)==105&&r8(src+mnm+3)==110 { mfi=mk }
+          }
         }
         mk=mk+1
     }
+    if mfi < 0 { mfi = 0 }
     g_main_fi = mfi
     // ARM64: object mode -> emit .o with relocations (defer to p5_elf_obj,
     // which emits R_AARCH64_CALL26 relocs + EM_AARCH64). Otherwise patch the
@@ -977,7 +1005,11 @@ fn main(argc, argv) {
         exit(0)
     }
     w32(code+init_call+1, r64(func_code_starts+0)-(init_call+5))
-    w32(code+stub_call+1, r64(func_code_starts+(mfi+1)*8)-(stub_call+5))
+    // g_main_ofs is set by the compile loop at the exact moment main's code is
+    // emitted -- for source functions AND for cache-imported ones. Reading it
+    // here is authoritative; re-deriving the offset from the slot table can
+    // pick a different function when imported slots are interleaved.
+    if g_main_ofs > 0 { w32(code+stub_call+1, g_main_ofs-(stub_call+5)) } else { w32(code+stub_call+1, r64(func_code_starts+(mfi+1)*8)-(stub_call+5)) }
     write_elf(out_p)
     exit(0)
 }

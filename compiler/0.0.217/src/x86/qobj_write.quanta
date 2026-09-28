@@ -70,9 +70,23 @@ fn qobj_write(path) -> i64 {
         if op == 17 || op == 23 {
           let a0 = r64(r + 16)
           if a0 < srclen {
+            // Length rule MUST match len_name(), which is what codegen uses to
+            // recover an IR_CALL callee's name. Scanning to NUL is wrong: a
+            // callee name is a bare token in `src`, not NUL-terminated, so that
+            // captured a single character and produced an unusable cache.
             let L = 0
-            while L < 4096 && a0 + L < srclen && r8(src + a0 + L) != 0 { L = L + 1 }
-            if op == 23 { while L < 4096 && a0 + L < srclen && r8(src + a0 + L) != 34 { L = L + 1 } }
+            if op == 23 {
+              // IR_STR points at the opening quote; include through the closing one.
+              while L < 4096 && a0 + L < srclen && r8(src + a0 + L) != 34 { L = L + 1 }
+              if L < 4096 { L = L + 1 }
+            } else {
+              while L < 256 {
+                if a0 + L >= srclen { break }
+                let c = r8(src + a0 + L)
+                if c==0 || c==40 || c==41 || c==59 || c==123 || c==125 || c==44 || c==32 || c==9 || c==10 || c==13 { break }
+                L = L + 1
+              }
+            }
             total_pool_bytes = total_pool_bytes + L + 1
           }
         }
@@ -207,9 +221,19 @@ fn qobj_write(path) -> i64 {
           if op == 17 || op == 23 {
             let a0 = r64(r + 16)
             if a0 < srclen {
+              // Same length rule as the sizing pass above (and as len_name()).
               let L = 0
-              while L < 4096 && a0 + L < srclen && r8(src + a0 + L) != 0 { L = L + 1 }
-              if op == 23 { while L < 4096 && a0 + L < srclen && r8(src + a0 + L) != 34 { L = L + 1 } }
+              if op == 23 {
+                while L < 4096 && a0 + L < srclen && r8(src + a0 + L) != 34 { L = L + 1 }
+                if L < 4096 { L = L + 1 }
+              } else {
+                while L < 256 {
+                  if a0 + L >= srclen { break }
+                  let c = r8(src + a0 + L)
+                  if c==0 || c==40 || c==41 || c==59 || c==123 || c==125 || c==44 || c==32 || c==9 || c==10 || c==13 { break }
+                  L = L + 1
+                }
+              }
               if L > 0 {
                 let sb = mmap(L + 8)
                 let y = 0
