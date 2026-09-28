@@ -24,15 +24,11 @@ fn tokln(i) { return r64(toks + i*TKS + 32) }
 // page -> SIGSEGV (a crafted ≤16MB source with very high token density could
 // trigger this). As of 1.1.0 each emitter bounds its counter and aborts with a
 // clean error (exit 17) instead of corrupting memory.
-let TOK_CAP = 10000000     // toks is mmap(320000000) and a token record is 32B
-                         // (TKS), so the arena holds exactly 10000000
-                         // records. The old 500000000 came from a 20GB
-                         // arena that no longer exists: it admitted 50x more
-                         // tokens than fit, so the cap only fired AFTER
-                         // toks had been overrun into the neighbouring mapping
-                         // -- corrupting an unrelated arena, which is why
-                         // the same cache-only build failed differently on
-                         // each run.
+let TOK_CAP = 8000000      // toks is mmap(320000000) and TKS is 40, so the arena
+                         // holds 8000000 token records exactly. The original
+                         // 500000000 cited a 20GB arena that does not exist;
+                         // an intermediate 10000000 used a wrong 32B stride and
+                         // still overran by 80000000 bytes. TKS is 40.
 let IR_CAP  = 26843545     // `ir` is mmap(1073741824) and a record is IRS(40), so
                          // the arena holds exactly 26843545 records. The old
                          // 1000000000 was justified by a "40GB arena" that

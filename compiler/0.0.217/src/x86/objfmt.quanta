@@ -744,7 +744,16 @@ fn qobj_import(path) -> i64 {
   // fn_pnames and qimp_slot out of bounds, clobbering whichever arenas the
   // allocator placed after them. That is the non-determinism: each run
   // corrupted a different neighbour, so a different cached function failed.
-  if fnc + fn_count > FN_CAP { file_close(fd); return 0 }
+  // The param-type tables are indexed at (fn*200 + k): fn_partype, fn_parbig
+  // and fn_parstr are each mmap(2000000) = 250000 slots, so at 200 slots per
+  // function they hold only 1250 functions -- not the 250000 that FN_CAP
+  // allows. The old guard let fnc grow to FN_CAP while the param writes
+  // walked off the end of those three tables into the neighbouring
+  // mapping. That is the non-determinism: the overrun's victim depends on
+  // allocation layout, which shifts with machine state, so the same caches
+  // corrupted a different neighbour each run. Bound against the real
+  // param-table capacity, not the generic function cap.
+  if fnc + fn_count > 1250 { file_close(fd); return 0 }
   if name_bytes > 16777216 || ir_count > 400000 { file_close(fd); return 0 }
   if meta_bytes != fn_count * 128 { file_close(fd); return 0 }
 
