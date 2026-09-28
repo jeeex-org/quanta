@@ -186,6 +186,30 @@ let qimp_ircnt = mmap(400000)
 let qobj_path_buf = mmap(4096)
 // G3: scratch buffer for a candidate "<pfx><name>" path during cache probing.
 let qobj_try_buf = mmap(4096)
+
+// G3: staged cache paths. A program may import MANY cached modules, so staging
+// is a list, not a single slot. Each entry is a fixed 4096-byte path buffer at
+// qimp_paths[n*4096]; consumed in order by qobj_import_pending() immediately
+// after the function table is built.
+let qimp_paths = mmap(16777216)
+let qimp_n = 0
+// G5: qimp_slot[i] = the global function slot that local .qobj entry i was
+// registered into, or -1 when that entry was skipped. The entry loop and the IR
+// loop skip different conditions, so the IR loop must consult the real slot
+// rather than assuming base+i.
+let qimp_slot = mmap(2000000)
+// G5: running allocator for fn_pnames slices belonging to imported modules, so
+// their IR_PARAM records cannot alias the importing TU's parameter names.
+let qimp_pbase_next = 0
+
+// G5: imported-module IR lives in its OWN arena, never in the live `ir` buffer.
+// A source function's parse does `vclr(); irc=0`, which would otherwise truncate
+// every imported record appended before it -- the imported functions would then
+// compile from empty slices and dereference vregs that were never defined.
+// qir_n is the write cursor; ci_func() reads qir instead of ir when the function
+// is cache-imported.
+let qir_mod = mmap(1073741824)
+let qir_mod_n = 0
 // G3: qimp_is_cache[fi]=1 for a function registered by qobj_import (its IR is
 // already in the buffer; the compile loop must NOT parse a body for it).
 let qimp_is_cache = mmap(2000000)

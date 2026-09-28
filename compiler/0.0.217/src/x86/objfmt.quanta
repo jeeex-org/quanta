@@ -577,6 +577,21 @@ fn imp_try_one(name, nl, pfx, pl, use_ext) {
 }
 
 fn imp_load(fd, depth) {     // read fd into depth buffer, dedup, recurse-expand
+  // G3/G5: prefer the module's .qobj cache over re-tokenizing its source. The
+  // cache path is derived from imp_full (the resolved .quanta path). When a valid
+  // v7 cache exists we stage it and skip textual inclusion entirely -- that is
+  // the whole point of the cache, and it is what allows a module to be consumed
+  // with its .quanta absent from disk.
+  let qp0 = qobj_path_for(imp_full, src_strlen(imp_full))
+  if qp0 != 0 {
+    let probe0 = file_open(qp0, 0)
+    if probe0 >= 0 {
+      file_close(probe0)
+      qimp_stage_push(qp0)
+      file_close(fd)
+      return
+    }
+  }
   if imp_already()==0 {
     w64(imp_seen + imp_seenc*8, imp_hash()); if imp_seenc >= IMPSEEN_CAP { emit_ovf() }; imp_seenc=imp_seenc+1
     
@@ -591,6 +606,34 @@ fn imp_load(fd, depth) {     // read fd into depth buffer, dedup, recurse-expand
 // without the .quanta extension in the name). Returns 1 if a cache was
 // consumed, 0 otherwise. Builds the path directly so it does NOT require the
 // .quanta source to exist.
+// G5: append a discovered cache path to the staging list. A program may import
+// many cached modules, so staging is a list, never a single slot -- short-
+// circuiting after the first cache leaves later imports to be tokenized from
+// source, which silently halves a multi-module build.
+fn qimp_stage_push(path) {
+  // de-dup: the same module can be reached through several import forms
+  let i = 0
+  while i < qimp_n {
+    let a = qimp_paths + i*4096
+    let same = 1
+    let j = 0
+    while j < 4096 {
+      let ca = r8(a+j)
+      if ca == 0 && r8(path+j) == 0 { break }
+      if ca != r8(path+j) { same = 0; break }
+      j = j + 1
+    }
+    if same == 1 { return }
+    i = i + 1
+  }
+  if qimp_n >= 4000 { return }
+  let d = qimp_paths + qimp_n*4096
+  let k = 0
+  while k < 4095 { w8(d+k, r8(path+k)); k = k + 1 }
+  w8(d+4095, 0)
+  qimp_n = qimp_n + 1
+}
+
 fn qobj_stage_bare(name, nl, pfx, pl) -> i64 {
   if pl + nl + 16 >= 4095 { return 0 }
   let k = 0
@@ -602,7 +645,7 @@ fn qobj_stage_bare(name, nl, pfx, pl) -> i64 {
     let q = qobj_path_for(qobj_try_buf, k)
     if q != 0 {
       let probe = file_open(q, 0)
-      if probe >= 0 { file_close(probe); qimp_path = q; return 1 }
+      if probe >= 0 { file_close(probe); qimp_stage_push(q); return 1 }
     }
   }
   // Form B: bare module name -> append ".quanta" then derive .qobj.
@@ -612,7 +655,7 @@ fn qobj_stage_bare(name, nl, pfx, pl) -> i64 {
   let q2 = qobj_path_for(qobj_try_buf, k+7)
   if q2 == 0 { return 0 }
   let probe2 = file_open(q2, 0)
-  if probe2 >= 0 { file_close(probe2); qimp_path = q2; return 1 }
+  if probe2 >= 0 { file_close(probe2); qimp_stage_push(q2); return 1 }
   return 0
 }
 
@@ -636,119 +679,215 @@ fn qobj_path_for(path, plen) -> i64 {
   return qobj_path_buf
 }
 
-// QOBJ: Import a pre-compiled module cache (G3).
+// G3: try to stage a .qobj cache for a bare `import NAME` across all candidate
+// prefixes. Returns 1 if a cache was found and staged (caller must NOT tokenize
+// the source), 0 if none exists.
+fn qobj_try_cache(name, nl) -> i64 {
+  if qobj_stage_bare(name, nl, 0, 0) == 1 { return 1 }
+  if qobj_stage_bare(name, nl, imp_std_pfx, 4) == 1 { return 1 }
+  if qobj_stage_bare(name, nl, imp_ext_pfx, 4) == 1 { return 1 }
+  if qobj_stage_bare(name, nl, imp_lib_pfx, 4) == 1 { return 1 }
+  return 0
+}
+
+// QOBJ: import a pre-compiled module cache (G3/G5).
 //
-// Format MUST match qobj_write exactly (v6):
-//   [4] magic "QOBJ" [4] version [4] fn_count [4] ir_count [4] total_name_bytes
-//   [fn_count * 32] fn entries   (str_off, name_len, pcount, reserved*5)
-//   [total_name_bytes]           name blobs, NUL-terminated
-//   [ir_count * 40]              IR records
+// Reads FORMAT v7 written by qobj_write (layout documented there). Any other
+// version is rejected so a stale v6 cache is never silently misread.
 //
-// The import is TEXTUAL-equivalent to including the .quanta source: each
-// function's IR is appended to the live `ir` buffer, its body token offset is
-// recorded in fn_btok so a cross-module CALL can still find and parse the body,
-// and its name/param count are registered in fns[]. That is what makes G5 work.
-// We deliberately do NOT use `symtab` (the ELF .o symbol table) -- it belongs to
-// object-mode output and has no role in EXEC-mode module import.
-// QOBJ: Import a pre-compiled module cache (G3).
-//
-// Format MUST match qobj_write exactly (v6):
-//   [4] magic "QOBJ" [4] version [4] fn_count [4] ir_count [4] total_name_bytes
-//   [fn_count * 32] fn entries   (str_off, name_len, pcount, ir_count, reserved*4)
-//   [total_name_bytes]           name blobs, NUL-terminated
-//   [ir_count * 40]              IR records
-//
-// CONTRACT: qobj_import must be called AFTER scanfns() (which resets fnc=0 and
-// rebuilds fns[]). expand_includes() runs BEFORE that, so calling it there would
-// register functions that are immediately discarded. The caller stages the path
-// in qobj_stage_path and calls qobj_import_pending() after scanfns().
-//
-// Imported functions are registered with a NON-ZERO sentinel body token so the
-// normal compile loop (which skips fn_btok==0) still visits them: ci_func() emits
-// their code from the IR we appended, and parse never runs on them.
+// The import is textual-equivalent to including the .quanta source: names land
+// in `src`, the module's IR is appended to the live `ir` buffer, and EVERY
+// per-function table codegen reads is rebuilt -- fn_pnames/fn_pbase/fn_pcount,
+// fn_partype, fn_parbig, fn_parstr, fn_retstruct, fn_retbig, fn_rettype_*.
+// Omitting these is exactly what made imported functions compile cleanly and
+// then segfault: zero partype tags mistype the vregs, and codegen dereferences a
+// garbage frame slot.
 fn qobj_import(path) -> i64 {
   let fd = file_open(path, 0)
   if fd < 0 { return 0 }
 
-  let hdr = mmap(24)
-  let n = file_read(fd, hdr, 20)
-  if n < 20 { file_close(fd); return 0 }
+  let hdr = mmap(32)
+  if file_read(fd, hdr, 32) < 32 { file_close(fd); return 0 }
   if r32(hdr) != 0x514F424A { file_close(fd); return 0 }
-  let version    = r32(hdr + 4)
+  if r32(hdr + 4) != 7 { file_close(fd); return 0 }
   let fn_count   = r32(hdr + 8)
   let ir_count   = r32(hdr + 12)
   let name_bytes = r32(hdr + 16)
-  if version != 6 || fn_count == 0 { file_close(fd); return 0 }
-  if fn_count > 100000 || name_bytes > 16777216 || ir_count > 400000 {
-    file_close(fd); return 0
-  }
+  let meta_bytes = r32(hdr + 20)
+  let pool_bytes = r32(hdr + 24)
+  let param_bytes = r32(hdr + 28)
+  if fn_count == 0 || fn_count > 100000 { file_close(fd); return 0 }
+  if name_bytes > 16777216 || ir_count > 400000 { file_close(fd); return 0 }
+  if meta_bytes != fn_count * 128 { file_close(fd); return 0 }
 
   let ent = mmap(fn_count * 32 + 8)
   if file_read(fd, ent, fn_count * 32) < fn_count * 32 { file_close(fd); return 0 }
   let names = mmap(name_bytes + 8)
-  if name_bytes > 0 && file_read(fd, names, name_bytes) < name_bytes { file_close(fd); return 0 }
+  if file_read(fd, names, name_bytes) < name_bytes { file_close(fd); return 0 }
+  let meta = mmap(meta_bytes + 8)
+  if file_read(fd, meta, meta_bytes) < meta_bytes { file_close(fd); return 0 }
   let irb = mmap(ir_count * 40 + 8)
   if ir_count > 0 && file_read(fd, irb, ir_count * 40) < ir_count * 40 { file_close(fd); return 0 }
   file_close(fd)
 
-  let base = fnc
+  // The param-name blob is the remainder of the file after the meta region; its
+  // length is (file size - header - entries - names - meta - ir).
+  let pfd = file_open(path, 0)
+  if pfd < 0 { return 0 }
+  // Every region length is declared in the header, so read them exactly -- no
+  // guessing and no dependence on the file size. Order: entries, names, meta,
+  // param blobs, string pool, IR.
+  let prms = mmap(param_bytes + 8)
+  file_read(pfd, hdr, 32)
+  file_read(pfd, ent, fn_count * 32)
+  file_read(pfd, names, name_bytes)
+  file_read(pfd, meta, meta_bytes)
+  if param_bytes > 0 && file_read(pfd, prms, param_bytes) < param_bytes { file_close(pfd); return 0 }
+  let pool = mmap(pool_bytes + 8)
+  if pool_bytes > 0 && file_read(pfd, pool, pool_bytes) < pool_bytes { file_close(pfd); return 0 }
+  file_close(pfd)
+  let prm_len = param_bytes
+
+  if qimp_pbase_next == 0 {
+    let mx = 0
+    let mi = 0
+    while mi < fnc {
+      let ex = r64(fn_pbase + mi*8) + r64(fn_pcount + mi*8)*16
+      if ex > mx { mx = ex }
+      mi = mi + 1
+    }
+    qimp_pbase_next = mx
+  }
+
   let i = 0
   while i < fn_count {
-    let str_off = r32(ent + i * 32)
-    let name_len = r32(ent + i * 32 + 4)
-    let pcount   = r32(ent + i * 32 + 8)
-    let firn     = r32(ent + i * 32 + 12)
-    if name_len == 0 || str_off + name_len > name_bytes { i = i + 1; continue }
+    let str_off = r32(ent + i*32)
+    let name_len = r32(ent + i*32 + 4)
+    let pcount   = r32(ent + i*32 + 8)
+    let firn     = r32(ent + i*32 + 12)
+    let meta_off = r32(ent + i*32 + 16)
+    if name_len == 0 || str_off + name_len > name_bytes || meta_off + 128 > meta_bytes {
+      w64(qimp_slot + i*8, 0-1)
+      i = i + 1
+      continue
+    }
 
-    // Name must live in `src` so fn_name()/IR_CALL comparisons work identically
-    // to source-parsed functions.
     let nm = srclen
     let j = 0
     while j < name_len { w8(src+nm+j, r8(names+str_off+j)); j = j + 1 }
     w8(src+nm+name_len, 0)
     srclen = srclen + name_len + 1
 
-    if fnc >= FN_CAP { emit_ovf() }
+    if fnc >= FN_CAP { return 0 }
     w64(fns + fnc*FNS,     nm)
     w64(fns + fnc*FNS + 8, name_len)
-    w64(fns + fnc*FNS + 16, 1)      // fn_btok: SENTINEL 1 (non-zero => visited by
-                                    // the compile loop; never parsed, see below)
-    w64(fns + fnc*FNS + 24, 0)
+    w64(fns + fnc*FNS + 16, 1)   // sentinel body token: non-zero so the compile
+                                 // loop visits it, but no body is ever parsed
+    w64(fns + fnc*FNS + 24, 0)   // code_ofs, filled by the compile loop
     w64(fns + fnc*FNS + 32, pcount)
     w64(fns + fnc*FNS + 40, 0)
     w64(fns + fnc*FNS + 48, 0)
-    w64(fn_rettype_name + fnc*8, 0)
-    w64(fn_rettype_len + fnc*8, 0)
     w64(fn_extern + fnc*8, 0)
     w64(fn_parent  + fnc*8, 0-1)
-    w64(fn_pcount  + fnc*8, pcount)
-    w64(fn_pbase   + fnc*8, 0)
-    w64(fn_ir_count + fnc*8, firn)
-    // Mark this function as cache-imported: the compile loop must emit code from
-    // the IR we append rather than parsing a body.
     w64(qimp_is_cache + fnc*8, 1)
     w64(qimp_local_i + fnc*8, i)
+    w64(qimp_slot + i*8, fnc)
+
+    // ---- metadata ----
+    let mo = meta_off
+    w64(fn_retstruct + fnc*8, r64(meta + mo + 16))
+    w64(fn_retbig    + fnc*8, r64(meta + mo + 20))
+    let rtn = r64(meta + mo)
+    let rtl = r64(meta + mo + 8)
+    if rtl > 0 && rtn != 0 {
+      let rn = srclen
+      let y = 0
+      while y < rtl { w8(src+rn+y, r8(src+rtn+y)); y = y + 1 }
+      w8(src+rn+rtl, 0)
+      srclen = srclen + rtl + 1
+      w64(fn_rettype_name + fnc*8, rn)
+      w64(fn_rettype_len  + fnc*8, rtl)
+    } else {
+      w64(fn_rettype_name + fnc*8, 0)
+      w64(fn_rettype_len  + fnc*8, 0)
+    }
+    let k = 0
+    while k < pcount {
+      if k < 4 {
+        w64(fn_partype + (fnc*200 + k)*8, r64(meta + mo + 24 + k*8))
+        w64(fn_parbig  + (fnc*200 + k)*8, r64(meta + mo + 48 + k*8))
+        w64(fn_parstr  + (fnc*200 + k)*8, r64(meta + mo + 80 + k*8))
+      }
+      k = k + 1
+    }
+    w64(fn_genparams + fnc*8, r64(meta + mo + 112))
+
+    // ---- param names into a private fn_pnames slice ----
+    let pb = qimp_pbase_next
+    w64(fn_pbase  + fnc*8, pb)
+    w64(fn_pcount + fnc*8, pcount)
+    let z = 0
+    while z < pcount {
+      let pl2 = 0
+      while pl2 < prm_len && r8(prms+pl2) != 0 { pl2 = pl2 + 1 }
+      let pn2 = srclen
+      let y2 = 0
+      while y2 < pl2 { w8(src+pn2+y2, r8(prms+y2)); y2 = y2 + 1 }
+      w8(src+pn2+pl2, 0)
+      srclen = srclen + pl2 + 1
+      w64(fn_pnames + pb + z*16, pn2)
+      w64(fn_pnames + pb + z*16 + 8, pl2)
+      prms = prms + pl2 + 1
+      prm_len = prm_len - pl2 - 1
+      z = z + 1
+    }
+    qimp_pbase_next = pb + pcount*16
+
+    w64(fn_ir_count + fnc*8, firn)
     fnc = fnc + 1
     i = i + 1
   }
 
-  // Append IR records to the live buffer, splitting per function by entry counts.
+  // ---- append IR, stamping per-function slices ----
+  let pool_cur = 0
   let rec = 0
   i = 0
   while i < fn_count {
-    let firn = r32(ent + i * 32 + 12)
+    let firn = r32(ent + i*32 + 12)
     if firn == 0 { i = i + 1; continue }
-    w64(fn_ir_start + (base + i)*8, irc)
-    let k = 0
-    while k < firn {
-      let so = (rec + k) * 40
-      w64(ir + irc*IRS,      r64(irb + so))
-      w64(ir + irc*IRS + 8,  r64(irb + so + 8))
-      w64(ir + irc*IRS + 16, r64(irb + so + 16))
-      w64(ir + irc*IRS + 24, r64(irb + so + 24))
-      w64(ir + irc*IRS + 32, r64(irb + so + 32))
-      irc = irc + 1
-      k = k + 1
+    let slot = r64(qimp_slot + i*8)
+    if slot < 0 { i = i + 1; continue }
+    // Slices are relative to the module arena, not the live `ir` buffer.
+    w64(fn_ir_start + slot*8, qir_mod_n)
+    let k2 = 0
+    while k2 < firn {
+      let so = (rec + k2) * 40
+      let op = r64(irb + so)
+      w64(qir_mod + qir_mod_n*IRS,      op)
+      w64(qir_mod + qir_mod_n*IRS + 8,  r64(irb + so + 8))
+      let a0v = r64(irb + so + 16)
+      // IR_CALL.a0 and IR_STR.a0 are byte offsets into the WRITER's `src` buffer.
+      // Copy the referenced bytes into this process's `src` and repoint a0 at the
+      // copy, so name lookups and string literals resolve here. The pool was
+      // written in exactly this walk order, so a single cursor suffices.
+      if op == 17 || op == 23 {
+        let L = 0
+        while L < 4096 && pool + pool_cur + L < pool + pool_bytes && r8(pool + pool_cur + L) != 0 { L = L + 1 }
+        if L > 0 {
+          let np = srclen
+          let y = 0
+          while y < L { w8(src + np + y, r8(pool + pool_cur + y)); y = y + 1 }
+          w8(src + np + L, 0)
+          srclen = srclen + L + 1
+          a0v = np
+        }
+        pool_cur = pool_cur + L + 1
+      }
+      w64(qir_mod + qir_mod_n*IRS + 16, a0v)
+      w64(qir_mod + qir_mod_n*IRS + 24, r64(irb + so + 24))
+      w64(qir_mod + qir_mod_n*IRS + 32, r64(irb + so + 32))
+      qir_mod_n = qir_mod_n + 1
+      k2 = k2 + 1
     }
     rec = rec + firn
     i = i + 1
@@ -756,13 +895,18 @@ fn qobj_import(path) -> i64 {
   return 1
 }
 
-// G3: consume a staged cache AFTER scanfns() has built fns[]. Returns 1 if a
-// cache was imported. Called from entry.quanta immediately after scanfns().
+// G5: import EVERY staged cache, not just the first. Draining the whole list is
+// what makes several modules resolvable to each other: module A can call into
+// module B only if B's functions were registered too.
 fn qobj_import_pending() -> i64 {
-  if qimp_pending == 0 || qimp_path == 0 { return 0 }
-  let r = qobj_import(qimp_path)
-  if r == 1 { qimp_pending = 0; qimp_path = 0 }
-  return r
+  let imported = 0
+  let i = 0
+  while i < qimp_n {
+    if qobj_import(qimp_paths + i*4096) == 1 { imported = imported + 1 }
+    i = i + 1
+  }
+  qimp_n = 0
+  return imported
 }
 
 fn expand_includes(buf, len, depth) {
@@ -838,12 +982,10 @@ fn expand_includes(buf, len, depth) {
                 w8(imp_full+k+m, 0)
               }
               // G3: stage this path's cache if present; import happens later.
-              if qimp_pending == 0 {
-                let qp = qobj_path_for(imp_full, src_strlen(imp_full))
-                if qp != 0 {
-                  let probe = file_open(qp, 0)
-                  if probe >= 0 { file_close(probe); qimp_path = qp; qimp_pending = 1 }
-                }
+              let qp = qobj_path_for(imp_full, src_strlen(imp_full))
+              if qp != 0 {
+                let probe = file_open(qp, 0)
+                if probe >= 0 { file_close(probe); qimp_stage_push(qp) }
               }
               {
                 let fd = file_open(imp_full, 0)
@@ -867,18 +1009,22 @@ fn expand_includes(buf, len, depth) {
             // G3: stage the first candidate that HAS a .qobj cache. The actual
             // import runs after scanfns() (see qobj_import_pending) because
             // scanfns resets fnc=0 and would discard anything registered earlier.
-            if qimp_pending == 0 {
-              if qobj_stage_bare(buf+ns, nl, 0, 0) == 1 { qimp_pending = 1 }
-              else if qobj_stage_bare(buf+ns, nl, imp_std_pfx, 4) == 1 { qimp_pending = 1 }
-              else if qobj_stage_bare(buf+ns, nl, imp_ext_pfx, 4) == 1 { qimp_pending = 1 }
-              else if qobj_stage_bare(buf+ns, nl, imp_lib_pfx, 4) == 1 { qimp_pending = 1 }
-            }
-            if qimp_pending == 0 {
+            // Stage a cache for this module across every candidate prefix. No
+            // "already staged" guard: a program may import several modules, and
+            // gating on the first one leaves the rest to be tokenized from source.
+            let staged_here = qobj_try_cache(buf+ns, nl)
+            if staged_here == 0 {
               let fd = imp_try(buf+ns, nl, 0, 0)
               if fd<0 { fd = imp_try(buf+ns, nl, imp_std_pfx, 4) }
               if fd<0 { fd = imp_try(buf+ns, nl, imp_ext_pfx, 4) }
               if fd<0 { fd = imp_try(buf+ns, nl, imp_lib_pfx, 4) }   // F8/0.0.30: lib/ capability modules
-              if fd>=0 { imp_load(fd, depth) } else { imp_err=1 }
+              // G3/G5: try the cache BEFORE the source. A cached module is a
+              // complete, self-contained artifact, so it must be consumable even
+              // when the .quanta is absent -- checking the source first makes the
+              // cache dead code in exactly the case it exists to serve.
+              if qobj_try_cache(buf+ns, nl) == 1 { if fd>=0 { file_close(fd) } }
+              else if fd>=0 { imp_load(fd, depth) }
+              else { imp_err=1 }
             }
             i=j
           }

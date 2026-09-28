@@ -426,9 +426,12 @@ fn main(argc, argv) {
     scantraits()
     mark_module_start()  // Mark module start for symbol ownership tracking
     scanfns()
-    // G3: if a .qobj cache was staged during include expansion, import it NOW --
-    // scanfns() has just built fns[], so registrations will survive.
-    qobj_import_pending()
+    // NOTE: the staged caches are imported LATER, just before the compile loop.
+    // Importing here would be too early: every source function's parse does
+    // `vclr(); irc=0`, which truncates the shared `ir` buffer and discards all
+    // imported module IR. Function SLOTS registered here survive that reset, but
+    // their IR does not, so the imported functions would compile from empty
+    // slices and dereference vregs that were never defined.
     scanstructs()
     rewrite_struct_literals()
     scanimpls()
@@ -582,6 +585,13 @@ fn main(argc, argv) {
     w64(func_code_starts+0,init_ofs)  // record __init at index 0
     g_init_ofs = init_ofs
 
+    // Import staged caches HERE: every `vclr(); irc=0` reset is finished (__init
+    // above, and the per-function source parses before it), so the appended module
+    // IR will not be truncated. Imported functions get slots after the source
+    // ones and explicit IR slices, so the compile loop emits each exactly once.
+    qobj_import_pending()
+
+
     // For each fn: parse body → IR, then compile IR → code, record offset
     let fi=0
     while fi<fnc {
@@ -596,10 +606,27 @@ fn main(argc, argv) {
       cur_fi=fi
       fn_push(fi)
       cur_fnname=fn_name(fi); cur_fnnlen=fn_nlen(fi)
+      // Imported IR lives in the module arena. Point the `ir` accessor base at it
+      // for the duration of this function so irop()/ira0() and every other IR
+      // reader resolve against the right buffer, then restore. A source function
+      // further down the loop must see the live buffer again.
+      let ir_saved = ir
+      ir = qir_mod
+      let irc_saved = irc
+      irc = qir_mod_n
       let cc = codelen
       w64(func_code_starts+(fi+1)*8, cc)
+      // fn_pc()/fns[+32] already carries the param count from the cache, so the
+      // post-parse arity check and call patching resolve imported fns. Also mirror
+      // the offset into fns[+24] so the code-start table has no zero holes.
+      w64(fns + fi*FNS + 24, cc)
       if fn_nlen(fi)==4 && r8(src+fn_name(fi))==109 && r8(src+fn_name(fi)+1)==97 && r8(src+fn_name(fi)+2)==105 && r8(src+fn_name(fi)+3)==110 { g_main_ofs = cc }
+      // ci_func() runs the Tier-1 optimiser internally, bounded to this
+      // function's IR slice, so the cache path and the source path treat their IR
+      // identically.
       ci_func(fi,0)
+      ir = ir_saved
+      irc = irc_saved
       fn_pop()
       fi=fi+1
       continue
@@ -715,11 +742,12 @@ fn main(argc, argv) {
         w64(func_code_starts+(fi+1)*8,cstart)
         // P4: record main's code offset for the startup-stub bl patch (global, unshadowable)
         if fn_nlen(fi)==4 && r8(src+fn_name(fi))==109 && r8(src+fn_name(fi)+1)==97 && r8(src+fn_name(fi)+2)==105 && r8(src+fn_name(fi)+3)==110 { g_main_ofs = cstart }
-        opt_func()      // Tier-1 IR opt (constant folding). No-op when opt_on==0.
+        // Tier-1 IR opt now runs inside ci_func(), bounded to the function's own IR
+        // slice so it behaves identically for source and cache-imported IR.
         cur_fnname=fn_name(fi); cur_fnnlen=fn_nlen(fi)
         // IR count updated by sfn() when irc > fn_ir_start[fi]
         sfn(fi,fn_name(fi),fn_nlen(fi),fn_btok(fi),cstart,pc,r64(fn_rettype_name+fi*8),r64(fn_rettype_len+fi*8))
-        ci_func(fi,0)
+      ci_func(fi,0)
 
         fi=fi+1
     }

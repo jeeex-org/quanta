@@ -192,6 +192,16 @@ fn iremit(op,res,a0,a1,a2) {
     w8(ir_unsafe + i, unsafe_depth)   // G2: record whether this op is inside `unsafe {}`
 }
 
+
+// G5: arena-aware IR accessors. The live `ir` buffer is reset by every source
+// function's parse (`vclr(); irc=0`), so imported-module IR cannot live there.
+// These read the module arena instead, letting cached functions be compiled
+// without disturbing the live buffer.
+fn morop(i) { return r64(qir_mod + i*IRS) }
+fn morres(i) { return r64(qir_mod + i*IRS + 8) }
+fn mora0(i) { return r64(qir_mod + i*IRS + 16) }
+fn mora1(i) { return r64(qir_mod + i*IRS + 24) }
+fn mora2(i) { return r64(qir_mod + i*IRS + 32) }
 fn irop(i) { return r64(ir + i*IRS) }
 fn irres(i) { return r64(ir + i*IRS + 8) }
 fn ira0(i) { return r64(ir + i*IRS + 16) }
@@ -327,4 +337,6 @@ fn vclr() {
     while vci < vreg_n { w64(vreg_type + vci*8, 0); vci = vci + 1 }
     varc = 0; vreg_n = 0
 }
+
+
 

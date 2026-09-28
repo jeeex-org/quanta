@@ -146,13 +146,24 @@ fn width_mask(o0, o1, rd) {
     }
 }
 
+// G5: opt_func() and ci_func() both used to scan 0..irc. That is correct for a
+// source function, whose IR is the whole live buffer, but WRONG for a
+// cache-imported one: its slice lives in the module arena at [ir_beg, ir_end)
+// while `irc` is the arena's total record count. Scanning 0..irc there walked
+// every other function's records and dereferenced a bogus `src` offset, so the
+// optimiser crashed before codegen even started. opt_beg/opt_opt_end describe the
+// current function and are set by ci_func.
+let opt_beg = 0
+let opt_end = 0
+
 fn opt_func() {
     if opt_on==0 { return }
     if had_error==1 { return }
+    if opt_end <= opt_beg { return }
     // PRE-PASS: mark float vregs so constfold/emit handle them as floats.
     // i2f(x): int64 -> f64. Any IR_CALL named "i2f" yields a float result vreg.
-    let pp=0
-    while pp<irc {
+    let pp=opt_beg
+    while pp<opt_end {
         if irop(pp)==IR_CALL {
             let nm = ira0(pp)
             if r8(src+nm)=='i' && r8(src+nm+1)=='2' && r8(src+nm+2)=='f' {
@@ -162,8 +173,8 @@ fn opt_func() {
         pp=pp+1
     }
     // --- A: constant folding + algebraic identity (per-record, index-safe) ---
-    opt_i=0
-    while opt_i<irc {
+    opt_i=opt_beg
+    while opt_i<opt_end {
         let op=irop(opt_i); let r0=irres(opt_i); let a0=ira0(opt_i); let a1=ira1(opt_i)
         if op==IR_ADD || op==IR_SUB || op==IR_MUL || op==IR_BAND || op==IR_BOR || op==IR_BXOR || op==IR_OR || op==IR_AND
           || op==IR_EQ || op==IR_NE || op==IR_LT || op==IR_GT || op==IR_LE || op==IR_GE {
@@ -539,7 +550,48 @@ fn opt_tailcall() {
 }
 
 fn ci_func(fi, is_main) {
+    // Per-function IR slice. Source-parsed functions live in the live `ir` buffer
+    // and own 0..irc. Cache-imported functions live in the module arena
+    // (`qir_mod`) and own [ir_beg, ir_end). Both are indexed in ABSOLUTE IR
+    // indices, so IR_CALL's argument-list pointer (a2) and branch targets (a0)
+    // are already correct within whichever buffer they were captured in -- no
+    // relocation is needed, provided the caller points `ir` at the right arena.
+    let ir_beg = r64(fn_ir_start + fi*8)
+    let ir_end = ir_beg + r64(fn_ir_count + fi*8)
+    let is_cache = r64(qimp_is_cache + fi*8)
+    if is_cache == 0 { ir_beg = 0; ir_end = irc }
+    // Run the Tier-1 optimiser over THIS function's slice only. The source path
+    // calls opt_func() externally; doing it here guarantees the same treatment
+    // regardless of which arena the IR lives in.
+    opt_beg = ir_beg
+    opt_end = ir_end
+    opt_func()
     vreg_n = 0
+    if is_cache == 1 {
+      // Per-function context the source path establishes before parsing a body.
+      // Without these an imported function inherits the previous function's label
+      // counter, closure context, and operator-overload suppression.
+      lblc = 0
+      cur_clo = 0 - 1
+      overload_suppressed = 0
+      if r64(OPFN_SUPP + fi*8) == 1 { overload_suppressed = 1 }
+      // Generic type parameters are vregs tagged type 10 that the body references.
+      // A source function gets them from the parse-time binding loop; a cached
+      // one has no parse, so recreate them here in the same order.
+      let gcount = r64(fn_genparams + fi*8)
+      if gcount > 0 {
+        let gbase = r64(fn_genparam_base + fi*8)
+        let gz = 0
+        while gz < gcount {
+          let gnm = r64(fn_genparam_names + gbase + gz*16)
+          let gnl = r64(fn_genparam_names + gbase + gz*16 + 8)
+          let gvr = nv()
+          w64(vreg_type + gvr*8, 10)
+          vadd(gnm, gnl, gvr)
+          gz = gz + 1
+        }
+      }
+    }
     let pstart = patchc
     // Pre-scan IR to compute total string buffer size AND the true max vreg,
     // so the spill frame is sized to hold every vreg's home slot.  (compiler.py
@@ -547,8 +599,8 @@ fn ci_func(fi, is_main) {
     // with >2041 vregs run past the min_spill frame and corrupt locals.)
     let total_str=0
     let maxvr=0
-    let psi=0
-    while psi<irc {
+    let psi=ir_beg
+    while psi<ir_end {
         let pres=irres(psi); if pres>maxvr { maxvr=pres }
         if irop(psi)==IR_STR {
             let sp2=ira0(psi)+1; let ln2=0; let scp2=sp2
@@ -570,8 +622,8 @@ fn ci_func(fi, is_main) {
         let changed=1
         while changed==1 {
             changed=0
-            let mp=0
-            while mp<irc {
+            let mp=ir_beg
+            while mp<ir_end {
                 if irop(mp)==IR_CALL {
                     let mnm = ira0(mp)
                     if r8(src+mnm)=='i' && r8(src+mnm+1)=='2' && r8(src+mnm+2)=='f' {
@@ -650,10 +702,10 @@ fn ci_func(fi, is_main) {
 
     let str_off = -(frame_size - total_str)  // string buffer offset from frame base (below spill)
     let early_ret_lbl = -1   // P7: lazy epilogue label; IR_TRY jumps here on Err/None
-    let r1=0; let ii=0
+    let r1=0; let ii=ir_beg
   let loop_depth = 0
   let loop_pinned = 0
-    while ii<irc {
+    while ii<ir_end {
         let op=irop(ii); let res=irres(ii); let a0=ira0(ii); let a1=ira1(ii); let a2=ira2(ii)
         if op==IR_CONST { let rd=aphys(res); if a0<0||a0>4294967295 { ri64(rd,a0) } else { ri(rd,a0) }; sdef(res, rd) }
         else if op==IR_MOV { let rd=aphys(res); let rs=aphys(a0); if rd!=rs { rr(rd,rs) }; sdef(res, rd); w8(vfloat+res, r8(vfloat+a0)) }
@@ -1475,7 +1527,7 @@ fn ci_func(fi, is_main) {
                 let sj=arg_cnt-1
                 while sj>=6 {
                     let arg_ir2=arg_start+sj
-                    if arg_ir2<irc {
+                    if arg_ir2<ir_end {
                         let av2=irres(arg_ir2)
                         rbp(0, spill_home(av2))   // rax = arg
                         xpush(0)                  // push rax
@@ -1489,7 +1541,7 @@ fn ci_func(fi, is_main) {
             while arg_i<arg_cnt {
                 if arg_i<6 {
                     let arg_ir = arg_start + arg_i
-                    if arg_ir < irc {
+                    if arg_ir < ir_end {
                         let av=irres(arg_ir)
                         let preg=0
                         if arg_i==0 { preg=7 }
@@ -1526,7 +1578,7 @@ fn ci_func(fi, is_main) {
             // Clear vreg_owned for arg 0 so the RAII scope-exit (owned_scope_pop_one)
             // does NOT re-emit IR_FREE for the same block (double-free -> aliased-block
             // heap corruption once the allocator starts recycling the free list).
-            if is_idx==0 && arg_cnt>=1 && arg_start<irc {
+            if is_idx==0 && arg_cnt>=1 && arg_start<ir_end {
                 let _isfree = 0
                 if nl==8&&r8(src+nm)=='m'&&r8(src+nm+1)=='e'&&r8(src+nm+2)=='m'&&r8(src+nm+3)=='_'&&r8(src+nm+4)=='f'&&r8(src+nm+5)=='r'&&r8(src+nm+6)=='e'&&r8(src+nm+7)=='e' { _isfree = 1 }
                 if nl==4&&r8(src+nm)=='d'&&r8(src+nm+1)=='r'&&r8(src+nm+2)=='o'&&r8(src+nm+3)=='p' { _isfree = 1 }
@@ -1550,7 +1602,7 @@ fn ci_func(fi, is_main) {
                     let sj=arg_cnt-1
                     while sj>=6 {
                         let arg_ir2=arg_start+sj
-                        if arg_ir2<irc {
+                        if arg_ir2<ir_end {
                             let av2=irres(arg_ir2)
                             rbp(0, spill_home(av2))   // rax = arg
                             xpush(0)                  // push rax

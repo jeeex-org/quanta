@@ -1,113 +1,254 @@
 // Write functions + IR to .qobj with portable string format
+//
+// FORMAT v7 (see docs/QOBJ_ROADMAP.md):
+//   header   24B  magic, version=7, fn_count, ir_count, name_bytes, meta_bytes
+//   entries  32B  x fn_count   str_off, name_len, pcount, ir_count, meta_off, rsv*3
+//   names         name_bytes    NUL-terminated function names
+//   meta          meta_bytes    96B x fn_count  (see below)
+//   params        param_bytes   NUL-terminated param names, fn entry order
+//   IR            ir_count*40B  IR records, fn entry order
+//
+// The v7 metadata record exists because codegen reads per-function tables that
+// are NOT recoverable from IR alone. An imported function whose fn_partype /
+// fn_parbig / fn_retstruct / fn_retbig / fn_rettype* are zero will be emitted
+// with wrong vreg type tags and dereference a garbage frame slot at runtime.
+// fn_pnames is carried in the separate param blob (variable length).
+//
+//   meta record (96B):
+//    0  rettype_name_off (into `src`, 0 = none)
+//    8  rettype_len
+//   16  retstruct      0 = none
+//   20  retbig         0 = normal, 1 = : big
+//   24  partype[0..3]   first 4 param struct/trait type ids (-1 = none)
+//   ..  parbig[0..3]    per-param : big flags
+//   ..  parstr[0..3]    per-param "was a string literal at the call site" flags
+//   ..  genparams      count of generic type params
+//   ..  genparam_names offset/length pairs are carried in the param blob tail
 fn qobj_write(path) -> i64 {
   let fd = file_open(path, 577)
   if fd < 0 { return 0 }
-  
-  // Count functions with IR
+
+  // ---- pass 1: sizes ----
   let fn_count = 0
   let total_name_bytes = 0
   let total_ir_records = 0
+  let total_param_bytes = 0
   let i = 0
   while i < fnc {
-    let ir_count = r64(fn_ir_count + i*8)
-    if ir_count > 0 {
+    let ic = r64(fn_ir_count + i*8)
+    if ic > 0 {
       fn_count = fn_count + 1
       total_name_bytes = total_name_bytes + r64(fns + i*FNS + 8) + 1
-      total_ir_records = total_ir_records + ir_count
+      total_ir_records = total_ir_records + ic
+      let pc = r64(fn_pcount + i*8)
+      let pb = r64(fn_pbase + i*8)
+      let z = 0
+      while z < pc {
+        total_param_bytes = total_param_bytes + r64(fn_pnames + pb + z*16 + 8) + 1
+        z = z + 1
+      }
     }
     i = i + 1
   }
-  
-  // Write header (20 bytes at offset 0)
+  let meta_bytes = fn_count * 128
+
+  // String pool: IR_CALL.a0 and IR_STR.a0 are byte offsets into `src`, which is
+  // meaningless in another process. Serialise the referenced bytes so the reader
+  // can rebase them. Every such pointer is stored as its own NUL-terminated pool
+  // entry, in the same order the IR records appear, so the reader can walk both
+  // streams in lockstep and needs no side table.
+  let total_pool_bytes = 0
+  i = 0
+  while i < fnc {
+    let ic = r64(fn_ir_count + i*8)
+    if ic > 0 {
+      let s0 = r64(fn_ir_start + i*8)
+      let j = 0
+      while j < ic {
+        let r = qir + (s0 + j)*IRS
+        let op = r64(r)
+        if op == 17 || op == 23 {
+          let a0 = r64(r + 16)
+          if a0 < srclen {
+            let L = 0
+            while L < 4096 && a0 + L < srclen && r8(src + a0 + L) != 0 { L = L + 1 }
+            if op == 23 { while L < 4096 && a0 + L < srclen && r8(src + a0 + L) != 34 { L = L + 1 } }
+            total_pool_bytes = total_pool_bytes + L + 1
+          }
+        }
+        j = j + 1
+      }
+    }
+    i = i + 1
+  }
+
+  // ---- header ----
   let hdr = mmap(64)
-  w32(hdr, 0x514F424A)  // "QOBJ"
-  w32(hdr + 4, 6)        // version
-  w32(hdr + 8, fn_count) // fn_count
-  w32(hdr + 12, total_ir_records) // ir_count
+  w32(hdr, 0x514F424A)   // "QOBJ"
+  w32(hdr + 4, 7)         // version
+  w32(hdr + 8, fn_count)
+  w32(hdr + 12, total_ir_records)
   w32(hdr + 16, total_name_bytes)
-  file_write(fd, hdr, 20)
-  
-  // Write function entries (all entries first, then all name blobs)
+  w32(hdr + 20, meta_bytes)
+  w32(hdr + 24, total_pool_bytes)
+  w32(hdr + 28, total_param_bytes)
+  file_write(fd, hdr, 32)
+
   if fn_count > 0 {
+    // ---- entries ----
     let str_off = 0
+    let meta_off = 0
     i = 0
     while i < fnc {
-      let ir_count = r64(fn_ir_count + i*8)
-      if ir_count > 0 {
+      let ic = r64(fn_ir_count + i*8)
+      if ic > 0 {
         let name_len = r64(fns + i*FNS + 8)
-        
-        // Write 32-byte entry at offset 0 (zeroed first)
-        let entry = mmap(64)
-        w32(entry, str_off)
-        w32(entry + 4, name_len)
-        w32(entry + 8, r64(fn_pcount + i*8))
-        // +12: this function's IR record count. The reader needs it to split the
-        // flat IR record stream back into per-function slices (G3/G5).
-        w32(entry + 12, ir_count)
-        w32(entry + 16, 0)
-        w32(entry + 20, 0)
-        w32(entry + 24, 0)
-        w32(entry + 28, 0)
-        file_write(fd, entry, 32)
-        
+        let e = mmap(64)
+        w32(e, str_off)
+        w32(e + 4, name_len)
+        w32(e + 8, r64(fn_pcount + i*8))
+        w32(e + 12, ic)          // per-function IR record count
+        w32(e + 16, meta_off)    // offset into the meta region
+        w32(e + 20, 0)
+        w32(e + 24, 0)
+        w32(e + 28, 0)
+        file_write(fd, e, 32)
         str_off = str_off + name_len + 1
+        meta_off = meta_off + 128
       }
       i = i + 1
     }
-    
-    // Now write all name blobs
+
+    // ---- function-name blobs ----
     i = 0
     while i < fnc {
-      let ir_count = r64(fn_ir_count + i*8)
-      if ir_count > 0 {
-        let name_ptr = r64(fns + i*FNS)  // offset into src data
+      let ic = r64(fn_ir_count + i*8)
+      if ic > 0 {
+        let name_ptr = r64(fns + i*FNS)
         let name_len = r64(fns + i*FNS + 8)
-        
         if name_len > 0 {
-          // Copy name from src to local buffer and write
-          let name_buf = mmap(name_len + 8)
+          let nb = mmap(name_len + 8)
           let j = 0
-          while j < name_len {
-            // fns[] holds a raw source offset, not a string-literal pointer:
-            // the 8-byte header offset applies only to literals, so read src
-            // at the token offset directly.
-            w8(name_buf + j, r8(src + name_ptr + j))
-            j = j + 1
-          }
-          file_write(fd, name_buf, name_len)
+          while j < name_len { w8(nb+j, r8(src+name_ptr+j)); j = j + 1 }
+          file_write(fd, nb, name_len)
         }
-        
-        // Write NUL terminator
         let nul = mmap(8)
         w8(nul, 0)
         file_write(fd, nul, 1)
       }
       i = i + 1
     }
-    
-    // Write IR records (40 bytes each)
+
+    // ---- per-function metadata records ----
     i = 0
     while i < fnc {
-      let ir_count = r64(fn_ir_count + i*8)
-      if ir_count > 0 {
-        let ir_start = r64(fn_ir_start + i*8)
+      let ic = r64(fn_ir_count + i*8)
+      if ic > 0 {
+        let m = mmap(128)
+        w64(m + 0,  r64(fn_rettype_name + i*8))
+        w64(m + 8,  r64(fn_rettype_len + i*8))
+        w64(m + 16, r64(fn_retstruct + i*8))
+        w64(m + 20, r64(fn_retbig + i*8))
+        let pc2 = r64(fn_pcount + i*8)
+        let k = 0
+        while k < pc2 {
+          if k < 4 {
+            w64(m + 24 + k*8, r64(fn_partype + (i*200 + k)*8))
+            w64(m + 48 + k*8, r64(fn_parbig + (i*200 + k)*8))
+            w64(m + 80 + k*8, r64(fn_parstr + (i*200 + k)*8))
+          }
+          k = k + 1
+        }
+        w64(m + 112, r64(fn_genparams + i*8))
+        // Params beyond the 4 slots stored above are not serialized; the reader
+        // leaves their type tags at 0, which codegen treats as "plain integer".
+        // No zero-fill pass: it would overwrite the parstr slots just written.
+        file_write(fd, m, 128)
+      }
+      i = i + 1
+    }
+
+    // ---- param-name blobs ----
+    i = 0
+    while i < fnc {
+      let ic = r64(fn_ir_count + i*8)
+      if ic > 0 {
+        let pc3 = r64(fn_pcount + i*8)
+        let pb3 = r64(fn_pbase + i*8)
+        let z = 0
+        while z < pc3 {
+          let pnm = r64(fn_pnames + pb3 + z*16)
+          let pnl = r64(fn_pnames + pb3 + z*16 + 8)
+          if pnl > 0 {
+            let pb5 = mmap(pnl + 8)
+            let y = 0
+            while y < pnl { w8(pb5+y, r8(src+pnm+y)); y = y + 1 }
+            file_write(fd, pb5, pnl)
+          }
+          let pn = mmap(8)
+          w8(pn, 0)
+          file_write(fd, pn, 1)
+          z = z + 1
+        }
+      }
+      i = i + 1
+    }
+
+    // ---- string pool (NUL-terminated, same order as the IR walk) ----
+    i = 0
+    while i < fnc {
+      let ic = r64(fn_ir_count + i*8)
+      if ic > 0 {
+        let s0 = r64(fn_ir_start + i*8)
         let j = 0
-        while j < ir_count {
-          let ir_idx = ir_start + j
-          let rec = mmap(64)
-          w64(rec, r64(qir + ir_idx*IRS))
-          w64(rec + 8, r64(qir + ir_idx*IRS + 8))
-          w64(rec + 16, r64(qir + ir_idx*IRS + 16))
-          w64(rec + 24, r64(qir + ir_idx*IRS + 24))
-          w64(rec + 32, r64(qir + ir_idx*IRS + 32))
-          file_write(fd, rec, 40)
+        while j < ic {
+          let r = qir + (s0 + j)*IRS
+          let op = r64(r)
+          if op == 17 || op == 23 {
+            let a0 = r64(r + 16)
+            if a0 < srclen {
+              let L = 0
+              while L < 4096 && a0 + L < srclen && r8(src + a0 + L) != 0 { L = L + 1 }
+              if op == 23 { while L < 4096 && a0 + L < srclen && r8(src + a0 + L) != 34 { L = L + 1 } }
+              if L > 0 {
+                let sb = mmap(L + 8)
+                let y = 0
+                while y < L { w8(sb + y, r8(src + a0 + y)); y = y + 1 }
+                file_write(fd, sb, L)
+              }
+              let sn = mmap(8)
+              w8(sn, 0)
+              file_write(fd, sn, 1)
+            }
+          }
+          j = j + 1
+        }
+      }
+      i = i + 1
+    }
+
+    // ---- IR records ----
+    i = 0
+    while i < fnc {
+      let ic = r64(fn_ir_count + i*8)
+      if ic > 0 {
+        let s0 = r64(fn_ir_start + i*8)
+        let j = 0
+        while j < ic {
+          let r = mmap(64)
+          w64(r,      r64(qir + (s0 + j)*IRS))
+          w64(r + 8,  r64(qir + (s0 + j)*IRS + 8))
+          w64(r + 16, r64(qir + (s0 + j)*IRS + 16))
+          w64(r + 24, r64(qir + (s0 + j)*IRS + 24))
+          w64(r + 32, r64(qir + (s0 + j)*IRS + 32))
+          file_write(fd, r, 40)
           j = j + 1
         }
       }
       i = i + 1
     }
   }
-  
+
   file_close(fd)
   return 1
 }
