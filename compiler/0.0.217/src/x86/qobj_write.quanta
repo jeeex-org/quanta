@@ -2,9 +2,9 @@
 //
 // FORMAT v7 (see docs/QOBJ_ROADMAP.md):
 //   header   24B  magic, version=7, fn_count, ir_count, name_bytes, meta_bytes
-//   entries  32B  x fn_count   str_off, name_len, pcount, ir_count, meta_off, rsv*3
+//   entries  32B  x emitted_count  str_off, name_len, pcount, ir_count, meta_off, rsv*3
 //   names         name_bytes    NUL-terminated function names
-//   meta          meta_bytes    96B x fn_count  (see below)
+//   meta          meta_bytes    128B x emitted_count  (see below)
 //   params        param_bytes   NUL-terminated param names, fn entry order
 //   IR            ir_count*40B  IR records, fn entry order
 //
@@ -50,7 +50,25 @@ fn qobj_write(path) -> i64 {
     }
     i = i + 1
   }
-  let meta_bytes = fn_count * 128
+  // Only functions with at least one IR record get an entry, a name blob, a
+  // metadata record and a parameter blob -- every region below is written
+  // inside `if ic > 0`. So the region sizes must be counted from the
+  // functions that are actually emitted, NOT from fn_count.
+  //
+  // Counting from fn_count made meta_bytes larger than the bytes on disk for
+  // any module containing a function with zero IR records. The reader then
+  // read past the end of the metadata region into the pool/IR region or off
+  // the end of the file entirely, got a SHORT READ that nothing checked, and
+  // parsed the garbage it had buffered. That is what made the cache-only
+  // build fail at a rate that varied run to run: the read landed wherever
+  // the mapping boundaries happened to fall.
+  let emitted = 0
+  let i0 = 0
+  while i0 < fnc {
+    if r64(fn_ir_count + i0*8) > 0 { emitted = emitted + 1 }
+    i0 = i0 + 1
+  }
+  let meta_bytes = emitted * 128
 
   // String pool: IR_CALL.a0 and IR_STR.a0 are byte offsets into `src`, which is
   // meaningless in another process. Serialise the referenced bytes so the reader

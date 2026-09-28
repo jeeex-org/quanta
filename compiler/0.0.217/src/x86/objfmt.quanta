@@ -313,10 +313,30 @@ fn p5_elf_obj(out_p) {
     // addend gidx*8. x86 global relocs were emitted in patch_globals().
     let agi=0
     while agi<gapatchc {
-        let adrp_ofs = r64(gpatches_a + agi*32 + 0)
-        let add_ofs  = r64(gpatches_a + agi*32 + 8)
-        let gidx     = r64(gpatches_a + agi*32 + 16)
-        let has_add  = r64(gpatches_a + agi*32 + 24)
+        // Read `gpatches`, the table the emitter actually populates:
+        //   [+0] instruction offset, [+8] global index, [+16] type, stride 24.
+        //
+        // This used to read `gpatches_a`, an mmap(8000000) arena declared in
+        // globals.quanta and written by NOTHING -- a leftover from an
+        // unfinished rename of `gpatches` to `gpatches_a`. So adrp_ofs, gidx and
+        // has_add were whatever the page happened to contain, and they went
+        // straight into reldyn: a garbage offset as a relocation site, a garbage
+        // global index as a data addend, and a garbage flag deciding whether a
+        // second relocation is emitted. relc then advanced by a garbage-dependent
+        // amount, so the relocation table was filled inconsistently.
+        //
+        // That is also why the symptom looked like memory corruption and why
+        // valgrind could not see it: the fault is an uninitialised READ of
+        // in-bounds memory, not an out-of-bounds access, and valgrind happens to
+        // hand back zeroed pages so the bad values were self-consistent. The
+        // cache-only build then succeeded or failed depending on the page
+        // contents -- i.e. on allocation layout and machine state, which is the
+        // non-determinism reported in
+        // docs/roadmap/G5_CACHE_ONLY_NON_DETERMINISM.md.
+        let adrp_ofs = r64(gpatches + agi*24 + 0)
+        let add_ofs  = r64(gpatches + agi*24 + 8)
+        let gidx     = r64(gpatches + agi*24 + 8)
+        let has_add  = r64(gpatches + agi*24 + 16)
         // gidx is the global index emitted by the IR instruction (gfind result
         // for source globals at .data slot gidx*8, or a reserved 38..37+INTERNAL_GLOBAL_COUNT
         // index for compiler-internal globals at slot gidx*8). Named cross-TU globals
@@ -597,7 +617,7 @@ fn imp_load(fd, depth) {     // read fd into depth buffer, dedup, recurse-expand
   // Check BEFORE writing: imp_seen is mmap(8192) = 1024 slots, and the old
   // order wrote imp_seen[imp_seenc] first and only then tested the cap, so the
   // write at the cap landed one slot past the mapping.
-  if imp_seenc >= IMPSEEN_CAP { emit_ovf() }
+  if imp_seenc >= IMPSEEN_CAP { emit_ovf(11) }
   w64(imp_seen + imp_seenc*8, imp_hash())
   imp_seenc = imp_seenc + 1
 
@@ -826,6 +846,16 @@ fn qobj_import(path) -> i64 {
     w64(fns + fnc*FNS + 48, 0)
     w64(fn_extern + fnc*8, 0)
     w64(fn_parent  + fnc*8, 0-1)
+    // Zero the per-function tables that the SOURCE registration path sets as a
+    // side effect but the cache path never touches. fn_var, fn_is_imported and
+    // vreg_to_param are declared mmap'd in globals.quanta and are READ during
+    // codegen (isvar, the imported-global filter, the param-passing helper) with
+    // no writer anywhere in the tree. A cache-imported function therefore read
+    // whatever those pages held, which made a "is this variadic / is this
+    // imported" test depend on allocation layout. Initialise them to the
+    // non-variadic, not-imported, not-a-param defaults.
+    w64(fn_var + fnc*8, 0)
+    w64(fn_is_imported + fnc*8, 0)
     w64(qimp_is_cache + fnc*8, 1)
     w64(qimp_local_i + fnc*8, i)
     w64(qimp_slot + i*8, fnc)

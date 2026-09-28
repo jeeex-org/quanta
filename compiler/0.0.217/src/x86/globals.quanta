@@ -913,7 +913,7 @@ fn cap_add(ci, nm, nl, outer_vr) {
     let ex = cap_find(ci, nm, nl)
     if ex >= 0 { return ex }
     let n = r64(cap_count + ci*8)
-    if n >= CAP_MAX { emit_ovf() }
+    if n >= CAP_MAX { emit_ovf(12) }
     w64(cap_name + (ci*CAP_MAX + n)*8, nm)
     w64(cap_nlen + (ci*CAP_MAX + n)*8, nl)
     w64(cap_vreg + (ci*CAP_MAX + n)*8, outer_vr)
@@ -1221,7 +1221,11 @@ let relc = 0
 let fn_symidx = mmap(2000000)  // map function index -> .symtab index (for relocations)
 // object-mode global patches: for each global access, record the relocation
 // site and global index so p5_elf_obj can emit relocations against _gdata.
-let gpatches_a = mmap(8000000)
+// gpatches_a removed: an mmap(8000000) arena written by nothing and read by
+// patch_globals() as the global-patch table. It was a leftover from an
+// unfinished rename; the real table is `gpatches` (stride 24). Reading it
+// supplied uninitialised relocation offsets, addends and type flags.
+
 let parse_mut_flag = 0  // 0.0.76: set when TT_MUT consumed at statement level
 let parse_ref_flag = 0  // 0.0.94: set when TT_REF consumed at statement level
 let gapatchc = 0
