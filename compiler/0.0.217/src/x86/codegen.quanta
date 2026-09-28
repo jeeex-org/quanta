@@ -640,9 +640,13 @@ fn ci_func(fi, is_main) {
       // r64() returned the stale upper seven bytes of the slot -- an
       // arbitrary value, which is the same uninitialised-read class this
       // block exists to remove. That is what broke closure_named_fn.
+      // Bounded to THIS function's IR slice, not the whole module. On the cache
+      // path `ir` points at the module arena and `irc` is the module's total
+      // record count, so scanning 0..irc walks every other function's records
+      // and reads their vregs as if they belonged to this one.
       let mvmax2 = 0
-      let mv2 = 0
-      while mv2 < irc {
+      let mv2 = ir_beg
+      while mv2 < ir_end {
         let rv2 = irres(mv2)
         if rv2 > mvmax2 { mvmax2 = rv2 }
         mv2 = mv2 + 1
