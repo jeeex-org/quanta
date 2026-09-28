@@ -24,8 +24,21 @@ fn tokln(i) { return r64(toks + i*TKS + 32) }
 // page -> SIGSEGV (a crafted ≤16MB source with very high token density could
 // trigger this). As of 1.1.0 each emitter bounds its counter and aborts with a
 // clean error (exit 17) instead of corrupting memory.
-let TOK_CAP = 500000000    // toks arena 20GB / 40B per token (raised for stdlib inlining)
-let IR_CAP  = 1000000000   // ir arena 40GB / 40B per record (raised for SHA3)
+let TOK_CAP = 10000000     // toks is mmap(320000000) and a token record is 32B
+                         // (TKS), so the arena holds exactly 10000000
+                         // records. The old 500000000 came from a 20GB
+                         // arena that no longer exists: it admitted 50x more
+                         // tokens than fit, so the cap only fired AFTER
+                         // toks had been overrun into the neighbouring mapping
+                         // -- corrupting an unrelated arena, which is why
+                         // the same cache-only build failed differently on
+                         // each run.
+let IR_CAP  = 26843545     // `ir` is mmap(1073741824) and a record is IRS(40), so
+                         // the arena holds exactly 26843545 records. The old
+                         // 1000000000 was justified by a "40GB arena" that
+                         // does not exist, so the cap admitted 37x more IR
+                         // than fit and only fired after `ir` had been
+                         // overrun into the next mapping.
 let VAR_CAP = 250000       // vars arena 2MB / 24B (VRS=24? keep headroom)
 let FN_CAP  = 250000       // fns arena 2MB / 40B (FNS=40)
 let ALLOC_CAP = 131000     // alloc arena 2MB / 16B
@@ -34,7 +47,10 @@ let VREG_CAP = 400000      // raised 0.0.98 to fit compiler self-build with feat
 let LBL_CAP  = 124000      // lblmap arena 2MB / 16B (LBS=16), keep headroom
 let PATCH_CAP = 330000     // patches arena 8MB / 24B (PCS=24), keep headroom
 let GPATCH_CAP = 62000     // gpatches arena 2MB / 32B, keep headroom
-let IMPSEEN_CAP = 8100     // imp_seen arena 8192 slots, keep headroom
+let IMPSEEN_CAP = 1000     // imp_seen is mmap(8192) = 1024 slots of 8B. The
+                         // old 8100 was described as "headroom" but is 94%
+                         // of the mapping, so a deep or diamond import graph
+                         // wrote past the arena.
 
 // Follow IR_MOV chain recursively to find the ultimate source vreg.
 // Returns the vreg that has vreg_is_str=1 or the original IR_STR source.

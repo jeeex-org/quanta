@@ -594,8 +594,11 @@ fn imp_load(fd, depth) {     // read fd into depth buffer, dedup, recurse-expand
   // imp_hash() reads imp_full, which is still valid here, and dedup is by
   // resolved path, so it covers cache and source routes for the same module.
   if imp_already() == 1 { file_close(fd); return }
-  w64(imp_seen + imp_seenc*8, imp_hash())
+  // Check BEFORE writing: imp_seen is mmap(8192) = 1024 slots, and the old
+  // order wrote imp_seen[imp_seenc] first and only then tested the cap, so the
+  // write at the cap landed one slot past the mapping.
   if imp_seenc >= IMPSEEN_CAP { emit_ovf() }
+  w64(imp_seen + imp_seenc*8, imp_hash())
   imp_seenc = imp_seenc + 1
 
   let qp0 = qobj_path_for(imp_full, src_strlen(imp_full))
@@ -733,6 +736,15 @@ fn qobj_import(path) -> i64 {
   let pool_bytes = r32(hdr + 24)
   let param_bytes = r32(hdr + 28)
   if fn_count == 0 || fn_count > 100000 { file_close(fd); return 0 }
+  // Validate the file against the COMPILER'S REMAINING CAPACITY, not just
+  // against the file's own internal consistency. The per-file checks below
+  // (meta_bytes == fn_count*128, etc.) all pass for a well-formed cache, so
+  // a cache that is merely LARGE -- or a second module pushed past the end --
+  // walked fnc past FN_CAP and wrote fns[fnc*FNS..], fn_ir_count[fnc*8],
+  // fn_pnames and qimp_slot out of bounds, clobbering whichever arenas the
+  // allocator placed after them. That is the non-determinism: each run
+  // corrupted a different neighbour, so a different cached function failed.
+  if fnc + fn_count > FN_CAP { file_close(fd); return 0 }
   if name_bytes > 16777216 || ir_count > 400000 { file_close(fd); return 0 }
   if meta_bytes != fn_count * 128 { file_close(fd); return 0 }
 
@@ -840,7 +852,11 @@ fn qobj_import(path) -> i64 {
     w64(fn_genparams + fnc*8, r64(meta + mo + 112))
 
     // ---- param names into a private fn_pnames slice ----
+    // fn_pnames is mmap(4000000) = 250000 [ptr,len] entries of 16B. pcount is
+    // capped at 4 per function, so a full FN_CAP worth of cached functions needs
+    // 1000000 entries and overruns. Bound the base against the real capacity.
     let pb = qimp_pbase_next
+    if pb + pcount*16 > 4000000 { file_close(fd); return 0 }
     w64(fn_pbase  + fnc*8, pb)
     w64(fn_pcount + fnc*8, pcount)
     let z = 0
@@ -881,6 +897,15 @@ fn qobj_import(path) -> i64 {
     while k2 < firn {
       let so = (rec + k2) * 40
       let op = r64(irb + so)
+      // BOUND THE MODULE ARENA. qir_mod is 1GiB = 26843545 records of IRS(40),
+      // and the reader had NO check here at all. A cache whose ir_count is
+      // misread, or a module re-imported into a region that overlaps another
+      // module's, walks qir_mod_n past the end of the mapping and scribbles
+      // over whichever arena the allocator placed next -- which is why the
+      // cache-only build was NON-DETERMINISTIC: the same caches corrupted a
+      // different neighbour on each run, so a different cached function failed
+      // each time and the symptom looked like a call-patch bug.
+      if qir_mod_n >= 26843545 { return 0 }
       w64(qir_mod + qir_mod_n*IRS,      op)
       w64(qir_mod + qir_mod_n*IRS + 8,  r64(irb + so + 8))
       let a0v = r64(irb + so + 16)
