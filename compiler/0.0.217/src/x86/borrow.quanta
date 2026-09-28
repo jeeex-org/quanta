@@ -133,19 +133,20 @@ fn is_mut_binding(vr) {
 }
 
 fn is_param_vreg(vr) {
-    // Check if this vreg is a function parameter
+    // A parameter is recorded in `vars` by vadd(name_off, name_len, vreg) at
+    // parse time: vars[varc] = {name_off, vreg, name_len}, and varc advances.
+    // So the set of parameter vregs is exactly the vreg field of every vars
+    // entry -- scan vars[0..varc) and compare the vreg at +8.
+    //
+    // The previous implementation walked the FUNCTION table and indexed `vars`
+    // with (fn_pbase[i] + j)*VRS. fn_pbase is a byte offset into the separate
+    // fn_pnames arena -- the param NAME table populated by scanfns before any
+    // vreg exists -- not an index into `vars`. Two different arenas, so
+    // (fn_pbase + j)*VRS addressed memory unrelated to any param record and
+    // returned whatever vreg-sized value happened to be there.
     let i = 0
-    while i < fnc {
-        let pc = r64(fn_pcount + i*8)
-        let pbase = r64(fn_pbase + i*8)
-        let j = 0
-        while j < pc {
-            let pvr = r64(vars + (pbase + j)*VRS + 8)
-            if pvr == vr {
-                return 1
-            }
-            j = j + 1
-        }
+    while i < varc {
+        if r64(vars + i*VRS + 8) == vr { return 1 }
         i = i + 1
     }
     return 0
