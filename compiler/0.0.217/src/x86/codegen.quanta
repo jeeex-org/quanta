@@ -644,9 +644,17 @@ fn ci_func(fi, is_main) {
       // path `ir` points at the module arena and `irc` is the module's total
       // record count, so scanning 0..irc walks every other function's records
       // and reads their vregs as if they belonged to this one.
+      // Bounded to this function's IR within the LIVE buffer: ir_beg..irc.
+      //
+      // Not 0..irc: on the cache path `ir` is the module arena, so index 0 is
+      // another function's first record.
+      // Not ir_beg..ir_end: on the SOURCE path a function's closure bodies are
+      // emitted into the same buffer AFTER the parent body, past ir_end, and
+      // they carry the captured vregs this scan must see. Bounding to ir_end
+      // truncated the range and cost closure_capture its vreg_clo state.
       let mvmax2 = 0
       let mv2 = ir_beg
-      while mv2 < ir_end {
+      while mv2 < irc {
         let rv2 = irres(mv2)
         if rv2 > mvmax2 { mvmax2 = rv2 }
         mv2 = mv2 + 1

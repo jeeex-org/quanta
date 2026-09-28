@@ -748,7 +748,7 @@ fn qobj_import(path) -> i64 {
   let hdr = mmap(32)
   if file_read(fd, hdr, 32) < 32 { file_close(fd); return 0 }
   if r32(hdr) != 0x514F424A { file_close(fd); return 0 }
-  if r32(hdr + 4) != 7 { file_close(fd); return 0 }
+  if r32(hdr + 4) != 8 { file_close(fd); return 0 }
   let fn_count   = r32(hdr + 8)
   let ir_count   = r32(hdr + 12)
   let name_bytes = r32(hdr + 16)
@@ -822,7 +822,7 @@ fn qobj_import(path) -> i64 {
     let pcount   = r32(ent + i*32 + 8)
     let firn     = r32(ent + i*32 + 12)
     let meta_off = r32(ent + i*32 + 16)
-    if name_len == 0 || str_off + name_len > name_bytes || meta_off + 128 > meta_bytes {
+    if name_len == 0 || str_off + name_len > name_bytes || meta_off + 144 > meta_bytes {
       w64(qimp_slot + i*8, 0-1)
       i = i + 1
       continue
@@ -877,7 +877,7 @@ fn qobj_import(path) -> i64 {
     // ---- metadata ----
     let mo = meta_off
     w64(fn_retstruct + fnc*8, r64(meta + mo + 16))
-    w64(fn_retbig    + fnc*8, r64(meta + mo + 20))
+    w64(fn_retbig    + fnc*8, r64(meta + mo + 24))
     let rtn = r64(meta + mo)
     let rtl = r64(meta + mo + 8)
     if rtl > 0 && rtn != 0 {
@@ -896,13 +896,13 @@ fn qobj_import(path) -> i64 {
     let k = 0
     while k < pcount {
       if k < 4 {
-        w64(fn_partype + (fnc*200 + k)*8, r64(meta + mo + 24 + k*8))
-        w64(fn_parbig  + (fnc*200 + k)*8, r64(meta + mo + 48 + k*8))
-        w64(fn_parstr  + (fnc*200 + k)*8, r64(meta + mo + 80 + k*8))
+        w64(fn_partype + (fnc*200 + k)*8, r64(meta + mo + 32 + k*8))
+        w64(fn_parbig  + (fnc*200 + k)*8, r64(meta + mo + 64 + k*8))
+        w64(fn_parstr  + (fnc*200 + k)*8, r64(meta + mo + 96 + k*8))
       }
       k = k + 1
     }
-    w64(fn_genparams + fnc*8, r64(meta + mo + 112))
+    w64(fn_genparams + fnc*8, r64(meta + mo + 128))
 
     // ---- param names into a private fn_pnames slice ----
     // fn_pnames is mmap(4000000) = 250000 [ptr,len] entries of 16B. pcount is

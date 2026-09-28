@@ -68,7 +68,7 @@ fn qobj_write(path) -> i64 {
     if r64(fn_ir_count + i0*8) > 0 { emitted = emitted + 1 }
     i0 = i0 + 1
   }
-  let meta_bytes = emitted * 128
+  let meta_bytes = emitted * 144
 
   // String pool: IR_CALL.a0 and IR_STR.a0 are byte offsets into `src`, which is
   // meaningless in another process. Serialise the referenced bytes so the reader
@@ -117,7 +117,7 @@ fn qobj_write(path) -> i64 {
   // ---- header ----
   let hdr = mmap(64)
   w32(hdr, 0x514F424A)   // "QOBJ"
-  w32(hdr + 4, 7)         // version
+  w32(hdr + 4, 8)         // version
   w32(hdr + 8, fn_count)
   w32(hdr + 12, total_ir_records)
   w32(hdr + 16, total_name_bytes)
@@ -176,26 +176,26 @@ fn qobj_write(path) -> i64 {
     while i < fnc {
       let ic = r64(fn_ir_count + i*8)
       if ic > 0 {
-        let m = mmap(128)
+        let m = mmap(144)
         w64(m + 0,  r64(fn_rettype_name + i*8))
         w64(m + 8,  r64(fn_rettype_len + i*8))
         w64(m + 16, r64(fn_retstruct + i*8))
-        w64(m + 20, r64(fn_retbig + i*8))
+        w64(m + 24, r64(fn_retbig + i*8))
         let pc2 = r64(fn_pcount + i*8)
         let k = 0
         while k < pc2 {
           if k < 4 {
-            w64(m + 24 + k*8, r64(fn_partype + (i*200 + k)*8))
-            w64(m + 48 + k*8, r64(fn_parbig + (i*200 + k)*8))
-            w64(m + 80 + k*8, r64(fn_parstr + (i*200 + k)*8))
+            w64(m + 32 + k*8, r64(fn_partype + (i*200 + k)*8))
+            w64(m + 64 + k*8, r64(fn_parbig + (i*200 + k)*8))
+            w64(m + 96 + k*8, r64(fn_parstr + (i*200 + k)*8))
           }
           k = k + 1
         }
-        w64(m + 112, r64(fn_genparams + i*8))
+        w64(m + 128, r64(fn_genparams + i*8))
         // Params beyond the 4 slots stored above are not serialized; the reader
         // leaves their type tags at 0, which codegen treats as "plain integer".
         // No zero-fill pass: it would overwrite the parstr slots just written.
-        file_write(fd, m, 128)
+        file_write(fd, m, 144)
       }
       i = i + 1
     }
