@@ -61,6 +61,57 @@ else
   FUNCTIONAL_RC=0
 fi
 
+# --- Stage 1.4: NATIVE SUFFICIENCY (no extern, no libc) ------------------------
+# Quanta is a native language. `extern "C"` and the dynamic-linker path are
+# OPTIONAL interop, never the way anything has to be written. This stage asserts
+# that directly: a program covering strings, byte indexing, NUL termination,
+# raw syscalls, raw memory and the native allocator must compile in plain EXEC
+# mode -- no flags, no extern -- and run correctly.
+#
+# The stages after this one all test extern paths, and a gate made only of those
+# would stay green while the native surface quietly rotted. This is the one that
+# fails when native regresses.
+#
+# The binary must also be statically linked: a native program that pulled in
+# libc would mean something reached for extern "C" to get at it.
+echo ""
+echo "########## NATIVE SUFFICIENCY (no extern, no libc) ##########"
+NATIVE_FAIL=0
+NAT_SRC="$TEST_SUITES/codes/native_capability_test.quanta"
+if [ ! -f "$NAT_SRC" ]; then
+  echo "  FAIL native $NAT_SRC missing"
+  NATIVE_FAIL=1
+else
+  NAT_BIN="$TEST_SUITES/bin/native_capability_test"
+  if ! $QC "$NAT_SRC" "$NAT_BIN" 2>/tmp/native_stderr.txt; then
+    echo "  FAIL (compile) native_capability_test  $(cat /tmp/native_stderr.txt)"
+    NATIVE_FAIL=1
+  else
+    # Capture the status before inspecting it: `[ $? -ne 42 ]` inside a
+    # `! ... ||` chain reads the status of the negation, not the program, and
+    # reported a correct run as exit 0.
+    "$NAT_BIN" >/dev/null 2>&1
+    nat_rc=$?
+    if [ "$nat_rc" -ne 42 ]; then
+      echo "  FAIL (run) native_capability_test: expected exit 42, got $nat_rc"
+      NATIVE_FAIL=1
+    else
+      # A static binary is the real assertion. A native program has no reason to
+      # reach libc, and nothing is allowed to make it: the compiler now refuses
+      # `extern "C"` in EXEC mode outright ("extern \"C\" needs --emit-dynamic"),
+      # so if a native build ever does link libc that is a hole in that check and
+      # it should fail loudly here.
+      if ldd "$NAT_BIN" 2>&1 | grep -q "libc\.so\|ld-linux"; then
+        echo "  FAIL (link) native_capability_test linked libc; a native program must not"
+        NATIVE_FAIL=1
+      else
+        echo "  PASS native: strings, indexing, syscall, mmap, mem_alloc, no libc"
+      fi
+    fi
+  fi
+fi
+if [ "$NATIVE_FAIL" -eq 0 ]; then NATIVE_RC=0; else NATIVE_RC=1; FUNCTIONAL_RC=1; fi
+
 # --- Stage 1.5: EXTERN "C" FFI (object mode + gcc link) ----------------------
 # The main loop above compiles in EXEC mode only ($QC -O), where extern "C"
 # cannot resolve libc. This stage actually links a real libc FFI test so the
@@ -300,7 +351,8 @@ fi
 
 echo "=== GATE SUMMARY ==="
 echo "  functional     : $([ $FUNCTIONAL_RC = 0 ] && echo GREEN || echo RED)"
-echo "  extern-c      : $([ $EXTERN_RC = 0 ] && echo GREEN || echo RED)  (object-mode + gcc libc link)"
+echo "  native        : $([ $NATIVE_RC = 0 ] && echo GREEN || echo RED)  (no extern, no libc -- the default path)
+  extern-c      : $([ $EXTERN_RC = 0 ] && echo GREEN || echo RED)  (object-mode + gcc libc link)"
 echo "  extern-ld     : $([ $EXTERN_LD_RC = 0 ] && echo GREEN || echo RED)  (object-mode + ld, GCC-FREE 0.0.122)"
 echo "  security      : $([ $SECURITY_RC = 0 ] && echo GREEN || echo RED)  (KNOWN bugs reported by script, not blocking)"
 echo "  performance   : $([ $PERF_RC = 0 ] && echo GREEN || echo RED)"
@@ -321,7 +373,9 @@ echo "  qobj          : $([ $QOBJ_RC = 0 ] && echo GREEN || echo RED)  (module c
 # while every cache-only build failed (unreadable cache mode, 128-vs-144
 # metadata stride, an unrebased IR_CALL argument list, and a cache written from
 # stale IR). qobj_gate.sh is the only stage that exercises the format.
-if [ $FUNCTIONAL_RC -ne 0 ] || [ $SECURITY_RC -ne 0 ] || [ $PERF_RC -ne 0 ] \
+# NATIVE_RC is folded into FUNCTIONAL_RC above and listed separately for
+# clarity: a native regression blocks promotion even though extern still works.
+if [ $FUNCTIONAL_RC -ne 0 ] || [ $NATIVE_RC -ne 0 ] || [ $SECURITY_RC -ne 0 ] || [ $PERF_RC -ne 0 ] \
    || [ $VALGRIND_RC -ne 0 ] || [ $FUZZ_RC -ne 0 ] || [ $DIFF_RC -ne 0 ] \
    || [ $GENERICS_RC -ne 0 ] || [ $STDLIB_RC -ne 0 ] || [ $MTU_RC -ne 0 ] \
    || [ $QOBJ_RC -ne 0 ] || [ $VERIFY_STATUS_RC -ne 0 ]; then

@@ -64,14 +64,27 @@ chk "gen2 == gen3 (stable)"     "$h2" "$h3"
 gate_gen() { # $1=gen binary  $2=log
   ( cd $REPO && QC="$1" timeout 1800 bash test_suites/scripts/run_tests.sh > "$2" 2>&1 )
 }
-gate_gen $WORK/gen1/qc $WORK/g1.log
-chk "gen1 gate exit code" 0 "$?"
-chk "gen1 gate: 14 stages" 14 "$(grep -c ': GREEN\|: RED' $WORK/g1.log)"
-chk "gen1 gate: 0 RED"    0 "$(grep ': RED' $WORK/g1.log | wc -l)"
-gate_gen $WORK/gen3/qc $WORK/g3.log
-chk "gen3 gate exit code" 0 "$?"
-chk "gen3 gate: 14 stages" 14 "$(grep -c ': GREEN\|: RED' $WORK/g3.log)"
-chk "gen3 gate: 0 RED"    0 "$(grep ': RED' $WORK/g3.log | wc -l)"
+# Verify a gate run. Stage count is NOT hardcoded: it is counted from the log and
+# cross-checked against the summary, so adding a stage does not turn this RED and
+# a stage that is missing from the summary is caught. (Both a hardcoded 14 here
+# and the hardcoded V= above were the same mistake: a constant that silently rots.)
+#
+# The one absolute is "at least 12": a truncated log must not pass by being small.
+verify_gate() { # $1=binary  $2=log  $3=label
+  gate_gen "$1" "$2"
+  chk "$3 gate exit code" 0 "$?"
+
+  local body summary red
+  body=$(grep -cE '^##########' "$2")
+  summary=$(sed -n '/GATE SUMMARY/,$p' "$2" | grep -cE ': (GREEN|RED)')
+  red=$(grep ': RED' "$2" | wc -l)
+
+  [ "$body" -ge 12 ] || { echo "  FAIL $3 gate: only $body stages logged (log truncated?)"; FAIL=$((FAIL+1)); }
+  chk "$3 gate: summary covers every stage" "$body" "$summary"
+  chk "$3 gate: 0 RED" 0 "$red"
+}
+verify_gate $WORK/gen1/qc $WORK/g1.log gen1
+verify_gate $WORK/gen3/qc $WORK/g3.log gen3
 
 echo "  SELFH: $PASS/$((PASS+FAIL))"
 [ $FAIL -gt 0 ] && exit 1

@@ -76,6 +76,22 @@ All runtime values are 64‑bit words.  Types are *compile‑time* annotations t
 | `mut` | Mutable qualifier (used with `ref`) | – |
 | `move`| Move‑only qualifier (used with `ref`) | – |
 
+**Annotate string literals, or let the type come from context.** A `string` value
+is a pointer to its 8‑byte length field; the characters live at `s + 8` and are
+NUL‑terminated. So `let s = "abcde"` with *no* contextual type resolves to the
+**length** (5), and `s[0]` then reads the length field rather than `'a'`. This
+is silent — no diagnostic, just wrong bytes. Two ways to be right:
+
+```quanta
+let s: string = "abcde";   // explicit
+printi(len(s));            // 5   -- the length
+printi(mem_load8(s + 8));  // 97  -- 'a', the first character
+```
+
+Prefer the builtins (`len`, `prints`, `str_eq`, `push`, `pop`) over indexing raw.
+Indexing is for code that is deliberately working with the buffer — a `syscall`
+path, a `*u8` copy, a NUL‑scan — and there the `+ 8` is explicit and visible.
+
 *Note*: The compiler inserts implicit `free` for values owned via `mem_alloc` (see Ownership §5).
 
 ### Composite Types

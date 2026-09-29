@@ -3,13 +3,34 @@
 Created from 0.0.217 (STABLE). `VERSION` points here; this is the only tree
 whose `bin/x86/qc` may be modified.
 
-Gate: 14 GREEN / 0 RED. Caches: G5 7/7, G4 8/8, G4-transitive 8/8, G6 5/5.
+Gate: 15 GREEN / 0 RED. Caches: G5 7/7, G4 8/8, G4-transitive 8/8, G6 5/5.
 Self-hosting fixed point: `gen0 = gen1 = gen2 = gen3`.
 
-## `--emit-dynamic` with `extern "C"` — WORKS
+## Native is the default; extern is optional interop
 
-`extern "C"` calls now resolve through the real dynamic loader. Verified on the
-installed binary *and* on the gen3 self-compiled binary:
+Quanta builds anything natively. `extern "C"` and the dynamic-linker path are
+**optional**, off by default, and never the way anything has to be written. This
+is now enforced rather than asserted:
+
+- **New gate stage `native`** (stage 1.4, and a promotion blocker). A program
+  covering strings, byte indexing, NUL termination, raw syscalls, raw memory and
+  the native allocator must compile in plain EXEC mode — no flags, no extern —
+  run correctly, and come out statically linked. The rest of the gate tests
+  extern paths; without this one, a gate made only of those would stay green
+  while the native surface quietly rotted.
+- **`extern "C"` in static EXEC mode is now a hard error**
+  (`error: extern "C" needs --emit-dynamic`, exit 1). It used to emit a binary
+  that segfaulted on the first call, which reads as "the user's program is
+  broken". `--emit-obj` is exempt: it emits relocations the system linker
+  resolves, and the multi-TU tests depend on that.
+
+Test: `test_suites/codes/native_capability_test.quanta` — no `extern` in it, runs
+to exit 42, `ldd` says "not a dynamic executable", and it does the same on the
+gen3 self-compiled binary.
+
+## `--emit-dynamic` with `extern "C"` — works, and stays optional
+
+Opt-in interop, working. Verified on the installed binary *and* gen3:
 
 | case                                   | result |
 |----------------------------------------|--------|
@@ -17,10 +38,10 @@ installed binary *and* on the gen3 self-compiled binary:
 | 3 externs (`puts`, `strlen`, `abs`)    | exit 7  |
 | `--emit-dynamic`, no externs           | exit 42 |
 | `ldd` on the output                    | resolves `libc.so.6` |
-| static mode, no externs                | exit 42 (unchanged) |
-| static mode with `extern "C"`          | `error: extern "C" needs --emit-dynamic`, exit 1 |
+| static, no externs                     | exit 42 (default path) |
+| static with `extern "C"`               | hard error, exit 1 |
 
-New test: `test_suites/codes/dyn_extern_test.quanta`.
+Test: `test_suites/codes/dyn_extern_test.quanta`.
 
 ### What was wrong
 
@@ -98,10 +119,6 @@ were written, so a stray `dyn_idx` bump truncated the table the loader reads.
   *previous* stable tree no matter what was installed — a full-gate PASS against
   a binary that is not the one under test. Now reads `VERSION` and honours
   `QC=`.
-- `extern "C"` in static EXEC mode now reports
-  `error: extern "C" needs --emit-dynamic` instead of emitting a binary that
-  segfaults on the first call. `--emit-obj` is exempt: it emits relocations for
-  the system linker, and the multi-TU tests depend on that.
 
 ### Note for future work
 
