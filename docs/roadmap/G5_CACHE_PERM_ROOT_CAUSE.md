@@ -86,19 +86,40 @@ the two drift apart unnoticed. Now 35714, with the derivation recorded.
 ## Still open
 
 Cache-only builds still fail, now with **SIGILL** at a fixed address
-(`rip=0x42886c`, `imul` with `rax=0xa` and a code-range value in `rcx`) rather than
-`exit(16)`. Behavioural bisection with `return 1` cut-points inside `qobj_import`
-narrows it to the function-registration loop, but every value dumped at that point
-is small and sane (`fnc=1`, `nm=49`, `srclen=56`, `name_len=6`,
-`fn_count=1`, `ir_count=5`), and the multiply that traps uses a stride of 10,
-which matches none of the reader's strides (`FNS=56`, `IRS=40`, `VRS=24`,
-`PCS=24`, `LBS=16`, `CAP_MAX=32`). The faulting function therefore appears not to
-be `qobj_import`; the cut-point results are being confounded by the compiler's
-layout sensitivity.
+(`rip=0x42886c`) rather than `exit(16)`.
+
+What is proven by behavioural bisection (inserting `return 1` at successive points
+and rebuilding):
+
+- The fault is inside `qobj_import()`. Removing the whole body, or removing the
+  `qobj_import_pending()` call in `entry.quanta`, makes the build succeed.
+- Everything up to and including the six region reads (`ent`, `names`, `meta`,
+  `prms`, `pool`, `irb`) and the `qimp_pbase_next` block is safe.
+- The fault is in the function-registration loop, at or after the metadata block.
+
+What is **not** proven, and why: every value at the suspected statements is small
+and in range. Dumped at the `fn_partype` write: `fnc=1`, `k=0`, `pcount=1`,
+`mo=0`, `meta_bytes=144`, `name_len=6`, `nm=49`, `srclen=56`. The metadata region
+itself decodes cleanly (`retstruct=-1`, `partype[0]=-1`, `parstr[0]=0`). The
+trapping instruction is `imul rax(=10), rcx` where `rcx` holds a **code-range
+value** (`0x4298...`), not a data address — a stride of 10 matches none of the
+reader's strides (`FNS=56`, `IRS=40`, `VRS=24`, `PCS=24`, `LBS=16`,
+`CAP_MAX=32`), so the faulting function is probably **not** `qobj_import` despite
+the cut-point results.
+
+**The recurring confound:** this compiler is layout-sensitive. Adding or removing
+any statement in the failing path shifts code addresses and can move or change the
+fault, so a cut-point that "fixes" the crash does not prove the neighbouring
+statement was at fault. Several earlier conclusions in this investigation were
+wrong for exactly this reason. Cut-point results here indicate a *region*, not a
+statement.
 
 Next step: identify the function containing `0x42886c` from source. The binary has
-no section headers (`objdump -d` is silent) and no symbols, so this needs either a
-section-header-preserving build or a source-order function map.
+no section headers (`elf.quanta` writes `e_shoff=0`, `e_shnum=0` by design) and no
+symbols, so `objdump -d` is silent and there is nothing to map the address
+against. Either emit section headers in a diagnostic build, or build a source-order
+function map by compiling each function in isolation and recording its entry
+address.
 
 ## Note on stale artifacts
 
