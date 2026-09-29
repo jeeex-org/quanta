@@ -305,7 +305,10 @@ fn aclr() { allocfc=0; let i=0; while i<vreg_n { w8(vr_init+i,0); w8(vr_spill+i,
 // afree(): return a free physical reg, evicting a mapped vreg (spilling it) if needed.
 fn afree() {
     let k=0
-    while k<14 {
+    // 13 physical registers (RAX,RCX,RDX,RBX,RSI,RDI,R8-R10,R12-R15), not 14.
+    // REGS has 14 slots but init_regs fills 13; slot 13 is uninitialized and
+    // would read as 0=RAX, duplicating slot 0. k<13 is the correct bound.
+    while k<13 {
         let pr=r64(REGS+k*8)
         let used=0; let j=0
         while j<allocfc { if r64(alloc+j*16+8)==pr { used=1; break }; j=j+1 }

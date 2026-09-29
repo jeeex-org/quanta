@@ -1218,9 +1218,6 @@ let emit_obj = 0
 // When emit_dynamic==0 (default), write_elf emits static PIE (ET_DYN, no
 // PT_INTERP, no dynamic section) — fully self-contained, no libc dependency.
 let emit_dynamic = 0
-// write_elf's ht (ELF header + program header table size) — set by write_elf
-// so entry.quanta can compute correct PLT entry addresses for extern "C" calls.
-let g_elf_ht = 0
 // Dynamic-ELF scratch that must survive write_elf's long body.
 //
 // This compiler reuses bootstrap registers across a long block, and a `let` in
@@ -1233,7 +1230,18 @@ let g_elf_ht = 0
 //   +48 .plt cursor             +56 extern symbol index
 //   +64 dynamic_size            +72 got_size
 //   +80 got_plt_size            +88 plt_size
-let g_dyn_ext = mmap(128)
+//   +96 .dynsym file offset    +104 .dynstr fill start
+//   +112 .dynstr file offset   +120/.got       +128/.got.plt
+//   +136/.plt                  +144/.rela.plt  (file offsets)
+//   +152/.got  +160/.got.plt   +168/.plt  +176/.rela.plt (vaddrs)
+//   +184 current .got.plt slot vaddr          +192 current .plt entry offset
+//   +208 first per-symbol PLT entry vaddr      +224 .interp vaddr
+//   +232 .dynamic pre-alignment base
+//   +240 .interp   +248 .dynstr  +256 .dynsym  +264 .hash  +272 .gnu.hash
+//   +280 block file offset
+//   +304/.dynamic file offset  +312/.dynamic vaddr
+//   +320 dynamic_size  +328 got_size  +336 got_plt_size  +344 plt_size
+let g_dyn_ext = mmap(1024)
 // File offset and vaddr of the .dynamic entry table, computed once in write_elf's
 // size phase and read by BOTH the PT_DYNAMIC program header and the section
 // builder. They used to be derived separately and disagreed by 13 bytes.

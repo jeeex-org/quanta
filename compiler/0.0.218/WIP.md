@@ -4,49 +4,109 @@ Created from 0.0.217 (STABLE). `VERSION` points here; this is the only tree
 whose `bin/x86/qc` may be modified.
 
 Gate: 14 GREEN / 0 RED. Caches: G5 7/7, G4 8/8, G4-transitive 8/8, G6 5/5.
+Self-hosting fixed point: `gen0 = gen1 = gen2 = gen3`.
 
-## Work in progress: `--emit-dynamic` with `extern "C"`
+## `--emit-dynamic` with `extern "C"` — WORKS
 
-**Still not working.** A program with no externs builds and runs correctly
-(`--emit-dynamic` returns 3, 7, 42). A program with one extern compiles without
-the compiler crashing — a real advance over 0.0.217, where the compiler
-segfaulted — but the resulting binary segfaults instead of returning 126.
+`extern "C"` calls now resolve through the real dynamic loader. Verified on the
+installed binary *and* on the gen3 self-compiled binary:
 
-### What changed from 0.0.217
+| case                                   | result |
+|----------------------------------------|--------|
+| 1 extern (`puts`)                      | exit 42 |
+| 3 externs (`puts`, `strlen`, `abs`)    | exit 7  |
+| `--emit-dynamic`, no externs           | exit 42 |
+| `ldd` on the output                    | resolves `libc.so.6` |
+| static mode, no externs                | exit 42 (unchanged) |
+| static mode with `extern "C"`          | `error: extern "C" needs --emit-dynamic`, exit 1 |
 
-0.0.217's failure was `DT_RELASZ` reporting 24 externs for a program with one,
-so `.rela.plt` was the wrong size and the loader had nothing to bind. Fixed by
-holding everything the dynamic path needs in a global (`g_dyn_ext`) instead of
-locals: the extern count, the four region cursors, and the region sizes. Locals
-in `write_elf` do not reliably survive its long body — this compiler reuses
-bootstrap registers, and a value read back at its point of use had picked up a
-stale offset.
+New test: `test_suites/codes/dyn_extern_test.quanta`.
 
-Also fixed: `fn_name()` returns a source-relative offset, so the extern name is
-read as `src + fn_name(fi)`. Reading it as an absolute address walked into
-unmapped memory.
+### What was wrong
 
-### Where it is stuck
+Nine distinct defects in the dynamic-ELF path. Most share one root cause: **this
+compiler's bootstrap register reuse loses `let` values declared and read far
+apart**, so anything crossing a long gap has to live in `g_dyn_ext`. The files
+already said this for the cursors; the fix was to extend the same treatment to
+every region offset, vaddr and size in the block.
 
-`DT_RELASZ` is now correct (24, one extern) and the `.rela.plt` entry on disk is
-correct (`r_offset` 0x42200328, `r_info` sym=1 type=7 JUMP_SLOT). The failure is
-that every **vaddr in the dynamic table is one byte low**: `DT_JMPREL`,
-`DT_PLTGOT` and `DT_RELA` all report `0x...4f` where the data is at `0x...50`.
+1. `.dynsym` NULL symbol written with ELF32 field offsets (st_name as `w64` at 0,
+   st_info at 8) — the loader saw a garbage symbol table.
+2. `.dynsym` written at the region start, overwriting the NULL symbol, so the
+   extern landed at index 0 and every relocation read "bad symbol index 1".
+3. `st_name` computed from the `.got.plt` cursor instead of the `.dynstr` cursor —
+   every symbol named the empty string at `.dynstr[0]`.
+4. `.dynstr`/`.dynsym`/`.hash` placed by walking the `dyn_ptr` cursor, which is
+   stale by the time those writes happen. The symbol landed 0x18 bytes past the
+   end of `.dynstr`, inside `.hash`.
+5. `hash_size` was `8 + 4*2 + 4*n` — buckets counted as chain entries. Should be
+   `8 + 8 + 4*n`. Every region after `.hash` was 8 bytes late, so `DT_HASH`
+   pointed into `.gnu.hash`.
+6. **PLT0**: `jmp`'s disp32 written at `+10` instead of `+8`, and the padding
+   `90 90` then overwrote two bytes of it. `ff 25 0000e2ff` — a jump 1.9MB past
+   the GOT.
+7. **Per-symbol PLT stub**: `jmp`'s disp32 computed from the stub's *file* offset
+   where a *vaddr* is required, and the `90 90` padding overwrote the top two
+   bytes of the `e9` back-jump to PLT0.
+8. **The `.got.plt` lazy-binding slot** stored a file offset where a vaddr is
+   required — the loader's resolution was written back over a random spot in the
+   file image.
+9. The pushed relocation index was the stub's *index* (0) where glibc's
+   `_dl_runtime_resolve` expects the byte *offset* into `.rela.plt` (i*24).
 
-`dynamic_vaddr` is derived as `gdata_vaddr + gdata_size + data_off`, mirroring
-the file layout, but the RW `PT_LOAD`'s `p_vaddr` is not `gdata_vaddr` — the two
-differ by a byte, and every address built on top of that base inherits the skew.
-Deriving `dynamic_vaddr` from the LOAD segment's own `p_vaddr` rather than from
-`gdata_vaddr` is the obvious next step, but it has not been done or verified.
+The `.got`/`.got.plt` reserved slot 0 also held the block's unaligned base
+rather than the `.dynamic` vaddr, and `dynamic_size` reserved 14 entries while 15
+were written, so a stray `dyn_idx` bump truncated the table the loader reads.
 
-This is the same class of defect as the two fixed in 0.0.217 (`e_phentsize`
-written as 0, and a PLT cursor read back as 16 instead of 4984). Three
-independent instances in one function is enough to say the real problem is the
-codegen's handling of long-lived locals, not any single site in `write_elf`.
-Fixing it properly means working in `codegen.quanta` / `funcscan.quanta`, not
-adding more globals.
+### Structural changes
 
-### Not blocking
+- **`publish_dyn_layout()`** — new, in `elf.quanta`. Writes every region offset
+  and vaddr to `g_dyn_ext`. Takes **no parameters**: it was six, and the register
+  allocator did not keep them (`gsz` came back wrong, placing `.got.plt` on top
+  of `.got`). The caller now writes the inputs to `g_dyn_ext + 304..` first.
+- **`exec_extern_patches()`** — new, in `entry.quanta`. The ty==3 extern CALL
+  patch loop, lifted out of the main patch loop and called from `write_elf` after
+  the layout is final. It previously recomputed the whole layout from independent
+  guesses (`dynstr_size = 200` against a real 16, `hash_size = 32` against 20,
+  `got_size = 8*(n+3)` against `24+n*8`, no 8-byte round-up) **and** ran before
+  `write_elf` published anything, so it patched against zeros. Then it ran before
+  the string-literal byte count was final and read it 0x18 low.
+- **`g_elf_ht` deleted.** It was set by `write_elf` and read by the patch loop
+  that runs before it, so it was always 0. The header size is a constant in
+  dynamic mode: `64 + 56*6`.
 
-`extern "C"` is supported and tested through `--emit-obj` plus a real linker —
-the `extern-c` and `extern-ld` gate stages, both GREEN.
+### Two deliberate non-defaults
+
+- **`DT_FLAGS = DF_BIND_NOW`** rather than lazy binding. glibc's lazy resolver
+  assumes a `.plt` shape this emitter does not produce: it computed the symbol
+  name as `.dynstr + 0x8000` and read unmapped memory, killing the process inside
+  `_dl_lookup_symbol_x` on the first call. Binding up front removes that path.
+  A `-z now` binary behaves identically, so this is ordinary, not a workaround.
+- **`DT_FLAGS_1 = DF_1_NOW` removed.** It made glibc bind eagerly *and* skip
+  initialising the three reserved `.got.plt` slots, so PLT0 pushed and jumped
+  through two zero slots.
+- **`.gnu.hash` reduced to a valid 20-byte table** (`nbuckets=1, symndx=1,
+  maskwords=0, shift2=0, bucket[0]=1`). The old 48-byte version was `symndx=0`
+  with no bloom words — malformed. It is not referenced by `DT_GNU_HASH`, so it is
+  inert either way, but it should not be garbage.
+
+### Also fixed here
+
+- `LOAD_RW` is now `R|W|X` in dynamic mode. `.plt` is code inside that segment;
+  without X the first extern call died with `SEGV_ACCERR` on the stub.
+- `scripts/selfhost_test.sh` read `V=0.0.217` hardcoded, so it always tested the
+  *previous* stable tree no matter what was installed — a full-gate PASS against
+  a binary that is not the one under test. Now reads `VERSION` and honours
+  `QC=`.
+- `extern "C"` in static EXEC mode now reports
+  `error: extern "C" needs --emit-dynamic` instead of emitting a binary that
+  segfaults on the first call. `--emit-obj` is exempt: it emits relocations for
+  the system linker, and the multi-TU tests depend on that.
+
+### Note for future work
+
+The root cause throughout is `codegen.quanta`/`funcscan.quanta` losing long-lived
+locals, not any individual site in `write_elf`. This change routes around it with
+globals. The real fix belongs in the register allocator; until then, any new
+value that has to survive more than a few dozen lines in one function must be
+parked in a global with a comment saying which slot is which.

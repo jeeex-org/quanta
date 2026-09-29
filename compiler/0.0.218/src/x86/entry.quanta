@@ -856,63 +856,8 @@ fn main(argc, argv) {
             let disp=cof-(po3+7)
             w32(code+po3+3, disp)
         } else if r64(patches+pi*PCS+16)==3 {
-            // extern "C" call in exec mode (dynamic linking) — patches+8 = function name ptr.
-            // Patch the CALL instruction to point to the PLT entry for this symbol.
-            let po3=r64(patches+pi*PCS)
-            let tg=r64(patches+pi*PCS+8)
-            let tg_nl=0
-            while tg_nl<256 {
-                let c0=r8(src+tg+tg_nl)
-                if c0==0||c0==40||c0==41||c0==59||c0==123||c0==125||c0==44||c0==60||c0==62 { break }
-                if c0==32||c0==9||c0==10||c0==13 { break }
-                tg_nl=tg_nl+1
-            }
-            let tfi=findfn(tg,tg_nl)
-            if tfi>=0 && r64(fn_extern + tfi*8)==1 {
-                // Find the extern index (0-based) for this function
-                let ext_idx = 0
-                let fi2 = 0
-                while fi2 < fnc {
-                    if r64(fn_extern + fi2*8) == 1 {
-                        if fi2 == tfi { break }
-                        ext_idx = ext_idx + 1
-                    }
-                    fi2 = fi2 + 1
-                }
-                // Recompute the same layout as write_elf to get plt_vaddr
-                // These must match write_elf's calculations exactly
-                let num_extern = 0
-                let fi3 = 0
-                while fi3 < fnc {
-                    if r64(fn_extern + fi3*8) == 1 { num_extern = num_extern + 1 }
-                    fi3 = fi3 + 1
-                }
-                let interp_len = 28  // "/lib64/ld-linux-x86-64.so.2\0"
-                let dynstr_size = 200
-                let dynsym_count = num_extern + 1
-                let dynsym_size = dynsym_count * 24
-                let hash_size = 32
-                let gnu_hash_size = 48
-                let dynamic_count = 15
-                let dynamic_size = dynamic_count * 16
-                let got_size = 8 * (num_extern + 3)
-                let got_plt_size = 8 * 3 + 8 * num_extern
-                let plt_size = 16 + 16 * num_extern
-                let rela_plt_size = num_extern * 24
-                let dyn_total = interp_len + dynstr_size + dynsym_size + hash_size + gnu_hash_size + dynamic_size + got_size + got_plt_size + plt_size + rela_plt_size
-                let dyn_pad = dyn_total % 16
-                if dyn_pad > 0 { dyn_total = dyn_total + (16 - dyn_pad) }
-                let gdata_size = (INTERNAL_GLOBAL_COUNT + gvarc) * 8
-                let data_off = 0  // placeholder - but we need the actual value
-                // The dynamic data starts at gdata_vaddr + gdata_size + data_off
-                let dynamic_vaddr = GDATA + gdata_size + data_off
-                let plt_vaddr = dynamic_vaddr + interp_len + dynstr_size + dynsym_size + hash_size + gnu_hash_size + dynamic_size + got_size + got_plt_size
-                let plt_entry_vaddr = plt_vaddr + 16 + ext_idx * 16
-                // Patch the CALL instruction (E8 rel32)
-                // rel32 = target - (call_addr + 5)
-                // Use g_elf_ht (set by write_elf) instead of hardcoded ht
-                w32(code+po3+1, plt_entry_vaddr - (BASE + g_elf_ht + po3 + 5))
-            }
+            // extern "C" call in exec mode: handled by exec_extern_patches(),
+            // which write_elf calls once the dynamic layout is final.
         }
         pi=pi+1
     }
@@ -1021,5 +966,63 @@ fn main(argc, argv) {
 // Quick init
 fn kregs() {
     return 0
+}
+
+
+// Patch every extern "C" CALL in exec mode to its PLT stub.
+//
+// Split out of the main patch loop and called from write_elf AFTER the dynamic
+// block's layout is final, because the loop that owns it runs first. Two things
+// made that ordering necessary. (1) The layout was recomputed here from
+// independent guesses -- dynstr_size pinned at 200 where elf.quanta sizes it
+// from the real name bytes, hash_size 32 against 20, got_size 8*(n+3) against
+// 24+n*8 -- and every guess put the stub somewhere else. (2) Even a correct
+// recomputation was not correct enough: the vaddr depends on the RW segment's
+// base, which depends on the string-literal bytes laid down by codegen, and that
+// count is only final inside write_elf. Reading it 0x18 low made every CALL
+// overshoot its stub by exactly the string table and land in the middle of the
+// file image, which faulted on the first call.
+fn exec_extern_patches() {
+    if emit_dynamic == 0 { return }
+    if emit_obj != 0 { return }
+    // The code segment begins at BASE + elf_ht: 64 (ELF64 header) + 56 * 6
+    // (PHDR, LOAD_RX, LOAD_RW, INTERP, DYNAMIC, GNU_STACK).
+    let elf_ht = 64 + 56 * 6
+    let pi = 0
+    while pi < patchc {
+        if r64(patches+pi*PCS+16)==3 {
+            // extern "C" call in exec mode. patches+8 = source offset of the
+            // callee's name.
+            let po3 = r64(patches+pi*PCS)
+            let tg = r64(patches+pi*PCS+8)
+            let tg_nl = 0
+            while tg_nl < 256 {
+                let c0 = r8(src+tg+tg_nl)
+                if c0==0||c0==40||c0==41||c0==59||c0==123||c0==125||c0==44||c0==60||c0==62 { break }
+                if c0==32||c0==9||c0==10||c0==13 { break }
+                tg_nl = tg_nl + 1
+            }
+            let tfi = findfn(tg, tg_nl)
+            if tfi >= 0 && r64(fn_extern + tfi*8)==1 {
+                // Which PLT stub: the nth extern, in declaration order.
+                let ext_idx = 0
+                let fi2 = 0
+                while fi2 < fnc {
+                    if r64(fn_extern + fi2*8) == 1 {
+                        if fi2 == tfi { break }
+                        ext_idx = ext_idx + 1
+                    }
+                    fi2 = fi2 + 1
+                }
+                // g_dyn_ext + 208 is .plt_vaddr + 16, the first per-symbol stub,
+                // published by publish_dyn_layout() during write_elf's size
+                // phase. Stubs are 16 bytes apart.
+                let plt_entry_vaddr = r64(g_dyn_ext + 208) + ext_idx * 16
+                // E8 rel32, measured from the end of the CALL instruction.
+                w32(code+po3+1, plt_entry_vaddr - (BASE + elf_ht + po3 + 5))
+            }
+        }
+        pi = pi + 1
+    }
 }
 

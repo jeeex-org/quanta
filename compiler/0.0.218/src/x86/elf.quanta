@@ -116,7 +116,82 @@ let ET_DYN = 3
 let EM_X86_64 = 62
 let EI_NIDENT = 16
 
+
+// Publish every region of the dynamic block, as both file offset and vaddr.
+//
+// This lives in a function of its own because two callers need it at different
+// times: write_elf's size phase, and entry.quanta's EXEC-mode extern CALL patch
+// loop. The patch loop runs first, so anything computed inside write_elf was
+// still 0 when the patch needed it and the CALL rel32 went to a near-null
+// address.
+//
+// It also fixes the clobbering. Every one of these was once a local computed
+// from the `dyn_ptr` cursor ~60 lines above its point of use, and across that
+// gap this compiler's bootstrap register reuse loses the value: the .got.plt
+// slot came out holding 0x1366, a file offset where a vaddr belongs, and PLT0's
+// disp32 came out as 0xffffe200 instead of 0xffffffe4. Not arithmetic errors --
+// lost registers, the same failure already fixed for the cursors. Hence globals.
+//
+//   +120/.got      +128/.got.plt  +136/.plt  +144/.rela.plt   (file offsets)
+//   +152/.got      +160/.got.plt  +168/.plt  +176/.rela.plt   (vaddrs)
+//   +208 first per-symbol PLT entry vaddr (.plt + 16)
+// Publish the dynamic block's region layout into g_dyn_ext.
+//
+// Takes no parameters on purpose. It was fn publish_dyn_layout(ent_off,
+// ent_vaddr, dynsz, gsz, gpsz, psz) -- six arguments, and this compiler's
+// register allocator does not reliably keep six live values across a call:
+// gsz came back wrong, so .got.plt was placed at .got's address, the PLT's
+// RIP-relative displacements were computed against the wrong base, and every
+// extern call jumped into the middle of the file. The caller now writes the
+// inputs to g_dyn_ext + 304.. first, where they round-trip, and this reads
+// them back.
+//
+//   +304 .dynamic entry file offset   +312 .dynamic entry vaddr
+//   +320 dynamic_size                +328 got_size
+//   +336 got_plt_size                +344 plt_size
+//
+// Out: +120/.got +128/.got.plt +136/.plt +144/.rela.plt (file offsets)
+//      +152/.got +160/.got.plt +168/.plt +176/.rela.plt (vaddrs)
+//      +208 first per-symbol PLT entry vaddr
+fn publish_dyn_layout() {
+    let eo = r64(g_dyn_ext + 304)
+    let ev = r64(g_dyn_ext + 312)
+    let d = r64(g_dyn_ext + 320)
+    let g = r64(g_dyn_ext + 328)
+    let gp = r64(g_dyn_ext + 336)
+    let p = r64(g_dyn_ext + 344)
+    w64(g_dyn_ext + 120, eo + d)
+    w64(g_dyn_ext + 152, ev + d)
+    w64(g_dyn_ext + 128, eo + d + g)
+    w64(g_dyn_ext + 160, ev + d + g)
+    w64(g_dyn_ext + 136, eo + d + g + gp)
+    w64(g_dyn_ext + 168, ev + d + g + gp)
+    w64(g_dyn_ext + 144, eo + d + g + gp + p)
+    w64(g_dyn_ext + 176, ev + d + g + gp + p)
+    w64(g_dyn_ext + 208, ev + d + g + gp + 16)
+}
+
+
 fn write_elf(outp) {
+    // An extern "C" call in static mode has no symbol to bind to: there is no
+    // PT_INTERP, no PLT and no dynamic loader, so the CALL is emitted as a
+    // direct relative call to a name that resolves to nothing. The compiler has
+    // always accepted this and produced a binary that segfaults on the first
+    // call, which is the worst possible report -- it looks like the user's
+    // program is broken. Say so instead, and say what to pass.
+    // Object mode is exempt: --emit-obj emits R_X86_64_PLT32 relocations and the
+    // system linker resolves them, so extern "C" works there without a PT_INTERP.
+    if emit_dynamic == 0 && emit_obj == 0 {
+        let exi = 0
+        while exi < fnc {
+            if r64(fn_extern + exi*8) == 1 {
+                let m = "error: extern \"C\" needs --emit-dynamic\n"
+                file_write(2, m+8, len(m))
+                exit(1)
+            }
+            exi = exi + 1
+        }
+    }
     let hsz = 64
     let phsz = 56
     let phc = 6  // PT_PHDR, LOAD_RX, LOAD_RW, PT_INTERP, PT_DYNAMIC, GNU_STACK
@@ -126,8 +201,6 @@ fn write_elf(outp) {
         phc = 4
     }
     let ht = hsz + phsz * phc
-    // Export ht so entry.quanta can use it for PLT call patching
-    g_elf_ht = ht
     let tsz = ht + codelen
     let pg = 4096
     let tp = tsz + data_off
@@ -183,18 +256,32 @@ fn write_elf(outp) {
     if emit_dynamic == 1 {
         // Sizes
         interp_len = 28  // "/lib64/ld-linux-x86-64.so.2\0"
-        dynstr_size = 1 + 10  // empty + "libc.so.6\0"
+        // Empty first entry + "libc.so.6\0", then each extern's name + NUL.
+        // Sized from fn_nlen so it matches dyn_layout_init() exactly -- a fixed
+        // 16 bytes per name here and a measured length there leave .dynstr a
+        // different length in each, which moves .dynsym and everything after it.
+        dynstr_size = 11
         let k = 0
-        while k < r64(g_dyn_ext) {
-            dynstr_size = dynstr_size + 16
+        while k < fnc {
+            if r64(fn_extern + k * 8) == 1 { dynstr_size = dynstr_size + fn_nlen(k) + 1 }
             k = k + 1
         }
         dynsym_count = r64(g_dyn_ext) + 1  // +1 for NULL symbol
         dynsym_size = dynsym_count * 24
-        hash_size = 8 + 4*2 + 4*dynsym_count
-        gnu_hash_size = 48  // minimal
+        // SYSV .hash is 8 bytes of header (nbucket, nchain) plus nbucket
+        // buckets and nchain chain entries, all u32. With 2 buckets that is
+        // 8 + 8 + 4*nchain = 24 for a single extern. The old 8 + 4*2 + 4*n
+        // double-counted the buckets as if they were chain entries, came to 32,
+        // and every region after .hash -- .gnu.hash, .dynamic, the GOT, the PLT
+        // -- was placed 8 bytes late, so DT_HASH pointed into .gnu.hash.
+        hash_size = 8 + 8 + 4 * dynsym_count
+        gnu_hash_size = 20  // 1 bucket, no bloom, no chain array
         // 15 entries: DT_NEEDED, PLTRELSZ, PLTGOT, HASH, STRTAB, SYMTAB, RELA,
-        // RELASZ, RELAENT, STRSZ, SYMENT, JMPREL, PLTREL, FLAGS_1, DT_NULL.
+        // RELASZ, RELAENT, STRSZ, SYMENT, JMPREL, DT_PLTREL, DT_FLAGS_1, DT_NULL.
+        //
+        // DT_FLAGS_1 itself is no longer written (see the note at its old site),
+        // but its slot is still reserved: the table is a fixed 15 entries, and
+        // reserving 14 let the last write run into the .got that follows.
         //
         // This reserved 12 while 15 were written, so the last three overran into
         // the GOT that follows. PT_DYNAMIC's p_filesz then cut the table short
@@ -238,6 +325,47 @@ fn write_elf(outp) {
         if dyn_misalign > 0 { dyn_base = dyn_base + (8 - dyn_misalign) }
         dynamic_entry_off = dynamic_off + dyn_base
         dynamic_entry_vaddr = dynamic_vaddr + dyn_base
+
+        w64(g_dyn_ext + 304, dynamic_entry_off)
+        w64(g_dyn_ext + 312, dynamic_entry_vaddr)
+        w64(g_dyn_ext + 320, dynamic_size)
+        w64(g_dyn_ext + 328, got_size)
+        w64(g_dyn_ext + 336, got_plt_size)
+        w64(g_dyn_ext + 344, plt_size)
+        publish_dyn_layout()
+
+        // Now that the layout is final, resolve the extern "C" CALLs. This must
+        // happen here and not in the main patch loop, which runs long before
+        // write_elf: the PLT stub vaddrs depend on the RW segment's base, which
+        // depends on the string-literal bytes codegen has only just finished
+        // laying down. Patching earlier read that count 0x18 low and every CALL
+        // overshot its stub by exactly the string table.
+        exec_extern_patches()
+        // .interp's vaddr, and the PRE-alignment base of .dynamic -- .interp,
+        // .dynstr and .dynsym all sit before the 8-byte round-up, so their DT_*
+        // vaddrs need the unrounded one. Published rather than read as locals
+        // here: they are consumed ~200 lines later, where a local does not
+        // survive. (PLTGOT/RELA/JMPREL/.got/.plt offsets come from
+        // publish_dyn_layout, which is shared with entry.quanta.)
+        w64(g_dyn_ext + 224, dynamic_vaddr)
+        w64(g_dyn_ext + 232, dyn_base)
+        // The five pre-.dynamic region sizes. DT_HASH/STRTAB/SYMTAB add these
+        // together ~200 lines later, and by then interp_len, dynstr_size,
+        // dynsym_size, hash_size and gnu_hash_size are all stale -- they came
+        // back 0 and the loader was handed three DT_* vaddrs in the first page
+        // of the file. g_dyn_ext + 240 .interp, +248 .dynstr, +256 .dynsym,
+        // +264 .hash, +272 .gnu.hash.
+        w64(g_dyn_ext + 240, interp_len)
+        w64(g_dyn_ext + 248, dynstr_size)
+        w64(g_dyn_ext + 256, dynsym_size)
+        w64(g_dyn_ext + 264, hash_size)
+        w64(g_dyn_ext + 272, gnu_hash_size)
+        // Where the block starts in the file, so the section builder can place
+        // .dynstr and .dynsym by arithmetic instead of reading the clobbered
+        // dyn_ptr cursor. +280 .interp file offset (== block start), +288 the
+        // pre-alignment total, so .dynstr = +280 + 28 and .dynsym = that + the
+        // .dynstr size.
+        w64(g_dyn_ext + 280, dynamic_off)
     }
     
     // RW segment must include dynamic data (or just gdata + string literals for static PIE)
@@ -311,7 +439,7 @@ fn write_elf(outp) {
         // PH 2: PT_INTERP - must be in first LOAD segment
         // The interpreter string is in the RW segment (with dynamic data), so point to it there
         let interp_off = dynamic_off  // in RW segment
-        let interp_vaddr = dynamic_vaddr
+        let interp_vaddr = r64(g_dyn_ext + 224)
         let ph_interp = ph_next
         w64(elfb + ph_interp + 0, PT_INTERP)
         w64(elfb + ph_interp + 4, PF_R)
@@ -324,10 +452,16 @@ fn write_elf(outp) {
         
         ph_next = ph_interp + phsz
         
-        // PH 3: PT_LOAD (data) R|W - includes dynamic section
+        // PH 3: PT_LOAD (data) R|W|X - includes dynamic section AND the PLT.
+        //
+        // The X matters: .plt is a code region that sits in the tail of this
+        // segment, and the segment was mapped rw-p, so the first extern call
+        // died with SEGV_ACCERR on the PLT stub itself. A normal dynamic
+        // executable keeps its PLT in the executable LOAD; this layout keeps
+        // everything dynamic in one segment, so that one needs the X.
         let phdo = ph_next
         w64(elfb + phdo + 0, PT_LOAD)
-        w64(elfb + phdo + 4, PF_R | PF_W)
+        w64(elfb + phdo + 4, PF_R | PF_W | PF_X)
         w64(elfb + phdo + 8, tp)
         w64(elfb + phdo + 16, gdata_vaddr)
         w64(elfb + phdo + 24, gdata_vaddr)
@@ -452,63 +586,82 @@ fn write_elf(outp) {
             let interp_off_abs = dyn_ptr
             dyn_ptr = dyn_ptr + interp_len
         
-            // .dynstr - string table for dynamic symbols
-            let dynstr_off = dyn_ptr
-            let dynstr_ptr = dyn_ptr
+            // .dynstr and .dynsym, placed by arithmetic from the published
+            // region offsets rather than by walking the dyn_ptr cursor.
+            //
+            // The cursor approach wrote every byte at the wrong place: dyn_ptr
+            // does not survive the intervening block, so the NULL symbol and the
+            // extern names landed 0x18 bytes past the end of .dynstr (inside
+            // .hash), .dynsym stayed all zeros, and the loader resolved every
+            // extern to the NULL symbol -- the program faulted on the first call.
+            // The offsets below come from g_dyn_ext, which round-trips.
+            let dynstr_off = r64(g_dyn_ext + 280) + r64(g_dyn_ext + 240)
+            let dynstr_ptr = dynstr_off
             w8(elfb + dynstr_ptr, 0); dynstr_ptr = dynstr_ptr + 1  // empty first entry
-        
+
             // "libc.so.6\0"
             let libc_str = "libc.so.6\0"
             let k2 = 0
             while k2 < 10 { w8(elfb + dynstr_ptr + k2, r8(libc_str + k2 + 8)); k2 = k2 + 1 }
             dynstr_ptr = dynstr_ptr + 10
-        
-            // extern function names - will add below
-            let dynstr_base = dynstr_ptr
-        
-            // Reserve space, will fill later
-            dyn_ptr = dyn_ptr + dynstr_size
-        
-            // .dynsym - dynamic symbol table
-            let dynsym_off = dyn_ptr
-            // NULL symbol (index 0)
-            w64(elfb + dyn_ptr + 0, 0)   // st_name
-            w8(elfb + dyn_ptr + 8, 0)    // st_info
-            w8(elfb + dyn_ptr + 9, 0)    // st_other
-            w16(elfb + dyn_ptr + 10, 0)  // st_shndx
-            w64(elfb + dyn_ptr + 16, 0)  // st_value
-            w64(elfb + dyn_ptr + 24, 0)  // st_size
-            dyn_ptr = dyn_ptr + 24
-        
-            // extern symbols - will fill below
-            let dynsym_start = dyn_ptr
-            dyn_ptr = dyn_ptr + dynsym_size - 24
-        
-            // .hash - simple SYSV hash (2 buckets, minimal)
-            let hash_off = dyn_ptr
-            w32(elfb + dyn_ptr, 2)   // nbucket
-            w32(elfb + dyn_ptr + 4, dynsym_count)  // nchain
-            w32(elfb + dyn_ptr + 8, 0)  // bucket[0]
-            w32(elfb + dyn_ptr + 12, 0) // bucket[1]
-            w32(elfb + dyn_ptr + 16, 0) // chain[0]
-            w32(elfb + dyn_ptr + 20, 0) // chain[1]
-            w32(elfb + dyn_ptr + 24, 0) // chain[2]
-            w32(elfb + dyn_ptr + 28, 0) // chain[3]
-            dyn_ptr = dyn_ptr + 32
-        
-            // .gnu.hash - minimal
-            let gnu_hash_off = dyn_ptr
-            w32(elfb + dyn_ptr, 2)    // nbuckets
-            w32(elfb + dyn_ptr + 4, 0) // symndx
-            w32(elfb + dyn_ptr + 8, 0) // maskwords
-            w32(elfb + dyn_ptr + 12, 0) // shift2
-            w64(elfb + dyn_ptr + 16, 0) // bloom[0]
-            w64(elfb + dyn_ptr + 24, 0) // bloom[1]
-            w32(elfb + dyn_ptr + 32, 0) // bucket[0]
-            w32(elfb + dyn_ptr + 36, 0) // bucket[1]
-            // chains follow
-            dyn_ptr = dyn_ptr + 48
-        
+
+            // extern function names - filled by the per-symbol loop below
+            w64(g_dyn_ext + 112, dynstr_off)
+            w64(g_dyn_ext + 104, dynstr_ptr)
+
+            // .dynsym starts right after .dynstr.
+            let dynsym_off = dynstr_off + r64(g_dyn_ext + 248)
+            w64(g_dyn_ext + 96, dynsym_off)
+            // NULL symbol (index 0) - ELF64 Sym: st_name(4) st_info(1) st_other(1)
+            // st_shndx(2) st_value(8) st_size(8) = 24 bytes.
+            w32(elfb + dynsym_off + 0, 0)
+            w8(elfb + dynsym_off + 4, 0)
+            w8(elfb + dynsym_off + 5, 0)
+            w16(elfb + dynsym_off + 6, 0)
+            w64(elfb + dynsym_off + 8, 0)
+            w64(elfb + dynsym_off + 16, 0)
+
+            // .hash and .gnu.hash, placed by arithmetic like .dynstr/.dynsym
+            // above -- same reason, same failure if the dyn_ptr cursor is used.
+            let hash_off = r64(g_dyn_ext + 96) + 24 * (r64(g_dyn_ext) + 1)
+            // .hash is 8 (nbucket+nchain) + 8 (2 buckets) + 4 * nchain. The
+            // old code always wrote 4 chain slots regardless of nchain, so a
+            // program with one extern overflowed its own .hash by 8 bytes and
+            // pushed .gnu.hash and everything after it out of position.
+            w32(elfb + hash_off, 2)                                  // nbucket
+            w32(elfb + hash_off + 4, r64(g_dyn_ext) + 1)            // nchain = symbols
+            w32(elfb + hash_off + 8, 0)                              // bucket[0]
+            w32(elfb + hash_off + 12, 0)                             // bucket[1]
+            let hc = 0
+            let chain_off = hash_off + 16
+            while hc < r64(g_dyn_ext) + 1 {
+                w32(elfb + chain_off + hc * 4, 0)
+                hc = hc + 1
+            }
+
+            // .gnu.hash, in a form glibc will actually accept.
+            //
+            // It was written as nbuckets=2, symndx=0, maskwords=0 and nothing
+            // else. glibc treats DT_GNU_HASH as the authoritative symbol lookup
+            // and ignores DT_HASH when it is present, so that table -- empty
+            // bloom filter, zero symndx, no chain array -- made the loader index
+            // its chain array out of bounds and hand the lazy resolver a symbol
+            // name pointer 0x8000 past .dynstr, into unmapped memory. The
+            // process died inside _dl_lookup_symbol_x on the first extern call.
+            //
+            // The minimal correct table for a binary whose only dynamic symbols
+            // are undefined: one bucket, symndx = 1 (the first symbol the GNU
+            // table covers), no bloom words, and bucket[0] = 1, the terminator
+            // value >= symndx that ends the chain walk. There is exactly one
+            // dynamic symbol, so there is exactly one chain entry and no chain
+            // array.
+            let gnu_hash_off = hash_off + r64(g_dyn_ext + 264)
+            w32(elfb + gnu_hash_off, 1)       // nbuckets
+            w32(elfb + gnu_hash_off + 4, 1)   // symndx: first symbol covered
+            w32(elfb + gnu_hash_off + 8, 0)   // maskwords
+            w32(elfb + gnu_hash_off + 12, 0)  // shift2
+            w32(elfb + gnu_hash_off + 16, 1)  // bucket[0] = terminator
+
             // .dynamic
             // Start at the offset the size phase computed rather than
             // accumulating dyn_ptr through the region writers: the bytes a
@@ -529,23 +682,23 @@ fn write_elf(outp) {
             dyn_idx = dyn_idx + 1
             // DT_PLTGOT -> .got.plt address
             w64(elfb + dyn_ptr + dyn_idx * 16, DT_PLTGOT)
-            w64(elfb + dyn_ptr + dyn_idx * 16 + 8, dynamic_vaddr + interp_len + dynstr_size + dynsym_size + hash_size + gnu_hash_size + dynamic_size + got_size + got_plt_size + plt_size)
+            w64(elfb + dyn_ptr + dyn_idx * 16 + 8, r64(g_dyn_ext + 160))
             dyn_idx = dyn_idx + 1
             // DT_HASH -> .hash address
             w64(elfb + dyn_ptr + dyn_idx * 16, DT_HASH)
-            w64(elfb + dyn_ptr + dyn_idx * 16 + 8, dynamic_vaddr + interp_len + dynstr_size + dynsym_size)
+            w64(elfb + dyn_ptr + dyn_idx * 16 + 8, r64(g_dyn_ext + 224) + r64(g_dyn_ext + 240) + r64(g_dyn_ext + 248) + r64(g_dyn_ext + 256))
             dyn_idx = dyn_idx + 1
             // DT_STRTAB -> .dynstr address
             w64(elfb + dyn_ptr + dyn_idx * 16, DT_STRTAB)
-            w64(elfb + dyn_ptr + dyn_idx * 16 + 8, dynamic_vaddr + interp_len)
+            w64(elfb + dyn_ptr + dyn_idx * 16 + 8, r64(g_dyn_ext + 224) + r64(g_dyn_ext + 240))
             dyn_idx = dyn_idx + 1
             // DT_SYMTAB -> .dynsym address
             w64(elfb + dyn_ptr + dyn_idx * 16, DT_SYMTAB)
-            w64(elfb + dyn_ptr + dyn_idx * 16 + 8, dynamic_vaddr + interp_len + dynstr_size)
+            w64(elfb + dyn_ptr + dyn_idx * 16 + 8, r64(g_dyn_ext + 224) + r64(g_dyn_ext + 240) + r64(g_dyn_ext + 248))
             dyn_idx = dyn_idx + 1
             // DT_RELA -> .rela.plt address
             w64(elfb + dyn_ptr + dyn_idx * 16, DT_RELA)
-            w64(elfb + dyn_ptr + dyn_idx * 16 + 8, dynamic_vaddr + interp_len + dynstr_size + dynsym_size + hash_size + gnu_hash_size + dynamic_size + got_size + got_plt_size + plt_size)
+            w64(elfb + dyn_ptr + dyn_idx * 16 + 8, r64(g_dyn_ext + 176))
             dyn_idx = dyn_idx + 1
             // DT_RELASZ
             w64(elfb + dyn_ptr + dyn_idx * 16, DT_RELASZ)
@@ -565,15 +718,30 @@ fn write_elf(outp) {
             dyn_idx = dyn_idx + 1
             // DT_JMPREL -> .rela.plt address
             w64(elfb + dyn_ptr + dyn_idx * 16, DT_JMPREL)
-            w64(elfb + dyn_ptr + dyn_idx * 16 + 8, dynamic_vaddr + interp_len + dynstr_size + dynsym_size + hash_size + gnu_hash_size + dynamic_size + got_size + got_plt_size + plt_size)
+            w64(elfb + dyn_ptr + dyn_idx * 16 + 8, r64(g_dyn_ext + 176))
             dyn_idx = dyn_idx + 1
             // DT_PLTREL (RELA)
             w64(elfb + dyn_ptr + dyn_idx * 16, DT_PLTREL)
             w64(elfb + dyn_ptr + dyn_idx * 16 + 8, 7)  // DT_RELA
             dyn_idx = dyn_idx + 1
-            // DT_FLAGS_1 (BIND_NOW)
-            w64(elfb + dyn_ptr + dyn_idx * 16, DT_FLAGS_1)
-            w64(elfb + dyn_ptr + dyn_idx * 16 + 8, 0x00000001)  // DF_1_NOW
+            // DT_FLAGS = DF_BIND_NOW.
+            //
+            // Every relocation is resolved during startup, so the lazy resolver
+            // is never entered. That matters here because this .plt is not the
+            // shape glibc's runtime resolver assumes: it computed the symbol
+            // name pointer as .dynstr + 0x8000 and read unmapped memory, killing
+            // the process inside _dl_lookup_symbol_x on the first extern call.
+            // Binding up front removes that path entirely. It is also what a
+            // -z now binary does, so the behaviour is ordinary, not a
+            // workaround.
+            //
+            // (This replaces DT_FLAGS_1 = DF_1_NOW. Emitting that one alone left
+            // the three reserved .got.plt slots uninitialised -- glibc skips
+            // their setup when it binds eagerly -- and PLT0 then pushed and
+            // jumped through two zero slots. DF_BIND_NOW in DT_FLAGS keeps the
+            // eager binding and lets the loader fill the reserved slots too.)
+            w64(elfb + dyn_ptr + dyn_idx * 16, 30)          // DT_FLAGS
+            w64(elfb + dyn_ptr + dyn_idx * 16 + 8, 0x8)    // DF_BIND_NOW
             dyn_idx = dyn_idx + 1
             // DT_NULL terminator
             w64(elfb + dyn_ptr + dyn_idx * 16, DT_NULL)
@@ -581,38 +749,65 @@ fn write_elf(outp) {
             dyn_ptr = dyn_ptr + dynamic_size
         
             // .got
-            let got_off = dyn_ptr
-            let got_vaddr = dynamic_vaddr + interp_len + dynstr_size + dynsym_size + hash_size + gnu_hash_size + dynamic_size
-            // 3 reserved entries: [0] = .dynamic addr, [1] = link_map, [2] = _dl_runtime_resolve
-            w64(elfb + got_off + 0, dynamic_vaddr)
+            let got_off = r64(g_dyn_ext + 120)
+            let got_vaddr = r64(g_dyn_ext + 152)
+            // 3 reserved entries: [0] = .dynamic addr, [1] = link_map, [2] = _dl_runtime_resolve.
+            // [0] must be the .dynamic SECTION's vaddr, which sits after the
+            // 8-byte round-up of the region before it -- not the block's unaligned
+            // base. It was 0x42200170 instead of 0x42200218, so the loader's view
+            // of its own tables was anchored to the wrong address.
+            w64(elfb + got_off + 0, r64(g_dyn_ext + 312))
             w64(elfb + got_off + 8, 0)
             w64(elfb + got_off + 16, 0)
             dyn_ptr = dyn_ptr + got_size
         
             // .got.plt
-            let got_plt_off = dyn_ptr
-            let got_plt_vaddr = got_vaddr + got_size
-            // 3 reserved entries
-            w64(elfb + got_plt_off + 0, dynamic_vaddr)
+            let got_plt_off = r64(g_dyn_ext + 128)
+            let got_plt_vaddr = r64(g_dyn_ext + 160)
+            // 3 reserved entries; [0] is the .dynamic vaddr, as in .got above.
+            // glibc's lazy resolver reads this slot to find _DYNAMIC, so a wrong
+            // value here sends it off the end of the block and the very first
+            // extern call faults inside the loader.
+            w64(elfb + got_plt_off + 0, r64(g_dyn_ext + 312))
             w64(elfb + got_plt_off + 8, 0)
             w64(elfb + got_plt_off + 16, 0)
             dyn_ptr = dyn_ptr + got_plt_size
         
             // .plt
-            let plt_off = dyn_ptr
-            let plt_vaddr = got_plt_vaddr + got_plt_size
+            // plt_off/plt_vaddr/got_plt_vaddr go straight to globals: all three
+            // are read again by the per-symbol PLT loop ~90 lines below, and as
+            // locals they are lost in between -- PLT0's second disp32 came out
+            // as 0x0000e2ff, a jmp into the middle of nowhere.
+            //   +136 .plt file offset   +168 .plt vaddr   +200 .got.plt vaddr
+            //   +144 .rela.plt file offset  +176 .rela.plt vaddr
+            //   +128 .got.plt file offset
+            w64(g_dyn_ext + 200, r64(g_dyn_ext + 160))
             // PLT0: push QWORD PTR [got.plt+8]; jmp QWORD PTR [got.plt+16]
-            w8(elfb + plt_off + 0, 0xFF); w8(elfb + plt_off + 1, 0x35);  // push qword [rip+disp32]
-            w32(elfb + plt_off + 2, got_plt_vaddr + 8 - (plt_vaddr + 6))  // disp32 to got.plt+8
-            w8(elfb + plt_off + 6, 0xFF); w8(elfb + plt_off + 7, 0x25);  // jmp qword [rip+disp32]
-            w32(elfb + plt_off + 10, got_plt_vaddr + 16 - (plt_vaddr + 14))
+            //
+            // Both displacements are computed as a RIP-relative delta from the
+            // PLT's own vaddr, then masked to 32 bits. Written as
+            // got_plt_vaddr + n - (plt_vaddr + m) they came out as 0xffe20000
+            // and 0xffffffe2: the subtraction of two 64-bit vaddrs loses its
+            // low bits before w32 sees it, and the loader ends up jumping
+            // 1.9MB past the GOT. Anchoring both sides to plt_vaddr and taking
+            // the difference as a small signed number keeps it in range.
+            w8(elfb + r64(g_dyn_ext + 136), 0xFF); w8(elfb + r64(g_dyn_ext + 136) + 1, 0x35)
+            w32(elfb + r64(g_dyn_ext + 136) + 2, (r64(g_dyn_ext + 200) + 8) - (r64(g_dyn_ext + 168) + 6))
+            w8(elfb + r64(g_dyn_ext + 136) + 6, 0xFF); w8(elfb + r64(g_dyn_ext + 136) + 7, 0x25)
+            // disp32 sits at +8, not +10. ff 25 is at +6/+7, so the operand
+            // starts at +8 and the jmp's RIP (the address AFTER the whole
+            // instruction) is +12. Writing the displacement at +10 left the top
+            // two bytes of it in the padding as 90 90, and the low two landed on
+            // the displacement's high bytes -- PLT0 read as ff 25 0000e2ff, a
+            // jump 1.9MB past the GOT, so the very first extern call faulted.
+            w32(elfb + r64(g_dyn_ext + 136) + 8, (r64(g_dyn_ext + 200) + 16) - (r64(g_dyn_ext + 168) + 12))
             // Pad to 16 bytes
-            w8(elfb + plt_off + 14, 0x90); w8(elfb + plt_off + 15, 0x90)
+            w8(elfb + r64(g_dyn_ext + 136) + 14, 0x90); w8(elfb + r64(g_dyn_ext + 136) + 15, 0x90)
             dyn_ptr = dyn_ptr + plt_size
         
             // .rela.plt
-            let rela_plt_off = dyn_ptr
-            let rela_plt_vaddr = plt_vaddr + plt_size
+            let rela_plt_off = r64(g_dyn_ext + 144)
+            let rela_plt_vaddr = r64(g_dyn_ext + 176)
             dyn_ptr = dyn_ptr + rela_plt_size
         
             // ============================================================
@@ -630,14 +825,14 @@ fn write_elf(outp) {
             //   +48 .plt write cursor        +56 extern symbol index
             w64(g_dyn_ext + 32, rela_plt_off)
             w64(g_dyn_ext + 40, got_plt_off + 24)   // skip 3 reserved
-            w64(g_dyn_ext + 48, plt_off + 16)       // skip PLT0
+            w64(g_dyn_ext + 48, r64(g_dyn_ext + 136) + 16)   // skip PLT0
             w64(g_dyn_ext + 56, 1)                  // symbol index (0 is NULL)
 
             // .dynsym and .dynstr write cursors. These advance only within the
             // loop, so locals are fine for them; it is the values read across
             // the whole body of write_elf that did not survive.
-            let dynsym_ptr = dynsym_start
-            let dynstr_fill_ptr = dynstr_base
+            let dynsym_ptr = r64(g_dyn_ext + 96) + 24  // skip NULL symbol
+            let dynstr_fill_ptr = r64(g_dyn_ext + 112) + 11
             let fi = 0
             while fi < fnc {
                 if r64(fn_extern + fi * 8) == 1 {
@@ -650,19 +845,19 @@ fn write_elf(outp) {
                     let exi = r64(g_dyn_ext + 56)
 
                     // .dynstr
-                    let name_off = r64(g_dyn_ext + 40) - dynstr_base
+                    let name_off = dynstr_fill_ptr - r64(g_dyn_ext + 112)
                     let k3 = 0
                     while k3 < nl { w8(elfb + dynstr_fill_ptr + k3, r8(nm_abs + k3)); k3 = k3 + 1 }
                     w8(elfb + dynstr_fill_ptr + nl, 0)
                     dynstr_fill_ptr = dynstr_fill_ptr + nl + 1
 
-                    // .dynsym
-                    w64(elfb + dynsym_ptr + 0, name_off)
-                    w8(elfb + dynsym_ptr + 8, 0x12)     // STT_FUNC | STB_GLOBAL
-                    w8(elfb + dynsym_ptr + 9, 0)
-                    w16(elfb + dynsym_ptr + 10, 0)     // st_shndx = SHN_UNDEF
+                    // .dynsym — ELF64 Sym: st_name(4) st_info(1) st_other(1) st_shndx(2) st_value(8) st_size(8) = 24 bytes
+                    w32(elfb + dynsym_ptr + 0, name_off)
+                    w8(elfb + dynsym_ptr + 4, 0x12)     // STT_FUNC | STB_GLOBAL
+                    w8(elfb + dynsym_ptr + 5, 0)
+                    w16(elfb + dynsym_ptr + 6, 0)      // st_shndx = SHN_UNDEF
+                    w64(elfb + dynsym_ptr + 8, 0)
                     w64(elfb + dynsym_ptr + 16, 0)
-                    w64(elfb + dynsym_ptr + 24, 0)
                     dynsym_ptr = dynsym_ptr + 24
 
                     // .rela.plt: R_X86_64_JUMP_SLOT for this symbol's GOT slot.
@@ -673,29 +868,52 @@ fn write_elf(outp) {
                     // survive to here: the resulting r_offset was 0x4220032790 --
                     // a vaddr with a stale offset added -- so the loader had
                     // nothing to bind and the program faulted on the first call.
-                    //   .got.plt sits after .dynamic and .got
-                    let got_slot = dynamic_entry_vaddr + r64(g_dyn_ext + 64) + r64(g_dyn_ext + 72) + 24 + (exi - 1) * 8
-                    w64(elfb + r64(g_dyn_ext + 32) + 0, got_slot)
+                    //   .got.plt sits after .dynamic and .got; its first 3 slots
+                    // are the loader's reserved entries, so symbol i owns
+                    // slot 3+i.
+                    w64(g_dyn_ext + 184, r64(g_dyn_ext + 160) + 24 + (exi - 1) * 8)
+                    w64(elfb + r64(g_dyn_ext + 32) + 0, r64(g_dyn_ext + 184))
                     w64(elfb + r64(g_dyn_ext + 32) + 8, (exi << 32) | R_X86_64_JUMP_SLOT)
                     w64(elfb + r64(g_dyn_ext + 32) + 16, 0)
                     w64(g_dyn_ext + 32, r64(g_dyn_ext + 32) + 24)
 
-                    // .got.plt slot: filled by the dynamic loader
-                    w64(elfb + r64(g_dyn_ext + 40), r64(g_dyn_ext + 48) + 6)
+                    // .got.plt slot: until the loader resolves it, holds the
+                    // address of the stub's `pushq $reloc_index`, which is where
+                    // the lazy resolver jumps back to. That is a VADDR: the old
+                    // code stored the stub's file offset (r64(g_dyn_ext + 48) + 6)
+                    // and the loader wrote its resolution back over a random spot
+                    // in the file image. Stub i sits at .plt + 16 + i*16, and its
+                    // push is 6 bytes in.
+                    w64(elfb + r64(g_dyn_ext + 40), r64(g_dyn_ext + 168) + 16 + (exi - 1) * 16 + 6)
                     w64(g_dyn_ext + 40, r64(g_dyn_ext + 40) + 8)
 
-                    // .plt entry, 16 bytes
-                    let pp = r64(g_dyn_ext + 48)
-                    w8(elfb + pp, 0xFF); w8(elfb + pp + 1, 0x25)          // jmp [rip+disp32]
-                    w32(elfb + pp + 2, got_slot - (pp + 6))
-                    w8(elfb + pp + 6, 0x68)                              // pushq $reloc_index
-                    w32(elfb + pp + 7, exi - 1)
-                    w8(elfb + pp + 11, 0xE9)                             // jmp PLT0
-                    // jmp PLT0, which is the first 16 bytes of the .plt region
-                    w32(elfb + pp + 12, (dynamic_entry_vaddr + r64(g_dyn_ext + 64) + r64(g_dyn_ext + 72) + r64(g_dyn_ext + 80)) - (pp + 16))
-                    w8(elfb + pp + 14, 0x90); w8(elfb + pp + 15, 0x90)
-                    w64(g_dyn_ext + 48, pp + 16)
-
+                    // Per-symbol PLT stub, 16 bytes. g_dyn_ext + 192 is the stub's
+                    // FILE offset and +200 its VADDR -- both needed, and they are
+                    // not interchangeable: the old code used the file offset in
+                    // both the jmp displacement and the PLT0 back-jump, so the
+                    // displacement pointed 0x421ff000 bytes short of the GOT slot.
+                    //   +0  ff 25 disp32        -> jmp [rip+disp32],  RIP = +6
+                    //   +6  68 imm32            -> pushq $reloc_index
+                    //   +11 e9 rel32           -> jmp PLT0,         RIP = +16
+                    //   +14/15 are the tail of the rel32, NOT padding. Writing
+                    //   90 90 there destroyed the top half of the jump and sent
+                    //   the stub to an unmapped address on the first call.
+                    let stub_off = r64(g_dyn_ext + 48)
+                    let stub_va = r64(g_dyn_ext + 168) + 16 + (exi - 1) * 16
+                    w8(elfb + stub_off, 0xFF); w8(elfb + stub_off + 1, 0x25)
+                    w32(elfb + stub_off + 2, r64(g_dyn_ext + 184) - (stub_va + 6))
+                    w8(elfb + stub_off + 6, 0x68)
+                    // The pushed value is the byte OFFSET of this stub's Rela into
+                    // .rela.plt, not its index. glibc's _dl_runtime_resolve reads
+                    // it as `reloc_arg`, multiplies by sizeof(Elf64_Rela) and adds
+                    // it to DT_JMPREL, so pushing the index 0 made the loader
+                    // resolve symbol 0 of an arbitrary table and it read the name
+                    // from an address 0x7ff4 past .dynstr -- unmapped, and the
+                    // process died inside the resolver.
+                    w32(elfb + stub_off + 7, (exi - 1) * 24)
+                    w8(elfb + stub_off + 11, 0xE9)
+                    w32(elfb + stub_off + 12, r64(g_dyn_ext + 168) - (stub_va + 16))
+                    w64(g_dyn_ext + 48, stub_off + 16)
                     w64(g_dyn_ext + 56, exi + 1)
                 }
                 fi = fi + 1

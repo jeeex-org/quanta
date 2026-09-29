@@ -15,9 +15,15 @@
 # Bounded: prints at most 16 lines.
 ulimit -c 0
 REPO=/opt/tali/quanta
-V=0.0.217
+# Read VERSION, and let QC= override the builder. This used to hardcode 0.0.217,
+# so it silently tested the previous stable tree no matter what was installed --
+# and a full-gate PASS against a binary that is not the one under test is not
+# evidence for that source at all. SRC, QC0 and the gate binaries must all be
+# the tree actually being verified.
+V=$(cat $REPO/VERSION)
 SRC=$REPO/compiler/$V/src/x86
-QC0=$REPO/compiler/$V/bin/x86/qc
+QC0=${QC:-$REPO/compiler/$V/bin/x86/qc}
+[ -f "$QC0" ] || { echo "  FAIL no builder at $QC0"; exit 1; }
 WORK=${1:-/tmp/selfhost}
 PASS=0; FAIL=0
 chk(){ if [ "$2" = "$3" ]; then echo "  PASS $1 (=$3)"; PASS=$((PASS+1)); else echo "  FAIL $1 (want $2 got $3)"; FAIL=$((FAIL+1)); fi; }
