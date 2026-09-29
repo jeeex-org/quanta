@@ -1,8 +1,46 @@
 # G5 Prerequisite — root cause: the cache was written unreadable
 
-**Status: four defects fixed; one remaining (see "Still open").**
+**Status: RESOLVED. G5 verified — cache-only builds produce correct working binaries.**
 
-## Symptom
+## Resolution
+
+Six defects were fixed in total across this investigation. The last three
+(`6591aaef`) were what finally made cache-only builds compile *and* run correctly:
+
+1. **The compile loop's bound was not enforced** (`entry.quanta`). The cached
+   branch calls `ci_func()`, which reinitialises the register allocator mid-loop,
+   and the loop's own condition vreg did not survive that. Measured: with `fnc=3`
+   the body was entered at `fi=3`, where `fi < fnc` is false, so the compiler
+   processed a non-existent function index and died.
+
+2. **Cached-path per-vreg init scanned the whole module** (`codegen.quanta`). The
+   scan ran `ir_beg..irc`; on the cache path `ir` is the shared module arena and
+   `irc` is the entire module's record count, so the max-vreg scan spanned every
+   other cached function and the init loop cleared their type/str/big/clo tags.
+   Bounded to the function's own slice.
+
+3. **`IR_CALL.a2` was not rebased** (`objfmt.quanta`). `a2` is the index of the
+   call's argument list within the writer's IR buffer. Copied verbatim, a cached
+   call read *another function's records* as its arguments — so a cached function
+   calling other cached functions computed the wrong value (`chain(10)` gave 12
+   instead of 38) while one- and two-function modules stayed correct by luck.
+   This is why the multi-function matrix was required to find it.
+
+Earlier fixes in the same series: the unreadable cache (`rc=16` blocker), the
+128-vs-144 metadata stride, the pool-scan pointer overflow, and `FN_CAP`.
+
+## Verification
+
+`scripts/g5_matrix_full.sh`, against the installed binary `25d7e37d`:
+
+- 3 modules, nested dependencies (`top -> mid -> leaf`), cross-module calls
+- every imported `.quanta` removed
+- compiles, links, runs, returns the correct value
+- 5 consecutive cache-only builds are byte-identical
+- two builds of the compiler itself are byte-identical
+- full gate: 13 GREEN / 0 RED against that exact binary
+
+## Original symptom
 
 Every cache-only build (imported `.quanta` source removed, `.qobj` present) failed
 with `rc=16` — `imp_err`, the "include not found" exit — even though the cache file
