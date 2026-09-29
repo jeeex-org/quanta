@@ -32,7 +32,42 @@
 // half of retstruct, and a -1 sentinel became 0x00000000FFFFFFFF = 4294967295,
 // which codegen read as a struct index. v8 puts every scalar and array on its
 // own 8-byte boundary, and the reader rejects any version != 8.
-fn qobj_write(path) -> i64 {
+// === G4: source fingerprint ===
+// Hash of the module's OWN source file, so a consumer can tell a fresh cache
+// from a stale one and recompile instead of silently reusing old IR.
+//
+// Deliberately a content hash of the source FILE, not of the expanded text and
+// not an mtime:
+//   - not mtime: the language exposes no stat() intrinsic, and mtime is wrong in
+//     the case that matters -- a cache is routinely copied or checked out next
+//     to its source, which moves one and not the other. A content hash is stable
+//     under copy and detects the real condition: the bytes changed.
+//   - not the expanded text: the consumer must recompute this cheaply, from one
+//     file. Hashing the expansion would mean redoing the import expansion, which
+//     is precisely the work the cache exists to avoid.
+//
+// Returns 0 when the path is unknown or unreadable, which the consumer reads as
+// "no fingerprint recorded" and therefore "trust the cache" -- required for the
+// G3/G5 cache-only path, where no source is present at all.
+fn qobj_file_fingerprint(path) -> i64 {
+  if path == 0 { return 0 }
+  let fd = file_open(path, 0)
+  if fd < 0 { return 0 }
+  let buf = mmap(1048576)
+  let n = file_read(fd, buf, 1048576)
+  file_close(fd)
+  if n <= 0 { return 0 }
+  let h = 2166136261
+  let i = 0
+  while i < n {
+    h = h ^ r8(buf + i)
+    h = (h * 16777619) & 4294967295
+    i = i + 1
+  }
+  return h | ((n & 4294967295) << 32)
+}
+
+fn qobj_write(path, src_path) -> i64 {
   // 577 = O_WRONLY|O_CREAT|O_TRUNC. O_CREAT REQUIRES a third mode argument:
   // without it the emitter leaves rdx holding whatever the previous syscall left
   // there, so the kernel masked that garbage against the umask and created the
@@ -130,16 +165,24 @@ fn qobj_write(path) -> i64 {
   }
 
   // ---- header ----
-  let hdr = mmap(64)
+  let hdr = mmap(80)
   w32(hdr, 0x514F424A)   // "QOBJ"
-  w32(hdr + 4, 8)         // version
+  w32(hdr + 4, 9)         // version (9: adds the G4 source fingerprint)
   w32(hdr + 8, fn_count)
   w32(hdr + 12, total_ir_records)
   w32(hdr + 16, total_name_bytes)
   w32(hdr + 20, meta_bytes)
   w32(hdr + 24, total_pool_bytes)
   w32(hdr + 28, total_param_bytes)
-  file_write(fd, hdr, 32)
+  // G4: fingerprint of the source this cache was built from. Version 9 is
+  // mandatory, not cosmetic: a v8 cache has no fingerprint, so a consumer that
+  // read one under the old rule would treat "no fingerprint" as "trust me" and
+  // silently reuse stale IR. Rejecting v8 outright forces a rebuild, which is
+  // the correct behaviour for a cache whose staleness cannot be established.
+  let fp = qobj_file_fingerprint(src_path)
+  w32(hdr + 32, fp & 4294967295)
+  w32(hdr + 36, (fp >> 32) & 4294967295)
+  file_write(fd, hdr, 40)
 
   if fn_count > 0 {
     // ---- entries ----

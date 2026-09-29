@@ -628,12 +628,17 @@ fn imp_load(fd, depth) {     // read fd into depth buffer, dedup, recurse-expand
   if emit_qobj == 0 { qp0 = qobj_path_for(imp_full, src_strlen(imp_full)) }
   if qp0 != 0 {
     let probe0 = file_open(qp0, 0)
-    if probe0 >= 0 {
+    // G4: only stage the cache when it is not stale with respect to the source
+    // it was built from. imp_full is the resolved .quanta path. If the source
+    // changed after the cache was written, the cached IR no longer describes
+    // the module on disk and must be rebuilt rather than reused.
+    if probe0 >= 0 && qobj_cache_is_stale(qp0, imp_full) == 0 {
       file_close(probe0)
       qimp_stage_push(qp0)
       file_close(fd)
       return
     }
+    if probe0 >= 0 { file_close(probe0) }
   }
 
   // Textual inclusion (like 0.0.188) - inline the referenced source into 'src'
@@ -688,7 +693,12 @@ fn qobj_stage_bare(name, nl, pfx, pl) -> i64 {
     let q = qobj_path_for(qobj_try_buf, k)
     if q != 0 {
       let probe = file_open(q, 0)
-      if probe >= 0 { file_close(probe); qimp_stage_push(q); return 1 }
+      // G4: the buffer holds the .quanta path here, so it is the source to
+      // check the cache against.
+      if probe >= 0 && qobj_cache_is_stale(q, qobj_try_buf) == 0 {
+        file_close(probe); qimp_stage_push(q); return 1
+      }
+      if probe >= 0 { file_close(probe) }
     }
   }
   // Form B: bare module name -> append ".quanta" then derive .qobj.
@@ -698,7 +708,10 @@ fn qobj_stage_bare(name, nl, pfx, pl) -> i64 {
   let q2 = qobj_path_for(qobj_try_buf, k+7)
   if q2 == 0 { return 0 }
   let probe2 = file_open(q2, 0)
-  if probe2 >= 0 { file_close(probe2); qimp_stage_push(q2); return 1 }
+  if probe2 >= 0 && qobj_cache_is_stale(q2, qobj_try_buf) == 0 {
+    file_close(probe2); qimp_stage_push(q2); return 1
+  }
+  if probe2 >= 0 { file_close(probe2) }
   return 0
 }
 
@@ -725,6 +738,34 @@ fn qobj_path_for(path, plen) -> i64 {
 // G3: try to stage a .qobj cache for a bare `import NAME` across all candidate
 // prefixes. Returns 1 if a cache was found and staged (caller must NOT tokenize
 // the source), 0 if none exists.
+// G4: is the cache at qpath stale with respect to the source at spath?
+//
+// Returns 1 when the cache must NOT be used because the source has changed.
+// Returns 0 when the cache is usable, including the case where no fingerprint
+// is recorded at all (cache built without a known source path, or built when
+// no source was present) -- that is the G3/G5 cache-only contract: absent
+// source means the cache is the only artifact there is.
+//
+// A cache with a fingerprint but no readable source on disk is NOT treated as
+// stale. That is the same cache-only case, and it must keep working: the whole
+// point of the cache is to be consumable after the source is removed.
+fn qobj_cache_is_stale(qpath, spath) -> i64 {
+  if qpath == 0 { return 0 }
+  let fd = file_open(qpath, 0)
+  if fd < 0 { return 0 }
+  let hdr = mmap(64)
+  if file_read(fd, hdr, 40) < 40 { file_close(fd); return 0 }
+  if r32(hdr) != 0x514F424A { file_close(fd); return 0 }
+  let stored = r32(hdr + 32) | (r32(hdr + 36) << 32)
+  file_close(fd)
+  if stored == 0 { return 0 }        // no fingerprint: trust it (cache-only)
+  if spath == 0 { return 0 }         // no source path known: trust it
+  let now = qobj_file_fingerprint(spath)
+  if now == 0 { return 0 }           // source absent: cache-only, trust it
+  if now != stored { return 1 }      // source changed: rebuild
+  return 0
+}
+
 fn qobj_try_cache(name, nl) -> i64 {
   if qobj_stage_bare(name, nl, 0, 0) == 1 { return 1 }
   if qobj_stage_bare(name, nl, imp_std_pfx, 4) == 1 { return 1 }
@@ -749,16 +790,21 @@ fn qobj_import(path) -> i64 {
   let fd = file_open(path, 0)
   if fd < 0 { return 0 }
 
-  let hdr = mmap(32)
-  if file_read(fd, hdr, 32) < 32 { file_close(fd); return 0 }
+  // G4: the header is 40 bytes in v9 (the last 8 carry the source fingerprint).
+  // A v8 cache is rejected rather than accepted without a fingerprint: its
+  // staleness cannot be established, and reusing it would silently reintroduce
+  // the stale-IR class of bug this check exists to catch.
+  let hdr = mmap(64)
+  if file_read(fd, hdr, 40) < 40 { file_close(fd); return 0 }
   if r32(hdr) != 0x514F424A { file_close(fd); return 0 }
-  if r32(hdr + 4) != 8 { file_close(fd); return 0 }
+  if r32(hdr + 4) != 9 { file_close(fd); return 0 }
   let fn_count   = r32(hdr + 8)
   let ir_count   = r32(hdr + 12)
   let name_bytes = r32(hdr + 16)
   let meta_bytes = r32(hdr + 20)
   let pool_bytes = r32(hdr + 24)
   let param_bytes = r32(hdr + 28)
+  let qobj_fp = r32(hdr + 32) | (r32(hdr + 36) << 32)
   if fn_count == 0 || fn_count > 100000 { file_close(fd); return 0 }
   // Validate the file against the COMPILER'S REMAINING CAPACITY, not just
   // against the file's own internal consistency. The per-file checks below
@@ -1122,7 +1168,11 @@ fn expand_includes(buf, len, depth) {
               let cache_here = 0
               if qp != 0 {
                 let probe = file_open(qp, 0)
-                if probe >= 0 { file_close(probe); qimp_stage_push(qp); cache_here = 1 }
+                // G4: skip a cache whose source has changed since it was written.
+                if probe >= 0 && qobj_cache_is_stale(qp, imp_full) == 0 {
+                  file_close(probe); qimp_stage_push(qp); cache_here = 1
+                }
+                if probe >= 0 && cache_here == 0 { file_close(probe) }
               }
               let fd = file_open(imp_full, 0)
               if fd>=0 {
