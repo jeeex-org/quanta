@@ -116,7 +116,7 @@ Compile each module to its own IR stream. Link multiple IR streams together. Res
 | G1 | `--emit-qobj` creates `.qobj` | File created, readable | ✅ |
 | G2 | `qobj_import()` parses the v6 format and registers functions | Functions + IR loaded, cross-module call resolves | ✅ |
 | G3 | Import with `.qobj` cache | Cache is consumed; no token explosion | ✅ |
-| G5 | Cross-module call | Call resolves via `.qobj` | ✅ verified |
+| G5 | Cross-module call | Call resolves via `.qobj` | ✅ verified (qobj gate, 10/10) |
 | G4 | Stale `.qobj` detection | Recompiles when source newer | ⏳ blocked on G5 |
 | G6 | Self-host with `.qobj` | Quanta compiles itself using cached modules | ⏳ blocked on G5, G4 |
 

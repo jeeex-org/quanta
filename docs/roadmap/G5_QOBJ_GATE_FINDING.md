@@ -1,7 +1,7 @@
 # G5 follow-up — qobj gate found a real bug my matrix missed
 
-**Status: defect identified and localised; fix NOT yet landed. HEAD is unchanged and
-gate-green.**
+**Status: RESOLVED. The bug is fixed (101bbc00) and the gate is wired into the
+suite as a blocking stage (02c629f2). Full gate 14 GREEN / 0 RED.**
 
 ## The gap in my own verification
 
@@ -92,12 +92,17 @@ without disabling cache import for ordinary program builds.
 
 ## What is verified at HEAD
 
-- `scripts/g5_matrix_full.sh`: 3/3, 5 consecutive cache-only builds byte-identical
-- full gate 13 GREEN / 0 RED against the installed binary `25d7e37d`
-- the qobj gate is **not** wired into `run_tests.sh`, so it does not affect HEAD
+- `scripts/g5_verify.sh`: 7/7 — correct cache content, correct cache-only result,
+  controls intact
+- `test_suites/scripts/qobj_gate.sh`: 10/10, and a blocking stage in
+  `run_tests.sh`. Confirmed it has teeth: **8/10 with exit 1** against the
+  pre-fix binary, **10/10 with exit 0** after the fix
+- full gate **14 GREEN / 0 RED** against the installed binary `f8cb669a`
+- compiler self-build byte-identical across two runs
 
-## Next step
+## Remaining
 
-Implement the source-only import resolution for `--emit-qobj` as described above,
-then run `test_suites/scripts/qobj_gate.sh` until it is 10/10, then wire it into
-`run_tests.sh` as a new gate so this class of bug cannot return unnoticed.
+- **G4** (stale-cache detection) and **G6** (self-compile from real caches) are
+  untouched and now unblocked.
+- The functional gate still runs 869 of 18,569 tests. The qobj stage adds real
+  coverage, but that ratio is a separate question and is unchanged.
