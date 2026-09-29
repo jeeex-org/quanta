@@ -117,10 +117,11 @@ Compile each module to its own IR stream. Link multiple IR streams together. Res
 | G2 | `qobj_import()` parses the v6 format and registers functions | Functions + IR loaded, cross-module call resolves | ✅ |
 | G3 | Import with `.qobj` cache | Cache is consumed; no token explosion | ✅ |
 | G5 | Cross-module call | Call resolves via `.qobj` | ✅ verified (qobj gate, 10/10) |
-| G4 | Stale `.qobj` detection | Recompiles when source newer | ⏳ blocked on G5 |
-| G6 | Self-host with `.qobj` | Quanta compiles itself using cached modules | ⏳ blocked on G5, G4 |
+| G4 | Stale `.qobj` detection | Recompiles when source newer | ✅ (v9 fingerprint, 8/8) |
+| G6 | Self-host with `.qobj` | Quanta compiles itself using cached modules | ⛔ blocked structurally — the 19 source files are one translation unit (cyclic `helpers`/`globals`), so 16 of 19 cannot be compiled alone. See `G6_SELF_COMPILE_BLOCKED.md` |
 
-**Order is G5 -> G4 -> G6, not the numeric order.** G5 must land before G4:
+**Order was G5 -> G4 -> G6, not the numeric order.** G5 and G4 are both
+done; G6 is blocked by a source-structure fact, not by cache work. G5 must land before G4:
 today the cache is consumed (G3) but produces binaries that segfault because
 call targets are not relocated, so a cache is currently a *liability*. Adding
 mtime staleness to a broken feature guards a door that should not be open, and
