@@ -260,7 +260,19 @@ fn write_elf(outp) {
         // Sized from fn_nlen so it matches dyn_layout_init() exactly -- a fixed
         // 16 bytes per name here and a measured length there leave .dynstr a
         // different length in each, which moves .dynsym and everything after it.
-        dynstr_size = 11
+        // .dynstr holds, in order: the empty first entry, every DT_NEEDED
+        // soname, then every extern symbol name.
+        //
+        // The 11 was "empty + libc.so.6\0" with libc hardcoded, which capped
+        // --emit-dynamic at a libc-only binary. Now the sonames come from
+        // dyn_libs, so a --lib libcuda.so.1 build sizes and lays out its own
+        // string table.
+        dynstr_size = 1
+        let lo = 0
+        while lo < dyn_lib_ptr {
+            dynstr_size = dynstr_size + dyn_lib_len(lo) + 1
+            lo = lo + dyn_lib_len(lo) + 1
+        }
         let k = 0
         while k < fnc {
             if r64(fn_extern + k * 8) == 1 { dynstr_size = dynstr_size + fn_nlen(k) + 1 }
@@ -289,7 +301,9 @@ fn write_elf(outp) {
         // as if they were entries -- DT_PLTGOT and DT_JMPREL ended up holding a
         // tag value, and the loader dereferenced that as a relocation table and
         // faulted before main.
-        dynamic_size = 16 * 15
+        // 13 fixed tags (NEEDED excluded) + DT_NULL, plus one DT_NEEDED per
+        // soname. Was a flat 15 with exactly one NEEDED assumed.
+        dynamic_size = 16 * (14 + dyn_lib_cnt)
         got_size = 24 + r64(g_dyn_ext) * 8
         got_plt_size = 24 + r64(g_dyn_ext) * 8
         plt_size = 16 + r64(g_dyn_ext) * 16
@@ -597,13 +611,31 @@ fn write_elf(outp) {
             // The offsets below come from g_dyn_ext, which round-trips.
             let dynstr_off = r64(g_dyn_ext + 280) + r64(g_dyn_ext + 240)
             let dynstr_ptr = dynstr_off
+            dyn_lib_off_cnt = 0
             w8(elfb + dynstr_ptr, 0); dynstr_ptr = dynstr_ptr + 1  // empty first entry
 
-            // "libc.so.6\0"
-            let libc_str = "libc.so.6\0"
-            let k2 = 0
-            while k2 < 10 { w8(elfb + dynstr_ptr + k2, r8(libc_str + k2 + 8)); k2 = k2 + 1 }
-            dynstr_ptr = dynstr_ptr + 10
+            // Every DT_NEEDED soname, from dyn_libs. Was a fixed 10-byte copy
+            // of "libc.so.6\0"; that copy is why no other library could ever be
+            // depended on, and why the symbol offsets below were fixed at 1.
+            //
+            // .dynstr byte offsets are recorded as they are written, into
+            // g_dyn_ext + 352 upward, so DT_NEEDED can name each one without
+            // recomputing the walk. Measured against the local dynstr_off, not
+            // g_dyn_ext + 112: that slot is written two lines BELOW this loop,
+            // so subtracting it here used a stale value and every d_un came out
+            // as a file offset near 0x117d instead of a small .dynstr index. The
+            // loader then read the soname from the wrong place.
+            let lo2 = 0
+            while lo2 < dyn_lib_ptr {
+                w64(g_dyn_ext + 352 + dyn_lib_off_cnt * 8, dynstr_ptr - dynstr_off)
+                let ln = dyn_lib_len(lo2)
+                let k2 = 0
+                while k2 < ln { w8(elfb + dynstr_ptr + k2, mem_load8(dyn_libs + lo2 + k2)); k2 = k2 + 1 }
+                w8(elfb + dynstr_ptr + ln, 0)
+                dynstr_ptr = dynstr_ptr + ln + 1
+                lo2 = lo2 + ln + 1
+                dyn_lib_off_cnt = dyn_lib_off_cnt + 1
+            }
 
             // extern function names - filled by the per-symbol loop below
             w64(g_dyn_ext + 112, dynstr_off)
@@ -672,10 +704,19 @@ fn write_elf(outp) {
             dyn_ptr = dynamic_entry_off
             let dynamic_off_abs = dyn_ptr
             let dyn_idx = 0
-            // DT_NEEDED -> "libc.so.6" offset in .dynstr (offset 1 after empty first entry)
-            w64(elfb + dyn_ptr + dyn_idx * 16, DT_NEEDED)
-            w64(elfb + dyn_ptr + dyn_idx * 16 + 8, 1)
-            dyn_idx = dyn_idx + 1
+            // One DT_NEEDED per soname, in the order they were given. This was a
+            // single entry hardcoded to .dynstr offset 1, i.e. always
+            // "libc.so.6"; a --lib libcuda.so.1 binary recorded that offset but
+            // the loader would then look for libc, and never for the library the
+            // program actually calls into. The offsets were captured as the names
+            // were written (g_dyn_ext + 352).
+            let li = 0
+            while li < dyn_lib_cnt {
+                w64(elfb + dyn_ptr + dyn_idx * 16, DT_NEEDED)
+                w64(elfb + dyn_ptr + dyn_idx * 16 + 8, r64(g_dyn_ext + 352 + li * 8))
+                dyn_idx = dyn_idx + 1
+                li = li + 1
+            }
             // DT_PLTRELSZ
             w64(elfb + dyn_ptr + dyn_idx * 16, DT_PLTRELSZ)
             w64(elfb + dyn_ptr + dyn_idx * 16 + 8, rela_plt_size)
@@ -832,7 +873,17 @@ fn write_elf(outp) {
             // loop, so locals are fine for them; it is the values read across
             // the whole body of write_elf that did not survive.
             let dynsym_ptr = r64(g_dyn_ext + 96) + 24  // skip NULL symbol
-            let dynstr_fill_ptr = r64(g_dyn_ext + 112) + 11
+            // Start writing extern names where the sonames ended.
+            //
+            // This was r64(g_dyn_ext + 112) + 11 -- a hardcoded 11 for "empty +
+            // libc.so.6\0", the only string table that existed when it was
+            // written. With two or more DT_NEEDED entries 11 lands in the middle
+            // of the soname region, so the extern fill overwrote them: the
+            // loader was told to load "abs" (the first extern symbol) as a shared
+            // library and the program died at exec. g_dyn_ext + 104 already holds
+            // the cursor as it stood after the sonames were written, which is the
+            // only correct value.
+            let dynstr_fill_ptr = r64(g_dyn_ext + 104)
             let fi = 0
             while fi < fnc {
                 if r64(fn_extern + fi * 8) == 1 {

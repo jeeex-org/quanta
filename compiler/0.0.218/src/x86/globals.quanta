@@ -1218,6 +1218,99 @@ let emit_obj = 0
 // When emit_dynamic==0 (default), write_elf emits static PIE (ET_DYN, no
 // PT_INTERP, no dynamic section) — fully self-contained, no libc dependency.
 let emit_dynamic = 0
+
+// DT_NEEDED library list, for `--lib <soname>` (repeatable) alongside
+// --emit-dynamic.
+//
+// This exists because "libc.so.6" was hardcoded into three places in elf.quanta
+// (the .dynstr seed, its size, and the DT_NEEDED value), so --emit-dynamic could
+// only ever produce a binary that needs libc. That is enough to call puts and
+// nothing else: there is no way to depend on libcuda, libstdc++, libm, libssl or
+// any other shared object, which is the actual reason to want dynamic linking.
+// CUDA is the case that forces it -- cuInit, cuDeviceGet and the rest live in
+// libcuda.so.1, not libc.
+//
+// Layout: dyn_libs is a buffer of packed NUL-terminated sonames; dyn_lib_ptr is
+// the write cursor and dyn_lib_cnt the number collected (0 = none given). These
+// are globals rather than locals for the same reason as g_dyn_ext -- the flag
+// loop and the size phase are far apart and a local does not survive.
+// libc.so.6 is always appended as the first entry when emit_dynamic is on, so
+// --emit-dynamic alone keeps working exactly as it did.
+let dyn_libs = mmap(65536)
+let dyn_lib_ptr = 0
+let dyn_lib_cnt = 0
+
+// Append a NUL-terminated soname to the DT_NEEDED list.
+//
+// `s` may be either form, and they are NOT interchangeable:
+//   * a RAW C string from argv, where byte 0 is the first character; the value
+//     passed to --lib arrives this way.
+//   * a Quanta literal, which is [8:len][bytes] -- byte 0 is the low half of the
+//     LENGTH, so the characters start at s+8. Reading a literal at s+0 wrote the
+//     length out as the soname: DT_NEEDED named a library called "l" (len 5 -> 5,
+//     NUL) and the loader then failed to find it.
+// Callers pass `lit` = 1 for a literal and 0 for a raw C string.
+fn add_dyn_lib_c(s) {
+    if dyn_lib_ptr + 512 > 65536 { return 0 }
+    let n = 0
+    while mem_load8(s + n) != 0 && n < 511 { n = n + 1 }
+    let i = 0
+    while i < n {
+        mem_store8(dyn_libs + dyn_lib_ptr + i, mem_load8(s + i))
+        i = i + 1
+    }
+    mem_store8(dyn_libs + dyn_lib_ptr + n, 0)
+    dyn_lib_ptr = dyn_lib_ptr + n + 1
+    dyn_lib_cnt = dyn_lib_cnt + 1
+    return 1
+}
+
+fn add_dyn_lib(s) { return add_dyn_lib_c(s + 8) }
+
+// Append a soname given as a Quanta literal plus its known byte length, without
+// dereferencing the literal at the call site. The literal's characters live at
+// s+8, and reading them there was unreliable across a call boundary, so the
+// length comes from the caller and only the copy is done in the callee.
+fn add_dyn_lib_bytes(lit, n) {
+    if dyn_lib_ptr + 512 > 65536 { return 0 }
+    let i = 0
+    while i < n {
+        mem_store8(dyn_libs + dyn_lib_ptr + i, mem_load8(lit + 8 + i))
+        i = i + 1
+    }
+    mem_store8(dyn_libs + dyn_lib_ptr + n, 0)
+    dyn_lib_ptr = dyn_lib_ptr + n + 1
+    dyn_lib_cnt = dyn_lib_cnt + 1
+    return 1
+}
+
+// As add_dyn_lib_bytes, but measuring the name with len() instead of taking a
+// hand-counted length.
+//
+// The count was 10 for "libc.so.6", which is 9 characters, so the copy ran one
+// byte past the name. A length that is computed cannot be off by one.
+fn add_dyn_lib_lit(lit) { return add_dyn_lib_bytes(lit, len(lit)) }
+
+// Scratch for the seeded soname. The seed is the one name the compiler supplies
+// rather than the user, and passing it as a literal ARGUMENT turned out to
+// depend on the argument surviving the call: with one --lib the name that
+// reached .dynstr was "abs" (the program's first extern symbol) and with two it
+// was "libc.so.6" -- the register allocator reuses the slot differently at
+// different argument counts, which is the same long-lived-local class of bug
+// that g_dyn_ext exists to route around. So the call site copies the bytes into
+// a global and passes only that.
+let g_libc_soname = mmap(64)
+
+// Byte length of the soname at `off` within dyn_libs.
+fn dyn_lib_len(off) {
+    let n = 0
+    while mem_load8(dyn_libs + off + n) != 0 { n = n + 1 }
+    return n
+}
+
+// How many soname .dynstr offsets have been recorded this run. The offsets live
+// in g_dyn_ext + 352 upward, one per soname; DT_NEEDED reads them back there.
+let dyn_lib_off_cnt = 0
 // Dynamic-ELF scratch that must survive write_elf's long body.
 //
 // This compiler reuses bootstrap registers across a long block, and a `let` in
@@ -1241,7 +1334,8 @@ let emit_dynamic = 0
 //   +280 block file offset
 //   +304/.dynamic file offset  +312/.dynamic vaddr
 //   +320 dynamic_size  +328 got_size  +336 got_plt_size  +344 plt_size
-let g_dyn_ext = mmap(1024)
+//   +352.. .dynstr byte offset of each DT_NEEDED soname, one qword per library
+let g_dyn_ext = mmap(2048)
 // File offset and vaddr of the .dynamic entry table, computed once in write_elf's
 // size phase and read by BOTH the PT_DYNAMIC program header and the section
 // builder. They used to be derived separately and disagreed by 13 bytes.

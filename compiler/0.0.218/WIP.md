@@ -4,7 +4,91 @@ Created from 0.0.217 (STABLE). `VERSION` points here; this is the only tree
 whose `bin/x86/qc` may be modified.
 
 Gate: 15 GREEN / 0 RED. Caches: G5 7/7, G4 8/8, G4-transitive 8/8, G6 5/5.
-Self-hosting fixed point: `gen0 = gen1 = gen2 = gen3`.
+Self-hosting fixed point: `gen1 = gen2 = gen3 = 78c7a61b78b6`. (`gen0`, the
+previous compiler, is `64e8833b1668` and differs — correct, and it is the point:
+it means the `--lib` change really did alter codegen rather than being a no-op.)
+
+## `--lib <soname>` — depend on any shared library, not just libc
+
+`--emit-dynamic` used to hardcode `libc.so.6` in three places in `elf.quanta`: the
+`.dynstr` seed, its size, and the `DT_NEEDED` value. So a dynamic binary could
+only ever need libc — enough to call `puts` and nothing else. There was no way to
+depend on `libcuda.so.1`, `libm`, `libstdc++`, `libssl` or anything else, which is
+the actual reason to want dynamic linking at all.
+
+`--lib <soname>` is repeatable and additive. `libc.so.6` is seeded
+unconditionally so `--emit-dynamic` alone behaves exactly as before.
+
+```sh
+qc --emit-dynamic --lib libm.so.6 prog.quanta out
+```
+
+Verified:
+
+| case | result |
+|---|---|
+| `--emit-dynamic` alone | exit 42, `DT_NEEDED: libc.so.6` |
+| `--lib libm.so.6` | exit 42, `DT_NEEDED: libm.so.6, libc.so.6` |
+| two `--lib` | exit 42, three `DT_NEEDED` in order |
+| `sqrt`/`pow` with `--lib libm.so.6` | resolves; exact f64 bit patterns back |
+| `sqrt` with **no** `--lib` | loader reports `undefined symbol: sqrt` |
+
+The last two are the ones that matter: it resolves when the library is declared
+and correctly fails to when it is not, so `--lib` is doing real work rather than
+decorating the binary.
+
+### The bug that made it produce a library called "abs"
+
+The extern-name fill cursor was `r64(g_dyn_ext + 112) + 11` — a hardcoded 11 for
+"empty entry + `libc.so.6\0`", the only string table that existed when it was
+written. With two or more `DT_NEEDED` entries, 11 lands in the middle of the
+soname region, so the extern fill overwrote the sonames: `libm.so.6` was lost,
+`abs` (the program's first extern symbol) was recorded as a library to load, and
+the binary died at exec with
+
+```
+error while loading shared libraries: abs: cannot open shared object file
+```
+
+Fixed to read the cursor as it actually stands after the sonames are written
+(`g_dyn_ext + 104`).
+
+A second one, same family: each `DT_NEEDED`'s `d_un` was measured against
+`g_dyn_ext + 112`, which is written *below* the loop that reads it, so every value
+was a file offset near `0x117d` instead of a small `.dynstr` index. Measured
+against the local `dynstr_off` instead.
+
+### `extern "C"` still cannot be removed, and here is the measured reason
+
+Two facts, both verified rather than assumed:
+
+1. **`dlopen`/`dlsym` are libc functions, not syscalls.** There is no syscall
+   number for them, so `syscall()` cannot reach them. (An earlier note here
+   claimed `dlopen` worked natively on the strength of a `syscall(302, ...)`
+   returning a handle; 302 is not a syscall number and the value returned was
+   garbage. Corrected.)
+2. **Quanta has no indirect call.** `f(x)` where `f` is a runtime value is a
+   compile error — `call to undeclared function: f`. `closure_call` exists but
+   takes a `[codeptr, env]` tuple and does `mov rdx,[rax]` to load the target, so
+   handing it a bare `dlsym` address dereferences the callee's own first
+   instructions and segfaults.
+
+So native Quanta can *reach* a library but cannot *call into* one, and every
+external library — CUDA's 600+ entry points included — is out of reach natively.
+`extern "C"` is not a convenience layer; it is the only door out, and it costs a
+build-time declaration of every symbol touched.
+
+**The prerequisite is a first-class indirect call**, `f(args)` on a runtime
+value. That has a chicken-and-egg worth naming: the first thing you would call
+through it is `dlsym` itself. The IR is close — `IR_CLOSURE_CALL` already loads a
+code pointer and sets up SysV registers; what is missing is accepting a bare
+pointer rather than a tuple, plus some way to obtain that pointer without
+`extern`. Not started; scope undecided.
+
+Note that removing `extern "C"` would **not** remove the dynamic-linking codegen.
+Any binary that does `dlopen` still needs libc and `ld.so`, so both `write_elf`
+paths survive regardless. This is a decision about the source-language surface,
+not about collapsing two execution models.
 
 ## Native is the default; extern is optional interop
 

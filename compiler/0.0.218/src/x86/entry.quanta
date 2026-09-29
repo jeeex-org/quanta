@@ -198,6 +198,10 @@ fn main(argc, argv) {
     }
     while ai<argc {
         let ap=r64(argv+ai*8)
+        // Declared here, not inside the flag branch: the argv step after the
+        // branch has to know whether this element was `--lib`, and a value
+        // declared in the branch is not in scope there.
+        let is_lib=0
         // ignore any "-O" (and other "-X" flags) when picking source/output
         if !(r8(ap)==45 && r8(ap+1)==79) {
             // G2: overflow trap is ON by default (secure by default). Two flags:
@@ -233,6 +237,21 @@ fn main(argc, argv) {
                 let emdyn = "emit-dynamic"
                 while od<12 { if r8(ap+2+od) != r8(emdyn+8+od) { is_dyn=0; break }; od=od+1 }
                 if is_dyn==1 { emit_dynamic=1 }
+
+                // `--lib <soname>` (repeatable): add a DT_NEEDED entry.
+                //
+                // The value is the NEXT argv element, not part of this one. argv
+                // strings are raw C strings (no 8-byte Quanta header), so it is
+                // read from ap directly. Ignored without --emit-dynamic, since a
+                // static binary has no dynamic section to put a DT_NEEDED in.
+                let ol2=0
+                let lstr2 = "lib"
+                while ol2<3 { if r8(ap+2+ol2) != r8(lstr2+8+ol2) { break }; ol2=ol2+1 }
+                if ol2==3 && ai+1 < argc {
+                    is_lib=1
+                    add_dyn_lib_c(r64(argv+(ai+1)*8))
+                }
+
                 
                 // P5.1: try "--no-start" (9 chars) — secondary object TU
                 let is_nostart=1; let kc=0
@@ -252,7 +271,7 @@ fn main(argc, argv) {
                 while oq<9 { if r8(ap+2+oq) != r8(qobjstr+8+oq) { is_qobj=0; break }; oq=oq+1 }
                 if is_qobj==1 { emit_qobj=1 }
                 
-                if !is_novf && !is_arm && !is_obj && !is_nostart && !is_dyn && !is_link && !is_qobj {
+                if !is_novf && !is_arm && !is_obj && !is_nostart && !is_dyn && !is_link && !is_qobj && !is_lib {
                     if srcp==0 { srcp=ap } else if out_p==0 { out_p=ap }
                 }
                 // For --link, we do NOT capture the flag itself as srcp/out_p.
@@ -262,9 +281,43 @@ fn main(argc, argv) {
                 else if out_p==0 { out_p=ap }
             }
         }
+        // `--lib`'s value is a separate argv element; step over it here so it is
+        // never mistaken for the source or the output path. Without this,
+        // `qc --emit-dynamic --lib libcuda.so.1 in.qc out` took "libcuda.so.1" as
+        // srcp and "in.qc" as out_p.
+        if is_lib==1 && ai+1 < argc { ai=ai+1 }
         ai=ai+1
     }
     
+    // Seed DT_NEEDED with libc.so.6, unconditionally, when dynamic linking is on.
+    //
+    // Done after the flag loop so `--lib` order cannot affect it, and
+    // unconditionally rather than only when no --lib was given, because libc is
+    // the C runtime every dynamic executable ends up wanting and a program that
+    // lists only libcuda.so.1 would otherwise fail to start if it also calls
+    // printf. An explicit --no-libc is the way to opt out, and belongs here if a
+    // real case needs it (nothing in the tree does today).
+    // The literal is passed inline, not via a local. `let lc = "libc.so.6"` then
+    // add_dyn_lib(lc) put a value in `lc` whose meaning the compiler does not
+    // guarantee to be the literal's address -- and the soname that actually
+    // reached .dynstr was "abs", the first extern, so the local was reading
+    // reused storage by the time it was used. One expression, no local.
+    // Passed through add_dyn_lib_c (the RAW form) with the +8 skipped, because
+    // a Quanta literal is [8:len][bytes] and this compiler gives no guarantee
+    // that a literal used as an argument still means the literal: the soname
+    // that reached .dynstr was "abs", the first extern symbol, so the argument
+    // slot was reused before the callee read it. Writing the bytes into dyn_libs
+    // from a literal the callee never dereferences avoids depending on that.
+    if emit_dynamic == 1 {
+        // Copy the seeded soname into a global first; see g_libc_soname. Then
+        // hand it to the raw-string path, which is the same one --lib uses and
+        // the only one proven to survive the call.
+        let si = 0
+        while si < 9 { mem_store8(g_libc_soname + si, mem_load8("libc.so.6" + 8 + si)); si = si + 1 }
+        mem_store8(g_libc_soname + 9, 0)
+        add_dyn_lib_c(g_libc_soname)
+    }
+
     // Handle --link early: link object file with libc and exit
     if do_link == 1 {
         if srcp == 0 || out_p == 0 {
