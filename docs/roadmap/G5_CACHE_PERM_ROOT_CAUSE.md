@@ -133,6 +133,115 @@ the next useful move is to dump its frame slots at the call site
 (`x/200gx $rbp`) and see which slot holds the wild value, then map that offset
 back to a source local.
 
+### Follow-up: the frame dump identifies the shape of the bug
+
+Breaking at the faulting load itself and dumping the caller's frame gives the
+whole chain:
+
+```
+[caller_rbp+0x00] (array base) = 0x7ffe7986ca18      <- changes every run
+[caller_rbp-0x08] (index)      = 0x3
+rdi = base + 8                                    (i.e. base + index*8)
+```
+
+`x/2gx $base` on the base succeeds — it is a **readable, mapped** region, and the
+qwords stored there are stack-range values (`0x7ffe7986e5d0`, `0x7ffe7986e5fd`),
+not arena pointers.
+
+So the failure is not a wild pointer. It is this: a `[ptr + i*8]` array read where
+`ptr` legitimately points into the **relocated stack** region, the contents there
+are leftover stack words, and one of those words is loaded as a data pointer and
+dereferenced. The value read is stack garbage, which is exactly why it differs on
+every run while the crash is deterministic.
+
+`0x43d998` is `fn main` in `entry.quanta` (line 172) — the top-level driver, which
+inlines the reader's call sites. So a **vreg** (a compiler-allocated register
+slot) is being used as an array base without ever having been assigned a real
+value. The reader's own arrays are all correctly-sized arenas and are not the
+culprit; the uninitialised vreg is one the reader reads before assigning.
+
+Prime suspect, in `codegen.quanta` `ci_func()` on the cached path:
+
+```quanta
+let pbase_c = r64(fn_pbase + fi*8)
+...
+let pnm_c = r64(fn_pnames + pbase_c + ppi*16)   // pbase_c is NEVER bounds-checked
+```
+
+`ppi` is validated (`ppi >= 0 && ppi < 8`) but `pbase_c` is not. If `fn_pbase[fi]`
+is stale for a cached function, this indexes `fn_pnames` at an arbitrary offset.
+Note also that `pseen` is compared in the loop condition but never incremented in
+the visible code, so the loop runs to `ir_end` regardless.
+
+### Follow-up 2: the faulting function is a spill-slot bug in the register allocator
+
+Disassembling the faulting function again, with the stack dump alongside, settles
+the mechanism:
+
+```
+0x42719d:  and    $0xffffffc0,%eax        <- stack alignment mask: base = rsp & ~63
+0x4271a2:  mov    %rcx,-0x38(%rbp)
+0x4271aa:  mov    -0x40(%rbp),%rdi       <- loads a DISPLACEMENT as a value
+0x4271b1:  mov    (%rdi),%rax            <- FAULT: dereferences it as a POINTER
+```
+
+The array base is `rsp & ~63` — the compiler's own **aligned frame base**. And in
+`emitter.quanta`:
+
+```quanta
+let SPILL_BASE = 48
+fn spill_home(v) { return -(SPILL_BASE + (v + 1) * 8) }   // a NEGATIVE displacement
+```
+
+`spill_home()` returns a *displacement*, not an address. It is correct to use as
+the `disp32` of `mov reg, [rbp+disp]` (which is what `rbp(r,d)` emits). The faulting
+code instead **loads that displacement into a register and dereferences it as a
+pointer**. So a vreg that holds a `spill_home` displacement is reaching a call
+that expects a real pointer.
+
+This is a register-allocator / spill-slot bug on the cached path, not a
+cache-format bug. It explains why every cache-carrying build dies at the same
+place regardless of cache content, and why the faulting value is leftover stack
+content that differs every run.
+
+Corroborating detail: the call site at `0x43ef7e` in the caller is `call 0x427545`
+(the `mmap` emitter), and its result is stored to `-0x820(%rbp)`. Immediately after,
+`mov 0x41dc170e(%rip),%rcx` loads a global whose runtime value is `3`, and the
+sequence `mov %rdx,%rbx; add %rcx,%rbx; jno; ud2` is the overflow-trap idiom. The
+bad displacement is therefore flowing through the same spill machinery that stores
+`mmap` results — consistent with `spill_home` being applied to a value that is not
+a vreg slot.
+
+Next step: audit every use of `spill_home()` for one that feeds a value (rather
+than a `[rbp+disp]` memory operand). That is the specific defect to fix.
+
+### Follow-up 3: the spill-slot hypothesis is WRONG — audited and cleared
+
+All `spill_home()` uses were audited. `spill_home(v)` returns
+`-(SPILL_BASE + (v+1)*8)`, a negative displacement, correct as the `disp32` of an
+rbp-relative memory operand. Every call site uses it that way:
+
+- `emitter.quanta` allocator: `rbp(p, spill_home(vr))`, `wbp(spill_home(vr), pr)`
+  — memory operands.
+- `codegen.quanta:1493` `leabp(1, spill_home(cvr))` — `lea rcx,[rbp+disp]`, the
+  correct idiom for "address of a local".
+- `codegen.quanta:1527` `let hm=spill_home(av)` then `rbp(R_RDI, hm)` etc. — still
+  a memory operand.
+- `codegen.quanta:1836` `let off=spill_home(a0)` then a hand-emitted
+  `lea rd,[rbp+off]` — correct.
+
+So **no use dereferences a `spill_home` displacement as a pointer**, and the
+register allocator is not the culprit. That hypothesis is cleared.
+
+What the disassembly does establish, and what is worth keeping: the faulting
+function loads a value and dereferences it, and that value is
+`rsp & ~63` — the compiler's own aligned frame base — at the moment of the fault.
+Combined with the caller being `fn main` (which inlines the reader's call sites),
+this still points at a **vreg used as an array base before it is assigned**, but
+the specific mechanism is not yet identified. Resolving it needs the source
+statement, and the binary carries neither symbols nor section headers to map
+`0x4271b1` back to one.
+
 ## Note on stale artifacts
 
 Caches generated before fix 1 are mode `0111` and unreadable, and caches generated
