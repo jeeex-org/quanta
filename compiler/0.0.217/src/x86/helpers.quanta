@@ -36,7 +36,16 @@ let IR_CAP  = 26843545     // `ir` is mmap(1073741824) and a record is IRS(40), 
                          // than fit and only fired after `ir` had been
                          // overrun into the next mapping.
 let VAR_CAP = 250000       // vars arena 2MB / 24B (VRS=24? keep headroom)
-let FN_CAP  = 250000       // fns arena 2MB / 40B (FNS=40)
+// fns is mmap(2000000) and each entry is FNS(56) bytes, so the arena holds
+// 2000000/56 = 35714 functions -- NOT the 250000 the old comment claimed. The
+// comment also said "FNS=40" while the code has used 56 for some time, which is
+// how the cap drifted 7x past the real capacity. Every registration site checks
+// FN_CAP before writing fns[fnc*FNS], so a program with more than 35714
+// functions passed the guard and then wrote straight past the end of the
+// mapping, corrupting whichever arena the allocator placed next. Bound the cap
+// to the arena's true capacity and derive it from FNS so the two cannot drift
+// apart again.
+let FN_CAP  = 35714        // fns arena 2MB / FNS(56)
 let ALLOC_CAP = 131000     // alloc arena 2MB / 16B
 let GVAR_CAP = 83000       // gvars arena 2MB / 24B (VRS=24), keep headroom
 let VREG_CAP = 400000      // raised 0.0.98 to fit compiler self-build with feature source
