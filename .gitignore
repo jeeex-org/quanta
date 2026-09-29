@@ -8,21 +8,54 @@
 #   lib/        - standard library source
 
 # Everything else is internal/local and must NOT be pushed:
-#   systems/ agents/ bootstrap/ test_suites/ tools/ scripts/ bin/ src/
-#   .github/ .hyperresearch/ .claude/ scratch/ temp/ and all junk.
+#   systems/ agents/ bootstrap/ tools/ scripts/ bin/ src/
+#   .hyperresearch/ .claude/ scratch/ temp/ and all junk.
+#
+# test_suites/, tools/ and .github/ ARE pushed: the CI gate reads
+# test_suites/codes/, EXPECTED*.tsv and test_suites/scripts/, so they are
+# un-ignored explicitly below. Listing test_suites/ among the ignored names here
+# is what caused the original trap.
 
 /*
 
+# The `/*` catch-all above ignores every top-level entry, and gitignore will not
+# re-include a file whose PARENT directory is ignored. So `!/test_suites/...` rules
+# can rescue nothing: the directory itself stays excluded and every NEW file under
+# it is silently dropped. That is the trap this file fell into -- the existing gate
+# scripts are tracked (gitignore only applies to untracked files), so test_suites/
+# looked correct while 8,864 test sources and every new gate script vanished from
+# `git status` and from CI.
+#
+# Correct shape: un-ignore the DIRECTORY, then blanket-ignore its contents with
+# `test_suites/*`, then re-include only what CI actually reads. Inside a
+# re-included tree, later exclusions do win, so generated output stays out.
+!/test_suites/
+# Un-ignore the two directories CI reads. No blanket `test_suites/*` here: it
+# would also exclude the 18k test sources and the gate scripts, and gitignore
+# will not re-include anything inside a directory the rule already excluded.
+!/test_suites/codes/
+!/test_suites/scripts/
+!/test_suites/EXPECTED.tsv
+!/test_suites/EXPECTED_STDLIB.tsv
+!/test_suites/EXTERN_EXPECTED.tsv
+!/test_suites/numeric_harness.py
+# Generated output. LAST match wins, so these beat the re-includes above:
+# 89MB of compiled test binaries plus ~30 scratch *_probe.quanta files.
+test_suites/bin/
+test_suites/codes/*probe*.quanta
+
 # --- explicitly ALLOWED ---
+!/tools/
+!/.github/
 !.gitignore
 !README.md
 !QUANTA.png
 !/compiler/
 !/docs/
 !/lib/
-!/gap_specs.json
-#   test_suites/        # CI gate reads codes/, EXPECTED*.tsv, scripts/ — must not be ignored
-!/test_suites/**       # force-unignore ALL nested files (dir-negation alone misses new untracked files)
+!gap_specs.json
+# (test_suites/ contents are un-ignored in the block immediately above this one,
+#  together with the re-exclusions for bin/ and the scratch probes.)
 !/tools/              # CI needs fuzz + diff_test; same silent-miss trap as test_suites
 !/tools/**
 !/.github/            # CI workflows must be tracked
@@ -39,15 +72,24 @@ tools/**/*.bin
 # would surface in `git status` and get caught.)
 
 # --- internal / local-only (never pushed) ---
-systems/
-agents/
-bootstrap/
-tools/
-scripts/
-.hyperresearch/
-.claude/
-scratch/
-temp/
+# The un-anchored names below are intentional for the directories that have NO
+# explicit "!" re-inclusion above (systems, agents, bootstrap, scripts, and the
+# dot-dirs). A bare `scripts/` matches at ANY depth, so it also swallowed
+# test_suites/scripts/ -- and because a later rule beats an earlier negation,
+# every NEW CI gate script under test_suites/ was silently dropped while the
+# pre-existing ones survived only because they were added before this rule.
+# Anchor those to the repo root.
+#
+# tools/ is deliberately NOT listed here: it already has `!/tools/**` above
+# (CI needs fuzz + diff_test), and re-ignoring it here would beat that negation.
+/systems/
+/agents/
+/bootstrap/
+/scripts/
+/.hyperresearch/
+/.claude/
+/scratch/
+/temp/
 
 # --- CI gate inputs (under test_suites/, already un-ignored above) ---
 # test_suites/ as a whole is un-ignored; nothing else needed here.
@@ -58,6 +100,11 @@ temp/
 # Order matters: they must follow the !/compiler/ negation above.
 !compiler/**/bin/
 !compiler/**/src/
+
+# --- test_suites/ generated output ---
+# Already excluded alongside the re-includes above (test_suites/bin/ and the
+# scratch probes); the extra out/ and crashes/ patterns live here because they
+# only ever appear in tool output subtrees. LAST match wins, so these hold.
 
 # --- junk ---
 vgcore.*
