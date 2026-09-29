@@ -654,7 +654,20 @@ fn ci_func(fi, is_main) {
       // truncated the range and cost closure_capture its vreg_clo state.
       let mvmax2 = 0
       let mv2 = ir_beg
-      while mv2 < irc {
+      // Bound to THIS function's own slice. On the cache path `ir` is the module
+      // arena and `irc` is the whole module's record count, so irc walks every
+      // other cached function's records and takes the max vreg across all of
+      // them. The init loop below then clears type/str/big/clo tags for vregs
+      // that belong to a LATER function, and when that function is compiled its
+      // own tags are already wrong -- which is how a cached function calling
+      // two other cached functions returned a wrong value (chain(10) gave 12
+      // instead of 38) while every single- and two-function module was correct.
+      //
+      // ir_end is right for both paths here: on the source path a function's
+      // closure bodies are emitted past ir_end, but this block only runs when
+      // is_cache==1, and a cached function has no closure bodies of its own.
+      let mv2_end = ir_end
+      while mv2 < mv2_end {
         let rv2 = irres(mv2)
         if rv2 > mvmax2 { mvmax2 = rv2 }
         mv2 = mv2 + 1

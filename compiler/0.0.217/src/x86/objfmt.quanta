@@ -1003,7 +1003,19 @@ fn qobj_import(path) -> i64 {
       }
       w64(qir_mod + qir_mod_n*IRS + 16, a0v)
       w64(qir_mod + qir_mod_n*IRS + 24, r64(irb + so + 24))
-      w64(qir_mod + qir_mod_n*IRS + 32, r64(irb + so + 32))
+      let a2raw = r64(irb + so + 32)
+      // IR_CALL.a2 is the index of the call's ARGUMENT LIST within the buffer the
+      // writer built the record in, and codegen reads it as `irres(arg_start)`.
+      // The writer's index is meaningless here: the reader appends every module
+      // into one shared arena (qir_mod), so the same function starts at
+      // qir_mod_n, not at 0. Copying a2 verbatim made a cached call read some
+      // other function's IR records as its arguments, so a cached function whose
+      // body called another cached function computed the wrong value
+      // (chain(10) == 12 instead of 38) while every single- and two-function
+      // module -- whose calls land on in-range records by luck -- stayed correct.
+      // Rebase it onto this function's own slice in the module arena.
+      if op == 17 || op == 30 { a2raw = r64(fn_ir_start + slot*8) + a2raw }
+      w64(qir_mod + qir_mod_n*IRS + 32, a2raw)
       qir_mod_n = qir_mod_n + 1
       k2 = k2 + 1
     }

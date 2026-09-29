@@ -587,7 +587,16 @@ fn main(argc, argv) {
 
     // For each fn: parse body → IR, then compile IR → code, record offset
     let fi=0
+    // The while condition alone is not sufficient here. Measured: with fnc=3 the
+    // body was entered at fi=3, where fi<fnc is false, and the compiler then
+    // processed a non-existent function index and died. The cached branch calls
+    // ci_func(), which reinitialises the register allocator mid-loop, and the
+    // loop's own condition vreg does not survive that. Re-testing the bound
+    // explicitly inside the body restores it: the same test, evaluated where it
+    // is known to be evaluated.
     while fi<fnc {
+      if fi>=fnc { break }
+
     // P5.1: extern "C" fns have no body — skip compilation/codegen here;
     // their UNDEF symbol is emitted by p5_elf_obj and resolved at link time.
     // Also skip bare function declarations (no body, not extern "C") - they have fn_btok=0.
