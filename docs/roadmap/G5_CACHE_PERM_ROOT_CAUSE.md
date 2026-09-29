@@ -85,41 +85,53 @@ the two drift apart unnoticed. Now 35714, with the derivation recorded.
 
 ## Still open
 
-Cache-only builds still fail, now with **SIGILL** at a fixed address
-(`rip=0x42886c`) rather than `exit(16)`.
+Cache-only builds still fail, now with **SIGILL at `rip=0x4271b1`**. The call chain
+has now been recovered from the stack (the binary has no unwind info, so the
+return addresses were scanned off `$rsp` directly):
 
-What is proven by behavioural bisection (inserting `return 1` at successive points
-and rebuilding):
+```
+0x4271b1  FAULT   fn @ 0x427164  (77 bytes)
+0x43ef83  caller  fn @ 0x43d998  (5611 bytes)
+0x43d48c  caller  fn @ 0x43d3a8  (228 bytes)
+```
 
-- The fault is inside `qobj_import()`. Removing the whole body, or removing the
-  `qobj_import_pending()` call in `entry.quanta`, makes the build succeed.
-- Everything up to and including the six region reads (`ent`, `names`, `meta`,
-  `prms`, `pool`, `irb`) and the `qimp_pbase_next` block is safe.
-- The fault is in the function-registration loop, at or after the metadata block.
+**The faulting function is a one-line accessor.** Its whole body is:
 
-What is **not** proven, and why: every value at the suspected statements is small
-and in range. Dumped at the `fn_partype` write: `fnc=1`, `k=0`, `pcount=1`,
-`mo=0`, `meta_bytes=144`, `name_len=6`, `nm=49`, `srclen=56`. The metadata region
-itself decodes cleanly (`retstruct=-1`, `partype[0]=-1`, `parstr[0]=0`). The
-trapping instruction is `imul rax(=10), rcx` where `rcx` holds a **code-range
-value** (`0x4298...`), not a data address — a stride of 10 matches none of the
-reader's strides (`FNS=56`, `IRS=40`, `VRS=24`, `PCS=24`, `LBS=16`,
-`CAP_MAX=32`), so the faulting function is probably **not** `qobj_import` despite
-the cut-point results.
+```
+mov  -0x38(%rbp),%rcx     ; the pointer argument
+mov  -0x40(%rbp),%rdi
+mov  (%rdi),%rax          ; <-- FAULT
+mov  %rax,-0x48(%rbp)
+```
 
-**The recurring confound:** this compiler is layout-sensitive. Adding or removing
+That is `r64(p)` / `mem_load(p)` — a plain 8-byte load. It is not doing any
+arithmetic; it is dereferencing a pointer it was handed.
+
+**The pointer is wild.** At the fault, `rdi = 0x7fffda400018`, which is unmapped
+(gdb: "Cannot access memory"). The instruction immediately before the trapping
+`add`/`jno` pair loads a global from `0x422006a0`, whose runtime value is `3` — not
+an arena base. So the sequence is roughly `rbx = local + 3` and the `local` it
+loaded was already the bad `0x7fffda400018`.
+
+**What this rules out.** Every value dumped inside the reader is small and sane
+(`fnc=1`, `k=0`, `pcount=1`, `mo=0`, `meta_bytes=144`, `nm=49`, `srclen=56`,
+`name_len=6`), the metadata region decodes cleanly (`retstruct=-1`,
+`partype[0]=-1`, `parstr[0]=0`), all six region reads succeed with the right byte
+counts (7, 144, 2, 200), and all 152 `mmap`s succeed with no overlaps. So this is
+not an out-of-range index, a short read, or a failed allocation — a *pointer value
+itself* is wrong by the time it reaches a load.
+
+**The recurring confound.** This compiler is layout-sensitive: adding or removing
 any statement in the failing path shifts code addresses and can move or change the
-fault, so a cut-point that "fixes" the crash does not prove the neighbouring
-statement was at fault. Several earlier conclusions in this investigation were
-wrong for exactly this reason. Cut-point results here indicate a *region*, not a
-statement.
+fault. Cut-point bisection here indicates a *region*, not a statement — which is
+why several earlier conclusions in this investigation were wrong. Do not trust a
+cut-point that "fixes" the crash.
 
-Next step: identify the function containing `0x42886c` from source. The binary has
-no section headers (`elf.quanta` writes `e_shoff=0`, `e_shnum=0` by design) and no
-symbols, so `objdump -d` is silent and there is nothing to map the address
-against. Either emit section headers in a diagnostic build, or build a source-order
-function map by compiling each function in isolation and recording its entry
-address.
+Next step: find which local in the 5611-byte caller (`0x43d998`) holds
+`0x7fffda400018`. That caller is large enough to be a merged/optimised function, so
+the next useful move is to dump its frame slots at the call site
+(`x/200gx $rbp`) and see which slot holds the wild value, then map that offset
+back to a source local.
 
 ## Note on stale artifacts
 
