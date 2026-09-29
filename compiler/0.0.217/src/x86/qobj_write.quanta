@@ -1,31 +1,46 @@
 // Write functions + IR to .qobj with portable string format
 //
-// FORMAT v7 (see docs/QOBJ_ROADMAP.md):
-//   header   24B  magic, version=7, fn_count, ir_count, name_bytes, meta_bytes
+// FORMAT v8 (see docs/QOBJ_ROADMAP.md):
+//   header   32B  magic, version=8, fn_count, ir_count, name_bytes, meta_bytes,
+//                   pool_bytes, param_bytes
 //   entries  32B  x emitted_count  str_off, name_len, pcount, ir_count, meta_off, rsv*3
 //   names         name_bytes    NUL-terminated function names
-//   meta          meta_bytes    128B x emitted_count  (see below)
+//   meta          meta_bytes    144B x emitted_count  (see below)
 //   params        param_bytes   NUL-terminated param names, fn entry order
+//   pool          pool_bytes    NUL-terminated strings referenced by IR_CALL/IR_STR
 //   IR            ir_count*40B  IR records, fn entry order
 //
-// The v7 metadata record exists because codegen reads per-function tables that
+// The v8 metadata record exists because codegen reads per-function tables that
 // are NOT recoverable from IR alone. An imported function whose fn_partype /
 // fn_parbig / fn_retstruct / fn_retbig / fn_rettype* are zero will be emitted
 // with wrong vreg type tags and dereference a garbage frame slot at runtime.
 // fn_pnames is carried in the separate param blob (variable length).
 //
-//   meta record (96B):
-//    0  rettype_name_off (into `src`, 0 = none)
-//    8  rettype_len
-//   16  retstruct      0 = none
-//   20  retbig         0 = normal, 1 = : big
-//   24  partype[0..3]   first 4 param struct/trait type ids (-1 = none)
-//   ..  parbig[0..3]    per-param : big flags
-//   ..  parstr[0..3]    per-param "was a string literal at the call site" flags
-//   ..  genparams      count of generic type params
-//   ..  genparam_names offset/length pairs are carried in the param blob tail
+//   meta record (144B) -- every field is 8-byte aligned on purpose:
+//    0   rettype_name_off (into `src`, 0 = none)
+//    8   rettype_len
+//   16   retstruct      -1 = none
+//   24   retbig          0 = normal, 1 = : big
+//   32   partype[0..3]   first 4 param struct/trait type ids (-1 = none)
+//   64   parbig[0..3]    per-param : big flags
+//   96   parstr[0..3]    per-param "was a string literal at the call site" flags
+//  128   genparams       count of generic type parameters
+//   ..   genparam_names offset/length pairs are carried in the param blob tail
+//
+// v7 packed retstruct/retbig and the param arrays on 4-byte boundaries, so the
+// two w64 writes to adjacent fields OVERLAPPED: writing retbig clobbered the low
+// half of retstruct, and a -1 sentinel became 0x00000000FFFFFFFF = 4294967295,
+// which codegen read as a struct index. v8 puts every scalar and array on its
+// own 8-byte boundary, and the reader rejects any version != 8.
 fn qobj_write(path) -> i64 {
-  let fd = file_open(path, 577)
+  // 577 = O_WRONLY|O_CREAT|O_TRUNC. O_CREAT REQUIRES a third mode argument:
+  // without it the emitter leaves rdx holding whatever the previous syscall left
+  // there, so the kernel masked that garbage against the umask and created the
+  // cache unreadable (observed mode 0111). The compiler then could not re-open
+  // its own cache -- open() returned EACCES, the cache lookup treated it as
+  // absent, and every cache-only build died with imp_err -> exit(16). 493 = 0755,
+  // matching the ELF writer's own output-file mode.
+  let fd = file_open(path, 577, 493)
   if fd < 0 { return 0 }
 
   // ---- pass 1: sizes ----
@@ -146,7 +161,15 @@ fn qobj_write(path) -> i64 {
         w32(e + 28, 0)
         file_write(fd, e, 32)
         str_off = str_off + name_len + 1
-        meta_off = meta_off + 128
+        // Must match the record size actually written below (144B, and
+        // meta_bytes = emitted * 144). This advanced by 128 while 144 bytes were
+        // written, so every function after the first pointed 16 bytes BEFORE its
+        // real record -- landing in the previous function's partype/parbig/
+        // parstr arrays. The reader then loaded another function's metadata:
+        // garbage fn_retstruct/fn_retbig, which codegen turns into a bogus
+        // struct index and a bogus frame slot. A single-function module hid it
+        // completely, which is why every one-function test passed.
+        meta_off = meta_off + 144
       }
       i = i + 1
     }

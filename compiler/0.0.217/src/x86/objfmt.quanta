@@ -977,7 +977,16 @@ fn qobj_import(path) -> i64 {
       // written in exactly this walk order, so a single cursor suffices.
       if op == 17 || op == 23 {
         let L = 0
-        while L < 4096 && pool + pool_cur + L < pool + pool_bytes && r8(pool + pool_cur + L) != 0 { L = L + 1 }
+        // Bound the scan on OFFSETS, never on absolute pointers. `pool` is a
+        // kernel-chosen mmap address near 2^47, so `pool + pool_bytes` already
+        // sits high in the address space and `pool + pool_cur + L` pushes the
+        // sum past 2^63 for a large enough L. That signed overflow tripped the
+        // compiler's own `jno` overflow guard and killed it with SIGILL (ud2)
+        // partway through the first pool string -- which is why every cache
+        // carrying an IR_CALL/IR_STR record died, and why the failure looked
+        // layout-dependent: the exact L at which the sum wrapped depended on
+        // where the allocator placed the pool arena.
+        while L < 4096 && pool_cur + L < pool_bytes && r8(pool + pool_cur + L) != 0 { L = L + 1 }
         if L > 0 {
           // Appending into `src` must respect the buffer's cap: an unchecked
           // write past the end of the arena is a silent heap corruption that
