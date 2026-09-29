@@ -1,0 +1,127 @@
+// Minimal AES-GCM test — only imports what's needed
+// NIST SP 800-38D test vectors
+
+import std/crypto
+import std/aes_gcm
+
+fn main() {
+  // NIST AES-GCM test vector 1: empty plaintext, empty AAD
+  // Key: 00000000000000000000000000000000
+  // IV:  000000000000000000000000
+  // PT:  (empty)
+  // AAD: (empty)
+  // CT:  (empty)
+  // Tag: 530f8afbc74536b9a963b4f1c4cb738b
+  
+  let key = mem_alloc(2)
+  let i = 0
+  while i < 16 { mem_store8(key + i, 0); i = i + 1 }
+  
+  let iv = mem_alloc(2)
+  i = 0
+  while i < 12 { mem_store8(iv + i, 0); i = i + 1 }
+  
+  let aad = mem_alloc(1)
+  let aad_len = 0
+  let pt = mem_alloc(1)
+  let pt_len = 0
+  
+  let ct = mem_alloc(2)
+  let tag = mem_alloc(2)
+  
+  let enc_res = aes128_gcm_enc(key, iv, 12, aad, aad_len, pt, pt_len, ct, tag)
+  
+  // Verify tag: 530f8afbc74536b9a963b4f1c4cb738b
+  let expected_tag = [0x53,0x0f,0x8a,0xfb,0xc7,0x45,0x36,0xb9,0xa9,0x63,0xb4,0xf1,0xc4,0xcb,0x73,0x8b]
+  i = 0
+  while i < 16 {
+    if mem_load8(tag + i) != expected_tag[i] { exit(i + 100) }
+    i = i + 1
+  }
+  
+  // Test vector 2: 16-byte plaintext
+  // Key: 00000000000000000000000000000000
+  // IV:  000000000000000000000000
+  // PT:  00000000000000000000000000000000 (16 bytes zeros)
+  // AAD: (empty)
+  // CT:  0388dace60b6a392f328c2b971b2fe78
+  // Tag: ab6e47d42cec13bdf53a67b21257bddf
+  
+  let pt2 = mem_alloc(2)
+  i = 0
+  while i < 16 { mem_store8(pt2 + i, 0); i = i + 1 }
+  let pt_len2 = 16
+  let ct2 = mem_alloc(2)
+  let tag2 = mem_alloc(2)
+  
+  enc_res = aes128_gcm_enc(key, iv, 12, aad, aad_len, pt2, pt_len2, ct2, tag2)
+  
+  let expected_ct2 = [0x03,0x88,0xda,0xce,0x60,0xb6,0xa3,0x92,0xf3,0x28,0xc2,0xb9,0x71,0xb2,0xfe,0x78]
+  let expected_tag2 = [0xab,0x6e,0x47,0xd4,0x2c,0xec,0x13,0xbd,0xf5,0x3a,0x67,0xb2,0x12,0x57,0xbd,0xdf]
+  
+  i = 0
+  while i < 16 {
+    if mem_load8(ct2 + i) != expected_ct2[i] { exit(i + 200) }
+    if mem_load8(tag2 + i) != expected_tag2[i] { exit(i + 300) }
+    i = i + 1
+  }
+  
+  // Decrypt test vector 2
+  let pt3 = mem_alloc(2)
+  let dec_res = aes128_gcm_dec(key, iv, 12, aad, aad_len, ct2, pt_len2, tag2, pt3)
+  if dec_res != 0 { exit(400) }
+  
+  i = 0
+  while i < 16 {
+    if mem_load8(pt3 + i) != 0 { exit(i + 410) }
+    i = i + 1
+  }
+  
+  // Test vector 3: with AAD (16 bytes zeros)
+  // Key: 00000000000000000000000000000000
+  // IV:  000000000000000000000000
+  // PT:  00000000000000000000000000000000
+  // AAD: 00000000000000000000000000000000 (16 bytes)
+  // CT:  42831ec2217774244b7221b784d0d49c
+  // Tag: 4d5c2af327cd64a62cf35abd2ba6a7b6
+  
+  let aad2 = mem_alloc(2)
+  i = 0
+  while i < 16 { mem_store8(aad2 + i, 0); i = i + 1 }
+  let aad_len2 = 16
+  let ct3 = mem_alloc(2)
+  let tag3 = mem_alloc(2)
+  
+  enc_res = aes128_gcm_enc(key, iv, 12, aad2, aad_len2, pt2, pt_len2, ct3, tag3)
+  
+  let expected_ct3 = [0x42,0x83,0x1e,0xc2,0x21,0x77,0x74,0x24,0x4b,0x72,0x21,0xb7,0x84,0xd0,0xd4,0x9c]
+  let expected_tag3 = [0x4d,0x5c,0x2a,0xf3,0x27,0xcd,0x64,0xa6,0x2c,0xf3,0x5a,0xbd,0x2b,0xa6,0xa7,0xb6]
+  
+  i = 0
+  while i < 16 {
+    if mem_load8(ct3 + i) != expected_ct3[i] { exit(i + 500) }
+    if mem_load8(tag3 + i) != expected_tag3[i] { exit(i + 600) }
+    i = i + 1
+  }
+  
+  // Decrypt test vector 3
+  let pt4 = mem_alloc(2)
+  dec_res = aes128_gcm_dec(key, iv, 12, aad2, aad_len2, ct3, pt_len2, tag3, pt4)
+  if dec_res != 0 { exit(700) }
+  
+  i = 0
+  while i < 16 {
+    if mem_load8(pt4 + i) != 0 { exit(i + 710) }
+    i = i + 1
+  }
+  
+  // Auth failure: wrong tag
+  let wrong_tag = mem_alloc(2)
+  i = 0
+  while i < 16 { mem_store8(wrong_tag + i, 0xFF); i = i + 1 }
+  let pt5 = mem_alloc(2)
+  dec_res = aes128_gcm_dec(key, iv, 12, aad, aad_len, ct2, pt_len2, wrong_tag, pt5)
+  if dec_res != 1 { exit(800) }
+  
+  exit(0)
+}
