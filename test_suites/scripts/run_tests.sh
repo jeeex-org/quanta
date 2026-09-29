@@ -258,6 +258,26 @@ else
   echo "  SKIP: multi_tu_tests.sh missing"
 fi
 
+echo "########## QOBJ (module cache: write, read, cache-only consume) ##########"
+# G1/G3/G5. This stage is the only thing that exercises the .qobj format: a
+# module that imports two other modules is written as a cache, its sources are
+# deleted, and the cache is then consumed on its own. Single- and two-function
+# modules pass by luck -- a corrupt argument list still lands on in-range IR
+# records -- so the fixture deliberately uses three modules with cross-calls.
+#
+# It also asserts the cache file is READABLE, not merely present. A cache
+# written mode 0111 is treated as absent by every probe, which is how the
+# cache-only build was silently broken for a long time.
+QOBJ_RC=0
+if [ -f "$TEST_SUITES/scripts/qobj_gate.sh" ]; then
+  if ! QC="$QC" bash "$TEST_SUITES/scripts/qobj_gate.sh"; then
+    QOBJ_RC=1
+  fi
+else
+  echo "  FAIL: qobj_gate.sh missing"
+  QOBJ_RC=1
+fi
+
 # --- Stage 12: STATUS VERIFICATION (docs vs source consistency) --------------
 echo ""
 echo "########## STATUS VERIFICATION GATE ##########"
@@ -291,12 +311,20 @@ echo "  generics      : $([ $GENERICS_RC = 0 ] && echo GREEN || echo RED)  (nega
 echo "  stdlib        : $([ $STDLIB_RC = 0 ] && echo GREEN || echo RED)  (lib/std/* via import, EXPECTED_STDLIB.tsv)"
 echo "  multi-tu      : $([ $MTU_RC = 0 ] && echo GREEN || echo RED)  (cross-TU call + global, --emit-obj + gcc link)"
 echo "  verify-status : $([ $VERIFY_STATUS_RC = 0 ] && echo GREEN || echo RED)  (docs/status.json consistency)"
-# Block promotion on a real functional/security/perf/valgrind/fuzz/diff/stdlib/mtu/verify-status regression.
-# Security KNOWN issues are surfaced by the script but do not turn the gate red.
+echo "  qobj          : $([ $QOBJ_RC = 0 ] && echo GREEN || echo RED)  (module cache write/read/cache-only, G1+G3+G5)"
+# Block promotion on a real functional/security/perf/valgrind/fuzz/diff/stdlib/mtu/qobj/verify-status
+# regression. Security KNOWN issues are surfaced by the script but do not turn
+# the gate red.
+#
+# qobj is included because the .qobj module cache had NO coverage at all: the
+# 811-test functional gate never writes or consumes a cache, so it stayed green
+# while every cache-only build failed (unreadable cache mode, 128-vs-144
+# metadata stride, an unrebased IR_CALL argument list, and a cache written from
+# stale IR). qobj_gate.sh is the only stage that exercises the format.
 if [ $FUNCTIONAL_RC -ne 0 ] || [ $SECURITY_RC -ne 0 ] || [ $PERF_RC -ne 0 ] \
    || [ $VALGRIND_RC -ne 0 ] || [ $FUZZ_RC -ne 0 ] || [ $DIFF_RC -ne 0 ] \
    || [ $GENERICS_RC -ne 0 ] || [ $STDLIB_RC -ne 0 ] || [ $MTU_RC -ne 0 ] \
-   || [ $VERIFY_STATUS_RC -ne 0 ]; then
+   || [ $QOBJ_RC -ne 0 ] || [ $VERIFY_STATUS_RC -ne 0 ]; then
   exit 1
 fi
 exit 0
