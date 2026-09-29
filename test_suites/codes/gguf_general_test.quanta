@@ -1,0 +1,26 @@
+import std/fs
+import std/gguf
+
+fn main() {
+    let rc = gguf_load("/opt/ai/models/quanta/QUANTA-LFM2.5-2.6Bv1-Q4_K_M.gguf")
+    if rc != 0 { return 1 }
+    
+    // Check first tensor by index (don't rely on find_tensor string match)
+    let dtype = gguf_tensor_dtype(0)
+    let offset = gguf_tensor_offset(0)
+    let nelem = gguf_tensor_nelements(0)
+    
+    // token_embd.weight should be Q6_K (14), offset 0, 262144000 elements
+    if dtype != 14 { return 1 }
+    if offset != 0 { return 1 }
+    if nelem != 262144000 { return 1 }
+    
+    // Check second tensor (token_embd_norm.weight, f32, offset 215040000)
+    let dtype1 = gguf_tensor_dtype(1)
+    let offset1 = gguf_tensor_offset(1)
+    if dtype1 != 0 { return 1 }
+    if offset1 != 215040000 { return 1 }
+    
+    gguf_close()
+    return 0
+}
