@@ -621,7 +621,11 @@ fn imp_load(fd, depth) {     // read fd into depth buffer, dedup, recurse-expand
   w64(imp_seen + imp_seenc*8, imp_hash())
   imp_seenc = imp_seenc + 1
 
-  let qp0 = qobj_path_for(imp_full, src_strlen(imp_full))
+  // --emit-qobj builds a cache: imports come from source (see the note in
+  // expand_includes). Honouring an existing .qobj here would register the import
+  // as a cache function whose fn_ir_start is never written this run.
+  let qp0 = 0
+  if emit_qobj == 0 { qp0 = qobj_path_for(imp_full, src_strlen(imp_full)) }
   if qp0 != 0 {
     let probe0 = file_open(qp0, 0)
     if probe0 >= 0 {
@@ -1112,7 +1116,9 @@ fn expand_includes(buf, len, depth) {
                 w8(imp_full+k+m, 0)
               }
               // G3: stage this path's cache if present; import happens later.
-              let qp = qobj_path_for(imp_full, src_strlen(imp_full))
+              // --emit-qobj builds a cache: resolve imports from source only.
+              let qp = 0
+              if emit_qobj == 0 { qp = qobj_path_for(imp_full, src_strlen(imp_full)) }
               let cache_here = 0
               if qp != 0 {
                 let probe = file_open(qp, 0)
@@ -1145,7 +1151,9 @@ fn expand_includes(buf, len, depth) {
             // Stage a cache for this module across every candidate prefix. No
             // "already staged" guard: a program may import several modules, and
             // gating on the first one leaves the rest to be tokenized from source.
-            let staged_here = qobj_try_cache(buf+ns, nl)
+            // --emit-qobj builds a cache: resolve imports from source only.
+            let staged_here = 0
+            if emit_qobj == 0 { staged_here = qobj_try_cache(buf+ns, nl) }
             if staged_here == 0 {
               let fd = imp_try(buf+ns, nl, 0, 0)
               if fd<0 { fd = imp_try(buf+ns, nl, imp_std_pfx, 4) }
@@ -1155,7 +1163,29 @@ fn expand_includes(buf, len, depth) {
               // complete, self-contained artifact, so it must be consumable even
               // when the .quanta is absent -- checking the source first makes the
               // cache dead code in exactly the case it exists to serve.
-              if qobj_try_cache(buf+ns, nl) == 1 { if fd>=0 { file_close(fd) } }
+              //
+              // --emit-qobj is the exception: that run is BUILDING a module cache,
+              // so it must compile this module's imports from SOURCE.
+              //
+              // Resolving an import from an existing .qobj registers it as a
+              // cache function, which takes the cached compile path in
+              // entry.quanta: ci_func() runs but sfn() never does, so
+              // fn_ir_start[i] is never written for this run while
+              // fn_ir_count[i] still holds a live value from that earlier
+              // import. qobj_write then serialises each function from
+              // qir[fn_ir_start[i]] with that count, pairing a stale start with
+              // a live count -- so the emitted cache gave an imported
+              // arithmetic helper the importer's body, IR_CALL records included.
+              // Measured: a module importing two modules produced a cache whose
+              // `inc` contained agg's IR_CALLs, and consuming it built a binary
+              // that segfaulted.
+              //
+              // The import is still resolved and textually inlined below, so
+              // every function in the module is compiled from source and
+              // recorded -- which is what makes the cache self-contained.
+              let take_cache = 0
+              if emit_qobj == 0 { take_cache = qobj_try_cache(buf+ns, nl) }
+              if take_cache == 1 { if fd>=0 { file_close(fd) } }
               else if fd>=0 { imp_load(fd, depth) }
               else { imp_err=1 }
             }
