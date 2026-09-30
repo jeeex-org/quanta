@@ -270,7 +270,6 @@ let fn_parfn = mmap(2000000)
 // bit patterns. Float LOCALS worked (their tag comes from the fconst that
 // produced them) which is exactly why the bug survived: `let a: f64 = 10.0;
 // a / 2.0` was fine while `fn f(a: f64) -> f64 { a / 2.0 }` crashed.
-let fn_parflt = mmap(2000000)
 // Per-fn flag: fn_retflt[fi*8] = 1 when the function is declared `-> f64`.
 //
 // A float return came back intact in rax (IR_RET is a plain register move), but
@@ -279,16 +278,28 @@ let fn_parflt = mmap(2000000)
 // then `printi(f(1.0))` printed 0, and `f(1.0) == 0.1` was false because 1.0's
 // bit pattern read as a huge integer. It only showed up across a call -- a local
 // `let x: f64 = 1.0;` kept its tag from the fconst that produced it.
-// Per-fn PARAMETER flag: fn_parflt[(fi*200 + z)*8] = 1 when parameter z is
-// declared `: f64`. Same shape and indexing as fn_parstr/fn_parbig, which are
-// written from the same metadata record in objfmt.quanta. Needed because nothing
-// else tags an inbound float: fn_retflt covers only the return value, fconst
-// only literals, i2f only conversions. Untagged, a parameter made every float
-// operation on it take the integer path -- `fn half(x: f64) -> f64 { return
-// x / 2.0; }` then `half(10.0) == 5.0` was false because `x / 2.0` divided raw
-// bit patterns.
-let fn_parflt = mmap(2000000)
 let fn_retflt = mmap(2000000)
+
+// Per-fn flag: fn_retstr[fi*8] = 1 when the function is declared `-> string`.
+// A returned string comes back as the same [len][bytes] pointer, but the CALLER's
+// result vreg carried no vreg_is_str tag. `file_open` decides whether to skip the
+// 8-byte length header by reading that tag, so a computed path handed straight
+// back from a function was opened from its LENGTH field instead of its bytes and
+// open() returned -2. Same class of bug as fn_retflt: the value survives the
+// call, the tag does not.
+let fn_retstr = mmap(2000000)
+
+// Per-fn PARAMETER flag: fn_parflt[(fi*200 + z)*8] = 1 when parameter z is
+// declared `: f64`. Same shape and indexing as fn_parstr/fn_parbig, written from
+// the same metadata record in objfmt.quanta, and serialised into the cache as a
+// bitmask at meta offset 136 (qobj format v11).
+//
+// Needed because nothing else tags an inbound float: fn_retflt covers only the
+// return value, fconst only literals, i2f only conversions. Untagged, a
+// parameter made every float operation on it take the integer path --
+// `fn half(x: f64) -> f64 { return x / 2.0; }` then `half(10.0) == 5.0` was
+// false, because `x / 2.0` divided raw bit patterns.
+let fn_parflt = mmap(2000000)
 let fn_parbig = mmap(2000000)
 // 0.0.166: per-fn-param string flag. fn_parstr[(fi*200 + z)*8] = 1 when the
 // caller passes a string literal for this param, so entry.quanta tags the

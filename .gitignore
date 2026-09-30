@@ -116,6 +116,35 @@ tools/**/*.bin
 /scratch/
 /temp/
 
+# 0.0.220: the `/*` catch-all above would drop these. Both are meant to be
+# versioned:
+#   config/  -- the single place a path lives. Losing it means every script
+#               reverts to its own hardcoded copy, which is the problem the
+#               config exists to remove.
+#   scripts/rag_*.py + rag_config.py -- the RAG tooling that reads the config.
+#               The rest of scripts/ stays ignored; it is scratch and build
+#               tooling, not part of the contract.
+# `/*` ignores config/ as a directory, and gitignore will not re-include a file
+# whose PARENT is excluded. The negation must therefore be on the DIRECTORY, not
+# on its contents -- same trap as test_suites/ above. Un-ignore the directory,
+# then ignore everything in it except rag.conf, so a stray scratch file dropped
+# there does not get committed.
+!/config/
+/config/*
+!/config/rag.conf
+!/scripts/
+/scripts/*
+!/scripts/rag_config.py
+!/scripts/build_rag.py
+!/scripts/build_rag_sqlite.py
+!/scripts/fast_rag.py
+!/scripts/rag_cli.py
+!/scripts/rag_helper.py
+!/scripts/rag_server.py
+!/scripts/test_rag.py
+!/scripts/test_rag_pipeline.py
+!/scripts/rag_embed_file.py
+
 # --- CI gate inputs (under test_suites/, already un-ignored above) ---
 # test_suites/ as a whole is un-ignored; nothing else needed here.
 

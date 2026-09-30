@@ -308,6 +308,23 @@ fn sfn(i,nm,nl,bt,co,pc,ret_nm,ret_nl) {
             w64(fn_retflt + i*8, 1)
         }
     }
+    // `-> string` / `-> str` tags the caller's result vreg as a string. See
+    // globals.quanta for why: file_open keys off vreg_is_str to decide whether to
+    // skip the 8-byte length header, so an untagged result was opened from its
+    // length field and every call returning a path failed with -2.
+    w64(fn_retstr + i*8, 0)
+    if ret_nm != 0 && (ret_nl == 6 || ret_nl == 3) {
+        let m1 = r8(src+ret_nm)
+        if ret_nl == 6 {
+            if m1=='s' && r8(src+ret_nm+1)=='t' && r8(src+ret_nm+2)=='r' && r8(src+ret_nm+3)=='i' && r8(src+ret_nm+4)=='n' && r8(src+ret_nm+5)=='g' {
+                w64(fn_retstr + i*8, 1)
+            }
+        } else {
+            if m1=='s' && r8(src+ret_nm+1)=='t' && r8(src+ret_nm+2)=='r' {
+                w64(fn_retstr + i*8, 1)
+            }
+        }
+    }
     // IR slice tracking. The compile loop calls sfn() twice per function:
     // once BEFORE parse_block() with co==0 (record where the IR starts) and
     // once AFTER ci_func() with co==cstart (record the record count). Without

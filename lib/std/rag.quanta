@@ -11,19 +11,34 @@
 
 import std/str
 import std/io
+import std/config
 
 // Query embedding via Python helper
 fn rag_embed(query) -> str {
     // Write query to temp file (handles special chars safely)
-    file_write("/tmp/rag_query.txt", query)
-    let cmd = "python3 /opt/tali/quanta/scripts/rag_embed_file.py /tmp/rag_query.txt"
+    let qf = config::rag_query_file()
+    file_write(qf, query)
+    // Interpreter and script both come from config/rag.conf. Neither path is
+    // written here, so relocating either needs no edit to this file.
+    let py = config::embed_python()
+    let sc = config::cfg_str("embed", "script", "")
+    if len(py) == 0 || len(sc) == 0 {
+        // embed.python / embed.script are unset in the config. Say so plainly
+        // rather than running a `python3` that cannot load sentence-transformers.
+        return "[error: embed.python / embed.script not set in config/rag.conf]"
+    }
+    let cmd = str(str(py, " "), str(sc, str(" ", qf)))
     return exec(cmd)
 }
 
 // Search for similar chunks using sqlite3 + sqlite-vec
 fn rag_search(embedding_hex, top_k) -> str {
     // Use sqlite3 with vec0 extension
-    let cmd = "sqlite3 /opt/tali/ti/ai/rag/vectors.db \""
+    // Path from config/rag.conf, not from this file.
+    let db = config::rag_db()
+    let cmd = "sqlite3 "
+    cmd = cmd = cmd + db
+    cmd = cmd = cmd + " \""
     cmd = cmd = cmd + "SELECT source, type, chunk_index, content "
     cmd = cmd = cmd + "FROM chunks "
     cmd = cmd = cmd + "WHERE embedding IS NOT NULL "
@@ -59,8 +74,8 @@ fn rag_query(query, model) {
     // Default to e2b
     if str_len(model) == 0 { model = "e2b" }
     
-    let port = "1235"
-    if model == "e4b" { port = "1236" }
+    // Port from [models] in the config, by name.
+    let port = config::model_port(model)
     
     print("Quanta RAG Query: " + query)
     print("Model: " + str_upper(model))
@@ -72,7 +87,7 @@ fn rag_query(query, model) {
     
     // Step 2: Search
     print("[2/4] Searching knowledge base...")
-    let results = rag_search(emb_hex, 5)
+    let results = rag_search(emb_hex, config::rag_default_top_k())
     
     // Step 3: Parse and build prompt
     print("[3/4] Building context...")
