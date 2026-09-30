@@ -167,7 +167,7 @@ fn qobj_write(path, src_path) -> i64 {
   // ---- header ----
   let hdr = mmap(80)
   w32(hdr, 0x514F424A)   // "QOBJ"
-  w32(hdr + 4, 9)         // version (9: adds the G4 source fingerprint)
+  w32(hdr + 4, 10)        // version (10: adds the dependency fingerprint list)
   w32(hdr + 8, fn_count)
   w32(hdr + 12, total_ir_records)
   w32(hdr + 16, total_name_bytes)
@@ -182,7 +182,13 @@ fn qobj_write(path, src_path) -> i64 {
   let fp = qobj_file_fingerprint(src_path)
   w32(hdr + 32, fp & 4294967295)
   w32(hdr + 36, (fp >> 32) & 4294967295)
-  file_write(fd, hdr, 40)
+  // G4 transitive: dep_count/dep_bytes describe the dependency region appended
+  // after every other region. v10 is mandatory, not cosmetic -- a v9 cache has
+  // no dependency list, so its transitive validity cannot be established, and
+  // accepting one is exactly the staleness this version exists to catch.
+  w32(hdr + 40, imp_srcpc)
+  w32(hdr + 44, imp_srcpc * QOBJ_DEP_REC)
+  file_write(fd, hdr, 48)
 
   if fn_count > 0 {
     // ---- entries ----
@@ -354,6 +360,26 @@ fn qobj_write(path, src_path) -> i64 {
         }
       }
       i = i + 1
+    }
+  }
+
+  // ---- G4 dependency region (appended last) ----
+  if imp_srcpc > 0 {
+    let dbuf = mmap(8192)
+    let dj = 0
+    while dj < imp_srcpc {
+      let sp = imp_srcpaths + dj*4096
+      let sl = 0
+      while sl < 4095 && r8(sp+sl) != 0 { sl = sl + 1 }
+      w32(dbuf, sl)
+      let dk = 0
+      while dk < sl { w8(dbuf+4+dk, r8(sp+dk)); dk = dk+1 }
+      w8(dbuf+4+sl, 0)
+      let dfp = qobj_file_fingerprint(sp)
+      w32(dbuf + 4 + QOBJ_DEP_PATH, dfp & 4294967295)
+      w32(dbuf + 4 + QOBJ_DEP_PATH + 4, (dfp >> 32) & 4294967295)
+      let wn = file_write(fd, dbuf, QOBJ_DEP_REC)
+      dj = dj + 1
     }
   }
 

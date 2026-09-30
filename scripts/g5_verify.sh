@@ -19,9 +19,14 @@ f,expect=sys.argv[1],sys.argv[2]
 d=open(f,'rb').read()
 m,v,nf,irn,nb,mb,pb,prb=struct.unpack_from('<8I',d,0)
 if m!=0x514F424A: print("BADMAGIC"); raise SystemExit
-no=32+nf*32; names=d[no:no+nb]
+# Header size grew with the format: 32 (v8), 40 (v9, own fingerprint),
+# 48 (v10, + dependency list). Derive it from the version rather than assuming,
+# or every region after the header is read at the wrong offset.
+hs={8:32,9:40,10:48}.get(v)
+if hs is None: print("BADVER:%d"%v); raise SystemExit
+no=hs+nf*32; names=d[no:no+nb]
 o=no+nb+mb+prb+pb; irb=d[o:o+irn*40]
-ents=[struct.unpack_from('<5I',d,32+i*32) for i in range(nf)]
+ents=[struct.unpack_from('<5I',d,hs+i*32) for i in range(nf)]
 s=0; bad=[]
 for i,(so,nl,pc,firn,mo) in enumerate(ents):
     nm=names[so:so+nl].decode()

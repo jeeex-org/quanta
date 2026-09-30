@@ -129,6 +129,21 @@ let imp_std_pfx = mmap(8)
 let imp_ext_pfx = mmap(8)
 let imp_lib_pfx = mmap(8)   // F8/0.0.30: 'lib/' search root for capability modules
 let imp_seen = mmap(8192); let imp_seenc = 0   // dedup: hashes of resolved paths
+// G4 transitive: resolved SOURCE path of every module consumed by this compile,
+// in inclusion order. The cache records these so a consumer can re-fingerprint
+// every dependency, not just the module itself -- otherwise a cache stays valid
+// after an imported module changes.
+// G4: fixed-size dependency record: [4 len][path, NUL-padded][4 fp lo][4 fp hi].
+// Defined here, not in qobj_write, because objfmt.quanta is included first and
+// both the reader and the writer need them.
+const QOBJ_DEP_PATH = 4096
+// On-disk size of ONE dependency record: 4 (path length) + path + NUL padding
+// to QOBJ_DEP_PATH + 8 (64-bit fingerprint). The path field is fixed-width so
+// the region is locatable from the file length -- every earlier region is
+// variable-length, so the file end is the only anchor the reader has.
+const QOBJ_DEP_REC = 4 + 4096 + 8
+let imp_srcpaths = mmap(1048576)
+let imp_srcpc = 0
 let imp_err = 0
 // Tokens: 40 bytes each [type,value,line,col,len]
 let toks = mmap(320000000); let tokc = 0; let tokp = 0

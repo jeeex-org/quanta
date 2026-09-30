@@ -90,20 +90,24 @@ else echo "  FAIL G5 cache-only NOT deterministic ($h)"; FAIL=$((FAIL+1)); fi
 # produced the old answer would satisfy the weaker test. Deliberately folded in
 # here rather than made a 15th gate stage -- it is the same fixture and the same
 # cache, and a separate stage would be a second place to forget to look.
-G4V=$REPO/scripts/g4_verify.sh
-if [ -f "$G4V" ]; then
-  if QC="$QC" bash "$G4V" > "$W/g4.log" 2>&1; then
-    echo "  PASS G4 stale-cache detection ($(grep -o 'G4: [0-9]*/[0-9]*' "$W/g4.log" | tail -1))"
-    PASS=$((PASS+1))
+# Both G4 harnesses: own-source staleness, and the transitive case where an
+# IMPORTED module changes while the cached module's own bytes do not.
+for g4v in g4_verify g4_transitive; do
+  G4V=$REPO/scripts/$g4v.sh
+  if [ -f "$G4V" ]; then
+    if QC="$QC" bash "$G4V" > "$W/$g4v.log" 2>&1; then
+      echo "  PASS G4 $g4v ($(grep -oE 'G4: [0-9]+/[0-9]+|G4TRANS: [0-9]+/[0-9]+' "$W/$g4v.log" | tail -1))"
+      PASS=$((PASS+1))
+    else
+      echo "  FAIL G4 $g4v:"
+      grep FAIL "$W/$g4v.log" | sed 's/^/    /'
+      FAIL=$((FAIL+1))
+    fi
   else
-    echo "  FAIL G4 stale-cache detection:"
-    grep FAIL "$W/g4.log" | sed 's/^/    /'
+    echo "  FAIL $g4v.sh missing at $G4V"
     FAIL=$((FAIL+1))
   fi
-else
-  echo "  FAIL g4_verify.sh missing at $G4V"
-  FAIL=$((FAIL+1))
-fi
+done
 
 echo "  QOBJ: $PASS/$((PASS+FAIL)) GREEN"
 [ $FAIL -gt 0 ] && exit 1

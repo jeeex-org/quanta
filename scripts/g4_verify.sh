@@ -27,7 +27,7 @@ printf 'import std/agg\nfn main() {\n  return agg(5)\n}\n' > main.quanta
 
 for m in inc dbl agg; do $Q --emit-qobj lib/std/$m.quanta lib/std/$m.qobj >/dev/null 2>&1; done
 chk "3 caches written" 3 "$(ls lib/std/*.qobj 2>/dev/null | wc -l)"
-chk "cache is v9" 9 "$(python3 -c "
+chk "cache is v10" 10 "$(python3 -c "
 import struct;d=open('lib/std/agg.qobj','rb').read();print(struct.unpack_from('<i',d,4)[0])")"
 chk "cache has a fingerprint" 1 "$(python3 -c "
 import struct;d=open('lib/std/agg.qobj','rb').read()
@@ -58,16 +58,19 @@ rm -f co; $Q main.quanta co >/dev/null 2>&1
 chk "cache-only still works" 113 "$(rc ./co)"
 for m in inc dbl agg; do mv bk/$m.quanta lib/std/ 2>/dev/null; done
 
-# --- a v8 cache must be rejected, not silently reused ---
+# --- an older cache must be rejected, not silently reused ---
+# v8 has no fingerprint and v9 has only its own; neither can establish that an
+# IMPORTED module is unchanged, so v10 rejects both. A downgraded cache must not
+# be trusted.
 printf 'fn inc(x) {\n  return x + 1\n}\n'  > lib/std/inc.quanta
 $Q --emit-qobj lib/std/inc.quanta lib/std/inc.qobj >/dev/null 2>&1
 python3 -c "
 import struct
 p='lib/std/inc.qobj'; d=bytearray(open(p,'rb').read())
-struct.pack_into('<i',d,4,8)   # claim v8
+struct.pack_into('<i',d,4,8)   # downgrade to v8
 open(p,'wb').write(d)"
 rm -f v8; $Q main.quanta v8 >/dev/null 2>&1
-chk "v8 cache rejected, source used" 113 "$(rc ./v8)"
+chk "downgraded cache rejected, source used" 113 "$(rc ./v8)"
 
 echo "  G4: $PASS/$((PASS+FAIL))"
 [ $FAIL -gt 0 ] && exit 1
