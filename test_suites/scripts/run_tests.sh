@@ -190,6 +190,35 @@ if [ "$FLOATOP_FAIL" -eq 0 ]; then FLOATOP_RC=0; else FLOATOP_RC=1; FUNCTIONAL_R
 echo ""
 echo "########## FLOAT BUILTINS (known-failing, non-gating) ##########"
 FBT_FAIL=0
+# --- Stage 1.6b: FLOAT RETURN TYPING (gating) ---------------------------------
+# float_builtin_test.quanta covers the arithmetic; this covers the TYPE. A call to
+# a function declared `-> f64` must produce a float-tagged vreg, or an enclosing
+# builtin takes the integer path on its bit patterns.
+echo ""
+echo "########## FLOAT RETURN TYPING (gating) ##########"
+FRT_FAIL=0
+FRT_SRC="$TEST_SUITES/codes/float_return_test.quanta"
+if [ ! -f "$FRT_SRC" ]; then
+  echo "  FAIL float_return_test $FRT_SRC missing"
+  FRT_FAIL=1
+else
+  FRT_BIN="$TEST_SUITES/bin/float_return_test"
+  if ! $QC "$FRT_SRC" "$FRT_BIN" 2>/tmp/frt_stderr.txt; then
+    echo "  FAIL (compile) float_return_test  $(cat /tmp/frt_stderr.txt)"
+    FRT_FAIL=1
+  else
+    "$FRT_BIN" >/dev/null 2>&1
+    frt_rc=$?
+    if [ "$frt_rc" -ne 42 ]; then
+      echo "  FAIL (run) float_return_test: expected exit 42, got $frt_rc (case $frt_rc is the first failing one)"
+      FRT_FAIL=1
+    else
+      echo "  PASS float returns: -> f64 tags the caller's operand vreg"
+    fi
+  fi
+fi
+if [ "$FRT_FAIL" -eq 0 ]; then FRT_RC=0; else FRT_RC=1; FUNCTIONAL_RC=1; fi
+
 FBT_SRC="$TEST_SUITES/codes/float_builtin_test.quanta"
 if [ ! -f "$FBT_SRC" ]; then
   echo "  FAIL float_builtin_test $FBT_SRC missing"
@@ -455,6 +484,7 @@ echo "  functional     : $([ $FUNCTIONAL_RC = 0 ] && echo GREEN || echo RED)"
 echo "  native        : $([ $NATIVE_RC = 0 ] && echo GREEN || echo RED)  (no extern, no libc -- the default path)"
 echo "  float-oper   : $([ $FLOATOP_RC = 0 ] && echo GREEN || echo RED)  (f64 + - * / , params, returns, comparisons)"
 echo "  float-builtin: $([ $FBT_RC = 0 ] && echo GREEN || echo RED)  (fadd/fsub/fmul/fdiv result store + vfloat tag; fixed 0.0.220)"
+echo "  float-return: $([ $FRT_RC = 0 ] && echo GREEN || echo RED)  (a call to a -> f64 function tags its result; fixed 0.0.220)"
 echo "  extern-c      : $([ $EXTERN_RC = 0 ] && echo GREEN || echo RED)  (object-mode + gcc libc link)"
 echo "  extern-ld     : $([ $EXTERN_LD_RC = 0 ] && echo GREEN || echo RED)  (object-mode + ld, GCC-FREE 0.0.122)"
 echo "  security      : $([ $SECURITY_RC = 0 ] && echo GREEN || echo RED)  (KNOWN bugs reported by script, not blocking)"

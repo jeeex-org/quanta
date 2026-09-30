@@ -269,9 +269,53 @@ fn scanfns() {
                     }
                     j=j+1
                 }
-                // ret_type_name/len intentionally NOT captured (return-type checking
-                // deferred — see STATE.md F3 note). Pass 0 so sfn records "inferred".
+                // 0.0.220: capture the declared RETURN TYPE.
+                //
+                // This was hard-coded to 0 "return-type checking deferred (STATE.md
+                // F3)", which made sfn() record fn_retflt=0 for EVERY function. Both
+                // of codegen's reads of fn_retflt had therefore always seen 0, and
+                // the interprocedural float tag never fired: a call to a function
+                // declared `-> f64` produced an untagged vreg, so an enclosing float
+                // builtin such as `fadd(gg(), 1.0)` -- or ai_add()'s
+                // `fadd(f64_read(..), f64_read(..))` -- fed raw bit patterns to
+                // cvtsi2sd and returned garbage.
+                //
+                // Only the f64 case is interpreted, which is all sfn() reads (it
+                // matches exactly "f64", len 3). Other return types are still
+                // recorded as untyped, so return-type CHECKING remains deferred --
+                // this captures the name, it does not start validating signatures.
+                //
+                // The signature scan left `j` just past the parameter list, so the
+                // return type is the '->' immediately after it. TT_OP with value 62
+                // is '>' (matching the generic-parameter scan above), so '->' is
+                // TT_OP 45 followed by TT_OP 62.
                 let ret_type_name = 0; let ret_type_len = 0
+                // Scan forward from kstart (the token after '(') for the '-> TYPE'
+                // that follows the parameter list. Independent of where the signature
+                // scan above left `k`, which is position-sensitive and hard to reason
+                // about after the fact.
+                let rj = kstart
+                let rlim = tokc
+                if rj + 400 < rlim { rlim = rj + 400 }   // bounded: a signature is not 400 tokens
+                while rj + 1 < rlim {
+                    // stop at the body: everything after '{' or ';' is not a signature
+                    if tokt(rj)==TT_PNCT && (tokv(rj)==123 || tokv(rj)==59) { break }
+                    // '->' is lexed as ONE multichar operator token: ismop() matches
+                    // `b1==45&&b2==62` and the token stores mopv(p) = c1*256 + c2, so
+                    // its TT_OP value is 45*256+62 == 11582. It is NOT 45, and NOT
+                    // two tokens (45 then 62) -- both of those were tried first and
+                    // neither matched, which is why the return type read as absent
+                    // and fn_retflt stayed 0 for every function.
+                    if tokt(rj)==TT_OP && tokv(rj)==11582 {
+                        let rt = rj + 1
+                        if rt < tokc && (tokt(rt)==TT_ID || tokt(rt)==TT_KEY) {
+                            ret_type_name = tokv(rt)
+                            ret_type_len = tokln(rt)
+                        }
+                        break
+                    }
+                    rj = rj + 1
+                }
                 // Same-scope duplicate function name: if already registered in this
                 // scope (same parent), it's a duplicate FROM AN IMPORT (source was
                 // inlined). First-wins: skip re-registering instead of erroring.

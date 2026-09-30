@@ -1,0 +1,69 @@
+// Interprocedural float typing: a call to a function declared `-> f64` returns a
+// float, and the tag must survive into whatever consumes it.
+//
+// Before 0.0.220 funcscan.quanta passed the return type to sfn() as a hard-coded
+// 0 ("return-type checking deferred, STATE.md F3"), so sfn() recorded
+// fn_retflt=0 for EVERY function. Both of codegen's reads of fn_retflt therefore
+// always saw 0 and the tag never fired:
+//
+//     fn gg() -> f64 { return 2.0 }
+//     fadd(gg(), 1.0)        // operands untagged -> cvtsi2sd on the bit patterns
+//     gg() != 2.0            // integer rcmp over two bit patterns
+//
+// The `->` token was the last piece: lexer.quanta merges '-' and '>' into ONE
+// multichar operator via mopv(p) = c1*256 + c2, so the token's TT_OP value is
+// 45*256+62 == 11582 -- not 45, and not two tokens. Both of those were tried and
+// neither matched.
+//
+// Only the f64 case is interpreted (that is all sfn() reads), so return-type
+// CHECKING is still deferred; this captures the name without validating it.
+//
+// Build:  qc float_return_test.quanta out
+// Run:    out ; echo $?   -- expect 42
+
+// Return a literal.
+fn lit() -> f64 {
+    return 2.0;
+}
+
+// Return an f64 parameter: the value is tagged on the way in, so this only
+// exercises the return path.
+fn pass(a: f64) -> f64 {
+    return a;
+}
+
+// Return a converted integer.
+fn conv(x: i64) -> f64 {
+    return i2f(x);
+}
+
+// A -> f64 function used inside a float builtin call.
+fn main() -> i64 {
+    // 1. as a direct operand of a builtin
+    if fadd(lit(), 1.0) != 3.0 { return 1 }
+    if fmul(conv(3), 2.0) != 6.0 { return 2 }
+
+    // 2. through a parameter
+    if pass(4.0) != 4.0 { return 3 }
+
+    // 3. stored to a local, then compared -- the tag must survive the IR_MOV
+    let v = lit()
+    if v != 2.0 { return 4 }
+    if v == 2.0 { } else { return 5 }
+
+    // 4. ordering comparisons go through comisd, not rcmp
+    if !(v < 3.0) { return 6 }
+    if !(v > 1.0) { return 7 }
+    if !(v <= 2.0) { return 8 }
+    if !(v >= 2.0) { return 9 }
+
+    // 5. a -> i64 function must NOT be tagged: f2i(fadd(g(), 1)) == 4 needs the
+    //    integer path, and tagging it would make the comparison a float compare.
+    let g: i64 = 3
+    if f2i(fadd(g, 1)) != 4 { return 10 }
+
+    // 6. a function with no declared return type stays untyped
+    if 1 + 1 != 2 { return 11 }
+
+    return 42
+}
