@@ -219,6 +219,38 @@ else
 fi
 if [ "$FRT_FAIL" -eq 0 ]; then FRT_RC=0; else FRT_RC=1; FUNCTIONAL_RC=1; fi
 
+# --- Stage 1.6c: FLOAT OPERAND PATH (gating) ---------------------------------
+# float_operand_path_test.quanta exercises the INTEGER operand path of
+# fadd/fsub/fmul/fdiv, which emits cvtsi2sd. Those sites carried a stray 66
+# (packed-SSE prefix) between the mandatory F2 and the REX byte -- F2 66 48 0F 2A
+# is not a decodable cvtsi2sd -- and arg1's sites put F2 after the REX. Eleven
+# sites in emitter.quanta. The test discriminates: exit 0 with the fix, exit 1
+# against 0.0.219's broken encoding.
+echo ""
+echo "########## FLOAT OPERAND PATH (gating) ##########"
+FOP_FAIL=0
+FOP_SRC="$TEST_SUITES/codes/float_operand_path_test.quanta"
+if [ ! -f "$FOP_SRC" ]; then
+  echo "  FAIL float_operand_path_test $FOP_SRC missing"
+  FOP_FAIL=1
+else
+  FOP_BIN="$TEST_SUITES/bin/float_operand_path_test"
+  if ! $QC "$FOP_SRC" "$FOP_BIN" 2>/tmp/fop_stderr.txt; then
+    echo "  FAIL (compile) float_operand_path_test  $(cat /tmp/fop_stderr.txt)"
+    FOP_FAIL=1
+  else
+    "$FOP_BIN" >/dev/null 2>&1
+    fop_rc=$?
+    if [ "$fop_rc" -ne 0 ]; then
+      echo "  FAIL (run) float_operand_path_test: expected exit 0, got $fop_rc (case $fop_rc is the first failing one)"
+      FOP_FAIL=1
+    else
+      echo "  PASS float operands: cvtsi2sd encoding correct on both arg slots"
+    fi
+  fi
+fi
+if [ "$FOP_FAIL" -eq 0 ]; then FOP_RC=0; else FOP_RC=1; FUNCTIONAL_RC=1; fi
+
 FBT_SRC="$TEST_SUITES/codes/float_builtin_test.quanta"
 if [ ! -f "$FBT_SRC" ]; then
   echo "  FAIL float_builtin_test $FBT_SRC missing"
@@ -485,6 +517,7 @@ echo "  native        : $([ $NATIVE_RC = 0 ] && echo GREEN || echo RED)  (no ext
 echo "  float-oper   : $([ $FLOATOP_RC = 0 ] && echo GREEN || echo RED)  (f64 + - * / , params, returns, comparisons)"
 echo "  float-builtin: $([ $FBT_RC = 0 ] && echo GREEN || echo RED)  (fadd/fsub/fmul/fdiv result store + vfloat tag; fixed 0.0.220)"
 echo "  float-return: $([ $FRT_RC = 0 ] && echo GREEN || echo RED)  (a call to a -> f64 function tags its result; fixed 0.0.220)"
+echo "  float-operpath: $([ $FOP_RC = 0 ] && echo GREEN || echo RED)  (cvtsi2sd operand encoding on the int path; fixed 0.0.220)"
 echo "  extern-c      : $([ $EXTERN_RC = 0 ] && echo GREEN || echo RED)  (object-mode + gcc libc link)"
 echo "  extern-ld     : $([ $EXTERN_LD_RC = 0 ] && echo GREEN || echo RED)  (object-mode + ld, GCC-FREE 0.0.122)"
 echo "  security      : $([ $SECURITY_RC = 0 ] && echo GREEN || echo RED)  (KNOWN bugs reported by script, not blocking)"
