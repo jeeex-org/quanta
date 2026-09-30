@@ -18,8 +18,9 @@ Quanta can only self-improve when its core subsystems are in place. These are th
 | Quanta emitter | Compiler + AST + printer | `compiler` + `std/ast` + `std/fmt_ir` | ✅ verified |
 | Test generator | Test harness + EXPECTED.tsv | `std/testing` + `test/` | ✅ verified |
 | Merge automation | Git integration + CI | `std/git` + `std/ci` | ✅ verified |
+| **System integration (blocked)** | Process/thread/futex/pty/stack/raii/mem/clock | `std/process` + `std/thread` + `std/futex` + `std/pty` + `std/stack_trace` + `std/raii` + `std/mem` + `std/clock` | ❌ **MISSING (8 modules)** |
 
-**All 6 core prerequisites ✅ verified** — the 11 stdlib modules exist and are non-trivial.
+**All 6 core prerequisites ✅ verified** — the 11 stdlib modules exist and are non-trivial. **System integration blocked** — 8 system modules (process/thread/futex/pty/stack/raii/mem/clock) missing; needed for self-hosting SI pipeline.
 
 ---
 
@@ -64,9 +65,10 @@ Fixed critical bug where string literals lost `vreg_is_str` tag when passed as f
 | Crypto/TLS/QUIC/HTTP/H3/Net | 6 | 0 | 0 |
 | Strings/Vec/Map | 3 | 0 | 0 |
 | Math/Linalg/Big/Quantum/Trig | 5 | 0 | 0 |
-| System (Process/Thread/Futex/PTY/Stack/Raii/Mem/Clock) | 8 | 0 | 0 |
+| **AI/ML (Tensor/Transformers/GGUF/SIMD/Tokenizer)** | 6 | 0 | 0 |
+| System (Process/Thread/Futex/PTY/Stack/Raii/Mem/Clock) | 0 | 0 | 8 |
 | I/O/Regex/JSON | 2 | 1 (json) | 0 |
-| **TOTAL** | **32** | **1** | **0** |
+| **TOTAL** | **30** | **1** | **8** |
 
 ### Phase 2 SI Modules
 
@@ -82,7 +84,7 @@ Fixed critical bug where string literals lost `vreg_is_str` tag when passed as f
 
 | Feature | Status | In Domain Files? |
 |---|---|---|
-| `ai_llm` (RoPE/RMSNorm/SwiGLU/GQA, KV cache, FlashAttn, BF16, quantization, distributed training, tokenizers) | ❌ todo → 0.163–0.172 core | ❌ LLM is 🔲 planned in programming_language |
+| `ai_llm` (RoPE/RMSNorm/SwiGLU/GQA, KV cache, FlashAttn, BF16, quantization, distributed training, tokenizers) | ⚠️ partial (core: ai_core, gguf, simd, tokenizer) | ✅ Core NN ops, Transformers, GQA, KV Cache, Quantization, Tokenization done |
 | `chain` (blockchain: UTXO/account/MPT, consensus, VMs, crypto, P2P, storage, standards) | ❌ todo → 0.170–0.182 core | ❌ mostly 🔲 planned in programming_language |
 | `quantum` (QFT/Grover/Shor/VQE/QAOA, error correction, PQC migration, QKD) | ❌ todo → 0.180–0.182 core | ❌ quantum.md exists, mostly 🔲 |
 | `math_full` (Linear Algebra, Numerical Analysis, Statistics, Signal Processing, Computational Geometry, Graph Algorithms, Number Theory, Symbolic Math, Special Functions, Interval Computing, Financial Math) | ❌ todo → 0.187–0.197 core | ❌ mathematics.md has ✅ for some, 🔲 for rest |
@@ -132,13 +134,23 @@ These are pure Quanta libraries needed to replicate Flint/Soup functionality wit
 
 ---
 
-## Domains (from `status.json` → `domains/*.md`)
+## OS / Bare-Metal (from `OS_ROADMAP.md` → `status.json`)
+
+See `OS_ROADMAP.md` for full Phase 1 (Bare-Metal Backend, Inline Assembly) and Phase 2 (Memory Management, Scheduler, Drivers) details. Target: Quanta gains capability to write and boot its own kernel.
+
+---
+
+## .qobj Module System (from `QOBJ_PLAN.md` / `QOBJ_ROADMAP.md` → `status.json`)
+
+**Phase 1 (DONE):** `.qobj` read/write via `qobj.quanta`, `--emit-qobj` flag, `imp_load()` checks `.qobj` first.
+**Phase 2 (TODO):** Symbol table separation — track owned vs imported symbols, write only owned to `.qobj`, load only owned on import.
+**Phase 3 (TODO):** Separate IR generation per module, emit `.o` with relocations, linker resolves cross-module refs.
 
 Quanta's domain roadmaps cover every industry, academic discipline, and general topic. Each domain file lists modules with status: ✅ done or 🔲 planned. Counts from `status.json`:
 
 | Domain | Modules | Done | Planned | Source |
 |---|---|---|---|---|
-| [programming_language](domains/programming_language.md) | 400 | 30 | 370 | quanta.md:86 |
+| [programming_language](domains/programming_language.md) | 400 | 59 | 341 | quanta.md:86 |
 | [mathematics](domains/mathematics.md) | 54 | 4 | 50 | quanta.md:87 |
 | [physics](domains/physics.md) | 65 | 0 | 65 | quanta.md:88 |
 | [chemistry](domains/chemistry.md) | 68 | 0 | 68 | quanta.md:89 |

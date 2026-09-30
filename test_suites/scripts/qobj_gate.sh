@@ -92,6 +92,23 @@ else echo "  FAIL G5 cache-only NOT deterministic ($h)"; FAIL=$((FAIL+1)); fi
 # cache, and a separate stage would be a second place to forget to look.
 # Both G4 harnesses: own-source staleness, and the transitive case where an
 # IMPORTED module changes while the cached module's own bytes do not.
+# G6: the compiler caches itself and builds from that cache with every source
+# deleted. The longest case in the gate (~13s), and the only one that runs the
+# cache format against the real 327-function compiler rather than a fixture.
+if [ -f "$REPO/scripts/g6_selfcache.sh" ]; then
+  if QC="$QC" bash "$REPO/scripts/g6_selfcache.sh" > "$W/g6.log" 2>&1; then
+    echo "  PASS G6 compiler self-compiles from cache ($(grep -o 'G6: [0-9]*/[0-9]*' "$W/g6.log" | tail -1))"
+    PASS=$((PASS+1))
+  else
+    echo "  FAIL G6 compiler self-compiles from cache:"
+    grep FAIL "$W/g6.log" | sed 's/^/    /'
+    FAIL=$((FAIL+1))
+  fi
+else
+  echo "  FAIL g6_selfcache.sh missing"
+  FAIL=$((FAIL+1))
+fi
+
 for g4v in g4_verify g4_transitive; do
   G4V=$REPO/scripts/$g4v.sh
   if [ -f "$G4V" ]; then

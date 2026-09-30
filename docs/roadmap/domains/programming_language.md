@@ -237,7 +237,7 @@
 
 | Category | Module | Status | Version | Stdlib | Notes |
 |----------|--------|--------|---------|--------|-------|
-| CPU | SIMD | 🔲 planned | — | — | Vector instructions |
+| CPU | SIMD | ✅ done | 0.168 | `simd.quanta` | Vector instructions |
 | CPU | Multi-core | 🔲 planned | — | — | Parallelism |
 | CPU | Assembly | ✅ done | 0.0.162 | `asm` builtin | Inline asm |
 | GPU | CUDA | 🔲 planned | — | — | NVIDIA GPU |
@@ -306,16 +306,16 @@
 | ML | Unsupervised | 🔲 planned | — | — | Clustering |
 | ML | Semi-Supervised | 🔲 planned | — | — | Mixed data |
 | ML | Self-Supervised | 🔲 planned | — | — | Pre-training |
-| DL | Neural Networks | ✅ done | 0.148 | `ai.quanta` | Core NN ops |
-| DL | CNN | ✅ done | 0.148 | `ai.quanta` | Convolutional |
+| DL | Neural Networks | ✅ done | 0.148 | `ai.quanta` + `ai_core.quanta` | Core NN ops |
+| DL | CNN | ✅ done | 0.148 | `ai.quanta` + `ai_core.quanta` | Convolutional |
 | DL | RNN | 🔲 planned | — | — | Recurrent |
 | DL | LSTM | 🔲 planned | — | — | Long short-term |
 | DL | GRU | 🔲 planned | — | — | Gated recurrent |
-| DL | Transformers | ✅ done | 0.148 | `ai.quanta` | Attention-based |
-| DL | Attention | ✅ done | 0.148 | `ai.quanta` | Self-attention |
-| DL | Multi-Head Attn | ✅ done | 0.148 | `ai.quanta` | Multi-head |
-| DL | GQA | 🔲 planned | — | — | Grouped query |
-| DL | KV Cache | 🔲 planned | — | — | Key-value cache |
+| DL | Transformers | ✅ done | 0.148 | `ai.quanta` + `ai_core.quanta` | Attention-based |
+| DL | Attention | ✅ done | 0.148 | `ai_core.quanta` | Self-attention |
+| DL | Multi-Head Attn | ✅ done | 0.148 | `ai_core.quanta` | Multi-head |
+| DL | GQA | ✅ done | 0.168 | `ai_core.quanta` | Grouped query |
+| DL | KV Cache | ✅ done | 0.168 | `ai_core.quanta` | Key-value cache |
 | DL | FlashAttention | 🔲 planned | — | — | Efficient attn |
 | DL | GANs | 🔲 planned | — | — | Adversarial |
 | DL | Diffusion | 🔲 planned | — | — | Generative |
@@ -327,9 +327,9 @@
 | DL | Embedding | ✅ done | 0.148 | `ai.quanta` | Lookup table |
 | DL | Loss | ✅ done | 0.148 | `ai.quanta` | MSE/CrossEntropy |
 | DL | Optimizer | ✅ done | 0.148 | `ai.quanta` | SGD/Adam |
-| DL | Quantization | ✅ done | 0.148 | `ai.quanta` | INT8/dynamic |
-| DL | Inference | ✅ done | 0.148 | `ai.quanta` | Runtime engine |
-| NLP | Tokenization | 🔲 planned | — | — | BPE/WordPiece |
+| DL | Quantization | ✅ done | 0.148 | `ai_core.quanta` + `gguf.quanta` | INT8/dynamic |
+| DL | Inference | ✅ done | 0.148 | `ai_core.quanta` + `gguf.quanta` | Runtime engine |
+| NLP | Tokenization | ✅ done | 0.168 | `sp_tokenizer.quanta` | BPE/WordPiece |
 | NLP | Embeddings | 🔲 planned | — | — | Word vectors |
 | NLP | Seq2Seq | 🔲 planned | — | — | Translation |
 | NLP | Language Model | 🔲 planned | — | — | Text generation |
@@ -386,7 +386,7 @@
 | HPC | MPI | 🔲 planned | — | — | Message passing |
 | HPC | OpenMP | 🔲 planned | — | — | Shared memory |
 | HPC | CUDA | 🔲 planned | — | — | GPU compute |
-| HPC | SIMD | 🔲 planned | — | — | Vectorization |
+| HPC | SIMD | ✅ done | 0.168 | `simd.quanta` | Vectorization |
 | HPC | Cluster | 🔲 planned | — | — | Distributed |
 | Signal | FFT | 🔲 planned | — | — | Fourier transform |
 | Signal | Filter | 🔲 planned | — | — | FIR/IIR |
