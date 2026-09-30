@@ -1,4 +1,14 @@
+// The f64 builtins return an f64 BIT PATTERN, not a truncated integer.
+//
+// This used to be `let a = fadd(3, 4); return a` expecting 7. fadd(3.0, 4.0)
+// returned the integer 7 because the handler stored the result with
+// 66 48 0F 2C (CVTTSD2SI) instead of 66 48 0F 7E (MOVQ). Fixed in 0.0.220, so
+// the integer has to be asked for explicitly with f2i().
+//
+// Kept as the smallest end-to-end check of that contract: one builtin call, one
+// conversion, one return.
+
 fn main() {
-    let a = fadd(3, 4)
+    let a = f2i(fadd(i2f(3), i2f(4)))    // 3.0 + 4.0 = 7.0  -> 7
     return a
 }

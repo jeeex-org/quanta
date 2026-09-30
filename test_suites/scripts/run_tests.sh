@@ -189,24 +189,29 @@ if [ "$FLOATOP_FAIL" -eq 0 ]; then FLOATOP_RC=0; else FLOATOP_RC=1; FUNCTIONAL_R
 # tracking item and the quanta-float-builtins-defect skill for the analysis.
 echo ""
 echo "########## FLOAT BUILTINS (known-failing, non-gating) ##########"
+FBT_FAIL=0
 FBT_SRC="$TEST_SUITES/codes/float_builtin_test.quanta"
 if [ ! -f "$FBT_SRC" ]; then
   echo "  FAIL float_builtin_test $FBT_SRC missing"
+  FBT_FAIL=1
 else
   FBT_BIN="$TEST_SUITES/bin/float_builtin_test"
   if ! $QC "$FBT_SRC" "$FBT_BIN" 2>/tmp/fbt_stderr.txt; then
     echo "  FAIL (compile) float_builtin_test  $(cat /tmp/fbt_stderr.txt)"
+    FBT_FAIL=1
   else
     "$FBT_BIN" >/dev/null 2>&1
     fbt_rc=$?
     if [ "$fbt_rc" -eq 42 ]; then
       echo "  PASS float builtins: fadd/fsub/fmul/fdiv correct (exit 42)"
+      FBT_FAIL=0
     else
-      echo "  KNOWN-FAIL float builtins: exit $fbt_rc (want 42) -- case $fbt_rc is the first failing op"
-      echo "           fadd/fsub/fmul/fdiv return an argument, not the result. Non-gating."
+      echo "  FAIL (run) float_builtin_test: expected exit 42, got $fbt_rc (case $fbt_rc is the first failing op)"
+      FBT_FAIL=1
     fi
   fi
 fi
+if [ "$FBT_FAIL" -eq 0 ]; then FBT_RC=0; else FBT_RC=1; FUNCTIONAL_RC=1; fi
 
 # --- Stage 1.5: EXTERN "C" FFI (object mode + gcc link) ----------------------
 # The main loop above compiles in EXEC mode only ($QC -O), where extern "C"
@@ -449,7 +454,7 @@ echo "=== GATE SUMMARY ==="
 echo "  functional     : $([ $FUNCTIONAL_RC = 0 ] && echo GREEN || echo RED)"
 echo "  native        : $([ $NATIVE_RC = 0 ] && echo GREEN || echo RED)  (no extern, no libc -- the default path)"
 echo "  float-oper   : $([ $FLOATOP_RC = 0 ] && echo GREEN || echo RED)  (f64 + - * / , params, returns, comparisons)"
-echo "  float-builtin: GREEN (tracker armed)  (fadd/fsub/fmul/fdiv currently return an argument; KNOWN-FAIL by design, non-gating -- see stage 1.6)"
+echo "  float-builtin: $([ $FBT_RC = 0 ] && echo GREEN || echo RED)  (fadd/fsub/fmul/fdiv result store + vfloat tag; fixed 0.0.220)"
 echo "  extern-c      : $([ $EXTERN_RC = 0 ] && echo GREEN || echo RED)  (object-mode + gcc libc link)"
 echo "  extern-ld     : $([ $EXTERN_LD_RC = 0 ] && echo GREEN || echo RED)  (object-mode + ld, GCC-FREE 0.0.122)"
 echo "  security      : $([ $SECURITY_RC = 0 ] && echo GREEN || echo RED)  (KNOWN bugs reported by script, not blocking)"

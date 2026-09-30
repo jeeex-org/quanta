@@ -746,8 +746,33 @@ fn emit_bltn(nmi,nl,ii) {
         let fa1=0; if ira1(ii)>=2 { if is_float_vr(irres(ira2(ii)+1))==1 { fa1=1 } }
         if fa0==1 { eb(102); eb(72); eb(15); eb(110); eb(199) } else { eb(242); eb(102); eb(72); eb(15); eb(42); eb(199) }
         if fa1==1 { eb(102); eb(72); eb(15); eb(110); eb(206) } else { eb(72); eb(242); eb(15); eb(42); eb(206) }
+        // FIX 0.0.220 -- two defects, both in the RESULT STORE.
+        //
+        // 1. Wrong opcode. The store was `eb(102); eb(72); eb(15); eb(44); eb(192)`,
+        //    i.e. 66 48 0F 2C -- that is CVTTSD2SI, which converts the double to a
+        //    64-bit INTEGER and returns it. fadd(3.0, 4.0) therefore returned the
+        //    integer 7 instead of 7.0's bit pattern, and ai_core.quanta
+        //    (ai_add, ai_matmul, ai_dequant8) stores the result through f64_write,
+        //    so every value it computed was wrong before it was written.
+        //    The MOVQ store is 66 48 0F 7E (opcode 0x7E). Note the operand roles
+        //    SWAP between the two forms: 0F 6E is reg=xmm/rm=GP (load),
+        //    0F 7E is reg=xmm/rm=GP as well but ModRM C0 means rax <- xmm0.
+        //    codegen.quanta's operator path already used fst_x(), which emits 0x7E;
+        //    these four handlers had 0x2C hard-coded.
+        // 2. Result never tagged. Without w8(vfloat+res, 1) a chained builtin
+        //    (fadd -> fmul) fed the bit pattern to cvtsi2sd as an integer.
+        //
+        // The operand loads, the missing flush_all() concern, and the spill_home()
+        // reads were CORRECT all along. Proven by disassembling this handler and
+        // the operator path within the SAME compiled function: both emit
+        // movq xmm0, reg / movq xmm1, reg / addsd, and differed only in the store
+        // opcode. Do not "fix" the load or marshalling side -- attempts to do so
+        // made it worse.
         eb(242); eb(15); eb(88); eb(193)          // addsd xmm0, xmm1
-        eb(242); eb(72); eb(15); eb(44); eb(192)  // cvttsd2si rax, xmm0
+        eb(102); eb(72); eb(15); eb(126); eb(192)  // MOVQ rax, xmm0 -- the f64 bit pattern, NOT a truncation        // Tag the result so a chained float builtin (fadd -> fmul) reads the bit
+        // pattern as a double rather than feeding it to cvtsi2sd as an integer.
+        w8(vfloat+irres(ii), 1)
+
         return 1
     }
     if nl==4&&r8(nm)=='f'&&r8(nm+1)=='s'&&r8(nm+2)=='u'&&r8(nm+3)=='b' {  // fsub(a,b)
@@ -756,8 +781,33 @@ fn emit_bltn(nmi,nl,ii) {
         let fa1=0; if ira1(ii)>=2 { if is_float_vr(irres(ira2(ii)+1))==1 { fa1=1 } }
         if fa0==1 { eb(102); eb(72); eb(15); eb(110); eb(199) } else { eb(242); eb(102); eb(72); eb(15); eb(42); eb(199) }
         if fa1==1 { eb(102); eb(72); eb(15); eb(110); eb(206) } else { eb(72); eb(242); eb(15); eb(42); eb(206) }
+        // FIX 0.0.220 -- two defects, both in the RESULT STORE.
+        //
+        // 1. Wrong opcode. The store was `eb(102); eb(72); eb(15); eb(44); eb(192)`,
+        //    i.e. 66 48 0F 2C -- that is CVTTSD2SI, which converts the double to a
+        //    64-bit INTEGER and returns it. fadd(3.0, 4.0) therefore returned the
+        //    integer 7 instead of 7.0's bit pattern, and ai_core.quanta
+        //    (ai_add, ai_matmul, ai_dequant8) stores the result through f64_write,
+        //    so every value it computed was wrong before it was written.
+        //    The MOVQ store is 66 48 0F 7E (opcode 0x7E). Note the operand roles
+        //    SWAP between the two forms: 0F 6E is reg=xmm/rm=GP (load),
+        //    0F 7E is reg=xmm/rm=GP as well but ModRM C0 means rax <- xmm0.
+        //    codegen.quanta's operator path already used fst_x(), which emits 0x7E;
+        //    these four handlers had 0x2C hard-coded.
+        // 2. Result never tagged. Without w8(vfloat+res, 1) a chained builtin
+        //    (fadd -> fmul) fed the bit pattern to cvtsi2sd as an integer.
+        //
+        // The operand loads, the missing flush_all() concern, and the spill_home()
+        // reads were CORRECT all along. Proven by disassembling this handler and
+        // the operator path within the SAME compiled function: both emit
+        // movq xmm0, reg / movq xmm1, reg / addsd, and differed only in the store
+        // opcode. Do not "fix" the load or marshalling side -- attempts to do so
+        // made it worse.
         eb(242); eb(15); eb(92); eb(193)          // subsd xmm0, xmm1
-        eb(242); eb(72); eb(15); eb(44); eb(192)
+        eb(102); eb(72); eb(15); eb(126); eb(192)  // MOVQ rax, xmm0 -- the f64 bit pattern        // Tag the result so a chained float builtin (fadd -> fmul) reads the bit
+        // pattern as a double rather than feeding it to cvtsi2sd as an integer.
+        w8(vfloat+irres(ii), 1)
+
         return 1
     }
     if nl==4&&r8(nm)=='f'&&r8(nm+1)=='m'&&r8(nm+2)=='u'&&r8(nm+3)=='l' {  // fmul(a,b)
@@ -766,8 +816,33 @@ fn emit_bltn(nmi,nl,ii) {
         let fa1=0; if ira1(ii)>=2 { if is_float_vr(irres(ira2(ii)+1))==1 { fa1=1 } }
         if fa0==1 { eb(102); eb(72); eb(15); eb(110); eb(199) } else { eb(242); eb(102); eb(72); eb(15); eb(42); eb(199) }
         if fa1==1 { eb(102); eb(72); eb(15); eb(110); eb(206) } else { eb(72); eb(242); eb(15); eb(42); eb(206) }
+        // FIX 0.0.220 -- two defects, both in the RESULT STORE.
+        //
+        // 1. Wrong opcode. The store was `eb(102); eb(72); eb(15); eb(44); eb(192)`,
+        //    i.e. 66 48 0F 2C -- that is CVTTSD2SI, which converts the double to a
+        //    64-bit INTEGER and returns it. fadd(3.0, 4.0) therefore returned the
+        //    integer 7 instead of 7.0's bit pattern, and ai_core.quanta
+        //    (ai_add, ai_matmul, ai_dequant8) stores the result through f64_write,
+        //    so every value it computed was wrong before it was written.
+        //    The MOVQ store is 66 48 0F 7E (opcode 0x7E). Note the operand roles
+        //    SWAP between the two forms: 0F 6E is reg=xmm/rm=GP (load),
+        //    0F 7E is reg=xmm/rm=GP as well but ModRM C0 means rax <- xmm0.
+        //    codegen.quanta's operator path already used fst_x(), which emits 0x7E;
+        //    these four handlers had 0x2C hard-coded.
+        // 2. Result never tagged. Without w8(vfloat+res, 1) a chained builtin
+        //    (fadd -> fmul) fed the bit pattern to cvtsi2sd as an integer.
+        //
+        // The operand loads, the missing flush_all() concern, and the spill_home()
+        // reads were CORRECT all along. Proven by disassembling this handler and
+        // the operator path within the SAME compiled function: both emit
+        // movq xmm0, reg / movq xmm1, reg / addsd, and differed only in the store
+        // opcode. Do not "fix" the load or marshalling side -- attempts to do so
+        // made it worse.
         eb(242); eb(15); eb(89); eb(193)          // mulsd xmm0, xmm1
-        eb(242); eb(72); eb(15); eb(44); eb(192)
+        eb(102); eb(72); eb(15); eb(126); eb(192)  // MOVQ rax, xmm0 -- the f64 bit pattern        // Tag the result so a chained float builtin (fadd -> fmul) reads the bit
+        // pattern as a double rather than feeding it to cvtsi2sd as an integer.
+        w8(vfloat+irres(ii), 1)
+
         return 1
     }
     if nl==4&&r8(nm)=='f'&&r8(nm+1)=='d'&&r8(nm+2)=='i'&&r8(nm+3)=='v' {  // fdiv(a,b)
@@ -776,8 +851,33 @@ fn emit_bltn(nmi,nl,ii) {
         let fa1=0; if ira1(ii)>=2 { if is_float_vr(irres(ira2(ii)+1))==1 { fa1=1 } }
         if fa0==1 { eb(102); eb(72); eb(15); eb(110); eb(199) } else { eb(242); eb(102); eb(72); eb(15); eb(42); eb(199) }
         if fa1==1 { eb(102); eb(72); eb(15); eb(110); eb(206) } else { eb(72); eb(242); eb(15); eb(42); eb(206) }
+        // FIX 0.0.220 -- two defects, both in the RESULT STORE.
+        //
+        // 1. Wrong opcode. The store was `eb(102); eb(72); eb(15); eb(44); eb(192)`,
+        //    i.e. 66 48 0F 2C -- that is CVTTSD2SI, which converts the double to a
+        //    64-bit INTEGER and returns it. fadd(3.0, 4.0) therefore returned the
+        //    integer 7 instead of 7.0's bit pattern, and ai_core.quanta
+        //    (ai_add, ai_matmul, ai_dequant8) stores the result through f64_write,
+        //    so every value it computed was wrong before it was written.
+        //    The MOVQ store is 66 48 0F 7E (opcode 0x7E). Note the operand roles
+        //    SWAP between the two forms: 0F 6E is reg=xmm/rm=GP (load),
+        //    0F 7E is reg=xmm/rm=GP as well but ModRM C0 means rax <- xmm0.
+        //    codegen.quanta's operator path already used fst_x(), which emits 0x7E;
+        //    these four handlers had 0x2C hard-coded.
+        // 2. Result never tagged. Without w8(vfloat+res, 1) a chained builtin
+        //    (fadd -> fmul) fed the bit pattern to cvtsi2sd as an integer.
+        //
+        // The operand loads, the missing flush_all() concern, and the spill_home()
+        // reads were CORRECT all along. Proven by disassembling this handler and
+        // the operator path within the SAME compiled function: both emit
+        // movq xmm0, reg / movq xmm1, reg / addsd, and differed only in the store
+        // opcode. Do not "fix" the load or marshalling side -- attempts to do so
+        // made it worse.
         eb(242); eb(15); eb(94); eb(193)          // divsd xmm0, xmm1
-        eb(242); eb(72); eb(15); eb(44); eb(192)
+        eb(102); eb(72); eb(15); eb(126); eb(192)  // MOVQ rax, xmm0 -- the f64 bit pattern        // Tag the result so a chained float builtin (fadd -> fmul) reads the bit
+        // pattern as a double rather than feeding it to cvtsi2sd as an integer.
+        w8(vfloat+irres(ii), 1)
+
         return 1
     }
     // faddf: float-preserving add (no truncation) - NO flush_all, uses only xmm
