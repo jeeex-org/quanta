@@ -16,6 +16,13 @@
 # Prints at most 20 lines.
 ulimit -c 0
 QC="${QC:?QC must be set}"
+# Repo root, resolved now while $0 is still the path the caller used. The gate
+# cd's into $W later and run_tests.sh invokes this with a relative path, so a
+# $0-derived root would resolve against $W instead of the repo.
+REPO=$(cd "$(dirname "$(readlink -f "$0")")/../.." && pwd)
+# Absolute, because this script cd's to $W below and the nested harnesses need
+# to exec the compiler from there. run_tests.sh passes a repo-relative QC.
+case $QC in /*) ;; *) QC=$(cd "$(dirname "$QC")" 2>/dev/null && pwd)/$(basename "$QC") ;; esac
 W=/tmp/qobj_gate
 PASS=0; FAIL=0
 
@@ -73,6 +80,30 @@ for i in 1 2 3; do
 done
 if [ $same = 1 ] && [ -n "$h" ]; then echo "  PASS G5 cache-only deterministic (md5 $h)"; PASS=$((PASS+1));
 else echo "  FAIL G5 cache-only NOT deterministic ($h)"; FAIL=$((FAIL+1)); fi
+
+# ---- G4: stale cache detection ---------------------------------------------
+# A cache written from source S must not be reused after S changes. G4 added a
+# content fingerprint to the header (v9); this confirms the writer records it and
+# that a consume site actually rejects a stale cache.
+#
+# Checks the RESULT, not merely that a rebuild happened: a rebuild that still
+# produced the old answer would satisfy the weaker test. Deliberately folded in
+# here rather than made a 15th gate stage -- it is the same fixture and the same
+# cache, and a separate stage would be a second place to forget to look.
+G4V=$REPO/scripts/g4_verify.sh
+if [ -f "$G4V" ]; then
+  if QC="$QC" bash "$G4V" > "$W/g4.log" 2>&1; then
+    echo "  PASS G4 stale-cache detection ($(grep -o 'G4: [0-9]*/[0-9]*' "$W/g4.log" | tail -1))"
+    PASS=$((PASS+1))
+  else
+    echo "  FAIL G4 stale-cache detection:"
+    grep FAIL "$W/g4.log" | sed 's/^/    /'
+    FAIL=$((FAIL+1))
+  fi
+else
+  echo "  FAIL g4_verify.sh missing at $G4V"
+  FAIL=$((FAIL+1))
+fi
 
 echo "  QOBJ: $PASS/$((PASS+FAIL)) GREEN"
 [ $FAIL -gt 0 ] && exit 1

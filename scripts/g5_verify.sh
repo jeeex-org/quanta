@@ -3,6 +3,9 @@
 # controls that must never regress. Bounded: prints at most 18 lines.
 ulimit -c 0
 Q=${QC:-/opt/tali/quanta/compiler/0.0.217/bin/x86/qc}
+# Absolute path: the compile runs from $W, so a repo-relative QC would not
+# resolve there and every check would measure "command not found" (127).
+case $Q in /*) ;; *) Q=$(cd "$(dirname "$Q")" 2>/dev/null && pwd)/$(basename "$Q") ;; esac
 W=/tmp/g5fix
 PASS=0; FAIL=0
 chk(){ if [ "$2" = "$3" ]; then echo "  PASS $1 (=$3)"; PASS=$((PASS+1)); else echo "  FAIL $1 (want $2 got $3)"; FAIL=$((FAIL+1)); fi; }

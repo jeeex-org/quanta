@@ -4,15 +4,21 @@
 # A cache written from source S must not be reused after S changes, and must
 # still be reusable when S is unchanged or absent. Bounded: at most 12 lines.
 ulimit -c 0
+# Resolve the compiler to an ABSOLUTE path before the cd to $W below. The gate
+# passes QC=compiler/0.0.217/bin/x86/qc -- a repo-relative path that no longer
+# resolves once the working directory is $W, and every assertion then measured
+# "command not found" (rc 127) rather than the cache behaviour.
 Q=${QC:-/tmp/g4d/qc}
+case $Q in /*) ;; *) Q=$(cd "$(dirname "$Q")" 2>/dev/null && pwd)/$(basename "$Q") ;; esac
 W=/tmp/g4t
 PASS=0; FAIL=0
 chk(){ if [ "$2" = "$3" ]; then echo "  PASS $1 (=$3)"; PASS=$((PASS+1)); else echo "  FAIL $1 (want $2 got $3)"; FAIL=$((FAIL+1)); fi; }
 rc(){ set +e; "$1" >/dev/null 2>&1; local r=$?; set -e; echo $r; }
 
-# "import std/x" resolves through the lib/ search root, so the tree must have
-# lib/std/ and the compile must run from its root. A flat /tmp tree does not
-# resolve, which silently measures the fixture instead of the feature.
+# "import std/x" resolves through the "lib/" search root, which is relative to
+# the COMPILE cwd -- so the tree must have lib/std/ and the compile must run from
+# its root. Every module the fixture imports is created here, so it stays
+# self-contained and does not depend on the repo's real stdlib.
 rm -rf $W; mkdir -p $W/lib/std; cd $W || exit 1
 printf 'fn inc(x) {\n  return x + 1\n}\n'  > lib/std/inc.quanta
 printf 'fn dbl(x) {\n  return x * 2\n}\n'  > lib/std/dbl.quanta
