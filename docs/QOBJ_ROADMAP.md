@@ -116,12 +116,14 @@ Compile each module to its own IR stream. Link multiple IR streams together. Res
 | G1 | `--emit-qobj` creates `.qobj` | File created, readable | ✅ |
 | G2 | `qobj_import()` parses the v6 format and registers functions | Functions + IR loaded, cross-module call resolves | ✅ |
 | G3 | Import with `.qobj` cache | Cache is consumed; no token explosion | ✅ |
-| G5 | Cross-module call | Call resolves via `.qobj` | ✅ verified (qobj gate, 10/10) |
-| G4 | Stale `.qobj` detection | Recompiles when source newer | ✅ (v9 fingerprint, 8/8) |
-| G6 | Self-host with `.qobj` | Quanta compiles itself using cached modules | ⛔ blocked structurally — the 19 source files are one translation unit (cyclic `helpers`/`globals`), so 16 of 19 cannot be compiled alone. See `G6_SELF_COMPILE_BLOCKED.md` |
+| G5 | Cross-module call | Call resolves via `.qobj` | ✅ (qobj gate) |
+| G4 | Stale `.qobj` detection | Recompiles when source newer, own **or** imported | ✅ (v10 dep fingerprints, 8/8 + 8/8) |
+| G6 | Self-host with `.qobj` | Quanta compiles itself using cached modules | ✅ as one module (the compiler is one TU): 327 fns, 4.7MB, builds with every source deleted |
 
-**Order was G5 -> G4 -> G6, not the numeric order.** G5 and G4 are both
-done; G6 is blocked by a source-structure fact, not by cache work. G5 must land before G4:
+**Order was G5 -> G4 -> G6, not the numeric order.** All three are done.
+G6 is satisfied at the granularity the source has: the compiler is one
+translation unit, so it caches as one module and builds from that cache with
+every source deleted. G5 must land before G4:
 today the cache is consumed (G3) but produces binaries that segfault because
 call targets are not relocated, so a cache is currently a *liability*. Adding
 mtime staleness to a broken feature guards a door that should not be open, and
@@ -145,3 +147,27 @@ Notes on the earlier rows:
 Phase 1 provides the foundation (`.qobj` read/write). Phases 2-3 are needed for the actual fix. Total remaining effort: ~3-4 days.
 
 Alternative: Document the flat-scope rule and continue building domain cores (blockchain/quantum/math) within current constraints.
+## Per-file caching of the compiler: still structurally blocked
+
+G6 above is satisfied at the granularity the source actually has — the compiler
+is one translation unit, so it caches as one module. Caching its 19 files
+*individually* is not achievable: they are mutually dependent (`globals` calls
+`r64` from `helpers`; `helpers` needs `TKS` and `toks` from `globals`), so 16 of
+19 cannot be compiled alone. Re-measured at `bf75a307`: still 3 of 19.
+
+That needs source work, not cache work: move the primitives into a leaf module
+that depends on nothing, then convert the `include` boundary into a real
+`import`. See `G6_SELF_COMPILE_BLOCKED.md`.
+
+## Gate coverage summary
+
+| suite | assertions |
+|---|---|
+| `qobj_gate.sh` | 13/13 (G5, G6, G4 own-source, G4 transitive, controls) |
+| `g5_verify.sh` | 7/7 |
+| `g4_verify.sh` | 8/8 |
+| `g4_transitive.sh` | 8/8 |
+| `qobj_features.sh` | 7 features, 0 gaps |
+| `qobj_hard_features.sh` | 4 full, 1 gap (the `--emit-dynamic` extern case) |
+| `g6_selfcache.sh` | 5/5 |
+| `selfhost_test.sh` | 8/8 (4-generation fixed point) |
