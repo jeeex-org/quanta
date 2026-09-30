@@ -134,6 +134,80 @@ else
 fi
 if [ "$NATIVE_FAIL" -eq 0 ]; then NATIVE_RC=0; else NATIVE_RC=1; FUNCTIONAL_RC=1; fi
 
+# --- Stage 1.5a: FLOAT OPERATORS (gating) -------------------------------------
+# float_arith_test.quanta was committed long ago but referenced by NO script, so
+# the + - * / float operator path was never actually gated. It passes (exit 42) as
+# of 0.0.220 and is now enforced: the four prefix/tagging/comparison defects it
+# documents (SSE prefix order, untagged float params, untagged float returns,
+# bitwise float comparison) must not come back.
+#
+# The BUILTIN path (fadd/fsub/fmul/fdiv) is a separate implementation and is
+# still broken -- see stage 1.6 below.
+echo ""
+echo "########## FLOAT OPERATOR PATH (gating) ##########"
+FLOATOP_FAIL=0
+FLOATOP_SRC="$TEST_SUITES/codes/float_arith_test.quanta"
+if [ ! -f "$FLOATOP_SRC" ]; then
+  echo "  FAIL float_arith_test $FLOATOP_SRC missing"
+  FLOATOP_FAIL=1
+else
+  FLOATOP_BIN="$TEST_SUITES/bin/float_arith_test"
+  if ! $QC "$FLOATOP_SRC" "$FLOATOP_BIN" 2>/tmp/floatop_stderr.txt; then
+    echo "  FAIL (compile) float_arith_test  $(cat /tmp/floatop_stderr.txt)"
+    FLOATOP_FAIL=1
+  else
+    "$FLOATOP_BIN" >/dev/null 2>&1
+    floatop_rc=$?
+    if [ "$floatop_rc" -ne 42 ]; then
+      echo "  FAIL (run) float_arith_test: expected exit 42, got $floatop_rc"
+      FLOATOP_FAIL=1
+    else
+      echo "  PASS float operators: + - * / , params, returns, comparisons"
+    fi
+  fi
+fi
+if [ "$FLOATOP_FAIL" -eq 0 ]; then FLOATOP_RC=0; else FLOATOP_RC=1; FUNCTIONAL_RC=1; fi
+
+# --- Stage 1.6: FLOAT BUILTINS (KNOWN FAILING -- does not gate) ----------------
+# fadd/fsub/fmul/fdiv are implemented separately from the + - * / operators and
+# are currently WRONG: they return one of their arguments instead of the result.
+#   let a = 3.0
+#   let b = 4.0
+#   a + b        -> 7.0    correct
+#   fadd(a, b)   -> 3.0    wrong
+#
+# sqrt, floor, ceil, cos, sin, log and pow are all correct.
+#
+# Why this stage exists: NEITHER float test was wired into the runner before
+# 0.0.220 -- float_arith_test.quanta is still referenced by nothing -- which is
+# how these four stayed broken while the gate stayed green. This stage keeps the
+# defect VISIBLE without turning the gate red, and flips to PASS the moment the
+# handlers are fixed.
+#
+# It deliberately does NOT set FUNCTIONAL_RC: the tree is knowingly broken here
+# and a red gate would block every other fix. See docs/roadmap for the
+# tracking item and the quanta-float-builtins-defect skill for the analysis.
+echo ""
+echo "########## FLOAT BUILTINS (known-failing, non-gating) ##########"
+FBT_SRC="$TEST_SUITES/codes/float_builtin_test.quanta"
+if [ ! -f "$FBT_SRC" ]; then
+  echo "  FAIL float_builtin_test $FBT_SRC missing"
+else
+  FBT_BIN="$TEST_SUITES/bin/float_builtin_test"
+  if ! $QC "$FBT_SRC" "$FBT_BIN" 2>/tmp/fbt_stderr.txt; then
+    echo "  FAIL (compile) float_builtin_test  $(cat /tmp/fbt_stderr.txt)"
+  else
+    "$FBT_BIN" >/dev/null 2>&1
+    fbt_rc=$?
+    if [ "$fbt_rc" -eq 42 ]; then
+      echo "  PASS float builtins: fadd/fsub/fmul/fdiv correct (exit 42)"
+    else
+      echo "  KNOWN-FAIL float builtins: exit $fbt_rc (want 42) -- case $fbt_rc is the first failing op"
+      echo "           fadd/fsub/fmul/fdiv return an argument, not the result. Non-gating."
+    fi
+  fi
+fi
+
 # --- Stage 1.5: EXTERN "C" FFI (object mode + gcc link) ----------------------
 # The main loop above compiles in EXEC mode only ($QC -O), where extern "C"
 # cannot resolve libc. This stage actually links a real libc FFI test so the
