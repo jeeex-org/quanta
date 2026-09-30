@@ -38,27 +38,43 @@ express. Closing it needs the cache to record its dependencies' fingerprints and
 check them, which is a format change (v10). Until then: **when you change a
 module, rebuild the caches of everything that imports it.**
 
-## extern "C" in EXEC mode segfaults — pre-existing, not a cache bug
+## extern "C" in EXEC mode: `--emit-dynamic` is broken outright
 
 The probe reports `extern C call in cached module (src=139, CACHE-ONLY=251)`.
-Both sides fail, which means the cache is not the cause. Reduced to a
-three-line program with no import and no cache at all:
+Both sides fail, so the cache is not involved.
 
-```
-extern "C" fn abs(x);
-fn useabs(x) { return abs(x) }
-fn main() { return useabs(0 - 5) }
-```
+The cause is not what I first wrote here. I claimed EXEC mode patched extern
+calls to a wrong PLT address, because the patch loop in `entry.quanta` did
+recompute `write_elf`'s dynamic-segment layout by hand and three of its sizes
+disagreed with the real layout (`dynstr_size` 200 vs `11+16*num_extern`,
+`hash_size` 32 vs `16+4*dynsym_count`, `got_size` `8*(n+3)` vs `24+8n`). That
+disagreement is real. It is also not the cause of this failure, because that
+code is **unreachable without `--emit-dynamic`**: `emit_dynamic` defaults to 0
+and is set only by that flag, so the whole dynamic block — PLT, GOT,
+`.rela.plt` — is skipped in an ordinary build.
 
-→ **segfault, rc 139**, on the installed binary.
+What is actually true:
 
-So `extern "C"` is broken in EXEC mode generally. The gate's `extern-c` and
-`extern-ld` stages are GREEN because they exercise **object mode**
-(`--emit-obj` + gcc/ld link), which is a different code path. The EXEC-mode
-extern path has no coverage, and it is broken.
+- **Without `--emit-dynamic`**, an `extern "C"` declaration compiles and the
+  program segfaults. There is no PLT, no dynamic loader and no libc mapping, so
+  the call target does not exist. EXEC mode does not support `extern "C"`.
+- **With `--emit-dynamic`**, *every* program segfaults — including
+  `fn main() { return 3 }`, which has no extern at all. A plain source build of
+  the same program works and returns 3.
 
-This is outside QOBJ's scope and is recorded here only so the probe result is
-not mistaken for a cache defect. It deserves its own bug.
+So `--emit-dynamic` is broken independently of extern, and extern-in-EXEC-mode
+is simply unsupported. `--emit-dynamic` has **no test, no documentation and no
+gate coverage** anywhere in the repo — `grep -rl 'emit.dynamic' test_suites/
+scripts/ .github/` returns nothing.
+
+`extern "C"` is supported and tested through a different path: the
+`extern-c` and `extern-ld` gate stages use `--emit-obj` and link with gcc or
+`ld`, and both are GREEN. That is the supported route.
+
+Fixing `--emit-dynamic` means debugging the dynamic ELF path from scratch. That
+is a separate piece of work from QOBJ and should be its own task, with a test
+written first — the failure mode here was invisible precisely because nothing
+exercises the flag.
 
 ## How these probes were written
 
