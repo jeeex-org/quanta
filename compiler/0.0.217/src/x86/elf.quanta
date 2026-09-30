@@ -184,7 +184,16 @@ fn write_elf(outp) {
         dynsym_size = dynsym_count * 24
         hash_size = 8 + 4*2 + 4*dynsym_count
         gnu_hash_size = 48  // minimal
-        dynamic_size = 16 * 12
+        // 15 entries: DT_NEEDED, PLTRELSZ, PLTGOT, HASH, STRTAB, SYMTAB, RELA,
+        // RELASZ, RELAENT, STRSZ, SYMENT, JMPREL, PLTREL, FLAGS_1, DT_NULL.
+        //
+        // This reserved 12 while 15 were written, so the last three overran into
+        // the GOT that follows. PT_DYNAMIC's p_filesz then cut the table short
+        // before DT_NULL, leaving the loader to read three slots past the region
+        // as if they were entries -- DT_PLTGOT and DT_JMPREL ended up holding a
+        // tag value, and the loader dereferenced that as a relocation table and
+        // faulted before main.
+        dynamic_size = 16 * 15
         got_size = 24 + num_extern * 8
         got_plt_size = 24 + num_extern * 8
         plt_size = 16 + num_extern * 16
@@ -198,6 +207,20 @@ fn write_elf(outp) {
         // Dynamic section will be placed in RW segment after gdata + string literals
         dynamic_off = tp + gdata_size + data_off
         dynamic_vaddr = gdata_vaddr + gdata_size + data_off
+        // Offset of the .dynamic entry table, rounded UP to 8.
+        //
+        // Two bugs lived here. (1) The regions do not sum to a multiple of 8 --
+        // with no externs, interp(28) + dynstr(11) + dynsym(24) + hash(20) +
+        // gnu.hash(48) = 131 -- so every d_tag/d_un pair was written 3 bytes off
+        // and the table began with what read as a leading DT_NULL, stopping the
+        // loader at entry 0. (2) PT_DYNAMIC's p_offset was recomputed locally in
+        // the program-header pass, so header and section disagreed by 13 bytes.
+        // Deriving it once, here, and aligning it fixes both by construction.
+        let dyn_base = interp_len + dynstr_size + dynsym_size + hash_size + gnu_hash_size
+        let dyn_misalign = dyn_base % 8
+        if dyn_misalign > 0 { dyn_base = dyn_base + (8 - dyn_misalign) }
+        dynamic_entry_off = dynamic_off + dyn_base
+        dynamic_entry_vaddr = dynamic_vaddr + dyn_base
     }
     
     // RW segment must include dynamic data (or just gdata + string literals for static PIE)
@@ -291,13 +314,12 @@ fn write_elf(outp) {
         ph_next = phdo + phsz
         
         // PH 4: PT_DYNAMIC - inside RW segment, points to .dynamic section
-        let dynamic_off_abs = dynamic_off + interp_len + dynstr_size + dynsym_size + hash_size + gnu_hash_size
         let ph_dyn = ph_next
         w64(elfb + ph_dyn + 0, PT_DYNAMIC)
         w64(elfb + ph_dyn + 4, PF_R | PF_W)
-        w64(elfb + ph_dyn + 8, dynamic_off_abs)
-        w64(elfb + ph_dyn + 16, dynamic_vaddr + interp_len + dynstr_size + dynsym_size + hash_size + gnu_hash_size)
-        w64(elfb + ph_dyn + 24, dynamic_vaddr + interp_len + dynstr_size + dynsym_size + hash_size + gnu_hash_size)
+        w64(elfb + ph_dyn + 8, dynamic_entry_off)
+        w64(elfb + ph_dyn + 16, dynamic_entry_vaddr)
+        w64(elfb + ph_dyn + 24, dynamic_entry_vaddr)
         w64(elfb + ph_dyn + 32, dynamic_size)
         w64(elfb + ph_dyn + 40, dynamic_size)
         w64(elfb + ph_dyn + 48, 8)
@@ -464,6 +486,13 @@ fn write_elf(outp) {
             dyn_ptr = dyn_ptr + 48
         
             // .dynamic
+            // Start at the offset the size phase computed rather than
+            // accumulating dyn_ptr through the region writers: the bytes a
+            // region writes and the size it reserved do not always agree (the
+            // SYSV .hash reserves 8+8+4*dynsym_count but writes a fixed 32).
+            let dyn_pad2 = dyn_ptr % 8
+            if dyn_pad2 > 0 { dyn_ptr = dyn_ptr + (8 - dyn_pad2) }
+            dyn_ptr = dynamic_entry_off
             let dynamic_off_abs = dyn_ptr
             let dyn_idx = 0
             // DT_NEEDED -> "libc.so.6" offset in .dynstr (offset 1 after empty first entry)
@@ -564,8 +593,15 @@ fn write_elf(outp) {
         
             // ============================================================
             // Fill in extern symbols in .dynsym and .dynstr
-            // ============================================================
             let dynsym_ptr = dynsym_start
+            //
+            // Every pointer below is a bare FILE OFFSET -- they all derive from
+            // dyn_ptr or one of the *_off values, none of which include elfb.
+            // Writing "elfb + ptr" therefore addressed elfb twice and produced a
+            // wild pointer: the compiler segfaulted the first time it emitted an
+            // extern name, which is why --emit-dynamic compiled cleanly for a
+            // program with no externs and crashed the compiler on one with any.
+            // ============================================================
             let dynstr_fill_ptr = dynstr_base
             let rela_plt_ptr = rela_plt_off
             let got_plt_entry_ptr = got_plt_off + 24  // skip 3 reserved
@@ -579,48 +615,53 @@ fn write_elf(outp) {
                     let nl = fn_nlen(fi)
                 
                     // Write symbol name to .dynstr
+                    // nm is a SOURCE-RELATIVE offset: every other caller reads
+                    // the name as src+fn_name(i) (see the duplicate check in
+                    // funcscan). Treating it as an absolute address walked off
+                    // into unmapped memory and crashed the compiler.
+                    let nm_abs = src + nm
                     let name_off = dynstr_fill_ptr - dynstr_off
                     let k3 = 0
-                    while k3 < nl { w8(elfb + dynstr_fill_ptr + k3, r8(nm + k3)); k3 = k3 + 1 }
-                    w8(elfb + dynstr_fill_ptr + nl, 0)
+                    while k3 < nl { w8(dynstr_fill_ptr + k3, r8(nm_abs + k3)); k3 = k3 + 1 }
+                    w8(dynstr_fill_ptr + nl, 0)
                     dynstr_fill_ptr = dynstr_fill_ptr + nl + 1
                 
                     // Write .dynsym entry
-                    w64(elfb + dynsym_ptr + 0, name_off)  // st_name
-                    w8(elfb + dynsym_ptr + 8, 0x12)       // STT_FUNC | STB_GLOBAL (0x12)
-                    w8(elfb + dynsym_ptr + 9, 0)          // st_other
-                    w16(elfb + dynsym_ptr + 10, 0)        // st_shndx = SHN_UNDEF
-                    w64(elfb + dynsym_ptr + 16, 0)        // st_value
-                    w64(elfb + dynsym_ptr + 24, 0)        // st_size
+                    w64(dynsym_ptr + 0, name_off)  // st_name
+                    w8(dynsym_ptr + 8, 0x12)       // STT_FUNC | STB_GLOBAL (0x12)
+                    w8(dynsym_ptr + 9, 0)          // st_other
+                    w16(dynsym_ptr + 10, 0)        // st_shndx = SHN_UNDEF
+                    w64(dynsym_ptr + 16, 0)        // st_value
+                    w64(dynsym_ptr + 24, 0)        // st_size
                     dynsym_ptr = dynsym_ptr + 24
                 
                     // Write .rela.plt entry (R_X86_64_JUMP_SLOT)
                     // r_offset = .got.plt entry for this symbol
                     let got_plt_entry_vaddr = got_plt_vaddr + 24 + (extern_idx - 1) * 8
-                    w64(elfb + rela_plt_ptr + 0, got_plt_entry_vaddr)
-                    w64(elfb + rela_plt_ptr + 8, (extern_idx << 32) | R_X86_64_JUMP_SLOT)
-                    w64(elfb + rela_plt_ptr + 16, 0)
+                    w64(rela_plt_ptr + 0, got_plt_entry_vaddr)
+                    w64(rela_plt_ptr + 8, (extern_idx << 32) | R_X86_64_JUMP_SLOT)
+                    w64(rela_plt_ptr + 16, 0)
                     rela_plt_ptr = rela_plt_ptr + 24
                 
                     // Write .got.plt entry (initially points to PLT resolver stub)
                     // Will be filled by dynamic linker
-                    w64(elfb + got_plt_entry_ptr, plt_entry_ptr + 6)  // points to jmp in PLT entry
+                    w64(got_plt_entry_ptr, plt_entry_ptr + 6)  // points to jmp in PLT entry
                     got_plt_entry_ptr = got_plt_entry_ptr + 8
                 
                     // Write PLT entry (16 bytes each)
                     // jmp QWORD PTR [got.plt + X]
-                    w8(elfb + plt_entry_ptr, 0xFF); w8(elfb + plt_entry_ptr + 1, 0x25)
+                    w8(plt_entry_ptr, 0xFF); w8(plt_entry_ptr + 1, 0x25)
                     let got_entry_for_this = got_plt_vaddr + 24 + (extern_idx - 1) * 8
-                    w32(elfb + plt_entry_ptr + 2, got_entry_for_this - (plt_entry_ptr + 6))
+                    w32(plt_entry_ptr + 2, got_entry_for_this - (plt_entry_ptr + 6))
                     // pushq $reloc_index
-                    w8(elfb + plt_entry_ptr + 6, 0x68)
-                    w32(elfb + plt_entry_ptr + 7, extern_idx - 1)
+                    w8(plt_entry_ptr + 6, 0x68)
+                    w32(plt_entry_ptr + 7, extern_idx - 1)
                     // jmp PLT0
-                    w8(elfb + plt_entry_ptr + 11, 0xE9)
+                    w8(plt_entry_ptr + 11, 0xE9)
                     let plt0_addr = plt_vaddr
-                    w32(elfb + plt_entry_ptr + 12, plt0_addr - (plt_entry_ptr + 16))
+                    w32(plt_entry_ptr + 12, plt0_addr - (plt_entry_ptr + 16))
                     // Pad to 16 bytes
-                    w8(elfb + plt_entry_ptr + 14, 0x90); w8(elfb + plt_entry_ptr + 15, 0x90)
+                    w8(plt_entry_ptr + 14, 0x90); w8(plt_entry_ptr + 15, 0x90)
                 
                     plt_entry_ptr = plt_entry_ptr + 16
                     extern_idx = extern_idx + 1
