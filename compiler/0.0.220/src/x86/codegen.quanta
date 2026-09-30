@@ -771,68 +771,55 @@ fn ci_func(fi, is_main) {
             while mp<ir_end {
                 if irop(mp)==IR_CALL {
                     let mnm = ira0(mp)
-                    if r8(src+mnm)=='i' && r8(src+mnm+1)=='2' && r8(src+mnm+2)=='f' {
-                    // f64_load tags its own result in emit_bltn, but that happens DURING
-                    // emission -- after this fixpoint and after aclr(). An IR_MOV or an
-                    // IR_NE emitted before the call would then see an untagged operand
-                    // and take the integer path, so tag it here as well.
-                    else if r8(src+mnm)=='f' && r8(src+mnm+1)=='6' && r8(src+mnm+2)=='4' && r8(src+mnm+3)=='_' && r8(src+mnm+4)=='l' && r8(src+mnm+5)=='o' && r8(src+mnm+6)=='a' && r8(src+mnm+7)=='d' {
+                    // A call yields a float result when it is:
+                    //   - i2f(x)                     (int -> f64)
+                    //   - fconst(M, scale)           (how the parser lowers an f64 literal)
+                    //   - f64_load(p)                (the typed float load)
+                    //   - a function declared `-> f64` (via fn_retflt)
+                    //
+                    // The last three are the ones an enclosing operation depends on.
+                    // codegen's IR_CALL emit branch applies the fn_retflt tag itself,
+                    // but only AS the call is emitted, and emit_bltn asks is_float_vr()
+                    // about an operand while emitting the ENCLOSING call. A nested
+                    // operand therefore has no tag yet and the float path is silently
+                    // skipped:
+                    //     fadd(f64_load(p), f64_load(p+8))   -> correct
+                    //     fadd(f64_read(p), f64_read(p+8))   -> 1.0 instead of 6.0
+                    // where f64_read is `fn f64_read(ptr: i64): f64 { return f64_load(ptr) }`
+                    // -- same signature, same body, one extra call layer. Tagging every
+                    // call here, before emission, removes the ordering dependency.
+                    let mcf = -1
+                    let mcn = 0
+                    while mcn < 200 && r8(src+mnm+mcn)!=0 && r8(src+mnm+mcn)!=40 && r8(src+mnm+mcn)!=41 && r8(src+mnm+mcn)!=44 { mcn = mcn + 1 }
+                    if mcn > 0 { mcf = findfn(mnm, mcn) }
+                    let isf64 = 0
+                    if r8(src+mnm)=='i' && r8(src+mnm+1)=='2' && r8(src+mnm+2)=='f' { isf64 = 1 }
+                    if r8(src+mnm)=='f' && r8(src+mnm+1)=='c' && r8(src+mnm+2)=='o' { isf64 = 1 }
+                    if r8(src+mnm)=='f' && r8(src+mnm+1)=='6' && r8(src+mnm+2)=='4' && r8(src+mnm+3)=='_' && r8(src+mnm+4)=='l' && r8(src+mnm+5)=='o' && r8(src+mnm+6)=='a' && r8(src+mnm+7)=='d' { isf64 = 1 }
+                    if mcf>=0 && mcf<fnc && r64(fn_retflt + mcf*8)==1 { isf64 = 1 }
+                    if isf64==1 {
                         if r8(vfloat+irres(mp))!=1 { w8(vfloat+irres(mp), 1); changed=1 }
-                    }
-                    // A call to a function DECLARED `-> f64` also yields a float.
-                    //
-                    // The IR_CALL emit branch applies this from fn_retflt, but it does
-                    // so AS the call is emitted -- and emit_bltn asks is_float_vr()
-                    // about an operand while emitting the ENCLOSING call. When the
-                    // operand is a nested call, its tag has not been applied yet, so
-                    // the float path is silently skipped and the integer path runs
-                    // over the bit patterns:
-                    //   fadd(f64_read(p), f64_read(p+8))  returned 1.0 instead of 6.0
-                    //
-                    // Doing it here, in the pre-emission fixpoint, removes the ordering
-                    // dependency entirely. Verified to also cover the callee's own
-                    // IR_RET vreg, since that is the same vreg this tags.
-                    else {
-                        let mcn = 0
-                        while mcn < 200 && r8(src+mnm+mcn)!=0 && r8(src+mnm+mcn)!=40 && r8(src+mnm+mcn)!=41 && r8(src+mnm+mcn)!=44 { mcn = mcn + 1 }
-                        if mcn > 0 {
-                            let mcf = findfn(mnm, mcn)
-                            if mcf>=0 && mcf<fnc && r64(fn_retflt + mcf*8)==1 {
-                                if r8(vfloat+irres(mp))!=1 { w8(vfloat+irres(mp), 1); changed=1 }
+                        // ALSO tag the ARGUMENT-LIST entries. emit_bltn reads an
+                        // operand as vfloat[irres(ira2(ii)+k)] -- the record at the
+                        // call's argument-list pointer -- which is NOT the same vreg
+                        // as the call's own result. Tagging only the result left
+                        // vfloat[arg0] == 0 when the enclosing fadd asked for it.
+                        // Measured directly, encoding (is_float_vr(arg0),
+                        // is_float_vr(arg1), vfloat[arg0], vfloat[arg1)) as digits:
+                        //   fadd(1.0, 2.0)          -> 1111
+                        //   fadd(f64_load(p), 1.0)  -> 1111
+                        //   fadd(gg5(p), 1.0)       -> 0110   <- arg0 untagged
+                        // where `fn gg5(q: i64): f64 { return mem_load(q) }` is a plain
+                        // declared-f64 function. The arg entries were the gap.
+                        let avp = ira2(mp)
+                        if isf64==1 && avp>=0 && avp<ir_end {
+                            let ak = 0
+                            let an = ira1(mp)
+                            while ak < an && avp+ak < ir_end {
+                                let avr = irres(avp+ak)
+                                if avr>=0 && r8(vfloat+avr)!=1 { w8(vfloat+avr, 1); changed=1 }
+                                ak = ak + 1
                             }
-                        }
-                    }
-                        if r8(vfloat+irres(mp))!=1 { w8(vfloat+irres(mp), 1); changed=1 }
-                    }
-                    // fconst(M, scale) is how the PARSER lowers every f64 literal.
-                    // It must be tagged HERE, not only in opt_func's pre-pass: that
-                    // pre-pass returns immediately unless -O is passed, so without
-                    // this a literal was never a float vreg and every float
-                    // comparison silently took the integer path. Verified by
-                    // probe: with this removed, `0.25 < 0.5` returned false.
-                    else if r8(src+mnm)=='f' && r8(src+mnm+1)=='c' && r8(src+mnm+2)=='o' {
-                        if r8(vfloat+irres(mp))!=1 { w8(vfloat+irres(mp), 1); changed=1 }
-                    }
-                } else if irop(mp)==IR_PARAM {
-                    // A parameter declared `: f64` is a float vreg. scanfns records
-                    // the flag in fn_parflt; entry.quanta also sets the tag at bind
-                    // time, but aclr() runs AFTER that and clears vfloat for the
-                    // function, so the bind-time tag does not survive. Re-mark here,
-                    // in the same fixpoint that re-marks fconst/i2f.
-                    //
-                    // ira1(IR_PARAM) is the param ordinal z; fn_parflt is indexed
-                    // (fi*200 + z)*8 for the function now being compiled.
-                    //
-                    // Untagged, a float arriving through a parameter made every
-                    // float operation on it take the integer path: `fn half(x: f64)
-                    // -> f64 { return x / 2.0; }` then `half(10.0) == 5.0` was
-                    // false, because `x / 2.0` divided and compared raw bit
-                    // patterns. Locals were never affected -- they took their tag
-                    // from the fconst or i2f that produced them.
-                    let pz2 = ira1(mp)
-                    if pz2 >= 0 && pz2 < 4 {
-                        if r64(fn_parflt + (fi*200 + pz2)*8) == 1 {
-                            if r8(vfloat+irres(mp)) != 1 { w8(vfloat+irres(mp), 1); changed=1 }
                         }
                     }
                 } else if irop(mp)==IR_MOV {
