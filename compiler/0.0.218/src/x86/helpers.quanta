@@ -296,6 +296,18 @@ fn sfn(i,nm,nl,bt,co,pc,ret_nm,ret_nl) {
     w64(fns + i*FNS + 48, ret_nl)
     w64(fn_rettype_name + i*8, ret_nm)
     w64(fn_rettype_len + i*8, ret_nl)
+    // `-> f64` marks the function as returning a float, so the CALLER tags the
+    // result vreg. IR_RET is a plain register move and hands back the bits
+    // intact; without this the caller read them as an integer, so
+    // `fn f(a: f64) -> f64 { return a; }` followed by `f(1.0) == 0.1` compared
+    // 4607182418800017408 against 0.1 and was false. Set here because sfn() is the
+    // one place every function passes through with its declared return type.
+    w64(fn_retflt + i*8, 0)
+    if ret_nm != 0 && ret_nl == 3 {
+        if r8(src+ret_nm)=='f' && r8(src+ret_nm+1)=='6' && r8(src+ret_nm+2)=='4' {
+            w64(fn_retflt + i*8, 1)
+        }
+    }
     // IR slice tracking. The compile loop calls sfn() twice per function:
     // once BEFORE parse_block() with co==0 (record where the IR starts) and
     // once AFTER ci_func() with co==cstart (record the record count). Without

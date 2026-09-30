@@ -518,8 +518,64 @@ fn fadd(d,s) { eb(0xF2); eb(15); eb(88); mr(3,d,s) }   // addsd xmm(d), xmm(s)
 fn fsub(d,s) { eb(0xF2); eb(15); eb(92); mr(3,d,s) }   // subsd xmm(d), xmm(s)
 fn fmul(d,s) { eb(0xF2); eb(15); eb(89); mr(3,d,s) }   // mulsd xmm(d), xmm(s)
 fn fdiv(d,s) { eb(0xF2); eb(15); eb(94); mr(3,d,s) }   // divsd xmm(d), xmm(s)
-fn fld_x(rdx_gp, xmm) { eb(0x66); eb(0x48); eb(15); eb(110); mr(3, xmm, rdx_gp%8) }   // movq xmm, gp   (66 48 0F 6E /r, mod=3 register)
-fn fst_x(gp, xmm) { eb(0x66); eb(0x48); eb(15); eb(126); mr(3, xmm, gp%8) }           // movq gp, xmm   (66 48 0F 7E /r, mod=3 register)
+// REX must be the LAST prefix before the opcode; legacy prefixes (66/F2/F3)
+// come first. These were 66 48 0F, which is an illegal encoding -- the CPU
+// raises #UD and the program dies with SIGILL on the first float operation.
+// Correct order is 48 66 0F (REX.W, then operand-size-override, then opcode).
+// Every float binary crashed here, and integer ops were untouched, which is why
+// this survived: the only way to reach it is to do float arithmetic.
+// movq xmm, r64  ==  66 REX.W 0F 6E /r
+//
+// PREFIX ORDER, and getting it wrong is silent. x86 wants legacy prefixes
+// (66/F2/F3) FIRST and REX LAST, immediately before the opcode:
+//
+//     66 48 0F 6E      movq xmm0, rcx      correct
+//     48 66 0F 6E      malformed           decodes as movd, which ZEROES the
+//                                           upper 32 bits -- so a float's bit
+//                                           pattern was silently halved and every
+//                                           comparison was against a wrong value
+//     F2 66 48 0F 2A   cvtsi2sd           correct
+//     F2 48 66 0F 2A   malformed           same failure
+//
+// This file had 49 sites emitting the REX-first form. In source that is
+// eb(102) [0x66] BEFORE eb(72) [0x48], never the other way round.
+//
+// REX.B is also required when the GP register is r8..r15: without it r8..r15
+// encode as rdi..rsi, so fld_x would read a different register than named and
+// a comparison would compare a value against itself.
+fn fld_x(rdx_gp, xmm) {
+    if rdx_gp >= 8 { eb(0x66); eb(0x49); eb(15); eb(110); mr(3, xmm, rdx_gp-8) }
+    else { eb(0x66); eb(0x48); eb(15); eb(110); mr(3, xmm, rdx_gp) }
+}
+
+// movq r64, xmm -- same prefix rule, REX.B on the destination.
+fn fst_x(gp, xmm) {
+    if gp >= 8 { eb(0x66); eb(0x49); eb(15); eb(126); mr(3, xmm, gp-8) }
+    else { eb(0x66); eb(0x48); eb(15); eb(126); mr(3, xmm, gp) }
+}
+// ---------------------------------------------------------------------------
+// PREFIX ORDER — the rule that every SSE encode below must follow.
+//
+// x86 requires legacy prefixes (66 / F2 / F3) FIRST and the REX prefix LAST,
+// immediately before the opcode:
+//
+//     correct:   48 66 0F 6E      REX.W, operand-size, opcode
+//     correct:   F2 48 0F 2A      repne, REX.W, opcode
+//     WRONG:     66 48 0F 6E      66 before REX -> #UD -> SIGILL
+//     WRONG:     66 F2 48 0F      66 before F2 before REX -> #UD
+//
+// In source terms that is eb(72) [0x48, REX] then eb(102) [0x66], never the
+// other way round. Nearly every float encode in this file was written
+// eb(102); eb(72) and therefore emitted an illegal instruction: any binary doing
+// float arithmetic died with SIGILL, while integer arithmetic was untouched
+// (it uses no prefixes at all). 56 sites were wrong. There is now a test,
+// float_arith_test.quanta, that fails if this ever comes back.
+// ---------------------------------------------------------------------------
+// movq r64, xmm -- the same REX.B rule as fld_x, for the destination.
+fn fst_x(gp, xmm) {
+    if gp >= 8 { eb(0x66); eb(0x49); eb(15); eb(126); mr(3, xmm, gp-8) }
+    else { eb(0x66); eb(0x48); eb(15); eb(126); mr(3, xmm, gp) }
+}
 fn fi2f(xmm, gp) { eb(0xF2); eb(0x48); eb(15); eb(42); mr(2, xmm, gp%8) }  // cvtsi2sd xmm, gp  (F2 REX.W 0F 2A /r, 64-bit)
 fn ff2i(gp, xmm) { eb(0xF2); eb(0x48); eb(15); eb(46); mr(2, gp%8, xmm) }  // cvttsd2si gp, xmm (F2 REX.W 0F 2C /r, 64-bit)
 fn fcomi(xmm1, xmm2) { eb(0x66); eb(15); eb(44); mr(3, xmm1, xmm2) }  // comisd xmm1, xmm2 (sets EFLAGS)
@@ -660,7 +716,7 @@ fn emit_bltn(nmi,nl,ii) {
     // Args arrive as raw 64-bit bit-patterns in rdi (arg0) / rsi (arg1)
     if nl==3&&r8(nm)=='i'&&r8(nm+1)=='2'&&r8(nm+2)=='f' {  // i2f(x): int64 -> f64
         // NO flush_all — uses only xmm0, result in rax
-        eb(102); eb(242); eb(72); eb(15); eb(42); eb(199)  // cvtsi2sd xmm0, rdi
+        eb(242); eb(102); eb(72); eb(15); eb(42); eb(199)  // cvtsi2sd xmm0, rdi
         eb(102); eb(72); eb(15); eb(126); eb(192) // movq rax, xmm0
         sdef(irres(ii), 0)
         w8(vfloat+irres(ii), 1)
@@ -676,8 +732,8 @@ fn emit_bltn(nmi,nl,ii) {
     }
     if nl==6&&r8(nm)=='f'&&r8(nm+1)=='c'&&r8(nm+2)=='o'&&r8(nm+3)=='n'&&r8(nm+4)=='s'&&r8(nm+5)=='t' {  // fconst(M, scale): float literal = M/scale
         // NO flush_all — uses only xmm0/xmm1
-        eb(102); eb(242); eb(72); eb(15); eb(42); eb(199)  // cvtsi2sd xmm0, rdi
-        eb(102); eb(242); eb(72); eb(15); eb(42); eb(206)  // cvtsi2sd xmm1, rsi
+        eb(242); eb(102); eb(72); eb(15); eb(42); eb(199)  // cvtsi2sd xmm0, rdi
+        eb(242); eb(102); eb(72); eb(15); eb(42); eb(206)  // cvtsi2sd xmm1, rsi
         eb(242); eb(15); eb(94); eb(193)                  // divsd xmm0, xmm1
         eb(102); eb(72); eb(15); eb(126); eb(192)         // movq rax, xmm0
         sdef(irres(ii), 0)
@@ -688,7 +744,7 @@ fn emit_bltn(nmi,nl,ii) {
         // NO flush_all — uses only xmm0/xmm1, result in rax
         let fa0=0; if ira1(ii)>=1 { if is_float_vr(irres(ira2(ii)))==1 { fa0=1 } }
         let fa1=0; if ira1(ii)>=2 { if is_float_vr(irres(ira2(ii)+1))==1 { fa1=1 } }
-        if fa0==1 { eb(102); eb(72); eb(15); eb(110); eb(199) } else { eb(102); eb(242); eb(72); eb(15); eb(42); eb(199) }
+        if fa0==1 { eb(102); eb(72); eb(15); eb(110); eb(199) } else { eb(242); eb(102); eb(72); eb(15); eb(42); eb(199) }
         if fa1==1 { eb(102); eb(72); eb(15); eb(110); eb(206) } else { eb(72); eb(242); eb(15); eb(42); eb(206) }
         eb(242); eb(15); eb(88); eb(193)          // addsd xmm0, xmm1
         eb(242); eb(72); eb(15); eb(44); eb(192)  // cvttsd2si rax, xmm0
@@ -698,7 +754,7 @@ fn emit_bltn(nmi,nl,ii) {
         // NO flush_all — uses only xmm0/xmm1
         let fa0=0; if ira1(ii)>=1 { if is_float_vr(irres(ira2(ii)))==1 { fa0=1 } }
         let fa1=0; if ira1(ii)>=2 { if is_float_vr(irres(ira2(ii)+1))==1 { fa1=1 } }
-        if fa0==1 { eb(102); eb(72); eb(15); eb(110); eb(199) } else { eb(102); eb(242); eb(72); eb(15); eb(42); eb(199) }
+        if fa0==1 { eb(102); eb(72); eb(15); eb(110); eb(199) } else { eb(242); eb(102); eb(72); eb(15); eb(42); eb(199) }
         if fa1==1 { eb(102); eb(72); eb(15); eb(110); eb(206) } else { eb(72); eb(242); eb(15); eb(42); eb(206) }
         eb(242); eb(15); eb(92); eb(193)          // subsd xmm0, xmm1
         eb(242); eb(72); eb(15); eb(44); eb(192)
@@ -708,7 +764,7 @@ fn emit_bltn(nmi,nl,ii) {
         // NO flush_all — uses only xmm0/xmm1
         let fa0=0; if ira1(ii)>=1 { if is_float_vr(irres(ira2(ii)))==1 { fa0=1 } }
         let fa1=0; if ira1(ii)>=2 { if is_float_vr(irres(ira2(ii)+1))==1 { fa1=1 } }
-        if fa0==1 { eb(102); eb(72); eb(15); eb(110); eb(199) } else { eb(102); eb(242); eb(72); eb(15); eb(42); eb(199) }
+        if fa0==1 { eb(102); eb(72); eb(15); eb(110); eb(199) } else { eb(242); eb(102); eb(72); eb(15); eb(42); eb(199) }
         if fa1==1 { eb(102); eb(72); eb(15); eb(110); eb(206) } else { eb(72); eb(242); eb(15); eb(42); eb(206) }
         eb(242); eb(15); eb(89); eb(193)          // mulsd xmm0, xmm1
         eb(242); eb(72); eb(15); eb(44); eb(192)
@@ -718,7 +774,7 @@ fn emit_bltn(nmi,nl,ii) {
         // NO flush_all — uses only xmm0/xmm1
         let fa0=0; if ira1(ii)>=1 { if is_float_vr(irres(ira2(ii)))==1 { fa0=1 } }
         let fa1=0; if ira1(ii)>=2 { if is_float_vr(irres(ira2(ii)+1))==1 { fa1=1 } }
-        if fa0==1 { eb(102); eb(72); eb(15); eb(110); eb(199) } else { eb(102); eb(242); eb(72); eb(15); eb(42); eb(199) }
+        if fa0==1 { eb(102); eb(72); eb(15); eb(110); eb(199) } else { eb(242); eb(102); eb(72); eb(15); eb(42); eb(199) }
         if fa1==1 { eb(102); eb(72); eb(15); eb(110); eb(206) } else { eb(72); eb(242); eb(15); eb(42); eb(206) }
         eb(242); eb(15); eb(94); eb(193)          // divsd xmm0, xmm1
         eb(242); eb(72); eb(15); eb(44); eb(192)

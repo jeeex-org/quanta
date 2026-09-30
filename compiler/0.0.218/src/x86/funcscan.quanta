@@ -206,6 +206,14 @@ fn scanfns() {
                             if ktext(tokv(nk), tokln(nk))==1 { w64(fn_parfn + (fnc*200 + saw_param-1)*8, 1) }
                             // 0.0.114: flag big-typed params (x: big)
                             if ktext(tokv(nk), tokln(nk))==62 { w64(fn_parbig + (fnc*200 + saw_param-1)*8, 1) }
+                            // Flag f64-typed params. f64 is not a keyword -- it lexes
+                            // as TT_ID -- so this is a byte compare on the token text,
+                            // the same way the string-param flag does it. Checked as
+                            // `x: f64` and `x f64` alike, since the ':' was already
+                            // skipped above.
+                            let fnl = tokln(nk)
+                            if fnl==3 && r8(src+tokv(nk))=='f' && r8(src+tokv(nk)+1)=='6' && r8(src+tokv(nk)+2)=='4' {
+                                w64(fn_parflt + (fnc*200 + saw_param-1)*8, 1)                            }
                             // Consume the full type expression, tracking [] and ()
                             // nesting; stop at a top-level ',' or ')' (param boundary).
                             let td = 0

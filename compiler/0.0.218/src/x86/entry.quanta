@@ -723,6 +723,14 @@ fn main(argc, argv) {
             // Phase 4.3: tag param vreg with its declared struct type (enables `param.field`)
             let ptyp = r64(fn_partype + (fi*200 + pz)*8)
             if ptyp>=0 { w64(vreg_struct + vr*8, ptyp) }
+            // A parameter declared `: f64` is a float vreg. scanfns records the
+            // flag (fn_parflt); nothing consumed it, so a float arriving as a
+            // parameter was untagged and every float operation on it took the
+            // integer path -- `fn half(x: f64) -> f64 { return x / 2.0; }` then
+            // `half(10.0) == 5.0` was false because `x / 2.0` divided and
+            // compared raw bit patterns. Locals were never affected: they got
+            // their tag from the fconst / i2f that produced them.
+            if r64(fn_parflt + (fi*200 + pz)*8)==1 { w8(vfloat+vr, 1) }
             // P9: tag param vreg with trait type (negative encoding)
             if ptyp < 0-1 { w64(vreg_trait + vr*8, (ptyp * -1) - 2) }
             // 0.0.114: tag param vreg big when declared `: big`

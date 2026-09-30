@@ -256,6 +256,34 @@ let fn_partype = mmap(2000000)
 let fn_parfn = mmap(2000000)
 // 0.0.114: per-fn-param big-type flag. fn_parbig[(fi*200 + z)*8] = 1 when the
 // param is annotated `: big`, so entry.quanta tags the param vreg big.
+// Per-param f64 flag: fn_parflt[(fi*200 + pz)*8] = 1 when the parameter is
+// declared `: f64`.
+//
+// Without this a float parameter was never marked as a float vreg, so
+// IR_ADD/IR_SUB/IR_MUL reached their SSE path only by accident and IR_DIV fell
+// all the way through to the integer idiv -- which raised SIGFPE on the float
+// bit patterns. Float LOCALS worked (their tag comes from the fconst that
+// produced them) which is exactly why the bug survived: `let a: f64 = 10.0;
+// a / 2.0` was fine while `fn f(a: f64) -> f64 { a / 2.0 }` crashed.
+let fn_parflt = mmap(2000000)
+// Per-fn flag: fn_retflt[fi*8] = 1 when the function is declared `-> f64`.
+//
+// A float return came back intact in rax (IR_RET is a plain register move), but
+// nothing told the CALLER that, so the result vreg was untagged and the caller
+// treated the bits as an integer. Symptom: `fn f(a: f64) -> f64 { return a; }`
+// then `printi(f(1.0))` printed 0, and `f(1.0) == 0.1` was false because 1.0's
+// bit pattern read as a huge integer. It only showed up across a call -- a local
+// `let x: f64 = 1.0;` kept its tag from the fconst that produced it.
+// Per-fn PARAMETER flag: fn_parflt[(fi*200 + z)*8] = 1 when parameter z is
+// declared `: f64`. Same shape and indexing as fn_parstr/fn_parbig, which are
+// written from the same metadata record in objfmt.quanta. Needed because nothing
+// else tags an inbound float: fn_retflt covers only the return value, fconst
+// only literals, i2f only conversions. Untagged, a parameter made every float
+// operation on it take the integer path -- `fn half(x: f64) -> f64 { return
+// x / 2.0; }` then `half(10.0) == 5.0` was false because `x / 2.0` divided raw
+// bit patterns.
+let fn_parflt = mmap(2000000)
+let fn_retflt = mmap(2000000)
 let fn_parbig = mmap(2000000)
 // 0.0.166: per-fn-param string flag. fn_parstr[(fi*200 + z)*8] = 1 when the
 // caller passes a string literal for this param, so entry.quanta tags the
