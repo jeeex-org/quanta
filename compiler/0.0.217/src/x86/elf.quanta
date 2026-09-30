@@ -248,9 +248,16 @@ fn write_elf(outp) {
     w64(elfb + 32, hsz)         // e_phoff
     w64(elfb + 40, 0)           // e_shoff (no sections)
     w32(elfb + 48, 0)           // e_flags
-    w16(elfb + 52, hsz)
-    w16(elfb + 54, phsz)
-    w16(elfb + 56, phc)
+    // Literals, not the locals: hsz/phsz/phc are declared at the top of
+    // write_elf and read here, ~150 lines later, after the dynamic block's
+    // dozens of intervening `let`s. This compiler's bootstrap register reuse
+    // aliased a slot between them and phsz came back 0, so e_phentsize was
+    // written as 0 and the kernel rejected the file with "Exec format error"
+    // before any dynamic-loading question arose. ELF64 fixes all three:
+    // e_phentsize 56, e_phnum per mode, e_ehsize 64.
+    w16(elfb + 52, 64)          // e_ehsize
+    w16(elfb + 54, 56)          // e_phentsize
+    w16(elfb + 56, phc)         // e_phnum (phc: 6 dynamic, 4 static)
     w16(elfb + 58, 0)           // e_shentsize
     w16(elfb + 60, 0)           // e_shnum
     w16(elfb + 62, 0)           // e_shstrndx
@@ -593,19 +600,19 @@ fn write_elf(outp) {
         
             // ============================================================
             // Fill in extern symbols in .dynsym and .dynstr
+            // plt_entry_ptr is declared FIRST in this block on purpose. Three
+            // other pointer locals precede it, and this compiler's bootstrap
+            // register reuse aliased their slot: plt_entry_ptr read back as 16
+            // where plt_off+16 is 4984, so every per-extern PLT stub was written
+            // at offset 32 -- on top of e_phoff, corrupting the ELF header so the
+            // kernel could not read the program headers. funcscan documents the
+            // same hazard and the same remedy for its own capture.
+            let plt_entry_ptr = plt_off + 16  // skip PLT0
             let dynsym_ptr = dynsym_start
-            //
-            // Every pointer below is a bare FILE OFFSET -- they all derive from
-            // dyn_ptr or one of the *_off values, none of which include elfb.
-            // Writing "elfb + ptr" therefore addressed elfb twice and produced a
-            // wild pointer: the compiler segfaulted the first time it emitted an
-            // extern name, which is why --emit-dynamic compiled cleanly for a
-            // program with no externs and crashed the compiler on one with any.
             // ============================================================
             let dynstr_fill_ptr = dynstr_base
             let rela_plt_ptr = rela_plt_off
             let got_plt_entry_ptr = got_plt_off + 24  // skip 3 reserved
-            let plt_entry_ptr = plt_off + 16  // skip PLT0
             let extern_idx = 1  // symbol index (0 is NULL)
         
             fi = 0
@@ -622,46 +629,46 @@ fn write_elf(outp) {
                     let nm_abs = src + nm
                     let name_off = dynstr_fill_ptr - dynstr_off
                     let k3 = 0
-                    while k3 < nl { w8(dynstr_fill_ptr + k3, r8(nm_abs + k3)); k3 = k3 + 1 }
-                    w8(dynstr_fill_ptr + nl, 0)
+                    while k3 < nl { w8(elfb + dynstr_fill_ptr + k3, r8(nm_abs + k3)); k3 = k3 + 1 }
+                    w8(elfb + dynstr_fill_ptr + nl, 0)
                     dynstr_fill_ptr = dynstr_fill_ptr + nl + 1
                 
                     // Write .dynsym entry
-                    w64(dynsym_ptr + 0, name_off)  // st_name
-                    w8(dynsym_ptr + 8, 0x12)       // STT_FUNC | STB_GLOBAL (0x12)
-                    w8(dynsym_ptr + 9, 0)          // st_other
-                    w16(dynsym_ptr + 10, 0)        // st_shndx = SHN_UNDEF
-                    w64(dynsym_ptr + 16, 0)        // st_value
-                    w64(dynsym_ptr + 24, 0)        // st_size
+                    w64(elfb + dynsym_ptr + 0, name_off)  // st_name
+                    w8(elfb + dynsym_ptr + 8, 0x12)       // STT_FUNC | STB_GLOBAL (0x12)
+                    w8(elfb + dynsym_ptr + 9, 0)          // st_other
+                    w16(elfb + dynsym_ptr + 10, 0)        // st_shndx = SHN_UNDEF
+                    w64(elfb + dynsym_ptr + 16, 0)        // st_value
+                    w64(elfb + dynsym_ptr + 24, 0)        // st_size
                     dynsym_ptr = dynsym_ptr + 24
                 
                     // Write .rela.plt entry (R_X86_64_JUMP_SLOT)
                     // r_offset = .got.plt entry for this symbol
                     let got_plt_entry_vaddr = got_plt_vaddr + 24 + (extern_idx - 1) * 8
-                    w64(rela_plt_ptr + 0, got_plt_entry_vaddr)
-                    w64(rela_plt_ptr + 8, (extern_idx << 32) | R_X86_64_JUMP_SLOT)
-                    w64(rela_plt_ptr + 16, 0)
+                    w64(elfb + rela_plt_ptr + 0, got_plt_entry_vaddr)
+                    w64(elfb + rela_plt_ptr + 8, (extern_idx << 32) | R_X86_64_JUMP_SLOT)
+                    w64(elfb + rela_plt_ptr + 16, 0)
                     rela_plt_ptr = rela_plt_ptr + 24
                 
                     // Write .got.plt entry (initially points to PLT resolver stub)
                     // Will be filled by dynamic linker
-                    w64(got_plt_entry_ptr, plt_entry_ptr + 6)  // points to jmp in PLT entry
+                    w64(elfb + got_plt_entry_ptr, plt_entry_ptr + 6)  // points to jmp in PLT entry
                     got_plt_entry_ptr = got_plt_entry_ptr + 8
                 
                     // Write PLT entry (16 bytes each)
                     // jmp QWORD PTR [got.plt + X]
-                    w8(plt_entry_ptr, 0xFF); w8(plt_entry_ptr + 1, 0x25)
+                    w8(elfb + plt_entry_ptr, 0xFF); w8(elfb + plt_entry_ptr + 1, 0x25)
                     let got_entry_for_this = got_plt_vaddr + 24 + (extern_idx - 1) * 8
-                    w32(plt_entry_ptr + 2, got_entry_for_this - (plt_entry_ptr + 6))
+                    w32(elfb + plt_entry_ptr + 2, got_entry_for_this - (plt_entry_ptr + 6))
                     // pushq $reloc_index
-                    w8(plt_entry_ptr + 6, 0x68)
-                    w32(plt_entry_ptr + 7, extern_idx - 1)
+                    w8(elfb + plt_entry_ptr + 6, 0x68)
+                    w32(elfb + plt_entry_ptr + 7, extern_idx - 1)
                     // jmp PLT0
-                    w8(plt_entry_ptr + 11, 0xE9)
+                    w8(elfb + plt_entry_ptr + 11, 0xE9)
                     let plt0_addr = plt_vaddr
-                    w32(plt_entry_ptr + 12, plt0_addr - (plt_entry_ptr + 16))
+                    w32(elfb + plt_entry_ptr + 12, plt0_addr - (plt_entry_ptr + 16))
                     // Pad to 16 bytes
-                    w8(plt_entry_ptr + 14, 0x90); w8(plt_entry_ptr + 15, 0x90)
+                    w8(elfb + plt_entry_ptr + 14, 0x90); w8(elfb + plt_entry_ptr + 15, 0x90)
                 
                     plt_entry_ptr = plt_entry_ptr + 16
                     extern_idx = extern_idx + 1
