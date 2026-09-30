@@ -297,16 +297,31 @@ fn scanfns() {
                 let rj = kstart
                 let rlim = tokc
                 if rj + 400 < rlim { rlim = rj + 400 }   // bounded: a signature is not 400 tokens
+                // '->' is lexed as ONE multichar operator token: ismop() matches
+                // `b1==45&&b2==62` and the token stores mopv(p) = c1*256 + c2, so its
+                // TT_OP value is 45*256+62 == 11582. It is NOT 45, and NOT two tokens
+                // (45 then 62) -- both were tried first and neither matched.
+                //
+                // Only the arrow at PARAMETER-LIST depth counts. A parameter's own type
+                // may contain one (a function-typed parameter, `f: fn(i64) -> f64`),
+                // and matching that would capture the parameter's return type as the
+                // function's own. Without the depth check, `fn gg(ptr: i64) -> f64`
+                // was fine but a function with such a parameter captured the wrong
+                // name -- and, measured, `fn_retflt` ended up 0 for any function with
+                // a parameter, because the nested arrow was matched first.
+                // kstart points AT the '(' that opens the parameter list, so the
+                // loop begins already inside it.
+                let pdepth = 1
                 while rj + 1 < rlim {
-                    // stop at the body: everything after '{' or ';' is not a signature
-                    if tokt(rj)==TT_PNCT && (tokv(rj)==123 || tokv(rj)==59) { break }
-                    // '->' is lexed as ONE multichar operator token: ismop() matches
-                    // `b1==45&&b2==62` and the token stores mopv(p) = c1*256 + c2, so
-                    // its TT_OP value is 45*256+62 == 11582. It is NOT 45, and NOT
-                    // two tokens (45 then 62) -- both of those were tried first and
-                    // neither matched, which is why the return type read as absent
-                    // and fn_retflt stayed 0 for every function.
-                    if tokt(rj)==TT_OP && tokv(rj)==11582 {
+                    if tokt(rj)==TT_PNCT {
+                        if tokv(rj)==40 { pdepth = pdepth + 1 }        // '(' nested in a type
+                        if tokv(rj)==41 {                              // ')' closes one
+                            if pdepth == 1 { rj = rj + 1; break }     // back to top level: signature ends
+                            pdepth = pdepth - 1
+                        }
+                        if pdepth == 0 && (tokv(rj)==123 || tokv(rj)==59) { break }  // body or decl end
+                    }
+                    if pdepth == 1 && tokt(rj)==TT_OP && tokv(rj)==11582 {
                         let rt = rj + 1
                         if rt < tokc && (tokt(rt)==TT_ID || tokt(rt)==TT_KEY) {
                             ret_type_name = tokv(rt)

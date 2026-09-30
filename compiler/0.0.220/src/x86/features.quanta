@@ -394,6 +394,12 @@ fn compile_error(kind, nm, nl) {
 // are mutually recursive with the builtin breaking the cycle, so honouring
 // user-wins for them is infinite recursion and the self-host stops bootstrapping.
 fn is_prim_intrin(nm,nl) {
+    // Primitive, so a user function of the same name cannot shadow it the way a
+    // user `fn abs` used to hijack the float builtin.
+    // f64_load(p): the TYPED float load. mem_load is untyped and therefore
+    // untagged, which silently pushes every enclosing float op onto the integer
+    // path. Name length is 8: f,6,4,_,l,o,a,d.
+    if nl==8&&r8(src+nm)=='f'&&r8(src+nm+1)=='6'&&r8(src+nm+2)=='4'&&r8(src+nm+3)=='_'&&r8(src+nm+4)=='l'&&r8(src+nm+5)=='o'&&r8(src+nm+6)=='a'&&r8(src+nm+7)=='d' { return 1 }
     if nl==8&&r8(src+nm)=='m'&&r8(src+nm+1)=='e'&&r8(src+nm+2)=='m'&&r8(src+nm+3)=='_'&&r8(src+nm+4)=='l'&&r8(src+nm+5)=='o'&&r8(src+nm+6)=='a'&&r8(src+nm+7)=='d' { return 1 }
     if nl==9&&r8(src+nm)=='m'&&r8(src+nm+1)=='e'&&r8(src+nm+2)=='m'&&r8(src+nm+3)=='_'&&r8(src+nm+4)=='l'&&r8(src+nm+5)=='o'&&r8(src+nm+6)=='a'&&r8(src+nm+7)=='d'&&r8(src+nm+8)=='8' { return 1 }
     if nl==9&&r8(src+nm)=='m'&&r8(src+nm+1)=='e'&&r8(src+nm+2)=='m'&&r8(src+nm+3)=='_'&&r8(src+nm+4)=='s'&&r8(src+nm+5)=='t'&&r8(src+nm+6)=='o'&&r8(src+nm+7)=='r'&&r8(src+nm+8)=='e' { return 1 }
@@ -408,6 +414,10 @@ fn is_prim_intrin(nm,nl) {
 }
 
 fn is_bltn(nm,nl) {
+    // f64_load(p): the TYPED float load. mem_load is untyped and therefore
+    // untagged, which silently pushes every enclosing float op onto the integer
+    // path. Name length is 8: f,6,4,_,l,o,a,d.
+    if nl==8&&r8(src+nm)=='f'&&r8(src+nm+1)=='6'&&r8(src+nm+2)=='4'&&r8(src+nm+3)=='_'&&r8(src+nm+4)=='l'&&r8(src+nm+5)=='o'&&r8(src+nm+6)=='a'&&r8(src+nm+7)=='d' { return 1 }
     if nl>=8&&r8(src+nm)=='m'&&r8(src+nm+1)=='e'&&r8(src+nm+2)=='m'&&r8(src+nm+3)=='_' { return 1 } // mem_*
     // memcpy(dst, src, n): rep movsb (forward).  m-e-m-c-p-y
     if nl==6&&r8(src+nm)=='m'&&r8(src+nm+1)=='e'&&r8(src+nm+2)=='m'&&r8(src+nm+3)=='c'&&r8(src+nm+4)=='p'&&r8(src+nm+5)=='y' { return 1 }
