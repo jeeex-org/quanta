@@ -1,0 +1,388 @@
+// Write functions + IR to .qobj with portable string format
+//
+// FORMAT v8 (see docs/QOBJ_ROADMAP.md):
+//   header   32B  magic, version=8, fn_count, ir_count, name_bytes, meta_bytes,
+//                   pool_bytes, param_bytes
+//   entries  32B  x emitted_count  str_off, name_len, pcount, ir_count, meta_off, rsv*3
+//   names         name_bytes    NUL-terminated function names
+//   meta          meta_bytes    144B x emitted_count  (see below)
+//   params        param_bytes   NUL-terminated param names, fn entry order
+//   pool          pool_bytes    NUL-terminated strings referenced by IR_CALL/IR_STR
+//   IR            ir_count*40B  IR records, fn entry order
+//
+// The v8 metadata record exists because codegen reads per-function tables that
+// are NOT recoverable from IR alone. An imported function whose fn_partype /
+// fn_parbig / fn_retstruct / fn_retbig / fn_rettype* are zero will be emitted
+// with wrong vreg type tags and dereference a garbage frame slot at runtime.
+// fn_pnames is carried in the separate param blob (variable length).
+//
+//   meta record (144B) -- every field is 8-byte aligned on purpose:
+//    0   rettype_name_off (into `src`, 0 = none)
+//    8   rettype_len
+//   16   retstruct      -1 = none
+//   24   retbig          0 = normal, 1 = : big
+//   32   partype[0..3]   first 4 param struct/trait type ids (-1 = none)
+//   64   parbig[0..3]    per-param : big flags
+//   96   parstr[0..3]    per-param "was a string literal at the call site" flags
+//  128   genparams       count of generic type parameters
+//   ..   genparam_names offset/length pairs are carried in the param blob tail
+//
+// v7 packed retstruct/retbig and the param arrays on 4-byte boundaries, so the
+// two w64 writes to adjacent fields OVERLAPPED: writing retbig clobbered the low
+// half of retstruct, and a -1 sentinel became 0x00000000FFFFFFFF = 4294967295,
+// which codegen read as a struct index. v8 puts every scalar and array on its
+// own 8-byte boundary, and the reader rejects any version != 8.
+// === G4: source fingerprint ===
+// Hash of the module's OWN source file, so a consumer can tell a fresh cache
+// from a stale one and recompile instead of silently reusing old IR.
+//
+// Deliberately a content hash of the source FILE, not of the expanded text and
+// not an mtime:
+//   - not mtime: the language exposes no stat() intrinsic, and mtime is wrong in
+//     the case that matters -- a cache is routinely copied or checked out next
+//     to its source, which moves one and not the other. A content hash is stable
+//     under copy and detects the real condition: the bytes changed.
+//   - not the expanded text: the consumer must recompute this cheaply, from one
+//     file. Hashing the expansion would mean redoing the import expansion, which
+//     is precisely the work the cache exists to avoid.
+//
+// Returns 0 when the path is unknown or unreadable, which the consumer reads as
+// "no fingerprint recorded" and therefore "trust the cache" -- required for the
+// G3/G5 cache-only path, where no source is present at all.
+fn qobj_file_fingerprint(path) -> i64 {
+  if path == 0 { return 0 }
+  let fd = file_open(path, 0)
+  if fd < 0 { return 0 }
+  let buf = mmap(1048576)
+  let n = file_read(fd, buf, 1048576)
+  file_close(fd)
+  if n <= 0 { return 0 }
+  let h = 2166136261
+  let i = 0
+  while i < n {
+    h = h ^ r8(buf + i)
+    h = (h * 16777619) & 4294967295
+    i = i + 1
+  }
+  return h | ((n & 4294967295) << 32)
+}
+
+fn qobj_write(path, src_path) -> i64 {
+  // 577 = O_WRONLY|O_CREAT|O_TRUNC. O_CREAT REQUIRES a third mode argument:
+  // without it the emitter leaves rdx holding whatever the previous syscall left
+  // there, so the kernel masked that garbage against the umask and created the
+  // cache unreadable (observed mode 0111). The compiler then could not re-open
+  // its own cache -- open() returned EACCES, the cache lookup treated it as
+  // absent, and every cache-only build died with imp_err -> exit(16). 493 = 0755,
+  // matching the ELF writer's own output-file mode.
+  let fd = file_open(path, 577, 493)
+  if fd < 0 { return 0 }
+
+  // ---- pass 1: sizes ----
+  let fn_count = 0
+  let total_name_bytes = 0
+  let total_ir_records = 0
+  let total_param_bytes = 0
+  let i = 0
+  while i < fnc {
+    let ic = r64(fn_ir_count + i*8)
+    if ic > 0 {
+      fn_count = fn_count + 1
+      total_name_bytes = total_name_bytes + r64(fns + i*FNS + 8) + 1
+      total_ir_records = total_ir_records + ic
+      let pc = r64(fn_pcount + i*8)
+      let pb = r64(fn_pbase + i*8)
+      let z = 0
+      while z < pc {
+        total_param_bytes = total_param_bytes + r64(fn_pnames + pb + z*16 + 8) + 1
+        z = z + 1
+      }
+    }
+    i = i + 1
+  }
+  // Only functions with at least one IR record get an entry, a name blob, a
+  // metadata record and a parameter blob -- every region below is written
+  // inside `if ic > 0`. So the region sizes must be counted from the
+  // functions that are actually emitted, NOT from fn_count.
+  //
+  // Counting from fn_count made meta_bytes larger than the bytes on disk for
+  // any module containing a function with zero IR records. The reader then
+  // read past the end of the metadata region into the pool/IR region or off
+  // the end of the file entirely, got a SHORT READ that nothing checked, and
+  // parsed the garbage it had buffered. That is what made the cache-only
+  // build fail at a rate that varied run to run: the read landed wherever
+  // the mapping boundaries happened to fall.
+  let emitted = 0
+  let i0 = 0
+  while i0 < fnc {
+    if r64(fn_ir_count + i0*8) > 0 { emitted = emitted + 1 }
+    i0 = i0 + 1
+  }
+  let meta_bytes = emitted * 144
+
+  // String pool: IR_CALL.a0 and IR_STR.a0 are byte offsets into `src`, which is
+  // meaningless in another process. Serialise the referenced bytes so the reader
+  // can rebase them. Every such pointer is stored as its own NUL-terminated pool
+  // entry, in the same order the IR records appear, so the reader can walk both
+  // streams in lockstep and needs no side table.
+  let total_pool_bytes = 0
+  i = 0
+  while i < fnc {
+    let ic = r64(fn_ir_count + i*8)
+    if ic > 0 {
+      let s0 = r64(fn_ir_start + i*8)
+      let j = 0
+      while j < ic {
+        let r = qir + (s0 + j)*IRS
+        let op = r64(r)
+        if op == 17 || op == 23 {
+          let a0 = r64(r + 16)
+          if a0 < srclen {
+            // Length rule MUST match len_name(), which is what codegen uses to
+            // recover an IR_CALL callee's name. Scanning to NUL is wrong: a
+            // callee name is a bare token in `src`, not NUL-terminated, so that
+            // captured a single character and produced an unusable cache.
+            let L = 0
+            if op == 23 {
+              // IR_STR points at the opening quote; include through the closing one.
+              while L < 4096 && a0 + L < srclen && r8(src + a0 + L) != 34 { L = L + 1 }
+              if L < 4096 { L = L + 1 }
+            } else {
+              while L < 256 {
+                if a0 + L >= srclen { break }
+                let c = r8(src + a0 + L)
+                if c==0 || c==40 || c==41 || c==59 || c==123 || c==125 || c==44 || c==32 || c==9 || c==10 || c==13 { break }
+                L = L + 1
+              }
+            }
+            total_pool_bytes = total_pool_bytes + L + 1
+          }
+        }
+        j = j + 1
+      }
+    }
+    i = i + 1
+  }
+
+  // ---- header ----
+  let hdr = mmap(80)
+  w32(hdr, 0x514F424A)   // "QOBJ"
+  w32(hdr + 4, 10)        // version (10: adds the dependency fingerprint list)
+  w32(hdr + 8, fn_count)
+  w32(hdr + 12, total_ir_records)
+  w32(hdr + 16, total_name_bytes)
+  w32(hdr + 20, meta_bytes)
+  w32(hdr + 24, total_pool_bytes)
+  w32(hdr + 28, total_param_bytes)
+  // G4: fingerprint of the source this cache was built from. Version 9 is
+  // mandatory, not cosmetic: a v8 cache has no fingerprint, so a consumer that
+  // read one under the old rule would treat "no fingerprint" as "trust me" and
+  // silently reuse stale IR. Rejecting v8 outright forces a rebuild, which is
+  // the correct behaviour for a cache whose staleness cannot be established.
+  let fp = qobj_file_fingerprint(src_path)
+  w32(hdr + 32, fp & 4294967295)
+  w32(hdr + 36, (fp >> 32) & 4294967295)
+  // G4 transitive: dep_count/dep_bytes describe the dependency region appended
+  // after every other region. v10 is mandatory, not cosmetic -- a v9 cache has
+  // no dependency list, so its transitive validity cannot be established, and
+  // accepting one is exactly the staleness this version exists to catch.
+  w32(hdr + 40, imp_srcpc)
+  w32(hdr + 44, imp_srcpc * QOBJ_DEP_REC)
+  file_write(fd, hdr, 48)
+
+  if fn_count > 0 {
+    // ---- entries ----
+    let str_off = 0
+    let meta_off = 0
+    i = 0
+    while i < fnc {
+      let ic = r64(fn_ir_count + i*8)
+      if ic > 0 {
+        let name_len = r64(fns + i*FNS + 8)
+        let e = mmap(64)
+        w32(e, str_off)
+        w32(e + 4, name_len)
+        w32(e + 8, r64(fn_pcount + i*8))
+        w32(e + 12, ic)          // per-function IR record count
+        w32(e + 16, meta_off)    // offset into the meta region
+        w32(e + 20, 0)
+        w32(e + 24, 0)
+        w32(e + 28, 0)
+        file_write(fd, e, 32)
+        str_off = str_off + name_len + 1
+        // Must match the record size actually written below (144B, and
+        // meta_bytes = emitted * 144). This advanced by 128 while 144 bytes were
+        // written, so every function after the first pointed 16 bytes BEFORE its
+        // real record -- landing in the previous function's partype/parbig/
+        // parstr arrays. The reader then loaded another function's metadata:
+        // garbage fn_retstruct/fn_retbig, which codegen turns into a bogus
+        // struct index and a bogus frame slot. A single-function module hid it
+        // completely, which is why every one-function test passed.
+        meta_off = meta_off + 144
+      }
+      i = i + 1
+    }
+
+    // ---- function-name blobs ----
+    i = 0
+    while i < fnc {
+      let ic = r64(fn_ir_count + i*8)
+      if ic > 0 {
+        let name_ptr = r64(fns + i*FNS)
+        let name_len = r64(fns + i*FNS + 8)
+        if name_len > 0 {
+          let nb = mmap(name_len + 8)
+          let j = 0
+          while j < name_len { w8(nb+j, r8(src+name_ptr+j)); j = j + 1 }
+          file_write(fd, nb, name_len)
+        }
+        let nul = mmap(8)
+        w8(nul, 0)
+        file_write(fd, nul, 1)
+      }
+      i = i + 1
+    }
+
+    // ---- per-function metadata records ----
+    i = 0
+    while i < fnc {
+      let ic = r64(fn_ir_count + i*8)
+      if ic > 0 {
+        let m = mmap(144)
+        w64(m + 0,  r64(fn_rettype_name + i*8))
+        w64(m + 8,  r64(fn_rettype_len + i*8))
+        w64(m + 16, r64(fn_retstruct + i*8))
+        w64(m + 24, r64(fn_retbig + i*8))
+        let pc2 = r64(fn_pcount + i*8)
+        let k = 0
+        while k < pc2 {
+          if k < 4 {
+            w64(m + 32 + k*8, r64(fn_partype + (i*200 + k)*8))
+            w64(m + 64 + k*8, r64(fn_parbig + (i*200 + k)*8))
+            w64(m + 96 + k*8, r64(fn_parstr + (i*200 + k)*8))
+          }
+          k = k + 1
+        }
+        w64(m + 128, r64(fn_genparams + i*8))
+        // Params beyond the 4 slots stored above are not serialized; the reader
+        // leaves their type tags at 0, which codegen treats as "plain integer".
+        // No zero-fill pass: it would overwrite the parstr slots just written.
+        file_write(fd, m, 144)
+      }
+      i = i + 1
+    }
+
+    // ---- param-name blobs ----
+    i = 0
+    while i < fnc {
+      let ic = r64(fn_ir_count + i*8)
+      if ic > 0 {
+        let pc3 = r64(fn_pcount + i*8)
+        let pb3 = r64(fn_pbase + i*8)
+        let z = 0
+        while z < pc3 {
+          let pnm = r64(fn_pnames + pb3 + z*16)
+          let pnl = r64(fn_pnames + pb3 + z*16 + 8)
+          if pnl > 0 {
+            let pb5 = mmap(pnl + 8)
+            let y = 0
+            while y < pnl { w8(pb5+y, r8(src+pnm+y)); y = y + 1 }
+            file_write(fd, pb5, pnl)
+          }
+          let pn = mmap(8)
+          w8(pn, 0)
+          file_write(fd, pn, 1)
+          z = z + 1
+        }
+      }
+      i = i + 1
+    }
+
+    // ---- string pool (NUL-terminated, same order as the IR walk) ----
+    i = 0
+    while i < fnc {
+      let ic = r64(fn_ir_count + i*8)
+      if ic > 0 {
+        let s0 = r64(fn_ir_start + i*8)
+        let j = 0
+        while j < ic {
+          let r = qir + (s0 + j)*IRS
+          let op = r64(r)
+          if op == 17 || op == 23 {
+            let a0 = r64(r + 16)
+            if a0 < srclen {
+              // Same length rule as the sizing pass above (and as len_name()).
+              let L = 0
+              if op == 23 {
+                while L < 4096 && a0 + L < srclen && r8(src + a0 + L) != 34 { L = L + 1 }
+                if L < 4096 { L = L + 1 }
+              } else {
+                while L < 256 {
+                  if a0 + L >= srclen { break }
+                  let c = r8(src + a0 + L)
+                  if c==0 || c==40 || c==41 || c==59 || c==123 || c==125 || c==44 || c==32 || c==9 || c==10 || c==13 { break }
+                  L = L + 1
+                }
+              }
+              if L > 0 {
+                let sb = mmap(L + 8)
+                let y = 0
+                while y < L { w8(sb + y, r8(src + a0 + y)); y = y + 1 }
+                file_write(fd, sb, L)
+              }
+              let sn = mmap(8)
+              w8(sn, 0)
+              file_write(fd, sn, 1)
+            }
+          }
+          j = j + 1
+        }
+      }
+      i = i + 1
+    }
+
+    // ---- IR records ----
+    i = 0
+    while i < fnc {
+      let ic = r64(fn_ir_count + i*8)
+      if ic > 0 {
+        let s0 = r64(fn_ir_start + i*8)
+        let j = 0
+        while j < ic {
+          let r = mmap(64)
+          w64(r,      r64(qir + (s0 + j)*IRS))
+          w64(r + 8,  r64(qir + (s0 + j)*IRS + 8))
+          w64(r + 16, r64(qir + (s0 + j)*IRS + 16))
+          w64(r + 24, r64(qir + (s0 + j)*IRS + 24))
+          w64(r + 32, r64(qir + (s0 + j)*IRS + 32))
+          file_write(fd, r, 40)
+          j = j + 1
+        }
+      }
+      i = i + 1
+    }
+  }
+
+  // ---- G4 dependency region (appended last) ----
+  if imp_srcpc > 0 {
+    let dbuf = mmap(8192)
+    let dj = 0
+    while dj < imp_srcpc {
+      let sp = imp_srcpaths + dj*4096
+      let sl = 0
+      while sl < 4095 && r8(sp+sl) != 0 { sl = sl + 1 }
+      w32(dbuf, sl)
+      let dk = 0
+      while dk < sl { w8(dbuf+4+dk, r8(sp+dk)); dk = dk+1 }
+      w8(dbuf+4+sl, 0)
+      let dfp = qobj_file_fingerprint(sp)
+      w32(dbuf + 4 + QOBJ_DEP_PATH, dfp & 4294967295)
+      w32(dbuf + 4 + QOBJ_DEP_PATH + 4, (dfp >> 32) & 4294967295)
+      let wn = file_write(fd, dbuf, QOBJ_DEP_REC)
+      dj = dj + 1
+    }
+  }
+
+  file_close(fd)
+  return 1
+}
