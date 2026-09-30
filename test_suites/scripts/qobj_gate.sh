@@ -68,6 +68,32 @@ $QC main.quanta out_co >/dev/null 2>&1; chk "G5 cache-only compile" 0 $?
 chk "  G5 cache-only result" "$want" "$(runrc ./out_co)"
 mv $W/bak/*.quanta lib/std/ 2>/dev/null
 
+# ---- f64 PARAM through the cache (0.0.219) ----------------------------------
+# fn_parflt records which params are declared `: f64`, and that flag has to
+# survive a round trip through the cache. It did not: a cached module taking an
+# f64 param reloaded with the float tag missing, so every float operation on
+# that param took the integer path. The failure is SILENT -- no diagnostic, a
+# wrong number -- so the integer-only fixtures above could not catch it.
+#
+# main -> fmath.q -> half(third(12.0)); expected 2.0.
+printf 'fn half(x: f64) -> f64 {\n  return x / 2.0\n}\n' > lib/std/half.quanta
+printf 'fn third(x: f64) -> f64 {\n  return x / 3.0\n}\n' > lib/std/third.quanta
+printf 'import std/half\nimport std/third\nfn q(x: f64) -> f64 {\n  return half(third(x))\n}\n' > lib/std/fmath.quanta
+printf 'import std/fmath\nfn main() -> i32 {\n  if q(12.0) != 2.0 { return 1; }\n  return 42\n}\n' > mainf.quanta
+
+rm -f outf_src; $QC mainf.quanta outf_src >/dev/null 2>&1; chk "f64 param source compile" 0 $?
+fwant=$(runrc ./outf_src)
+if [ "$fwant" = 42 ]; then echo "  PASS f64 param source result (=42)"; PASS=$((PASS+1));
+else echo "  FAIL f64 param source result is $fwant, want 42 (fixture broken)"; FAIL=$((FAIL+1)); fi
+
+for m in half third fmath; do $QC --emit-qobj lib/std/$m.quanta lib/std/$m.qobj >/dev/null 2>&1; done
+for m in half third fmath; do mv lib/std/$m.quanta $W/bak/ 2>/dev/null; done
+rm -f outf_co
+$QC mainf.quanta outf_co >/dev/null 2>&1; chk "f64 param cache-only compile" 0 $?
+chk "  f64 param cache-only result" "$fwant" "$(runrc ./outf_co)"
+for m in half third fmath; do mv $W/bak/$m.quanta lib/std/ 2>/dev/null; done
+rm -f lib/std/half.qobj lib/std/third.qobj lib/std/fmath.qobj
+
 # ---- G5: determinism (byte-identity) ---------------------------------------
 h=""; same=1
 for i in 1 2 3; do

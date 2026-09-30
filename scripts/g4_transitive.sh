@@ -2,8 +2,10 @@
 # G4 transitive: a cache must be rejected when an IMPORTED module changes, even
 # though the cached module's own source is untouched.
 # Bounded: at most 12 lines.
+REPO=$(cd "$(dirname "$(readlink -f "$0")")/.." && pwd)
+V=$(cat "$REPO/VERSION")
 ulimit -c 0
-Q=${QC:-/tmp/v10/qc}
+Q=${QC:-}
 case $Q in /*) ;; *) Q=$(cd "$(dirname "$Q")" 2>/dev/null && pwd)/$(basename "$Q") ;; esac
 W=/tmp/g4trans
 PASS=0; FAIL=0
@@ -19,8 +21,14 @@ printf 'import std/top\nfn main() {\n  return top(1)\n}\n'            > main.qua
 # top's cache embeds mid AND leaf (it is self-contained), so it must list both.
 $Q --emit-qobj lib/std/top.quanta lib/std/top.qobj >/dev/null 2>&1
 chk "cache written" 0 "$([ -f lib/std/top.qobj ] && echo 0 || echo 1)"
-chk "version 10" 10 "$(python3 -c "
-import struct;print(struct.unpack_from('<i',open('lib/std/top.qobj','rb').read(),4)[0])")"
+# Same rule as g4_verify.sh: compare against the writer's declared version
+# rather than a literal, so a format bump is not a false failure.
+# Take the number AFTER the comma -- grepping all digits would match the 4 in
+# "hdr + 4" first and yield 4, not the version.
+WVER=$(grep -oE 'w32\(hdr \+ 4, [0-9]+\)' "$REPO/compiler/$(cat "$REPO/VERSION")/src/x86/qobj_write.quanta" | head -1 | grep -oE '[0-9]+\)$' | tr -d ')')
+CVER=$(python3 -c "
+import struct;print(struct.unpack_from('<i',open('lib/std/top.qobj','rb').read(),4)[0])")
+chk "version matches writer" "$WVER" "$CVER"
 chk "dep_count >= 2 (mid+leaf)" 1 "$(python3 -c "
 import struct
 d=open('lib/std/top.qobj','rb').read()

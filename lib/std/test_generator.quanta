@@ -12,6 +12,58 @@ import std/fs
 const TEST_CAP = 10000;
 
 // Build path string using Quanta string format
+// slugify(s) -> Quanta string: a PATH-SAFE form of a human display title.
+//
+// 0.0.219: `module` in gap_specs.json is a DISPLAY title ("Revenue Recognition",
+// "Arrays & Lists", "SOC 1"), and 1602 of them contain whitespace or shell
+// metacharacters. build_test_path() used it verbatim, so the generated filename
+// was `std_accounting_GAAP_Revenue Recognition_const_test.quanta` and the
+// `import std/...` line the generator writes ended at the first space. The
+// tokeniser then treated the remainder as the compiler's OUTPUT PATH and wrote
+// a file whose name was whatever came next -- which is how 21 files named
+// "A", "B", ";", ">", "@" appeared in the project root on every gate run. The
+// generator's own test (std_test_generator_const_test) ran it, so the gate kept
+// re-creating the mess.
+//
+// Rule: any byte that is not [A-Za-z0-9] or '_' becomes '_'; runs of '_'
+// collapse to one; leading/trailing '_' are trimmed. The display title is
+// still what gets written into the file's header comment -- only the PATH uses
+// the slug.
+fn slugify(s) -> i64 {
+    let n = len(s);
+    let cap = n + 8;
+    let out = mem_alloc(cap + 9);
+    mem_store(out, cap);
+    let pos = 8;
+    let last_us = 1;   // suppress a leading '_'
+    let i = 0;
+    while i < n {
+        let c = mem_load8(s + 8 + i);
+        let ok = 0;
+        if c >= 65 && c <= 90 { ok = 1 }
+        if c >= 97 && c <= 122 { ok = 1 }
+        if c >= 48 && c <= 57 { ok = 1 }
+        if c == 95 { ok = 1 }
+        if ok == 1 {
+            mem_store8(out + pos, c);
+            pos = pos + 1;
+            last_us = 0;
+        } else {
+            if last_us == 0 {
+                mem_store8(out + pos, 95);
+                pos = pos + 1;
+                last_us = 1;
+            }
+        }
+        i = i + 1;
+    }
+    // trim a trailing '_'
+    if last_us == 1 && pos > 8 { pos = pos - 1 }
+    mem_store(out, pos - 8);
+    mem_store8(out + pos, 0);
+    return out;
+}
+
 fn build_test_path(domain, category, module) -> i64 {
     let base = "test_suites/codes/std_";
     let suffix = "_const_test.quanta";
@@ -71,25 +123,34 @@ fn build_test_path(domain, category, module) -> i64 {
 }
 
 fn generate_const_test(domain, category, module) -> i64 {
-    let path = build_test_path(domain, category, module);
+    // The PATH and the emitted `import` must use the slug; the header comment
+    // keeps the display title so the file still reads correctly.
+    let dslug = slugify(domain);
+    let cslug = slugify(category);
+    let mslug = slugify(module);
+    if dslug == 0 || cslug == 0 || mslug == 0 { return 0; }
+    let path = build_test_path(dslug, cslug, mslug);
     if path == 0 { return 0; }
     
     let fd = file_open(path, 577);
     if fd < 0 { return 0; }
     
-    // Write header
+    // Write header (DISPLAY titles -- this is prose, spaces are fine here)
     file_write(fd, "// Auto-generated const test for std_", 37);
     file_write(fd, domain + 8, len(domain));
     file_write(fd, "_", 1);
     file_write(fd, category + 8, len(category));
     file_write(fd, "_", 1);
     file_write(fd, module + 8, len(module));
+    // The import is CODE, so it takes the slug. A display title here truncated
+    // the import at the first space and handed the rest to the compiler as an
+    // output path -- the source of the stray root files.
     file_write(fd, "\nimport std/", 11);
-    file_write(fd, domain + 8, len(domain));
+    file_write(fd, dslug + 8, len(dslug));
     file_write(fd, "_", 1);
-    file_write(fd, category + 8, len(category));
+    file_write(fd, cslug + 8, len(cslug));
     file_write(fd, "_", 1);
-    file_write(fd, module + 8, len(module));
+    file_write(fd, mslug + 8, len(mslug));
     file_write(fd, "\nfn main() {\n    return 0\n}\n", 30);
     
     file_close(fd);

@@ -7,13 +7,22 @@ set -e
 # that must not abort the gate.
 ulimit -c 0 2>/dev/null || true
 
-QC="${QC:-./compiler/$(cat VERSION)/bin/x86/qc}"
+REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
+QC="${QC:-$REPO/compiler/$(cat "$REPO/VERSION")/bin/x86/qc}"
 TEST_SUITES="./test_suites"
 PASS=0
 FAIL=0
 COMPILE_FAIL=0
 
 mkdir -p "$TEST_SUITES/bin"
+# Scratch cwd for test runs. Symlink every top-level repo entry in, so a test
+# that reads a repo-relative path still finds it, while a test that WRITES drops
+# the file here instead of in the project root.
+rm -rf "$TEST_SUITES/run"; mkdir -p "$TEST_SUITES/run"
+for e in "$REPO"/* "$REPO"/.gitattributes "$REPO"/.gitignore; do
+  [ -e "$e" ] || continue
+  ln -sfn "$e" "$TEST_SUITES/run/$(basename "$e")" 2>/dev/null || true
+done
 
 # Compile all test codes
 echo "=== Compiling test suite ==="
@@ -39,7 +48,20 @@ while IFS=$'\t' read -r name expected; do
     continue
   fi
   set +e
-  ./scripts/quanta_run.sh "$bin" < /dev/null > /dev/null 2>&1
+  # Run from a scratch cwd. A test that writes a file (test_generator does)
+  # would otherwise drop it in the project root, and a path built from an
+  # unquoted title can land anywhere at all. The 0.0.219 root debris -- 21
+  # files named "A", "B", ";", ">", "@" -- was exactly this.
+  # Resolve the absolute path FIRST -- inside the subshell, `cd ..` is relative
+  # to the new cwd, so doing it there yields test_suites/ and the runner reports
+  # "not executable" (rc 2) for every test.
+  #
+  # $TEST_SUITES/run is a symlink farm, not an empty dir: it contains links to
+  # the repo's top-level entries. Tests that open a repo-relative path
+  # (file_open_test opens "test_suites/codes/simple.quanta") still resolve,
+  # while a test that WRITES still lands in the scratch dir, not the root.
+  abs_bin="$(cd "$(dirname "$bin")" && pwd)/$(basename "$bin")"
+  ( cd "$TEST_SUITES/run" && "$REPO/scripts/quanta_run.sh" "$abs_bin" ) < /dev/null > /dev/null 2>&1
   actual=$?
   if [ "$actual" = "$expected" ]; then
     echo "  PASS $name (rc=$actual)"

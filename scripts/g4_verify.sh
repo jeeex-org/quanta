@@ -3,6 +3,8 @@
 #
 # A cache written from source S must not be reused after S changes, and must
 # still be reusable when S is unchanged or absent. Bounded: at most 12 lines.
+REPO=$(cd "$(dirname "$(readlink -f "$0")")/.." && pwd)
+V=$(cat "$REPO/VERSION")
 ulimit -c 0
 # Resolve the compiler to an ABSOLUTE path before the cd to $W below. The gate
 # passes QC=compiler/0.0.217/bin/x86/qc -- a repo-relative path that no longer
@@ -27,8 +29,20 @@ printf 'import std/agg\nfn main() {\n  return agg(5)\n}\n' > main.quanta
 
 for m in inc dbl agg; do $Q --emit-qobj lib/std/$m.quanta lib/std/$m.qobj >/dev/null 2>&1; done
 chk "3 caches written" 3 "$(ls lib/std/*.qobj 2>/dev/null | wc -l)"
-chk "cache is v10" 10 "$(python3 -c "
-import struct;d=open('lib/std/agg.qobj','rb').read();print(struct.unpack_from('<i',d,4)[0])")"
+# Read the version the compiler actually wrote and require it to be the one the
+# reader accepts. Hardcoding the literal meant every format bump turned this
+# into a false failure (0.0.219: "want 10 got 11") that looked like a
+# regression when nothing was wrong. Compare the WRITTEN version against the
+# version the source declares, and separately require >= 11 so a cache that
+# silently reverted to v10 -- which carries no parflt and so miscompiles any
+# module taking an f64 param -- fails loudly here.
+# Take the number AFTER the comma -- grepping all digits would match the 4 in
+# "hdr + 4" first and yield 4, not the version.
+WVER=$(grep -oE 'w32\(hdr \+ 4, [0-9]+\)' "$REPO/compiler/$(cat "$REPO/VERSION")/src/x86/qobj_write.quanta" | head -1 | grep -oE '[0-9]+\)$' | tr -d ')')
+CVER=$(python3 -c "
+import struct;d=open('lib/std/agg.qobj','rb').read();print(struct.unpack_from('<i',d,4)[0])")
+chk "cache version matches writer" "$WVER" "$CVER"
+chk "cache version >= 11 (has parflt)" 1 "$([ "$CVER" -ge 11 ] && echo 1 || echo 0)"
 chk "cache has a fingerprint" 1 "$(python3 -c "
 import struct;d=open('lib/std/agg.qobj','rb').read()
 lo,hi=struct.unpack_from('<2I',d,32);print(1 if (lo|hi)!=0 else 0)")"
