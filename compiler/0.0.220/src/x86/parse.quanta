@@ -554,6 +554,7 @@ fn parse_let() {
         let more = 1
         while more == 1 {
             let btv = 0
+            let barsz = 0
             if peek()==TT_PNCT && pval()==58 {
                 adv()
                 if peek()==TT_KEY || peek()==TT_ID {
@@ -569,9 +570,15 @@ fn parse_let() {
                 if peek()==TT_PNCT && pval()==91 {  // '[' -- sized or empty array type
                     adv()
                     if peek()==TT_PNCT && pval()==93 {
+                        barsz = 0                                // unsized: no storage
                         adv()
                     } else {
-                        parse_expr()                               // the size
+                        // Keep the count. It has to come from the TOKEN: parse_expr
+                        // returns a vreg (0 for the first expression in a
+                        // function), which is not the size -- storing that left
+                        // `let a: i64[2], b: i64[3]` allocating nothing, so
+                        // `a[0] = 1` wrote through a null handle.
+                        if peek()==TT_NUM { barsz = pval(); adv() } else { barsz = parse_expr() }
                         if peek()==TT_PNCT && pval()==59 { adv() }  // optional ';'
                         if peek()==TT_PNCT && pval()==93 { adv() }  // ']'
                     }
@@ -601,8 +608,21 @@ fn parse_let() {
                 // as the single-binding path; `let a: i64, b: i64` followed by
                 // `a=1; b=2` is the exact shape lib/std/ai.quanta uses.
                 let bz = nv(); iremit(IR_CONST, bz, 0, 0, 0)
-                bvr = nv(); iremit(IR_MOV, bvr, bz, 0, 0)
-                if btv > 0 { w64(vreg_type + bvr*8, btv) }
+                if btv == 11 && barsz > 0 {
+                    // Sized array annotation: allocate the declared storage.
+                    //
+                    // IR_ARRNEW reads the count from the SLOT of vreg a0
+                    // (spill_home(a0)), and IR_MOV reads a1 the same way, so
+                    // `IR_MOV(bsz, 3)` would copy whatever is in vreg 3 rather
+                    // than the literal 3. Put the count in the vreg with
+                    // IR_CONST and hand THAT vreg to IR_ARRNEW.
+                    let bsz = nv(); iremit(IR_CONST, bsz, barsz, 0, 0)
+                    bvr = nv(); iremit(IR_ARRNEW, bvr, bsz, 0, 0)
+                    w64(vreg_type + bvr*8, 11)
+                } else {
+                    bvr = nv(); iremit(IR_MOV, bvr, bz, 0, 0)
+                    if btv > 0 { w64(vreg_type + bvr*8, btv) }
+                }
                 vadd(bn, bl, bvr)
             }
             if peek()==TT_PNCT && pval()==44 {
@@ -637,6 +657,9 @@ fn parse_let() {
     // Must check for type annotation BEFORE consuming '=' and parsing expression
     let vtype = 0
     let pointee_type = 0  // store pointee type for raw pointers
+    // Element count from a sized `T[N]`, carried across the nested type block in
+    // g_arrsz. Read it after the annotation is parsed, below, where it is used.
+    let arrsz = 0
     if peek()==TT_PNCT && pval()==58 {
         adv()  // consume ':'
         // P6: raw pointer type annotation: *u64 or *mut u64
@@ -700,10 +723,22 @@ fn parse_let() {
                 // and the element count comes from the initialiser at runtime,
                 // which is how every other container in the language works.
                 adv()
-                if peek()==TT_PNCT && pval()==93 {  // ']' -- unsized
+                if peek()==TT_PNCT && pval()==93 {  // ']' -- unsized: no storage
+                    w64(g_arrsz, 0)
                     adv()
                 } else {
-                    parse_expr()                               // the size
+                    // Keep the size. `T[N]` declares N elements of storage, and
+                    // without it the binding is a NULL handle: `let d: i64[1]`
+                    // followed by `d[0] = 42` wrote through address 0 and
+                    // segfaulted. Discarding the size here is why every
+                    // ai.quanta test died at runtime.
+                    // parse_expr returns a VREG (0 for the first expression in a
+                    // function), not the literal value, so it cannot be stored as
+                    // the count. Materialise the value instead: if the size is a
+                    // bare number literal, take it straight from the token.
+                    let szsz = 0
+                    if peek()==TT_NUM { szsz = pval(); adv() } else { szsz = parse_expr() }
+                    w64(g_arrsz, szsz)
                     if peek()==TT_PNCT && pval()==59 { adv() }  // optional ';' as in [T;N]
                     if peek()==TT_PNCT && pval()==93 { adv() }  // ']'
                 }
@@ -720,6 +755,7 @@ fn parse_let() {
     // below (ownership, struct, string, big) reads them unconditionally. Declaring
     // them inside the initialised branch left those reads dangling in the
     // uninitialised one, which tagged a garbage vreg and corrupted the binding.
+    arrsz = r64(g_arrsz)     // sized `T[N]` element count, or 0 when unsized
     let v = 0
     let vr = 0
     let mop2 = mop(61)      // 1 when an initialiser was present
@@ -762,10 +798,29 @@ fn parse_let() {
         //
         // So: MOV the destination from a constant-zero source. The destination
         // is not itself marked constant, so later assignments to it survive.
-        let zsrc = nv(); iremit(IR_CONST, zsrc, 0, 0, 0)
-        let zr = nv(); iremit(IR_MOV, zr, zsrc, 0, 0)
-        if vtype>0 { w64(vreg_type + zr*8, vtype) }
-        vadd(nm,nl,zr)
+        if vtype==11 && arrsz>0 {
+            // A SIZED array annotation declares storage. `let d: i64[1]` means
+            // one element exists, and indexing it must reach memory -- with a
+            // null handle `d[0] = 42` wrote through address 0 and segfaulted.
+            //
+            // IR_ARRNEW takes the element count as the VALUE of the vreg in a0,
+            // not as a literal in the IR slot, so route the parsed size through
+            // a MOV to guarantee it is a vreg holding the count.
+            // IR_ARRNEW reads the count from vreg a0's slot, so the count must
+            // be a vreg holding it -- IR_CONST, not IR_MOV, whose a1 is also read
+            // as a vreg.
+            let szr = nv(); iremit(IR_CONST, szr, arrsz, 0, 0)
+            let zr = nv(); iremit(IR_ARRNEW, zr, szr, 0, 0)
+            w64(vreg_type + zr*8, 11)
+            vadd(nm,nl,zr)
+            vr = zr
+        } else {
+            let zsrc = nv(); iremit(IR_CONST, zsrc, 0, 0, 0)
+            let zr = nv(); iremit(IR_MOV, zr, zsrc, 0, 0)
+            if vtype>0 { w64(vreg_type + zr*8, vtype) }
+            vadd(nm,nl,zr)
+            vr = zr
+        }
         // `vr` MUST alias the vreg actually bound. The tag-propagation block
         // below indexes vreg_*[vr*8], and with vr left at 0 it stamped
         // vreg slot 0 -- a live temp -- with this binding's struct/string/big
