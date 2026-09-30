@@ -482,6 +482,139 @@ fn parse_let() {
     // t7: multiple-return destructuring: `let a, b, c = f()` binds each name
     // to tup.<i>. This comma path never runs during self-host (compiler source
     // uses single-name let), so it is hazard-safe.
+    // Comma-separated TYPED declarations: `let a: T, b: T = ...`
+    //
+    // The tuple form below guards on `peek()==','`, but in the TYPED form the
+    // current token is ':' -- the comma comes later, after the type and an
+    // optional `[N]`. So that guard never fired, control fell through to the
+    // single-binding type path, it consumed `: T`, and then hit the trailing
+    // comma with nothing left to do with it. The parser desynchronised and the
+    // compiler died with SIGILL.
+    //
+    // Impact: lib/std/ai.quanta opens every test function with a comma-separated
+    // TYPED declaration (`let data: i64[1], shape: i64[1], ...`). That is why
+    // ai.quanta crashed the compiler, and why native_inference.quanta -- which
+    // has the same shape -- silently produced no binary: the missing std/mem
+    // was the error it finally reported, but the parser desync came first.
+    //
+    // Detect it by scanning the TOKEN ARRAY for a ',' ahead of the '='. Reading
+    // by index consumes nothing, so there is no rewind to get wrong -- an
+    // earlier attempt used peek()/adv() for this and corrupted the stream.
+    // Is this a comma-separated list of BINDINGS? `let a: T, b: T` and
+    // `let a: T = x, b: T = y` are both lists, and the second form is what
+    // lib/std/ai.quanta writes.
+    //
+    // The scan cannot stop at the first '=': in `let a: i64[2] = { 2, 3 },
+    // b: i64[2] = { 3, 2 }` that '=' belongs to the FIRST binding, and stopping
+    // there hid the separator that follows, so the line parsed as one binding and
+    // the leftover tokens desynchronised into SIGILL.
+    //
+    // So track bracket depth and treat a ',' as a separator only at depth 0.
+    // Depth counts (), [], {} and the closure '|' -- each of which encloses
+    // commas that belong to something other than the binding list. Four
+    // constructs were caught by the gate for exactly this reason:
+    //   `let p = P(1, 2)`             comma in a constructor's argument list
+    //   `let f = |x, y| { ... }`     comma in a closure's parameter list
+    //   `let a: T = { 2, 3 }`        comma inside a brace initialiser
+    //   `let p: *u64 = &x`           44 is also a multichar operator's value, so
+    //                                 a comma must be matched on TT_PNCT(5), not
+    //                                 on the value alone -- while '=' is TT_OP(4)
+    //                                 and must be matched on the value
+    //
+    // '=', '}' and ';' end a binding's VALUE, not the list, so keep scanning; a
+    // newline or end-of-input ends the whole declaration.
+    //
+    // Reading the token array rather than peek()/adv() consumes nothing, so there
+    // is no rewind to get wrong. Token facts confirmed with an in-compiler probe
+    // printing (index, type, value).
+    let lstyped = 0
+    {
+        let si = tokp
+        let steps = 0
+        let depth = 0
+        while steps < 64 && si < tokc {
+            let tk = tokt(si)
+            let tv = tokv(si)
+            if tk==TT_OP && tv==124 { depth = depth + 1 }               // closure '|'
+            if tk==TT_PNCT {
+                if tv==91 || tv==123 || tv==40 { depth = depth + 1 }    // '[' '{' '('
+                if tv==93 || tv==125 || tv==41 { depth = depth - 1 }    // ']' '}' ')'
+                if tv==44 && depth==0 { lstyped = 1; si = tokc }        // ',' at top level
+                if tv==10 || tv==59 { si = tokc }                       // newline or ';' ends it
+            }
+            si = si + 1
+            steps = steps + 1
+        }
+    }
+    if lstyped == 1 {
+        // One binding per name: NAME [':' type] '=' expr, repeated while a comma
+        // follows. Each name is bound independently; this is NOT destructuring.
+        let bn = nm
+        let bl = nl
+        let more = 1
+        while more == 1 {
+            let btv = 0
+            if peek()==TT_PNCT && pval()==58 {
+                adv()
+                if peek()==TT_KEY || peek()==TT_ID {
+                    let hk = ktext(pval(), plen())
+                    if hk==44 { btv = 1 } else if hk==45 { btv = 2 }
+                    else if hk==46 { btv = 3 } else if hk==47 { btv = 4 }
+                    else if hk==48 { btv = 5 } else if hk==49 { btv = 6 }
+                    else if hk==50 { btv = 7 } else if hk==51 { btv = 8 }
+                    else if hk==35 { btv = 9 } else if hk==55 { btv = 0 }
+                    else { let ai = find_type_alias(pval(), plen()); if ai>=0 { btv = ai } else { btv = 0 } }
+                    adv()
+                }
+                if peek()==TT_PNCT && pval()==91 {  // '[' -- sized or empty array type
+                    adv()
+                    if peek()==TT_PNCT && pval()==93 {
+                        adv()
+                    } else {
+                        parse_expr()                               // the size
+                        if peek()==TT_PNCT && pval()==59 { adv() }  // optional ';'
+                        if peek()==TT_PNCT && pval()==93 { adv() }  // ']'
+                    }
+                    btv = 11  // VT_ARRAY
+                }
+            }
+            // Same defect as the single-binding path, fixed there first: mop is
+            // "maybe operator", so a `let a: i64` with NO initialiser left the
+            // '=' absent, and calling parse_expr() regardless swallowed the next
+            // token and never bound the name -- `let a: i64, b: i64` bound `a`
+            // only, and `b = 5` then failed with "undeclared variable: b".
+            let bh = mop(61)
+            let bvr = 0
+            if bh == 1 {
+                let bv = parse_expr()
+                bvr = nv(); iremit(IR_MOV, bvr, bv, 0, 0); vadd(bn, bl, bvr)
+                if btv > 0 { w64(vreg_type + bvr*8, btv) }
+                if r64(vreg_is_str + bv*8) >= 0 { w64(vreg_is_str + bvr*8, r64(vreg_is_str + bv*8)) }
+                if r64(vreg_is_big + bv*8) >= 0 { w64(vreg_is_big + bvr*8, r64(vreg_is_big + bv*8)) }
+            } else {
+                // No initialiser. Zero with a real STORE (MOV from a constant
+                // zero), not `IR_CONST`: IR_CONST marks the destination as
+                // compile-time-constant, so the later `b = 2` was dropped as a
+                // redundant store and reads saw 0 -- and omitting the store
+                // entirely leaves the value slot uninitialised, so an
+                // unassigned read returns garbage rather than 0. Same reasoning
+                // as the single-binding path; `let a: i64, b: i64` followed by
+                // `a=1; b=2` is the exact shape lib/std/ai.quanta uses.
+                let bz = nv(); iremit(IR_CONST, bz, 0, 0, 0)
+                bvr = nv(); iremit(IR_MOV, bvr, bz, 0, 0)
+                if btv > 0 { w64(vreg_type + bvr*8, btv) }
+                vadd(bn, bl, bvr)
+            }
+            if peek()==TT_PNCT && pval()==44 {
+                adv()
+                if peek()==TT_ID { bn = pval(); bl = plen(); adv() }
+                more = 1
+            } else {
+                more = 0
+            }
+        }
+        return
+    }
     if peek()==TT_PNCT&&pval()==44 {
         let names=mmap(8000); let lens=mmap(8000); w64(names+0*8,nm); w64(lens+0*8,nl); let nc=1
         while peek()==TT_PNCT&&pval()==44 {
@@ -549,13 +682,32 @@ fn parse_let() {
             // suffix marks the binding as an array. Runtime array access (a[idx])
             // already works via IR_IDX; this annotation just records the type.
             if peek()==TT_PNCT && pval()==91 {  // '['
+                // Array type. The size is OPTIONAL: `T[]`, `T[N]` and the
+                // C-style `[T; N]` all land here.
+                //
+                // Only the EMPTY form was handled -- '[' then immediately ']'. A
+                // SIZED form left the `N]` in the token stream, the parser
+                // desynchronised, and the compiler died with SIGILL. Every
+                // `let a: T[N]` crashed regardless of element type or length,
+                // and regardless of whether the binding was used at all,
+                // because the failure is in parsing.
+                //
+                // The old comment here read "malformed `T[x]` -- not supported",
+                // which is precisely what left the tokens behind: T[x] is not
+                // malformed, it is the ordinary sized-array annotation.
+                //
+                // The size is consumed and discarded. VT_ARRAY is a single tag
+                // and the element count comes from the initialiser at runtime,
+                // which is how every other container in the language works.
                 adv()
-                if peek()==TT_PNCT && pval()==93 {  // ']'
+                if peek()==TT_PNCT && pval()==93 {  // ']' -- unsized
                     adv()
-                    vtype = 11  // VT_ARRAY (supersedes element vtype; array is its own tag)
                 } else {
-                    // malformed `T[x]` — not supported; leave vtype as element type
+                    parse_expr()                               // the size
+                    if peek()==TT_PNCT && pval()==59 { adv() }  // optional ';' as in [T;N]
+                    if peek()==TT_PNCT && pval()==93 { adv() }  // ']'
                 }
+                vtype = 11  // VT_ARRAY (supersedes element vtype; array is its own tag)
             }
         } else if peek()==TT_STRING {
             // 0.0.95: `String` type annotation (lexed as TT_STRING, not TT_KEY).
@@ -564,26 +716,87 @@ fn parse_let() {
         }
     }
     
-    mop(61)
-    let v=parse_expr(); let vr=nv(); iremit(IR_MOV,vr,v,0,0); vadd(nm,nl,vr)
-    // 0.0.117: `let x: big = <int-expr>` must PROMOTE the RHS to a big when it
-    // is not already big-tagged (previously the vreg was tagged big but held a
-    // raw i64, so any big-op on it dereferenced garbage). big_promote is a no-op
-    // if v is already big.
-    if vtype==12 && r64(vreg_is_big + vr*8)!=1 {
-        vr = big_promote(vr)
-        vadd(nm,nl,vr)
+    // `v` and `vr` must be in scope for BOTH paths: the tag-propagation block
+    // below (ownership, struct, string, big) reads them unconditionally. Declaring
+    // them inside the initialised branch left those reads dangling in the
+    // uninitialised one, which tagged a garbage vreg and corrupted the binding.
+    let v = 0
+    let vr = 0
+    let mop2 = mop(61)      // 1 when an initialiser was present
+    if mop2 == 1 {
+        v = parse_expr(); vr = nv(); iremit(IR_MOV, vr, v, 0, 0); vadd(nm, nl, vr)
+        // 0.0.117: `let x: big = <int-expr>` must PROMOTE the RHS to a big when it
+        // is not already big-tagged (previously the vreg was tagged big but held a
+        // raw i64, so any big-op on it dereferenced garbage). big_promote is a no-op
+        // if v is already big.
+        if vtype==12 && r64(vreg_is_big + vr*8)!=1 {
+            vr = big_promote(vr)
+            vadd(nm,nl,vr)
+        }
+    } else {
+        // No initialiser: `let a: i64` or a bare `let a`. This IS a declaration and
+        // `a` must exist afterwards -- typed, and zero-initialised so a later
+        // `a = 1` resolves and a bare read sees 0.
+        //
+        // `mop` is "maybe operator": it consumes '=' and returns 1, or returns 0
+        // when it is absent. The old code called parse_expr() unconditionally, so
+        // with no '=' it swallowed whatever token came next as the initialiser and
+        // never established the binding at all -- `let a: i64` followed by `a = 1`
+        // failed with "undeclared variable: a", and a bare `let a` had the very
+        // same defect with no type annotation involved.
+        //
+        // This is what lib/std/ai.quanta relies on: its test functions open with
+        // declarations like `let data: i64[1], shape: i64[1]` and then assign
+        // into them.
+        // Zero the binding with a real STORE, not `IR_CONST`.
+        //
+        // `IR_CONST` marks the destination as holding a compile-time constant
+        // (`op_is_const` in codegen.quanta), so a later `a = 1` -- which
+        // correctly emits IR_MOV into that same vreg -- was dropped as a
+        // redundant store and every read saw 0. That is why `return a` and
+        // `printi(a)` disagreed with `a * 1` and `a * a`.
+        //
+        // Nor can the store simply be omitted: `nv()` only initialises vreg
+        // METADATA, so the value slot still holds whatever the page had and an
+        // unassigned read returned garbage (144, 140 -- not 0).
+        //
+        // So: MOV the destination from a constant-zero source. The destination
+        // is not itself marked constant, so later assignments to it survive.
+        let zsrc = nv(); iremit(IR_CONST, zsrc, 0, 0, 0)
+        let zr = nv(); iremit(IR_MOV, zr, zsrc, 0, 0)
+        if vtype>0 { w64(vreg_type + zr*8, vtype) }
+        vadd(nm,nl,zr)
+        // `vr` MUST alias the vreg actually bound. The tag-propagation block
+        // below indexes vreg_*[vr*8], and with vr left at 0 it stamped
+        // vreg slot 0 -- a live temp -- with this binding's struct/string/big
+        // tags. The next load out of that slot then read garbage: `return 0 + a`
+        // was correct (a is the right operand, already in a register) while
+        // `return a + 0` came back 0, because there `a` is loaded from the
+        // poisoned slot.
+        vr = zr
     }
     // 0.0.94: record ownership tag for the just-bound symbol (0 plain,1 mut,2 ref).
     if own>0 { set_vown(nm,nl,own) }
-    let vsi = r64(vreg_struct + v*8)
-    if vsi>=0 { w64(vreg_struct + vr*8, vsi) }
-    let vss = r64(vreg_is_str + v*8)
-    if vss>=0 { w64(vreg_is_str + vr*8, vss) }
+    // Tag propagation reads the INITIALISER's vreg. With no initialiser `v` is
+    // the placeholder 0, so these would read vreg slot 0 -- whatever live temp
+    // happens to be there -- and stamp its struct/string/big tags onto the new
+    // binding. That silently corrupted a `let a: i64`, whose `a` then read 0
+    // after a later `a = 1`. Skip the propagation when there is no initialiser;
+    // the tag the annotation itself implies is applied below regardless.
+    let hasinit = 0
+    if mop2 != 0 { hasinit = 1 }
+    if hasinit==1 {
+        let vsi = r64(vreg_struct + v*8)
+        if vsi>=0 { w64(vreg_struct + vr*8, vsi) }
+        let vss = r64(vreg_is_str + v*8)
+        if vss>=0 { w64(vreg_is_str + vr*8, vss) }
+    }
     // 0.0.114: propagate a big RHS (big literal / big_* call result) onto the
     // bound vreg, and honour an explicit `: big` annotation (vtype==12).
-    let vsb = r64(vreg_is_big + v*8)
-    if vsb>=0 { w64(vreg_is_big + vr*8, vsb) }
+    if hasinit==1 {
+        let vsb = r64(vreg_is_big + v*8)
+        if vsb>=0 { w64(vreg_is_big + vr*8, vsb) }
+    }
     if vtype==12 { w64(vreg_is_big + vr*8, 1) }
     // 0.0.95: `String` annotation (vtype==10) means the RHS should be treated as a
     // string at runtime (it is, once it holds a string-literal/concat result); tag

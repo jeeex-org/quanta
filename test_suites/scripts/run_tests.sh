@@ -385,7 +385,7 @@ echo "  generics      : $([ $GENERICS_RC = 0 ] && echo GREEN || echo RED)  (nega
 echo "  stdlib        : $([ $STDLIB_RC = 0 ] && echo GREEN || echo RED)  (lib/std/* via import, EXPECTED_STDLIB.tsv)"
 echo "  multi-tu      : $([ $MTU_RC = 0 ] && echo GREEN || echo RED)  (cross-TU call + global, --emit-obj + gcc link)"
 echo "  verify-status : $([ $VERIFY_STATUS_RC = 0 ] && echo GREEN || echo RED)  (docs/status.json consistency)"
-echo "  qobj          : $([ $QOBJ_RC = 0 ] && echo GREEN || echo RED)  (module cache write/read/cache-only, G1+G3+G5)"
+echo "  qobj          : $([ $QOBJ_RC = 0 ] && echo GREEN || echo RED)  (module cache write/read/cache-only, G1+G3+G5+G4, plus G6 cache self-compile)"
 # Block promotion on a real functional/security/perf/valgrind/fuzz/diff/stdlib/mtu/qobj/verify-status
 # regression. Security KNOWN issues are surfaced by the script but do not turn
 # the gate red.

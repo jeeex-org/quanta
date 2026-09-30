@@ -843,7 +843,58 @@ fn parse_primary() {
         }
         }
     }
-    // P10: array literal [ ... ] or [TYPE]()
+    // P10: array literal [ ... ] or [TYPE](), and the brace form { a, b, c }.
+    //
+    // Only the bracket form was parsed. A brace literal in EXPRESSION position --
+    // `let s: i64[2] = { 2, 3 }` -- fell through to the default case and died with
+    // "unexpected token in expression", which is why every test function in
+    // lib/std/ai.quanta failed to compile and why ai.quanta took the compiler
+    // down with it.
+    //
+    // This is deliberately reached ONLY from a '{' in expression position, which
+    // is always an initialiser here. A struct body `struct P { x: i64 }` is
+    // consumed by scanstructs from the token array before parse_primary runs, so
+    // adding this gate does not touch struct declarations.
+    // A '{' here is a brace LITERAL only if it is not a block delimiter. Blocks
+    // are routed by the statement parser before parse_primary runs, except for
+    // one case that matters: `match x { ... }` asks parse_expr for the scrutinee
+    // and then claims the '{' itself, so if the scrutinee is just a name the '{'
+    // must still be left for parse_match.
+    //
+    // A brace literal never contains '=>' -- match arms always do. So require the
+    // contents to the first matching '}' to be free of '=>'; if one is there this
+    // is a match body and is left alone.
+    //
+    // Without this, `match x { 1 => { return 42 } }` compiled to a literal and the
+    // function returned 0 instead of taking the arm.
+    if peek()==TT_PNCT&&pval()==123 {
+        let isarm = 0
+        let s2 = tokp
+        let k2 = 0
+        while k2 < 96 && s2 < tokc {
+            if tokt(s2)==TT_OP && tokv(s2)==(61*256+62) { isarm = 1; s2 = tokc }   // '=>'
+            s2 = s2 + 1
+            k2 = k2 + 1
+        }
+        if isarm == 0 {
+            adv()
+            let belems=mmap(8000)   // stash element vregs
+            let bcnt=0
+            if !(peek()==TT_PNCT && pval()==125) {   // non-empty literal
+                let be0=parse_expr(); w64(belems+bcnt*8, be0); bcnt=bcnt+1
+                while peek()==TT_PNCT&&pval()==44 { adv(); let be=parse_expr(); w64(belems+bcnt*8, be); bcnt=bcnt+1 }
+            }
+            if peek()==TT_PNCT && pval()==125 { adv() }   // '}'
+            let btr=nv(); iremit(IR_TALLOC,btr,bcnt,0,0)
+            let bci=0
+            while bci<bcnt {
+                let bev=r64(belems+bci*8); let bfi=nv(); iremit(IR_CONST,bfi,bci,0,0)
+                iremit(IR_ISTORE,0,btr,bfi,bev)
+                bci=bci+1
+            }
+            return btr
+        }
+    }
     if peek()==TT_PNCT&&pval()==91 {
         if tokp+3<tokc && tokt(tokp)==TT_PNCT && tokv(tokp)==91 && tokt(tokp+1)==TT_ID && tokt(tokp+2)==TT_PNCT && tokv(tokp+2)==93 && tokt(tokp+3)==TT_PNCT && tokv(tokp+3)==40 && tokp+4<tokc && tokt(tokp+4)==TT_PNCT && tokv(tokp+4)==41 {
             adv(); adv(); adv(); adv(); adv()  // consume [ TYPE ] ( )

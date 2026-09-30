@@ -179,30 +179,119 @@ fn tokenize() {
                 // ('3.14' or dangling '1.'). Otherwise it is a field-access/
                 // range dot ('.N', '.field', '..') and must be left for the
                 // parser - never rejected here.
-                if p<srclen&&r8(src+p)==46 {
+                // A number is a FLOAT when a '.' follows, OR when an exponent
+                // does. The '.' test alone missed `1e-6` entirely: with no dot,
+                // control fell to the TT_NUM branch and `e` lexed as a separate
+                // identifier -- the parse then failed with "undeclared variable:
+                // e", which is exactly what lib/std/native_inference.quanta hit
+                // on its `1e-6` epsilon. `f`-suffixed literals (`2.5f`) reach the
+                // same branch via their dot; a bare `2f32` has no dot and is
+                // covered by the exponent-style lookahead below.
+                // Is this number a FLOAT? It is if a '.' follows, or if an
+                // exponent does.
+                //
+                // The '.' test alone missed `1e-6` entirely. With no dot, control
+                // fell through to the TT_NUM branch and the `e` lexed as a
+                // separate identifier, so the parse failed with "undeclared
+                // variable: e" -- exactly what lib/std/native_inference.quanta hit
+                // on its `1e-6` epsilon. `1.0` worked only because the fraction
+                // alone made a TT_FNUM token.
+                let isfloat = 0
+                if p<srclen && r8(src+p)==46 {
+                    // A trailing '.' is a decimal point only when the integer is a
+                    // genuine literal (previous token is not '.') and the '.' is
+                    // followed by a digit or ends the input ('3.14', dangling
+                    // '1.'). Otherwise it is field access / a range dot.
                     let prevdot = (tokc>0 && tokt(tokc-1)==TT_PNCT && tokv(tokc-1)==46)
-                    if prevdot==0 && ((p+1<srclen && idigit(r8(src+p+1))==1) || p+1>=srclen) {
-                        // Float literal: scan fractional digits
-                        p = p + 1  // consume '.'
-                        let fsp = p; let fsc = c
-                        let fval = 0
-                        let fdigits = 0
-                        while p<srclen && idigit(r8(src+p))==1 {
-                            let d = r8(src+p) - 48
-                            val = val*10 + d
-                            fval = fval*10 + d
-                            fdigits = fdigits + 1
-                            p = p + 1; c = c + 1
-                        }
-                        let nlen = p - sp
-                        // Encode frac_digits in upper byte of value: (val << 8) | fdigits
-                        let fval_enc = (val << 8) | fdigits
-                        stok(tokc, TT_FNUM, fval_enc, l, sc, nlen); tokc = tokc + 1
-                        // Note: exponent (e/E) scanning could be added here if needed
-                        continue
-                    }
+                    if prevdot==0 && ((p+1<srclen && idigit(r8(src+p+1))==1) || p+1>=srclen) { isfloat = 1 }
                 }
-                stok(tokc, TT_NUM, val, l, sc, nlen); tokc = tokc + 1
+                if isfloat==0 && p<srclen && (r8(src+p)==101 || r8(src+p)==69) {
+                    // 'e'/'E', optional sign, then at least one digit
+                    let ep = p + 1
+                    if ep<srclen && (r8(src+ep)==43 || r8(src+ep)==45) { ep = ep + 1 }
+                    if ep<srclen && idigit(r8(src+ep))==1 { isfloat = 1 }
+                }
+                if isfloat==1 {
+                    if p<srclen && r8(src+p)==46 { p = p + 1 }   // consume '.' if present
+                    let fval = 0
+                    let fdigits = 0
+                    while p<srclen && idigit(r8(src+p))==1 {
+                        let d = r8(src+p) - 48
+                        val = val*10 + d
+                        fval = fval*10 + d
+                        fdigits = fdigits + 1
+                        p = p + 1; c = c + 1
+                    }
+                    let nlen = p - sp
+                    // Scientific notation: fold the exponent into the existing
+                    // (mantissa, frac_digits) encoding that fconst(M, scale)
+                    // already consumes, so no new token kind is needed.
+                    if p<srclen && (r8(src+p)==101 || r8(src+p)==69) {
+                        let es = p
+                        p = p + 1
+                        let eneg = 0
+                        if p<srclen && (r8(src+p)==43 || r8(src+p)==45) {
+                            if r8(src+p)==45 { eneg = 1 }
+                            p = p + 1
+                        }
+                        if p<srclen && idigit(r8(src+p))==1 {
+                            // READ THE EXPONENT VALUE. The loop counted DIGITS, so
+                            // `en` was 1 for every single-digit exponent and `1.0e2`
+                            // came out as 100 instead of 1000, `1e-6` as 10/10^7
+                            // instead of 1e-6, and `1.0e0` as 100 instead of 10.
+                            // Only one-digit exponents looked right, and only because
+                            // the two wrongs cancelled.
+                            let en = 0
+                            while p<srclen && idigit(r8(src+p))==1 {
+                                en = en*10 + (r8(src+p) - 48)
+                                p = p + 1
+                            }
+                            // A float literal is carried as (mantissa, fdigits),
+                            // read by parse_primary as mantissa / 10^fdigits, and
+                            // fconst evaluates that with real fp division
+                            // (cvtsi2sd + divsd in emitter.quanta). So the pair only
+                            // has to be moved together, never rescaled on its own.
+                            //
+                            //   1e-6   1e-6 == mantissa 1, six more fraction digits
+                            //   1.0e0  1.0  == unchanged; a zero exponent is a no-op
+                            //   1.0e2  100  == mantissa 10 * 10^2
+                            if eneg==1 {
+                                // A NEGATIVE exponent adds fraction digits and
+                                // leaves the mantissa alone: 1e-6 is mantissa 1 with
+                                // 6 fraction digits, i.e. 1/10^6.
+                                //
+                                // Scaling BOTH by 10^en (an earlier attempt) cancels
+                                // out and yields 10^6/10^6 == 1, so `1e-6` came out
+                                // as 1.0 and the epsilon in rms_norm was enormous.
+                                fdigits = fdigits + en
+                            } else {
+                                // Positive (or zero) exponent: multiply the mantissa
+                                // by 10^en and leave fdigits alone. With en==0 the
+                                // loop does not run, so `1.0e0` stays 10/10 == 1.0.
+                                let e2 = en
+                                while e2 > 0 { val = val*10; e2 = e2 - 1 }
+                            }
+                        } else {
+                            p = es   // 'e' with no digits: not an exponent
+                        }
+                    }
+                    // Rust-style float type suffix: 0.0f32, 1.0f64, 2.5f. A no-op
+                    // for the value -- one float representation -- but it MUST be
+                    // consumed or it lexes as an identifier and the expression
+                    // parse fails with "undeclared variable: f32".
+                    if p<srclen && (r8(src+p)==102 || r8(src+p)==70) {
+                        let fs = p
+                        p = p + 1
+                        while p<srclen && idigit(r8(src+p))==1 { p = p + 1 }
+                        // f16/f32/f64 only; otherwise it was an identifier
+                        // starting with 'f', so put it back.
+                        if p-fs != 2 && p-fs != 3 { p = fs }
+                    }
+                    let fval_enc = (val << 8) | fdigits
+                    stok(tokc, TT_FNUM, fval_enc, l, sc, nlen); tokc = tokc + 1
+                    continue
+                }
+stok(tokc, TT_NUM, val, l, sc, nlen); tokc = tokc + 1
             }
         } else if ialpha(ch) {
             let sp=p; let sc=c
