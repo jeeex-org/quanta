@@ -23,7 +23,7 @@ E4B_API = "http://localhost:1236/v1/chat/completions"
 
 class QuantaRAG:
     def __init__(self):
-        self.encoder = SentenceTransformer("all-MiniLM-L6-v2")
+        self.encoder = SentenceTransformer(_CFG.get("embed", "model", "all-MiniLM-L6-v2"))
         self.conn = sqlite3.connect(DB_PATH)
         self._load_embeddings()
     

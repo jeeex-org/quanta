@@ -9,7 +9,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import rag_config as _CFG
 
 DB_PATH = _CFG.get("rag", "db")
-MODEL = "all-MiniLM-L6-v2"
+MODEL = _CFG.get("embed", "model", "all-MiniLM-L6-v2")
 
 model = SentenceTransformer(MODEL)
 conn = sqlite3.connect(DB_PATH)

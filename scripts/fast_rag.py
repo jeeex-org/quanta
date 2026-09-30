@@ -18,7 +18,7 @@ DB_PATH = _CFG.get("rag", "db")
 class FastRAG:
     def __init__(self):
         print("Loading embedding model...")
-        self.encoder = SentenceTransformer("all-MiniLM-L6-v2")
+        self.encoder = SentenceTransformer(_CFG.get("embed", "model", "all-MiniLM-L6-v2"))
         self.conn = sqlite3.connect(DB_PATH)
         self.conn.execute("PRAGMA journal_mode=WAL")
         

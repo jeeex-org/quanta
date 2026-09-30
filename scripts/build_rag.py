@@ -19,7 +19,7 @@ import rag_config as _CFG
 # Configuration
 QUANTA_ROOT = "/opt/tali/quanta"
 VECTOR_DB_PATH = _CFG.get("rag", "db")
-EMBEDDINGS_MODEL = "all-MiniLM-L6-v2"  # Fast, good quality, small
+EMBEDDINGS_MODEL = _CFG.get("embed", "model", "all-MiniLM-L6-v2")
 BATCH_SIZE = 1000
 MAX_CHUNK_SIZE = 1000  # Characters per chunk
 CHUNK_OVERLAP = 200

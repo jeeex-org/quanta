@@ -27,7 +27,7 @@ class QuantaRAGServer:
         
         # Load embedding model
         print("\n1. Loading embedding model...")
-        self.encoder = SentenceTransformer("all-MiniLM-L6-v2")
+        self.encoder = SentenceTransformer(_CFG.get("embed", "model", "all-MiniLM-L6-v2"))
         
         # Load all embeddings into memory
         print("\n2. Loading embeddings into matrix...")

@@ -20,7 +20,7 @@ DB_PATH = _CFG.get("rag", "db")
 QUANTA_ROOT = "/opt/tali/quanta"
 
 class QuantaRAG:
-    def __init__(self, model_name: str = "all-MiniLM-L6-v2"):
+    def __init__(self, model_name: str = _CFG.get("embed", "model", "all-MiniLM-L6-v2")):
         print(f"Loading embedding model: {model_name}")
         self.encoder = SentenceTransformer(model_name)
         self.conn = sqlite3.connect(DB_PATH)

@@ -21,7 +21,7 @@ def main():
     
     # Embed
     from sentence_transformers import SentenceTransformer
-    encoder = SentenceTransformer("all-MiniLM-L6-v2")
+    encoder = SentenceTransformer(_CFG.get("embed", "model", "all-MiniLM-L6-v2"))
     query_emb = encoder.encode([query], show_progress_bar=False)[0].astype(np.float32)
     
     # Search - load embeddings into matrix for brute-force

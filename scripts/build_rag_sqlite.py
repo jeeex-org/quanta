@@ -16,7 +16,7 @@ import rag_config as _CFG
 
 QUANTA_ROOT = "/opt/tali/quanta"
 DB_PATH = _CFG.get("rag", "db")
-EMBED_MODEL = "all-MiniLM-L6-v2"
+EMBED_MODEL = _CFG.get("embed", "model", "all-MiniLM-L6-v2")
 CHUNK_SIZE = 1000
 CHUNK_OVERLAP = 200
 BATCH_SIZE = 500
