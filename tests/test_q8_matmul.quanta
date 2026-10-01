@@ -1,0 +1,158 @@
+import std/fs
+
+// Strategy: Pre-dequantize ALL weights from Q4_K to Q8 at model load time
+// Then matmul becomes simple Q8 * Q8 = Q8 dot product
+// This trades memory for speed (like llama.cpp's approach)
+
+const Q8_SCALE = 128
+
+// Pre-dequantize Q4_K to Q8: convert all weights at once
+// Q4_K: 144 bytes per 256 elements
+// Q8: 256 bytes per 256 elements
+fn preconvert_q4k_to_q8(W_q4k, n_blocks, W_q8) {
+    let bi = 0
+    while bi < n_blocks {
+        let base = bi * 144
+        let scale_raw = mem_load8(W_q4k + base) + mem_load8(W_q4k + base + 1) * 256
+        let scale_q8 = f16_to_q8(scale_raw)
+        
+        let qi = 0
+        while qi < 256 {
+            let sub_byte = mem_load8(W_q4k + base + 2 + qi / 16)
+            let sub_q8 = sub_byte
+            
+            let byte_idx = qi / 2
+            let byte_val = mem_load8(W_q4k + base + 18 + byte_idx)
+            let nibble = 0
+            if qi - (qi / 2) * 2 == 0 {
+                nibble = byte_val - (byte_val / 16) * 16
+            } else {
+                nibble = byte_val / 16
+            }
+            
+            let val_q8 = scale_q8 * sub_q8 * (nibble - 8) / Q8_SCALE
+            mem_store(W_q8 + bi * 256 * 8 + qi * 8, val_q8)
+            qi = qi + 1
+        }
+        bi = bi + 1
+    }
+}
+
+fn f16_to_q8(f16) {
+    let sign = (f16 / 32768) * 32768
+    let exp = (f16 - sign) / 1024
+    let mant = f16 - sign - exp * 1024
+    
+    if exp == 0 {
+        if mant == 0 { return 0 }
+        return mant * Q8_SCALE / 1024
+    }
+    if exp == 31 { return 0 }
+    
+    let base = 1024 + mant
+    let shift = exp - 15
+    if shift >= 0 {
+        return base * shift * Q8_SCALE / 1024
+    } else {
+        return base * Q8_SCALE / 1024 / (-shift)
+    }
+}
+
+// Q8 matmul (much faster - no dequantization needed)
+fn matvec_q8(W, x, rows, cols, y) {
+    let i = 0
+    while i < rows {
+        let sum = 0
+        let j = 0
+        while j < cols {
+            sum = sum + mem_load(W + (i * cols + j) * 8) * mem_load(x + j * 8) / Q8_SCALE
+            j = j + 1
+        }
+        mem_store(y + i * 8, sum)
+        i = i + 1
+    }
+}
+
+// Benchmark: preconvert + matmul
+fn main() {
+    let fd = open("/opt/ai/models/quanta/QUANTA-LFM2.5-2.6Bv1-Q4_K_M.gguf", 0, 0)
+    if fd < 0 { return 1 }
+    
+    // Load gate weights for blk.0 (Q4_K, [2048, 10752])
+    let gate_offset = 241358880
+    let rows = 2048
+    let cols = 10752
+    let n_blocks_per_row = cols / 256  // 42
+    
+    // Read all gate weights
+    let gate_size = rows * n_blocks_per_row * 144
+    let gate_q4k = mem_alloc(gate_size)
+    lseek(fd, gate_offset, 0)
+    file_read(fd, gate_q4k, gate_size)
+    
+    close(fd)
+    
+    print("Preconverting weights...\n")
+    
+    // Pre-dequantize to Q8 (2048 x 10752 = 22,020,096 elements = 176MB)
+    let gate_q8 = mem_alloc(rows * cols * 8)
+    
+    // Convert one row at a time
+    let i = 0
+    while i < rows {
+        let row_offset_q4k = i * n_blocks_per_row * 144
+        let row_offset_q8 = i * cols * 8
+        
+        // Convert this row's blocks
+        let bi = 0
+        while bi < n_blocks_per_row {
+            let base = row_offset_q4k + bi * 144
+            let scale_raw = mem_load8(gate_q4k + base) + mem_load8(gate_q4k + base + 1) * 256
+            let scale_q8 = f16_to_q8(scale_raw)
+            
+            let qi = 0
+            while qi < 256 {
+                let sub_byte = mem_load8(gate_q4k + base + 2 + qi / 16)
+                let sub_q8 = sub_byte
+                
+                let byte_idx = qi / 2
+                let byte_val = mem_load8(gate_q4k + base + 18 + byte_idx)
+                let nibble = 0
+                if qi - (qi / 2) * 2 == 0 {
+                    nibble = byte_val - (byte_val / 16) * 16
+                } else {
+                    nibble = byte_val / 16
+                }
+                
+                let val_q8 = scale_q8 * sub_q8 * (nibble - 8) / Q8_SCALE
+                mem_store(gate_q8 + row_offset_q8 + bi * 256 * 8 + qi * 8, val_q8)
+                qi = qi + 1
+            }
+            bi = bi + 1
+        }
+        
+        i = i + 1
+    }
+    
+    print("Preconversion done. Starting matmul...\n")
+    
+    // Create input x (10752 elements in Q8)
+    let x = mem_alloc(cols * 8)
+    i = 0
+    while i < cols {
+        mem_store(x + i * 8, Q8_SCALE)
+        i = i + 1
+    }
+    
+    // Output buffer
+    let y = mem_alloc(rows * 8)
+    
+    // Run matmul
+    matvec_q8(gate_q8, x, rows, cols, y)
+    
+    print("Done. result[0]=")
+    print(mem_load(y))
+    print("\n")
+    
+    return 0
+}

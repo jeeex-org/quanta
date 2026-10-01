@@ -1,0 +1,107 @@
+import std/fs
+
+fn main() {
+    let fd = open("/opt/ai/models/quanta/QUANTA-LFM2.5-2.6Bv1-Q4_K_M.gguf", 0, 0)
+    if fd < 0 { print("open failed\n"); return 1 }
+    
+    let hdr = mem_alloc(24)
+    file_read(fd, hdr, 24)
+    let n_kv = mem_load(hdr + 8)
+    let n_tensors = mem_load(hdr + 16)
+    
+    print("n_kv=")
+    print(n_kv)
+    print(" n_tensors=")
+    print(n_tensors)
+    print("\n")
+    
+    let klen_buf = mem_alloc(8)
+    let vtype_buf = mem_alloc(4)
+    let slen_buf = mem_alloc(8)
+    let atype_buf = mem_alloc(4)
+    let alen_buf = mem_alloc(8)
+    
+    let i = 0
+    while i < n_kv {
+        read_raw(fd, klen_buf, 8)
+        let klen = mem_load(klen_buf)
+        if klen > 100000 {
+            print("end at kv ")
+            print(i)
+            print(" klen=")
+            print(klen)
+            print("\n")
+            i = n_kv
+        } else {
+            lseek(fd, klen, 1)
+            read_raw(fd, vtype_buf, 4)
+            let vtype = mem_load(vtype_buf)
+            
+            if vtype == 8 {
+                read_raw(fd, slen_buf, 8)
+                lseek(fd, mem_load(slen_buf), 1)
+            } else if vtype == 9 {
+                read_raw(fd, atype_buf, 4)
+                let atype = mem_load(atype_buf)
+                read_raw(fd, alen_buf, 8)
+                let alen = mem_load(alen_buf)
+                if atype == 8 {
+                    let j = 0
+                    while j < alen {
+                        read_raw(fd, slen_buf, 8)
+                        lseek(fd, mem_load(slen_buf), 1)
+                        j = j + 1
+                    }
+                } else {
+                    lseek(fd, alen * 4, 1)
+                }
+            } else if vtype == 0 { lseek(fd, 1, 1) }
+            else if vtype == 1 { lseek(fd, 1, 1) }
+            else if vtype == 2 { lseek(fd, 2, 1) }
+            else if vtype == 3 { lseek(fd, 2, 1) }
+            else if vtype == 4 { lseek(fd, 4, 1) }
+            else if vtype == 5 { lseek(fd, 4, 1) }
+            else if vtype == 6 { lseek(fd, 4, 1) }
+            else if vtype == 7 { lseek(fd, 1, 1) }
+            else if vtype == 10 { lseek(fd, 8, 1) }
+            else if vtype == 11 { lseek(fd, 8, 1) }
+            else if vtype == 12 { lseek(fd, 8, 1) }
+            i = i + 1
+        }
+    }
+    
+    let meta_end = lseek(fd, 0, 1)
+    print("meta_end=")
+    print(meta_end)
+    print("\n")
+    
+    // Scan for first tensor name
+    let scan = mem_alloc(128)
+    let offset = 0
+    while offset < 512 {
+        lseek(fd, meta_end + offset, 0)
+        read_raw(fd, scan, 8)
+        let nlen = mem_load(scan)
+        if nlen > 5 && nlen < 100 {
+            let first = mem_load8(scan + 8)
+            if first == 98 || first == 116 {
+                let name = mem_alloc(nlen + 1)
+                read_raw(fd, name, nlen)
+                mem_store8(name + nlen, 0)
+                print("offset=")
+                print(offset)
+                print(" name: ")
+                write_raw(1, name, nlen)
+                print("\n")
+                offset = offset + 100
+            } else {
+                offset = offset + 1
+            }
+        } else {
+            offset = offset + 1
+        }
+    }
+    
+    close(fd)
+    return 0
+}

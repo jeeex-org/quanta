@@ -1,0 +1,48 @@
+import std/fs
+
+// Test AVX2 4-wide float operations
+// faddf_avx2(dst, a, b): dst[i] = a[i] + b[i] for i=0..3
+
+fn main() {
+    // Allocate 4 doubles (32 bytes each)
+    let a = mem_alloc(32)
+    let b = mem_alloc(32)
+    let dst = mem_alloc(32)
+    
+    // a = [1.0, 2.0, 3.0, 4.0]
+    mem_store(a, 128)
+    mem_store(a + 8, 256)
+    mem_store(a + 16, 384)
+    mem_store(a + 24, 512)
+    
+    // b = [10.0, 20.0, 30.0, 40.0]
+    mem_store(b, 1280)
+    mem_store(b + 8, 2560)
+    mem_store(b + 16, 3840)
+    mem_store(b + 24, 5120)
+    
+    // Call faddf_avx2(dst, a, b)
+    faddf_avx2(dst, a, b)
+    
+    // Check result
+    let r0 = mem_load(dst)
+    let r1 = mem_load(dst + 8)
+    let r2 = mem_load(dst + 16)
+    let r3 = mem_load(dst + 24)
+    
+    print("dst[0]="); print(r0); print("\n")
+    print("dst[1]="); print(r1); print("\n")
+    print("dst[2]="); print(r2); print("\n")
+    print("dst[3]="); print(r3); print("\n")
+    
+    // Expected: 138, 282, 426, 570
+    // 1.0+10.0=11.0=1408 Q8... wait, these are i64 values
+    // Actually these are Q8: 128=1.0, 1280=10.0, so 1408=11.0
+    
+    if r0 == 1408 && r1 == 2816 && r2 == 4224 && r3 == 5632 {
+        print("PASS\n")
+        return 0
+    }
+    print("FAIL\n")
+    return 1
+}

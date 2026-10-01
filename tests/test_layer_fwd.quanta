@@ -1,0 +1,98 @@
+import std/fs
+
+fn main() {
+    print("=== Single Layer Forward Test ===\n")
+    
+    let fd = open("/opt/ai/models/quanta/QUANTA-LFM2.5-2.6Bv1-Q4_K_M.gguf", 0, 0)
+    if fd < 0 { print("open failed\n"); return 1 }
+    
+    let hdr = mem_alloc(24)
+    read_raw(fd, hdr, 24)
+    
+    lseek(fd, 8222781, 0)
+    
+    // Read all tensor metadata (40 tensors, 40 bytes each)
+    let infos = mem_alloc(40 * 40)
+    
+    let nlen_buf = mem_alloc(8)
+    let ndims_buf = mem_alloc(4)
+    let dim_buf = mem_alloc(8)
+    let dtype_buf = mem_alloc(4)
+    let off_buf = mem_alloc(8)
+    let name_buf = mem_alloc(256)
+    
+    let ti = 0
+    let n_tensors = 37
+    
+    while ti < n_tensors {
+        read_raw(fd, nlen_buf, 8)
+        let nlen = mem_load(nlen_buf)
+        read_raw(fd, name_buf, nlen)
+        mem_store8(name_buf + nlen, 0)
+        
+        read_raw(fd, ndims_buf, 4)
+        let ndims = mem_load(ndims_buf)
+        
+        let nelem = 1
+        let d = 0
+        while d < ndims {
+            read_raw(fd, dim_buf, 8)
+            nelem = nelem * mem_load(dim_buf)
+            d = d + 1
+        }
+        
+        read_raw(fd, dtype_buf, 4)
+        let dtype = mem_load(dtype_buf)
+        
+        read_raw(fd, off_buf, 8)
+        let offset = mem_load(off_buf)
+        
+        mem_store(infos + ti * 40, dtype)
+        mem_store(infos + ti * 40 + 8, offset)
+        mem_store(infos + ti * 40 + 16, nelem)
+        
+        // Print name
+        print("[")
+        print(ti)
+        print("] ")
+        write_raw(1, name_buf, nlen)
+        print("\n")
+        
+        ti = ti + 1
+    }
+    
+    // Tensor 2: blk.0.attn_norm.weight, dtype=0 (f32), nelem=2048
+    let dtype2 = mem_load(infos + 2 * 40)
+    let off2 = mem_load(infos + 2 * 40 + 8)
+    let ne2 = mem_load(infos + 2 * 40 + 16)
+    
+    print("\nattn_norm: dtype=")
+    print(dtype2)
+    print(" off=")
+    print(off2)
+    print(" nelem=")
+    print(ne2)
+    print("\n")
+    
+    // Read weight (f32 = 8 bytes per element in our memory layout)
+    let weight = mem_alloc(ne2 * 8)
+    lseek(fd, off2, 0)
+    read_raw(fd, weight, ne2 * 4)  // Read 4 bytes per f32
+    
+    // Convert f32 bytes to our f64 layout (just use raw bytes as i64 for now)
+    // Actually, for f32 the bytes are already in IEEE754, we need to convert
+    // For now just read and use as-is (treating as integer)
+    print("weight[0] raw bytes: ")
+    print(mem_load8(weight))
+    print(" ")
+    print(mem_load8(weight + 1))
+    print(" ")
+    print(mem_load8(weight + 2))
+    print(" ")
+    print(mem_load8(weight + 3))
+    print("\n")
+    
+    print("SUCCESS\n")
+    close(fd)
+    return 0
+}

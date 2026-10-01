@@ -1,0 +1,49 @@
+import std/fs
+import std/gguf
+
+fn main() {
+    print("=== Simple Test ===\n")
+    
+    let rc = gguf_load("/opt/ai/models/quanta/QUANTA-LFM2.5-2.6Bv1-Q4_K_M.gguf")
+    print("rc=")
+    print(rc)
+    print("\n")
+    
+    // Use a small tensor
+    let idx = 2  // blk.0.attn_norm.weight
+    print("idx=")
+    print(idx)
+    print("\n")
+    
+    let dtype = gguf_tensor_dtype(idx)
+    let nelements = gguf_tensor_nelements(idx)
+    let offset = gguf_tensor_offset(idx)
+    
+    print("dtype=")
+    print(dtype)
+    print(" nelements=")
+    print(nelements)
+    print(" offset=")
+    print(offset)
+    print("\n")
+    
+    print("Reading tensor...\n")
+    let raw = gguf_read_tensor(idx)
+    print("raw ptr=")
+    print(raw)
+    print("\n")
+    
+    if raw == 0 {
+        print("READ FAILED\n")
+        return 1
+    }
+    
+    print("First value: ")
+    let v = mem_load(raw)
+    print(v)
+    print("\n")
+    
+    gguf_close()
+    print("DONE\n")
+    return 0
+}

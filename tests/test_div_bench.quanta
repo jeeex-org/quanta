@@ -1,0 +1,41 @@
+import std/fs
+
+// Benchmark: division by power-of-2 (Q8_SCALE = 128)
+// Tests Phase 3: division → multiply-shift optimization
+
+fn main() {
+    let N = 1000000
+    
+    let t0_buf = mem_alloc(2)
+    let t1_buf = mem_alloc(2)
+    
+    clock_gettime(1, t0_buf)
+    
+    let i = 0
+    let acc = 0
+    while i < N {
+        // This should compile to: sar rax, 7  (1 instruction)
+        // NOT: 30-instruction idiv + floor correction
+        let x = i * 1000
+        let y = x / 128  // power-of-2 division
+        acc = acc + y
+        i = i + 1
+    }
+    
+    clock_gettime(1, t1_buf)
+    
+    let t0_sec = mem_load(t0_buf)
+    let t0_nsec = mem_load(t0_buf + 8)
+    let t1_sec = mem_load(t1_buf)
+    let t1_nsec = mem_load(t1_buf + 8)
+    
+    let elapsed = (t1_sec - t0_sec) * 1000000000 + (t1_nsec - t0_nsec)
+    
+    print("result=")
+    print(acc)
+    print("\nns_per_iter=")
+    print(elapsed / N)
+    print("\n")
+    
+    return 0
+}

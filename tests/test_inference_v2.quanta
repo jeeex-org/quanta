@@ -1,0 +1,88 @@
+import std/fs
+import std/gguf
+
+fn main() {
+    print("=== Inference Test ===\n")
+    
+    let rc = gguf_load("/opt/ai/models/quanta/QUANTA-LFM2.5-2.6Bv1-Q4_K_M.gguf")
+    print("rc=")
+    print(rc)
+    print("\n")
+    
+    // Use a small tensor: blk.0.attn_norm.weight (type=0, nelements=2048)
+    let idx = gguf_find_tensor("blk.0.attn_norm.weight")
+    if idx < 0 {
+        print("tensor not found\n")
+        return 1
+    }
+    print("found tensor at idx ")
+    print(idx)
+    print("\n")
+    
+    let dtype = gguf_tensor_dtype(idx)
+    let nelements = gguf_tensor_nelements(idx)
+    print("dtype=")
+    print(dtype)
+    print(" nelements=")
+    print(nelements)
+    print("\n")
+    
+    // Read raw data (F32, 4 bytes per element)
+    let raw = gguf_read_tensor(idx)
+    if raw == 0 {
+        print("read failed\n")
+        return 1
+    }
+    
+    // Print first 8 raw float values (as integer bits)
+    print("Raw values (first 8): ")
+    let i = 0
+    while i < 8 {
+        print(mem_load(raw + i * 4))
+        print(" ")
+        i = i + 1
+    }
+    print("\n")
+    
+    // Test matvec: simple 2x2 matrix
+    let A = mem_alloc(16)
+    mem_store(A, 1)
+    mem_store(A + 4, 2)
+    mem_store(A + 8, 3)
+    mem_store(A + 12, 4)
+    
+    let x = mem_alloc(8)
+    mem_store(x, 5)
+    mem_store(x + 4, 6)
+    
+    let y = mem_alloc(8)
+    gguf_matvec(A, x, 2, 2, y)
+    
+    print("matvec result: y[0]=")
+    print(mem_load(y))
+    print(" y[1]=")
+    print(mem_load(y + 4))
+    print("\n")
+    print("Expected: y[0]=17 y[1]=39\n")
+    
+    // Test softmax
+    let inp = mem_alloc(12)
+    mem_store(inp, 1)
+    mem_store(inp + 4, 2)
+    mem_store(inp + 8, 3)
+    
+    let out = mem_alloc(12)
+    gguf_softmax(out, inp, 3)
+    
+    print("softmax result: ")
+    print(mem_load(out))
+    print(" ")
+    print(mem_load(out + 4))
+    print(" ")
+    print(mem_load(out + 8))
+    print("\n")
+    
+    gguf_close()
+    print("Done\n")
+    return 0
+}

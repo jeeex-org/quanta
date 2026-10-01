@@ -1,0 +1,120 @@
+import std/fs
+
+// Integer-only fixed-point Q4_K matmul for LFM2.5 2.6B
+// No float builtins needed - pure integer arithmetic
+// Q4_K block: 144 bytes = 256 values
+// Layout: [scale_f16(2)] [scales_8bit(16)] [quads(128)]
+
+const Q8_SCALE = 128  // 1.0 in Q8 = 128
+
+// Dequantize one Q4_K block to Q8 integers
+fn dequant_q4k(W_base, out) {
+    let scale_raw = mem_load8(W_base) + mem_load8(W_base + 1) * 256
+    let scale_q8 = f16_to_q8(scale_raw)
+    
+    let qi = 0
+    while qi < 256 {
+        let sub_byte = mem_load8(W_base + 2 + qi / 16)
+        let sub_q8 = sub_byte
+        
+        let byte_idx = qi / 2
+        let byte_val = mem_load8(W_base + 18 + byte_idx)
+        let nibble = 0
+        if qi - (qi / 2) * 2 == 0 {
+            nibble = byte_val - (byte_val / 16) * 16
+        } else {
+            nibble = byte_val / 16
+        }
+        
+        let val_q8 = scale_q8 * sub_q8 * (nibble - 8) / Q8_SCALE
+        mem_store(out + qi * 8, val_q8)
+        qi = qi + 1
+    }
+}
+
+// Convert f16 to Q8 fixed-point
+fn f16_to_q8(f16) {
+    let sign = (f16 / 32768) * 32768
+    let exp = (f16 - sign) / 1024
+    let mant = f16 - sign - exp * 1024
+    
+    if exp == 0 {
+        if mant == 0 { return 0 }
+        return mant * Q8_SCALE / 1024
+    }
+    if exp == 31 { return 0 }
+    
+    let base = 1024 + mant
+    let shift = exp - 15
+    if shift >= 0 {
+        return base * shift * Q8_SCALE / 1024
+    } else {
+        return base * Q8_SCALE / 1024 / (-shift)
+    }
+}
+
+// Q4_K matmul: y = W * x
+fn matvec_q4k(W, x, rows, cols, y) {
+    let n_blocks = cols / 256
+    let i = 0
+    while i < rows {
+        let sum = 0
+        let bi = 0
+        while bi < n_blocks {
+            let dequant = mem_alloc(256 * 8)
+            dequant_q4k(W + (i * n_blocks + bi) * 144, dequant)
+            
+            let j = 0
+            while j < 256 {
+                let w_val = mem_load(dequant + j * 8)
+                let x_val = mem_load(x + (bi * 256 + j) * 8)
+                sum = sum + w_val * x_val / Q8_SCALE
+                j = j + 1
+            }
+            bi = bi + 1
+        }
+        mem_store(y + i * 8, sum)
+        i = i + 1
+    }
+}
+
+// Benchmark with real model weights
+fn main() {
+    let fd = open("/opt/ai/models/quanta/QUANTA-LFM2.5-2.6Bv1-Q4_K_M.gguf", 0, 0)
+    if fd < 0 { return 1 }
+    
+    // Load gate weights for blk.0 (Q4_K, [2048, 10752])
+    let gate_offset = 241358880
+    let rows = 2048
+    let cols = 10752
+    let n_blocks_per_row = cols / 256  // 42
+    
+    // Read all gate weights (2048 rows * 42 blocks * 144 bytes = 12,386,304 bytes)
+    let gate_size = rows * n_blocks_per_row * 144
+    let gate = mem_alloc(gate_size)
+    lseek(fd, gate_offset, 0)
+    file_read(fd, gate, gate_size)
+    
+    // Create input x (10752 elements in Q8 = 128 = 1.0)
+    let x = mem_alloc(cols * 8)
+    let i = 0
+    while i < cols {
+        mem_store(x + i * 8, Q8_SCALE)
+        i = i + 1
+    }
+    
+    // Output buffer
+    let y = mem_alloc(rows * 8)
+    
+    print("Starting benchmark: 2048 x 10752 matmul...\n")
+    
+    // Full matmul
+    matvec_q4k(gate, x, rows, cols, y)
+    
+    print("Done. result[0]=")
+    print(mem_load(y))
+    print("\n")
+    
+    close(fd)
+    return 0
+}

@@ -1,0 +1,129 @@
+import std/fs
+
+// Fix: read metadata section into buffer, parse from buffer (avoids compiler loop bug)
+fn main() {
+    print("start\n")
+    
+    let fd = open("/opt/ai/models/quanta/QUANTA-LFM2.5-2.6Bv1-Q4_K_M.gguf", 0, 0)
+    if fd < 0 { print("open failed\n"); return 1 }
+    
+    // Read header + metadata section (first 100KB is more than enough)
+    let buf = mem_alloc(102400)
+    read_raw(fd, buf, 102400)
+    print("read 100KB\n")
+    
+    // Parse header
+    let n_kv = mem_load(buf + 8)
+    let n_tensors = mem_load(buf + 16)
+    print("n_tensors=")
+    print(n_tensors)
+    print("\n")
+    
+    // Parse metadata pairs from buffer
+    let pos = 24
+    let klen = 0
+    let vtype = 0
+    let slen = 0
+    let alen = 0
+    let i = 0
+    
+    // Unrolled loop for metadata skip - process 4 pairs at a time
+    // This avoids the compiler bug with long while loops
+    let remaining = 37
+    
+    // Process in chunks of 4
+    let chunk_count = 9  // 9 * 4 = 36, plus 1 more
+    let chunk_idx = 0
+    
+    while chunk_idx < 9 {
+        // Pair 1
+        klen = mem_load(buf + pos); pos = pos + 8 + klen
+        vtype = mem_load(buf + pos); pos = pos + 4
+        if vtype == 8 { slen = mem_load(buf + pos); pos = pos + 8 + slen }
+        else if vtype == 0 { pos = pos + 1 }
+        else if vtype == 4 { pos = pos + 4 }
+        else if vtype == 5 { pos = pos + 4 }
+        else if vtype == 6 { pos = pos + 4 }
+        else if vtype == 7 { pos = pos + 1 }
+        else if vtype == 10 { pos = pos + 8 }
+        else if vtype == 11 { pos = pos + 8 }
+        else if vtype == 12 { pos = pos + 8 }
+        
+        // Pair 2
+        klen = mem_load(buf + pos); pos = pos + 8 + klen
+        vtype = mem_load(buf + pos); pos = pos + 4
+        if vtype == 8 { slen = mem_load(buf + pos); pos = pos + 8 + slen }
+        else if vtype == 0 { pos = pos + 1 }
+        else if vtype == 4 { pos = pos + 4 }
+        else if vtype == 5 { pos = pos + 4 }
+        else if vtype == 6 { pos = pos + 4 }
+        else if vtype == 7 { pos = pos + 1 }
+        else if vtype == 10 { pos = pos + 8 }
+        else if vtype == 11 { pos = pos + 8 }
+        else if vtype == 12 { pos = pos + 8 }
+        
+        // Pair 3
+        klen = mem_load(buf + pos); pos = pos + 8 + klen
+        vtype = mem_load(buf + pos); pos = pos + 4
+        if vtype == 8 { slen = mem_load(buf + pos); pos = pos + 8 + slen }
+        else if vtype == 0 { pos = pos + 1 }
+        else if vtype == 4 { pos = pos + 4 }
+        else if vtype == 5 { pos = pos + 4 }
+        else if vtype == 6 { pos = pos + 4 }
+        else if vtype == 7 { pos = pos + 1 }
+        else if vtype == 10 { pos = pos + 8 }
+        else if vtype == 11 { pos = pos + 8 }
+        else if vtype == 12 { pos = pos + 8 }
+        
+        // Pair 4
+        klen = mem_load(buf + pos); pos = pos + 8 + klen
+        vtype = mem_load(buf + pos); pos = pos + 4
+        if vtype == 8 { slen = mem_load(buf + pos); pos = pos + 8 + slen }
+        else if vtype == 0 { pos = pos + 1 }
+        else if vtype == 4 { pos = pos + 4 }
+        else if vtype == 5 { pos = pos + 4 }
+        else if vtype == 6 { pos = pos + 4 }
+        else if vtype == 7 { pos = pos + 1 }
+        else if vtype == 10 { pos = pos + 8 }
+        else if vtype == 11 { pos = pos + 8 }
+        else if vtype == 12 { pos = pos + 8 }
+        
+        chunk_idx = chunk_idx + 1
+    }
+    
+    // Last pair (37th)
+    klen = mem_load(buf + pos); pos = pos + 8 + klen
+    vtype = mem_load(buf + pos); pos = pos + 4
+    if vtype == 8 { slen = mem_load(buf + pos); pos = pos + 8 + slen }
+    else if vtype == 0 { pos = pos + 1 }
+    else if vtype == 4 { pos = pos + 4 }
+    else if vtype == 5 { pos = pos + 4 }
+    else if vtype == 6 { pos = pos + 4 }
+    else if vtype == 7 { pos = pos + 1 }
+    else if vtype == 10 { pos = pos + 8 }
+    else if vtype == 11 { pos = pos + 8 }
+    else if vtype == 12 { pos = pos + 8 }
+    
+    print("metadata done, pos=")
+    print(pos)
+    print("\n")
+    
+    // Read first tensor from buffer
+    let nlen = mem_load(buf + pos)
+    pos = pos + 8
+    print("nlen=")
+    print(nlen)
+    print("\n")
+    
+    print("name: ")
+    i = 0
+    while i < nlen {
+        file_write(1, mem_load8(buf + pos + i), 1)
+        i = i + 1
+    }
+    print("\n")
+    
+    print("SUCCESS\n")
+    close(fd)
+    return 0
+}

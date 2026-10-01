@@ -1,0 +1,118 @@
+import std/fs
+
+// Full inference pipeline for LFM2.5 2.6B
+// Pure integer arithmetic - no float truncation issues
+
+const HIDDEN = 2048
+const INTERMEDIATE = 10752  // Model uses 10752 (not 6144)
+const N_LAYERS = 30  // Actually 30 layers (blk.0-29)
+const Q8_SCALE = 128  // Q8 fixed-point: 1.0 = 128
+
+// Approximate SiLU in fixed-point: silu(x) = x * sigmoid(x) ≈ x * (0.5 + 0.5*x/(1+|x|))
+fn silu_approx(x) {
+    let abs_x = x
+    if abs_x < 0 { abs_x = -abs_x }
+    // sigmoid ≈ 0.5 + 0.5 * x / (1 + |x|) in Q8
+    let sig = Q8_SCALE / 2 + x / (2 * (Q8_SCALE + abs_x))
+    if sig < 0 { sig = 0 }
+    if sig > Q8_SCALE { sig = Q8_SCALE }
+    return x * sig / Q8_SCALE
+}
+
+// Integer square root (Newton's method)
+fn isqrt(n) {
+    if n <= 0 { return 0 }
+    let x = n
+    let y = (x + 1) / 2
+    while y < x {
+        x = y
+        y = (x + n / x) / 2
+    }
+    return x
+}
+
+// RMSNorm in Q8 fixed-point
+fn rms_norm_q8(out, x, w, n) {
+    let sum_sq = 0
+    let i = 0
+    while i < n {
+        let v = x + i * 8
+        let val = mem_load(v)
+        sum_sq = sum_sq + val * val
+        i = i + 1
+    }
+    let mean_sq = sum_sq / n
+    let rms = isqrt(mean_sq)
+    let ir = Q8_SCALE * Q8_SCALE / (rms + 1)
+    
+    i = 0
+    while i < n {
+        let v = mem_load(x + i * 8)
+        let weight = mem_load(w + i * 8)
+        mem_store(out + i * 8, v * weight / Q8_SCALE)
+        i = i + 1
+    }
+}
+
+// FFN layer: gate = SiLU(W_gate(x)), up = W_up(x), out = W_down(gate * up)
+fn ffn_q8(W_gate, W_up, W_down, x, out) {
+    let rows = INTERMEDIATE
+    let cols = HIDDEN
+    
+    // Compute gate and up in one pass (interleave for cache)
+    let gate = mem_alloc(rows * 8)
+    let up = mem_alloc(rows * 8)
+    
+    let i = 0
+    while i < rows {
+        let gate_val = 0
+        let up_val = 0
+        let j = 0
+        while j < cols {
+            // Read Q4 weight and dequantize
+            let w_gate_q4 = 8  // placeholder - should read from W_gate
+            let w_up_q4 = 8     // placeholder - should read from W_up
+            let x_val = mem_load(x + j * 8)
+            
+            gate_val = gate_val + w_gate_q4 * x_val / Q8_SCALE
+            up_val = up_val + w_up_q4 * x_val / Q8_SCALE
+            j = j + 1
+        }
+        mem_store(gate + i * 8, silu_approx(gate_val))
+        mem_store(up + i * 8, up_val)
+        i = i + 1
+    }
+    
+    // Down projection: out = W_down(gate * up)
+    i = 0
+    while i < cols {
+        let sum = 0
+        let j = 0
+        while j < rows {
+            let g = mem_load(gate + j * 8)
+            let u = mem_load(up + j * 8)
+            let w_down_q4 = 8  // placeholder
+            sum = sum + w_down_q4 * g * u / Q8_SCALE / Q8_SCALE
+            j = j + 1
+        }
+        mem_store(out + i * 8, sum)
+        i = i + 1
+    }
+}
+
+// Test: basic pipeline step
+fn main() {
+    // Test silu_approx
+    let s = silu_approx(Q8_SCALE)  // silu(1.0) ≈ 0.73 * 128 ≈ 93
+    print("silu(1.0) in Q8: ")
+    print(s)
+    print("\n")
+    
+    // Test isqrt
+    let sq = isqrt(16 * Q8_SCALE * Q8_SCALE)
+    print("isqrt(16*128*128)=")
+    print(sq)
+    print("\n")
+    
+    return 0
+}

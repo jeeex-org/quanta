@@ -1,0 +1,23 @@
+import std/fs
+
+fn main() {
+    let fd = open("/opt/ai/models/quanta/QUANTA-LFM2.5-2.6Bv1-Q4_K_M.gguf", 0, 0)
+    if fd < 0 { print("open failed\n"); return 1 }
+    
+    // Seek to known tensor info offset
+    let rc = lseek(fd, 8222781, 0)
+    print("lseek rc=")
+    print(rc)
+    print("\n")
+    
+    // Read first tensor name length
+    let nlen_buf = mem_alloc(8)
+    read_raw(fd, nlen_buf, 8)
+    let nlen = mem_load(nlen_buf)
+    print("nlen=")
+    print(nlen)
+    print("\n")
+    
+    close(fd)
+    return 0
+}

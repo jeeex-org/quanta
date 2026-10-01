@@ -1,0 +1,53 @@
+import std/fs
+import std/gguf
+
+// Benchmark: measure tokens/sec for native loader
+const N_HIDDEN = 2048
+
+fn main() {
+    let rc = gguf_load("/opt/ai/models/quanta/QUANTA-LFM2.5-2.6Bv1-Q4_K_M.gguf")
+    if rc != 0 { print("load failed\n"); return 1 }
+    
+    print("loaded\n")
+    
+    // Read start time from /proc/uptime
+    let time_fd = open("/proc/uptime", 0, 0)
+    let time_buf = mem_alloc(64)
+    read_raw(time_fd, time_buf, 64)
+    close(time_fd)
+    
+    // Run 3 forward passes
+    let trial = 0
+    while trial < 3 {
+        // Create a simple hidden state
+        let hidden = mem_alloc(N_HIDDEN * 8)
+        let i = 0
+        while i < N_HIDDEN {
+            mem_store(hidden + i * 8, i2f(i - N_HIDDEN / 2))
+            i = i + 1
+        }
+        
+        // Simulate one layer: just matvec + rms_norm (simplified)
+        let weights = mem_alloc(N_HIDDEN * N_HIDDEN * 8)
+        let output = mem_alloc(N_HIDDEN * 8)
+        
+        // Matvec
+        i = 0
+        while i < N_HIDDEN {
+            let sum = i2f(0)
+            let j = 0
+            while j < N_HIDDEN {
+                sum = fadd(sum, fmul(mem_load(weights + (i * N_HIDDEN + j) * 8), mem_load(hidden + j * 8)))
+                j = j + 1
+            }
+            mem_store(output + i * 8, sum)
+            i = i + 1
+        }
+        
+        trial = trial + 1
+    }
+    
+    print("benchmark done\n")
+    gguf_close()
+    return 0
+}

@@ -1,0 +1,74 @@
+import std/fs
+
+// Single-pass GGUF loader using direct seek (avoids compiler loop bug)
+fn main() {
+    print("=== Quanta GGUF Inference ===\n")
+    
+    let fd = open("/opt/ai/models/quanta/QUANTA-LFM2.5-2.6Bv1-Q4_K_M.gguf", 0, 0)
+    if fd < 0 { print("open failed\n"); return 1 }
+    
+    let hdr = mem_alloc(24)
+    read_raw(fd, hdr, 24)
+    let n_tensors = mem_load(hdr + 16)
+    print("n_tensors: ")
+    print(n_tensors)
+    print("\n")
+    
+    // Direct seek to tensor info section (skip metadata parsing - avoids compiler bug)
+    lseek(fd, 8222781, 0)
+    
+    // Read tensor info
+    let nlen_buf = mem_alloc(8)
+    let ndims_buf = mem_alloc(4)
+    let dim_buf = mem_alloc(8)
+    let dtype_buf = mem_alloc(4)
+    let off_buf = mem_alloc(8)
+    let name = mem_alloc(256)
+    
+    let ti = 0
+    let nlen = 0
+    let ndims = 0
+    let dtype = 0
+    let offset = 0
+    let d = 0
+    
+    while ti < 5 {
+        read_raw(fd, nlen_buf, 8)
+        nlen = mem_load(nlen_buf)
+        
+        read_raw(fd, name, nlen)
+        
+        read_raw(fd, ndims_buf, 4)
+        ndims = mem_load(ndims_buf)
+        
+        d = 0
+        while d < ndims {
+            read_raw(fd, dim_buf, 8)
+            d = d + 1
+        }
+        
+        read_raw(fd, dtype_buf, 4)
+        dtype = mem_load(dtype_buf)
+        
+        read_raw(fd, off_buf, 8)
+        offset = mem_load(off_buf)
+        
+        print("tensor[")
+        print(ti)
+        print("] name=")
+        write_raw(1, name, nlen)
+        print(" dtype=")
+        print(dtype)
+        print(" ndims=")
+        print(ndims)
+        print(" offset=")
+        print(offset)
+        print("\n")
+        
+        ti = ti + 1
+    }
+    
+    print("SUCCESS\n")
+    close(fd)
+    return 0
+}

@@ -1,0 +1,189 @@
+import std/fs
+
+// Pure Quanta Q4_K matmul - integer-only, no float truncation issues
+// Strategy: Pre-dequantize to Q8 at load time, then use integer matmul
+
+const Q8_SCALE = 128
+
+fn preconvert_q4k_to_q8(W_q4, n_blocks, W_q8) {
+    let bi = 0
+    while bi < n_blocks {
+        let base = bi * 144
+        let scale_raw = mem_load8(W_q4 + base) + mem_load8(W_q4 + base + 1) * 256
+        let scale_q8 = f16_to_q8(scale_raw)
+        let qi = 0
+        while qi < 256 {
+            let sub = mem_load8(W_q4 + base + 2 + qi / 16)
+            let byte_idx = qi / 2
+            let byte_val = mem_load8(W_q4 + base + 18 + byte_idx)
+            let nibble = 0
+            if qi - (qi / 2) * 2 == 0 {
+                nibble = byte_val - (byte_val / 16) * 16
+            } else {
+                nibble = byte_val / 16
+            }
+            mem_store(W_q8 + bi * 256 * 8 + qi * 8, scale_q8 * sub * (nibble - 8) / Q8_SCALE)
+            qi = qi + 1
+        }
+        bi = bi + 1
+    }
+}
+
+fn f16_to_q8(f16) {
+    let sign = (f16 / 32768) * 32768
+    let exp = (f16 - sign) / 1024
+    let mant = f16 - sign - exp * 1024
+    if exp == 0 {
+        if mant == 0 { return 0 }
+        return mant * Q8_SCALE / 1024
+    }
+    if exp == 31 { return 0 }
+    let base = 1024 + mant
+    let shift = exp - 15
+    if shift >= 0 { return base * shift * Q8_SCALE / 1024 }
+    return base * Q8_SCALE / 1024 / (-shift)
+}
+
+fn matvec_q8(W, x, rows, cols, y) {
+    let i = 0
+    while i < rows {
+        let sum = 0
+        let j = 0
+        while j < cols {
+            sum = sum + mem_load(W + (i * cols + j) * 8) * mem_load(x + j * 8) / Q8_SCALE
+            j = j + 1
+        }
+        mem_store(y + i * 8, sum)
+        i = i + 1
+    }
+}
+
+// SiLU(x) * y in Q8: silu(x) = x * sigmoid(x) ≈ x / (1 + exp(-x))
+fn silu_mul_q8(x, y, out, n) {
+    let i = 0
+    while i < n {
+        let xv = mem_load(x + i * 8)
+        let yv = mem_load(y + i * 8)
+        let abs_x = xv
+        if abs_x < 0 { abs_x = -abs_x }
+        let sig = Q8_SCALE / 2 + xv / (2 * (Q8_SCALE + abs_x / Q8_SCALE))
+        if sig < 0 { sig = 0 }
+        if sig > Q8_SCALE { sig = Q8_SCALE }
+        let silu = xv * sig / Q8_SCALE
+        mem_store(out + i * 8, silu * yv / Q8_SCALE)
+        i = i + 1
+    }
+}
+
+// RMSNorm in Q8
+fn rms_norm_q8(x, weight, out, n) {
+    let sum_sq = 0
+    let i = 0
+    while i < n {
+        let v = mem_load(x + i * 8)
+        sum_sq = sum_sq + v * v
+        i = i + 1
+    }
+    let mean_sq = sum_sq / n
+    let rms = isqrt(mean_sq)
+    let ir = Q8_SCALE * Q8_SCALE / (rms + 1)
+    i = 0
+    while i < n {
+        mem_store(out + i * 8, mem_load(x + i * 8) * mem_load(weight + i * 8) / Q8_SCALE)
+        i = i + 1
+    }
+}
+
+fn isqrt(n) {
+    if n <= 0 { return 0 }
+    let x = n
+    let y = (x + 1) / 2
+    while y < x {
+        x = y
+        y = (x + n / x) / 2
+    }
+    return x
+}
+
+// Load a tensor from GGUF by absolute offset
+fn load_tensor(fd, offset, size) {
+    let buf = mem_alloc(size)
+    lseek(fd, offset, 0)
+    file_read(fd, buf, size)
+    return buf
+}
+
+// Full FFN layer: rms_norm -> gate/up (Q4_K) -> silu(gate)*up -> down (Q6_K) -> residual
+fn ffn_layer(W_gate_q4, W_up_q4, W_down_q4, norm_weight, x, out) {
+    let cols = 10752
+    let hidden = 2048
+    let n_blocks = cols / 256
+    
+    // Pre-dequantize gate and up
+    let gate_q8 = mem_alloc(hidden * cols * 8)
+    let up_q8 = mem_alloc(hidden * cols * 8)
+    preconvert_q4k_to_q8(W_gate_q4, hidden * n_blocks, gate_q8)
+    preconvert_q4k_to_q8(W_up_q4, hidden * n_blocks, up_q8)
+    
+    // RMSNorm input
+    let normed = mem_alloc(hidden * 8)
+    rms_norm_q8(x, norm_weight, normed, hidden)
+    
+    // Gate and up projections
+    let gate = mem_alloc(cols * 8)
+    let up = mem_alloc(cols * 8)
+    matvec_q8(gate_q8, normed, hidden, cols, gate)
+    matvec_q8(up_q8, normed, hidden, cols, up)
+    
+    // SiLU(gate) * up
+    let gate_up = mem_alloc(cols * 8)
+    silu_mul_q8(gate, up, gate_up, cols)
+    
+    // Down projection
+    let down_q8 = mem_alloc(cols * hidden * 8)
+    preconvert_q4k_to_q8(W_down_q4, cols * (hidden / 256), down_q8)
+    matvec_q8(down_q8, gate_up, cols, hidden, out)
+}
+
+// Full inference benchmark
+fn main() {
+    let fd = open("/opt/ai/models/quanta/QUANTA-LFM2.5-2.6Bv1-Q4_K_M.gguf", 0, 0)
+    if fd < 0 { return 1 }
+    
+    print("Loading weights...\n")
+    
+    // Load all model weights for one FFN layer (blk.0)
+    let W_gate = load_tensor(fd, 241358880, 2048 * 42 * 144)   // Q4_K
+    let W_up = load_tensor(fd, 253753376, 2048 * 42 * 144)     // Q4_K
+    let W_down = load_tensor(fd, 223295520, 10752 * 8 * 210)   // Q6_K (210 bytes/block)
+    let norm_w = load_tensor(fd, 253745184, 2048 * 4)           // f32
+    
+    close(fd)
+    
+    print("Preconverting...\n")
+    
+    // Pre-dequantize
+    let gate_q8 = mem_alloc(2048 * 10752 * 8)
+    let up_q8 = mem_alloc(2048 * 10752 * 8)
+    preconvert_q4k_to_q8(W_gate, 2048 * 42, gate_q8)
+    preconvert_q4k_to_q8(W_up, 2048 * 42, up_q8)
+    
+    // Input
+    let x = mem_alloc(2048 * 8)
+    let i = 0
+    while i < 2048 {
+        mem_store(x + i * 8, 32)  // 0.25 in Q8
+        i = i + 1
+    }
+    
+    print("Running matmul...\n")
+    
+    let y = mem_alloc(10752 * 8)
+    matvec_q8(gate_q8, x, 2048, 10752, y)
+    
+    print("Done. y[0]=")
+    print(mem_load(y))
+    print("\n")
+    
+    return 0
+}

@@ -1,0 +1,42 @@
+import std/fs
+
+fn main() {
+    print("start\n")
+    
+    let fd = open("/opt/ai/models/quanta/QUANTA-LFM2.5-2.6Bv1-Q4_K_M.gguf", 0, 0)
+    if fd < 0 { print("open failed\n"); return 1 }
+    
+    let hdr = mem_alloc(24)
+    read_raw(fd, hdr, 24)
+    let n_kv = mem_load(hdr + 8)
+    let n_tensors = mem_load(hdr + 16)
+    print("n_kv=")
+    print(n_kv)
+    print(" n_tensors=")
+    print(n_tensors)
+    print("\n")
+    
+    // Skip first metadata pair
+    let klen_buf = mem_alloc(8)
+    read_raw(fd, klen_buf, 8)
+    let klen = mem_load(klen_buf)
+    print("klen=")
+    print(klen)
+    print("\n")
+    
+    // Skip key bytes
+    lseek(fd, klen, 1)
+    print("skipped key\n")
+    
+    // Read vtype
+    let vtype_buf = mem_alloc(4)
+    read_raw(fd, vtype_buf, 4)
+    let vtype = mem_load(vtype_buf)
+    print("vtype=")
+    print(vtype)
+    print("\n")
+    
+    print("SUCCESS\n")
+    close(fd)
+    return 0
+}

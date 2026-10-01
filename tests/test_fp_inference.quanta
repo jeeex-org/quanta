@@ -1,0 +1,38 @@
+import std/fs
+import std/gguf
+
+const N_HIDDEN = 2048
+
+fn main() {
+    print("=== FP Inference Test ===\n")
+    
+    let rc = gguf_load("/opt/ai/models/quanta/QUANTA-LFM2.5-2.6Bv1-Q4_K_M.gguf")
+    if rc != 0 { print("load failed\n"); return 1 }
+    
+    print("loaded\n")
+    
+    // Load token 0 embedding (Q6_K)
+    let token_embd = gguf_find_tensor("token_embd.weight")
+    let hidden = mem_alloc(N_HIDDEN * 8)
+    read_tensor_f64(token_embd, hidden)
+    
+    print("hidden[0]=")
+    print(mem_load(hidden))
+    print("\n")
+    
+    // Test RMSNorm
+    let norm_idx = gguf_find_tensor("token_embd_norm.weight")
+    let norm_w = mem_alloc(N_HIDDEN * 8)
+    read_tensor_f64(norm_idx, norm_w)
+    
+    let normed = mem_alloc(N_HIDDEN * 8)
+    rms_norm(normed, hidden, norm_w, N_HIDDEN)
+    
+    print("normed[0]=")
+    print(mem_load(normed))
+    print("\n")
+    
+    print("SUCCESS\n")
+    gguf_close()
+    return 0
+}

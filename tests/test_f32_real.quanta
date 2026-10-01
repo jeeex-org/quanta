@@ -1,0 +1,68 @@
+import std/fs
+import std/gguf
+
+// f32 bytes -> i64 bits using only float arithmetic
+fn f32_bits(ptr) {
+    let b0 = mem_load8(ptr)
+    let b1 = mem_load8(ptr + 1)
+    let b2 = mem_load8(ptr + 2)
+    let b3 = mem_load8(ptr + 3)
+    
+    let sign = i2f(b3 / 128)
+    let exp32 = i2f(b3 - (b3 / 128) * 128) * i2f(2) + i2f(b2 / 128)
+    let mant32 = i2f(b2 - (b2 / 128) * 128) * i2f(65536) + i2f(b1) * i2f(256) + i2f(b0)
+    
+    if exp32 == i2f(0) { return i2f(0) }
+    if exp32 == i2f(255) { return i2f(0) }
+    
+    let new_exp = f2i(exp32 - i2f(127))
+    let mant_frac = fdiv(mant32, i2f(8388608))
+    let one_plus_mant = fadd(i2f(1), mant_frac)
+    
+    let pow2 = i2f(1)
+    let i = 0
+    if new_exp >= 0 {
+        while i < new_exp { pow2 = fmul(pow2, i2f(2)); i = i + 1 }
+    } else {
+        let neg = 0 - new_exp
+        while i < neg { pow2 = fdiv(pow2, i2f(2)); i = i + 1 }
+    }
+    
+    let result = fmul(pow2, one_plus_mant)
+    if sign == i2f(1) { result = fsub(i2f(0), result) }
+    return result
+}
+
+fn main() {
+    print("=== f32 Conversion ===\n")
+    
+    // Test: 1.0f32 = 0x3F800000
+    let test = mem_alloc(4)
+    mem_store8(test, 0)
+    mem_store8(test + 1, 0)
+    mem_store8(test + 2, 128)
+    mem_store8(test + 3, 63)
+    
+    print("1.0 -> ")
+    print(f32_bits(test))
+    print(" (expect 1.0)\n")
+    
+    // Test: read actual f32 weight
+    let rc = gguf_load("/opt/ai/models/quanta/QUANTA-LFM2.5-2.6Bv1-Q4_K_M.gguf")
+    if rc != 0 { print("load failed\n"); return 1 }
+    
+    // token_embd_norm.weight (tensor 1): f32, 2048 elements, offset 215040000
+    let off = gguf_tensor_offset(1)
+    let raw = mem_alloc(16)
+    lseek(gguf_fd, off, 0)
+    read_raw(gguf_fd, raw, 16)
+    
+    print("weight[0]=")
+    print(f32_bits(raw))
+    print(" weight[1]=")
+    print(f32_bits(raw + 4))
+    print("\n")
+    
+    print("SUCCESS\n")
+    return 0
+}

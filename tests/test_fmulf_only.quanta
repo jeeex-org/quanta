@@ -1,0 +1,85 @@
+// Fused Q4_K matvec using float-preserving builtins
+// Processes one Q4_K block (256 elements, 144 bytes) at a time
+// Q4_K layout: [scale_f16(2)] [scales_8bit(16)] [quads(128)] = 146 bytes? 
+// Actual Q4_K_M: 132 bytes (2 + 16 + 128 = 146? or different)
+// Let's use 144 bytes per block (standard Q4_K)
+
+fn matvec_q4k_fused(W, x, rows, cols, y) {
+    let n_blocks = cols / 256
+    let i = 0
+    while i < rows {
+        let sum = i2f(0)
+        let bi = 0
+        while bi < n_blocks {
+            let base = (i * n_blocks + bi) * 144
+            
+            // Read scale (f16, 2 bytes)
+            let scale_raw = mem_load8(W + base) + mem_load8(W + base + 1) * 256
+            let scale = f16_to_f32_bits(scale_raw)
+            
+            // Process 256 elements
+            let qi = 0
+            while qi < 256 {
+                // Get sub-scale (one per 16 elements)
+                let sub_byte = mem_load8(W + base + 2 + qi / 16)
+                let sub_scale = i2f(sub_byte)
+                
+                // Get quad (4-bit value)
+                let byte_idx = qi / 2
+                let byte_val = mem_load8(W + base + 18 + byte_idx)
+                let nibble = 0
+                if qi - (qi / 2) * 2 == 0 {
+                    nibble = byte_val - (byte_val / 16) * 16
+                } else {
+                    nibble = byte_val / 16
+                }
+                
+                // Dequantize: value = scale * sub_scale * (nibble - 8)
+                let quant = fmulf(fmulf(scale, sub_scale), i2f(nibble - 8))
+                
+                // Multiply by x and accumulate
+                let xv = mem_load(x + (bi * 256 + qi) * 8)
+                sum = faddf(sum, fmulf(quant, xv))
+                
+                qi = qi + 1
+            }
+            bi = bi + 1
+        }
+        mem_store(y + i * 8, sum)
+        i = i + 1
+    }
+}
+
+// Convert f16 bits to f32 bit-pattern (simplified)
+fn f16_to_f32_bits(f16) {
+    let sign = (f16 / 32768) * 32768
+    let exp = (f16 - sign) / 1024
+    let mant = f16 - sign - exp * 1024
+    
+    if exp == 0 {
+        if mant == 0 { return i2f(0) }
+        return i2f(mant)
+    }
+    if exp == 31 { return i2f(0) }
+    
+    // Normal: value = 2^(exp-15) * (1 + mant/1024)
+    // Approximate as integer for now
+    let val = (1024 + mant) * (1 * (exp - 15))
+    return i2f(val)
+}
+
+// Simple test: matmul using float-preserving builtins
+fn main() {
+    // Test fmulf with values from actual Q4 weights
+    let a = i2f(3)
+    let b = i2f(7)
+    let r = fmulf(a, b)
+    
+    print("fmulf(3,7)=")
+    print(r)
+    print("\n")
+    
+    if r == i2f(21) { print("PASS\n"); return 0 }
+    print("FAIL\n")
+    return 1
+}

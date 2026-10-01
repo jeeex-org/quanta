@@ -1,0 +1,42 @@
+import std/fs
+import std/gguf
+
+fn main() {
+    print("=== Full Transformer Forward Pass ===\n")
+    
+    let rc = gguf_load("/opt/ai/models/quanta/QUANTA-LFM2.5-2.6Bv1-Q4_K_M.gguf")
+    if rc != 0 { print("load failed\n"); return 1 }
+    
+    print("loaded ")
+    print(gguf_num_tensors())
+    print(" tensors\n")
+    
+    // Find required tensors for layer 0
+    let token_embd_idx = gguf_find_tensor("token_embd.weight")
+    let token_embd_norm_idx = gguf_find_tensor("token_embd_norm.weight")
+    let attn_norm_idx = gguf_find_tensor("blk.0.attn_norm.weight")
+    let ffn_gate_idx = gguf_find_tensor("blk.0.ffn_gate.weight")
+    let ffn_up_idx = gguf_find_tensor("blk.0.ffn_up.weight")
+    let ffn_down_idx = gguf_find_tensor("blk.0.ffn_down.weight")
+    let ffn_norm_idx = gguf_find_tensor("blk.0.ffn_norm.weight")
+    
+    print("indices: ")
+    print(token_embd_idx)
+    print(" ")
+    print(token_embd_norm_idx)
+    print(" ")
+    print(attn_norm_idx)
+    print("\n")
+    
+    // Read token_embd.weight for token ID 0
+    let emb_off = gguf_tensor_offset(token_embd_idx)
+    let emb_dtype = gguf_tensor_dtype(token_embd_idx)
+    print("emb dtype=")
+    print(emb_dtype)
+    print(" off=")
+    print(emb_off)
+    print("\n")
+    
+    print("SUCCESS\n")
+    return 0
+}

@@ -1,0 +1,77 @@
+import std/fs
+import std/gguf
+
+fn main() {
+    print("=== Direct Read Test ===\n")
+    
+    let rc = gguf_load("/opt/ai/models/quanta/QUANTA-LFM2.5-2.6Bv1-Q4_K_M.gguf")
+    print("rc=")
+    print(rc)
+    print("\n")
+    
+    // Use a small tensor: blk.0.attn_norm.weight (idx=2, dtype=0, nelements=2048, offset=215048192)
+    let idx = 2
+    let dtype = gguf_tensor_dtype(idx)
+    let nelements = gguf_tensor_nelements(idx)
+    let offset = gguf_tensor_offset(idx)
+    
+    print("dtype=")
+    print(dtype)
+    print(" nelements=")
+    print(nelements)
+    print(" offset=")
+    print(offset)
+    print("\n")
+    
+    // Calculate size: dtype=0 is F32 = 4 bytes per element
+    let elem_sz = 4
+    let data_size = nelements * elem_sz
+    print("data_size=")
+    print(data_size)
+    print("\n")
+    
+    // Allocate buffer
+    print("allocating...\n")
+    let buf = mem_alloc(data_size)
+    print("buf=")
+    print(buf)
+    print("\n")
+    
+    if buf == 0 {
+        print("ALLOC FAILED\n")
+        return 1
+    }
+    
+    // Seek to offset
+    print("seeking...\n")
+    let seek_rc = lseek(gguf_fd, offset, 0)
+    print("seek_rc=")
+    print(seek_rc)
+    print("\n")
+    
+    // Read data
+    print("reading...\n")
+    let n = read_raw(gguf_fd, buf, data_size)
+    print("read n=")
+    print(n)
+    print("\n")
+    
+    if n < data_size {
+        print("READ FAILED\n")
+        return 1
+    }
+    
+    // Print first 8 values
+    print("First 8 values: ")
+    let i = 0
+    while i < 8 {
+        print(mem_load(buf + i * 4))
+        print(" ")
+        i = i + 1
+    }
+    print("\n")
+    
+    gguf_close()
+    print("DONE\n")
+    return 0
+}

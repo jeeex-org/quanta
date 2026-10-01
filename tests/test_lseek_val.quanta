@@ -1,0 +1,28 @@
+import std/fs
+
+// Isolate: is it from lseek with mem_load result?
+fn main() {
+    print("start\n")
+    
+    let fd = open("/opt/ai/models/quanta/QUANTA-LFM2.5-2.6Bv1-Q4_K_M.gguf", 0, 0)
+    if fd < 0 { print("open failed\n"); return 1 }
+    
+    let klen_buf = mem_alloc(8)
+    
+    print("before read\n")
+    read_raw(fd, klen_buf, 8)
+    print("after read\n")
+    
+    let klen = mem_load(klen_buf)
+    print("klen=")
+    print(klen)
+    print("\n")
+    
+    print("before lseek\n")
+    lseek(fd, klen, 1)
+    print("after lseek\n")
+    
+    print("SUCCESS\n")
+    close(fd)
+    return 0
+}

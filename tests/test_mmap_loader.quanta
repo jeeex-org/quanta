@@ -1,0 +1,149 @@
+import std/fs
+
+// GGUF loader using mmap for fast random access
+// No lseek needed - just slice the mmap'd buffer
+
+fn main() {
+    let path = "/opt/ai/models/quanta/QUANTA-LFM2.5-2.6Bv1-Q4_K_M.gguf"
+    let fd = open(path, 0, 0)
+    if fd < 0 { print("open failed\n"); return 1 }
+    
+    // Get file size. stat()/fstat() returns EFAULT on this target and leaves
+    // the buffer untouched, so st_size read from it was always 0 and the mmap
+    // below failed with EINVAL. file_size() uses lseek(SEEK_END), which is exact.
+    let fsize = file_size(fd)
+    print("file_size=")
+    print(fsize)
+    print("\n")
+    
+    // Mmap entire file. mmap_file/munmap_file, not mmap/munmap: the compiler has
+    // a 1-arg anonymous-mapping builtin named `mmap` that would win over this
+    // 6-arg file mapping and silently map the wrong thing.
+    let data = mmap_file(0, fsize, 1, 2, fd, 0)
+    if data < 0 { print("mmap failed\n"); close(fd); return 1 }
+    
+    print("mmap'd at ")
+    print(data)
+    print("\n")
+    
+    // Read header from mmap'd buffer. GGUF v3 layout: +8 is tensor_count and
+    // +16 is metadata_kv_count (these two were swapped in this test).
+    let magic = mem_load(data)
+    let version = mem_load(data + 4)
+    let n_tensors = mem_load(data + 8)
+    let n_kv = mem_load(data + 16)
+    
+    print("magic=")
+    print(magic)
+    print(" version=")
+    print(version)
+    print(" n_kv=")
+    print(n_kv)
+    print(" n_tensors=")
+    print(n_tensors)
+    print("\n")
+    
+    // Skip the 37 metadata KV pairs. Every GGUF scalar is a little-endian FIXED-WIDTH
+    // field, so mem_load (8 bytes) is wrong for 1/2/4-byte types -- reading 8 bytes
+    // where only 4 exist advances pos past the real record and desynchronizes the
+    // whole walk (this was the segfault). GGUF type widths:
+    //   0 u8,1 i8,7 bool      -> 1
+    //   2 u16,3 i16           -> 2
+    //   4 u32,5 i32,6 f32     -> 4
+    //   8 string,10 i64,11 f64,12 u64 -> 8 (strings: 8 + len bytes)
+    //   9 array               -> 4 (elem type) + 8 (count) + count*elem_width
+    let pos = 24  // Start after header
+    let i = 0
+    while i < 37 {
+        let klen = mem_load(data + pos)
+        pos = pos + 8 + klen  // skip key length + key
+
+        let vtype = mem_load32(data + pos)   // 4 bytes, not 8
+        pos = pos + 4
+
+        if vtype == 8 {
+            let slen = mem_load(data + pos)
+            pos = pos + 8 + slen
+        } else if vtype == 9 {
+            let atype = mem_load32(data + pos)
+            pos = pos + 4
+            let alen = mem_load(data + pos)
+            pos = pos + 8
+            let aw = 4
+            if atype == 0 || atype == 1 || atype == 7 { aw = 1 }
+            else if atype == 2 || atype == 3 { aw = 2 }
+            else if atype == 4 || atype == 5 || atype == 6 { aw = 4 }
+            else if atype == 8 { aw = 0 }   // array of strings: variable, handled below
+            if atype == 8 {
+                let j = 0
+                while j < alen {
+                    let slen = mem_load(data + pos)
+                    pos = pos + 8 + slen
+                    j = j + 1
+                }
+            } else {
+                // count * width -- NOT count: the old code advanced by element
+                // count, which for a 2048-entry u32 array moved 4 bytes instead
+                // of 8192 and desynchronized every subsequent record.
+                pos = pos + alen * aw
+            }
+        } else if vtype == 0 || vtype == 1 || vtype == 7 { pos = pos + 1 }
+        else if vtype == 2 || vtype == 3 { pos = pos + 2 }
+        else if vtype == 4 || vtype == 5 || vtype == 6 { pos = pos + 4 }
+        else if vtype == 10 || vtype == 11 || vtype == 12 { pos = pos + 8 }
+
+        i = i + 1
+    }
+    
+    print("skipped 37 pairs, pos=")
+    print(pos)
+    print("\n")
+    
+    // Read first tensor. All three length fields are u64: nlen (8 bytes), each
+    // dim (8 bytes), and offset (8 bytes); only n_dims and dtype are u32.
+    // Reading dims as u32 made dim[1] swallow the dtype field -- it produced
+    // the right dim[0]/dim[1] only by luck, and shifted dtype/offset.
+    let nlen = mem_load(data + pos)
+    pos = pos + 8
+    let name = data + pos
+    pos = pos + nlen
+
+    let ndims = mem_load32(data + pos)
+    pos = pos + 4
+
+    let d = 0
+    while d < ndims {
+        let dim = mem_load(data + pos)   // u64, NOT u32 -- see above
+        print("dim[")
+        print(d)
+        print("]=")
+        print(dim)
+        print("\n")
+        pos = pos + 8
+        d = d + 1
+    }
+    
+    let dtype = mem_load(data + pos)
+    pos = pos + 4
+    
+    let offset = mem_load(data + pos)
+    
+    print("First tensor: ")
+    // Print name
+    d = 0
+    while d < nlen {
+        let c = mem_load8(name + d)
+        file_write(1, c, 1)
+        d = d + 1
+    }
+    print(" dtype=")
+    print(dtype)
+    print(" offset=")
+    print(offset)
+    print("\n")
+    
+    // Unmap
+    munmap_file(data, fsize)
+    close(fd)
+    return 0
+}

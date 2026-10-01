@@ -1,0 +1,66 @@
+import std/fs
+
+fn main() {
+    print("start\n")
+    
+    let fd = open("/opt/ai/models/quanta/QUANTA-LFM2.5-2.6Bv1-Q4_K_M.gguf", 0, 0)
+    if fd < 0 { print("open failed\n"); return 1 }
+    
+    let hdr = mem_alloc(24)
+    read_raw(fd, hdr, 24)
+    
+    lseek(fd, 8222781, 0)
+    
+    // Read first tensor
+    let nlen_buf = mem_alloc(8)
+    read_raw(fd, nlen_buf, 8)
+    let nlen = mem_load(nlen_buf)
+    
+    let name = mem_alloc(256)
+    read_raw(fd, name, nlen)
+    
+    let ndims_buf = mem_alloc(4)
+    read_raw(fd, ndims_buf, 4)
+    let ndims = mem_load(ndims_buf)
+    
+    let dim_buf = mem_alloc(8)
+    let d = 0
+    while d < ndims {
+        read_raw(fd, dim_buf, 8)
+        d = d + 1
+    }
+    
+    let dtype_buf = mem_alloc(4)
+    read_raw(fd, dtype_buf, 4)
+    
+    let off_buf = mem_alloc(8)
+    read_raw(fd, off_buf, 8)
+    let offset = mem_load(off_buf)
+    
+    print("name: ")
+    write_raw(1, name, nlen)
+    print("\n")
+    
+    // Read first block
+    let blk = mem_alloc(210)
+    lseek(fd, offset, 0)
+    read_raw(fd, blk, 210)
+    
+    let scale = mem_load8(blk) + mem_load8(blk + 1) * 256
+    print("scale=")
+    print(scale)
+    print("\n")
+    
+    // First 6-bit quant
+    let b0 = mem_load8(blk + 2)
+    let b1 = mem_load8(blk + 3)
+    let v16 = b0 + b1 * 256
+    let q0 = v16 - (v16 / 64) * 64
+    print("q0=")
+    print(q0)
+    print("\n")
+    
+    print("SUCCESS\n")
+    close(fd)
+    return 0
+}

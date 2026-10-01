@@ -1,0 +1,27 @@
+import std/fs
+
+// Minimal crash reproduction
+fn main() {
+    print("start\n")
+    
+    let fd = open("/opt/ai/models/quanta/QUANTA-LFM2.5-2.6Bv1-Q4_K_M.gguf", 0, 0)
+    if fd < 0 { print("open failed\n"); return 1 }
+    
+    let klen_buf = mem_alloc(8)
+    let vtype_buf = mem_alloc(4)
+    
+    print("before loop\n")
+    
+    let i = 0
+    while i < 37 {
+        read_raw(fd, klen_buf, 8)
+        lseek(fd, mem_load(klen_buf), 1)
+        read_raw(fd, vtype_buf, 4)
+        i = i + 1
+    }
+    
+    print("after loop\n")
+    
+    close(fd)
+    return 0
+}

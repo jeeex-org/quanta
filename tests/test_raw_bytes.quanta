@@ -1,0 +1,122 @@
+import std/fs
+// Uses gguf_skip/gguf_skip_value (raw GGUF metadata skipping). They live in
+// std/gguf, not std/fs -- without this import the compiler correctly reported
+// "call to undeclared function: gguf_skip".
+import std/gguf
+
+fn fail(msg, got, want) {
+    print("FAIL ") ; print(msg) ; print(" got=") ; print(got) ; print(" want=") ; print(want) ; print("\n")
+}
+
+fn main() {
+    let fd = open("/opt/ai/models/quanta/QUANTA-LFM2.5-2.6Bv1-Q4_K_M.gguf", 0, 0)
+    if fd < 0 { print("FAIL open\n"); return 1 }
+
+    // ---- header ---------------------------------------------------------
+    // GGUF header: magic[4] version(u32) tensor_count(u64) metadata_kv_count(u64).
+    // tensor_count comes FIRST. Reading them the other way round reports
+    // n_kv=266 n_tensors=37 and every downstream count is then wrong.
+    let hdr = mem_alloc(24)
+    file_read(fd, hdr, 24)
+    let n_tensors = mem_load(hdr + 8)
+    let n_kv = mem_load(hdr + 16)
+    print("n_kv=") ; print(n_kv) ; print(" n_tensors=") ; print(n_tensors) ; print("\n")
+    if n_tensors != 266 { fail("n_tensors", n_tensors, 266); return 1 }
+    if n_kv != 37 { fail("n_kv", n_kv, 37); return 1 }
+
+    // ---- skip the metadata KV block -------------------------------------
+    let klen_buf = mem_alloc(8)
+    let vtype_buf = mem_alloc(4)
+    let i = 0
+    while i < n_kv {
+        read_raw(fd, klen_buf, 8)
+        gguf_skip(fd, mem_load(klen_buf))  // skip key
+        read_raw(fd, vtype_buf, 4)
+        gguf_skip_value(fd, mem_load(vtype_buf))
+        i = i + 1
+    }
+
+    let pos = lseek(fd, 0, 1)
+    print("After ") ; print(n_kv) ; print(" pairs: pos=") ; print(pos) ; print("\n")
+    if pos != 8222781 { fail("kv_end", pos, 8222781); return 1 }
+
+    // ---- first tensor-info ----------------------------------------------
+    // Layout: name_len(u64) name name_len bytes n_dims(u32) dims(u64[n_dims])
+    //         dtype(u32) offset(u64)
+    //
+    // n_dims and dtype are 32-bit. A 64-bit mem_load at the name_len position
+    // reads dtype | n_dims<<32 = 8796093022210, and a 64-bit read at the
+    // following position reads dims[0]<<32 | dtype = 549755813888000. The dims
+    // loop must start 4 bytes later than the name to land on dims[0].
+    let raw = mem_alloc(256)
+    read_raw(fd, raw, 256)
+
+    let nlen = mem_load(raw)
+    print("name_len=") ; print(nlen) ; print("\n")
+    if nlen != 17 { fail("name_len", nlen, 17); return 1 }
+
+    let name = mem_alloc(nlen + 1)
+    let j = 0
+    while j < nlen {
+        mem_store8(name + j, mem_load8(raw + 8 + j))
+        j = j + 1
+    }
+    mem_store8(name + nlen, 0)
+    print("name: ") ; write_raw(1, name, nlen) ; print("\n")
+
+    let base = raw + 8 + nlen          // start of n_dims
+    let ndims = mem_load4(base)        // u32
+    let dtype = mem_load4(base + 4 + ndims * 8)   // u32, after the dims
+    let dim0  = mem_load(base + 4)
+    let dim1  = mem_load(base + 12)
+    let offset = mem_load(base + 4 + ndims * 8 + 4)
+
+    print("ndims=") ; print(ndims) ; print("\n")
+    print("dtype=") ; print(dtype) ; print("\n")
+    print("dim[0]=") ; print(dim0) ; print(" dim[1]=") ; print(dim1) ; print("\n")
+    print("offset=") ; print(offset) ; print("\n")
+
+    if ndims != 2 { fail("ndims", ndims, 2); return 1 }
+    if dtype != 14 { fail("dtype", dtype, 14); return 1 }        // Q6_K
+    if dim0 != 2048 { fail("dim0", dim0, 2048); return 1 }
+    if dim1 != 128000 { fail("dim1", dim1, 128000); return 1 }
+    if offset != 0 { fail("offset", offset, 0); return 1 }
+
+    // ---- walk every tensor-info -----------------------------------------
+    // Confirms the record size is derived correctly for ndims != 2 as well.
+    // Each record is read at its own fd offset rather than from one big buffer:
+    // 266 records do not fit in the 256-byte staging buffer, and `raw = raw + rec`
+    // would walk straight off the end of the allocation.
+    let rec = mem_alloc(256)
+    let b8 = mem_alloc(8)
+    let b4 = mem_alloc(4)
+    lseek(fd, pos, 0)                  // back to the first tensor-info record
+    let t = 0
+    let bad = 0
+    let last_nd = 0
+    let last_dt = 0
+    while t < n_tensors {
+        read_raw(fd, b8, 8)
+        let n2 = mem_load(b8)
+        if n2 < 1 || n2 > 128 { fail("record name_len", n2, "1..128"); return 1 }
+        read_raw(fd, rec, n2)         // name bytes (length only, not needed further)
+        read_raw(fd, b4, 4)
+        let nd2 = mem_load4(b4)
+        if nd2 < 1 || nd2 > 4 { fail("record ndims", nd2, "1..4"); return 1 }
+        gguf_skip(fd, nd2 * 8)        // dims
+        read_raw(fd, b4, 4)
+        let d2 = mem_load4(b4)
+        read_raw(fd, b8, 8)           // offset
+        if d2 < 0 || d2 > 40 { bad = bad + 1 }
+        last_nd = nd2
+        last_dt = d2
+        t = t + 1
+    }
+    print("walked ") ; print(n_tensors) ; print(" tensor-info records, bad=") ; print(bad) ; print("\n")
+    print("last record: ndims=") ; print(last_nd) ; print(" dtype=") ; print(last_dt) ; print("\n")
+    if bad != 0 { fail("tensor-info walk", bad, 0); return 1 }
+
+    print("PASS\n")
+    close(fd)
+    return 0
+}

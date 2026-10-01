@@ -1,0 +1,65 @@
+import std/fs
+
+fn main() {
+    let fd = open("/opt/ai/models/quanta/QUANTA-LFM2.5-2.6Bv1-Q4_K_M.gguf", 0, 0)
+    if fd < 0 { print("open failed\n"); return 1 }
+    
+    // Seek to known tensor info offset
+    lseek(fd, 8222781, 0)
+    
+    // Read first tensor name length
+    let nlen_buf = mem_alloc(8)
+    let n = file_read(fd, nlen_buf, 8)
+    if n < 8 { print("EOF\n"); close(fd); return 1 }
+    
+    let nlen = mem_load(nlen_buf)
+    print("nlen=")
+    print(nlen)
+    print("\n")
+    
+    // Read tensor name
+    let name = mem_alloc(nlen + 1)
+    read_raw(fd, name, nlen)
+    mem_store8(name + nlen, 0)
+    print("name: ")
+    write_raw(1, name, nlen)
+    print("\n")
+    
+    // Read ndims
+    let ndims_buf = mem_alloc(4)
+    read_raw(fd, ndims_buf, 4)
+    let ndims = mem_load(ndims_buf)
+    print("ndims=")
+    print(ndims)
+    print("\n")
+    
+    // Read dims
+    let d = 0
+    while d < ndims {
+        let dim_buf = mem_alloc(8)
+        read_raw(fd, dim_buf, 8)
+        print("dim[")
+        print(d)
+        print("]=")
+        print(mem_load(dim_buf))
+        print("\n")
+        d = d + 1
+    }
+    
+    // Read dtype
+    let dtype_buf = mem_alloc(4)
+    read_raw(fd, dtype_buf, 4)
+    print("dtype=")
+    print(mem_load(dtype_buf))
+    print("\n")
+    
+    // Read offset
+    let off_buf = mem_alloc(8)
+    read_raw(fd, off_buf, 8)
+    print("offset=")
+    print(mem_load(off_buf))
+    print("\n")
+    
+    close(fd)
+    return 0
+}

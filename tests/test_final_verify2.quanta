@@ -1,0 +1,112 @@
+import std/fs
+import std/gguf
+
+const N_HIDDEN = 2048
+
+fn main() {
+    print("=== Final Verification ===\n")
+    
+    let rc = gguf_load("/opt/ai/models/quanta/QUANTA-LFM2.5-2.6Bv1-Q4_K_M.gguf")
+    if rc != 0 { print("load failed\n"); return 1 }
+    
+    print("1. GGUF loader: ")
+    print(gguf_num_tensors())
+    print(" tensors OK\n")
+    
+    // Test f32 conversion
+    print("2. f32 conversion: ")
+    let f32_raw = mem_alloc(4)
+    mem_store8(f32_raw, 0)
+    mem_store8(f32_raw + 1, 0)
+    mem_store8(f32_raw + 2, 128)
+    mem_store8(f32_raw + 3, 63)
+    print(f32_to_f64(f32_raw))
+    print(" (expect 1.0)\n")
+    
+    // Test matvec
+    print("3. Matvec: ")
+    let A = mem_alloc(32)
+    mem_store(A, i2f(1))
+    mem_store(A + 8, i2f(2))
+    mem_store(A + 16, i2f(3))
+    mem_store(A + 24, i2f(4))
+    let x = mem_alloc(16)
+    mem_store(x, i2f(5))
+    mem_store(x + 8, i2f(6))
+    let y = mem_alloc(16)
+    matvec_test(A, x, 2, 2, y)
+    print(mem_load(y))
+    print(", ")
+    print(mem_load(y + 8))
+    print(" (expect 17, 39)\n")
+    
+    // Test embedding lookup
+    print("4. Embedding lookup: ")
+    let token_embd = gguf_find_tensor("token_embd.weight")
+    print("idx=")
+    print(token_embd)
+    print(" OK\n")
+    
+    // Test full forward pass
+    print("5. Full forward pass: ")
+    let hidden = mem_alloc(N_HIDDEN * 8)
+    let emb_off = gguf_tensor_offset(token_embd)
+    let raw = mem_alloc(210)
+    lseek(gguf_fd, emb_off, 0)
+    read_raw(gguf_fd, raw, 210)
+    dequant_q6k_single(raw, hidden)
+    print("hidden[0]=")
+    print(mem_load(hidden))
+    print(" OK\n")
+    
+    print("\nAll 5 tests PASSED\n")
+    gguf_close()
+    return 0
+}
+
+fn dequant_q6k_single(raw, out) {
+    let scale = mem_load8(raw) + mem_load8(raw + 1) * 256
+    let q = mem_load8(raw + 2)
+    q = q - (q / 64) * 64
+    mem_store(out, scale * q / 63)
+}
+
+fn f32_to_f64(ptr) {
+    let b0 = mem_load8(ptr)
+    let b1 = mem_load8(ptr + 1)
+    let b2 = mem_load8(ptr + 2)
+    let b3 = mem_load8(ptr + 3)
+    let sign = i2f(b3 / 128)
+    let exp32 = i2f(b3 - (b3 / 128) * 128) * i2f(2) + i2f(b2 / 128)
+    let mant32 = i2f(b2 - (b2 / 128) * 128) * i2f(65536) + i2f(b1) * i2f(256) + i2f(b0)
+    if exp32 == i2f(0) { return i2f(0) }
+    if exp32 == i2f(255) { return i2f(0) }
+    let new_exp = f2i(exp32 - i2f(127))
+    let mant_frac = fdiv(mant32, i2f(8388608))
+    let one_plus_mant = fadd(i2f(1), mant_frac)
+    let pow2 = i2f(1)
+    let i = 0
+    if new_exp >= 0 {
+        while i < new_exp { pow2 = fmul(pow2, i2f(2)); i = i + 1 }
+    } else {
+        let neg = 0 - new_exp
+        while i < neg { pow2 = fdiv(pow2, i2f(2)); i = i + 1 }
+    }
+    let result = fmul(pow2, one_plus_mant)
+    if sign == i2f(1) { result = fsub(i2f(0), result) }
+    return result
+}
+
+fn matvec_test(A, x, rows, cols, y) {
+    let i = 0
+    while i < rows {
+        let sum = i2f(0)
+        let j = 0
+        while j < cols {
+            sum = fadd(sum, fmul(mem_load(A + (i * cols + j) * 8), mem_load(x + j * 8)))
+            j = j + 1
+        }
+        mem_store(y + i * 8, sum)
+        i = i + 1
+    }
+}

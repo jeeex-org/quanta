@@ -1,0 +1,106 @@
+import std/fs
+
+// Q4_K matmul using pre-dequantized Q8 weights
+// Simple, fast, integer-only - works with current compiler
+
+const Q8_SCALE = 128
+
+// Pre-dequantize one row of Q4_K weights to Q8
+fn preconvert_row_q4k(W_q4k, W_q8, n_blocks) {
+    let bi = 0
+    while bi < n_blocks {
+        let base = bi * 144
+        let scale_raw = mem_load8(W_q4k + base) + mem_load8(W_q4k + base + 1) * 256
+        let scale_q8 = f16_to_q8(scale_raw)
+        
+        let qi = 0
+        while qi < 256 {
+            let sub_byte = mem_load8(W_q4k + base + 2 + qi / 16)
+            let byte_idx = qi / 2
+            let byte_val = mem_load8(W_q4k + base + 18 + byte_idx)
+            let nibble = 0
+            if qi - (qi / 2) * 2 == 0 {
+                nibble = byte_val - (byte_val / 16) * 16
+            } else {
+                nibble = byte_val / 16
+            }
+            mem_store(W_q8 + bi * 256 * 8 + qi * 8, scale_q8 * sub_byte * (nibble - 8) / Q8_SCALE)
+            qi = qi + 1
+        }
+        bi = bi + 1
+    }
+}
+
+fn f16_to_q8(f16) {
+    let sign = (f16 / 32768) * 32768
+    let exp = (f16 - sign) / 1024
+    let mant = f16 - sign - exp * 1024
+    if exp == 0 {
+        if mant == 0 { return 0 }
+        return mant * Q8_SCALE / 1024
+    }
+    if exp == 31 { return 0 }
+    let base = 1024 + mant
+    let shift = exp - 15
+    if shift >= 0 { return base * shift * Q8_SCALE / 1024 }
+    return base * Q8_SCALE / 1024 / (-shift)
+}
+
+// Q8 dot product for one row
+fn dot_q8(W, x, cols) {
+    let sum = 0
+    let j = 0
+    while j < cols {
+        sum = sum + mem_load(W + j * 8) * mem_load(x + j * 8) / Q8_SCALE
+        j = j + 1
+    }
+    return sum
+}
+
+// Benchmark: preconvert + matmul
+fn main() {
+    let fd = open("/opt/ai/models/quanta/QUANTA-LFM2.5-2.6Bv1-Q4_K_M.gguf", 0, 0)
+    if fd < 0 { return 1 }
+    
+    let gate_offset = 241358880
+    let rows = 2048
+    let cols = 10752
+    let n_blocks = cols / 256
+    
+    let gate_size = rows * n_blocks * 144
+    let gate_q4k = mem_alloc(gate_size)
+    lseek(fd, gate_offset, 0)
+    file_read(fd, gate_q4k, gate_size)
+    close(fd)
+    
+    print("Preconverting...\n")
+    
+    let gate_q8 = mem_alloc(rows * cols * 8)
+    let i = 0
+    while i < rows {
+        preconvert_row_q4k(gate_q4k + i * n_blocks * 144, gate_q8 + i * cols * 8, n_blocks)
+        i = i + 1
+    }
+    
+    let x = mem_alloc(cols * 8)
+    i = 0
+    while i < cols {
+        mem_store(x + i * 8, Q8_SCALE)
+        i = i + 1
+    }
+    
+    print("Matmul...\n")
+    
+    let y = mem_alloc(rows * 8)
+    i = 0
+    while i < rows {
+        mem_store(y + i * 8, dot_q8(gate_q8 + i * cols * 8, x, cols))
+        i = i + 1
+    }
+    
+    print("Done. result[0]=")
+    print(mem_load(y))
+    print("\n")
+    
+    return 0
+}

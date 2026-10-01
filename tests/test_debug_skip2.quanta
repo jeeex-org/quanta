@@ -1,0 +1,114 @@
+import std/fs
+
+fn main() {
+    print("=== Debug: Check After Skip ===\n")
+    
+    let fd = open("/opt/ai/models/quanta/QUANTA-LFM2.5-2.6Bv1-Q4_K_M.gguf", 0, 0)
+    if fd < 0 { print("open failed\n"); return 1 }
+    
+    let hdr = mem_alloc(24)
+    read_raw(fd, hdr, 24)
+    
+    let n_kv = mem_load(hdr + 8)
+    print("n_kv=")
+    print(n_kv)
+    print("\n")
+    
+    // Skip metadata
+    let klen_buf = mem_alloc(8)
+    let vtype_buf = mem_alloc(4)
+    let slen_buf = mem_alloc(8)
+    let i = 0
+    
+    while i < n_kv {
+        read_raw(fd, klen_buf, 8)
+        let klen = mem_load(klen_buf)
+        lseek(fd, klen, 1)
+        
+        read_raw(fd, vtype_buf, 4)
+        let vtype = mem_load(vtype_buf)
+        
+        if vtype == 0 { lseek(fd, 1, 1) }
+        else if vtype == 1 { lseek(fd, 1, 1) }
+        else if vtype == 2 { lseek(fd, 2, 1) }
+        else if vtype == 3 { lseek(fd, 2, 1) }
+        else if vtype == 4 { lseek(fd, 4, 1) }
+        else if vtype == 5 { lseek(fd, 4, 1) }
+        else if vtype == 6 { lseek(fd, 4, 1) }
+        else if vtype == 7 { lseek(fd, 1, 1) }
+        else if vtype == 8 {
+            read_raw(fd, slen_buf, 8)
+            lseek(fd, mem_load(slen_buf), 1)
+        } else if vtype == 9 {
+            read_raw(fd, vtype_buf, 4)
+            read_raw(fd, slen_buf, 8)
+            let alen = mem_load(slen_buf)
+            let etype = mem_load(vtype_buf)
+            // For string arrays (etype=8), skip each string
+            if etype == 8 {
+                let ai = 0
+                while ai < alen {
+                    read_raw(fd, slen_buf, 8)
+                    lseek(fd, mem_load(slen_buf), 1)
+                    ai = ai + 1
+                }
+            } else {
+                let esize = 1
+                if etype == 4 || etype == 5 || etype == 6 { esize = 4 }
+                lseek(fd, alen * esize, 1)
+            }
+        }
+        
+        i = i + 1
+    }
+    
+    // Read first tensor: nlen, name, ndims, dims, dtype, offset
+    let nlen_buf = mem_alloc(8)
+    read_raw(fd, nlen_buf, 8)
+    let nlen = mem_load(nlen_buf)
+    
+    print("nlen=")
+    print(nlen)
+    print("\n")
+    
+    let name = mem_alloc(64)
+    read_raw(fd, name, nlen)
+    print("name: ")
+    write_raw(1, name, nlen)
+    print("\n")
+    
+    let ndims_buf = mem_alloc(4)
+    read_raw(fd, ndims_buf, 4)
+    let ndims = mem_load(ndims_buf)
+    print("ndims=")
+    print(ndims)
+    print("\n")
+    
+    let dim_buf = mem_alloc(8)
+    let d = 0
+    while d < ndims {
+        read_raw(fd, dim_buf, 8)
+        print("dim[")
+        print(d)
+        print("]=")
+        print(mem_load(dim_buf))
+        print("\n")
+        d = d + 1
+    }
+    
+    let dtype_buf = mem_alloc(4)
+    read_raw(fd, dtype_buf, 4)
+    print("dtype=")
+    print(mem_load(dtype_buf))
+    print("\n")
+    
+    let off_buf = mem_alloc(8)
+    read_raw(fd, off_buf, 8)
+    print("offset=")
+    print(mem_load(off_buf))
+    print("\n")
+    
+    print("SUCCESS\n")
+    close(fd)
+    return 0
+}

@@ -1,0 +1,59 @@
+import std/fs
+import std/gguf
+
+fn main() {
+    print("=== Read + Dequant Test ===\n")
+    
+    let rc = gguf_load("/opt/ai/models/quanta/QUANTA-LFM2.5-2.6Bv1-Q4_K_M.gguf")
+    if rc != 0 { print("load failed\n"); return 1 }
+    
+    print("loaded ")
+    print(gguf_num_tensors())
+    print(" tensors\n")
+    
+    let idx = gguf_find_tensor("token_embd.weight")
+    if idx < 0 { print("not found\n"); return 1 }
+    
+    print("idx=")
+    print(idx)
+    print(" dtype=")
+    print(gguf_tensor_dtype(idx))
+    print(" off=")
+    print(gguf_tensor_offset(idx))
+    print(" nelem=")
+    print(gguf_tensor_nelements(idx))
+    print("\n")
+    
+    // Read first Q6_K block (210 bytes for 256 elements)
+    let raw = mem_alloc(210)
+    lseek(gguf_fd, gguf_tensor_offset(idx), 0)
+    read_raw(gguf_fd, raw, 210)
+    
+    let scale = mem_load8(raw) + mem_load8(raw + 1) * 256
+    print("scale=")
+    print(scale)
+    print("\n")
+    
+    // Print first 4 dequant values from block
+    let b0 = mem_load8(raw + 2)
+    let b1 = mem_load8(raw + 3)
+    let b2 = mem_load8(raw + 4)
+    
+    let q0 = b0 - (b0 / 64) * 64
+    let q1 = (b0 / 64) + (b1 - (b1 / 16) * 16) * 4
+    let q2 = (b1 / 16) + (b2 - (b2 / 4) * 4) * 16
+    let q3 = b2 / 4
+    
+    print("q0=")
+    print(q0)
+    print(" q1=")
+    print(q1)
+    print(" q2=")
+    print(q2)
+    print(" q3=")
+    print(q3)
+    print("\n")
+    
+    print("SUCCESS\n")
+    return 0
+}

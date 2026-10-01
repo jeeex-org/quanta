@@ -1,0 +1,54 @@
+import std/fs
+import std/gguf
+
+fn main() {
+    print("=== Debug ===\n")
+    
+    let rc = gguf_load("/opt/ai/models/quanta/QUANTA-LFM2.5-2.6Bv1-Q4_K_M.gguf")
+    print("rc=")
+    print(rc)
+    print("\n")
+    
+    let idx = 4  // blk.0.ffn_gate.weight
+    let dtype = gguf_tensor_dtype(idx)
+    let nelements = gguf_tensor_nelements(idx)
+    let offset = gguf_tensor_offset(idx)
+    
+    print("dtype=")
+    print(dtype)
+    print(" nelements=")
+    print(nelements)
+    print(" offset=")
+    print(offset)
+    print("\n")
+    
+    // Try to allocate buffer
+    print("allocating buffer...\n")
+    let elem_sz = 2  // Q4_K
+    let data_size = nelements * elem_sz
+    print("data_size=")
+    print(data_size)
+    print("\n")
+    
+    let buf = mem_alloc(data_size)
+    print("buf allocated at ")
+    print(buf)
+    print("\n")
+    
+    // Try lseek
+    print("seeking to offset...\n")
+    let seek_rc = lseek(gguf_fd, offset, 0)
+    print("seek_rc=")
+    print(seek_rc)
+    print("\n")
+    
+    // Try read
+    print("reading data...\n")
+    let n = read_raw(gguf_fd, buf, data_size)
+    print("read n=")
+    print(n)
+    print("\n")
+    
+    print("done\n")
+    return 0
+}

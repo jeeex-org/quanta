@@ -1,0 +1,27 @@
+import std/fs
+
+// Test: read small chunk into buffer, then parse
+fn main() {
+    print("start\n")
+    
+    let fd = open("/opt/ai/models/quanta/QUANTA-LFM2.5-2.6Bv1-Q4_K_M.gguf", 0, 0)
+    if fd < 0 { print("open failed\n"); return 1 }
+    
+    // Read 256 bytes into buffer
+    let buf = mem_alloc(256)
+    read_raw(fd, buf, 256)
+    print("read 256 bytes\n")
+    
+    // Parse header
+    let n_kv = mem_load(buf + 8)
+    let n_tensors = mem_load(buf + 16)
+    print("n_kv=")
+    print(n_kv)
+    print(" n_tensors=")
+    print(n_tensors)
+    print("\n")
+    
+    print("SUCCESS\n")
+    close(fd)
+    return 0
+}

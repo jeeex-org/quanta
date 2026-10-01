@@ -1,0 +1,142 @@
+import std/fs
+
+// Fixed-point matmul for Q4_K weights
+// Uses integer arithmetic only - no float-preserving builtins needed
+// FIXED_POINT = 1000 means we store 1.5 as 1500
+
+const FIXED_POINT = 1000
+
+// Dequantize one Q4_K block to fixed-point integers
+// Q4_K layout: [scale_f16(2)] [scales_8bit(16)] [quads(128)] = 146 bytes? 
+// Actually Q4_K_M uses 132 bytes per 256 elements
+// For now, use 144 bytes per block (standard Q4_K)
+
+fn dequant_q4k_block(W_base, out) {
+    // Read scale (f16, 2 bytes) - convert to fixed-point integer
+    let scale_raw = mem_load8(W_base) + mem_load8(W_base + 1) * 256
+    let scale_fp = f16_to_fixed(scale_raw)
+    
+    let qi = 0
+    while qi < 256 {
+        // Get sub-scale (one per 16 elements)
+        let sub_byte = mem_load8(W_base + 2 + qi / 16)
+        let sub_fp = sub_byte * 16  // Scale up to fixed-point
+        
+        // Get quad (4-bit value)
+        let byte_idx = qi / 2
+        let byte_val = mem_load8(W_base + 18 + byte_idx)
+        let nibble = 0
+        if qi - (qi / 2) * 2 == 0 {
+            nibble = byte_val - (byte_val / 16) * 16
+        } else {
+            nibble = byte_val / 16
+        }
+        
+        // Dequantize: value = scale * sub_scale * (nibble - 8)
+        // In fixed-point: val_fp = scale_fp * sub_fp * (nibble - 8) / FIXED_POINT
+        let val_fp = scale_fp * sub_fp * (nibble - 8) / FIXED_POINT
+        mem_store(out + qi * 8, val_fp)
+        
+        qi = qi + 1
+    }
+}
+
+// Convert f16 to fixed-point integer (approximate)
+fn f16_to_fixed(f16) {
+    let sign = (f16 / 32768) * 32768
+    let exp = (f16 - sign) / 1024
+    let mant = f16 - sign - exp * 1024
+    
+    if exp == 0 {
+        if mant == 0 { return 0 }
+        return mant * FIXED_POINT / 1048576
+    }
+    if exp == 31 { return 0 }
+    
+    // Normal: value = 2^(exp-15) * (1 + mant/1024)
+    // In fixed-point: val = (1024 + mant) * 2^(exp-15) * FIXED_POINT / 1024
+    let base = 1024 + mant
+    let shift = exp - 15
+    if shift >= 0 {
+        return base * (1 * shift) * FIXED_POINT / 1024
+    } else {
+        return base * FIXED_POINT / 1024 / (1 * (-shift))
+    }
+}
+
+// Fixed-point matmul: y = W * x
+// W is Q4_K quantized, x is fixed-point integer array
+fn matvec_q4k_fixed(W, x, rows, cols, y) {
+    let n_blocks = cols / 256
+    let i = 0
+    while i < rows {
+        let sum = 0
+        let bi = 0
+        while bi < n_blocks {
+            // Dequantize one block
+            let dequant = mem_alloc(256 * 8)
+            dequant_q4k_block(W + (i * n_blocks + bi) * 144, dequant)
+            
+            // Dot product with x
+            let j = 0
+            while j < 256 {
+                let w_val = mem_load(dequant + j * 8)
+                let x_val = mem_load(x + (bi * 256 + j) * 8)
+                sum = sum + w_val * x_val / FIXED_POINT
+                j = j + 1
+            }
+            
+            bi = bi + 1
+        }
+        mem_store(y + i * 8, sum)
+        i = i + 1
+    }
+}
+
+// Test fixed-point matmul
+fn main() {
+    // Create a simple Q4_K block (144 bytes for 256 elements)
+    let W = mem_alloc(144)
+    
+    // Set scale to 1.0 (f16 = 0x3C00 = 15360)
+    mem_store8(W, 0)
+    mem_store8(W + 1, 60)  // 15360 = 0x3C00
+    
+    // Set sub-scales to 1 (for simplicity)
+    let i = 0
+    while i < 16 {
+        mem_store8(W + 2 + i, 1)
+        i = i + 1
+    }
+    
+    // Set quads: alternate between nibble 9 (value = 1) and nibble 7 (value = -1)
+    i = 0
+    while i < 128 {
+        // Each byte has 2 nibbles
+        mem_store8(W + 18 + i, 0x97)  // nibble 9, nibble 7
+        i = i + 1
+    }
+    
+    // Create input x (256 elements, all 1.0 in fixed-point = 1000)
+    let x = mem_alloc(256 * 8)
+    i = 0
+    while i < 256 {
+        mem_store(x + i * 8, 1000)  // 1.0 in fixed-point
+        i = i + 1
+    }
+    
+    // Run matmul
+    let y = mem_alloc(8)
+    matvec_q4k_fixed(W, x, 1, 256, y)
+    
+    let result = mem_load(y)
+    print("result=")
+    print(result)
+    print("\n")
+    
+    // Expected: 128 elements with value 1, 128 elements with value -1
+    // Sum = 128 * 1 + 128 * (-1) = 0
+    if result == 0 { print("PASS\n"); return 0 }
+    print("FAIL (expected 0)\n")
+    return 1
+}

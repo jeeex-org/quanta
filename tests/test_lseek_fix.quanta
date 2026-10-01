@@ -1,0 +1,40 @@
+import std/fs
+
+fn main() {
+    print("=== lseek test ===\n")
+    
+    let fd = open("/opt/ai/models/quanta/QUANTA-LFM2.5-2.6Bv1-Q4_K_M.gguf", 0, 0)
+    if fd < 0 { print("open failed\n"); return 1 }
+    
+    // Read header
+    let hdr = mem_alloc(24)
+    read_raw(fd, hdr, 24)
+    print("magic=")
+    print(mem_load8(hdr))
+    print("\n")
+    
+    // Test lseek to offset 100
+    lseek(fd, 100, 0)
+    
+    // Read 4 bytes at offset 100
+    let buf = mem_alloc(4)
+    read_raw(fd, buf, 4)
+    print("data at 100: ")
+    print(mem_load8(buf))
+    print(" ")
+    print(mem_load8(buf + 1))
+    print("\n")
+    
+    // Test lseek to offset 0 (back to start)
+    lseek(fd, 0, 0)
+    read_raw(fd, buf, 4)
+    print("data at 0: ")
+    print(mem_load8(buf))
+    print(" ")
+    print(mem_load8(buf + 1))
+    print("\n")
+    
+    print("SUCCESS\n")
+    close(fd)
+    return 0
+}

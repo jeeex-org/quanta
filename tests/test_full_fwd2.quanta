@@ -1,0 +1,55 @@
+import std/fs
+import std/gguf
+
+// Full forward pass test using the proper gguf API
+const HIDDEN = 2048
+const INTERMEDIATE = 6144
+
+fn main() {
+    print("=== Full Forward Pass ===\n")
+    
+    let rc = gguf_load("/opt/ai/models/quanta/QUANTA-LFM2.5-2.6Bv1-Q4_K_M.gguf")
+    if rc != 0 { print("load failed\n"); return 1 }
+    
+    print("model loaded, tensors=")
+    print(gguf_num_tensors())
+    print("\n")
+    
+    // Find required tensors
+    let token_embd_idx = gguf_find_tensor("token_embd.weight")
+    let output_norm_idx = gguf_find_tensor("output_norm.weight")
+    let output_idx = gguf_find_tensor("output.weight")
+    
+    print("token_embd idx=")
+    print(token_embd_idx)
+    print("\n")
+    print("output_norm idx=")
+    print(output_norm_idx)
+    print("\n")
+    print("output idx=")
+    print(output_idx)
+    print("\n")
+    
+    // Read token_embd weight (f32, 2048x128000 = huge)
+    // For testing, just read first 2048 elements
+    if token_embd_idx >= 0 {
+        let emb = mem_alloc(2048 * 8)
+        read_tensor_f64(token_embd_idx, emb)
+        print("token_embd[0]=")
+        print(mem_load(emb))
+        print("\n")
+    }
+    
+    // Read output_norm weight (f32, 2048)
+    if output_norm_idx >= 0 {
+        let norm_w = mem_alloc(2048 * 8)
+        read_tensor_f64(output_norm_idx, norm_w)
+        print("output_norm[0]=")
+        print(mem_load(norm_w))
+        print("\n")
+    }
+    
+    gguf_close()
+    print("SUCCESS\n")
+    return 0
+}

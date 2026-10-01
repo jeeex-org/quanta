@@ -1,0 +1,63 @@
+import std/fs
+
+// The crash is from relative lseek in a loop. Use absolute lseek instead.
+fn main() {
+    print("start\n")
+    
+    let fd = open("/opt/ai/models/quanta/QUANTA-LFM2.5-2.6Bv1-Q4_K_M.gguf", 0, 0)
+    if fd < 0 { print("open failed\n"); return 1 }
+    
+    let hdr = mem_alloc(24)
+    read_raw(fd, hdr, 24)
+    let n_tensors = mem_load(hdr + 16)
+    print("n_tensors=")
+    print(n_tensors)
+    print("\n")
+    
+    // Use absolute lseek to tensor info section
+    lseek(fd, 8222781, 0)
+    
+    // Read tensor info with minimal loop
+    let nlen_buf = mem_alloc(8)
+    let name = mem_alloc(256)
+    let ndims_buf = mem_alloc(4)
+    let dim_buf = mem_alloc(8)
+    let dtype_buf = mem_alloc(4)
+    let off_buf = mem_alloc(8)
+    
+    let ti = 0
+    let nlen = 0
+    
+    // Read just first tensor
+    read_raw(fd, nlen_buf, 8)
+    nlen = mem_load(nlen_buf)
+    read_raw(fd, name, nlen)
+    mem_store8(name + nlen, 0)
+    
+    let ndims_buf2 = mem_alloc(4)
+    read_raw(fd, ndims_buf2, 4)
+    let ndims = mem_load(ndims_buf2)
+    
+    let d = 0
+    let dim_buf2 = mem_alloc(8)
+    while d < ndims {
+        read_raw(fd, dim_buf2, 8)
+        d = d + 1
+    }
+    
+    let dtype_buf2 = mem_alloc(4)
+    read_raw(fd, dtype_buf2, 4)
+    
+    let off_buf2 = mem_alloc(8)
+    read_raw(fd, off_buf2, 8)
+    
+    print("tensor[0] name=")
+    write_raw(1, name, nlen)
+    print(" ndims=")
+    print(ndims)
+    print("\n")
+    
+    print("SUCCESS\n")
+    close(fd)
+    return 0
+}

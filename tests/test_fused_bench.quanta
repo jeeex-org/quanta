@@ -1,0 +1,95 @@
+import std/fs
+import std/matmul_fused
+
+// Benchmark: fused Q4_K_M matvec on real weights
+const HIDDEN = 2048
+const INTERMEDIATE = 6144
+
+fn main() {
+    let fd = open("/opt/ai/models/quanta/QUANTA-LFM2.5-2.6Bv1-Q4_K_M.gguf", 0, 0)
+    if fd < 0 { return 1 }
+    
+    // Known tensor info offset
+    let tensor_start = 8222781
+    
+    // Read tensor info for blk.0.ffn_gate.weight (Q4_K, 6144x2048)
+    lseek(fd, tensor_start, 0)
+    
+    let nlen_buf = mem_alloc(8)
+    let ndims_buf = mem_alloc(4)
+    let dim_buf = mem_alloc(8)
+    let dtype_buf = mem_alloc(4)
+    let off_buf = mem_alloc(8)
+    let name_buf = mem_alloc(256)
+    
+    let target_idx = 0
+    let i = 0
+    while i <= target_idx {
+        file_read(fd, nlen_buf, 8)
+        let nlen = mem_load(nlen_buf)
+        if nlen > 255 { nlen = 255 }
+        file_read(fd, name_buf, nlen)
+        
+        file_read(fd, ndims_buf, 4)
+        let ndims = mem_load(ndims_buf)
+        
+        // Skip dims
+        let d = 0
+        while d < ndims {
+            file_read(fd, dim_buf, 8)
+            d = d + 1
+        }
+        
+        file_read(fd, dtype_buf, 4)
+        let dtype = mem_load(dtype_buf)
+        
+        file_read(fd, off_buf, 8)
+        let offset = mem_load(off_buf)
+        
+        if i == target_idx {
+            // Found target tensor
+            print("tensor ")
+            print(target_idx)
+            print(" dtype=")
+            print(dtype)
+            print(" offset=")
+            print(offset)
+            print("\n")
+            
+            // Read a small portion for testing (first block = 146 bytes = 256 elements)
+            let raw_block = mem_alloc(146)
+            lseek(fd, offset, 0)
+            file_read(fd, raw_block, 146)
+            
+            // Create input vector (256 elements)
+            let x = mem_alloc(256 * 8)
+            let j = 0
+            while j < 256 {
+                mem_store(x + j * 8, i2f(j - 128))
+                j = j + 1
+            }
+            
+            // Single block test
+            let raw_scale = i2f(mem_load8(raw_block) + mem_load8(raw_block + 1) * 256)
+            let sub_scale = i2f(mem_load8(raw_block + 2))
+            let quant_val = fmul(fmul(raw_scale, sub_scale), i2f(5))
+            let xv = mem_load(x + 100 * 8)
+            let result = fmul(quant_val, xv)
+            
+            print("raw_scale=")
+            print(raw_scale)
+            print(" sub_scale=")
+            print(sub_scale)
+            print(" xv=")
+            print(xv)
+            print(" result=")
+            print(result)
+            print("\n")
+        }
+        
+        i = i + 1
+    }
+    
+    close(fd)
+    return 0
+}

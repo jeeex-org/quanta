@@ -1,0 +1,42 @@
+import std/fs
+import std/gguf
+
+// Debug: print tensor info with details
+fn main() {
+    let fd = open("/opt/ai/models/quanta/QUANTA-LFM2.5-2.6Bv1-Q4_K_M.gguf", 0, 0)
+    if fd < 0 { return 1 }
+    
+    // Skip header + metadata (just seek to tensor info section)
+    // Header: 24 bytes, metadata varies, tensor info starts after alignment
+    // Use the known offset
+    lseek(fd, 8222781, 0)
+    
+    // Read first tensor name length
+    let nlen_buf = mem_alloc(8)
+    let name_buf = mem_alloc(256)
+    
+    // Read first tensor
+    file_read(fd, nlen_buf, 8)
+    let nlen = mem_load(nlen_buf)
+    print("tensor 0 nlen=")
+    print(nlen)
+    print("\n")
+    
+    if nlen > 0 && nlen < 256 {
+        file_read(fd, name_buf, nlen)
+        mem_store8(name_buf + nlen, 0)
+        
+        // Print name bytes
+        print("name bytes: ")
+        let j = 0
+        while j < nlen {
+            print(mem_load8(name_buf + j))
+            print(" ")
+            j = j + 1
+        }
+        print("\n")
+    }
+    
+    close(fd)
+    return 0
+}

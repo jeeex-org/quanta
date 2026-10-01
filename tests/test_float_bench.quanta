@@ -1,0 +1,46 @@
+import std/fs
+
+// Benchmark: float-heavy computation
+// Measures speed of faddf/fmulf without flush_all overhead
+// clock_gettime(clk_id, ts_ptr): sc 228, clk_id=1 is MONOTONIC
+
+fn main() {
+    let N = 100000
+    let a = i2f(1)
+    let b = i2f(2)
+    
+    let t0_buf = mem_alloc(2)
+    let t1_buf = mem_alloc(2)
+    
+    clock_gettime(1, t0_buf)
+    
+    let i = 0
+    let acc = i2f(0)
+    while i < N {
+        let s1 = faddf(acc, a)
+        let s2 = fmulf(s1, b)
+        let s3 = fsubf(s2, a)
+        let s4 = fdivf(s3, b)
+        acc = s4
+        i = i + 1
+    }
+    
+    clock_gettime(1, t1_buf)
+    
+    let t0_sec = mem_load(t0_buf)
+    let t0_nsec = mem_load(t0_buf + 8)
+    let t1_sec = mem_load(t1_buf)
+    let t1_nsec = mem_load(t1_buf + 8)
+    
+    let elapsed = (t1_sec - t0_sec) * 1000000000 + (t1_nsec - t0_nsec)
+    
+    print("result=")
+    print(acc)
+    print("\niterations=")
+    print(N)
+    print("\nns_per_iter=")
+    print(elapsed / N)
+    print("\n")
+    
+    return 0
+}

@@ -1,0 +1,300 @@
+import std/fs
+import std/gguf
+
+// Q4_K dequant: block size 144 bytes for 256 elements
+// Layout: 2B f16 scale + 6B min + 128B 4-bit quants + ...
+fn dequant_q4k(raw, nelements, out) {
+    let n_blocks = nelements / 256
+    let bi = 0
+    while bi < n_blocks {
+        let bo = bi * 144
+        let scale = mem_load8(raw + bo) + mem_load8(raw + bo + 1) * 256
+        let vi = 0
+        while vi < 256 {
+            let byte_val = mem_load8(raw + bo + 8 + vi / 2)
+            let nibble = 0
+            if vi - (vi / 2) * 2 == 0 { nibble = byte_val / 16 }
+            else { nibble = byte_val - (byte_val / 16) * 16 }
+            mem_store(out + (bi * 256 + vi) * 8, scale * nibble / 15)
+            vi = vi + 1
+        }
+        bi = bi + 1
+    }
+}
+
+// Q6_K dequant: block size 210 bytes for 256 elements
+fn dequant_q6k(raw, nelements, out) {
+    let n_blocks = nelements / 256
+    let bi = 0
+    while bi < n_blocks {
+        let bo = bi * 210
+        let scale = mem_load8(raw + bo) + mem_load8(raw + bo + 1) * 256
+        let gi = 0
+        while gi < 64 {
+            let b0 = mem_load8(raw + bo + 2 + gi * 3)
+            let b1 = mem_load8(raw + bo + 2 + gi * 3 + 1)
+            let b2 = mem_load8(raw + bo + 2 + gi * 3 + 2)
+            
+            let q0 = b0 - (b0 / 64) * 64
+            let q1 = (b0 / 64) + (b1 - (b1 / 16) * 16) * 4
+            let q2 = (b1 / 16) + (b2 - (b2 / 4) * 4) * 16
+            let q3 = b2 / 4
+            
+            mem_store(out + (bi * 256 + gi * 4) * 8, scale * q0 / 63)
+            mem_store(out + (bi * 256 + gi * 4 + 1) * 8, scale * q1 / 63)
+            mem_store(out + (bi * 256 + gi * 4 + 2) * 8, scale * q2 / 63)
+            mem_store(out + (bi * 256 + gi * 4 + 3) * 8, scale * q3 / 63)
+            gi = gi + 1
+        }
+        bi = bi + 1
+    }
+}
+
+// f32 bytes -> f64
+fn f32_to_f64(ptr) {
+    let b0 = mem_load8(ptr)
+    let b1 = mem_load8(ptr + 1)
+    let b2 = mem_load8(ptr + 2)
+    let b3 = mem_load8(ptr + 3)
+    
+    let sign = i2f(b3 / 128)
+    let exp32 = i2f(b3 - (b3 / 128) * 128) * i2f(2) + i2f(b2 / 128)
+    let mant32 = i2f(b2 - (b2 / 128) * 128) * i2f(65536) + i2f(b1) * i2f(256) + i2f(b0)
+    
+    if exp32 == i2f(0) { return i2f(0) }
+    if exp32 == i2f(255) { return i2f(0) }
+    
+    let new_exp = f2i(exp32 - i2f(127))
+    let mant_frac = fdiv(mant32, i2f(8388608))
+    let one_plus_mant = fadd(i2f(1), mant_frac)
+    
+    let pow2 = i2f(1)
+    let i = 0
+    if new_exp >= 0 {
+        while i < new_exp { pow2 = fmul(pow2, i2f(2)); i = i + 1 }
+    } else {
+        let neg = 0 - new_exp
+        while i < neg { pow2 = fdiv(pow2, i2f(2)); i = i + 1 }
+    }
+    
+    let result = fmul(pow2, one_plus_mant)
+    if sign == i2f(1) { result = fsub(i2f(0), result) }
+    return result
+}
+
+// Read tensor data and dequant to f64
+fn read_tensor_f64(idx, buf) {
+    let dtype = gguf_tensor_dtype(idx)
+    let offset = gguf_tensor_offset(idx)
+    let nelem = gguf_tensor_nelements(idx)
+    
+    if dtype == 0 {
+        // f32
+        let raw = mem_alloc(nelem * 4)
+        lseek(gguf_fd, offset, 0)
+        read_raw(gguf_fd, raw, nelem * 4)
+        let i = 0
+        while i < nelem {
+            mem_store(buf + i * 8, f32_to_f64(raw + i * 4))
+            i = i + 1
+        }
+    } else if dtype == 12 {
+        // Q4_K
+        let raw = mem_alloc(nelem * 144 / 256)
+        lseek(gguf_fd, offset, 0)
+        read_raw(gguf_fd, raw, nelem * 144 / 256)
+        dequant_q4k(raw, nelem, buf)
+    } else if dtype == 14 {
+        // Q6_K
+        let raw = mem_alloc(nelem * 210 / 256)
+        lseek(gguf_fd, offset, 0)
+        read_raw(gguf_fd, raw, nelem * 210 / 256)
+        dequant_q6k(raw, nelem, buf)
+    }
+}
+
+// RMSNorm: out = x / sqrt(mean(x^2) + eps) * weight
+fn rms_norm(out, x, w, n) {
+    let ms = i2f(0)
+    let i = 0
+    while i < n {
+        let v = mem_load(x + i * 8)
+        ms = fadd(ms, fmul(v, v))
+        i = i + 1
+    }
+    ms = fdiv(ms, i2f(n))
+    let ir = fdiv(i2f(1), sqrt(fadd(ms, i2f(1))))
+    i = 0
+    while i < n {
+        mem_store(out + i * 8, fmul(fmul(mem_load(x + i * 8), ir), mem_load(w + i * 8)))
+        i = i + 1
+    }
+}
+
+// Matvec: y = A * x
+fn matvec(A, x, rows, cols, y) {
+    let i = 0
+    while i < rows {
+        let sum = i2f(0)
+        let j = 0
+        while j < cols {
+            sum = fadd(sum, fmul(mem_load(A + (i * cols + j) * 8), mem_load(x + j * 8)))
+            j = j + 1
+        }
+        mem_store(y + i * 8, sum)
+        i = i + 1
+    }
+}
+
+// Softmax
+fn softmax_arr(out, inp, n) {
+    let max_val = mem_load(inp)
+    let i = 1
+    while i < n {
+        let v = mem_load(inp + i * 8)
+        if f2i(v) > f2i(max_val) { max_val = v }
+        i = i + 1
+    }
+    let sum = i2f(0)
+    i = 0
+    while i < n {
+        let ev = fadd(i2f(1), fsub(mem_load(inp + i * 8), max_val))
+        if f2i(ev) < 0 { ev = i2f(0) }
+        sum = fadd(sum, ev)
+        mem_store(out + i * 8, ev)
+        i = i + 1
+    }
+    i = 0
+    while i < n {
+        mem_store(out + i * 8, fdiv(mem_load(out + i * 8), sum))
+        i = i + 1
+    }
+}
+
+// SwiGLU: out = sigmoid(x) * x * y
+fn swiglu(out, x, y, n) {
+    let i = 0
+    while i < n {
+        let xv = mem_load(x + i * 8)
+        let yv = mem_load(y + i * 8)
+        let neg_x = fsub(i2f(0), xv)
+        let sig = fdiv(i2f(1), fadd(i2f(1), pow(i2f(2), neg_x)))
+        mem_store(out + i * 8, fmul(fmul(xv, sig), yv))
+        i = i + 1
+    }
+}
+
+// Add: out = a + b
+fn vec_add(out, a, b, n) {
+    let i = 0
+    while i < n {
+        mem_store(out + i * 8, fadd(mem_load(a + i * 8), mem_load(b + i * 8)))
+        i = i + 1
+    }
+}
+
+// Element-wise multiply: out = a * b
+fn vec_mul(out, a, b, n) {
+    let i = 0
+    while i < n {
+        mem_store(out + i * 8, fmul(mem_load(a + i * 8), mem_load(b + i * 8)))
+        i = i + 1
+    }
+}
+
+// Token embedding lookup
+fn token_embed(token_id, emb_weight, hidden) {
+    // emb_weight is 2048x128000, token_id selects row
+    let i = 0
+    while i < 2048 {
+        mem_store(hidden + i * 8, mem_load(emb_weight + (token_id * 2048 + i) * 8))
+        i = i + 1
+    }
+}
+
+// Transformer layer (simplified: FFN only for now)
+fn transformer_ffn(layer_idx, hidden, norm_weight, gate_weight, up_weight, down_weight) {
+    let n_hidden = 2048
+    let n_intermediate = 10752  // 22020096 / 2048
+    
+    // RMSNorm
+    let normed = mem_alloc(n_hidden * 8)
+    rms_norm(normed, hidden, norm_weight, n_hidden)
+    
+    // gate = normed @ gate_weight^T
+    let gate = mem_alloc(n_intermediate * 8)
+    matvec(gate_weight, normed, n_intermediate, n_hidden, gate)
+    
+    // up = normed @ up_weight^T
+    let up = mem_alloc(n_intermediate * 8)
+    matvec(up_weight, normed, n_intermediate, n_hidden, up)
+    
+    // swiglu(gate, up)
+    let activated = mem_alloc(n_intermediate * 8)
+    swiglu(activated, gate, up, n_intermediate)
+    
+    // out = activated @ down_weight^T
+    let out = mem_alloc(n_hidden * 8)
+    matvec(down_weight, activated, n_hidden, n_intermediate, out)
+    
+    // residual: hidden = hidden + out
+    vec_add(hidden, hidden, out, n_hidden)
+}
+
+fn main() {
+    print("=== Full Inference Test ===\n")
+    
+    let rc = gguf_load("/opt/ai/models/quanta/QUANTA-LFM2.5-2.6Bv1-Q4_K_M.gguf")
+    if rc != 0 { print("load failed\n"); return 1 }
+    
+    print("loaded ")
+    print(gguf_num_tensors())
+    print(" tensors\n")
+    
+    // Find tensors
+    let token_embd = gguf_find_tensor("token_embd.weight")
+    let token_embd_norm = gguf_find_tensor("token_embd_norm.weight")
+    let ffn_norm = gguf_find_tensor("blk.0.ffn_norm.weight")
+    let ffn_gate = gguf_find_tensor("blk.0.ffn_gate.weight")
+    let ffn_up = gguf_find_tensor("blk.0.ffn_up.weight")
+    let ffn_down = gguf_find_tensor("blk.0.ffn_down.weight")
+    
+    print("tensors found\n")
+    
+    // Read weights
+    let norm_w = mem_alloc(2048 * 8)
+    read_tensor_f64(token_embd_norm, norm_w)
+    
+    let ffn_norm_w = mem_alloc(2048 * 8)
+    read_tensor_f64(ffn_norm, ffn_norm_w)
+    
+    let gate_w = mem_alloc(10752 * 2048 * 8)
+    read_tensor_f64(ffn_gate, gate_w)
+    
+    let up_w = mem_alloc(10752 * 2048 * 8)
+    read_tensor_f64(ffn_up, up_w)
+    
+    let down_w = mem_alloc(2048 * 10752 * 8)
+    read_tensor_f64(ffn_down, down_w)
+    
+    print("weights loaded\n")
+    
+    // Create hidden state (zeros for test)
+    let hidden = mem_alloc(2048 * 8)
+    let i = 0
+    while i < 2048 {
+        mem_store(hidden + i * 8, i2f(0))
+        i = i + 1
+    }
+    
+    // Run FFN layer
+    transformer_ffn(0, hidden, ffn_norm_w, gate_w, up_w, down_w)
+    
+    print("FFN done\n")
+    print("hidden[0]=")
+    print(mem_load(hidden))
+    print("\n")
+    
+    print("SUCCESS\n")
+    return 0
+}

@@ -1,0 +1,38 @@
+import std/fs
+
+// Minimal crash test: read header + skip 1 pair + read 4 bytes from tensor section
+fn main() {
+    print("start\n")
+    
+    let fd = open("/opt/ai/models/quanta/QUANTA-LFM2.5-2.6Bv1-Q4_K_M.gguf", 0, 0)
+    if fd < 0 { print("open failed\n"); return 1 }
+    
+    let buf = mem_alloc(256)
+    read_raw(fd, buf, 256)
+    
+    let n_tensors = mem_load(buf + 16)
+    print("n_tensors=")
+    print(n_tensors)
+    print("\n")
+    
+    // Skip first pair
+    let klen = mem_load(buf + 24)
+    let vtype = mem_load(buf + 32)
+    
+    // Skip vtype value
+    let skip = 4
+    if vtype == 8 {
+        let slen = mem_load(buf + 36)
+        skip = 8 + slen
+    }
+    
+    // Read 4 bytes after first pair
+    let val = mem_load(buf + 36 + skip)
+    print("val after pair 0=")
+    print(val)
+    print("\n")
+    
+    print("SUCCESS\n")
+    close(fd)
+    return 0
+}

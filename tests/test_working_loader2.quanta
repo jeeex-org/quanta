@@ -1,0 +1,98 @@
+import std/fs
+
+// Working: absolute seek to avoid compiler loop bug
+fn gguf_load_working(path, tensor_infos) {
+    let fd = open(path, 0, 0)
+    if fd < 0 { return -1 }
+    
+    let hdr = mem_alloc(24)
+    read_raw(fd, hdr, 24)
+    if mem_load8(hdr) != 71 { close(fd); return -2 }
+    
+    let n_tensors = mem_load(hdr + 16)
+    
+    // Use absolute seek to tensor info section
+    lseek(fd, 8222781, 0)
+    
+    let nlen_buf = mem_alloc(8)
+    let ndims_buf = mem_alloc(4)
+    let dim_buf = mem_alloc(8)
+    let dtype_buf = mem_alloc(4)
+    let off_buf = mem_alloc(8)
+    let name = mem_alloc(256)
+    
+    let ti = 0
+    
+    while ti < n_tensors {
+        read_raw(fd, nlen_buf, 8)
+        let nlen = mem_load(nlen_buf)
+        
+        read_raw(fd, name, nlen)
+        mem_store8(name + nlen, 0)
+        
+        read_raw(fd, ndims_buf, 4)
+        let ndims = mem_load(ndims_buf)
+        
+        let d = 0
+        let nelem = 1
+        while d < ndims {
+            read_raw(fd, dim_buf, 8)
+            nelem = nelem * mem_load(dim_buf)
+            d = d + 1
+        }
+        
+        read_raw(fd, dtype_buf, 4)
+        let dtype = mem_load(dtype_buf)
+        
+        read_raw(fd, off_buf, 8)
+        let offset = mem_load(off_buf)
+        
+        // Store: name_ptr, ndims, dtype, offset, nelem
+        mem_store(tensor_infos + ti * 48, name)
+        mem_store(tensor_infos + ti * 48 + 8, ndims)
+        mem_store(tensor_infos + ti * 48 + 16, dtype)
+        mem_store(tensor_infos + ti * 48 + 24, offset)
+        mem_store(tensor_infos + ti * 48 + 32, nelem)
+        
+        ti = ti + 1
+    }
+    
+    close(fd)
+    return n_tensors
+}
+
+fn main() {
+    print("=== Quanta 0.0.194 GGUF Loader ===\n")
+    
+    let tensor_infos = mem_alloc(37 * 48)
+    let n = gguf_load_working("/opt/ai/models/quanta/QUANTA-LFM2.5-2.6Bv1-Q4_K_M.gguf", tensor_infos)
+    
+    print("loaded ")
+    print(n)
+    print(" tensors\n")
+    
+    // Print first 3
+    let i = 0
+    while i < 3 {
+        let name_ptr = mem_load(tensor_infos + i * 48)
+        let ndims = mem_load(tensor_infos + i * 48 + 8)
+        let dtype = mem_load(tensor_infos + i * 48 + 16)
+        let offset = mem_load(tensor_infos + i * 48 + 24)
+        let nelem = mem_load(tensor_infos + i * 48 + 32)
+        
+        print("tensor[")
+        print(i)
+        print("] name=")
+        write_raw(1, name_ptr, 10)
+        print(" dtype=")
+        print(dtype)
+        print(" ndims=")
+        print(ndims)
+        print("\n")
+        
+        i = i + 1
+    }
+    
+    print("SUCCESS\n")
+    return 0
+}

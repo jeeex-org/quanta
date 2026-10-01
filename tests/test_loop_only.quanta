@@ -1,0 +1,27 @@
+import std/fs
+
+// Test: is the crash from the loop or from the allocations?
+fn main() {
+    print("start\n")
+    
+    let fd = open("/opt/ai/models/quanta/QUANTA-LFM2.5-2.6Bv1-Q4_K_M.gguf", 0, 0)
+    if fd < 0 { print("open failed\n"); return 1 }
+    
+    let hdr = mem_alloc(24)
+    read_raw(fd, hdr, 24)
+    print("header read\n")
+    
+    // Test: simple loop with no allocations
+    let i = 0
+    while i < 37 {
+        print("i=")
+        print(i)
+        print("\n")
+        i = i + 1
+    }
+    
+    print("loop done\n")
+    
+    close(fd)
+    return 0
+}

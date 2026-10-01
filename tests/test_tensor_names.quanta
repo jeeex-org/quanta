@@ -1,0 +1,37 @@
+import std/fs
+import std/gguf
+
+// Debug: print all tensor names
+fn main() {
+    let rc = gguf_load("/opt/ai/models/quanta/QUANTA-LFM2.5-2.6Bv1-Q4_K_M.gguf")
+    if rc != 0 { print("load failed\n"); return 1 }
+    
+    print("tensors=")
+    print(gguf_num_tensors())
+    print("\n")
+    
+    let i = 0
+    while i < gguf_num_tensors {
+        let tname = gguf_tensor_name(i)
+        print("[")
+        print(i)
+        print("] ")
+        // Print the name character by character
+        let j = 0
+        while j < 64 {
+            let c = mem_load8(tname + j)
+            if c == 0 { j = 64 }
+            else {
+                // Print as character (simple: just print the byte value)
+                print(c)
+                print(" ")
+                j = j + 1
+            }
+        }
+        print("\n")
+        i = i + 1
+    }
+    
+    gguf_close()
+    return 0
+}

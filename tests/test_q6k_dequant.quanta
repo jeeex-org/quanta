@@ -1,0 +1,99 @@
+import std/fs
+
+// Test Q6_K dequant - block size 210 bytes for 256 elements
+// Layout: 2 bytes f16 scale + 192 bytes 6-bit quants + 16 bytes mins
+fn main() {
+    print("=== Q6_K Dequant Test ===\n")
+    
+    let fd = open("/opt/ai/models/quanta/QUANTA-LFM2.5-2.6Bv1-Q4_K_M.gguf", 0, 0)
+    if fd < 0 { print("open failed\n"); return 1 }
+    
+    let hdr = mem_alloc(24)
+    read_raw(fd, hdr, 24)
+    
+    lseek(fd, 8222781, 0)
+    
+    let nlen_buf = mem_alloc(8)
+    read_raw(fd, nlen_buf, 8)
+    let nlen = mem_load(nlen_buf)
+    
+    let name = mem_alloc(256)
+    read_raw(fd, name, nlen)
+    
+    let ndims_buf = mem_alloc(4)
+    read_raw(fd, ndims_buf, 4)
+    let ndims = mem_load(ndims_buf)
+    
+    let dim_buf = mem_alloc(8)
+    let nelem = 1
+    let d = 0
+    while d < ndims {
+        read_raw(fd, dim_buf, 8)
+        nelem = nelem * mem_load(dim_buf)
+        d = d + 1
+    }
+    
+    let dtype_buf = mem_alloc(4)
+    read_raw(fd, dtype_buf, 4)
+    let dtype = mem_load(dtype_buf)
+    
+    let off_buf = mem_alloc(8)
+    read_raw(fd, off_buf, 8)
+    let offset = mem_load(off_buf)
+    
+    print("tensor: ")
+    write_raw(1, name, nlen)
+    print(" dtype=")
+    print(dtype)
+    print(" nelem=")
+    print(nelem)
+    print("\n")
+    
+    // Read first block (210 bytes)
+    let blk = mem_alloc(210)
+    lseek(fd, offset, 0)
+    read_raw(fd, blk, 210)
+    
+    // Scale: f16 at bytes 0-1
+    let scale_raw = mem_load8(blk) + mem_load8(blk + 1) * 256
+    print("scale_raw=")
+    print(scale_raw)
+    print("\n")
+    
+    // Extract first 6-bit value (element 0)
+    let b0 = mem_load8(blk + 2)
+    let b1 = mem_load8(blk + 3)
+    let v16 = b0 + b1 * 256
+    let quant0 = v16 - (v16 / 64) * 64  // v16 % 64
+    print("quant0=")
+    print(quant0)
+    print("\n")
+    
+    // Element 1: shift=6
+    let quant1 = (v16 / 64) - ((v16 / 64) / 64) * 64
+    print("quant1=")
+    print(quant1)
+    print("\n")
+    
+    // Element 2: byte_off=1, bit_off=4
+    let b2 = mem_load8(blk + 3)
+    let b3 = mem_load8(blk + 4)
+    let v16_2 = b2 + b3 * 256
+    let quant2 = (v16_2 / 16) - ((v16_2 / 16) / 64) * 64
+    print("quant2=")
+    print(quant2)
+    print("\n")
+    
+    // Element 3: byte_off=2, bit_off=2
+    let b4 = mem_load8(blk + 4)
+    let b5 = mem_load8(blk + 5)
+    let v16_3 = b4 + b5 * 256
+    let quant3 = (v16_3 / 4) - ((v16_3 / 4) / 64) * 64
+    print("quant3=")
+    print(quant3)
+    print("\n")
+    
+    print("SUCCESS\n")
+    close(fd)
+    return 0
+}

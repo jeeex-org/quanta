@@ -1,0 +1,36 @@
+import std/fs
+import std/gguf
+
+// Simple byte-level tokenizer for testing (SentencePiece would require full parser)
+// For now, use byte-level BPE: each byte is a token, with special tokens
+fn tokenize(text, tokens, max_len) {
+    let n = len(text)
+    if n > max_len { n = max_len }
+    let i = 0
+    while i < n {
+        // Token = byte value + offset (0-255 for bytes, special tokens after)
+        mem_store(tokens + i * 8, i2f(mem_load8(text + 8 + i)))
+        i = i + 1
+    }
+    return n
+}
+
+fn main() {
+    print("=== Tokenizer Test ===\n")
+    
+    let text = "Hello"
+    let tokens = mem_alloc(256 * 8)
+    let n = tokenize(text, tokens, 256)
+    
+    print("tokens: ")
+    let i = 0
+    while i < n {
+        print(mem_load(tokens + i * 8))
+        print(" ")
+        i = i + 1
+    }
+    print("\n")
+    
+    print("SUCCESS\n")
+    return 0
+}

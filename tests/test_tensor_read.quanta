@@ -1,0 +1,78 @@
+import std/fs
+
+fn main() {
+    let fd = open("/opt/ai/models/quanta/QUANTA-LFM2.5-2.6Bv1-Q4_K_M.gguf", 0, 0)
+    if fd < 0 { print("open failed\n"); return 1 }
+    
+    // Read header
+    let hdr = mem_alloc(24)
+    file_read(fd, hdr, 24)
+    let n_kv = mem_load(hdr + 8)
+    let n_tensors = mem_load(hdr + 16)
+    
+    print("n_kv=")
+    print(n_kv)
+    print(" n_tensors=")
+    print(n_tensors)
+    print("\n")
+    
+    // Skip metadata - seek to known tensor info offset
+    // For this file, tensor info starts at byte 8222781
+    // This is a workaround for the metadata skip bug
+    lseek(fd, 8222781, 0)
+    
+    // Read first tensor name
+    let nlen_buf = mem_alloc(8)
+    read_raw(fd, nlen_buf, 8)
+    let nlen = mem_load(nlen_buf)
+    print("nlen=")
+    print(nlen)
+    print("\n")
+    
+    if nlen > 0 && nlen < 1000 {
+        let name = mem_alloc(nlen + 1)
+        read_raw(fd, name, nlen)
+        mem_store8(name + nlen, 0)
+        print("name: ")
+        write_raw(1, name, nlen)
+        print("\n")
+        
+        // Read ndims
+        let ndims_buf = mem_alloc(4)
+        read_raw(fd, ndims_buf, 4)
+        let ndims = mem_load(ndims_buf)
+        print("ndims=")
+        print(ndims)
+        print("\n")
+        
+        // Read dims
+        let d = 0
+        while d < ndims {
+            let dim_buf = mem_alloc(8)
+            read_raw(fd, dim_buf, 8)
+            print("dim[")
+            print(d)
+            print("]=")
+            print(mem_load(dim_buf))
+            print("\n")
+            d = d + 1
+        }
+        
+        // Read dtype
+        let dtype_buf = mem_alloc(4)
+        read_raw(fd, dtype_buf, 4)
+        print("dtype=")
+        print(mem_load(dtype_buf))
+        print("\n")
+        
+        // Read offset
+        let off_buf = mem_alloc(8)
+        read_raw(fd, off_buf, 8)
+        print("offset=")
+        print(mem_load(off_buf))
+        print("\n")
+    }
+    
+    close(fd)
+    return 0
+}
