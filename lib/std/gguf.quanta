@@ -5,24 +5,27 @@ import std/fs
 
 let gguf_fd = -1
 let gguf_n_tensors = 0
+let gguf_n_kv = 0
+let gguf_data_start = 0
+let gguf_tensor_dims = 0
 let gguf_tensor_data = 0
 
 const TINFO_SIZE = 40
 
-fn gguf_load(path) {
-    let fd = open(path, 0, 0)
-    if fd < 0 { return -1 }
-    gguf_fd = fd
-    
-    // GGUF header: magic(4) + version(4) + n_kv(8) + n_tensors(8) = 24 bytes
-    let hdr = mem_alloc(24)
-    file_read(fd, hdr, 24)
-    if mem_load8(hdr) != 71 { close(fd); gguf_fd = -1; return -2 }
-    
-    let n_kv = mem_load(hdr + 8)
-    gguf_n_tensors = mem_load(hdr + 16)
-    
-    // Skip metadata pairs with proper alignment tracking
+// GGUF layout: the tensor DATA section begins after the tensor-info table,
+// padded to a 32-byte boundary. Each tensor's `offset` is RELATIVE to this
+// point -- seeking to the raw offset lands in the header and yields zeros.
+fn record_data_start(fd) {
+    let info_end = lseek(fd, 0, 1)
+    let rem = info_end - (info_end / 32) * 32
+    if rem != 0 { lseek(fd, 32 - rem, 1) }
+    gguf_data_start = lseek(fd, 0, 1)
+    return 0
+}
+
+// Walk the metadata KV block, leaving fd at the tensor-info table.
+// Returns the metadata byte count excluding the 24-byte header.
+fn scan_metadata(fd, n_kv) {
     let klen_buf = mem_alloc(8)
     let vtype_buf = mem_alloc(4)
     let slen_buf = mem_alloc(8)
@@ -84,14 +87,11 @@ fn gguf_load(path) {
         i = i + 1
     }
     
-    // GGUF alignment: pad to 32-byte boundary after metadata
-    let total_meta = 24 + meta_size
-    let rem = total_meta - (total_meta / 32) * 32
-    let pad = 0
-    if rem != 0 { pad = 32 - rem }
-    lseek(fd, pad, 1)
-    
-    // Read tensor info section
+    return meta_size
+}
+
+// Read the gguf_n_tensors tensor-info records into gguf_tensor_data.
+fn read_tensor_info(fd) {
     gguf_tensor_data = mem_alloc(gguf_n_tensors * TINFO_SIZE)
     
     let nlen_buf = mem_alloc(8)
@@ -100,8 +100,12 @@ fn gguf_load(path) {
     let dtype_buf = mem_alloc(4)
     let off_buf = mem_alloc(8)
     let name_buf = mem_alloc(256)
+
+    // Shape storage: up to 4 dims per tensor, kept alongside the fixed
+    // tensor-info record so gguf_tensor_dim() does not need a second lookup.
+    gguf_tensor_dims = mem_alloc(gguf_n_tensors * 32)
     
-    i = 0
+    let i = 0
     while i < gguf_n_tensors {
         file_read(fd, nlen_buf, 8)
         let nlen = mem_load(nlen_buf)
@@ -115,7 +119,14 @@ fn gguf_load(path) {
         let d = 0
         while d < ndims {
             file_read(fd, dim_buf, 8)
-            nelem = nelem * mem_load(dim_buf)
+            let dim = mem_load(dim_buf)
+            nelem = nelem * dim
+            mem_store(gguf_tensor_dims + i * 32 + d * 8, dim)
+            d = d + 1
+        }
+        // clear any stale dims from a wider previous record
+        while d < 4 {
+            mem_store(gguf_tensor_dims + i * 32 + d * 8, 0)
             d = d + 1
         }
         
@@ -145,12 +156,92 @@ fn gguf_load(path) {
     return 0
 }
 
+fn gguf_load(path) {
+    let fd = open(path, 0, 0)
+    if fd < 0 { return -1 }
+    gguf_fd = fd
+    
+    // GGUF header: magic(4) + version(4) + n_kv(8) + n_tensors(8) = 24 bytes
+    let hdr = mem_alloc(24)
+    file_read(fd, hdr, 24)
+    if mem_load8(hdr) != 71 { close(fd); gguf_fd = -1; return -2 }
+    
+    // GGUF v3 header layout:
+    //   +0 magic(4)  +4 version(4)  +8 tensor_count(8)  +16 metadata_kv_count(8)
+    // tensor_count comes FIRST, then metadata_kv_count. Reading these the
+    // other way round makes the metadata walk iterate over tensor records and
+    // desync every subsequent read.
+    let n_kv = mem_load(hdr + 16)
+    gguf_n_tensors = mem_load(hdr + 8)
+    gguf_n_kv = n_kv
+    
+    let meta_size = scan_metadata(fd, n_kv)
+    
+    // GGUF alignment: pad to 32-byte boundary after metadata
+    // NO alignment padding between the metadata block and the tensor-info
+    // table. gguf writes the KV block and the tensor-info records back to
+    // back; only the tensor DATA section is aligned. Padding here pushes the
+    // tensor-info read three bytes past the real first record and reads a
+    // garbage name length.
+    let total_meta = 24 + meta_size
+    
+    read_tensor_info(fd)
+    
+    record_data_start(fd)
+    return 0
+}
+
 fn gguf_tensor_name(idx) { return mem_load(gguf_tensor_data + idx * TINFO_SIZE) }
 fn gguf_tensor_dtype(idx) { return mem_load(gguf_tensor_data + idx * TINFO_SIZE + 16) }
 fn gguf_tensor_offset(idx) { return mem_load(gguf_tensor_data + idx * TINFO_SIZE + 24) }
 fn gguf_tensor_nelements(idx) { return mem_load(gguf_tensor_data + idx * TINFO_SIZE + 32) }
+fn gguf_tensor_ndims(idx) { return mem_load(gguf_tensor_data + idx * TINFO_SIZE + 8) }
+fn gguf_tensor_dim(idx, d) {
+    if d < 0 || d > 3 { return 0 }
+    return mem_load(gguf_tensor_dims + idx * 32 + d * 8)
+}
+
+// Byte size of a tensor's raw storage, from its dtype and element count.
+fn gguf_type_size(dtype) {
+    if dtype == 0 || dtype == 1 || dtype == 7 { return 1 }
+    if dtype == 2 || dtype == 3 { return 2 }
+    if dtype == 6 || dtype == 8 || dtype == 9 || dtype == 30 { return 1 }
+    if dtype == 10 || dtype == 11 || dtype == 12 { return 8 }
+    if dtype == 13 { return 4 }
+    return 0
+}
+
+// Byte size of a quantised tensor, per the GGUF block layouts.
+fn gguf_tensor_nbytes(idx) {
+    let dtype = gguf_tensor_dtype(idx)
+    let n = gguf_tensor_nelements(idx)
+    if dtype == 12 || dtype == 11 { return n }
+    if dtype == 10 { return n }
+    if dtype == 14 || dtype == 15 { return (n / 256) * 210 + n / 256 * 20 }
+    if dtype == 16 || dtype == 17 { return (n / 256) * 84 + n / 64 * 18 + n / 256 * 128 }
+    if dtype == 18 { return (n / 256) * 292 + n / 64 * 18 + n / 256 * 128 + n / 256 * 2 }
+    if dtype == 20 { return (n / 256) * 84 + n / 64 * 18 + n / 256 * 128 }
+    if dtype == 2 || dtype == 3 { return n * 2 }
+    if dtype == 4 || dtype == 5 || dtype == 6 { return n * 4 }
+    if dtype == 7 { return n }
+    if dtype == 13 { return n * 4 }
+    if dtype == 1 { return n }
+    return n
+}
+
+// Read `nbytes` of a tensor's RAW (still quantised) storage into `buf`.
+// Tensor offsets in GGUF are relative to the start of the aligned tensor
+// data section, so the file position must include gguf_data_start.
+fn gguf_read_tensor_bytes(idx, buf, nbytes) {
+    if idx < 0 || idx >= gguf_n_tensors { return -1 }
+    let abs_pos = gguf_data_start + gguf_tensor_offset(idx)
+    if lseek(gguf_fd, abs_pos, 0) < 0 { return -2 }
+    return read_raw(gguf_fd, buf, nbytes)
+}
 
 fn gguf_num_tensors() { return gguf_n_tensors }
+fn gguf_num_kv() { return gguf_n_kv }
+fn gguf_data_offset() { return gguf_data_start }
 fn gguf_close() { if gguf_fd >= 0 { close(gguf_fd); gguf_fd = -1 } }
 
 fn gguf_find_tensor(name) {
@@ -179,7 +270,7 @@ fn read_tensor_f64(idx, buf) {
     
     if dtype == 0 {
         let raw = mem_alloc(nelem * 4)
-        lseek(gguf_fd, offset, 0)
+        lseek(gguf_fd, gguf_data_start + offset, 0)
         file_read(gguf_fd, raw, nelem * 4)
         let i = 0
         while i < nelem {
@@ -188,12 +279,12 @@ fn read_tensor_f64(idx, buf) {
         }
     } else if dtype == 12 {
         let raw = mem_alloc(nelem * 144 / 256)
-        lseek(gguf_fd, offset, 0)
+        lseek(gguf_fd, gguf_data_start + offset, 0)
         file_read(gguf_fd, raw, nelem * 144 / 256)
         dequant_q4k(raw, nelem, buf)
     } else if dtype == 14 {
         let raw = mem_alloc(nelem * 210 / 256)
-        lseek(gguf_fd, offset, 0)
+        lseek(gguf_fd, gguf_data_start + offset, 0)
         file_read(gguf_fd, raw, nelem * 210 / 256)
         dequant_q6k(raw, nelem, buf)
     }
@@ -360,4 +451,169 @@ fn vec_mul(out, a, b, n) {
         mem_store(out + i * 8, fmul(mem_load(a + i * 8), mem_load(b + i * 8)))
         i = i + 1
     }
+}
+
+// ---------------------------------------------------------------- skipping
+
+// Advance fd by `n` bytes.
+fn gguf_skip(fd, n) {
+    if n <= 0 { return 0 }
+    return lseek(fd, n, 1)
+}
+
+// Byte width of a scalar GGUF metadata value type.
+fn gguf_value_size(vtype) {
+    if vtype == 0 || vtype == 1 || vtype == 7 { return 1 }
+    if vtype == 2 || vtype == 3 { return 2 }
+    if vtype == 4 || vtype == 5 || vtype == 6 { return 4 }
+    return 0
+}
+
+// Advance fd past one metadata value of type `vtype`, including its length
+// prefix when the value is a string or an array. This is what lets a reader
+// walk a KV block without interpreting the payload.
+fn gguf_skip_value(fd, vtype) {
+    let b8 = mem_alloc(8)
+    let b4 = mem_alloc(4)
+    if vtype == 8 {
+        // string: u64 length + bytes
+        read_raw(fd, b8, 8)
+        gguf_skip(fd, mem_load(b8))
+    } else if vtype == 9 {
+        // array: u32 element type + u64 count + payload
+        read_raw(fd, b4, 4)
+        let etype = mem_load(b4)
+        read_raw(fd, b8, 8)
+        let alen = mem_load(b8)
+        if etype == 8 {
+            let i = 0
+            while i < alen {
+                read_raw(fd, b8, 8)
+                gguf_skip(fd, mem_load(b8))
+                i = i + 1
+            }
+        } else {
+            let esz = gguf_value_size(etype)
+            gguf_skip(fd, alen * esz)
+        }
+    } else {
+        gguf_skip(fd, gguf_value_size(vtype))
+    }
+    return 0
+}
+
+// Print a human-readable summary of the loaded model.
+fn gguf_print_info() {
+    print("GGUF tensors=") print(gguf_n_tensors) print(" kv=") print(gguf_n_kv) print(" data@") print(gguf_data_start) print("\n")
+    let i = 0
+    while i < gguf_n_tensors {
+        if i < 8 {
+            print("  [") print(i) print("] name@")
+            print(gguf_tensor_name(i))
+            print(" dims=")
+            let nd = gguf_tensor_ndims(i)
+            let d = 0
+            while d < nd { print(gguf_tensor_dim(i, d)) print(",") d = d + 1 }
+            print(" dt=") print(gguf_tensor_dtype(i)) print("\n")
+        }
+        i = i + 1
+    }
+    return 0
+}
+
+// ------------------------------------------------------- tensor data access
+
+// Read a tensor's raw (quantised) bytes into a fresh buffer and return the
+// buffer address; the length is available from gguf_tensor_nbytes().
+fn gguf_read_tensor(idx) {
+    if idx < 0 || idx >= gguf_n_tensors { return 0 }
+    let nbytes = gguf_tensor_nbytes(idx)
+    let buf = mem_alloc(nbytes)
+    if gguf_read_tensor_bytes(idx, buf, nbytes) < 0 { return 0 }
+    return buf
+}
+
+// ------------------------------------------------------------- linear algebra
+
+// y = A * x for a row-major matrix A of `rows` x `cols` values, 8 bytes each.
+// x holds `cols` values, y receives `rows` results. This is the plain
+// reference matvec used to check dequantised tensor data; the quantised
+// kernels in the inference path are separate.
+fn gguf_matvec(A, x, rows, cols, y) {
+    let r = 0
+    while r < rows {
+        let acc = 0.0
+        let c = 0
+        while c < cols {
+            let a = mem_load(A + (r * cols + c) * 8)
+            let xv = mem_load(x + c * 8)
+            acc = acc + a * xv
+            c = c + 1
+        }
+        mem_store(y + r * 8, acc)
+        r = r + 1
+    }
+    return 0
+}
+
+// exp(x) for f64. There is no native `exp` builtin, so this is range
+// reduced: exp(x) = 2^k * exp(r) with k = round(x / ln2) and |r| <= ln2/2,
+// leaving a series that converges to full f64 precision in a few terms.
+fn gguf_exp(x) {
+    if x < -745.0 { return 0.0 }
+    if x > 709.0 { return 1.0e308 }
+    let ln2 = 0.6931471805599453
+    let k = 0.0
+    if x >= 0.0 { k = floor(x / ln2 + 0.5) }
+    if x < 0.0 { k = -floor(-x / ln2 + 0.5) }
+    let r = x - k * ln2
+    // Taylor series for e^r; |r| <= ln2/2 so 20 terms overshoots f64 precision.
+    let term = 1.0
+    let acc = 1.0
+    let i = 1
+    while i <= 20 {
+        term = term * r / i
+        acc = acc + term
+        i = i + 1
+    }
+    // 2^k by repeated squaring on the integer part.
+    let ki = 0
+    if k >= 0.0 { ki = k }
+    let p = 1.0
+    let b = 2.0
+    let n = ki
+    while n > 0 {
+        let half = n / 2
+        if n - half * 2 > 0 { p = p * b }
+        b = b * b
+        n = half
+    }
+    if k < 0.0 { return acc / p }
+    return acc * p
+}
+
+// Softmax: out[i] = exp(inp[i] - max) / sum, over `n` f64 values.
+fn gguf_softmax(out, inp, n) {
+    if n <= 0 { return 0 }
+    let mx = mem_load(inp)
+    let i = 1
+    while i < n {
+        let x = mem_load(inp + i * 8)
+        if x > mx { mx = x }
+        i = i + 1
+    }
+    let sum = 0.0
+    i = 0
+    while i < n {
+        let e = gguf_exp(mem_load(inp + i * 8) - mx)
+        mem_store(out + i * 8, e)
+        sum = sum + e
+        i = i + 1
+    }
+    i = 0
+    while i < n {
+        mem_store(out + i * 8, mem_load(out + i * 8) / sum)
+        i = i + 1
+    }
+    return 0
 }

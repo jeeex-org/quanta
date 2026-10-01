@@ -433,7 +433,13 @@ fn parse_primary() {
         srclen = nmoff + 13
         // Register the callee in the global call table (imported from std/big).
         let fi = resolve_fn(nmoff, 12, FI_GLOBAL)
-        if fi < 0 { compile_error(0, nmoff, 12) }
+        // When std/big was not imported the old code reported
+        //     error: call to undeclared function: big_from_dec
+        // naming an internal symbol the user never wrote, and located it at the
+        // synthesized name (nmoff) -- which lies PAST the end of the user's own
+        // source, so a 106-line file reported "line 383". Report at the user's
+        // own literal instead and name the import that fixes it.
+        if fi < 0 { compile_error(7, soff, dlen) }
         // 0.0.114 FIX: emit the argument as an IR_MOV record and pass its IR
         // index as a2 (the convention codegen's IR_CALL arg-loader expects:
         // it reads irres(a2+i)). The old argstack-index convention made codegen

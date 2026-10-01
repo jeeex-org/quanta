@@ -478,6 +478,23 @@ fn parse_let() {
     let own = 0
     if is_mut==1 { own = 1 }
     else if is_ref==1 { own = 2 }
+    // 0.0.221: reject a reserved type/keyword as a binding name.
+    //
+    // `let u32 = ...` lexes `u32` as TT_KEY (a type keyword), NOT TT_ID. The
+    // name below is read with pval()/plen(), which for a TT_KEY returns the
+    // keyword's small integer id instead of a source offset. The local was then
+    // registered under a garbage name, every read of it resolved to nothing, and
+    // the binding silently evaluated to 0 -- no error, wrong code. That is how
+    // tests/test_f32_conv.quanta produced u32=0 for bytes 00 00 80 3f.
+    //
+    // Anything that is not a plain identifier cannot be a binding name. Report
+    // it here, at the name, instead of compiling a silently-wrong program.
+    {
+        let ntk = peek()
+        if ntk != TT_ID {
+            compile_error(8, pval(), plen())
+        }
+    }
     let nm=pval(); let nl=plen(); adv()
     // t7: multiple-return destructuring: `let a, b, c = f()` binds each name
     // to tup.<i>. This comma path never runs during self-host (compiler source

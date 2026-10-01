@@ -125,7 +125,153 @@ fn fstat(fd, buf) {
   return file_fstat(fd, buf)
 }
 
-// mmap(addr, len, prot, flags, fd, offset): memory map a file. Returns addr or -1.
+// mmap_file(addr, len, prot, flags, fd, offset): memory map a file.
+// Returns the mapped address, or a negative errno (e.g. -22 EINVAL on a bad
+// length, -9 EBADF on a closed fd). Check `p < 0`, do not compare to -1.
+//
+// NOTE: the name is deliberately NOT `mmap`. The compiler has a 1-argument
+// anonymous-mapping builtin named `mmap` (features.quanta is_builtin / the
+// emitter's syscall-9 path); a 6-argument call spelled `mmap` would be claimed
+// by that builtin and silently map `size` bytes of anonymous memory instead of
+// the file. Distinct names keep the two unambiguous.
 fn mmap_file(addr, len, prot, flags, fd, offset) {
-  return file_mmap(addr, len, prot, flags, fd, offset)
+  return syscall(9, addr, len, prot, flags, fd, offset)
+}
+
+// munmap(addr, len): unmap a mapping. Returns 0, or a negative errno.
+// Same naming reason as mmap_file -- there is no user-level `munmap` builtin,
+// but keeping the pair together avoids anyone re-deriving this trap.
+fn munmap_file(addr, len) {
+  return syscall(11, addr, len, 0, 0, 0, 0)
+}
+
+// file_size(fd): size in bytes via lseek(SEEK_END). Corrects the previous
+// approach of reading st_size out of an fstat buffer: file_stat/fstat returns
+// EFAULT on this target and leaves the buffer untouched, so every caller that
+// sized a buffer from it got 0. lseek(SEEK_END) is exact and cheap.
+// The file offset is left unchanged (SEEK_END is a query here, restored to 0).
+fn file_size(fd) {
+  let sz = file_lseek(fd, 0, 2)
+  file_lseek(fd, 0, 0)
+  return sz
+}
+
+// mem_load32(p): read a little-endian u32/i32 from memory.
+//
+// Why this exists: `mem_load(p)` reads a full 8-byte qword, so it is WRONG for
+// any 32-bit field. GGUF is full of them (value types, n_dims, tensor dims,
+// most KV scalars), and over-reading by 4 bytes there silently corrupts the
+// next field instead of faulting -- which is what desynchronized the metadata
+// walk in test_mmap_loader.
+//
+// Implemented with the 4 x mem_load8 reads rather than a 4-byte mov so it does
+// not depend on unaligned-load support. `u32()` exists as a builtin but only
+// masks an already-loaded VALUE; it is not a memory read and must not be
+// called with a pointer.
+fn mem_load32(p) {
+  let b0 = mem_load8(p)
+  let b1 = mem_load8(p + 1)
+  let b2 = mem_load8(p + 2)
+  let b3 = mem_load8(p + 3)
+  return b0 + b1 * 256 + b2 * 65536 + b3 * 16777216
+}
+
+// mem_load16(p): read a little-endian u16/i16. Same rationale as mem_load32.
+fn mem_load16(p) {
+  let b0 = mem_load8(p)
+  let b1 = mem_load8(p + 1)
+  return b0 + b1 * 256
+}
+
+// f16_to_f64(p): decode a little-endian IEEE-754 binary16 stored at `p`.
+//
+// Required by every quantised GGUF block: Q8_0, Q4_K, Q6_K and Q5_K all lead
+// their block with an f16 scale. There was no half-precision reader anywhere in
+// the tree, so every quantised tensor was unreadable.
+//
+// IEEE-754 binary16 layout: sign(1) exp(5, bias 15) frac(10).
+//   exp==0    -> subnormal/zero: value = frac * 2^-24
+//   exp==31   -> inf (frac==0) or NaN (frac!=0)
+//   otherwise -> (-1)^sign * (1 + frac/1024) * 2^(exp-15)
+fn f16_to_f64(p) {
+  let bits = mem_load16(p)
+  let sign = 1.0
+  if bits >= 32768 { sign = -1.0 }
+  let exp = bits / 1024          // bits >> 10 (bits is 0..65535, so unsigned)
+  let frac = bits - exp * 1024   // bits & 1023
+  if exp == 31 {
+    // Inf / NaN. Return a large finite magnitude and 0.0 respectively rather
+    // than synthesising them: 1e308*1e308 overflows and 0.0/0.0 can trap on the
+    // integer-division path. Nothing in the inference path depends on these.
+    if frac == 0 { return sign * 1.0e308 }
+    return 0.0
+  }
+  if exp == 0 { return sign * frac * 0.000000000000000000000000001 }
+  let mant = 1.0 + frac / 1024.0
+  // 2^(exp-15) by exact squaring on the integer exponent.
+  let e = exp - 15
+  let p2 = 1.0
+  if e > 0 {
+    let n = e
+    while n > 0 {
+      p2 = p2 * 2.0
+      n = n - 1
+    }
+  }
+  if e < 0 {
+    let n = 0 - e
+    while n > 0 {
+      p2 = p2 / 2.0
+      n = n - 1
+    }
+  }
+  return sign * mant * p2
+}
+
+
+// print_f(v: f64): print a float VALUE as decimal with six fractional digits.
+//
+// There was no float formatter anywhere in the tree, so every float result had
+// to be read as its raw bit pattern -- which makes a 1-ULP error
+// indistinguishable from a 100x one. Needed to validate dequant output.
+//
+// The sign is emitted separately and the magnitude is printed, so the
+// fractional digits never go negative and borrow back through the integer
+// part (which a naive `v = -v` rounding causes).
+fn print_f(v: f64) {
+    if v == 0.0 {
+        print("0.000000")
+        return
+    }
+    let neg = 0
+    let m = v
+    if m < 0.0 {
+        neg = 1
+        m = 0.0 - m
+    }
+    if neg == 1 { print("-") }
+
+    let ip = 0
+    while m >= 1.0 {
+        m = m - 1.0
+        ip = ip + 1
+    }
+    printi(ip)
+    print(".")
+
+    // Six fractional digits, each from a multiply-by-ten so rounding does not
+    // accumulate across digits. Digit extraction truncates; the residual
+    // fraction is carried into the next digit, which is what keeps 0.008069
+    // from printing as 0.008068.
+    let k = 0
+    while k < 6 {
+        m = m * 10.0
+        let d = 0
+        while m >= 1.0 {
+            m = m - 1.0
+            d = d + 1
+        }
+        printi(d)
+        k = k + 1
+    }
 }

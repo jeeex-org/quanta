@@ -545,22 +545,30 @@ fn rewrite_struct_literals() {
     let p = 0
     while p < tokc {
         if tokt(p)==TT_ID {
-            // inline findstruct(tokv(p), tokln(p)) — no user-fn calls (clobber)
+            // inline findstruct(tokv(p), tokln(p)) - no user-fn calls (clobber)
             let nm = tokv(p); let nl = tokln(p)
             let si = 0-1
             let su = 0
             while su < structc {
                 if r64(sdefs + su*64 + 8)==nl {
                     let sp = r64(sdefs + su*64); let sm = 0; let smatch = 1
-                    while sm < nl { if r8(src+sp+sm)!=r8(src+nm+sm) { smatch=0; break }; sm=sm+1 }
+                    while sm < nl { if r8(src+sp+sm)!=r8(src+nm+sm) { smatch=0; break }; sm = sm+1 }
                     if smatch==1 { si = su; break }
                 }
                 su = su+1
             }
             // skip declaration contexts: `struct Name {`, `impl ... for Name {`,
-            // `trait Name {` — only rewrite in EXPRESSION position.
+            // `trait Name {` - only rewrite in EXPRESSION position.
+            //
+            // Only a TT_ID token carries a SOURCE OFFSET in tokv(); a keyword
+            // token (fn, return, let, ...) carries its keyword ID there. Reading
+            // src+pv+k with a keyword ID is an out-of-range read: with a large
+            // decimal literal elsewhere in the same function it walked off the
+            // source arena and segfaulted the compiler. Non-identifier tokens
+            // simply cannot precede a struct-literal name in a way that matters,
+            // so skip them.
             let prev_ok = 1
-            if p>=1 {
+            if p>=1 && tokt(p-1)==TT_ID {
                 let pv = tokv(p-1); let pl = tokln(p-1)
                 // byte-compare regardless of token type (struct/impl/trait/for
                 // are TT_ID here)

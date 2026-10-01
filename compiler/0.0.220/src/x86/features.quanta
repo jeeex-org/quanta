@@ -383,6 +383,18 @@ fn compile_error(kind, nm, nl) {
         // compare would be wrong; reject until signed big_cmp exists.
         let msg = "error: ordering compare (< > <= >=) not supported for big: "
         file_write(2, msg+8, len(msg)); file_write(2, src+nm, nl)
+    } else if kind==7 {
+        // Decimal literal wider than i64 with no bigint runtime imported.
+        // nm/nl is the literal's own text in the user source, so the message
+        // shows the digits that overflowed rather than an internal symbol.
+        let msg = "error: decimal literal exceeds i64 range (import std/big to use it): "
+        file_write(2, msg+8, len(msg)); file_write(2, src+nm, nl)
+    } else if kind==8 {
+        // 0.0.221: a reserved type/keyword used as a binding name. pval()/plen()
+        // carry the keyword id rather than a source offset, so the name was read
+        // as garbage and the binding silently compiled to 0.
+        let msg = "error: reserved type keyword used as a variable name: "
+        file_write(2, msg+8, len(msg))
     } else {
         let msg = "error: function declares return type but 'return' has no value"
         file_write(2, msg+8, len(msg))

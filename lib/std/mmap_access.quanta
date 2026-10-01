@@ -8,10 +8,10 @@ fn mmap_load(path) {
     let fd = open(path, 0, 0)
     if fd < 0 { return -1 }
     
-    // Get file size from stat
-    let stat_buf = mem_alloc(144)
-    file_stat(fd, stat_buf)
-    let size = mem_load(stat_buf + 64)  // st_size at offset 64 on x86-64
+    // Get file size from lseek(SEEK_END), not fstat: file_stat returns EFAULT
+    // on this target and leaves the buffer untouched, so reading st_size from
+    // it always yielded 0 and every tensor read below would fault.
+    let size = file_size(fd)
     
     // Read entire file into one big buffer
     mmap_size = size
