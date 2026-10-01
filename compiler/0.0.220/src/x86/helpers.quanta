@@ -356,7 +356,15 @@ fn sfn(i,nm,nl,bt,co,pc,ret_nm,ret_nl) {
     // globals.quanta for why: file_open keys off vreg_is_str to decide whether to
     // skip the 8-byte length header, so an untagged result was opened from its
     // length field and every call returning a path failed with -2.
-    w64(fn_retstr + i*8, 0)
+    //
+    // The unconditional reset below is removed for the same reason as
+    // fn_retflt: sfn() runs a second time from the compile loop, after
+    // scan_retstr() has inferred the flag for an untyped function that returns
+    // a string literal. Resetting here erased that inference, and the caller
+    // read the string pointer's low 4 bytes as an integer --
+    // `fn lit() { return "hello" }` then printed 1109393744 (0x6c6c6568 ==
+    // "hell"). An explicit `-> string` / `-> str` declaration still sets the
+    // flag below, so declared code is unaffected.
     if ret_nm != 0 && (ret_nl == 6 || ret_nl == 3) {
         let m1 = r8(src+ret_nm)
         if ret_nl == 6 {

@@ -894,3 +894,43 @@ fn scan_retfloat() {
     fi = fi+1
   }
 }
+
+// Same shape as scan_retfloat(): walk the canonical function list with `fi`,
+// derive the body from fn_btok(fi), and record the flag against that same fi.
+// This deliberately does NOT reuse scan_retfloat's index guessing or a
+// name-rematching map -- findfn() resolves against this canonical index, so a
+// second numbering scheme silently mis-tags the caller (the bug that made
+// typed-before-untyped float functions interfere with each other).
+//
+// Without this, `fn lit() { return "hello" }` leaves fn_retstr unset. codegen
+// then leaves the caller's result vreg untagged, and print() reads the string
+// pointer's low 4 bytes as an integer: "hello" printed as 1109393744
+// (0x6c6c6568 == "hell"). Only a *declared* `-> string` return was tagged,
+// via the codegen.quanta check on fn_retstr[rfi].
+fn scan_retstr() {
+  let fi = 0
+  while fi < fnc {
+    w64(fn_retstr + fi*8, 0)
+    let bt = fn_btok(fi)
+    let depth = 0; let p = bt; let end = tokc; let started = 0
+    while p < tokc {
+      if tokt(p)==TT_PNCT&&tokv(p)==123 { depth = depth+1; started = 1 }
+      else if tokt(p)==TT_PNCT&&tokv(p)==125 { depth = depth-1; if started==1&&depth==0 { end = p; break } }
+      p = p+1
+    }
+    let q = bt
+    while q < end {
+      if tokt(q)==TT_KEY && tokln(q)==6 && r8(src+tokv(q))=='r'&&r8(src+tokv(q)+1)=='e'&&r8(src+tokv(q)+2)=='t'&&r8(src+tokv(q)+3)=='u'&&r8(src+tokv(q)+4)=='r'&&r8(src+tokv(q)+5)=='n' && depth==1 {
+        let r = q+1
+        if r<end && tokt(r)==TT_OP && tokv(r)==45 { r = r+1 }
+        if r<end && tokt(r)==TT_STR { w64(fn_retstr + fi*8, 1) }
+      }
+      if tokt(q)==TT_PNCT {
+        if tokv(q)==123 { depth = depth+1 }
+        else if tokv(q)==125 { depth = depth-1 }
+      }
+      q = q+1
+    }
+    fi = fi+1
+  }
+}
