@@ -311,23 +311,39 @@ fn scanfns() {
                 // a parameter, because the nested arrow was matched first.
                 // kstart points AT the '(' that opens the parameter list, so the
                 // loop begins already inside it.
-                let pdepth = 1
+                // The return-type arrow sits AFTER the parameter list's closing
+                // ')'. The old loop broke at that ')', so it never reached the arrow
+                // and ret_type_name/ret_type_len kept whatever they already held --
+                // measured: `fn aa(ptr: i64): f64` recorded the type as "i64",
+                // the PARAMETER's type, because the scan stopped inside the
+                // parameter list. Two explicit phases: walk to the ')' that closes
+                // the parameter list, then look for '->' from there.
+                let d1 = 0
                 while rj + 1 < rlim {
                     if tokt(rj)==TT_PNCT {
-                        if tokv(rj)==40 { pdepth = pdepth + 1 }        // '(' nested in a type
-                        if tokv(rj)==41 {                              // ')' closes one
-                            if pdepth == 1 { rj = rj + 1; break }     // back to top level: signature ends
-                            pdepth = pdepth - 1
+                        if tokv(rj)==40 { d1 = d1 + 1 }
+                        if tokv(rj)==41 {
+                            d1 = d1 - 1
+                            if d1 == 0 { break }
                         }
-                        if pdepth == 0 && (tokv(rj)==123 || tokv(rj)==59) { break }  // body or decl end
                     }
-                    if pdepth == 1 && tokt(rj)==TT_OP && tokv(rj)==11582 {
+                    rj = rj + 1
+                }
+                if rj < rlim { rj = rj + 1 }
+                while rj + 1 < rlim {
+                    if tokt(rj)==TT_OP && tokv(rj)==11582 {
                         let rt = rj + 1
-                        if rt < tokc && (tokt(rt)==TT_ID || tokt(rt)==TT_KEY) {
-                            ret_type_name = tokv(rt)
-                            ret_type_len = tokln(rt)
+                        if rt < tokc {
+                            if tokt(rt)==TT_ID { ret_type_name = tokv(rt) }
+                            if tokt(rt)==TT_KEY { ret_type_name = tokv(rt) }
+                            if tokt(rt)==TT_ID { ret_type_len = tokln(rt) }
+                            if tokt(rt)==TT_KEY { ret_type_len = tokln(rt) }
                         }
                         break
+                    }
+                    if tokt(rj)==TT_PNCT {
+                        if tokv(rj)==123 { break }
+                        if tokv(rj)==59 { break }
                     }
                     rj = rj + 1
                 }
