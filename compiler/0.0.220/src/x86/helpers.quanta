@@ -330,7 +330,23 @@ fn sfn(i,nm,nl,bt,co,pc,ret_nm,ret_nl) {
     // `fn f(a: f64) -> f64 { return a; }` followed by `f(1.0) == 0.1` compared
     // 4607182418800017408 against 0.1 and was false. Set here because sfn() is the
     // one place every function passes through with its declared return type.
-    w64(fn_retflt + i*8, 0)
+    //
+    // Only the DECLARED type is recomputed here. sfn() runs a second time from the
+    // compile loop (entry.quanta), long after scan_retfloat() has inferred the
+    // flag for an untyped function whose body returns a float literal, so an
+    // unconditional `w64(fn_retflt + i*8, 0)` silently erased that inference and
+    // the caller's result vreg stayed untagged. Measured on the same source:
+    //
+    //     fn g3t() -> f64 { return 3.0 }   let a = g3t()   a - 1.0  -> 2.0  ok
+    //     fn g3u() { return 3.0 }          let a = g3u()   a - 1.0  -> garbage
+    //
+    // with the untagged operand taking the integer path in fopld_rr:
+    //     cvtsi2sd %rcx,%xmm0        <- a float's raw bit pattern read as an int
+    //     subsd  %xmm1,%xmm0
+    //
+    // An explicit `-> big` or `-> string` declaration below still wins, so
+    // declared code is unaffected: a function declared not-f64 that genuinely
+    // returns an integer was never flagged in the first place.
     if ret_nm != 0 && ret_nl == 3 {
         if r8(src+ret_nm)=='f' && r8(src+ret_nm+1)=='6' && r8(src+ret_nm+2)=='4' {
             w64(fn_retflt + i*8, 1)

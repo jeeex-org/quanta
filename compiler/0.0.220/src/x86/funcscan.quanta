@@ -821,3 +821,76 @@ fn scan_call_float() {
         q = q + 1
     }
 }
+
+
+// scan_retfloat: mark a function as returning a float from its own body.
+//
+// Mirror of scan_retbig() in globals.quanta, deliberately. That pass iterates
+// `fi` over fnc and derives the body from fn_btok(fi), so the flag lands on the
+// SAME index the compiler assigns the function. An earlier version of this pass
+// walked the token stream looking for `fn` and then guessed the registration
+// index by re-matching the name; that index disagreed with findfn() whenever a
+// typed function preceded the target, and the flag was written to the wrong
+// slot. Symptom:
+//
+//     fn t1() -> f64 { return 3.0 }   ok
+//     fn g() { return 3.0 }
+//     fn main() { let b = g()   b - 1.0 }   -> garbage, but only if t1 came first
+//
+// Why this pass exists at all
+// -------------------------
+// scan_call_float() only marks CALLEE PARAMETERS, from the arguments seen at a
+// call site. It never considers what a function RETURNS, so an untyped function
+// returning a float literal kept fn_retflt == 0 and the caller's result vreg was
+// never tagged. vfloat[] is per-vreg, so the enclosing IR_SUB asked fopld_rr for
+// that operand, found it untagged, and emitted cvtsi2sd over the float's raw bit
+// pattern:
+//
+//     mov    -0x40(%rbp),%rcx
+//     cvtsi2sd %rcx,%xmm0        <- a float's raw bit pattern read as an integer
+//     subsd  %xmm1,%xmm0
+//
+// The declared `-> f64` form already worked because sfn() records the type. Only
+// the return TYPE differed between these, on identical source:
+//
+//     fn g3t() -> f64 { return 3.0 }   let a = g3t()   a - 1.0  -> 2.0  correct
+//     fn g3u() { return 3.0 }          let a = g3u()   a - 1.0  -> garbage
+//
+// Rule
+// ----
+// A `return` directly in a function body (brace depth 1) whose first token is a
+// float literal -- optionally after a unary '-' -- marks the function as
+// returning a float. `scan_retbig()`'s explicit `-> big` annotation is honoured
+// first so a function declared to return a big never gets flagged here, and
+// sfn() recomputes the DECLARED `-> f64` case on every pass.
+//
+// The body walk starts AT the opening brace, as in scan_retbig(): a `return`
+// sitting directly in the body is reached at depth 1, and one nested in an inner
+// block at depth 2+.
+fn scan_retfloat() {
+  let fi = 0
+  while fi < fnc {
+    w64(fn_retflt + fi*8, 0)
+    let bt = fn_btok(fi)
+    let depth = 0; let p = bt; let end = tokc; let started = 0
+    while p < tokc {
+      if tokt(p)==TT_PNCT&&tokv(p)==123 { depth = depth+1; started = 1 }
+      else if tokt(p)==TT_PNCT&&tokv(p)==125 { depth = depth-1; if started==1&&depth==0 { end = p; break } }
+      p = p+1
+    }
+    let q = bt
+    while q < end {
+      if tokt(q)==TT_KEY && tokln(q)==6 && r8(src+tokv(q))=='r'&&r8(src+tokv(q)+1)=='e'&&r8(src+tokv(q)+2)=='t'&&r8(src+tokv(q)+3)=='u'&&r8(src+tokv(q)+4)=='r'&&r8(src+tokv(q)+5)=='n' && depth==1 {
+        let r = q+1
+        if r<end && tokt(r)==TT_OP && tokv(r)==45 { r = r+1 }
+        if r<end && tokt(r)==TT_FNUM { w64(fn_retflt + fi*8, 1) }
+      }
+      if tokt(q)==TT_PNCT {
+        if tokv(q)==123 { depth = depth+1 }
+        else if tokv(q)==125 { depth = depth-1 }
+      }
+      q = q+1
+    }
+    fi = fi+1
+  }
+}
