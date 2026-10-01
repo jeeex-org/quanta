@@ -1070,17 +1070,38 @@ fn ci_func(fi, is_main) {
             // NO flush_all -- flush_all() spills the live vregs, so reading them
             // afterwards gets stale data. Getting that wrong made every ordering
             // comparison come out inverted while == still worked.
-            let r1=aphys(a0); let r2=aphys(a1); let rd=adistinct(res,r1,r2)
+            let r1=aphys(a0); let r2=aphys(a1)
             if r8(vfloat+a0)==1 && r8(vfloat+a1)==1 {
                 fld_x(r1, 0); fld_x(r2, 1)
                 eb(102); eb(15); eb(47); eb(193)    // comisd xmm0, xmm1
-                eb(15); eb(148); eb(192)   // sete al  (ZF=1)
-                eb(15); eb(147); eb(193)   // setae cl (CF=0)
-                eb(32); eb(200)            // and al, cl -> ordered equal only
-                eb(15); eb(182); eb(192)   // movzx eax, al
-                if rd != 0 { rr(rd, 0) }
+                // Ordered equal: ZF=1 AND PF=0.  comisd sets PF for NaN, so a
+                // plain `sete` reports NaN == NaN as TRUE; the setnp term kills
+                // that.  (The previous form was sete + setae; CF is 0 for
+                // every comisd result that is not unordered, so it contributed
+                // nothing and was pure risk.)
+                //
+                // Both setcc destinations MUST come from ascratch(): setcc
+                // r/m8 writes ONE byte, and the other 56 bits of a physical
+                // register here hold a live f64 bit-pattern.  The old code
+                // wrote %cl directly, turning an f64 0x3FF0000000000000 into
+                // 0x3FF0000000000001; the next spill then stored that into the
+                // float's home and `fsub(zero, result)` returned -1.0000000000000002.
+                // Scratch selection FIRST, destination register SECOND.
+                // ascratch()'s all-busy fallback evicts the most recent
+                // allocation; had rd already been allocated it would be that
+                // one, and evicting it unmaps the destination mid-emit, so the
+                // `rr(rd, rz)` below wrote to a register nothing ever read --
+                // which silently turned every float == into "false".
+                let rz=ascratch(-1)
+                let rp=ascratch(rz)
+                rsetcz(0, rz)               // sete rz  -> ZF
+                rsetcz(6, rp)               // setnp rp -> PF clear (NaN)
+                rand(rz, rp)                // and rz, rp
+                let rd=adistinct(res,r1,r2)
+                if rd != rz { rr(rd, rz) }
                 sdef(res, rd)
             } else {
+                let rd=adistinct(res,r1,r2)
                 rxor(rd,rd); rcmp(r1,r2); rsetc(0,rd); rzx(rd,rd); sdef(res, rd)
             }
         }
@@ -1107,9 +1128,11 @@ fn ci_func(fi, is_main) {
             if r8(vfloat+a0)==1 && r8(vfloat+a1)==1 {
                 fld_x(r1, 0); fld_x(r2, 1)
                 eb(102); eb(15); eb(47); eb(193)    // comisd xmm0, xmm1
-                eb(15); eb(149); eb(192)   // setne al (ZF=0)
-                eb(15); eb(182); eb(192)   // movzx eax, al
-                if rd != 0 { rr(rd, 0) }
+                // setcc writes one byte; a scratch reg holds no live vreg.
+                let rz=ascratch(rd)
+                rzero(rz)
+                rsetc(1, rz)
+                if rd != rz { rr(rd, rz) }
                 sdef(res, rd)
             } else {
                 rxor(rd,rd); rcmp(r1,r2); rsetc(1,rd); rzx(rd,rd); sdef(res, rd)
@@ -1138,9 +1161,10 @@ fn ci_func(fi, is_main) {
             if r8(vfloat+a0)==1 && r8(vfloat+a1)==1 {
                 fld_x(r1, 0); fld_x(r2, 1)
                 eb(102); eb(15); eb(47); eb(193)    // comisd xmm0, xmm1
-                eb(15); eb(146); eb(192)   // setb al  (CF=1 => a<b)
-                eb(15); eb(182); eb(192)   // movzx eax, al
-                if rd != 0 { rr(rd, 0) }
+                let rz=ascratch(rd)
+                rzero(rz)
+                rsetc(2, rz)
+                if rd != rz { rr(rd, rz) }
                 sdef(res, rd)
             } else {
                 rxor(rd,rd); rcmp(r1,r2); rsetc(2,rd); rzx(rd,rd); sdef(res, rd)
@@ -1169,9 +1193,10 @@ fn ci_func(fi, is_main) {
             if r8(vfloat+a0)==1 && r8(vfloat+a1)==1 {
                 fld_x(r1, 0); fld_x(r2, 1)
                 eb(102); eb(15); eb(47); eb(193)    // comisd xmm0, xmm1
-                eb(15); eb(151); eb(192)   // seta al  (CF=0,ZF=0 => a>b)
-                eb(15); eb(182); eb(192)   // movzx eax, al
-                if rd != 0 { rr(rd, 0) }
+                let rz=ascratch(rd)
+                rzero(rz)
+                rsetc(3, rz)
+                if rd != rz { rr(rd, rz) }
                 sdef(res, rd)
             } else {
                 rxor(rd,rd); rcmp(r1,r2); rsetc(3,rd); rzx(rd,rd); sdef(res, rd)
@@ -1200,9 +1225,10 @@ fn ci_func(fi, is_main) {
             if r8(vfloat+a0)==1 && r8(vfloat+a1)==1 {
                 fld_x(r1, 0); fld_x(r2, 1)
                 eb(102); eb(15); eb(47); eb(193)    // comisd xmm0, xmm1
-                eb(15); eb(150); eb(192)   // setbe al (CF=1||ZF=1 => a<=b)
-                eb(15); eb(182); eb(192)   // movzx eax, al
-                if rd != 0 { rr(rd, 0) }
+                let rz=ascratch(rd)
+                rzero(rz)
+                rsetc(4, rz)
+                if rd != rz { rr(rd, rz) }
                 sdef(res, rd)
             } else {
                 rxor(rd,rd); rcmp(r1,r2); rsetc(4,rd); rzx(rd,rd); sdef(res, rd)
@@ -1231,9 +1257,10 @@ fn ci_func(fi, is_main) {
             if r8(vfloat+a0)==1 && r8(vfloat+a1)==1 {
                 fld_x(r1, 0); fld_x(r2, 1)
                 eb(102); eb(15); eb(47); eb(193)    // comisd xmm0, xmm1
-                eb(15); eb(147); eb(192)   // setae al (CF=0 => a>=b)
-                eb(15); eb(182); eb(192)   // movzx eax, al
-                if rd != 0 { rr(rd, 0) }
+                let rz=ascratch(rd)
+                rzero(rz)
+                rsetc(5, rz)
+                if rd != rz { rr(rd, rz) }
                 sdef(res, rd)
             } else {
                 rxor(rd,rd); rcmp(r1,r2); rsetc(5,rd); rzx(rd,rd); sdef(res, rd)

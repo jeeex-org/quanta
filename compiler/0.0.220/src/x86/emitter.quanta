@@ -55,11 +55,51 @@ fn ridiv(r) { if r>=8 { eb(73) } else { eb(72) }; eb(247); mr(3,7,r%8) }
 fn rshl(d,s) { if s!=1 { rr(1,s) }; eb(72); eb(211); mr(3,4,d%8) }
 fn rshr(d,s) { if s!=1 { rr(1,s) }; eb(72); eb(211); mr(3,5,d%8) }
 
+// SETCC_OP: opcode table for rsetc, indexed by cc.
+// 0..5 use the 0F 9x family (unchanged -- integer callers depend on it).
+// 6/7 are the only additions: 0xBB setnp, 0xBA setp.
+// Indexed load rather than an else-if chain: this is the one place a cc has
+// never been used before, and the chain made the new arms easy to get wrong.
+// Note 0x7B/0x7A are NOT setcc opcodes -- 0x0F 0xBB is setnp, 0x0F 0xBA is setp;
+// using the bare byte value emitted a truncated, illegal encode.
+let SETCC_OP = mmap(8)
+fn setcc_init() {
+    w8(SETCC_OP+0, 148) ; w8(SETCC_OP+1, 149) ; w8(SETCC_OP+2, 156) ; w8(SETCC_OP+3, 159)
+    w8(SETCC_OP+4, 158) ; w8(SETCC_OP+5, 157) ; w8(SETCC_OP+6, 187) ; w8(SETCC_OP+7, 186)
+}
 fn rsetc(cc,r) {
-    let c=0
-    if cc==0 { c=148 } else if cc==1 { c=149 } else if cc==2 { c=156 } else if cc==3 { c=159 } else if cc==4 { c=158 } else if cc==5 { c=157 }
+    let c=r8(SETCC_OP+cc)
     if r<4 { eb(15); eb(c); mr(3,0,r) } else if r<8 { eb(64); eb(15); eb(c); mr(3,0,r%8) } else { eb(65); eb(15); eb(c); mr(3,0,r%8) }
 }
+
+// rzero(r): mov $0, %r -- clear all 64 bits.
+//
+// REQUIRED before any setcc into r.  setcc r/m8 writes only the low byte and
+// leaves the upper 56 bits exactly as they were.  When r came from ascratch()
+// it has no live vreg, but its upper bits still hold whatever the register last
+// computed -- including a full f64 bit-pattern.  `sete %al` on a register holding
+// 0x3FF0000000000000 leaves 0x3FF0000000000001, and a later spill stores that
+// into the float's home.  Zeroing first makes the 1-byte write total.
+//
+// `mov $0, %r`, NOT `xor %r,%r`: xor SETS FLAGS, and these calls sit between the
+// `comisd` that produces ZF/PF and the `sete`/`setnp` that consume them.  Using
+// xor wiped the flags and every float compare silently returned 0.
+//
+// Encoding: C7 /0 id, modrm = 11 reg=000 rm=r.  For r>=8 the REX.B bit lives in
+// that SAME modrm byte, so it is 0xC0 | (r&7) | ((r>>3)<<0) -- emitted as
+// 49 (REX.WB) then C7 then the modrm.  A separate 0x41 REX prefix would not
+// encode the operand at all.
+fn rzero(r) {
+    let lo=r%8 ; let hi=r/8
+    if hi!=0 { eb(73) }                // REX.WB = 0x49 (W=1, B=1)
+    eb(199)                            // C7 /0
+    eb(192+(lo))                       // modrm 11 000 lo  -- rm low 3 bits
+    eb(0); eb(0); eb(0); eb(0)         // imm32 = 0
+}
+
+// rsetcz(cc,r): the only correct way to use rsetc -- zero the whole register,
+// then set the condition byte.  Result is a clean 0 or 1 in a full register.
+fn rsetcz(cc,r) { rzero(r); rsetc(cc,r) }
 fn rzx(d,s) {
     if d<8&&s<8 { eb(72); eb(15); eb(182); mr(3,d%8,s%8); return }
     rw(d,s); eb(15); eb(182); mr(3,d%8,s%8)
@@ -298,6 +338,42 @@ fn afind(vr) {
 fn aset(vr,pr) {
     if allocfc >= ALLOC_CAP { emit_ovf(50) }
     w64(alloc+allocfc*16,vr); w64(alloc+allocfc*16+8,pr); allocfc=allocfc+1
+}
+
+// ascratch(): return a physical register that holds NO live vreg.  Safe to
+// clobber arbitrarily -- including by a BYTE write.
+//
+// `setcc r/m8` writes ONE byte.  On this target the other 56 bits of a physical
+// register hold the raw f64 bit-pattern of a live float vreg, so a bare
+// `setae %cl` over 0x3FF0000000000000 yields 0x3FF0000000000001.  The float
+// compare path used to write AL/CL directly; when the allocator had left an f64
+// in RCX between a float's definition and its use, the next `mov %rcx,home`
+// stored that corrupted pattern into the float's spill slot, so `fsub(zero,
+// result)` computed 0 - 1.0000000000000002 instead of 0 - 1.0.
+// ascratch(ex): a physical register holding no live vreg, for setcc results.
+//
+// setcc r/m8 writes ONE byte and leaves the other 56 bits untouched.  That is
+// harmless when the destination is already 0/1, and catastrophic when it
+// is not: the old code wrote %cl while RCX still held a live f64 bit-pattern,
+// turning 0x3FF0000000000000 into 0x3FF0000000000001.  So besides picking an
+// unmapped register we must also make sure its upper bits are already zero,
+// which the allocator guarantees for a vreg only if we zero it ourselves.
+fn ascratch(ex) {
+    let k=0
+    while k<13 {
+        let pr=r64(REGS+k*8)
+        if pr!=ex {
+            let used=0; let j=0
+            while j<allocfc { if r64(alloc+j*16+8)==pr { used=1; break }; j=j+1 }
+            if used==0 { return pr }
+        }
+        k=k+1
+    }
+    allocfc=allocfc-1
+    let ev_vr=r64(alloc+allocfc*16); let ev_pr=r64(alloc+allocfc*16+8)
+    if r8(vr_init+ev_vr)!=0 { wbp(spill_home(ev_vr), ev_pr) }
+    w8(vr_spill+ev_vr, 1)
+    return ev_pr
 }
 
 fn aclr() { allocfc=0; let i=0; while i<vreg_n { w8(vr_init+i,0); w8(vr_spill+i,0); w8(vfloat+i,0); i=i+1 } }
