@@ -1,144 +1,251 @@
-import std/fs
-
-// f32 bytes (at ptr) -> f64 bits
-// f32: 1 sign + 8 exp + 23 mantissa (bias 127)
-// f64: 1 sign + 11 exp + 52 mantissa (bias 1023)
+// f32 -> f64 conversion: EXACT IEEE-754 validation by raw bit pattern.
 //
-// 0.0.221: the original used `let u32` (a reserved type keyword, which the
-// parser silently read as a garbage name -> binding always 0), and expressed
-// the bit extraction as division/multiplication against 2^31 and 2^63. The
-// first was wrong code, the second needed std/big. Both are shifts here.
-fn f32_to_f64(ptr) {
-    // Read little-endian u32
-    let b0 = mem_load8(ptr)
-    let b1 = mem_load8(ptr + 1)
-    let b2 = mem_load8(ptr + 2)
-    let b3 = mem_load8(ptr + 3)
-    let bits = b0 + (b1 * 256) + (b2 * 65536) + (b3 * 16777216)
+// This used to assert almost nothing. It defined its OWN local f32_to_f64 --
+// a pure-integer bit shuffle, not the library's float-arithmetic converter --
+// so it validated the test's own copy rather than the production path, and the
+// one-ULP float-compare corruption in lib/std/gguf.quanta's converter could not
+// possibly show up through it. Its only real-model assertion read at
+// `offset = 0`, which is the GGUF *header*, not tensor data, so it never
+// touched a weight.
+//
+// Now it calls lib/std's f32_to_f64 directly and asserts the exact 64-bit
+// pattern of every result via f64bits(). print_f() cannot validate this:
+// Inf/NaN/subnormals do not survive it, and it is the raw bits that IEEE-754
+// defines. Expectations below are the Python struct ground truth.
 
-    let sgn = (bits >> 31) << 63            // bit 31 -> bit 63
-    let exp32 = (bits >> 23) & 255          // bits 30-23
-    let man32 = bits & 8388607              // bits 22-0
+import "/opt/tali/quanta/lib/std/gguf.quanta"
 
-    if exp32 == 0 {
-        // Zero or denormal -- just return 0
-        return 0
+// Write the 4 little-endian bytes of an f32 bit pattern at ptr.
+fn put_f32(ptr, b0, b1, b2, b3) {
+    mem_store8(ptr, b0)
+    mem_store8(ptr + 1, b1)
+    mem_store8(ptr + 2, b2)
+    mem_store8(ptr + 3, b3)
+}
+
+// Convert the f32 at src and return the raw f64 bits.
+fn conv_bits(src) { return f64bits(f32_to_f64(src)) }
+
+// True when the f64 pattern is a NaN: all 11 exponent bits set and a non-zero
+// mantissa.
+//
+// The pattern arrives as a SIGNED i64 read (f64bits), so bit 63 is the sign and
+// must not be counted as part of the exponent. `(u >> 52) & 2047` masks the
+// sign-extension bits an arithmetic right shift fills in, leaving exactly the
+// 11 exponent bits for either sign; the mantissa mask is all-positive so it
+// never touches the sign.
+fn is_nan_bits(u) {
+    let expo = (u >> 52) & 2047
+    if expo != 2047 { return 0 }
+    let mant = u & 4503599627370495
+    return mant != 0
+}
+
+let fails = 0
+
+fn check(name: str, src, want) {
+    let got = conv_bits(src)
+    if got == want {
+        print("  ok   ")
+        print(name)
+        print("\n")
+    } else {
+        print("  FAIL ")
+        print(name)
+        print(" got=")
+        print(got)
+        print(" want=")
+        print(want)
+        print("\n")
+        fails = fails + 1
     }
-    if exp32 == 255 {
-        // Inf/NaN
-        let inf = sgn + (2047 << 52)
-        if man32 == 0 { return inf }
-        return inf + (man32 << 29)
-    }
-
-    let exp64 = (exp32 - 127 + 1023) << 52  // shift to bits 62-52
-    let man64 = man32 << 29                 // shift left by 29 (52-23=29)
-
-    return sgn + exp64 + man64
 }
 
 fn main() {
-    print("=== f32 Conversion Test ===\n")
+    print("=== f32_to_f64 exact IEEE-754 validation ===\n")
 
-    // Test: 1.0f32 = 0x3F800000
-    let test = mem_alloc(4)
-    mem_store8(test, 0)
-    mem_store8(test + 1, 0)
-    mem_store8(test + 2, 128)
-    mem_store8(test + 3, 63)
+    let p = mem_alloc(4)
 
-    let result = f32_to_f64(test)
-    print("1.0f32 = ")
-    print(result)
-    print(" (expected 4607182418800017408)\n")
-    if result != 4607182418800017408 {
-        print("FAIL: 1.0f32 conversion wrong\n")
+    // --- signed zeros -------------------------------------------------
+    put_f32(p, 0, 0, 0, 0)
+    check("+0.0  (0x00000000)", p, 0)
+    put_f32(p, 0, 0, 0, 128)
+    // 0x8000000000000000 is -0.0, whose SIGNED i64 reading is the one value
+    // that does not fit a positive i64 literal (2^63). Build it as 0-2^62*2.
+    check("-0.0  (0x80000000)", p, 0 - 4611686018427387904 - 4611686018427387904)
+
+    // --- normal, both signs -------------------------------------------
+    put_f32(p, 0, 0, 128, 63)
+    check("+1.0  (0x3F800000)", p, 4607182418800017408)
+    put_f32(p, 0, 0, 128, 191)
+    check("-1.0  (0xBF800000)", p, -4616189618054758400)
+    put_f32(p, 0, 0, 0, 64)
+    check("+2.0  (0x40000000)", p, 4611686018427387904)
+    put_f32(p, 0, 0, 0, 192)
+    check("-2.0  (0xC0000000)", p, -4611686018427387904)
+    put_f32(p, 0, 0, 0, 63)
+    check("+0.5  (0x3F000000)", p, 4602678819172646912)
+
+    // --- subnormals: mant * 2^-149 ------------------------------------
+    put_f32(p, 1, 0, 0, 0)
+    check("minsub  (0x00000001)", p, 3936146074321813504)
+    put_f32(p, 1, 0, 0, 128)
+    check("-minsub (0x80000001)", p, -5287225962532962304)
+    put_f32(p, 255, 255, 127, 0)
+    check("maxsub  (0x007FFFFF)", p, 4039728864677593088)
+
+    // --- boundary between subnormal and normal -------------------------
+    put_f32(p, 0, 0, 128, 1)
+    check("minnorm (0x01800000)", p, 4048736065006075904)
+
+    // --- largest finite values ----------------------------------------
+    put_f32(p, 255, 255, 127, 127)
+    check("+maxf32 (0x7F7FFFFF)", p, 5183643170566569984)
+    put_f32(p, 255, 255, 127, 255)
+    check("-maxf32 (0xFF7FFFFF)", p, -4039728866288205824)
+
+    // --- infinities ---------------------------------------------------
+    put_f32(p, 0, 0, 128, 127)
+    check("+Inf    (0x7F800000)", p, 9218868437227405312)
+    put_f32(p, 0, 0, 128, 255)
+    check("-Inf    (0xFF800000)", p, -4503599627370496)
+
+    // --- NaN ----------------------------------------------------------
+    // IEEE-754 does NOT require f32->f64 to preserve a NaN's payload, sign, or
+    // bit pattern -- only that the result is a NaN. The library returns the
+    // canonical quiet NaN from Inf-Inf (0xFFF8000000000000), which satisfies
+    // that. So these assert the CLASS (NaN, not Inf, not a number), which is
+    // what the standard actually specifies -- an exact-payload expectation here
+    // would be asserting something IEEE does not require and that most
+    // hardware (and every optimizing compiler) does not do.
+    put_f32(p, 1, 0, 128, 127)
+    if !is_nan_bits(conv_bits(p)) {
+        print("  FAIL qNaN  (0x7F800001) not classified as NaN\n")
+        fails = fails + 1
+    } else { print("  ok   qNaN  (0x7F800001) -> NaN\n") }
+    put_f32(p, 1, 0, 0, 127)
+    // NOT a NaN: 0x7F000001 has exponent field 254, so this is an ordinary
+    // normal f32 -- the smallest 2^127 * 1.0000001 -- and it must convert to
+    // an exact finite f64, not to a NaN. (0x7F800001 is the sNaN encoding;
+    // f32 has no separate sNaN/qNaN bit, the 0xFF800001 form below covers the
+    // negative-sign NaN.) An earlier version of this test asserted NaN here
+    // and the library correctly refused, because the input was not a NaN.
+    check("tiny    (0x7F000001)", p, 5179139572012941312)
+    put_f32(p, 1, 0, 0, 127)
+    if is_nan_bits(conv_bits(p)) {
+        print("  FAIL 0x7F000001 wrongly classified as NaN\n")
+        fails = fails + 1
+    }
+    put_f32(p, 1, 0, 128, 255)
+    if !is_nan_bits(conv_bits(p)) {
+        print("  FAIL -qNaN (0xFF800001) not classified as NaN\n")
+        fails = fails + 1
+    } else { print("  ok   -qNaN (0xFF800001) -> NaN\n") }
+
+    // =================================================================
+    // Real model data. The old test read at tensor[1]'s relative offset
+    // from the START of the file, i.e. 215040000 bytes into the GGUF --
+    // nowhere near the tensor. Ground truth for token_embd_norm.weight
+    // (F32, 2048 elems, relative offset 215040000, data start 8239136):
+    //   00 00 10 40 2.25       -> 0x4002000000000000
+    //   00 00 18 40 2.375      -> 0x4003000000000000
+    //   00 00 f5 3f 1.9140625  -> 0x3FFEA00000000000
+    //   00 00 11 40 2.265625   -> 0x4002200000000000
+    // =================================================================
+    print("\n=== real model: token_embd_norm.weight (F32) ===\n")
+
+    let g = gguf_load("/opt/ai/models/quanta/QUANTA-LFM2.5-2.6Bv1-Q4_K_M.gguf")
+    if g < 0 {
+        print("FAIL: gguf_load returned ")
+        print(g)
+        print("\n")
         return 1
     }
 
-    // Test: -1.0f32 = 0xBF800000
-    let ntest = mem_alloc(4)
-    mem_store8(ntest, 0)
-    mem_store8(ntest + 1, 0)
-    mem_store8(ntest + 2, 128)
-    mem_store8(ntest + 3, 191)
-    let nres = f32_to_f64(ntest)
-    print("-1.0f32 = ")
-    print(nres)
-    print(" (expected -4616189618054758400)\n")
-    // 0xBFF0000000000000 is the correct f64 bit pattern for -1.0. It does NOT
-    // read as -4607182418800017408: that is the UNSIGNED reading of the POSITIVE
-    // pattern 0x3FF0000000000000. Setting bit 63 adds 2^63, so the signed i64
-    // reading of an f64 pattern is (pattern - 2^64) for negatives. A signed
-    // negation of an i64 can never produce an f64 pattern with bit 63 set.
-    // Correct signed reading: 0 - 4616189618054758400.
-    if nres != 0 - 4616189618054758400 {
-        print("FAIL: -1.0f32 conversion wrong\n")
+    if gguf_num_tensors() != 266 {
+        print("FAIL: n_tensors=")
+        print(gguf_num_tensors())
+        print(" want 266\n")
+        fails = fails + 1
+    }
+    if gguf_num_kv() != 37 {
+        print("FAIL: n_kv=")
+        print(gguf_num_kv())
+        print(" want 37\n")
+        fails = fails + 1
+    }
+    if gguf_data_offset() != 8239136 {
+        print("FAIL: data_start=")
+        print(gguf_data_offset())
+        print(" want 8239136\n")
+        fails = fails + 1
+    }
+
+    let idx = gguf_find_tensor("token_embd_norm.weight")
+    if idx < 0 {
+        print("FAIL: token_embd_norm.weight not found\n")
         return 1
     }
-
-    // Test: read actual f32 weight from GGUF
-    let fd = open("/opt/ai/models/quanta/QUANTA-LFM2.5-2.6Bv1-Q4_K_M.gguf", 0, 0)
-    if fd < 0 { print("open failed\n"); return 1 }
-
-    lseek(fd, 8222781, 0)
-
-    // Skip to tensor 1 (token_embd_norm.weight, f32, 2048)
-    let nlen_buf = mem_alloc(8)
-    read_raw(fd, nlen_buf, 8)
-    let nlen = mem_load(nlen_buf)
-    let name = mem_alloc(256)
-    read_raw(fd, name, nlen)
-
-    let ndims_buf = mem_alloc(4)
-    read_raw(fd, ndims_buf, 4)
-    let ndims = mem_load(ndims_buf)
-    let dim_buf = mem_alloc(8)
-    let d = 0
-    while d < ndims {
-        read_raw(fd, dim_buf, 8)
-        d = d + 1
+    if gguf_tensor_dtype(idx) != 0 {
+        print("FAIL: dtype=")
+        print(gguf_tensor_dtype(idx))
+        print(" want 0 (F32)\n")
+        fails = fails + 1
+    }
+    if gguf_tensor_offset(idx) != 215040000 {
+        print("FAIL: offset=")
+        print(gguf_tensor_offset(idx))
+        print(" want 215040000\n")
+        fails = fails + 1
     }
 
-    let dtype_buf = mem_alloc(4)
-    read_raw(fd, dtype_buf, 4)
-    let off_buf = mem_alloc(8)
-    read_raw(fd, off_buf, 8)
-    let offset = mem_load(off_buf)
-
-    print("tensor[1] offset=")
-    print(offset)
-    print("\n")
-
-    // Read first 4 f32 values
+    // Read the first 4 f32 at the CORRECT absolute position.
     let raw = mem_alloc(16)
-    lseek(fd, offset, 0)
-    read_raw(fd, raw, 16)
-
-    let v0 = f32_to_f64(raw)
-    let v1 = f32_to_f64(raw + 4)
-    let v2 = f32_to_f64(raw + 8)
-    let v3 = f32_to_f64(raw + 12)
-
-    print("v0=")
-    print(v0)
-    print(" v1=")
-    print(v1)
-    print(" v2=")
-    print(v2)
-    print(" v3=")
-    print(v3)
-    print("\n")
-
-    // f32 weights are typically small (< 1.0), so their |value| in bits must be
-    // far below the 1.0 pattern (0x3FF0000000000000). A 0 here means the bit
-    // extraction collapsed, which is exactly what the reserved-name bug did.
-    if v0 == 0 && v1 == 0 && v2 == 0 && v3 == 0 {
-        print("FAIL: all tensor values read as zero\n")
+    let abs = gguf_data_offset() + gguf_tensor_offset(idx)
+    let fd = open("/opt/ai/models/quanta/QUANTA-LFM2.5-2.6Bv1-Q4_K_M.gguf", 0, 0)
+    if fd < 0 {
+        print("FAIL: reopen failed\n")
+        return 1
+    }
+    lseek(fd, abs, 0)
+    let nread = read_raw(fd, raw, 16)
+    close(fd)
+    if nread != 16 {
+        print("FAIL: read_raw=")
+        print(nread)
+        print(" want 16\n")
         return 1
     }
 
-    print("SUCCESS\n")
-    close(fd)
+    // Byte-level: the model really is 2.25, 2.375, ...
+    if mem_load8(raw) != 0 || mem_load8(raw + 1) != 0 || mem_load8(raw + 2) != 16 || mem_load8(raw + 3) != 64 {
+        print("FAIL: raw[0] bytes not 00 00 10 40\n")
+        fails = fails + 1
+    }
+
+    check("model v0 2.25      ", raw, 4612248968380809216)
+    check("model v1 2.375     ", raw + 4, 4612530443357519872)
+    check("model v2 1.9140625 ", raw + 8, 4611298990334410752)
+    check("model v3 2.265625  ", raw + 12, 4612284152752898048)
+
+    // Round-trip: the converted f64 must be arithmetically identical to 2.25.
+    // Asserted by comparing the f64's own bits against 2.25's pattern rather than
+    // by f2i(rt*1000): f2i truncates a product that is only exact if the multiply
+    // itself is exact, so a single wrong fmul would show up here as a converter
+    // failure and point at the wrong code.
+    let rt = f32_to_f64(raw)
+    if f64bits(rt) != 4612248968380809216 {
+        print("FAIL: round-trip v0 != 2.25 pattern\n")
+        fails = fails + 1
+    }
+
+    print("\n")
+    if fails > 0 {
+        print("FAILED: ")
+        print(fails)
+        print(" case(s)\n")
+        return 1
+    }
+    print("PASS: all f32_to_f64 IEEE-754 classes exact\n")
     return 0
 }

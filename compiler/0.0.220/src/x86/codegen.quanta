@@ -26,32 +26,59 @@ let cur_fi = 0
 // const-resolution helpers (op_is_const / op_const_val) can read it.
 let opt_i = 0
 
+// Const lookup scans BACKWARD from the current record, because a definition
+// precedes its use. The scan must STOP at the start of the current function.
+//
+// It used to run to record 0 unconditionally, crossing function boundaries.
+// That is invisible for most ops -- vreg numbers rarely collide across
+// functions -- but it is a live hazard now that float literals are IR_FCONST:
+// `opt_i` is the NEG record for a negative literal, and its operand vreg can
+// match an IR_FCONST belonging to an EARLIER function, so op_const_val returns
+// that function's constant. In test_f32_conv the `-maxf32` expectation then
+// folded to -(the +maxf32 constant) instead of the literal written in the
+// source, and the test failed with a plausible-looking but wrong number.
+//
+// The bound is opt_beg, which is the current function's first IR record.
 fn op_is_const(vr) {
     let k = opt_i-1
-    while k>=0 {
-        if irres(k)==vr && irop(k)==IR_CONST { return 1 }
+    while k>=opt_beg {
+        if irres(k)==vr && (irop(k)==IR_CONST || irop(k)==IR_FCONST) { return 1 }
         k=k-1
     }
     return 0
 }
 fn op_const_val(vr) {
     let k = opt_i-1
-    while k>=0 {
-        if irres(k)==vr && irop(k)==IR_CONST { return ira0(k) }
+    while k>=opt_beg {
+        if irres(k)==vr && (irop(k)==IR_CONST || irop(k)==IR_FCONST) { return ira0(k) }
         k=k-1
     }
     return 0
 }
 fn op_is_float(vr) {
-    // True if vr is defined (possibly via a chain of MOVs) by an IR_CALL whose
-    // name starts with "i2f" (int64 -> f64). The IR_CALL name field includes the
-    // '(' (e.g. "i2f("), so match only the first 3 chars like emit_bltn does.
+    // True if vr holds an f64 bit pattern.
+    //
+    // vfloat is the authority, set by method.quanta when a literal is lowered
+    // (w64(vfloat+cr*8,1)), by codegen's prepass for i2f/fconst results, and by
+    // entry.quanta for `-> f64` locals and parameters.  It is what the emit
+    // path uses, so consulting it here keeps the two in agreement.
+    //
+    // Before this, the walk below ONLY recognised an IR_CALL named i2f and
+    // returned 0 for everything else -- including a plain IR_CONST holding a
+    // float literal.  Lowering literals from fconst() to IR_CONST therefore
+    // made every float constant read as an integer: `let x: f64 = 1.0;
+    // x / d` folded to 1, `x * d` trapped with SIGILL, and `x + d` produced
+    // 9209861237972664320 (raw bit arithmetic on the patterns).
+    if vr >= 0 && r8(vfloat+vr)==1 { return 1 }
+    // Fall back to the def-chain walk for anything the table has not caught.
+    // Bounded by opt_beg for the same reason as op_is_const: walking past the
+    // current function can match a definition belonging to another one.
     let seen = mmap(256); let sp=0
     while sp<64 {
         w64(seen+sp*8, vr); sp=sp+1
         let k = irc-1
         let found = -1
-        while k>=0 {
+        while k>=opt_beg {
             if irres(k)==vr {
                 if irop(k)==IR_CALL {
                     let nm = ira0(k)
@@ -202,7 +229,17 @@ fn opt_func() {
         if op==IR_ADD || op==IR_SUB || op==IR_MUL || op==IR_BAND || op==IR_BOR || op==IR_BXOR || op==IR_OR || op==IR_AND
           || op==IR_EQ || op==IR_NE || op==IR_LT || op==IR_GT || op==IR_LE || op==IR_GE {
             if constfold(opt_i,op,r0,a0,a1)==1 { opt_i=opt_i+1; continue }
-            // algebraic identities on a single constant operand (resolve via def)
+            // Algebraic identities on a single constant operand.
+            //
+            // NEVER when either operand is a float. These rewrite the op into a
+            // MOV or a fresh IR_CONST, which throws away the float result class:
+            // `x * 2.0` folds to MOV x, and the multiply's SSE path (and with it
+            // the correct value) disappears. The integer fold path above already
+            // checks vfloat for exactly this reason; the identity path did not,
+            // and widening op_is_const() to accept IR_FCONST exposed it --
+            // test_full_inference started dying on an `imul` overflow trap
+            // (jno/ud2) where a float multiply belonged.
+            if r8(vfloat+a0)==1 || r8(vfloat+a1)==1 { opt_i=opt_i+1; continue }
             if op_is_const(a1)==1 {
                 let v1 = op_const_val(a1)
                 if op==IR_MUL && v1==1 { w64(ir+opt_i*IRS,IR_MOV); w64(ir+opt_i*IRS+8,r0); w64(ir+opt_i*IRS+16,a0); w64(ir+opt_i*IRS+24,0); w64(ir+opt_i*IRS+32,0) }
@@ -262,7 +299,76 @@ fn opt_func() {
                 // bitwise_not.quanta only ever passed because every operand in it
                 // is a constant, so it tested the buggy path exclusively and
                 // froze that behaviour in as if it were the spec.
-                if op==IR_NEG { f=0-op_const_val(a0) }
+                if op==IR_NEG {
+                    // Negating a CONSTANT. Two cases, and they must not be
+                    // conflated:
+                    //
+                    //  - an f64 LITERAL. `-1.0` parses as unary minus over the
+                    //    literal, so this is the sign of every negative float
+                    //    constant in the tree. It must be the IEEE-754 SIGN
+                    //    FLIP -- XOR the sign bit -- not `0 - x`. Subtracting the
+                    //    bit pattern as an integer does not negate the float,
+                    //    so every negative literal came out as a nonsense value:
+                    //        let a = -1.0   -> -4607182418800017408
+                    //        let c = -2.5   -> -4612811918334230528
+                    //    lib/std/fs.quanta's f16_to_f64 opens with exactly that
+                    //    shape (`let sign = 1.0` / `if .. { sign = -1.0 }`), so
+                    //    every FP16 weight scale in the model decoded to garbage
+                    //    and test_full_inference died on an imul overflow trap
+                    //    inside dequant_q4k. The result is IR_FCONST so the
+                    //    opcode still says "float"; folding to IR_CONST dropped
+                    //    that tag as well as the value.
+                    //
+                    //  - an INTEGER literal. Plain `0 - x`, and IR_CONST.
+                    //
+                    // BOTH resolve the operand by scanning BACKWARD for a
+                    // definition of its vreg, which is unsound: nv() is a global
+                    // counter that resets between compilation units, so two
+                    // constants in one function can share a vreg number and the
+                    // scan can return the wrong one. That is not theoretical --
+                    // it happened whenever an unrelated statement (a `print`,
+                    // say) shifted vreg allocation:
+                    //     check("+maxf32", p,  5183643170566569984)
+                    //     check("-maxf32", p, -4039728866288205824)
+                    // emitted want = -5183643170566569984, the PREVIOUS constant
+                    // negated, and test_f32_conv failed on a number that is
+                    // plausible enough to look like a converter bug.
+                    //
+                    // Fix: the operand of a folded unary op is the record
+                    // DEFINITELY IMMEDIATELY PRECEDING it -- parse_unary() emits
+                    // the literal and then the IR_NEG right after it, with
+                    // nothing in between. So read that record directly instead of
+                    // searching, which cannot pick a foreign definition.
+                    //
+                    // Floatness comes from the OPERAND RECORD'S OPCODE and
+                    // nothing else -- not from vfloat[a0]. opt_func runs BEFORE
+                    // aclr(), but the re-mark pass that populates vfloat has
+                    // already run once by then, and it tags the ARGUMENT entries
+                    // of any call to a `-> f64` function. An integer literal
+                    // passed to such a function therefore arrives with
+                    // vfloat==1, and deciding floatness from the tag made every
+                    // negative INTEGER constant take the float path:
+                    //     check("+maxf32", p,  5183643170566569984)   ok
+                    //     check("-maxf32", p, -4039728866288205824)   came out
+                    //     -5183643170566569984  = -(the previous constant)
+                    // because XOR-ing bit 63 into an INTEGER is not its
+                    // negation. `0 - x` is. Only an IR_FCONST operand -- a real
+                    // float literal -- may take the sign-flip path.
+                    let pk = opt_i-1
+                    if pk >= opt_beg && irres(pk)==a0 && (irop(pk)==IR_CONST || irop(pk)==IR_FCONST) {
+                        let b = ira0(pk)
+                        if irop(pk)==IR_FCONST {
+                            let SIGNBIT = 0 - 9223372036854775807 - 1
+                            w64(ir+opt_i*IRS,IR_FCONST); w64(ir+opt_i*IRS+8,r0)
+                            w64(ir+opt_i*IRS+16, b ^ SIGNBIT)
+                            w64(ir+opt_i*IRS+24,0); w64(ir+opt_i*IRS+32,0)
+                            return 1
+                        }
+                        f=0-b
+                    } else {
+                        f=0-op_const_val(a0)
+                    }
+                }
                 else if op==IR_NOT { if op_const_val(a0)==0 { f=1 } else { f=0 } }
                 else { f=~op_const_val(a0) }
                 w64(ir+opt_i*IRS,IR_CONST); w64(ir+opt_i*IRS+8,r0); w64(ir+opt_i*IRS+16,f); w64(ir+opt_i*IRS+24,0); w64(ir+opt_i*IRS+32,0)
@@ -311,8 +417,8 @@ fn opt_func() {
         // operands that read vregs
         let o0=ira0(j); let o1=ira1(j); let o2=ira2(j)
         // every op reads o0,o1 (and o2 where relevant); mark them live
-        if op!=IR_CONST { w8(live_bits+o0,1) }
-        if op!=IR_CONST && op!=IR_BR && op!=IR_JMP { w8(live_bits+o1,1) }
+        if op!=IR_CONST && op!=IR_FCONST { w8(live_bits+o0,1) }
+        if op!=IR_CONST && op!=IR_FCONST && op!=IR_BR && op!=IR_JMP { w8(live_bits+o1,1) }
         if op==IR_CALL {
             w8(live_bits+o2,1)   // arg-count IR index is live
             // mark each argument vreg live (the call reads irres(a2+i))
@@ -341,7 +447,23 @@ fn opt_func() {
         let res=irres(k)
         if w8(live_bits+res)==0 {
             // dead def -> no-op (MOV res,res). Keep index; harmless.
-            w64(ir+k*IRS, IR_MOV); w64(ir+k*IRS+8,res); w64(ir+k*IRS+16,res); w64(ir+k*IRS+24,0); w64(ir+k*IRS+32,0)
+            //
+            // NEVER for a CONSTANT or a folded literal. A constant has no
+            // operands, so liveness has nothing to mark it and `live_bits[res]`
+            // is 0 whenever the value is not read by a later IR op -- and a
+            // literal passed straight to a call is read through the argument
+            // record list, not through the IR op that defines it. Rewriting
+            // such a record to `MOV res, res` DELETES the constant and leaves
+            // the argument register holding whatever it last held, so the call
+            // received a stale value from an earlier statement:
+            //     check("+maxf32", p,  5183643170566569984)
+            //     check("-maxf32", p, -4039728866288205824)
+            // passed -5183643170566569984 -- the previous constant. That is
+            // exactly what made test_f32_conv fail on a value that is
+            // plausible enough to look like a converter defect.
+            if op!=IR_CONST && op!=IR_FCONST {
+                w64(ir+k*IRS, IR_MOV); w64(ir+k*IRS+8,res); w64(ir+k*IRS+16,res); w64(ir+k*IRS+24,0); w64(ir+k*IRS+32,0)
+            }
         }
         k=k+1
     }
@@ -387,7 +509,7 @@ fn def_is_constval(vr) {
     while k >= 0 {
         if irres(k) == vr {
             if irop(k) == IR_MOV { return def_is_constval(ira0(k)) }
-            if irop(k) == IR_CONST { return ira0(k) }
+            if irop(k) == IR_CONST || irop(k) == IR_FCONST { return ira0(k) }
             return -1
         }
         k = k - 1
@@ -723,6 +845,15 @@ fn ci_func(fi, is_main) {
             let pnm_c = r64(fn_pnames + pbase_c + ppi*16)
             let pnl_c = r64(fn_pnames + pbase_c + ppi*16 + 8)
             if pnl_c > 0 { vadd(pnm_c, pnl_c, pvr) }
+            // Link the param vreg to its fn_parstr slot. Both find_str_source()
+            // and arg_is_str() need this to recognise a string that arrived
+            // through a parameter: vreg_is_str only ever gets set for the
+            // vreg that IS the string, and a param vreg never is -- so with
+            // this link missing, print()/echo() inside any function that took a
+            // string printed the raw heap pointer instead of the text. That
+            // silently affected every string-taking helper in the tree.
+            // Key shape matches funcscan/objfmt: fi*200 + arg_index.
+            w64(vreg_to_param + pvr*8, fi*200 + ppi)
           }
           pseen = pseen + 1
         }
@@ -998,6 +1129,20 @@ fn ci_func(fi, is_main) {
     while ii<ir_end {
         let op=irop(ii); let res=irres(ii); let a0=ira0(ii); let a1=ira1(ii); let a2=ira2(ii)
         if op==IR_CONST { let rd=aphys(res); if a0<0||a0>4294967295 { ri64(rd,a0) } else { ri(rd,a0) }; sdef(res, rd) }
+        else if op==IR_FCONST {
+            // An f64 LITERAL, already rounded exactly once at parse time by
+            // fl_dexp2f64. a0 IS the IEEE-754 bit pattern, so this is the same
+            // 64-bit materialisation IR_CONST does -- the float-ness is carried
+            // by the opcode, which is why no side table is needed.
+            //
+            // This replaced an IR_CALL named "fconst" that rebuilt the value at
+            // RUN time with cvtsi2sd/divsd/mulsd. Every one of those rounds, and
+            // the errors compounded: 24 of 41 test literals came out 1-3 ULP
+            // wrong, and 1.0e308 came out one bit HIGH. That single corrupt
+            // constant is what made gguf_exp's overflow guard return a stack
+            // address instead of a float.
+            let rd=aphys(res); ri64(rd,a0); sdef(res, rd); w8(vfloat+res, 1)
+        }
         // IR_MOV propagates the float tag but NOT the string tag, so
         // `let x = lit()` dropped `x`'s stringness even though lit() returned a
         // string. Every `let s = <string expr>` then fell back to the integer
@@ -1163,7 +1308,7 @@ fn ci_func(fi, is_main) {
                 eb(102); eb(15); eb(47); eb(193)    // comisd xmm0, xmm1
                 let rz=ascratch(rd)
                 rzero(rz)
-                rsetc(2, rz)
+                rsetcf(0, rz)
                 if rd != rz { rr(rd, rz) }
                 sdef(res, rd)
             } else {
@@ -1195,7 +1340,7 @@ fn ci_func(fi, is_main) {
                 eb(102); eb(15); eb(47); eb(193)    // comisd xmm0, xmm1
                 let rz=ascratch(rd)
                 rzero(rz)
-                rsetc(3, rz)
+                rsetcf(1, rz)
                 if rd != rz { rr(rd, rz) }
                 sdef(res, rd)
             } else {
@@ -1227,7 +1372,7 @@ fn ci_func(fi, is_main) {
                 eb(102); eb(15); eb(47); eb(193)    // comisd xmm0, xmm1
                 let rz=ascratch(rd)
                 rzero(rz)
-                rsetc(4, rz)
+                rsetcf(2, rz)
                 if rd != rz { rr(rd, rz) }
                 sdef(res, rd)
             } else {
@@ -1259,7 +1404,7 @@ fn ci_func(fi, is_main) {
                 eb(102); eb(15); eb(47); eb(193)    // comisd xmm0, xmm1
                 let rz=ascratch(rd)
                 rzero(rz)
-                rsetc(5, rz)
+                rsetcf(3, rz)
                 if rd != rz { rr(rd, rz) }
                 sdef(res, rd)
             } else {

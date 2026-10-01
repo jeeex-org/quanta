@@ -280,6 +280,17 @@ let fn_parfn = mmap(2000000)
 // `let x: f64 = 1.0;` kept its tag from the fconst that produced it.
 let fn_retflt = mmap(2000000)
 
+// Per-TOKEN memo for ret_id_bound_float_d: bind_memo[t*8] = 0 unvisited,
+// 1 float, 2 not-float. The chain walk is exponential without it: each hop
+// branches over EVERY identifier in the bound expression, and scan_retfloat
+// runs for every function in every inlined import (std/gguf alone has ~200).
+// Unmemoised, compiling a file that imports std/gguf and std/fs stopped
+// responding past 400s. Keyed by token index because that is the stable
+// identity of the identifier being resolved within one compile.
+let bind_memo = mmap(2000000)
+
+
+
 // Per-fn flag: fn_retstr[fi*8] = 1 when the function is declared `-> string`.
 // A returned string comes back as the same [len][bytes] pointer, but the CALLER's
 // result vreg carried no vreg_is_str tag. `file_open` decides whether to skip the

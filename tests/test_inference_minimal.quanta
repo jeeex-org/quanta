@@ -1,9 +1,302 @@
+// Minimal inference path over the real production model.
+//
+// This test was written against an API that never existed:
+//   gguf_dequant_q4km(raw, n) -> pointer to an f32 buffer
+// lib/std/gguf.quanta instead exposes dequant_q4k(raw, nelements, out) writing
+// f64 (8-byte) values into a caller-supplied buffer. The old test also fed
+// gguf_softmax a 12-byte buffer for 3 f64 values, and asserted nothing -- it
+// printed "Expected: y[0]=17 y[1]=39" as a literal string rather than
+// comparing. Both are fixed here: the real API is called, and every result is
+// compared against an authoritative value with a non-zero exit on mismatch.
+//
+// Element width is f64 (8 bytes) throughout, matching gguf_softmax and
+// dequant_q4k. The Q4_K reference bits below are the true decoded values of
+// super-block 0 of blk.0.ffn_gate.weight in
+// QUANTA-LFM2.5-2.6Bv1-Q4_K_M.gguf, independently computed from the layout in
+// ggml-quants.c dequantize_row_q4_K / get_scale_min_k4.
+
 import std/fs
 import std/gguf
 
+// Raw bit patterns of the first 4 decoded f64 values of super-block 0.
+fn ref_bits(i) {
+    if i == 0 { return -4641242883846832128 }
+    if i == 1 { return -4642466949526192128 }
+    if i == 2 { return 4577794809451773952 }
+    if i == 3 { return -4660103562712317952 }
+    if i == 4 { return 4581425946602504192 }
+    if i == 5 { return -4660103562712317952 }
+    if i == 6 { return 4569126122339434496 }
+    if i == 7 { return 4575036134777683968 }
+    if i == 8 { return -4641242883846832128 }
+    if i == 9 { return 4581425946602504192 }
+    if i == 10 { return 4581425946602504192 }
+    if i == 11 { return -4646618945950842880 }
+    if i == 12 { return 4575036134777683968 }
+    if i == 13 { return -4660103562712317952 }
+    if i == 14 { return 4569126122339434496 }
+    if i == 15 { return -4650419339172773888 }
+    if i == 16 { return 4582650012281864192 }
+    if i == 17 { return -4650419339172773888 }
+    if i == 18 { return 4569126122339434496 }
+    if i == 19 { return -4646618945950842880 }
+    if i == 20 { return -4642466949526192128 }
+    if i == 21 { return -4646618945950842880 }
+    if i == 22 { return -4640018818167472128 }
+    if i == 23 { return -4641242883846832128 }
+    if i == 24 { return -4642466949526192128 }
+    if i == 25 { return 4569126122339434496 }
+    if i == 26 { return -4641242883846832128 }
+    if i == 27 { return -4646618945950842880 }
+    if i == 28 { return -4650419339172773888 }
+    if i == 29 { return -4638794752488112128 }
+    if i == 30 { return 4584881282151874560 }
+    if i == 31 { return 4575036134777683968 }
+    if i == 32 { return -4650331515681505280 }
+    if i == 33 { return 4573773208234229760 }
+    if i == 34 { return 4584992710783401984 }
+    if i == 35 { return 4581942579628605440 }
+    if i == 36 { return 4579219776521371648 }
+    if i == 37 { return -4644518603863883776 }
+    if i == 38 { return -4642738769416421376 }
+    if i == 39 { return -4640486488566398976 }
+    if i == 40 { return -4658185464677662720 }
+    if i == 41 { return -4646770884713906176 }
+    if i == 42 { return -4642738769416421376 }
+    if i == 43 { return -4640486488566398976 }
+    if i == 44 { return -4658185464677662720 }
+    if i == 45 { return -4644518603863883776 }
+    if i == 46 { return 4567383671287316480 }
+    if i == 47 { return -4658185464677662720 }
+    if i == 48 { return 4576967495671349248 }
+    if i == 49 { return -4658185464677662720 }
+    if i == 50 { return 4576967495671349248 }
+    if i == 51 { return 4567383671287316480 }
+    if i == 52 { return -4642738769416421376 }
+    if i == 53 { return 4573773208234229760 }
+    if i == 54 { return 4580816439203594240 }
+    if i == 55 { return 4580816439203594240 }
+    if i == 56 { return -4658185464677662720 }
+    if i == 57 { return -4642738769416421376 }
+    if i == 58 { return 4576967495671349248 }
+    if i == 59 { return 4579219776521371648 }
+    if i == 60 { return 4573773208234229760 }
+    if i == 61 { return -4658185464677662720 }
+    if i == 62 { return 4576967495671349248 }
+    if i == 63 { return -4641612628991410176 }
+    if i == 64 { return 4565586519531716608 }
+    if i == 65 { return 4575769818271055872 }
+    if i == 66 { return 4581588554064330752 }
+    if i == 67 { return -4642776444869541888 }
+    if i == 68 { return 4572259180722782208 }
+    if i == 69 { return 4565586519531716608 }
+    if i == 70 { return 4572259180722782208 }
+    if i == 71 { return 4565586519531716608 }
+    if i == 72 { return -4659179972944986112 }
+    if i == 73 { return 4580682745461604352 }
+    if i == 74 { return 4583400171269783552 }
+    if i == 75 { return 4583400171269783552 }
+    if i == 76 { return -4659179972944986112 }
+    if i == 77 { return 4565586519531716608 }
+    if i == 78 { return -4651461470037475328 }
+    if i == 79 { return -4659179972944986112 }
+    if i == 80 { return -4647838235626569728 }
+    if i == 81 { return -4645964908331008000 }
+    if i == 82 { return -4651461470037475328 }
+    if i == 83 { return 4572259180722782208 }
+    if i == 84 { return 4572259180722782208 }
+    if i == 85 { return 4575769818271055872 }
+    if i == 86 { return -4651461470037475328 }
+    if i == 87 { return 4572259180722782208 }
+    if i == 88 { return -4651461470037475328 }
+    if i == 89 { return -4645964908331008000 }
+    if i == 90 { return -4641870636266815488 }
+    if i == 91 { return -4659179972944986112 }
+    if i == 92 { return 4575769818271055872 }
+    if i == 93 { return -4645964908331008000 }
+    if i == 94 { return 4565586519531716608 }
+    if i == 95 { return -4644153291125555200 }
+    if i == 96 { return 4577163346180046848 }
+    if i == 97 { return -4655495234602401792 }
+    if i == 98 { return -4647064660476952576 }
+    if i == 99 { return 4579023926012674048 }
+    if i == 100 { return -4655495234602401792 }
+    if i == 101 { return -4647064660476952576 }
+    if i == 102 { return -4642347068399026176 }
+    if i == 103 { return -4647064660476952576 }
+    if i == 104 { return -4647064660476952576 }
+    if i == 105 { return 4574948311286415360 }
+    if i == 106 { return 4579023926012674048 }
+    if i == 107 { return 4559986981689360384 }
+    if i == 108 { return 4574948311286415360 }
+    if i == 109 { return -4647064660476952576 }
+    if i == 110 { return 4559986981689360384 }
+    if i == 111 { return -4647064660476952576 }
+    if i == 112 { return 4574948311286415360 }
+    if i == 113 { return -4645204080644325376 }
+    if i == 114 { return -4643343500811698176 }
+    if i == 115 { return 4571227151621160960 }
+    if i == 116 { return -4643343500811698176 }
+    if i == 117 { return -4642347068399026176 }
+    if i == 118 { return -4650135665172807680 }
+    if i == 119 { return -4650135665172807680 }
+    if i == 120 { return 4571227151621160960 }
+    if i == 121 { return -4645204080644325376 }
+    if i == 122 { return -4645204080644325376 }
+    if i == 123 { return -4642347068399026176 }
+    if i == 124 { return -4655495234602401792 }
+    if i == 125 { return 4581452953356861440 }
+    if i == 126 { return -4640486488566398976 }
+    if i == 127 { return 4579023926012674048 }
+    if i == 128 { return 4578166410022223872 }
+    if i == 129 { return -4651554241331068928 }
+    if i == 130 { return -4639225365909209088 }
+    if i == 131 { return -4647235359657164800 }
+    if i == 132 { return -4668825438699651072 }
+    if i == 133 { return 4580363199894781952 }
+    if i == 134 { return -4651554241331068928 }
+    if i == 135 { return 4582762368626327552 }
+    if i == 136 { return -4642824119006527488 }
+    if i == 137 { return 4582762368626327552 }
+    if i == 138 { return -4642824119006527488 }
+    if i == 139 { return -4647235359657164800 }
+    if i == 140 { return 4580363199894781952 }
+    if i == 141 { return 4571004225638629376 }
+    if i == 142 { return -4642824119006527488 }
+    if i == 143 { return 4578166410022223872 }
+    if i == 144 { return 4581562784260554752 }
+    if i == 145 { return 4581562784260554752 }
+    if i == 146 { return -4651554241331068928 }
+    if i == 147 { return 4580363199894781952 }
+    if i == 148 { return 4582762368626327552 }
+    if i == 149 { return -4641624534640754688 }
+    if i == 150 { return 4571004225638629376 }
+    if i == 151 { return 4583961952992100352 }
+    if i == 152 { return -4638366698867523584 }
+    if i == 153 { return 4582762368626327552 }
+    if i == 154 { return -4647235359657164800 }
+    if i == 155 { return 4571004225638629376 }
+    if i == 156 { return 4580363199894781952 }
+    if i == 157 { return 4581562784260554752 }
+    if i == 158 { return 4580363199894781952 }
+    if i == 159 { return 4571004225638629376 }
+    if i == 160 { return 4576760306448990208 }
+    if i == 161 { return -4639721898488365056 }
+    if i == 162 { return 4576760306448990208 }
+    if i == 163 { return -4645486517693710336 }
+    if i == 164 { return -4639721898488365056 }
+    if i == 165 { return -4649427510965043200 }
+    if i == 166 { return 4581545209254379520 }
+    if i == 167 { return -4661231111886602240 }
+    if i == 168 { return 4581545209254379520 }
+    if i == 169 { return 4576760306448990208 }
+    if i == 170 { return 4581545209254379520 }
+    if i == 171 { return 4576760306448990208 }
+    if i == 172 { return 4583087532010373120 }
+    if i == 173 { return -4641264221244358656 }
+    if i == 174 { return 4576760306448990208 }
+    if i == 175 { return 4576760306448990208 }
+    if i == 176 { return 4579844951960977408 }
+    if i == 177 { return 4576760306448990208 }
+    if i == 178 { return 4581545209254379520 }
+    if i == 179 { return -4641264221244358656 }
+    if i == 180 { return 4581545209254379520 }
+    if i == 181 { return -4649427510965043200 }
+    if i == 182 { return -4661231111886602240 }
+    if i == 183 { return 4585418299092762624 }
+    if i == 184 { return -4638443595961991168 }
+    if i == 185 { return 4586189460470759424 }
+    if i == 186 { return -4642806544000352256 }
+    if i == 187 { return -4661231111886602240 }
+    if i == 188 { return -4639721898488365056 }
+    if i == 189 { return -4645486517693710336 }
+    if i == 190 { return 4576760306448990208 }
+    if i == 191 { return -4661231111886602240 }
+    if i == 192 { return 4561794578805424128 }
+    if i == 193 { return -4646443195889090560 }
+    if i == 194 { return 4575905367438917632 }
+    if i == 195 { return -4641669116401287168 }
+    if i == 196 { return -4644337802920591360 }
+    if i == 197 { return -4642721812885536768 }
+    if i == 198 { return 4571942727532412928 }
+    if i == 199 { return -4644337802920591360 }
+    if i == 200 { return -4646443195889090560 }
+    if i == 201 { return -4646443195889090560 }
+    if i == 202 { return 4581191183690104832 }
+    if i == 203 { return -4654967881337929728 }
+    if i == 204 { return 4583296576658604032 }
+    if i == 205 { return -4644337802920591360 }
+    if i == 206 { return 4561794578805424128 }
+    if i == 207 { return 4571942727532412928 }
+    if i == 208 { return 4582243880174354432 }
+    if i == 209 { return -4649382362268827648 }
+    if i == 210 { return -4646443195889090560 }
+    if i == 211 { return -4654967881337929728 }
+    if i == 212 { return 4578010760407416832 }
+    if i == 213 { return 4580116153375916032 }
+    if i == 214 { return -4639563723432787968 }
+    if i == 215 { return -4644337802920591360 }
+    if i == 216 { return -4649382362268827648 }
+    if i == 217 { return 4571942727532412928 }
+    if i == 218 { return 4571942727532412928 }
+    if i == 219 { return -4654967881337929728 }
+    if i == 220 { return 4561794578805424128 }
+    if i == 221 { return -4649382362268827648 }
+    if i == 222 { return -4654967881337929728 }
+    if i == 223 { return 4582243880174354432 }
+    if i == 224 { return 4576647331629236224 }
+    if i == 225 { return -4650670440140767232 }
+    if i == 226 { return -4639102340865982464 }
+    if i == 227 { return 4579487164005351424 }
+    if i == 228 { return 4571957777097818112 }
+    if i == 229 { return -4668785856281051136 }
+    if i == 230 { return 4581243908708630528 }
+    if i == 231 { return -4643512963041329152 }
+    if i == 232 { return -4641942173242097664 }
+    if i == 233 { return -4650670440140767232 }
+    if i == 234 { return 4576647331629236224 }
+    if i == 235 { return -4668785856281051136 }
+    if i == 236 { return 4576647331629236224 }
+    if i == 237 { return 4579487164005351424 }
+    if i == 238 { return 4585793997062012928 }
+    if i == 239 { return 4571957777097818112 }
+    if i == 240 { return -4650670440140767232 }
+    if i == 241 { return 4571957777097818112 }
+    if i == 242 { return 4581243908708630528 }
+    if i == 243 { return -4641942173242097664 }
+    if i == 244 { return -4640522257054040064 }
+    if i == 245 { return 4576647331629236224 }
+    if i == 246 { return -4641942173242097664 }
+    if i == 247 { return -4643512963041329152 }
+    if i == 248 { return 4576647331629236224 }
+    if i == 249 { return 4584083741084745728 }
+    if i == 250 { return -4646352795417444352 }
+    if i == 251 { return -4643512963041329152 }
+    if i == 252 { return -4646352795417444352 }
+    if i == 253 { return 4576647331629236224 }
+    if i == 254 { return 4571957777097818112 }
+    if i == 255 { return 4581243908708630528 }
+    return 0
+}
+
+fn check(name: str, ok) {
+    if ok {
+        print("ok   ")
+        print(name)
+        print("\n")
+        return 0
+    }
+    print("FAIL ")
+    print(name)
+    print("\n")
+    return 1
+}
+
 fn main() {
-    print("=== GGUF Inference Test ===\n")
-    
+    let bad = 0
+
+    print("=== GGUF inference path: real model ===\n")
+
     let rc = gguf_load("/opt/ai/models/quanta/QUANTA-LFM2.5-2.6Bv1-Q4_K_M.gguf")
     if rc != 0 {
         print("load failed: rc=")
@@ -11,92 +304,118 @@ fn main() {
         print("\n")
         return 1
     }
-    print("Model loaded. n_tensors: ")
-    print(gguf_num_tensors())
+    let n_tensors = gguf_num_tensors()
+    print("n_tensors: ")
+    print(n_tensors)
     print("\n")
-    
-    // Find a Q4_K tensor (type=12)
+    bad = bad + check("n_tensors == 266", n_tensors == 266)
+
+    // ---- Q4_K tensor metadata -------------------------------------------
     let idx = gguf_find_tensor("blk.0.ffn_gate.weight")
     if idx < 0 {
         print("tensor not found\n")
         return 1
     }
-    print("found tensor at idx ")
-    print(idx)
-    print("\n")
-    
     let dtype = gguf_tensor_dtype(idx)
-    print("dtype=")
+    print("idx=")
+    print(idx)
+    print(" dtype=")
     print(dtype)
     print("\n")
-    
+    bad = bad + check("dtype is Q4_K (12)", dtype == 12)
+
     let nelements = gguf_tensor_nelements(idx)
-    print("nelements: ")
-    print(nelements)
-    print("\n")
-    
-    // Read raw data
+    bad = bad + check("nelements == 22020096", nelements == 22020096)
+
+    // nbytes must be the PACKED size: 144 bytes per 256-value super-block.
+    let nbytes = gguf_tensor_nbytes(idx)
+    let want_bytes = (nelements / 256) * 144
+    bad = bad + check("nbytes is packed Q4_K size", nbytes == want_bytes)
+
+    // ---- Q4_K dequantisation --------------------------------------------
     let raw = gguf_read_tensor(idx)
     if raw == 0 {
         print("read failed\n")
         return 1
     }
-    
-    // Dequantize first 256 values (one block)
-    let test_nelements = 256
-    let dequant = gguf_dequant_q4km(raw, test_nelements)
-    
-    // Print first 8 dequantized values
-    print("Dequantized values (first 8): ")
+    let out = mem_alloc(256 * 8)
+    dequant_q4k(raw, 256, out)
+
     let i = 0
-    while i < 8 {
-        print(mem_load(dequant + i * 4))
-        print(" ")
+    let dq_bad = 0
+    while i < 256 {
+        let got = f64bits(mem_load(out + i * 8))
+        if got != ref_bits(i) {
+            dq_bad = dq_bad + 1
+        }
         i = i + 1
     }
-    print("\n")
-    
-    // Test matvec: simple 2x2 matrix
-    let A = mem_alloc(16)
-    mem_store(A, 1)
-    mem_store(A + 4, 2)
-    mem_store(A + 8, 3)
-    mem_store(A + 12, 4)
-    
-    let x = mem_alloc(8)
-    mem_store(x, 5)
-    mem_store(x + 4, 6)
-    
-    let y = mem_alloc(8)
+    bad = bad + check("Q4_K block 0: 256/256 values bit-exact", dq_bad == 0)
+
+    // ---- matvec (f64, row-major, y = A * x) ------------------------------
+    // A = [[1,2],[3,4]] as f64 => 4 slots of 8 bytes.
+    let A = mem_alloc(32)
+    mem_store(A, 1.0)
+    mem_store(A + 8, 2.0)
+    mem_store(A + 16, 3.0)
+    mem_store(A + 24, 4.0)
+
+    let x = mem_alloc(16)
+    mem_store(x, 5.0)
+    mem_store(x + 8, 6.0)
+
+    let y = mem_alloc(16)
     gguf_matvec(A, x, 2, 2, y)
-    
-    // y[0] = 1*5 + 2*6 = 17
-    // y[1] = 3*5 + 4*6 = 39
-    print("matvec result: y[0]=")
-    print(mem_load(y))
+
+    let y0 = mem_load(y)
+    let y1 = mem_load(y + 8)
+    print("matvec y[0]=")
+    print(f64of(y0))
     print(" y[1]=")
-    print(mem_load(y + 4))
+    print(f64of(y1))
     print("\n")
-    print("Expected: y[0]=17 y[1]=39\n")
-    
-    // Test softmax
-    let inp = mem_alloc(12)
-    mem_store(inp, 1)
-    mem_store(inp + 4, 2)
-    mem_store(inp + 8, 3)
-    
-    let out = mem_alloc(12)
-    gguf_softmax(out, inp, 3)
-    
-    print("softmax result: ")
-    print(mem_load(out))
+    bad = bad + check("matvec y[0] == 17.0", f64bits(y0) == 4625478292286210048)
+    bad = bad + check("matvec y[1] == 39.0", f64bits(y1) == 4630685579355357184)
+
+    // ---- softmax (f64) ---------------------------------------------------
+    // 3 f64 values need 24 bytes, not the 12 the old test allocated.
+    let inp = mem_alloc(24)
+    mem_store(inp, 1.0)
+    mem_store(inp + 8, 2.0)
+    mem_store(inp + 16, 3.0)
+
+    let sout = mem_alloc(24)
+    gguf_softmax(sout, inp, 3)
+
+    let s0 = f64of(mem_load(sout))
+    let s1 = f64of(mem_load(sout + 8))
+    let s2 = f64of(mem_load(sout + 16))
+    print("softmax: ")
+    print(s0)
     print(" ")
-    print(mem_load(out + 4))
+    print(s1)
     print(" ")
-    print(mem_load(out + 8))
+    print(s2)
     print("\n")
-    
+
+    // softmax must sum to 1 and be monotonically ordered.
+    let sum = s0 + s1 + s2
+    let sum_err = sum - 1.0
+    if sum_err < 0.0 { sum_err = 0.0 - sum_err }
+    print("softmax sum: ")
+    print(sum)
+    print("\n")
+    bad = bad + check("softmax sums to 1", sum_err < 1.0e-12)
+    bad = bad + check("softmax is descending", s0 < s1 && s1 < s2)
+
     gguf_close()
-    print("Done\n")
+
+    if bad != 0 {
+        print("FAILED checks: ")
+        print(bad)
+        print("\n")
+        return 1
+    }
+    print("PASS: inference path (Q4_K dequant, matvec, softmax)\n")
     return 0
 }

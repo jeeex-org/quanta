@@ -65,8 +65,39 @@ fn rshr(d,s) { if s!=1 { rr(1,s) }; eb(72); eb(211); mr(3,5,d%8) }
 let SETCC_OP = mmap(8)
 fn setcc_init() {
     w8(SETCC_OP+0, 148) ; w8(SETCC_OP+1, 149) ; w8(SETCC_OP+2, 156) ; w8(SETCC_OP+3, 159)
-    w8(SETCC_OP+4, 158) ; w8(SETCC_OP+5, 157) ; w8(SETCC_OP+6, 187) ; w8(SETCC_OP+7, 186)
+    w8(SETCC_OP+4, 158) ; w8(SETCC_OP+5, 157) ; w8(SETCC_OP+6, 155) ; w8(SETCC_OP+7, 154)
 }
+
+// SETCC_FLT: setcc codes that are CORRECT after comisd.
+//
+// COMISD sets CF/ZF/PF and, unlike the integer CMP, it does NOT define SF or
+// OF. The signed forms setl/setg/setle/setge all test SF and OF, so after a
+// float compare they read undefined flags. They must never be used on a float
+// compare; the CF-based forms are the correct ones and behave identically for
+// ordered inputs:
+//
+//     a < b   ->  CF=1  ->  setb  (0x92 = 146)
+//     a > b   ->  CF=0  ->  seta  (0x97 = 151)
+//     a <= b  ->  setbe (0x96 = 150)
+//     a >= b  ->  setae (0x93 = 147)
+//
+// Equality (sete/setne) reads ZF and was already correct, which is why
+// `0.1 == 0.1` worked while every ordering compare was silently wrong:
+//
+//     if 0.0 > 709.0 { A } else { B }   ran A     (SF and OF both 0 -> setg)
+//     if 0.0 < 0.5   { A } else { B }   ran B     (SF == OF -> setl false)
+//
+// That is why gguf_exp's `if x > 709.0` overflow guard fired for every input
+// and every softmax in the tree collapsed.
+let SETCC_FLT = mmap(8)
+fn setcc_flt_init() {
+    w8(SETCC_FLT+0, 146) ; w8(SETCC_FLT+1, 151) ; w8(SETCC_FLT+2, 150) ; w8(SETCC_FLT+3, 147)
+}
+fn rsetcf(idx,r) {
+    let c=r8(SETCC_FLT+idx)
+    if r<4 { eb(15); eb(c); mr(3,0,r) } else if r<8 { eb(64); eb(15); eb(c); mr(3,0,r%8) } else { eb(65); eb(15); eb(c); mr(3,0,r%8) }
+}
+fn rsetcfz(idx,r) { rzero(r); rsetcf(idx,r) }
 fn rsetc(cc,r) {
     let c=r8(SETCC_OP+cc)
     if r<4 { eb(15); eb(c); mr(3,0,r) } else if r<8 { eb(64); eb(15); eb(c); mr(3,0,r%8) } else { eb(65); eb(15); eb(c); mr(3,0,r%8) }
@@ -1053,6 +1084,55 @@ fn emit_bltn(nmi,nl,ii) {
         flush_all()
         eb(72); eb(139); eb(7)                  // mov rax, [rdi]
         w8(vfloat+irres(ii), 1)                // the result IS an f64 bit pattern
+        return 1
+    }
+    if nl==7&&r8(nm)=='f'&&r8(nm+1)=='6'&&r8(nm+2)=='4'&&r8(nm+3)=='b'&&r8(nm+4)=='i'&&r8(nm+5)=='t'&&r8(nm+6)=='s' {  // f64bits(x): f64 -> raw u64 bit pattern
+        // Without this there is NO way to validate a float in Quanta: print_f()
+        // cannot represent Inf/NaN/subnormals faithfully and f2i() saturates,
+        // so a test could never assert the exact bits of a converted value --
+        // which is what the IEEE-754 conversion tests must do.
+        //
+        // The RESULT IS AN INTEGER, deliberately NOT tagged vfloat. The point is
+        // to get the bit pattern out as an integer; tagging it float makes the
+        // caller print the pattern back as the float it encodes, which is a
+        // silent no-op rather than a wrong number.
+        //
+        // This is a single-argument builtin, so codegen's IR_CALL marshalling has
+        // already put the argument in %rdi -- exactly where f2i and the other
+        // single-arg builtins read it from. The conversion is the identity (the
+        // argument IS the bit pattern), so all that is needed is rax <- rdi.
+        //
+        // Read the MARSHALLED register, not aphys(av) of the argument vreg. An
+        // earlier version resolved the vreg and moved aphys(av) -> aphys(res),
+        // which took a register from the allocator without asking it: the
+        // register was still marked live, so a later spill wrote through it and
+        // arguments that followed picked up a STALE value from an earlier
+        // statement. In test_f32_conv that surfaced as a `want` argument
+        // arriving as a different literal entirely:
+        //     check("-maxf32 (0xFF7FFFFF)", p, -4039728866288205824)
+        //     -> want printed as -5183643170566569984   (+maxf32's constant)
+        // NO flush_all(): it would spill live vregs into the argument register,
+        // destroying the argument -- which here is the whole answer.
+        rr(0, 7)                                 // mov rax, rdi
+        sdef(irres(ii), 0)
+        w8(vfloat+irres(ii), 0)
+        return 1
+    }
+    if nl==5&&r8(nm)=='f'&&r8(nm+1)=='6'&&r8(nm+2)=='4'&&r8(nm+3)=='o'&&r8(nm+4)=='f' {  // f64of(x): raw u64 bit pattern -> f64
+        // The inverse of f64bits(). Lets a test build a float from a known
+        // pattern (Inf, NaN, -0.0, a subnormal) to hand to a converter, which is
+        // the only way to test the special-value branches at all.
+        //
+        // MOVQ xmm, r64 is 66 REX.W 0F 7E /r -- note 0F 7E, NOT 0F 2A. 0F 2A is
+        // CVTSI2SD, which reinterprets the bits as an integer; an earlier version
+        // used it here and every f64of produced a small integer's value instead
+        // of the requested bit pattern.
+        //
+        // Also reads the marshalled %rdi, for the same reason f64bits does.
+        fld_x(7, 0)                              // movq xmm0, rdi
+        fst_x(0, 0)                              // movq rax, xmm0
+        sdef(irres(ii), 0)
+        w8(vfloat+irres(ii), 1)
         return 1
     }
     if nl==4&&r8(nm)=='f'&&r8(nm+1)=='a'&&r8(nm+2)=='d'&&r8(nm+3)=='d' {  // fadd(a,b): int or float args -> int

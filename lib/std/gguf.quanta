@@ -211,21 +211,58 @@ fn gguf_type_size(dtype) {
     return 0
 }
 
-// Byte size of a quantised tensor, per the GGUF block layouts.
+// Byte size of a quantised tensor, from the GGML block layouts.
+//
+// Every quantised type is (elements_per_block, bytes_per_block); the size is
+// (nelements / elems_per_block) * bytes_per_block. This used to return the
+// ELEMENT COUNT for the k-quants, so Q4_K (dtype 12) reported 22020096 for
+// blk.0.ffn_gate.weight instead of 12386304 -- a tensor then read as f32 would
+// run 1.8x past the end of its own storage.
+//
+//   type                      elems  bytes
+//   F32   (0)  /  I32  (12 n/a)    1      4
+//   F16   (1)  /  I16   (2)        1      2
+//   Q4_0  (2)  / Q4_1  (3)         32    18 / 20
+//   Q5_0  (6)  / Q5_1  (7)         32    22 / 24
+//   Q8_0  (8)  / Q8_1  (9)         32    34 / 36
+//   Q2_K  (10) / Q3_K  (11)       256    84 / 110
+//   Q4_K  (12) / Q5_K  (13)       256   144 / 176
+//   Q6_K  (14) / Q8_K  (15)       256   210 / 292
+//   IQ2_XXS(16) / IQ2_XS (17)      256    66 / 74
+//   IQ3_XXS(18) / IQ1_S   (19)     256    98 / 50
+//   IQ4_NL  (20) / IQ3_S  (21)     256   110 / 82
+//   IQ2_S   (22) / IQ4_XS (23)     256   136 / 186
+//   I8 (24) I16 (25) I32 (26) I64 (27) F64 (28)   1  1 / 2 / 4 / 8 / 8
+//   IQ1_M   (29) / IQ4_NL_4_4 (30)  256   54 / 56
 fn gguf_tensor_nbytes(idx) {
     let dtype = gguf_tensor_dtype(idx)
     let n = gguf_tensor_nelements(idx)
-    if dtype == 12 || dtype == 11 { return n }
-    if dtype == 10 { return n }
-    if dtype == 14 || dtype == 15 { return (n / 256) * 210 + n / 256 * 20 }
-    if dtype == 16 || dtype == 17 { return (n / 256) * 84 + n / 64 * 18 + n / 256 * 128 }
-    if dtype == 18 { return (n / 256) * 292 + n / 64 * 18 + n / 256 * 128 + n / 256 * 2 }
-    if dtype == 20 { return (n / 256) * 84 + n / 64 * 18 + n / 256 * 128 }
-    if dtype == 2 || dtype == 3 { return n * 2 }
-    if dtype == 4 || dtype == 5 || dtype == 6 { return n * 4 }
-    if dtype == 7 { return n }
-    if dtype == 13 { return n * 4 }
-    if dtype == 1 { return n }
+    if dtype == 0 || dtype == 26 { return n * 4 }
+    if dtype == 1 || dtype == 25 { return n * 2 }
+    if dtype == 24 { return n }
+    if dtype == 27 || dtype == 28 { return n * 8 }
+    if dtype == 2 { return (n / 32) * 18 }
+    if dtype == 3 { return (n / 32) * 20 }
+    if dtype == 6 { return (n / 32) * 22 }
+    if dtype == 7 { return (n / 32) * 24 }
+    if dtype == 8 { return (n / 32) * 34 }
+    if dtype == 9 { return (n / 32) * 36 }
+    if dtype == 10 { return (n / 256) * 84 }
+    if dtype == 11 { return (n / 256) * 110 }
+    if dtype == 12 { return (n / 256) * 144 }
+    if dtype == 13 { return (n / 256) * 176 }
+    if dtype == 14 { return (n / 256) * 210 }
+    if dtype == 15 { return (n / 256) * 292 }
+    if dtype == 16 { return (n / 256) * 66 }
+    if dtype == 17 { return (n / 256) * 74 }
+    if dtype == 18 { return (n / 256) * 98 }
+    if dtype == 19 { return (n / 256) * 50 }
+    if dtype == 20 { return (n / 256) * 110 }
+    if dtype == 21 { return (n / 256) * 82 }
+    if dtype == 22 { return (n / 256) * 136 }
+    if dtype == 23 { return (n / 256) * 186 }
+    if dtype == 29 { return (n / 256) * 54 }
+    if dtype == 30 { return (n / 256) * 56 }
     return n
 }
 
@@ -296,28 +333,70 @@ fn f32_to_f64(ptr) {
     let b2 = mem_load8(ptr + 2)
     let b3 = mem_load8(ptr + 3)
     
+    // f32 layout: sign = b3 bit 7; exp = b3 bits 0-6 | b2 bit 7;
+    // mant = b2 bits 0-6 | b1 | b0.
     let sign = i2f(b3 / 128)
     let exp32 = i2f(b3 - (b3 / 128) * 128) * i2f(2) + i2f(b2 / 128)
     let mant32 = i2f(b2 - (b2 / 128) * 128) * i2f(65536) + i2f(b1) * i2f(256) + i2f(b0)
     
-    if exp32 == i2f(0) { return i2f(0) }
-    if exp32 == i2f(255) { return i2f(0) }
+    let two = i2f(2)
+    let one = i2f(1)
+    let zero = i2f(0)
+    
+    if exp32 == zero {
+        // exp == 0: signed zero, or a subnormal. This used to return 0 for
+        // both, which silently discarded every subnormal weight. A subnormal
+        // f32 has value mant32 * 2^-149, exactly representable in f64.
+        if mant32 == zero {
+            // Signed zero. This returned `fsub(zero, zero)`, but that is
+            // +0.0 - +0.0 = +0.0 under round-to-nearest -- so every -0.0f32
+            // weight came back as +0.0 and the sign bit was simply lost.
+            // Negating the ZERO VARIABLE is what produces -0.0: 0.0 * -1.0 is
+            // -0.0 exactly, because the sign is applied to the zero itself.
+            if sign == one { return fmul(zero, i2f(0-1)) }
+            return zero
+        }
+        let sub = one
+        let si = 0
+        while si < 149 { sub = fdiv(sub, two); si = si + 1 }
+        let subv = fmul(mant32, sub)
+        if sign == one { return fsub(zero, subv) }
+        return subv
+    }
+    
+    if exp32 == i2f(255) {
+        // exp == 255: Inf when mant == 0, NaN otherwise. This used to return 0
+        // for both, so an Inf or NaN weight became a zero weight.
+        // 2^1023 is the largest finite f64, so one more doubling overflows to
+        // exactly +Inf. Keep the loop to 1023 iterations -- a 1024-iteration
+        // one kept doubling a value that was already Inf.
+        let pinf = one
+        let pi = 0
+        while pi < 1023 { pinf = fmul(pinf, two); pi = pi + 1 }
+        pinf = fmul(pinf, two)
+        if mant32 != zero {
+            // NaN: Inf - Inf is the canonical quiet NaN.
+            return fsub(pinf, pinf)
+        }
+        if sign == one { return fsub(zero, pinf) }
+        return pinf
+    }
     
     let new_exp = f2i(exp32 - i2f(127))
     let mant_frac = fdiv(mant32, i2f(8388608))
-    let one_plus_mant = fadd(i2f(1), mant_frac)
+    let one_plus_mant = fadd(one, mant_frac)
     
-    let pow2 = i2f(1)
+    let pow2 = one
     let i = 0
     if new_exp >= 0 {
-        while i < new_exp { pow2 = fmul(pow2, i2f(2)); i = i + 1 }
+        while i < new_exp { pow2 = fmul(pow2, two); i = i + 1 }
     } else {
         let neg = 0 - new_exp
-        while i < neg { pow2 = fdiv(pow2, i2f(2)); i = i + 1 }
+        while i < neg { pow2 = fdiv(pow2, two); i = i + 1 }
     }
     
     let result = fmul(pow2, one_plus_mant)
-    if sign == i2f(1) { result = fsub(i2f(0), result) }
+    if sign == one { result = fsub(zero, result) }
     return result
 }
 
@@ -349,24 +428,95 @@ fn dequant_q6k(raw, nelements, out) {
     }
 }
 
+// --------------------------------------------------------------- Q4_K (type 12)
+//
+// Q4_K super-block: 144 bytes -> 256 f32 weights.
+//   +0  f16 d      super-block scale for the 6-bit sub-scales
+//   +2  f16 dmin   super-block scale for the 6-bit sub-mins
+//   +4  u8 scales[12]  eight (scale, min) pairs, each 6 bits, bit-packed
+//   +16 u8 qs[128]     4-bit quants, low nibble = even element, high = odd
+//
+// The previous body of this function was NOT Q4_K: it read a 2-byte scale at +0
+// and treated the quants as starting at +8, which is Q4_0's layout. It compiled
+// and ran, so it silently produced garbage weights for every Q4_K tensor -- worse
+// than failing to build. Layout and arithmetic transcribed from
+// ggml-quants.c: dequantize_row_q4_K() + get_scale_min_k4(), and checked value
+// for value against the real QUANTA-LFM2.5 Q4_K_M tensor
+// (blk.0.ffn_gate.weight, file offset 8239136 + 233119744).
+
+// 6-bit (scale, min) pair for sub-block index `j`, read from the 12-byte packed
+// scale table at `sc`. This mirrors get_scale_min_k4() from ggml-quants.c
+// exactly, and both halves MUST be read from the same 12-byte table with the
+// same index j:
+//
+//     j < 4 : sc[j]   & 63          -> scale
+//             sc[j+4] & 63          -> min
+//     j >= 4: sc[j+4] & 0xF          scale low nibble
+//             (sc[j-4] >> 6) << 4    scale high bits   <- j-4, not j
+//             sc[j+4] >> 4           min low nibble
+//             (sc[j]   >> 6) << 4    min high bits      <- j, not j-4
+//
+// Two bugs lived here and both produced ~1e20 outputs. Passing `sc` and `sc+4`
+// as two different bases (to read the scale half and the min half) ran off the
+// end of the 12-byte table once j reached 4. And deriving both high halves from
+// `sc[j-4]` mis-paired the scale and min of every sub-block from 4 upward.
+fn q4k_sc(j, sc) {
+    if j < 4 { return mem_load8(sc + j) - (mem_load8(sc + j) / 64) * 64 }
+    let lo = mem_load8(sc + j + 4)
+    return (lo - (lo / 16) * 16) + ((mem_load8(sc + j - 4) / 64) * 16)
+}
+
+fn q4k_min(j, sc) {
+    if j < 4 { return mem_load8(sc + j + 4) - (mem_load8(sc + j + 4) / 64) * 64 }
+    let lo = mem_load8(sc + j + 4)
+    return (lo / 16 - (lo / 16 / 16) * 16) + ((mem_load8(sc + j) / 64) * 16)
+}
+
 fn dequant_q4k(raw, nelements, out) {
     let n_blocks = nelements / 256
     let bi = 0
     while bi < n_blocks {
         let bo = bi * 144
-        let scale = i2f(mem_load8(raw + bo) + mem_load8(raw + bo + 1) * 256)
-        
-        let vi = 0
-        while vi < 256 {
-            let byte_val = mem_load8(raw + bo + 8 + vi / 2)
-            let nibble = 0
-            if vi - (vi / 2) * 2 == 0 { nibble = byte_val / 16 }
-            else { nibble = byte_val - (byte_val / 16) * 16 }
-            mem_store(out + (bi * 256 + vi) * 8, fdiv(fmul(scale, i2f(nibble)), i2f(15)))
-            vi = vi + 1
+        let d    = f16_to_f64(raw + bo)
+        let dmin = f16_to_f64(raw + bo + 2)
+        let sc   = raw + bo + 4
+        let q    = raw + bo + 16
+
+        // Four 64-element chunks, each pairing two 32-element sub-blocks that
+        // share a 32-byte span of quants: low nibbles first, then high nibbles.
+        let chunk = 0
+        let is = 0
+        while chunk < 4 {
+            let s0 = q4k_sc(is, sc)
+            let m0 = q4k_min(is, sc)
+            let s1 = q4k_sc(is + 1, sc)
+            let m1 = q4k_min(is + 1, sc)
+            let d1 = fmul(d, i2f(s0))
+            let mm1 = fmul(dmin, i2f(m0))
+            let d2 = fmul(d, i2f(s1))
+            let mm2 = fmul(dmin, i2f(m1))
+
+            let l = 0
+            while l < 32 {
+                let b = mem_load8(q + l)
+                mem_store(out + (bi * 256 + chunk * 64 + l) * 8,
+                          fsub(fmul(d1, i2f(b - (b / 16) * 16)), mm1))
+                l = l + 1
+            }
+            l = 0
+            while l < 32 {
+                let b = mem_load8(q + l)
+                mem_store(out + (bi * 256 + chunk * 64 + 32 + l) * 8,
+                          fsub(fmul(d2, i2f(b / 16)), mm2))
+                l = l + 1
+            }
+            q = q + 32
+            is = is + 2
+            chunk = chunk + 1
         }
         bi = bi + 1
     }
+    return 0
 }
 
 fn rms_norm(out, x, w, n) {
@@ -539,14 +689,19 @@ fn gguf_read_tensor(idx) {
 // x holds `cols` values, y receives `rows` results. This is the plain
 // reference matvec used to check dequantised tensor data; the quantised
 // kernels in the inference path are separate.
-fn gguf_matvec(A, x, rows, cols, y) {
+fn gguf_matvec(A: u64, x: u64, rows: i64, cols: i64, y: u64) {
     let r = 0
     while r < rows {
-        let acc = 0.0
+        // `acc` MUST be a typed float. mem_load() returns a raw 64-bit integer
+        // bit pattern, so an untyped `acc` made `acc + a * xv` an integer
+        // multiply: the compiler emitted `imul` + the signed-overflow trap
+        // (`jno`/`ud2`), and the multiply then overflowed on ordinary index
+        // arithmetic -> SIGILL (exit 132) instead of a result.
+        let acc: f64 = 0.0
         let c = 0
         while c < cols {
-            let a = mem_load(A + (r * cols + c) * 8)
-            let xv = mem_load(x + c * 8)
+            let a = f64of(mem_load(A + (r * cols + c) * 8))
+            let xv = f64of(mem_load(x + c * 8))
             acc = acc + a * xv
             c = c + 1
         }
@@ -559,28 +714,27 @@ fn gguf_matvec(A, x, rows, cols, y) {
 // exp(x) for f64. There is no native `exp` builtin, so this is range
 // reduced: exp(x) = 2^k * exp(r) with k = round(x / ln2) and |r| <= ln2/2,
 // leaving a series that converges to full f64 precision in a few terms.
-fn gguf_exp(x) {
+fn gguf_exp(x: f64) -> f64 {
     if x < -745.0 { return 0.0 }
     if x > 709.0 { return 1.0e308 }
-    let ln2 = 0.6931471805599453
-    let k = 0.0
+    let ln2: f64 = 0.6931471805599453
+    let k: f64 = 0.0
     if x >= 0.0 { k = floor(x / ln2 + 0.5) }
     if x < 0.0 { k = -floor(-x / ln2 + 0.5) }
-    let r = x - k * ln2
+    let r: f64 = x - k * ln2
     // Taylor series for e^r; |r| <= ln2/2 so 20 terms overshoots f64 precision.
-    let term = 1.0
-    let acc = 1.0
+    let term: f64 = 1.0
+    let acc: f64 = 1.0
     let i = 1
     while i <= 20 {
-        term = term * r / i
+        term = term * r / i2f(i)
         acc = acc + term
         i = i + 1
     }
     // 2^k by repeated squaring on the integer part.
-    let ki = 0
-    if k >= 0.0 { ki = k }
-    let p = 1.0
-    let b = 2.0
+    let ki = f2i(k)
+    let p: f64 = 1.0
+    let b: f64 = 2.0
     let n = ki
     while n > 0 {
         let half = n / 2
@@ -593,26 +747,31 @@ fn gguf_exp(x) {
 }
 
 // Softmax: out[i] = exp(inp[i] - max) / sum, over `n` f64 values.
-fn gguf_softmax(out, inp, n) {
+//
+// Every float local and every mem_load() result must be converted with f64of():
+// mem_load() yields a raw 64-bit INTEGER bit pattern, so an untyped `mx` made
+// `x > mx` an integer compare and `gguf_exp(inp[i] - mx)` an integer subtract.
+// The result was all zeros.
+fn gguf_softmax(out: u64, inp: u64, n: i64) {
     if n <= 0 { return 0 }
-    let mx = mem_load(inp)
+    let mx: f64 = f64of(mem_load(inp))
     let i = 1
     while i < n {
-        let x = mem_load(inp + i * 8)
+        let x = f64of(mem_load(inp + i * 8))
         if x > mx { mx = x }
         i = i + 1
     }
-    let sum = 0.0
+    let sum: f64 = 0.0
     i = 0
     while i < n {
-        let e = gguf_exp(mem_load(inp + i * 8) - mx)
+        let e = gguf_exp(f64of(mem_load(inp + i * 8)) - mx)
         mem_store(out + i * 8, e)
         sum = sum + e
         i = i + 1
     }
     i = 0
     while i < n {
-        mem_store(out + i * 8, mem_load(out + i * 8) / sum)
+        mem_store(out + i * 8, f64of(mem_load(out + i * 8)) / sum)
         i = i + 1
     }
     return 0

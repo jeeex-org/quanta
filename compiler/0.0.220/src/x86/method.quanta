@@ -489,24 +489,43 @@ fn parse_primary() {
         // which is precisely the value the compiler emitted for that literal.
         // Because ln2 appears as a literal in lib/std/gguf.quanta's gguf_exp,
         // the corruption propagated into every softmax in the tree.
-        let scale = 1
-        let k = frac_digits
-        while k > 0 {
-            if scale <= 922337203685477580 { scale = scale * 10 } else { scale = 9223372036854775807; k = 0 }
-            k = k - 1
-        }
-        // Emit fconst(M, scale, exp10) -> IEEE-754 bits of (M/scale)*10^exp10,
-        // tagged float.
-        let cnm = srclen
-        w8(src+cnm, 102); w8(src+cnm+1, 99); w8(src+cnm+2, 111); w8(src+cnm+3, 110); w8(src+cnm+4, 115); w8(src+cnm+5, 116); w8(src+cnm+6, 0)  // "fconst\0"
-        srclen = cnm + 7
-        let cavs = irc
-        let cm = nv(); iremit(IR_CONST, cm, M, 0, 0)
-        let cs = nv(); iremit(IR_CONST, cs, scale, 0, 0)
-        let ce = nv(); iremit(IR_CONST, ce, exp10, 0, 0)
+        //
+        // `scale` is no longer built or used. The literal's exact value is
+        // (M / 10^frac_digits) * 10^exp10 == M * 10^(exp10 - frac_digits), which
+        // is EXACTLY the (M, fd, fe) triple fl_dexp2f64 takes, so the saturated
+        // power of ten was never needed for the value at all -- only for the old
+        // runtime division, which is what this replaces.
+        //
+        // Emit the IEEE-754 bit pattern as a CONSTANT, computed at PARSE time.
+        // That is the whole point: the literal is rounded exactly once,
+        // correctly, instead of being rebuilt out of cvtsi2sd/divsd/mulsd at
+        // run time where every step rounds and 24 of 41 test literals came out
+        // 1-3 ULP wrong (1.0e308 came out one bit HIGH). That one corrupt
+        // constant is what made gguf_exp's overflow guard hand back a stack
+        // address instead of a float.
+        //
+        // vlit records that this constant is a LITERAL. vfloat cannot: aclr()
+        // zeroes vfloat for every vreg after parsing, so the tag has to be
+        // re-established by codegen.quanta's float re-mark pass -- and that pass
+        // needs to know which constants are literals, which is exactly vlit.
+        //
+        // The opcode is IR_FCONST, not IR_CONST. A literal is a float, and the
+        // opcode is how the emitter knows that without consulting any table:
+        // aclr() clears vfloat for every vreg after parsing, so the re-mark pass
+        // has to re-derive it, and a side table keyed by vreg or by record index
+        // is wrong here. vreg numbers are reused across functions and record
+        // indices are reused because irc is reset between compilation units --
+        // either way a literal's mark lands on some other function's ordinary
+        // integer constant, which then gets tagged float.
+        //
+        // Observed exactly that: scan_metadata()'s `meta_size` accumulated
+        // correctly and came back as a float (4630263366890291200, not 8222757),
+        // and gguf_load() then segfaulted on every run.
+        //
+        // The record says what it is. That cannot go stale.
         let cr = nv()
-        iremit(IR_CALL, cr, cnm, 3, cavs)
-        w64(vfloat + cr*8, 1)   // fconst result is a float vreg
+        iremit(IR_FCONST, cr, fl_dexp2f64(M, frac_digits, exp10), 0, 0)
+        w8(vfloat + cr, 1)   // an f64 bit pattern IS a float vreg
         return cr
     }
     if peek()==TT_STR {
