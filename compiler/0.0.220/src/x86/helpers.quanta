@@ -24,11 +24,14 @@ fn tokln(i) { return r64(toks + i*TKS + 32) }
 // page -> SIGSEGV (a crafted ≤16MB source with very high token density could
 // trigger this). As of 1.1.0 each emitter bounds its counter and aborts with a
 // clean error (exit 17) instead of corrupting memory.
-let TOK_CAP = 8000000      // toks is mmap(320000000) and TKS is 40, so the arena
-                         // holds 8000000 token records exactly. The original
+let TOK_CAP = 10000000     // toks is mmap(512000000) and TKS is 48, so the arena
+                         // holds 10000000 token records exactly. The original
                          // 500000000 cited a 20GB arena that does not exist;
                          // an intermediate 10000000 used a wrong 32B stride and
-                         // still overran by 80000000 bytes. TKS is 40.
+                         // still overran by 80000000 bytes. 0.0.221: TKS is 48
+                         // (a 6th word carries the float exponent) and the
+                         // mapping was raised to 512000000 so the same 10M
+                         // record capacity still fits.
 let IR_CAP  = 26843545     // `ir` is mmap(1073741824) and a record is IRS(40), so
                          // the arena holds exactly 26843545 records. The old
                          // 1000000000 was justified by a "40GB arena" that
@@ -167,6 +170,24 @@ fn stok(i,t,v,l,c,ln) {
     w64(toks + i*TKS, t); w64(toks + i*TKS + 8, v)
     w64(toks + i*TKS + 16, l); w64(toks + i*TKS + 24, c)
     w64(toks + i*TKS + 32, ln)
+    // 0.0.221: side word, default 0. Float literals store their signed decimal
+    // exponent here; every other token kind leaves it 0. A float literal's value
+    // is (mantissa, frac_digits, exp10) -- packing all three into the single i64
+    // `v` (the old `(M << 8) | fdigits` scheme) cannot express 1.0e308, because
+    // neither the mantissa nor 10^frac_digits fits in i64.
+    w64(toks + i*TKS + 40, 0)
+}
+
+// stoke(i,e): store the float-exponent side word for token i.
+fn stoke(i,e) {
+    if i >= TOK_CAP { return }
+    w64(toks + i*TKS + 40, e)
+}
+
+// toke(i): read the float-exponent side word for token i.
+fn toke(i) {
+    if i >= TOK_CAP { return 0 }
+    return r64(toks + i*TKS + 40)
 }
 
 fn khash(p,ln) {
@@ -220,7 +241,14 @@ fn ktext(sv, ln) {
     if ln==2 && r8(src+sv)==97 && r8(src+sv+1)==115 { return 41 } // as
     // P10: 'in' keyword for for-in loops
     if ln==2 && r8(src+sv)==105 && r8(src+sv+1)==110 { return 43 } // in
-    if ln==3 && r8(src+sv)==114 && r8(src+sv+1)==97 && r8(src+sv+2)==119 { return 38 } // raw
+    // 0.0.220: removed the 'raw' keyword (ktext 38). It had NO consumer anywhere
+    // in the parser -- it was a leftover table entry that nonetheless made the
+    // tokenizer emit TT_KEY for the identifier `raw`. `raw` is used as a local
+    // variable name throughout lib/std (gguf.quanta, native_inference.quanta).
+    // As TT_KEY, parse_primary has no branch for it, so `read_raw(fd, raw, 8)`
+    // silently parsed only 2 arguments and the call was rejected with a bogus
+    // "wrong argument count". Reserving an unconsumed word is never correct;
+    // remove it so `raw` lexes as TT_ID again.
     if ln==3 && r8(src+sv)==97 && r8(src+sv+1)==115 && r8(src+sv+2)==109 { return 40 } // asm
     if ln==5 && r8(src+sv)==117 && r8(src+sv+1)==115 && r8(src+sv+2)==105 && r8(src+sv+3)==122 && r8(src+sv+4)==101 { return 48 } // usize
     if ln==8 && r8(src+sv)==118 && r8(src+sv+1)==111 && r8(src+sv+2)==108 && r8(src+sv+3)==97 && r8(src+sv+4)==116 && r8(src+sv+5)==105 && r8(src+sv+6)==108 && r8(src+sv+7)==101 { return 39 } // volatile

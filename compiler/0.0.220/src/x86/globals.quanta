@@ -151,7 +151,7 @@ let imp_srcpaths = mmap(1048576)
 let imp_srcpc = 0
 let imp_err = 0
 // Tokens: 40 bytes each [type,value,line,col,len]
-let toks = mmap(320000000); let tokc = 0; let tokp = 0
+let toks = mmap(512000000); let tokc = 0; let tokp = 0
 // $(name(args)) sigil paren-depth tracker: when >0 we are inside a $(…) sigil
 // and the PNCT handler skips the ')' that closes the $() (the one AFTER the
 // args' own ')'), so $(f(1,b)) does not leave a stray ')'.
@@ -1428,7 +1428,16 @@ let DAT_CAP = 33554432  // fail-closed cap for data buffer (parallel to CODE_CAP
 // Label map: 16 bytes [label,ir_pos]
 let lblmap = mmap(2000000); let lblc = 0
 
-let TKS = 40; let IRS = 40; let FNS = 56; let VRS = 24; let PCS = 24; let LBS = 16
+// 0.0.221: TKS 40 -> 48. Token records gained a 6th word (offset +40) holding the
+// signed decimal exponent of a float literal. The old `(M << 8) | frac_digits`
+// encoding cannot represent 1.0e308 (neither the mantissa nor 10^frac_digits fits
+// in i64) and the integer fallback overflowed the compiler into SIGILL. `toks` is
+// mmap(320000000) and TOK_CAP is derived from that, so the arena grows with the
+// stride: 8,000,000 * 48 = 384,000,000 <= 320,000,000 is FALSE, so TOK_CAP must
+// drop to 6,000,000 below. Raise the mapping to 512,000,000 to keep the old head
+// room -- every cap is checked explicitly, so a short map is a hard error, never
+// a silent overrun.
+let TKS = 48; let IRS = 40; let FNS = 56; let VRS = 24; let PCS = 24; let LBS = 16
 // 0.0.97: operator-overload suppression flag. Set per-function in entry.quanta
 // (1 when the current fn is an operator-named fn) so user_binop() forces the
 // builtin primitive instead of infinitely recursing through the overload.

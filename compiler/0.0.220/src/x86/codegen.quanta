@@ -859,6 +859,68 @@ fn ci_func(fi, is_main) {
                     // An f64 literal IS a float vreg. IR_FCONST's own definition
                     // says "result vreg tagged float" but nothing here did it.
                     if r8(vfloat+irres(mp))!=1 { w8(vfloat+irres(mp), 1); changed=1 }
+                } else if irop(mp)==IR_CALL {
+                    // The parser lowers EVERY f64 literal (TT_FNUM) to an IR_CALL
+                    // named "fconst" -- IR_FCONST is never emitted (see the note at
+                    // the fold pass above). The fold pass did tag these, but aclr()
+                    // zeroes vfloat for every vreg afterwards, so that tag was gone
+                    // by the time the emit pass ran.
+                    //
+                    // That left `let r = 6.0` as an UNTAGGED vreg, and every
+                    // arithmetic op whose floatness depended on it fell through to
+                    // the integer path:
+                    //
+                    //     let r = 6.0
+                    //     r / 2.0 -> 6.000000   (a1 inline literal is itself tagged)
+                    //     r / 2   -> 0.000000   (a1 int vreg, vfloat[r]==0)
+                    //     r + 2   -> hangs       (integer path, corrupt widths)
+                    //
+                    // The tell was that a FLOAT in a1 rescued the same expression:
+                    // the float had to reach the op tagged, and `r` alone never was.
+                    // The integer path ran on raw IEEE-754 bit patterns -- 6.0 is
+                    // 4613937818241073152, and idiv by 2 leaves a denormal that
+                    // prints as 0.000000.
+                    let cnm = ira0(mp)
+                    let is_fc = 0
+                    if r8(src+cnm)=='f' && r8(src+cnm+1)=='c' && r8(src+cnm+2)=='o' { is_fc=1 }
+                    if is_fc==0 && r8(src+cnm)=='i' && r8(src+cnm+1)=='2' && r8(src+cnm+2)=='f' { is_fc=1 }
+                    if is_fc==1 {
+                        if r8(vfloat+irres(mp))!=1 { w8(vfloat+irres(mp), 1); changed=1 }
+                    }
+                } else if irop(mp)==IR_MUL || irop(mp)==IR_ADD || irop(mp)==IR_SUB || irop(mp)==IR_FDIV {
+                    // NOTE: an UNTYPED parameter used as a float (`fn f(a, b) { a*b }`)
+                    // is not recoverable from the IR body alone. IR_PARAM's result
+                    // vreg belongs to the CALLEE's vreg space and the caller's float
+                    // vreg belongs to a different space, so no IR_MOV chain connects
+                    // them -- the callee simply cannot see what was passed. `a * b`
+                    // then took the integer imul path on the bit patterns, overflowed,
+                    // and the emitted jno trap fired as SIGILL (exit 132).
+                    //
+                    // This block used to paper over that by propagating floatness from
+                    // one operand to the other within the arithmetic op:
+                    //
+                    //     if vfloat+ira0==1 && vfloat+ira1!=1 { w8(vfloat+ira1,1) }
+                    //
+                    // That inference is UNSOUND and has been removed. It cannot
+                    // distinguish "untyped parameter that received a float" from
+                    // "genuine integer operand", so it tagged integer operands as
+                    // float:
+                    //
+                    //     fn h(a,b){ return a*b }   h(2, 1.0)
+                    //
+                    // a0=a holds the integer 2 and is NOT tagged by any legitimate
+                    // rule, but ira1 (b) is tagged, so the rule tagged a0 as float
+                    // too. fopld then moved the raw integer 2 -- not its f64 value --
+                    // into xmm0 as 0x0000000000000002, i.e. 1e-323, and the product
+                    // came out 0.0 instead of 2.0. Every mixed float/int expression
+                    // in the stdlib was corrupted by this rule.
+                    //
+                    // The correct source is the CALL SITE: scan_call_float() marks a
+                    // parameter's fn_parflt bit from a float literal argument before
+                    // codegen runs, and the IR_PARAM branch above turns that into a
+                    // vfloat tag. An operand that is not tagged is genuinely an
+                    // integer and is converted with cvtsi2sd by fopld. Nothing needs
+                    // to guess.
                 }
                 mp=mp+1
             }
@@ -939,9 +1001,14 @@ fn ci_func(fi, is_main) {
         else if op==IR_MOV { let rd=aphys(res); let rs=aphys(a0); if rd!=rs { rr(rd,rs) }; sdef(res, rd); w8(vfloat+res, r8(vfloat+a0)) }
 
         else if op==IR_ADD {
-            if r8(vfloat+a0)==1 && r8(vfloat+a1)==1 {
-                let r1=aphys(a0); let r2=aphys(a1); let rd=adistinct(res,r1,r2)
-                fld_x(r1, 0); fld_x(r2, 1)
+            // EITHER operand float -> SSE. This used to require BOTH to be float,
+            // so `1.0 + 2` fell through to the integer add and added the raw bit
+            // patterns (3.0 -> 1.0). An integer operand is converted with
+            // cvtsi2sd by fopld; only if NEITHER is float is this integer add.
+            if r8(vfloat+a0)==1 || r8(vfloat+a1)==1 {
+                let r1=aphys(a0); let r2=aphys(a1)
+            fopld_rr(a0, r1, 0, r1, r2); fopld_rr(a1, r2, 1, r1, r2)
+                    let rd=adistinct(res,r1,r2)
                 eb(242); eb(15); eb(88); eb(193)      // addsd xmm0, xmm1 (inline)
                 fst_x(rd, 0)
                 sdef(res, rd); w8(vfloat+res, 1)
@@ -949,9 +1016,11 @@ fn ci_func(fi, is_main) {
             let r1=aphys(a0); let r2=aphys(a1); let rd=adistinct(res,r1,r2); if rd!=r1 { rr(rd,r1) }; ra(rd,r2); if loop_depth == 0 { ovf_trap_emit(ii) }; sdef(res, rd); width_mask(a0, a1, rd) }
         }
         else if op==IR_SUB {
-            if r8(vfloat+a0)==1 && r8(vfloat+a1)==1 {
-                let r1=aphys(a0); let r2=aphys(a1); let rd=adistinct(res,r1,r2)
-                fld_x(r1, 0); fld_x(r2, 1)
+            // EITHER operand float, same as IR_ADD -- see the note there.
+            if r8(vfloat+a0)==1 || r8(vfloat+a1)==1 {
+                let r1=aphys(a0); let r2=aphys(a1)
+                    fopld_rr(a0, r1, 0, r1, r2); fopld_rr(a1, r2, 1, r1, r2)
+                    let rd=adistinct(res,r1,r2)
                 eb(242); eb(15); eb(92); eb(193)       // subsd xmm0, xmm1 (inline; fsub is reserved)
                 fst_x(rd, 0)
                 sdef(res, rd); w8(vfloat+res, 1)
@@ -959,10 +1028,15 @@ fn ci_func(fi, is_main) {
             let r1=aphys(a0); let r2=aphys(a1); let rd=adistinct(res,r1,r2); if rd!=r1 { rr(rd,r1) }; rs(rd,r2); if loop_depth == 0 { ovf_trap_emit(ii) }; sdef(res, rd); width_mask(a0, a1, rd) }
         }
         else if op==IR_MUL {
-            // float * float: both operands are float bit-patterns in GP regs -> SSE
-            if r8(vfloat+a0)==1 && r8(vfloat+a1)==1 {
-                let r1=aphys(a0); let r2=aphys(a1); let rd=adistinct(res,r1,r2)
-                fld_x(r1, 0); fld_x(r2, 1)          // movq xmm0/1, gp (raw float bits)
+            // EITHER operand float -> SSE. This required BOTH operands to be float,
+            // so every mixed float*int product took the integer imul path and
+            // multiplied the raw bit-patterns: `1.0 * 2` returned 0.0, and the whole
+            // gguf_exp Taylor series (`term * r / i`) was dead. An integer operand
+            // is converted with cvtsi2sd by fopld.
+            if r8(vfloat+a0)==1 || r8(vfloat+a1)==1 {
+                let r1=aphys(a0); let r2=aphys(a1)
+                    fopld_rr(a0, r1, 0, r1, r2); fopld_rr(a1, r2, 1, r1, r2)
+                    let rd=adistinct(res,r1,r2)          // movq/cvtsi2sd into xmm0/xmm1
                 eb(242); eb(15); eb(89); eb(193)      // mulsd xmm0, xmm1 (inline; fmul is reserved)
                 fst_x(rd, 0)                         // movq rd, xmm0 (raw float bits)
                 sdef(res, rd); w8(vfloat+res, 1)
@@ -1160,10 +1234,12 @@ fn ci_func(fi, is_main) {
             }
         }
         else if op==IR_DIV {
-          // float / float: both operands are float bit-patterns in GP regs -> SSE
-          if r8(vfloat+a0)==1 && r8(vfloat+a1)==1 {
-            let r1=aphys(a0); let r2=aphys(a1); let rd=adistinct(res,r1,r2)
-            fld_x(r1, 0); fld_x(r2, 1)          // movq xmm0/1, gp (raw float bits)
+          // EITHER operand float -> SSE, same as IR_ADD/IR_MUL -- `1.0 / 2` used
+          // to divide the raw bit-patterns on the integer idiv path and give 0.0.
+          if r8(vfloat+a0)==1 || r8(vfloat+a1)==1 {
+            let r1=aphys(a0); let r2=aphys(a1)
+            fopld_rr(a0, r1, 0, r1, r2); fopld_rr(a1, r2, 1, r1, r2)          // movq/cvtsi2sd into xmm0/xmm1
+            let rd=adistinct(res,r1,r2)
             eb(242); eb(15); eb(94); eb(193)      // divsd xmm0, xmm1 (inline; fdiv is reserved)
             fst_x(rd, 0)                         // movq rd, xmm0 (raw float bits)
             sdef(res, rd); w8(vfloat+res, 1)
@@ -1194,23 +1270,6 @@ fn ci_func(fi, is_main) {
             // (verified against Python: q differs from trunc only when the
             // truncated remainder r has opposite sign to b). Allocator-safe:
             // only res's own spill home is written.
-            let rd = aphys(res)
-            flush_clob(0,1,2)
-            rbp(0, spill_home(a0)); rbp(1, spill_home(a1))   // rax=a, rcx=b
-            rcqo(); ridiv(1)                                  // rax=q_trunc, rdx=r, rcx=b
-            wbp(spill_home(res), 0)                           // res home = q
-            rr(0, 2)                                          // rax = r
-            rxor(0, 1)                                        // rax = r ^ b
-            eb(72); eb(193); eb(248); eb(63)                  // sar rax, 63 -> adj_raw (0 / -1)
-            rr(1, 2)                                          // rcx = r
-            rneg(1)                                           // rcx = -r
-            rxor(2, 1)                                        // rdx = r ^ -r
-            eb(72); eb(193); eb(250); eb(63)                  // sar rdx, 63 -> rmask (0 / -1)
-            eb(72); eb(33); eb(194)                           // and rdx, rax -> rdx = adj (rmask & adj_raw)
-            rbp(0, spill_home(res))                           // rax = q
-            ra(0, 2)                                          // rax = q + adj
-            rr(rd, 0)                                         // rd = rax
-            sdef(res, rd)
           }
           let rd = aphys(res)
           flush_clob(0,1,2)
@@ -2058,6 +2117,12 @@ fn ci_func(fi, is_main) {
             let rfi = callee
             if is_idx==1 { rfi = a0 }
             if rfi>=0 && rfi<fnc && r64(fn_retflt + rfi*8)==1 { w8(vfloat+res, 1) }
+            // NOTE: parameter-float inference from the caller's float arguments is
+            // NOT done here. By the time an IR_CALL is emitted its callee has
+            // already been through ci_func(), so a fn_parflt bit set here would be
+            // read too late. It is a whole-IR pre-pass in entry.quanta
+            // (infer_par_flt) that runs after every function is parsed and before
+            // any ci_func emits one.
             // `-> string` tags the result vreg, so file_open skips the 8-byte length
             // header and opens the bytes. Without it a path returned from a function
             // was opened from its LENGTH field and open() returned -2 -- which made
@@ -2491,4 +2556,3 @@ fn init_cglobals() {
 }
 
 let CALLER_SAVED = call_saved
-

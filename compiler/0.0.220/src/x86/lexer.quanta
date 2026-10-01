@@ -215,10 +215,41 @@ fn tokenize() {
                     if p<srclen && r8(src+p)==46 { p = p + 1 }   // consume '.' if present
                     let fval = 0
                     let fdigits = 0
+                    // Signed decimal exponent, carried beside (not folded into) the
+                    // mantissa. Zero for every literal without an 'e'. See the
+                    // positive-exponent branch below for why it must NOT be folded
+                    // into the mantissa with integer multiplies.
+                    let fexp = 0
                     while p<srclen && idigit(r8(src+p))==1 {
                         let d = r8(src+p) - 48
-                        val = val*10 + d
-                        fval = fval*10 + d
+                        // The float token packs the mantissa as (val << 8) | fdigits
+                        // so that parse_primary can recover both with `v >> 8` and
+                        // `v & 255` (see method.quanta, the TT_FNUM branch). That
+                        // packing is the CONSTRAINT, and it is much tighter than
+                        // i64: `val << 8` must stay inside a SIGNED 64-bit field,
+                        // so val must not exceed 2^55 - 1 = 36028797018963967.
+                        //
+                        // The old guard compared val against 922337203685477580
+                        // (i64/10), which let val keep growing to ~19 digits and
+                        // only then stop. By that point `val << 8` was already
+                        // past 2^63, so the packed token came back NEGATIVE:
+                        // 6931471805599.0 packed to 1774456782233521445646, and
+                        // parse_primary's `v >> 8` recovered a sign-extended
+                        // mantissa instead of 6931471805599. The scale loop in
+                        // parse_primary then divided by a 10^fdigits that no
+                        // longer matched, and the emitted fconst divided by a
+                        // huge/garbage xmm1 -- the literal came out as 0.000751
+                        // instead of 0.6931471805599453, and a 13-digit integer
+                        // part sent the compiler into a hang.
+                        //
+                        // Saturating at 2^55-1 is exact for every literal that
+                        // i64 could have carried anyway: a mantissa needing more
+                        // than 17 significant digits cannot be represented in the
+                        // packed token at all, so the extra digits were always
+                        // going to be lost. Saturation (rather than wrap) keeps the
+                        // packed value positive and keeps the compiler alive.
+                        if val < 36028797018963967 { val = val*10 + d }
+                        if fval < 36028797018963967 { fval = fval*10 + d }
                         fdigits = fdigits + 1
                         p = p + 1; c = c + 1
                     }
@@ -256,20 +287,40 @@ fn tokenize() {
                             //   1.0e0  1.0  == unchanged; a zero exponent is a no-op
                             //   1.0e2  100  == mantissa 10 * 10^2
                             if eneg==1 {
-                                // A NEGATIVE exponent adds fraction digits and
-                                // leaves the mantissa alone: 1e-6 is mantissa 1 with
-                                // 6 fraction digits, i.e. 1/10^6.
+                                // A NEGATIVE exponent. It is carried in `fexp`
+                                // as a signed value, exactly like the positive
+                                // case, so BOTH branches share one representation:
                                 //
-                                // Scaling BOTH by 10^en (an earlier attempt) cancels
-                                // out and yields 10^6/10^6 == 1, so `1e-6` came out
-                                // as 1.0 and the epsilon in rms_norm was enormous.
-                                fdigits = fdigits + en
+                                //     literal == mantissa / 10^fdigits * 10^fexp
+                                //
+                                // 1e-6  -> mantissa 1, fdigits 0, fexp -6
+                                // 1.0e-6-> mantissa 10, fdigits 1, fexp -6
+                                //
+                                // The earlier code added `en` to `fdigits` instead.
+                                // `fdigits` is an 8-BIT field inside the token word,
+                                // so 1.0e-308 wanted fdigits = 308, truncated to 52,
+                                // and the value was wrong by 256 orders of magnitude.
+                                fexp = 0 - en
                             } else {
-                                // Positive (or zero) exponent: multiply the mantissa
-                                // by 10^en and leave fdigits alone. With en==0 the
-                                // loop does not run, so `1.0e0` stays 10/10 == 1.0.
-                                let e2 = en
-                                while e2 > 0 { val = val*10; e2 = e2 - 1 }
+                                // Positive (or zero) exponent. With en==0 this is a
+                                // no-op, so `1.0e0` stays 10/10 == 1.0.
+                                //
+                                // FIX 0.0.221: DO NOT DO THIS IN INTEGER ARITHMETIC.
+                                // `val = val*10` once per exponent digit overflows i64
+                                // as soon as the literal exceeds ~1e17 (1.0e18 turned
+                                // 10 into 10^19 = 0x8AC7230489E80000), and the
+                                // wrapped mantissa then also broke the `<< 8` token
+                                // packing below. The compiler did not report an
+                                // error -- it died with SIGILL (exit -4) partway
+                                // through codegen, so `import std/gguf` produced NO
+                                // binary and NO message.
+                                //
+                                // Carrying the exponent in the side word and letting
+                                // the PARSER materialise 10^fexp in floating point
+                                // (see the fconst path in method.quanta) removes the
+                                // integer power-of-ten entirely. Integer literals are
+                                // untouched: only the float branch reads `fexp`.
+                                fexp = en
                             }
                         } else {
                             p = es   // 'e' with no digits: not an exponent
@@ -287,8 +338,20 @@ fn tokenize() {
                         // starting with 'f', so put it back.
                         if p-fs != 2 && p-fs != 3 { p = fs }
                     }
+                    // 0.0.221: (M << 8) | frac_digits keeps its shape, but frac_digits
+                    // is now CLAMPED to 255 and the excess is moved into the side
+                    // word, because the field is only 8 bits wide. A literal such as
+                    // 0.0001234...<300 zeros>1 has more fraction digits than 255 can
+                    // name; the extra digits are all zero, so folding them into the
+                    // exponent is exact, not an approximation.
+                    if fdigits > 255 {
+                        fexp = fexp - (fdigits - 255)
+                        fdigits = 255
+                    }
                     let fval_enc = (val << 8) | fdigits
                     stok(tokc, TT_FNUM, fval_enc, l, sc, nlen); tokc = tokc + 1
+                    // Signed decimal exponent, in the side word stoke/toke read.
+                    stoke(tokc-1, fexp)
                     continue
                 }
 stok(tokc, TT_NUM, val, l, sc, nlen); tokc = tokc + 1

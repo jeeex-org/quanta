@@ -1074,13 +1074,28 @@ fn qobj_import(path) -> i64 {
     // v11: expand the parflt bitmask back into per-param flags. The format
     // gate above rejects a v10 cache, so a stale record can never be read as
     // v11 -- the 136 word is only meaningful at v11 and up.
+    //
+    // This must only ever SET a flag, never clear one. Imports run AFTER
+    // scan_call_float() (entry.quanta: "the staged caches are imported LATER,
+    // just before the compile loop"), and scan_call_float() infers float
+    // parameters from float-literal call sites across the WHOLE file --
+    // including calls into imported modules. A cleared flag here erased that
+    // inference, so every inferred parameter reverted to the integer code path
+    // inside the imported callee:
+    //
+    //     fn dd(a, b) { return a / b }
+    //     dd(6.0, 2.0)   -> 0.000000   (idiv over raw IEEE-754 bit patterns)
+    //     fn dd(a: f64, b: f64) -> f64 { return a / b }
+    //     dd(6.0, 2.0)   -> 3.000000   (declared type survives the import)
+    //
+    // Declared types are written by scanfns() before the import runs, so a flag
+    // already set at this point came from a declaration or from inference.
+    // Monotonic SET cannot contradict either.
     let pfbm_r = r64(meta + mo + 136)
     k = 0
     while k < 4 {
       if (pfbm_r & (1 << k)) != 0 {
         w64(fn_parflt + (fnc*200 + k)*8, 1)
-      } else {
-        w64(fn_parflt + (fnc*200 + k)*8, 0)
       }
       k = k + 1
     }

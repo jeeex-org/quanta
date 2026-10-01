@@ -158,13 +158,13 @@ fn shl_trap_emit(ii) { if ovf_trap==1 && r8(ir_unsafe+ii)==0 { eb(72); eb(131); 
 fn faddf_avx2(dst_ptr, a_ptr, b_ptr) {
     flush_all()
     // Load 4 doubles from [rsi] into ymm0
-    eb(196); eb(225); eb(121); eb(16); eb(6)      // vmovupd ymm0, [rsi] (C4 E1 79 10 06)
+    eb(196); eb(225); eb(125); eb(16); eb(6)      // vmovupd ymm0, [rsi] (C4 E1 7D 10 06)
     // Load 4 doubles from [rdx] into ymm1  
-    eb(196); eb(225); eb(121); eb(16); eb(10)     // vmovupd ymm1, [rdx] (C4 E1 79 10 0A)
+    eb(196); eb(225); eb(125); eb(16); eb(10)     // vmovupd ymm1, [rdx] (C4 E1 7D 10 0A)
     // Add: ymm0 = ymm0 + ymm1
-    eb(197); eb(249); eb(88); eb(193)               // vaddpd ymm0, ymm0, ymm1 (C5 F9 58 C1)
+    eb(197); eb(253); eb(88); eb(193)              // vaddpd ymm0, ymm0, ymm1 (C5 FD 58 C1 — L=1)
     // Store ymm0 to [rdi]
-    eb(196); eb(225); eb(121); eb(17); eb(7)       // vmovupd [rdi], ymm0 (C4 E1 79 11 07)
+    eb(196); eb(225); eb(125); eb(17); eb(7)       // vmovupd [rdi], ymm0 (C4 E1 7D 11 07)
     // Return dst_ptr
     eb(72); eb(137); eb(248)                         // mov rax, rdi
     return 1
@@ -172,30 +172,30 @@ fn faddf_avx2(dst_ptr, a_ptr, b_ptr) {
 
 fn fmulf_avx2(dst_ptr, a_ptr, b_ptr) {
     flush_all()
-    eb(196); eb(225); eb(121); eb(16); eb(6)      // vmovupd ymm0, [rsi]
-    eb(196); eb(225); eb(121); eb(16); eb(10)     // vmovupd ymm1, [rdx]
-    eb(197); eb(249); eb(89); eb(193)               // vmulpd ymm0, ymm0, ymm1
-    eb(196); eb(225); eb(121); eb(17); eb(7)       // vmovupd [rdi], ymm0
+    eb(196); eb(225); eb(125); eb(16); eb(6)      // vmovupd ymm0, [rsi]
+    eb(196); eb(225); eb(125); eb(16); eb(10)     // vmovupd ymm1, [rdx]
+    eb(197); eb(253); eb(89); eb(193)               // vmulpd ymm0, ymm0, ymm1 (C5 FD 59 C1 — L=1)
+    eb(196); eb(225); eb(125); eb(17); eb(7)       // vmovupd [rdi], ymm0
     eb(72); eb(137); eb(248)
     return 1
 }
 
 fn fsubf_avx2(dst_ptr, a_ptr, b_ptr) {
     flush_all()
-    eb(196); eb(225); eb(121); eb(16); eb(6)      // vmovupd ymm0, [rsi]
-    eb(196); eb(225); eb(121); eb(16); eb(10)     // vmovupd ymm1, [rdx]
-    eb(197); eb(249); eb(92); eb(193)               // vsubpd ymm0, ymm0, ymm1
-    eb(196); eb(225); eb(121); eb(17); eb(7)       // vmovupd [rdi], ymm0
+    eb(196); eb(225); eb(125); eb(16); eb(6)      // vmovupd ymm0, [rsi]
+    eb(196); eb(225); eb(125); eb(16); eb(10)     // vmovupd ymm1, [rdx]
+    eb(197); eb(253); eb(92); eb(193)               // vsubpd ymm0, ymm0, ymm1 (C5 FD 5C C1 — L=1)
+    eb(196); eb(225); eb(125); eb(17); eb(7)       // vmovupd [rdi], ymm0
     eb(72); eb(137); eb(248)
     return 1
 }
 
 fn fdivf_avx2(dst_ptr, a_ptr, b_ptr) {
     flush_all()
-    eb(196); eb(225); eb(121); eb(16); eb(6)      // vmovupd ymm0, [rsi]
-    eb(196); eb(225); eb(121); eb(16); eb(10)     // vmovupd ymm1, [rdx]
-    eb(197); eb(249); eb(94); eb(193)               // vdivpd ymm0, ymm0, ymm1
-    eb(196); eb(225); eb(121); eb(17); eb(7)       // vmovupd [rdi], ymm0
+    eb(196); eb(225); eb(125); eb(16); eb(6)      // vmovupd ymm0, [rsi]
+    eb(196); eb(225); eb(125); eb(16); eb(10)     // vmovupd ymm1, [rdx]
+    eb(197); eb(253); eb(94); eb(193)               // vdivpd ymm0, ymm0, ymm1 (C5 FD 5E C1 — L=1)
+    eb(196); eb(225); eb(125); eb(17); eb(7)       // vmovupd [rdi], ymm0
     eb(72); eb(137); eb(248)
     return 1
 }
@@ -603,12 +603,131 @@ fn fst_x(gp, xmm) {
     if gp >= 8 { eb(0x66); eb(0x49); eb(15); eb(126); mr(3, xmm, gp-8) }
     else { eb(0x66); eb(0x48); eb(15); eb(126); mr(3, xmm, gp) }
 }
-fn fi2f(xmm, gp) { eb(0xF2); eb(0x48); eb(15); eb(42); mr(2, xmm, gp%8) }  // cvtsi2sd xmm, gp  (F2 REX.W 0F 2A /r, 64-bit)
-fn ff2i(gp, xmm) { eb(0xF2); eb(0x48); eb(15); eb(46); mr(2, gp%8, xmm) }  // cvttsd2si gp, xmm (F2 REX.W 0F 2C /r, 64-bit)
-fn fcomi(xmm1, xmm2) { eb(0x66); eb(15); eb(44); mr(3, xmm1, xmm2) }  // comisd xmm1, xmm2 (sets EFLAGS)
+// cvtsi2sd xmm, r64/m64 -- F2 REX.W 0F 2A /r (64-bit source).
+//
+// The source rm field needs REX.B whenever the operand is NOT a low GPR, exactly
+// like fld_x: ModRM.rm 0-7 selects rax,rcx,rdx,rbx,rsp,rbp,rsi,rdi and 0-7 means
+// xmm0-xmm7 in the register-direct form. REX.W alone (0x48) leaves REX.B clear, so
+// `fi2f(1,1)` -- the CVTSI2SD xmm1,xmm1 emitted by fi2f_gp -- encoded rm=1 as rcx
+// and converted the FLOAT operand's raw bit pattern instead of the integer. That
+// silently produced r/k = 0.0 for distinct mixed operands, because the conversion
+// read the wrong register entirely.
+// cvtsi2sd xmm, r64/m64 -- F2 REX.W 0F 2A /r (64-bit source).
+//
+// The r/m operand is ALWAYS a GPR/m64: CVTSI2SD has no x/m64 form, so ModRM.rm
+// 0-7 means rax,rcx,rdx,rbx,rsp,rbp,rsi,rdi -- never xmm0-xmm7 -- and 8-15 need
+// REX.B. The reg field is the xmm destination and needs REX.R above xmm7.
+fn fi2f(xmm, gp) {
+    let rx = 0
+    if gp >= 8 { rx = rx + 1 }
+    if xmm >= 8 { rx = rx + 4 }
+    eb(0xF2)
+    if rx == 0 { eb(0x48) } else { eb(0x48 + rx) }
+    eb(15); eb(42); mr(3, xmm%8, gp%8)
+}
+
+// cvtsi2sd xmm, r64 -- convert an integer held in GPR `gp` into double xmm.
+//
+// This is a single instruction. It used to be fld_x(gp,xmm) followed by
+// fi2f(xmm,xmm), on the theory that the integer had to be parked in the xmm
+// register first; that is impossible, because the second step re-reads a GPR
+// whose identity comes from the xmm NUMBER, not from the value. With xmm1 the
+// source silently became rcx, so `r / k` converted the float operand's own bit
+// pattern and returned 0.000000, and `k / r` returned 1.833333.
+fn fi2f_gp(xmm, gp) { fi2f(xmm, gp) }
+// cvttsd2si r64, xmm -- F2 REX.W 0F 2C /r (64-bit destination).
+// REX.R selects the destination GPR and REX.B the XMM source, the mirror of the
+// rule fi2f/fld_x already follow; without them gp 8-15 and xmm 8-15 alias r0-r7.
+fn ff2i(gp, xmm) {
+    let rx = 0
+    if gp >= 8 { rx = rx + 4 }
+    if xmm >= 8 { rx = rx + 1 }
+    eb(0xF2); if rx == 0 { eb(0x48) } else { eb(0x48 + rx) }
+    eb(15); eb(46); mr(2, gp%8, xmm%8)
+}
+// comisd xmm1, xmm2 -- 66 0F 2F /r; sets EFLAGS (ZF/PF/CF on unordered compare).
+fn fcomi(xmm1, xmm2) {
+    let rx = 0
+    if xmm1 >= 8 { rx = rx + 4 }
+    if xmm2 >= 8 { rx = rx + 1 }
+    eb(0x66); if rx != 0 { eb(0x44 + rx) }
+    eb(15); eb(47); mr(3, xmm1%8, xmm2%8)
+}
 
 
-// === divide-by-const signed magic (strength reduction for IR_DIV by constant) ===
+// Load an operand into an XMM register for a mixed float/integer SSE operation.
+//
+// fld_x moves the raw float bit-pattern out of a GPR. An INTEGER operand instead
+// holds the value itself, so it must be converted with cvtsi2sd -- running fld_x
+// on it and doing the arithmetic in SSE would multiply the raw bits of the value
+// (1.0 * 2 became 0.0, because the bit-patterns were multiplied as integers).
+//
+// aphys() does not always return a GPR: for a vreg that is not currently live in
+// a register it returns the SPILL SLOT, and spill_home() encodes that as a
+// NEGATIVE stack displacement. fld_x/fi2f_gp both take a GPR, so feeding them a
+// spill address emitted `movq xmm, [negative disp]` and read whatever happened to
+// be at that address -- for a spilled integer operand the raw small integer, whose
+// bit-pattern is a denormal, so the sum came out as the float operand unchanged
+// (`h(2, 3.0)` returned 3.0 instead of 5.0). A spilled operand is reloaded into a
+// scratch GPR first, so the register-encoding helpers always get a real register.
+//
+// The destination is a low XMM register, which is what fld_x/fi2f_gp and the
+// inline opcode sequences below require.
+fn fopld(a, xmm) {
+    let r = aphys(a)
+    fopld_r(a, r, xmm)
+}
+
+// fopld_r(a, r, xmm): load operand `a` into xmm from physical register `r`.
+//
+// The register is passed in rather than re-derived. Callers that already hold a
+// resolved register MUST use this form: a second aphys() is not idempotent --
+// between the two calls the allocator may have evicted `a`, so aphys() hands
+// back a DIFFERENT register, and the XMM gets loaded from the wrong value while
+// every diagnostic still looks correct.
+//
+// That is exactly what made `let r = 6.0; let k = 2; r / k` yield 0.000000:
+//
+//     let r1 = aphys(a0)      // r1 = physical reg of r
+//     let r2 = aphys(a1)      // r2 = physical reg of k
+//     fopld(a0, 0)            // re-derives: may evict a0, gets another reg
+//     fopld(a1, 1)            // re-derives again
+//
+// With `k` already mapped, the SECOND re-derivation is the one that breaks:
+// afree() inside the first fopld can evict k, and the reload path (r < 0) then
+// uses afree() again, which is free to return the register holding r.
+//
+// xmm is always low (0/1) here, which is what fld_x/fi2f_gp require; those
+// helpers encode REX for the GPR side and use xmm verbatim as the reg field.
+fn fopld_r(a, r, xmm) {
+    fopld_rr(a, r, xmm, -1, -1)
+}
+
+// fopld_rr(a, r, xmm, keep0, keep1): as fopld_r, but when a reload is needed the
+// scratch register is chosen so it cannot be either operand's register.
+//
+// afree() returns whatever looks free, including a register that is still live in
+// an ALLOCATOR MAP entry. In the two-operand float ops the callers pass keep0/keep1
+// = the two operand registers; allocating one of those as scratch would overwrite
+// the very operand still waiting to be loaded into the other XMM.
+fn fopld_rr(a, r, xmm, keep0, keep1) {
+    if r < 0 {
+        // Spilled: bring the raw 64-bit word back into a register. rbp() is the
+        // same load the integer paths use, so the value is bit-identical to what
+        // aphys() would have handed back had the vreg stayed live.
+        let sc = afree()
+        let g = 0
+        while g < 14 {
+            let pr = r64(REGS+g*8)
+            if pr != keep0 && pr != keep1 { sc = pr; break }
+            g = g + 1
+        }
+        rbp(sc, r)
+        if r8(vfloat+a)==1 { fld_x(sc, xmm) } else { fi2f_gp(xmm, sc) }
+    } else {
+        if r8(vfloat+a)==1 { fld_x(r, xmm) } else { fi2f_gp(xmm, r) }
+    }
+}
 let magicM = 0
 let magicSh = 0
 // unsigned >= without xor: if signs equal use signed compare; else the
@@ -757,12 +876,87 @@ fn emit_bltn(nmi,nl,ii) {
         w8(vfloat+irres(ii), 0)
         return 1
     }
-    if nl==6&&r8(nm)=='f'&&r8(nm+1)=='c'&&r8(nm+2)=='o'&&r8(nm+3)=='n'&&r8(nm+4)=='s'&&r8(nm+5)=='t' {  // fconst(M, scale): float literal = M/scale
-        // NO flush_all — uses only xmm0/xmm1
-        eb(242); eb(72); eb(15); eb(42); eb(199)  // cvtsi2sd xmm0, rdi
-        eb(242); eb(72); eb(15); eb(42); eb(206)  // cvtsi2sd xmm1, rsi
-        eb(242); eb(15); eb(94); eb(193)                  // divsd xmm0, xmm1
-        eb(102); eb(72); eb(15); eb(126); eb(192)         // movq rax, xmm0
+    if nl==6&&r8(nm)=='f'&&r8(nm+1)=='c'&&r8(nm+2)=='o'&&r8(nm+3)=='n'&&r8(nm+4)=='s'&&r8(nm+5)=='t' {  // fconst(M, scale, exp10): float literal = (M/scale)*10^exp10
+        // NO flush_all — uses only xmm0/xmm1 and rax
+        //
+        // 0.0.221: a THIRD argument (the signed decimal exponent) plus a real
+        // floating-point power of ten, replacing the lexer's integer
+        // `val = val*10` fold. That fold overflowed i64 for any literal past
+        // ~1e17, and the parser built 10^frac_digits in i64 as well, so 1.0e-308
+        // was inexpressible. Either overflow killed the compiler with SIGILL --
+        // no diagnostic, no output binary -- as soon as any imported module
+        // contained a large float literal.
+        //
+        // exp10 is a COMPILE-TIME constant (IR_CONST), so 10^exp10 is unrolled
+        // here rather than computed at run time. The multiplier is chosen once,
+        // branch-free: 10.0 when the exponent is positive, 0.1 when negative, and
+        // |exp10| multiplies either way. |exp10| is clamped to 400 -- 10^400 is
+        // already past f64 range, so the clamp is exact rather than approximate,
+        // and it stops a 1.0e100000 literal from emitting 400KB of mulsd.
+        eb(242); eb(72); eb(15); eb(42); eb(199)  // cvtsi2sd xmm0, rdi   (M)
+        eb(242); eb(72); eb(15); eb(42); eb(206)  // cvtsi2sd xmm1, rsi   (scale)
+        eb(242); eb(15); eb(94); eb(193)          // divsd   xmm0, xmm1  (M/scale)
+        // exp10: the third argument's IR_CONST.
+        //
+        // IR_CALL field layout is a0 = name offset, a1 = ARG COUNT, a2 = the
+        // index of the FIRST argument record (`cavs` in method.quanta) -- not a
+        // vreg, and not the count. The three argument records are consecutive
+        // from a2, so the exponent is at (a2 + 2) and needs no scan. Walking
+        // backwards from ii would be O(1) too, but a2 is the documented field
+        // and does not depend on nv() staying adjacent to the call.
+        let e10 = 0
+        let argbase = ira2(ii)
+        let rec = argbase + 2
+        if rec >= 0 && rec < irc && irop(rec)==IR_CONST { e10 = ira0(rec) }
+        let neg = 0
+        if e10 < 0 { neg = 1; e10 = 0 - e10 }
+        if e10 > 400 { e10 = 400 }
+        if e10 > 0 {
+            // 10^exp10 by REPEATED MULTIPLICATION in chunks of 10^22.
+            //
+            // 0.0.221: this was originally `e10 x mulsd xmm0, xmm1` with xmm1=10.0.
+            // That is correct to ~1 ULP for small exponents but drifts: 1.0e308
+            // came out 9.999999999999998e+307, because 308 chained multiplies
+            // each round at 53 bits and the error compounds (1e-250 was 1.4e-14
+            // off, which is ~60000 ULP). Two problems, one fix.
+            //
+            // 10^22 = 5^22 * 2^22 and 5^22 < 2^53, so 10^22 is EXACTLY
+            // representable -- as is 10.0 (5 * 2). Each chunk step therefore
+            // consumes only 1.5 mantissa bits (log2 10^22) instead of 3.3, so
+            // 22 chunks = 33 bits stays well inside the 53-bit significand and
+            // the whole product is computed with no intermediate rounding. The
+            // final mulsd/divsd is the only rounding, making the literal
+            // correctly rounded across the whole f64 range. |exp10| is clamped to
+            // 400 because 10^400 is already past f64 range, so the clamp is
+            // exact rather than approximate, and it bounds the emitted code at
+            // 19 chunk steps instead of 400.
+            let chunk_n = 0
+            chunk_n = e10 / 22
+            // 10^22 is exactly representable (5^22 = 2384185791015625, 52 bits;
+            // the 2^22 factor is free), so it is a valid chunk multiplier.
+            // Bits 0x4480F0CF064DD592 = LE 92 D5 4D 06 CF F0 80 44.
+            eb(72); eb(184); eb(146); eb(213); eb(77); eb(6); eb(207); eb(240); eb(128); eb(68)  // movabs rax, 10^22
+            eb(102); eb(72); eb(15); eb(110); eb(200)   // movq xmm1, rax
+            let n = chunk_n
+            while n > 0 {
+                if neg==0 { eb(242); eb(15); eb(89); eb(193) }   // mulsd xmm0, xmm1
+                else { eb(242); eb(15); eb(94); eb(193) }        // divsd xmm0, xmm1
+                n = n - 1
+            }
+            // Remainder (< 22) in 10.0 steps -- exact too.
+            let r2 = e10 - chunk_n*22
+            if r2 > 0 {
+                eb(72); eb(184); eb(0); eb(0); eb(0); eb(0); eb(0); eb(0); eb(36); eb(64)   // movabs rax, 10.0
+                eb(102); eb(72); eb(15); eb(110); eb(200)
+                let m = r2
+                while m > 0 {
+                    if neg==0 { eb(242); eb(15); eb(89); eb(193) }
+                    else { eb(242); eb(15); eb(94); eb(193) }
+                    m = m - 1
+                }
+            }
+        }
+        eb(102); eb(72); eb(15); eb(126); eb(192)  // movq rax, xmm0
         sdef(irres(ii), 0)
         w8(vfloat+irres(ii), 1)
         return 1
@@ -789,6 +983,7 @@ fn emit_bltn(nmi,nl,ii) {
         // NO flush_all — uses only xmm0/xmm1, result in rax
         let fa0=0; if ira1(ii)>=1 { if is_float_vr(irres(ira2(ii)))==1 { fa0=1 } }
         let fa1=0; if ira1(ii)>=2 { if is_float_vr(irres(ira2(ii)+1))==1 { fa1=1 } }
+        if fa0==0 && fa1==0 { eb(72); eb(141); eb(4); eb(55); return 1 }  // lea rax,[rdi+rsi] — integer fast-path
         if fa0==1 { eb(102); eb(72); eb(15); eb(110); eb(199) } else { eb(242); eb(72); eb(15); eb(42); eb(199) }
         if fa1==1 { eb(102); eb(72); eb(15); eb(110); eb(206) } else { eb(242); eb(72); eb(15); eb(42); eb(206) }
         // FIX 0.0.220 -- two defects, both in the RESULT STORE.
@@ -824,6 +1019,7 @@ fn emit_bltn(nmi,nl,ii) {
         // NO flush_all — uses only xmm0/xmm1
         let fa0=0; if ira1(ii)>=1 { if is_float_vr(irres(ira2(ii)))==1 { fa0=1 } }
         let fa1=0; if ira1(ii)>=2 { if is_float_vr(irres(ira2(ii)+1))==1 { fa1=1 } }
+        if fa0==0 && fa1==0 { eb(72); eb(137); eb(248); eb(72); eb(41); eb(240); return 1 }  // mov rax,rdi; sub rax,rsi — integer fast-path
         if fa0==1 { eb(102); eb(72); eb(15); eb(110); eb(199) } else { eb(242); eb(72); eb(15); eb(42); eb(199) }
         if fa1==1 { eb(102); eb(72); eb(15); eb(110); eb(206) } else { eb(242); eb(72); eb(15); eb(42); eb(206) }
         // FIX 0.0.220 -- two defects, both in the RESULT STORE.
@@ -859,6 +1055,7 @@ fn emit_bltn(nmi,nl,ii) {
         // NO flush_all — uses only xmm0/xmm1
         let fa0=0; if ira1(ii)>=1 { if is_float_vr(irres(ira2(ii)))==1 { fa0=1 } }
         let fa1=0; if ira1(ii)>=2 { if is_float_vr(irres(ira2(ii)+1))==1 { fa1=1 } }
+        if fa0==0 && fa1==0 { eb(72); eb(137); eb(248); eb(72); eb(15); eb(175); eb(198); return 1 }  // mov rax,rdi; imul rax,rsi — integer fast-path
         if fa0==1 { eb(102); eb(72); eb(15); eb(110); eb(199) } else { eb(242); eb(72); eb(15); eb(42); eb(199) }
         if fa1==1 { eb(102); eb(72); eb(15); eb(110); eb(206) } else { eb(242); eb(72); eb(15); eb(42); eb(206) }
         // FIX 0.0.220 -- two defects, both in the RESULT STORE.
@@ -894,6 +1091,7 @@ fn emit_bltn(nmi,nl,ii) {
         // NO flush_all — uses only xmm0/xmm1
         let fa0=0; if ira1(ii)>=1 { if is_float_vr(irres(ira2(ii)))==1 { fa0=1 } }
         let fa1=0; if ira1(ii)>=2 { if is_float_vr(irres(ira2(ii)+1))==1 { fa1=1 } }
+        if fa0==0 && fa1==0 { eb(72); eb(137); eb(248); eb(72); eb(153); eb(72); eb(247); eb(254); return 1 }  // mov rax,rdi; cqo; idiv rsi — integer fast-path
         if fa0==1 { eb(102); eb(72); eb(15); eb(110); eb(199) } else { eb(242); eb(72); eb(15); eb(42); eb(199) }
         if fa1==1 { eb(102); eb(72); eb(15); eb(110); eb(206) } else { eb(242); eb(72); eb(15); eb(42); eb(206) }
         // FIX 0.0.220 -- two defects, both in the RESULT STORE.
@@ -1063,48 +1261,48 @@ fn emit_bltn(nmi,nl,ii) {
         return 1
     }
     // faddf_avx2(dst, a, b): 4-wide double add
-    if nl==6&&r8(nm)=='f'&&r8(nm+1)=='a'&&r8(nm+2)=='d'&&r8(nm+3)=='d'&&r8(nm+4)=='f'&&r8(nm+5)=='2' {
+    if nl==10&&r8(nm)=='f'&&r8(nm+1)=='a'&&r8(nm+2)=='d'&&r8(nm+3)=='d'&&r8(nm+4)=='f'&&r8(nm+5)=='_'&&r8(nm+6)=='a'&&r8(nm+7)=='v'&&r8(nm+8)=='x'&&r8(nm+9)=='2' {
         flush_all()
         // Args: rdi=dst, rsi=a, rdx=b (pointers to 4 doubles each)
         // vmovupd ymm0, [rsi]
-        eb(196); eb(225); eb(121); eb(16); eb(6)
+        eb(196); eb(225); eb(125); eb(16); eb(6)
         // vmovupd ymm1, [rdx]
-        eb(196); eb(225); eb(121); eb(16); eb(10)
+        eb(196); eb(225); eb(125); eb(16); eb(10)
         // vaddpd ymm0, ymm0, ymm1
-        eb(197); eb(249); eb(88); eb(193)
+        eb(197); eb(253); eb(88); eb(193)
         // vmovupd [rdi], ymm0
-        eb(196); eb(225); eb(121); eb(17); eb(7)
+        eb(196); eb(225); eb(125); eb(17); eb(7)
         // return dst
         eb(72); eb(137); eb(248)
         return 1
     }
     // fmulf_avx2(dst, a, b): 4-wide double multiply
-    if nl==6&&r8(nm)=='f'&&r8(nm+1)=='m'&&r8(nm+2)=='u'&&r8(nm+3)=='l'&&r8(nm+4)=='f'&&r8(nm+5)=='2' {
+    if nl==10&&r8(nm)=='f'&&r8(nm+1)=='m'&&r8(nm+2)=='u'&&r8(nm+3)=='l'&&r8(nm+4)=='f'&&r8(nm+5)=='_'&&r8(nm+6)=='a'&&r8(nm+7)=='v'&&r8(nm+8)=='x'&&r8(nm+9)=='2' {
         flush_all()
-        eb(196); eb(225); eb(121); eb(16); eb(6)
-        eb(196); eb(225); eb(121); eb(16); eb(10)
-        eb(197); eb(249); eb(89); eb(193)
-        eb(196); eb(225); eb(121); eb(17); eb(7)
+        eb(196); eb(225); eb(125); eb(16); eb(6)
+        eb(196); eb(225); eb(125); eb(16); eb(10)
+        eb(197); eb(253); eb(89); eb(193)
+        eb(196); eb(225); eb(125); eb(17); eb(7)
         eb(72); eb(137); eb(248)
         return 1
     }
     // fsubf_avx2(dst, a, b): 4-wide double subtract
-    if nl==6&&r8(nm)=='f'&&r8(nm+1)=='s'&&r8(nm+2)=='u'&&r8(nm+3)=='b'&&r8(nm+4)=='f'&&r8(nm+5)=='2' {
+    if nl==10&&r8(nm)=='f'&&r8(nm+1)=='s'&&r8(nm+2)=='u'&&r8(nm+3)=='b'&&r8(nm+4)=='f'&&r8(nm+5)=='_'&&r8(nm+6)=='a'&&r8(nm+7)=='v'&&r8(nm+8)=='x'&&r8(nm+9)=='2' {
         flush_all()
-        eb(196); eb(225); eb(121); eb(16); eb(6)
-        eb(196); eb(225); eb(121); eb(16); eb(10)
-        eb(197); eb(249); eb(92); eb(193)
-        eb(196); eb(225); eb(121); eb(17); eb(7)
+        eb(196); eb(225); eb(125); eb(16); eb(6)
+        eb(196); eb(225); eb(125); eb(16); eb(10)
+        eb(197); eb(253); eb(92); eb(193)
+        eb(196); eb(225); eb(125); eb(17); eb(7)
         eb(72); eb(137); eb(248)
         return 1
     }
     // fdivf_avx2(dst, a, b): 4-wide double divide
-    if nl==6&&r8(nm)=='f'&&r8(nm+1)=='d'&&r8(nm+2)=='i'&&r8(nm+3)=='v'&&r8(nm+4)=='f'&&r8(nm+5)=='2' {
+    if nl==10&&r8(nm)=='f'&&r8(nm+1)=='d'&&r8(nm+2)=='i'&&r8(nm+3)=='v'&&r8(nm+4)=='f'&&r8(nm+5)=='_'&&r8(nm+6)=='a'&&r8(nm+7)=='v'&&r8(nm+8)=='x'&&r8(nm+9)=='2' {
         flush_all()
-        eb(196); eb(225); eb(121); eb(16); eb(6)
-        eb(196); eb(225); eb(121); eb(16); eb(10)
-        eb(197); eb(249); eb(94); eb(193)
-        eb(196); eb(225); eb(121); eb(17); eb(7)
+        eb(196); eb(225); eb(125); eb(16); eb(6)
+        eb(196); eb(225); eb(125); eb(16); eb(10)
+        eb(197); eb(253); eb(94); eb(193)
+        eb(196); eb(225); eb(125); eb(17); eb(7)
         eb(72); eb(137); eb(248)
         return 1
     }

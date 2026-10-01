@@ -467,10 +467,20 @@ fn main(argc, argv) {
     if bd!=0 {
         let mb = "error: unbalanced braces\n"
         file_write(2, mb+8, len(mb)); had_error=1
+        // Abort here for the same reason as the `no main` check below: every
+        // scanner after this point walks the token stream looking for a `}`
+        // that is not there, and the function-slot table ends up with entries
+        // whose bodies were never closed. Downstream passes then read past the
+        // end of the token array and the compile loop dereferences undefined
+        // vregs, so a plain syntax error surfaced as SIGSEGV/SIGILL instead of
+        // this message. The brace count is a whole-file verdict, so there is
+        // nothing further to learn by continuing.
+        exit(7)
     }
     scantraits()
     mark_module_start()  // Mark module start for symbol ownership tracking
     scanfns()
+    scan_call_float()
     // NOTE: the staged caches are imported LATER, just before the compile loop.
     // Importing here would be too early: every source function's parse does
     // `vclr(); irc=0`, which truncates the shared `ir` buffer and discards all
@@ -498,6 +508,16 @@ fn main(argc, argv) {
     if has_main==0 && no_start==0 && emit_qobj==0 {
         let mm = "error: no 'main' function found\n"
         file_write(2, mm+8, len(mm)); had_error=1
+        // Abort HERE. `had_error` is otherwise only honoured at the end of the
+        // compile loop, but a source with no parseable `fn main` has already
+        // failed the token/brace sanity checks above (unbalanced braces, or an
+        // `import` expansion that swallowed the declaration). The function-slot
+        // table is therefore full of entries whose IR was never built, and the
+        // compile loop dereferences vregs that were never defined -- which
+        // faulted (SIGSEGV) or tripped the overflow trap (SIGILL) instead of
+        // reporting the error. Exit before any of that: the diagnostic above is
+        // the real problem and it is already on stderr.
+        exit(7)
     }
     // --emit-qobj mode: write .qobj module cache (skip main check)
     // Do NOT exit early - need to compile functions to get IR first

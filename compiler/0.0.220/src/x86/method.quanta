@@ -446,23 +446,60 @@ fn parse_primary() {
         return bvr
     }
     if peek()==TT_FNUM {
+        // The exponent side word is read BEFORE adv(): tokp still points at the
+        // float token, and adv() moves it to the next one. Reading afterwards
+        // would pick up the following token's (always zero) side word and turn
+        // every 1.0e3 into 1.0.
+        let exp10 = toke(tokp)
         let v=pval(); adv()
-        // Float value encoded by lexer as (M << 8) | frac_digits
+        // Float value encoded by lexer as (M << 8) | frac_digits, with the SIGNED
+        // decimal exponent in the token's side word.
+        //
+        // 0.0.221: the value is  M / 10^frac_digits * 10^fexp.
+        //
+        // Previously the exponent was folded into the mantissa by the lexer with
+        // integer `val = val*10`, and 10^frac_digits was built here in i64. Both
+        // overflow: 1.0e18 wrapped the mantissa to 0x8AC7230489E80000, and 1.0e-308
+        // wanted 10^308 in an i64. Neither produced a diagnostic -- the compiler
+        // died with SIGILL partway through codegen, so importing any module that
+        // contained a large float literal silently emitted NO binary (exit 0, no
+        // output file, no message).
+        //
+        // The exponent is now applied in FLOATING POINT by the emitter, so no
+        // integer power of ten is ever formed. `scale` is still built in i64 but is
+        // clamped: 10^k fits in i64 for k <= 18, and the lexer already guarantees
+        // frac_digits <= 255, so the clamp is what keeps a pathological literal
+        // from overflowing here.
         let M = v >> 8
         let frac_digits = v & 255
-        // scale = 10^frac_digits (fits i64 for any sane literal)
+        // scale = 10^frac_digits, saturated rather than wrapped.
+        //
+        // The guard must be INT64_MAX/10 = 922337203685477580 (18 digits), NOT
+        // 922337203685477 (15 digits). The shorter constant is smaller than
+        // 10^15 = 1000000000000000, so from frac_digits==16 onward the loop
+        // rejected the very value it had just built and substituted INT64_MAX:
+        //     0.6931471805599453 -> M=6931471805599453 fd=16 scale=INT64_MAX
+        //     6931471805599453 / 9223372036854775807 = 0.000751
+        // which is precisely the value the compiler emitted for that literal.
+        // Because ln2 appears as a literal in lib/std/gguf.quanta's gguf_exp,
+        // the corruption propagated into every softmax in the tree.
         let scale = 1
         let k = frac_digits
-        while k > 0 { scale = scale * 10; k = k - 1 }
-        // Emit fconst(M, scale) -> IEEE-754 bits of M/scale, tagged float.
+        while k > 0 {
+            if scale <= 922337203685477580 { scale = scale * 10 } else { scale = 9223372036854775807; k = 0 }
+            k = k - 1
+        }
+        // Emit fconst(M, scale, exp10) -> IEEE-754 bits of (M/scale)*10^exp10,
+        // tagged float.
         let cnm = srclen
         w8(src+cnm, 102); w8(src+cnm+1, 99); w8(src+cnm+2, 111); w8(src+cnm+3, 110); w8(src+cnm+4, 115); w8(src+cnm+5, 116); w8(src+cnm+6, 0)  // "fconst\0"
         srclen = cnm + 7
         let cavs = irc
         let cm = nv(); iremit(IR_CONST, cm, M, 0, 0)
         let cs = nv(); iremit(IR_CONST, cs, scale, 0, 0)
+        let ce = nv(); iremit(IR_CONST, ce, exp10, 0, 0)
         let cr = nv()
-        iremit(IR_CALL, cr, cnm, 2, cavs)
+        iremit(IR_CALL, cr, cnm, 3, cavs)
         w64(vfloat + cr*8, 1)   // fconst result is a float vreg
         return cr
     }
@@ -1539,6 +1576,26 @@ fn parse_primary() {
     // anything -- is what lets parse_assign see it. parse_assign's chain loop
     // does the real work.
     if peek()==TT_OP && pval()==61 {
+        return 0
+    }
+    // 0.0.220 SAFETY NET: a TT_KEY that reached the end of parse_primary was
+    // matched by no keyword handler, so it is not a keyword in expression
+    // position -- treat it as an identifier. Without this, a keyword table entry
+    // with no parser consumer silently returned CONST-0 WITHOUT advancing the
+    // cursor, which desynced the token stream: `read_raw(fd, raw, 8)` parsed only
+    // 2 arguments and was rejected with a bogus "wrong argument count for:
+    // read_raw" (the real defect this line's absence caused). Consuming the
+    // token here keeps the cursor honest and resolves the name through the
+    // normal local -> global -> const path.
+    if peek()==TT_KEY {
+        let knm = pval(); let kln = plen(); adv()
+        let kv = vfind(knm, kln); if kv>=0 { return kv }
+        let kg = gfind(knm, kln)
+        if kg>=0 { let kvr=nv(); iremit(IR_LOADG,kvr,kg,0,0); return kvr }
+        let kc = cfind(knm, kln); if kc>=0 { let kvr=nv(); iremit(IR_CONST,kvr,kc,0,0); return kvr }
+        // Genuinely unresolvable: keep the old no-advance behaviour so a real
+        // missing keyword is still diagnosed by the statement-level error path
+        // rather than being masked as a value.
         return 0
     }
     let vr5=nv(); iremit(IR_CONST,vr5,0,0,0); return vr5

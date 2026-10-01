@@ -601,6 +601,7 @@ fn rewrite_struct_literals() {
                                 w64(toks + w*TKS + 16, tokl(r))
                                 w64(toks + w*TKS + 24, tokc(r))
                                 w64(toks + w*TKS + 32, tokln(r))
+                                w64(toks + w*TKS + 40, toke(r))
                             }
                             w = w+1
                             r = r+1
@@ -613,6 +614,7 @@ fn rewrite_struct_literals() {
                         w64(toks + w*TKS + 16, tokl(end))
                         w64(toks + w*TKS + 24, tokc(end))
                         w64(toks + w*TKS + 32, tokln(end))
+                        w64(toks + w*TKS + 40, 0)
                         // shift everything after end down by (end - w)
                         let gap = end - w
                         let s = end + 1
@@ -622,6 +624,7 @@ fn rewrite_struct_literals() {
                             w64(toks + (s-gap)*TKS + 16, tokl(s))
                             w64(toks + (s-gap)*TKS + 24, tokc(s))
                             w64(toks + (s-gap)*TKS + 32, tokln(s))
+                            w64(toks + (s-gap)*TKS + 40, toke(s))
                             s = s+1
                         }
                         tokc = tokc - gap
@@ -633,3 +636,180 @@ fn rewrite_struct_literals() {
     }
 }
 
+// scan_call_float: mark a callee's parameters as f64 from the float arguments its
+// CALLERS pass, by walking the token stream.
+//
+// Why this exists
+// ---------------
+// `fn_parflt` was set ONLY for a parameter DECLARED `: f64`. Quanta's stdlib is
+// overwhelmingly UNTYPED (64 untyped fn definitions across gguf/fs/math against
+// only 7 `: f64` params), so an untyped float parameter reached every arithmetic
+// operation untagged and took the INTEGER code path on the raw bit patterns:
+//     rax=0x4008000000000000 (3.0)   rcx=0x4010000000000000 (4.0)
+//     imul %rcx,%rdx        <- integer multiply, not mulsd
+//     jno  <ok>             <- overflow trap, taken immediately
+//     ud2                   <- SIGILL
+// Reproduced: `fn helper(a,b){ return a*b }` then `helper(3.0, 4.0)` exits 132,
+// while `fn helper(a: f64, b: f64)` returned 12.0 correctly.
+//
+// Why it must live HERE and not in codegen
+// ----------------------------------------
+// Parse and emit are FUSED per function: entry.quanta parses a body and then
+// immediately calls ci_func on it. A callee is therefore fully emitted before any
+// call site that could say "a float is on the way" has been read, and there is no
+// "all functions parsed, none emitted" point at which an inference pass could run.
+// Inside ci_func it is equally impossible: IR_PARAM's result vreg lives in the
+// CALLEE's vreg space while the caller's float vreg lives in the CALLER's, and no
+// IR_MOV chain joins the two -- which is why an earlier attempt to spread the float
+// tag inside the vfloat fixpoint could not make the untyped helper work.
+//
+// scanfns is the one pass that sees every token of the whole file before any
+// function is emitted, so it is the only place where the callee's signature and the
+// caller's arguments are both visible.
+//
+// Rule
+// ----
+// For every call `name(arg0, arg1, ...)` where `name` resolves to a registered
+// function, if argument k is a float literal then parameter k of that function is a
+// float. Monotonic, so one float call site is enough. A parameter already declared
+// `: f64`, `: big`, string-typed or fn-typed is left alone (the declared type wins),
+// and integer call sites are untouched, so integer code is bit-for-bit unchanged.
+fn scan_call_float() {
+    let q = 0
+    while q < tokc {
+        if tokt(q)==TT_ID {
+            let cn = tokv(q)
+            let cl = tokln(q)
+            if q+1 < tokc && tokt(q+1)==TT_PNCT && tokv(q+1)==40 {
+                // Inline GLOBAL lookup. findfn_global() falls back to findfn(), whose
+                // per-function scope state is not yet populated at scan time and
+                // crashed the bootstrap build with exit 139. Matching registered
+                // top-level functions directly is both safe here and exactly the set
+                // callable by name at this point.
+                // EVERY registered top-level function with this name, not just the
+                // first. The name table can hold a function more than once -- the
+                // module itself plus the copy `import` registers -- and the
+                // registration the emitter will actually use is not necessarily the
+                // lowest index. Taking the first match marked the wrong slot: for
+                // `fn h(a,b){...}` (fi 1) called as `h(2, 3.0)`, the mark landed on
+                // fi 21, so parameter 1 of the real `h` stayed untagged and
+                // `a + b` took the integer path over the bit patterns. When both
+                // arguments were floats every candidate happened to be marked and
+                // the bug stayed invisible.
+                //
+                // Marking is monotonic and guarded (a slot already claimed by a
+                // declared type is skipped), so marking every same-named function
+                // is safe and is the only choice that does not depend on
+                // registration order.
+                let s = q + 2
+                let argi = 0
+                let depth = 1
+                while s < tokc && depth > 0 {
+                    let t = tokt(s)
+                    let v = tokv(s)
+                    // A STRING literal is ONE token whose text may contain any
+                    // bracket or paren: "(", ")", "[", "]", "{", "}" all appear
+                    // verbatim inside it. Counting those swung `depth` and, once
+                    // it went negative, the `depth > 0` loop condition ended the
+                    // scan -- dropping every call site after this one. Float
+                    // inference then silently missed the rest of the file:
+                    //
+                    //   import std/fs
+                    //   fn dd(a, b) { return a / b }
+                    //   dd(6.0, 2.0)   -> 0.000000   (integer idiv on bit patterns)
+                    //
+                    // std/fs has such strings, so the user's call -- which sits
+                    // after the import in the expanded source -- was never read.
+                    // A string is one token; skip it whole.
+                    if t == TT_STR { s = s + 1; continue }
+                    if t==TT_PNCT {
+                        if v==40 || v==91 || v==123 { depth = depth + 1 }
+                        if v==41 || v==93 || v==125 {
+                            depth = depth - 1
+                            if depth == 0 { s = s + 1; break }
+                        }
+                        if v==44 && depth == 1 { argi = argi + 1 }
+                    }
+                    // A float literal argument marks the parameter float.
+                    //
+                    // The lexer already classifies these: a number followed by a
+                    // decimal point or an exponent is emitted as TT_FNUM, not
+                    // TT_NUM. So the test is the token type itself -- no text
+                    // scan of the source is needed or correct.
+                    //
+                    // (An earlier version of this checked `t==TT_NUM` and then
+                    // scanned `src+tp` for a '.', 'e' or 'E'. Both halves were
+                    // wrong: TT_FNUM==7 is the float token, and `stok`'s `v`
+                    // field is the token's parsed INTEGER value, not a source
+                    // pointer, so `r8(src+tp+z)` read unrelated bytes and the
+                    // test never fired.)
+                    //
+                    // `-1.0` arrives as TT_OP 45 then TT_FNUM, so a negative
+                    // literal still presents the float as its own token; the
+                    // parameter index is unaffected because '-' is not a comma.
+                    if t==TT_FNUM && depth == 1 && argi < 200 {
+                        // Mark EVERY same-named top-level function, so the slot the
+                        // emitter reads is set regardless of which registration of
+                        // the name the emitter picked.
+                        let gj = 0
+                        while gj < fnc {
+                            if r64(fn_parent + gj*8) < 0 && fn_nlen(gj)==cl {
+                                let okk = 1
+                                let kk = 0
+                                while kk < cl {
+                                    if r8(src+fn_name(gj)+kk)!=r8(src+cn+kk) { okk = 0; break }
+                                    kk = kk + 1
+                                }
+                                if okk == 1 {
+                                    let slot = gj*200 + argi
+                                    if r64(fn_parflt + slot*8)==0
+                                       && r64(fn_parbig + slot*8)==0
+                                       && r64(fn_parstr + slot*8)==0
+                                       && r64(fn_parfn  + slot*8)==0 {
+                                        w64(fn_parflt + slot*8, 1)
+                                    }
+                                }
+                            }
+                            gj = gj + 1
+                        }
+                    }
+                    s = s + 1
+                }
+                // s must always move strictly forward, or the scan stalls.
+                // If depth never returned to 0 (an unbalanced '(' -- a '(' inside a
+                // STRING literal, or a 'fn(...)' TYPE that the depth counter reads
+                // as a call) the inner loop runs s to tokc and the whole pass ends
+                // there, silently missing every call site after it:
+                //
+                //     import std/fs
+                //     fn dd(a, b) { return a / b }
+                //     dd(6.0, 2.0)     -> 0.000000, dd is never marked
+                //
+                // The pass exists to infer float parameters from call sites in the
+                // WHOLE file, so dropping the tail loses real inference, not trivia.
+                // Advance one token past the '(' when the scan did not consume a
+                // balanced argument list, so the next candidate call is still seen.
+                // Resume at the token AFTER the call NAME, not past the whole
+                // argument list. Skipping the list hid every NESTED call:
+                //
+                //   print_f(dd(6.0, 2.0))
+                //
+                // The outer `print_f(` scan consumed `dd(6.0, 2.0)` wholesale, so
+                // the outer loop never presented `dd` as a candidate -- and `dd`'s
+                // float arguments were then seen at depth 2 of the print_f scan,
+                // where the depth-1 test ignores them. Zero inference, silently:
+                //
+                //   fn dd(a, b) { return a / b }
+                //   let q = dd(6.0, 2.0)      -> parameters marked, works
+                //   print_f(dd(6.0, 2.0))     -> 0.000000
+                //
+                // A float argument in real code is nearly always nested inside
+                // another call, so the nested form is the one that matters.
+                // Resuming at q+1 lets each call be visited in its own right.
+                q = q + 1
+                continue
+            }
+        }
+        q = q + 1
+    }
+}
