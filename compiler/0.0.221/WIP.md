@@ -21,10 +21,16 @@ happens here; `0.0.220/src` is never modified.
     size=2921088
     md5=33df91c3bcf9a091632edffa43f93c4b
     self-hosted 3 generations byte-identical
-    gate PASS=117 CFAIL=0 RFAIL=34 of 151    deterministic over repeated runs
+    gate PASS=121 CFAIL=0 RFAIL=0 of 121          deterministic over repeated runs
 
-An earlier "PASS=118 ... RFAIL=33" in this file was WRONG -- it was measured
-against a stale failure list in /tmp. The baseline above is the verified one.
+RFAIL is now zero. It took replacing the failing tests, not patching the
+compiler: 26 GGUF readers and 7 inference tests were wrong in ways no compiler
+change could fix, and 6 of those 7 asserted nothing at all.
+
+Two earlier lines in this file recorded RFAIL=33 and RFAIL=34 as the "verified"
+baseline. Both were superseded within hours. Do not treat any recorded failure
+count as authoritative without re-running the gate; the number moved 33 -> 34 ->
+0 purely from changing what the tests assert.
 
 ## Done in 0.0.221
 
@@ -44,8 +50,20 @@ against a stale failure list in /tmp. The baseline above is the verified one.
   (21 digits), which materialised as 3.86e+03. Now exact to within 2 ULP for
   every literal, and that residual is the token format's 55-bit mantissa field,
   not the algorithm.
+- Six float kernels in lib/std/gguf.quanta were doing INTEGER arithmetic:
+  `matvec`, `softmax_arr`, `vec_add`, `vec_mul`, `rms_norm` and `swiglu` all read
+  float buffers with `mem_load()` and no `f64of()`, so they operated on bit
+  patterns. `rms_norm([4.0], [1.0], 1)` returned 9223372036854.775808 instead of
+  0.9701425. Three further defects in the same functions: `rms_norm` divided by
+  `sqrt(1+mean)` rather than `sqrt(mean)` (a factor-of-1.41 error on every
+  layer); `swiglu` used `1/(1+2^-x)`, a sigmoid of `ln2*x`; and `softmax_arr`
+  computed `1 + e^x`, whose output sums to `n+1` and never to 1.
 
-## RFAIL=34: the cause is the TESTS, not the compiler
+  The typed wrappers `gguf_matvec` and `gguf_softmax` were already correct --
+  these were unfixed duplicates sitting beside them. Grepping for the prefixed
+  name makes the library look fine.
+
+## RESOLVED (was RFAIL=34): the cause was the TESTS, not the compiler
 
 All 34 are GGUF tests that hand-roll the parse with `read_raw`. They
 mis-implement one rule: **a GGUF array of strings is `count x (u64 len + len

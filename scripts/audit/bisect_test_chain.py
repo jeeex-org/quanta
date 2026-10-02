@@ -1,12 +1,13 @@
-"""Bisect the 37-pair loop INSIDE tests/test_simple_parse.quanta by replacing
+"""Bisect the 37-pair loop INSIDE tests/sys.argv[1] if len(sys.argv) > 1 else 'test_gguf_wire'.quanta by replacing
 the else-if chain with a reduced one, keeping everything else (prologue, the two
 mem_allocs, the read_raw sequence) exactly as written. This stays faithful to the
 real test because only the chain varies."""
+import sys
 import subprocess, os
 
 R = '/opt/tali/quanta'
 QC = R + '/compiler/0.0.221/bin/x86/qc'
-L = open(R + '/tests/test_simple_parse.quanta').read().split('\n')
+L = open(R + '/tests/sys.argv[1] if len(sys.argv) > 1 else 'test_gguf_wire'.quanta').read().split('\n')
 
 # lines 29..45 (1-based) are the if/else-if chain
 CHAIN_START, CHAIN_END = 28, 45   # 0-based slice bounds

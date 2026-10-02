@@ -6,12 +6,14 @@ import subprocess, os, sys
 R = '/opt/tali/quanta'
 QC = sys.argv[1] if len(sys.argv) > 1 else R + '/compiler/0.0.221/bin/x86/qc'
 
-TESTS = ['test_simple_parse', 'test_skip_37', 'test_raw2', 'test_no_lib',
-         'test_correct_format', 'test_gguf_full_debug', 'test_inline_load',
-         'test_list_tensors2', 'test_scan2', 'test_single_file',
-         'test_skip_all_kv', 'test_skip_and_read', 'test_skip_loop',
-         'test_tensor_read_only', 'test_prealloc_37', 'test_minimal_loader',
-         'test_minimal_loader2']
+# Discovered, not hardcoded. The previous list named 33 tests that no longer
+# exist; a stale list makes this script silently test nothing.
+def discover():
+    d = R + '/tests'
+    return sorted(os.path.basename(p)[:-7] for p in
+                  (d + '/' + f for f in os.listdir(d)) if p.endswith('.quanta'))
+
+TESTS = discover()
 
 ok = fail = nobin = 0
 for t in TESTS:
