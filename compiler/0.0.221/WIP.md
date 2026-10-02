@@ -18,10 +18,10 @@ happens here; `0.0.220/src` is never modified.
 ## Current state (measured, not asserted)
 
     compiler/0.0.221/bin/x86/qc
-    size=2921088
-    md5=33df91c3bcf9a091632edffa43f93c4b
+    size=2929280
+    md5=dd025dcef8090492b1d6736c3f7b2d0b
     self-hosted 3 generations byte-identical
-    gate PASS=121 CFAIL=0 RFAIL=0 of 121          deterministic over repeated runs
+    gate PASS=123 CFAIL=0 RFAIL=0 of 123          deterministic over repeated runs
 
 RFAIL is now zero. It took replacing the failing tests, not patching the
 compiler: 26 GGUF readers and 7 inference tests were wrong in ways no compiler
@@ -31,6 +31,56 @@ Two earlier lines in this file recorded RFAIL=33 and RFAIL=34 as the "verified"
 baseline. Both were superseded within hours. Do not treat any recorded failure
 count as authoritative without re-running the gate; the number moved 33 -> 34 ->
 0 purely from changing what the tests assert.
+
+## OPEN DEFECTS (measured, not suspected)
+
+### pow ignores an INTEGER exponent
+
+    pow(2.0, 3)     -> 1.0     want 8.0
+    pow(2.0, 3.0)   -> 8.0     correct
+
+The two spellings of the same call disagree, which is the tell. `pow` loads both
+operands into rdi/rsi and stores them to the slots the x87 sequence `fld`s from,
+but it never checks `is_float_vr()` the way fadd/fsub/fmul/fdiv do. An integer
+argument's bits are therefore reinterpreted as a denormal, and 0x3 as bits is
+why 1.0 comes out.
+
+`pow(2.0, n)` in a loop is the usual spelling, so this matters. It fails
+silently -- a plausible wrong number, not a crash.
+
+Fix identified and attempted (emitter.quanta's pow handler: convert an integer
+operand in place with cvtsi2sd, then move the f64 bits back into rdi/rsi; a
+float needs no conversion since rdi already holds its bits). Saved at
+/tmp/keep/emitter_pow_int_exp_attempt.quanta. It builds and does not regress the
+gate but does not yet produce correct values -- see
+quanta-compiler-development/references/pow-ignores-integer-exponent.md for the
+three encoding traps on the way, which cost most of the attempt.
+
+### sin/cos near roots -- NOT a defect, and the earlier claim was wrong
+
+Measured on 4000 arguments each (dense -20..20 plus every power of ten to 1e6),
+by RELATIVE error:
+
+    sin  3999/4001 exact, worst relative error 2.0e-16   (~1 ULP)
+    cos  3995/4001 exact, worst relative error 2.2e-16
+    tan  3985/4001 exact, worst relative error 2.0e-16
+    log   428/428  exact, worst relative error 0
+
+An earlier note in this file claimed sin had "up to 57 ULP" error and needed a
+range-reduced polynomial. That was measured in ABSOLUTE ULP distance near a
+root, where the true value is ~6e-17 -- the wrong metric. These are production
+accuracy, at or better than glibc. No change is needed, and the attempted
+`sinf()` that this claim motivated was correctly rejected on its own merits.
+
+### Array indexing has no bounds check
+
+    bytes_eq(fd, 32, [103,101,110,101,114,97,108,46,108,97,110,103,117,97,103,101,115],
+             18, 51)     // 17 codes, len 18  ->  SIGILL
+
+Indexing one element past a literal runs off the constant pool and dies with
+SIGILL rather than returning a value. Found by writing tests/test_gguf_wire.
+A bounds check returning a sentinel would turn that crash into a wrong answer,
+which is strictly easier to diagnose.
 
 ## Done in 0.0.221
 
