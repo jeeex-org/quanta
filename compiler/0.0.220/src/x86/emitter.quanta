@@ -1084,36 +1084,42 @@ fn emit_bltn(nmi,nl,ii) {
         flush_all()
         eb(72); eb(139); eb(7)                  // mov rax, [rdi]
         w8(vfloat+irres(ii), 1)                // the result IS an f64 bit pattern
+            // Bind the computed %rax to the result vreg. Without this the
+            // caller reads whatever the result register happens to hold, so
+            // the builtin's value never arrives: abs() returned 4 for every
+            // argument.
+            sdef(irres(ii), 0)
         return 1
     }
     if nl==7&&r8(nm)=='f'&&r8(nm+1)=='6'&&r8(nm+2)=='4'&&r8(nm+3)=='b'&&r8(nm+4)=='i'&&r8(nm+5)=='t'&&r8(nm+6)=='s' {  // f64bits(x): f64 -> raw u64 bit pattern
         // Without this there is NO way to validate a float in Quanta: print_f()
         // cannot represent Inf/NaN/subnormals faithfully and f2i() saturates,
         // so a test could never assert the exact bits of a converted value --
-        // which is what the IEEE-754 conversion tests must do.
+        // which is what every IEEE-754 test in the tree depends on.
         //
-        // The RESULT IS AN INTEGER, deliberately NOT tagged vfloat. The point is
-        // to get the bit pattern out as an integer; tagging it float makes the
-        // caller print the pattern back as the float it encodes, which is a
-        // silent no-op rather than a wrong number.
+        // The RESULT IS AN INTEGER, deliberately NOT tagged vfloat. Tagging it
+        // float makes the caller print the pattern back as the float it encodes,
+        // a silent no-op rather than a wrong number.
         //
-        // This is a single-argument builtin, so codegen's IR_CALL marshalling has
-        // already put the argument in %rdi -- exactly where f2i and the other
-        // single-arg builtins read it from. The conversion is the identity (the
-        // argument IS the bit pattern), so all that is needed is rax <- rdi.
-        //
-        // Read the MARSHALLED register, not aphys(av) of the argument vreg. An
-        // earlier version resolved the vreg and moved aphys(av) -> aphys(res),
-        // which took a register from the allocator without asking it: the
-        // register was still marked live, so a later spill wrote through it and
-        // arguments that followed picked up a STALE value from an earlier
-        // statement. In test_f32_conv that surfaced as a `want` argument
-        // arriving as a different literal entirely:
-        //     check("-maxf32 (0xFF7FFFFF)", p, -4039728866288205824)
-        //     -> want printed as -5183643170566569984   (+maxf32's constant)
-        // NO flush_all(): it would spill live vregs into the argument register,
-        // destroying the argument -- which here is the whole answer.
-        rr(0, 7)                                 // mov rax, rdi
+        // Move the ARGUMENT VREG into %rax explicitly. Do not assume the
+        // argument is already sitting in the marshalled %rdi: that holds when
+        // the argument is a plain value, but NOT when it is the result of
+        // another call, because a builtin result is bound to its own vreg and
+        // never copied into the argument register. Reading %rdi then returned
+        // whatever that register last held:
+        //     f64bits(abs(3.7))    -> 1
+        //     let a = abs(3.7)
+        //     f64bits(a)            -> 4615514078110652826   (correct)
+        // The same shape affected sqrt, floor and ceil; the audit that found it
+        // covered every math builtin against Python on the raw bits.
+        let av = -1
+        let ab = ira2(ii)
+        if ira1(ii) >= 1 && ab >= 0 { av = irres(ab) }
+        // The argument record is IR_MOV dst <- src, so irres is the call-owned
+        // COPY and ira0 is the value. And register 0 is a real destination:
+        // guarding `rs != 0` emitted `mov %rax,%rax`, leaving the previous
+        // statement's %rax in place -- which is how f64bits(abs(3.7)) returned 1.
+        if av >= 0 { let srcv = ira0(ab)  let rs = aphys(srcv)  rr(0, rs) }
         sdef(irres(ii), 0)
         w8(vfloat+irres(ii), 0)
         return 1
@@ -3360,6 +3366,11 @@ fn emit_bltn2(nmi,nl,ii) {
         // which is bit arithmetic on the float's encoding, and it is what broke
         // gguf_exp's range reduction (`let r: f64 = x - k * ln2`).
         w8(vfloat+irres(ii), 1)
+            // Bind the computed %rax to the result vreg. Without this the
+            // caller reads whatever the result register happens to hold, so
+            // the builtin's value never arrives: abs() returned 4 for every
+            // argument.
+            sdef(irres(ii), 0)
         return 1
     }
     // floor(a), ceil(a): use roundsd
@@ -3371,6 +3382,11 @@ fn emit_bltn2(nmi,nl,ii) {
         // imm 1 is round-down = floor, so the result is a float. Tag it, or the
         // enclosing multiply/add subtracts the raw pattern as an integer.
         w8(vfloat+irres(ii), 1)
+            // Bind the computed %rax to the result vreg. Without this the
+            // caller reads whatever the result register happens to hold, so
+            // the builtin's value never arrives: abs() returned 4 for every
+            // argument.
+            sdef(irres(ii), 0)
         return 1
     }
     if nl==4&&r8(nm)=='c'&&r8(nm+1)=='e'&&r8(nm+2)=='i'&&r8(nm+3)=='l' {
@@ -3381,19 +3397,30 @@ fn emit_bltn2(nmi,nl,ii) {
             // Result is an f64 bit pattern; tag it or the enclosing arithmetic
             // runs the INTEGER path over the pattern (add/sub/mul/div).
         w8(vfloat+irres(ii), 1)
+            // Bind the computed %rax to the result vreg. Without this the
+            // caller reads whatever the result register happens to hold, so
+            // the builtin's value never arrives: abs() returned 4 for every
+            // argument.
+            sdef(irres(ii), 0)
         return 1
     }
     // abs(a) for f64: clear sign bit
     if nl==3&&r8(nm)=='a'&&r8(nm+1)=='b'&&r8(nm+2)=='s' {
         flush_all()
         let arg0v = irres(ira2(ii))
-        rbp(7, spill_home(arg0v))                     // rdi = a (arg0 from spill home)
-        eb(72); eb(137); eb(192)           // mov rax, rdi
-        ri64(1, 0x7FFFFFFFFFFFFFFF)        // mov rcx, mask
-        eb(72); eb(33); eb(200)            // and rax, rcx (48 21 C8)
+        rbp(0, spill_home(arg0v))                     // mov rax, [arg0 spill home]
+        eb(72); eb(137); eb(199)           // mov rdi, rax   (arg0 also goes to rdi
+                                            //  for the marshalled-arg convention)
+        ri64(1, 0x7FFFFFFFFFFFFFFF)        // mov rcx, 0x7FFF_FFFF_FFFF_FFFF
+        eb(72); eb(33); eb(200)            // and rax, rcx   (48 21 C8)
             // Result is an f64 bit pattern; tag it or the enclosing arithmetic
             // runs the INTEGER path over the pattern (add/sub/mul/div).
         w8(vfloat+irres(ii), 1)
+            // Bind the computed %rax to the result vreg. Without this the
+            // caller reads whatever the result register happens to hold, so
+            // the builtin's value never arrives: abs() returned 4 for every
+            // argument.
+            sdef(irres(ii), 0)
         return 1
     }
     // ---- P2: fmin / fmax (SSE, branchless via comisd + cmov) ----
@@ -3415,6 +3442,11 @@ fn emit_bltn2(nmi,nl,ii) {
             // Result is an f64 bit pattern; tag it or the enclosing arithmetic
             // runs the INTEGER path over the pattern (add/sub/mul/div).
         w8(vfloat+irres(ii), 1)
+            // Bind the computed %rax to the result vreg. Without this the
+            // caller reads whatever the result register happens to hold, so
+            // the builtin's value never arrives: abs() returned 4 for every
+            // argument.
+            sdef(irres(ii), 0)
         return 1
     }
     if nl==4&&r8(nm)=='f'&&r8(nm+1)=='m'&&r8(nm+2)=='a'&&r8(nm+3)=='x' {
@@ -3434,6 +3466,11 @@ fn emit_bltn2(nmi,nl,ii) {
             // Result is an f64 bit pattern; tag it or the enclosing arithmetic
             // runs the INTEGER path over the pattern (add/sub/mul/div).
         w8(vfloat+irres(ii), 1)
+            // Bind the computed %rax to the result vreg. Without this the
+            // caller reads whatever the result register happens to hold, so
+            // the builtin's value never arrives: abs() returned 4 for every
+            // argument.
+            sdef(irres(ii), 0)
         return 1
     }
     // ---- P2: transcendentals via x87 FPU (freestanding, no libm) ----
@@ -3456,6 +3493,11 @@ fn emit_bltn2(nmi,nl,ii) {
             // Result is an f64 bit pattern; tag it or the enclosing arithmetic
             // runs the INTEGER path over the pattern (add/sub/mul/div).
         w8(vfloat+irres(ii), 1)
+            // Bind the computed %rax to the result vreg. Without this the
+            // caller reads whatever the result register happens to hold, so
+            // the builtin's value never arrives: abs() returned 4 for every
+            // argument.
+            sdef(irres(ii), 0)
         return 1
     }
     // cos(a): fld a; fcos
@@ -3472,6 +3514,11 @@ fn emit_bltn2(nmi,nl,ii) {
             // Result is an f64 bit pattern; tag it or the enclosing arithmetic
             // runs the INTEGER path over the pattern (add/sub/mul/div).
         w8(vfloat+irres(ii), 1)
+            // Bind the computed %rax to the result vreg. Without this the
+            // caller reads whatever the result register happens to hold, so
+            // the builtin's value never arrives: abs() returned 4 for every
+            // argument.
+            sdef(irres(ii), 0)
         return 1
     }
     if nl==3&&r8(nm)=='t'&&r8(nm+1)=='a'&&r8(nm+2)=='n' {
@@ -3488,6 +3535,11 @@ fn emit_bltn2(nmi,nl,ii) {
             // Result is an f64 bit pattern; tag it or the enclosing arithmetic
             // runs the INTEGER path over the pattern (add/sub/mul/div).
         w8(vfloat+irres(ii), 1)
+            // Bind the computed %rax to the result vreg. Without this the
+            // caller reads whatever the result register happens to hold, so
+            // the builtin's value never arrives: abs() returned 4 for every
+            // argument.
+            sdef(irres(ii), 0)
         return 1
     }
     // log(a) = ln(a): fldln2; fld a; fyl2x  (st0 = ln2 * log2(a) = ln(a))
@@ -3507,6 +3559,11 @@ fn emit_bltn2(nmi,nl,ii) {
             // Result is an f64 bit pattern; tag it or the enclosing arithmetic
             // runs the INTEGER path over the pattern (add/sub/mul/div).
         w8(vfloat+irres(ii), 1)
+            // Bind the computed %rax to the result vreg. Without this the
+            // caller reads whatever the result register happens to hold, so
+            // the builtin's value never arrives: abs() returned 4 for every
+            // argument.
+            sdef(irres(ii), 0)
         return 1
     }
     // pow(a,b) = exp(b * ln(a)). Compute ln(a) via fyl2x*ln2, multiply by b, exp.
@@ -3549,6 +3606,11 @@ fn emit_bltn2(nmi,nl,ii) {
             // Result is an f64 bit pattern; tag it or the enclosing arithmetic
             // runs the INTEGER path over the pattern (add/sub/mul/div).
         w8(vfloat+irres(ii), 1)
+            // Bind the computed %rax to the result vreg. Without this the
+            // caller reads whatever the result register happens to hold, so
+            // the builtin's value never arrives: abs() returned 4 for every
+            // argument.
+            sdef(irres(ii), 0)
         return 1
     }
     // ---- P2: random / fs-meta / introspection builtins (syscall-backed) ----
