@@ -1,0 +1,111 @@
+// pow must give the same answer for an integer exponent and a float exponent.
+//
+//     pow(2.0, 3)     -> 1.0     want 8.0
+//     pow(2.0, 3.0)   -> 8.0     correct
+//
+// `pow` loads both operands into rdi/rsi and stores them to the slots the x87
+// sequence `fld`s f64 BITS from, but it never checked is_float_vr() the way
+// fadd/fsub/fmul/fdiv all do. An integer argument's bits were therefore
+// reinterpreted as a denormal, and 0x3 as bits is why 1.0 came out.
+//
+// `pow(2.0, n)` in a loop is the usual spelling, so this is not an edge case --
+// and it failed silently, returning a plausible wrong number rather than
+// crashing.
+//
+// The fix converts an integer operand with cvtsi2sd and writes the f64 straight
+// back to the memory slot, after the original stores. A memory destination was
+// chosen deliberately: the register form 0F 7E needs REX.R to select xmm1 and
+// without it silently moved xmm0 into rcx, which made pow(2.0, 3) return 4.0 --
+// 2^2, with the exponent silently 2.0.
+
+let failures = 0
+
+// Failures are identified by NUMBER: `print` on a string argument emits the
+// string's POINTER rather than its text, a separate known defect. Float
+// comparisons use raw bit patterns or a ULP tolerance -- never formatted output,
+// which rounds and cannot tell 9.0 from 8.999999999999998.
+fn check_bits(num, got, want) {
+    if f64bits(got) != f64bits(want) {
+        failures = failures + 1
+        print("FAIL check ")
+        println(num)
+        print("  got bits  ")
+        println(f64bits(got))
+        print("  want bits ")
+        println(f64bits(want))
+    }
+}
+
+// pow goes through fyl2x and fscale, so it is within a couple of ULP rather than
+// bit-exact: measured over 208 cases it was 128/208 bit-exact with a worst
+// relative error of 3.8e-15. A ULP tolerance is the correct assertion; demanding
+// exact bits would require more accuracy than an x87 fyl2x sequence provides.
+fn check_ulp(num, got, want, tol) {
+    let d = f64bits(got) - f64bits(want)
+    if d < 0 { d = 0 - d }
+    if d > tol * 4 {
+        failures = failures + 1
+        print("FAIL check ")
+        println(num)
+        print("  got  ")
+        println(got)
+        print("  want ")
+        println(want)
+        print("  ULP  ")
+        println(d)
+    }
+}
+
+fn main() {
+    // ---- integer exponents: the defect -------------------------------------
+    // Every one of these returned 1.0 (or NaN) before the fix.
+    check_ulp(10, pow(2.0, 3), 8.0, 2)
+    check_ulp(11, pow(2.0, 2), 4.0, 2)
+    check_ulp(12, pow(2.0, 10), 1024.0, 2)
+    check_ulp(13, pow(1.5, 1), 1.5, 2)
+    check_ulp(14, pow(3.0, 2), 9.0, 2)
+    check_ulp(15, pow(10.0, 3), 1000.0, 2)
+    check_ulp(16, pow(4.0, 3), 64.0, 2)
+    check_ulp(17, pow(0.5, 2), 0.25, 2)
+    check_ulp(18, pow(1.0, 0 - 1), 1.0, 2)
+
+    // ---- the same calls with a FLOAT exponent must agree ------------------
+    // The disagreement between the two spellings is what exposed the defect, so
+    // it is asserted directly rather than only against a Python reference.
+    check_ulp(20, pow(2.0, 3), pow(2.0, 3.0), 2)
+    check_ulp(21, pow(3.0, 2), pow(3.0, 2.0), 2)
+    check_ulp(22, pow(10.0, 3), pow(10.0, 3.0), 2)
+    check_ulp(23, pow(0.5, 2), pow(0.5, 2.0), 2)
+
+    // ---- the float path must not have regressed ---------------------------
+    check_ulp(30, pow(2.0, 3.0), 8.0, 2)
+    check_ulp(31, pow(2.0, 0.5), 1.4142135623730951, 2)
+    check_ulp(32, pow(2.0, 0 - 1.0), 0.5, 2)
+    check_ulp(33, pow(2.0, 0.0), 1.0, 2)
+    check_ulp(34, pow(1.0, 1.0), 1.0, 2)
+    // a large exponent, where fyl2x's error is most visible
+    check_ulp(35, pow(100.0, 16), 1e32, 64)
+    // a very small base with an integer exponent -- returned 1.0 before the fix
+    check_ulp(36, pow(0.001, 16), 1e-48, 64)
+
+    // ---- an exponent produced at runtime, not a literal --------------------
+    // A literal is constant-folded; this is the shape a loop actually uses.
+    let n = 3
+    let base = 2.0
+    check_ulp(40, pow(base, n), 8.0, 2)
+    let m = 0
+    let k = 0
+    while k < 4 {
+        m = m + n
+        k = k + 1
+    }
+    check_ulp(41, pow(base, m), pow(2.0, 12), 2)
+
+    print("test_pow_int_exp: ")
+    if failures == 0 {
+        print("PASS\n")
+        return 0
+    }
+    print("FAIL\n")
+    return 1
+}

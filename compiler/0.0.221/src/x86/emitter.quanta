@@ -3577,6 +3577,35 @@ fn emit_bltn2(nmi,nl,ii) {
         fx87prep()                               // force 64-bit FPU precision
         eb(72); eb(137); eb(60); eb(36)   // mov [rsp], rdi      (a bits)
         eb(72); eb(137); eb(116); eb(36); eb(8)   // mov [rsp+8], rsi  (b bits)
+        // An argument may be an INTEGER, and the x87 sequence below `fld`s f64
+        // BITS from those slots. Storing rdi/rsi straight through reinterpreted a
+        // small integer as a denormal and collapsed the result:
+        //
+        //     pow(2.0, 3)     -> 1.0     want 8.0
+        //     pow(1.5, 1)     -> 1.0     want 1.5
+        //     pow(1.0, -1)    -> NaN    want 1.0
+        //     pow(2.0, 3.0)   -> 8.0     correct -- only the FLOAT spelling worked
+        //
+        // so `pow(2.0, 3)` and `pow(2.0, 3.0)` disagreed, which is the tell.
+        // fadd/fsub/fmul/fdiv all branch on is_float_vr() for this; pow did not.
+        // `pow(2.0, n)` in a loop is the usual spelling, so this is not an edge
+        // case, and it fails silently rather than crashing.
+        //
+        // Convert AFTER the stores, writing straight to the memory slot. A memory
+        // destination sidesteps the register-direction problem entirely: the reg
+        // field of a memory-operand form names the xmm unambiguously, where the
+        // 0F 7E register form needs REX.R to select xmm1 and silently moved xmm0
+        // into rcx without it -- which made pow(2.0, 3) return 4.0, i.e. 2^2 with
+        // the exponent silently 2.0.
+        //
+        //   cvtsi2sd xmm0, rdi  = F2 48 0F 2A C7
+        //   movsd [rsp], xmm0   = F2 0F 11 04 24
+        //   cvtsi2sd xmm1, rsi  = F2 48 0F 2A CE
+        //   movsd [rsp+8], xmm1 = F2 0F 11 4C 24 08
+        let pa0 = is_float_vr(arg0v)
+        let pa1 = is_float_vr(arg1v)
+        if pa0==0 { eb(242); eb(72); eb(15); eb(42); eb(199); eb(242); eb(15); eb(17); eb(4); eb(36) }
+        if pa1==0 { eb(242); eb(72); eb(15); eb(42); eb(206); eb(242); eb(15); eb(17); eb(76); eb(36); eb(8) }
         // ln(a): fldln2; fld [rsp]; fyl2x
         // z = b * log2(a). log2(a) via fyl2x: fld1; fld a; fyl2x -> st0 = 1.0*log2(a) = log2(a)
         // (z = b*ln(a)*log2(e) = b*log2(a) since ln(a)*log2(e)=log2(a) exactly — avoids rounding error)
