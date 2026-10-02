@@ -521,19 +521,33 @@ fn dequant_q4k(raw, nelements, out) {
 }
 
 fn rms_norm(out, x, w, n) {
+    // Standard RMSNorm: y[i] = x[i] / sqrt(mean(x^2)) * w[i].
+    //
+    // The divisor is sqrt(mean), NOT sqrt(1 + mean). The stray +1 (meant as an
+    // epsilon guard) scaled every vector by 1/sqrt(2) at unit magnitude, which
+    // is a factor-of-1.41 error on every layer of the model. Measured on
+    // x = all ones, w = [0.001, ..., 2.048]:
+    //     with the +1: 0.0007071067812 / 1.4481546879
+    //     correct:     0.0010000000000 / 2.0480000000
     let ms = i2f(0)
     let i = 0
     while i < n {
-        let v = mem_load(x + i * 8)
+        // f64of is REQUIRED: mem_load() returns the raw 8 bytes as an integer,
+        // so without it every value below is a float's bit pattern fed to
+        // fadd/fmul as a number. The integer path also overflows -- 4.0's bit
+        // pattern is 4612676019179889152 and squaring it needs 2^124, which
+        // raises the compiler's overflow trap.
+        let v = f64of(mem_load(x + i * 8))
         ms = fadd(ms, fmul(v, v))
         i = i + 1
     }
-    ms = fdiv(ms, i2f(n))
-    let ir = fdiv(i2f(1), sqrt(fadd(ms, i2f(1))))
-    
+    let ir = fdiv(i2f(1), sqrt(fdiv(ms, i2f(n))))
+
     i = 0
     while i < n {
-        mem_store(out + i * 8, fmul(fmul(mem_load(x + i * 8), ir), mem_load(w + i * 8)))
+        let xv = f64of(mem_load(x + i * 8))
+        let wv = f64of(mem_load(w + i * 8))
+        mem_store(out + i * 8, fmul(fmul(xv, ir), wv))
         i = i + 1
     }
 }
@@ -541,37 +555,43 @@ fn rms_norm(out, x, w, n) {
 fn matvec(A, x, rows, cols, y) {
     let i = 0
     while i < rows {
-        let sum = i2f(0)
+        // `acc` MUST be a typed float and both operands MUST go through f64of.
+        // mem_load() returns a raw 64-bit bit pattern, so the untyped version
+        // this replaces emitted an integer imul plus the signed-overflow trap
+        // and overflowed on ordinary index arithmetic.
+        let acc: f64 = 0.0
         let j = 0
         while j < cols {
-            sum = fadd(sum, fmul(mem_load(A + (i * cols + j) * 8), mem_load(x + j * 8)))
+            let a = f64of(mem_load(A + (i * cols + j) * 8))
+            let xv = f64of(mem_load(x + j * 8))
+            acc = acc + a * xv
             j = j + 1
         }
-        mem_store(y + i * 8, sum)
+        mem_store(y + i * 8, acc)
         i = i + 1
     }
 }
 
 fn softmax_arr(out, inp, n) {
-    let max_val = mem_load(inp)
+    if n <= 0 { return 0 }
+    let max_val: f64 = f64of(mem_load(inp))
     let i = 1
     while i < n {
-        let v = mem_load(inp + i * 8)
-        if f2i(v) > f2i(max_val) { max_val = v }
+        let v = f64of(mem_load(inp + i * 8))
+        if v > max_val { max_val = v }
         i = i + 1
     }
-    let sum = i2f(0)
+    let sum: f64 = 0.0
     i = 0
     while i < n {
-        let ev = fadd(i2f(1), fsub(mem_load(inp + i * 8), max_val))
-        if f2i(ev) < 0 { ev = i2f(0) }
-        sum = fadd(sum, ev)
+        let ev = gguf_exp(f64of(mem_load(inp + i * 8)) - max_val)
         mem_store(out + i * 8, ev)
+        sum = sum + ev
         i = i + 1
     }
     i = 0
     while i < n {
-        mem_store(out + i * 8, fdiv(mem_load(out + i * 8), sum))
+        mem_store(out + i * 8, f64of(mem_load(out + i * 8)) / sum)
         i = i + 1
     }
 }
@@ -579,10 +599,15 @@ fn softmax_arr(out, inp, n) {
 fn swiglu(out, x, y, n) {
     let i = 0
     while i < n {
-        let xv = mem_load(x + i * 8)
-        let yv = mem_load(y + i * 8)
-        let neg_x = fsub(i2f(0), xv)
-        let sig = fdiv(i2f(1), fadd(i2f(1), pow(i2f(2), neg_x)))
+        // Same defect rms_norm had: mem_load() yields the integer bit pattern,
+        // so swiglu was computing silu on bit patterns rather than values.
+        let xv = f64of(mem_load(x + i * 8))
+        let yv = f64of(mem_load(y + i * 8))
+        // sigmoid(x) = 1 / (1 + e^-x). This used pow(2, -x), which is
+        // 1/(1 + e^(-x*ln2)) -- a sigmoid of ln2*x, not of x. Measured on
+        // x = 2, y = 10: it returned 16.0, and the correct
+        // silu(2)*10 = 2/(1+e^-2)*10 = 17.615941559557648.
+        let sig = fdiv(i2f(1), fadd(i2f(1), gguf_exp(fsub(i2f(0), xv))))
         mem_store(out + i * 8, fmul(fmul(xv, sig), yv))
         i = i + 1
     }
@@ -591,7 +616,7 @@ fn swiglu(out, x, y, n) {
 fn vec_add(out, a, b, n) {
     let i = 0
     while i < n {
-        mem_store(out + i * 8, fadd(mem_load(a + i * 8), mem_load(b + i * 8)))
+        mem_store(out + i * 8, f64of(mem_load(a + i * 8)) + f64of(mem_load(b + i * 8)))
         i = i + 1
     }
 }
@@ -599,7 +624,7 @@ fn vec_add(out, a, b, n) {
 fn vec_mul(out, a, b, n) {
     let i = 0
     while i < n {
-        mem_store(out + i * 8, fmul(mem_load(a + i * 8), mem_load(b + i * 8)))
+        mem_store(out + i * 8, f64of(mem_load(a + i * 8)) * f64of(mem_load(b + i * 8)))
         i = i + 1
     }
 }

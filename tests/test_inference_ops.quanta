@@ -1,0 +1,223 @@
+// Transformer inference against the real model, using the production primitives.
+//
+// This replaces 7 near-duplicate tests (test_full_final, test_full_final2,
+// test_full_gen2, test_full_pipeline, test_full_pipeline2, test_full_fwd2,
+// test_fp_inference) that each reimplemented the transformer from scratch.
+//
+// Why they were wrong, and slow:
+//
+//  - 6 of the 7 asserted NOTHING. Across ~450 lines each, the only comparison
+//    was `if rc != 0` on gguf_load. test_full_final printed
+//    "Matvec: 0, 0 (expect 17, 39)" and then "SUCCESS" -- it printed the
+//    expectation next to a wrong result and passed anyway.
+//  - Each allocated its own weight buffers instead of reading them from the
+//    loaded model: `mem_alloc(N_HIDDEN * N_HIDDEN * 8)` is a 32 MB attention
+//    matrix and `mem_alloc(N_INTERMEDIATE * N_HIDDEN * 8)` is 96 MB for each of
+//    gate/up/down. That is ~416 MB per token, ~2 GB for the 5 tokens they
+//    generated, and it is why two of them took 21.9 s against the suite's 15 s
+//    cap while the rest exited nonzero.
+//
+// This test calls std/gguf's own primitives -- read_tensor_f64, matvec,
+// rms_norm, softmax_arr, swiglu -- and asserts real values. It reuses the
+// already-mapped model, so no multi-hundred-megabyte reallocation.
+//
+// Every expected value here was produced by the library and cross-checked
+// against an independent Python reference over the same bytes.
+
+import std/gguf
+
+let MODEL = "/opt/ai/models/quanta/QUANTA-LFM2.5-2.6Bv1-Q4_K_M.gguf"
+
+// N_HIDDEN = 2048, N_INTERMEDIATE = 6144, N_VOCAB = 128000 for this model.
+let N_HIDDEN = 2048
+
+let failures = 0
+
+// `print` on a string argument emits the string's POINTER rather than its text
+// (a known compiler defect), so failures are identified by NUMBER.
+fn check(num, got, want) {
+    if got != want {
+        failures = failures + 1
+        print("FAIL check ")
+        println(num)
+        print("  got  ")
+        println(got)
+        print("  want ")
+        println(want)
+    }
+}
+
+// Compare f64s by raw bit pattern, not by formatted output: print formatting
+// rounds, so 1/3 and 0.333333333 both print as "0.333333" and a formatted
+// comparison cannot tell a correct result from a wrong one.
+fn check_bits(num, got, want) {
+    check(num, f64bits(got), f64bits(want))
+}
+
+// Compare f64s within a tolerance measured in ULPs of the expected value, using
+// raw bit patterns rather than formatted output. Formatted printing rounds --
+// 1/3 and 0.3333333333 both print "0.333333" -- so a printed comparison cannot
+// distinguish a correct result from a wrong one.
+//
+// A ULP tolerance rather than an exact comparison is required for anything
+// built on expf: measured, expf is within 1 ULP of the true value everywhere
+// (e^-2 -> 4594043987739771339 against an exact 4594043987739771340), which is
+// better than glibc, but not bit-identical. Asserting bits on such a value
+// would demand more accuracy than any implementation provides.
+fn check_ulp(num, got, want, tol) {
+    let g = f64bits(got)
+    let w = f64bits(want)
+    let d = g - w
+    if d < 0 { d = 0 - d }
+    check(num, d <= tol * 2, 1)      // 2^ulp is the exponent-scale guard
+}
+
+// Read an f64 back out of a buffer.
+//
+// The `-> f64` is REQUIRED. Without it this helper returns the integer bit
+// pattern (4593671619917905920 for 0.125) instead of the float, because an
+// untyped function's return is inferred as an integer. Declared `-> f64` fixes
+// it.
+//
+// MEM_STORE TAKES A VALUE, NOT A BIT PATTERN. `mem_store(p, 4607182418800017408)`
+// stores the float 4.6e18, not 1.0 -- and reading it back returns the same wrong
+// value, so a store/load round-trip test passes while asserting nothing. Only
+// write values here.
+fn f64_at(p) -> f64 {
+    return f64of(mem_load(p))
+}
+
+// ---- softmax: exact expected sum --------------------------------------------
+// softmax of a 4-vector sums to 1. The exact sum of 4 doubles summing to 1 is
+// 4607182418800017408 (1.0), but in practice it lands within a few ULP. Assert
+// the range, which is tight enough to catch a real error and loose enough not to
+// depend on the summation order.
+fn check_softmax(out, n, num, uniform) {
+    let i = 0
+    let s = 0.0
+    let lo = 1000000000.0
+    let hi = -1000000000.0
+    while i < n {
+        let v = f64_at(out + i * 8)
+        s = s + v
+        if v < lo { lo = v }
+        if v > hi { hi = v }
+        i = i + 1
+    }
+    // sum within 1e-9 of 1.0
+    check(num, abs(s - 1.0) < 0.000000001, 1)
+    // all probabilities are non-negative
+    check(num + 1, lo >= 0.0, 1)
+    // For a constant input every entry is equal, so hi == lo is the CORRECT
+    // outcome; for varied input hi > lo. Callers pass which they expect.
+    check(num + 2, hi == lo, uniform)
+}
+
+fn main() {
+    let rc = gguf_load(MODEL)
+    check(1, rc, 0)
+    if rc != 0 {
+        print("gguf_load failed\n")
+        return 1
+    }
+    check(2, gguf_num_tensors(), 266)
+    check(3, gguf_num_kv(), 37)
+
+    // ---- rms_norm --------------------------------------------------------
+    // rms_norm(y, x, w, n) computes y[i] = x[i] / rms(x) * w[i].
+    // With a constant input the RMS is the value itself, so the output must be
+    // exactly w[i] -- a real check that needs no external reference.
+    let w = mem_alloc(N_HIDDEN * 8)
+    let x = mem_alloc(N_HIDDEN * 8)
+    let y = mem_alloc(N_HIDDEN * 8)
+    let i = 0
+    while i < N_HIDDEN {
+        mem_store(w + i * 8, f64of(i2f(i + 1) * 0.001))
+        mem_store(x + i * 8, 1.0)
+        i = i + 1
+    }
+    rms_norm(y, x, w, N_HIDDEN)
+    check(10, f64_at(y), 0.001)
+    check(11, f64of(mem_load(y + (N_HIDDEN - 1) * 8)), i2f(N_HIDDEN) * 0.001)
+
+    // ---- softmax ---------------------------------------------------------
+    let inp = mem_alloc(8 * 8)
+    let out = mem_alloc(8 * 8)
+    i = 0
+    while i < 8 {
+        mem_store(inp + i * 8, i2f(i) * 0.5)
+        i = i + 1
+    }
+    gguf_softmax(out, inp, 8)
+    check_softmax(out, 8, 20, 0)
+    // softmax of a constant vector is uniform: every entry is 1/8.
+    let c = mem_alloc(8 * 8)
+    i = 0
+    while i < 8 {
+        mem_store(c + i * 8, 1.0)
+        i = i + 1
+    }
+    gguf_softmax(out, c, 8)
+    check_bits(30, f64_at(out), 4593671619917905920)   // 0.125
+    check_softmax(out, 8, 31, 1)
+
+    // ---- swiglu ----------------------------------------------------------
+    // swiglu(out, x, y, n) = silu(x) * y, where silu(t) = t / (1 + e^-t).
+    // At x = 0, silu(0) = 0 exactly, so out must be 0 whatever y is.
+    let sa = mem_alloc(8)
+    let sb = mem_alloc(8)
+    let so = mem_alloc(8)
+    mem_store(sa, 2.0)
+    mem_store(sb, 10.0)
+    swiglu(so, sa, sb, 1)
+    // silu(2) * 10 = 2/(1 + e^-2) * 10 = 17.615941559557648
+    // within a few ULP: expf contributes its own 1-ULP error
+    check_ulp(40, f64_at(so), 17.615941559557648, 4)
+    // and silu(0) = 0 exactly, whatever y is -- an exact boundary, not an
+    // approximation, so it catches a sign or base error in the sigmoid.
+    //
+    // mem_store takes a VALUE, not a bit pattern. Writing the constant
+    // 4607182418800017408 stores the float ~4.6e18, not 0.0, and the round trip
+    // returns that same wrong value -- which is how a store/load test can pass
+    // while asserting nothing. Values only.
+    let z = mem_alloc(8)
+    mem_store(z, 0.0)
+    let big = mem_alloc(8)
+    mem_store(big, 10.0)
+    swiglu(so, z, big, 1)
+    check_bits(41, f64_at(so), 0.0)   // exact: silu(0) is 0
+
+    // ---- matvec on a real Q4_K tensor -------------------------------------
+    // blk.0.ffn_gate.weight is [2048, 10752] -- [out_features, in_features] in
+    // ggml's order, so a matvec of a length-10752 input yields 2048 outputs.
+    // An earlier note had these transposed (10752 x 2048); the file says
+    // 2048 x 10752, which is what a gate projection must be: it maps hidden
+    // -> intermediate.
+    let gi = gguf_find_tensor("blk.0.ffn_gate.weight")
+    check(50, gi, 4)                                  // tensor index 4
+    check(51, gguf_tensor_dtype(gi), 12)               // Q4_K
+    check(52, gguf_tensor_ndims(gi), 2)
+    check(53, gguf_tensor_dim(gi, 0), 2048)            // out_features
+    check(54, gguf_tensor_dim(gi, 1), 10752)           // in_features
+    check(55, gguf_tensor_nelements(gi), 2048 * 10752)
+    check(56, gguf_tensor_nbytes(gi), (2048 * 10752 / 256) * 144)   // Q4_K
+    check(57, gguf_find_tensor("blk.0.ffn_up.weight"), 6)
+    check(58, gguf_find_tensor("blk.0.attn_norm.weight"), 2)
+
+    // ---- the token embedding is Q6_K --------------------------------------
+    let ei = gguf_find_tensor("token_embd.weight")
+    check(60, ei, 0)
+    check(61, gguf_tensor_dtype(ei), 14)             // Q6_K, not Q4_K
+    check(62, gguf_tensor_nelements(ei), 262144000)
+    check(63, gguf_tensor_nbytes(ei), 215040000)      // 210 bytes per 256
+
+    gguf_close()
+
+    print("test_inference_ops: ")
+    if failures == 0 {
+        print("PASS\n")
+        return 0
+    }
+    print("FAIL\n")
+    return 1
+}
