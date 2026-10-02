@@ -1,0 +1,135 @@
+// String PARAMETERS must print as text, not as a heap pointer.
+//
+// Regression test for a defect that survived because locals and literals worked:
+// `println("hi")` and `println(x)` where `x` is a `let` both printed correctly,
+// while every string PARAMETER printed its address.
+//
+//     fn f(s: str) { println(s) }
+//     fn main() { f("hello") return 0 }      ->  1109393744
+//
+// Three separate causes, all fixed:
+//
+//  1. `: str`      lexes as a plain TT_ID, so funcscan's type-annotation guard
+//                  admitted it and fn_parstr was written -- but entry.quanta
+//                  never applied that flag to the vreg.
+//  2. `: string`   lexes as TT_STRING(29), a token class distinct from TT_KEY.
+//                  The guard accepted only TT_ID, TT_KEY, '[' and '(', so a
+//                  `: string` annotation was never entered: the type was not
+//                  recorded AND the type expression was not consumed.
+//  3. `String`     is the same ktext(37)/TT_STRING as `string`, so the
+//                  case-sensitive byte compare in the guard missed it.
+//
+// And the flag write itself was w8 where it had to be w64: nv() initialises each
+// vreg_is_str cell to -1 with w64(), so a one-byte store left it at
+// 0xFFFFFFFFFFFFFF01 -- neither the 1 that string readers test for nor the -1
+// they read as "not a string". The identical mistake had already killed the
+// declared `-> string` return tag; see codegen.quanta's IR_RET branch.
+
+import std/fs
+
+let failures = 0
+
+// `print` on a string argument emits the string's POINTER rather than its text --
+// a separate known defect -- so failures are identified by NUMBER.
+fn check(num, got, want) {
+    if got != want {
+        failures = failures + 1
+        print("FAIL check ")
+        println(num)
+        print("  got  ")
+        println(got)
+        print("  want ")
+        println(want)
+    }
+}
+
+fn f_str(s: str) {
+    println(s)
+}
+
+fn f_string(s: string) {
+    println(s)
+}
+
+fn f_String(s: String) {
+    println(s)
+}
+
+// Mixed signature: a string param next to integer params, and the string used
+// for something other than printing -- len() and open() both work on the value
+// whether or not the tag is right, so only the print is evidence of the tag.
+fn mixed(s: str, n) {
+    print("n=")
+    println(n)
+    print("len=")
+    println(len(s))
+    print("s=")
+    println(s)
+}
+
+// A string param passed through to another string param.
+fn passthrough(a: str, b: str) {
+    print("a=")
+    println(a)
+    print("b=")
+    println(b)
+}
+
+fn echo_len(s: str) {
+    return len(s)
+}
+
+fn locals_still_work() {
+    let x: str = "local"
+    println(x)
+    println("literal")
+}
+
+// HOW THIS TEST VERIFIES ITSELF, and why it is shaped this way.
+//
+// The string tag has exactly ONE observable effect in the language: it decides
+// which code path print/println take. Tagged, they write the string's bytes;
+// untagged, they treat the value as an integer and render its heap address as
+// digits. Nothing else distinguishes them:
+//
+//   len(s)   works either way -- it reads the length header, which is present
+//             regardless of the tag.
+//   open(s)  works either way -- it uses the value as a raw pointer.
+//   strcat()  works either way -- the address is itself a readable buffer, so a
+//             concatenation of it has the length of the address, not of the text.
+//
+// That is why an earlier version of this test PASSED on a compiler that printed
+// every parameter as a pointer: it only measured len() of literals passed
+// straight into the callee, which is correct in both worlds.
+//
+// There is no in-language way to capture stdout, so the verdict has to come from
+// the suite. tests/run_string_params.py compiles and runs this program and
+// compares stdout against the exact expected text, which is where a pointer
+// shows up as digits. The in-program assertions below cover what CAN be checked
+// in-language: that each parameter arrives with the length header of the string
+// that was passed, which a stray int or truncated pointer would not.
+
+fn main() {
+    f_str("A")
+    f_string("B")
+    f_String("C")
+    mixed("D", 42)
+    passthrough("E", "F")
+    locals_still_work()
+
+    // In-language only: each parameter's length header is the one it was given.
+    check(90, echo_len("A"), 1)
+    check(91, echo_len("hello"), 5)
+    check(92, echo_len("local"), 5)
+    check(93, echo_len("literal"), 7)
+    check(94, echo_len("a-much-longer-string-value"), 26)
+    // The rest of the verdict is the printed output; see the note above.
+
+    print("test_string_params: ")
+    if failures == 0 {
+        print("PASS\n")
+        return 0
+    }
+    print("FAIL\n")
+    return 1
+}

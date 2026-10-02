@@ -757,8 +757,45 @@ fn main(argc, argv) {
             if ptyp < 0-1 { w64(vreg_trait + vr*8, (ptyp * -1) - 2) }
             // 0.0.114: tag param vreg big when declared `: big`
             if r64(fn_parbig + (fi*200 + pz)*8)==1 { w64(vreg_is_big + vr*8, 1) }
-            pc=pc+1
-            pz=pz+1
+                                        // A parameter declared `: str` / `: string` is a string
+                                        // vreg. Same shape as the float, big and struct tagging
+                                        // directly above.
+                                        //
+                                        // fn_parstr was allocated in 0.0.166 and read by
+                                        // find_str_source() and by print()/echo()/file_open(), and
+                                        // funcscan.quanta writes the flag from the signature -- but
+                                        // nothing applied it to the vreg. So every string-typed
+                                        // parameter came back untagged and printing it emitted the
+                                        // raw heap pointer instead of the text:
+                                        //     fn f(s: str) { println(s) }
+                                        //     fn main() { f("hello") return 0 }   ->  1109393744
+                                        //
+                                        // Locals were never affected -- `let x: str = "hi"` prints
+                                        // fine -- because a local's tag comes from the IR_STR that
+                                        // produced it. That asymmetry is what hid this: every
+                                        // string-taking helper in the tree was affected, and no
+                                        // local-only test could see it.
+                                        // w64, NOT w8. nv() initialises every vreg_is_str cell to -1 via w64(), so a
+                            // ONE-BYTE store leaves the cell at 0xFFFFFFFFFFFFFF01 --
+                            // neither the 1 that string readers test for, nor the -1
+                            // they treat as "not a string". This exact mistake
+                            // already killed the declared `-> string` return tag; see
+                            // codegen.quanta's IR_RET branch for the same story. vfloat
+                            // is read bytewise, which is why w8 is correct THERE and
+                            // fatal here.
+                            if r64(fn_parstr + (fi*200 + pz)*8)==1 { w64(vreg_is_str + vr*8, 1) }
+                                        // Link the vreg to its fn_parstr slot. find_str_source()
+                                        // walks the MOV/STR/PARAM chain and, on IR_PARAM,
+                                        // consults vreg_to_param + fn_parstr; nv() zeroes
+                                        // vreg_to_param for every fresh vreg and the only writer
+                                        // was codegen's CACHED-IR path, so on a normal compile
+                                        // this stayed 0 and find_str_source() concluded "not a
+                                        // string param". Key shape is fi*200 + param_index,
+                                        // matching funcscan.quanta, codegen.quanta and
+                                        // objfmt.quanta.
+                                        w64(vreg_to_param + vr*8, fi*200 + pz)
+                                        pc=pc+1
+                                        pz=pz+1
                     }
                     // P10: Bind generic type parameters in function body scope
                     let gen_count = r64(fn_genparams + fi*8)

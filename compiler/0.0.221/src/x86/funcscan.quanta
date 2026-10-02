@@ -201,7 +201,15 @@ fn scanfns() {
                         {
                           let nk = k+1
                           if nk<tokc && tokt(nk)==TT_PNCT && tokv(nk)==58 { nk=nk+1 }  // skip ':'
-                          if nk<tokc && (tokt(nk)==TT_ID || tokt(nk)==TT_KEY || (tokt(nk)==TT_PNCT && (tokv(nk)==91 || tokv(nk)==40))) {
+                          // TT_STRING belongs here. `string` and `String` both map to ktext 37,
+                            // which lexer.quanta rewrites to TT_STRING(29) -- a token class of
+                            // its own, distinct from TT_KEY. This guard accepted only
+                            // TT_ID, TT_KEY, '[' and '(', so a `: string` parameter
+                            // annotation was never entered: the declared type was not
+                            // recorded AND the type expression was not consumed, which
+                            // is why `fn b(s: string)` printed the heap pointer while
+                            // `fn a(s: str)` worked -- `str` lexes as a plain TT_ID.
+                            if nk<tokc && (tokt(nk)==TT_ID || tokt(nk)==TT_KEY || tokt(nk)==TT_STRING || (tokt(nk)==TT_PNCT && (tokv(nk)==91 || tokv(nk)==40))) {
                             // P10: flag fn-pointer params (f: fn(...) -> ...)
                             if ktext(tokv(nk), tokln(nk))==1 { w64(fn_parfn + (fnc*200 + saw_param-1)*8, 1) }
                             // 0.0.114: flag big-typed params (x: big)
@@ -224,8 +232,18 @@ fn scanfns() {
                             let snl = tokln(nk)
                             if (snl==3 && r8(src+tokv(nk))=='s' && r8(src+tokv(nk)+1)=='t' && r8(src+tokv(nk)+2)=='r')
                                || (snl==6 && r8(src+tokv(nk))=='s' && r8(src+tokv(nk)+1)=='t'
-                                   && r8(src+tokv(nk)+2)=='r' && r8(src+tokv(nk)+3)=='i'
-                                   && r8(src+tokv(nk)+4)=='n' && r8(src+tokv(nk)+5)=='g') {
+                                                                   && r8(src+tokv(nk)+2)=='r' && r8(src+tokv(nk)+3)=='i'
+                                                                   && r8(src+tokv(nk)+4)=='n' && r8(src+tokv(nk)+5)=='g')
+                                                               // `String` with a capital S is the same ktext (37) and the
+                                                               // same TT_STRING token, so the byte compare above misses
+                                                               // it. Quanta's keyword table already treats the two
+                                                               // spellings as one word ("Only String gets a lowercase
+                                                               // alias"); the type-annotation check has to agree, or
+                                                               // `fn b(s: String)` prints a heap pointer while
+                                                               // `fn b(s: string)` works.
+                                                               || (snl==6 && r8(src+tokv(nk))=='S' && r8(src+tokv(nk)+1)=='t'
+                                                                   && r8(src+tokv(nk)+2)=='r' && r8(src+tokv(nk)+3)=='i'
+                                                                   && r8(src+tokv(nk)+4)=='n' && r8(src+tokv(nk)+5)=='g') {
                                 w64(fn_parstr + (fnc*200 + saw_param-1)*8, 1)
                             }
                             // Consume the full type expression, tracking [] and ()
