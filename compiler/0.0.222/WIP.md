@@ -54,18 +54,47 @@ history but wrong as a header. Replaced, not appended to.)
 
 ## OPEN DEFECTS
 
-### Array indexing has no bounds check
+### Nested indexing into a string-array element CRASHES THE COMPILER
 
-    bytes_eq(fd, 32, [103,101,110,101,114,97,108,46,108,97,110,103,117,97,103,101,115],
-             18, 51)      // 17 codes, len 18  ->  SIGILL
+    let p = ["one", "two", "three"]
+    println(p[1][0])        // SIGILL while COMPILING, before any run
 
-Indexing one element past a literal runs off the end of the constant pool and
-dies with SIGILL rather than returning a value or raising a diagnosable error.
-Found while writing tests/test_gguf_wire.
+This is not a miscompilation -- the compiler itself dies with SIGILL on this
+source. `p[1]` alone works (it yields the element's string pointer), so the crash
+is specific to indexing a second time into an IR_IDX result.
 
-A bounds check returning a sentinel would turn this crash into a wrong answer,
-which is strictly easier to diagnose -- an out-of-range index is a caller bug and
-should not take the process down.
+The emitter already has the machinery for it: `vreg_str_arr` is set on a string
+array's result vreg, and the IR_IDX array branch reads it to tag the RESULT as a
+byte-stride string, which is what would make the second index stride by 1. That
+tagging is at codegen.quanta:1580. So the intent is implemented and something in
+the path still faults -- worth an actual diagnosis before guessing.
+
+Not asserted in tests/test_indexing_bounds.quanta on purpose: a compile-time
+SIGILL would take the whole suite down and hide every other check in the file.
+
+### A slice whose HIGH bound exceeds the length traps instead of clamping
+
+    let b = [10, 20, 30, 40, 50]
+    b[3:5]   -> len 2   correct
+    b[3:3]   -> len 0   correct
+    b[3:99]  -> SIGILL
+
+method.quanta's slice lowering clamps only the LOW side:
+
+    nraw = hi - lo
+    neg  = nraw < 0
+    n    = neg ? 0 : nraw        // clamps nraw < 0 to an empty slice
+    dst  = TALLOC(n)
+    loop idx in 0..n: dst[idx] = base[lo+idx]
+
+So `hi` is never bounded by the array length, and when `hi > len` the loop walks
+past the end and `idx_trap_emit` fires. Python, Rust and Go all clamp the high
+bound; this does not. Whether that is the right choice is a design question --
+but it is currently silent, since the comment at method.quanta describes the
+clamp as if it covered both ends.
+
+### CORRECTION: array indexing IS bounds-checked
+
 
 ## Verified pitfalls for this tree
 
