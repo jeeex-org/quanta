@@ -732,10 +732,23 @@ fn gguf_exp(x: f64) -> f64 {
         i = i + 1
     }
     // 2^k by repeated squaring on the integer part.
+    //
+    // The loop builds 2^n for POSITIVE n only -- `while n > 0` never runs when ki
+    // is negative, so p stayed 1.0 and `acc / p` returned acc UNSCALED. Every
+    // negative argument was therefore off by a factor of 2^|k|:
+    //     exp(-1) -> 0.7357588823428848   (should be 0.36787944117144233)
+    //     exp(-2) -> 1.2718...            (should be 0.1353352832366127)
+    //     exp(-10)-> 1.0539...            (should be 4.5399929762484854e-05)
+    //
+    // The loop below runs on |ki|, so p is 2^|k| in both directions and the final
+    // multiply/divide by it selects the right one. It is exact: every step is a
+    // power of two and 2^|k| is representable for |k| <= 1023, which the range
+    // guards above already bound.
     let ki = f2i(k)
     let p: f64 = 1.0
     let b: f64 = 2.0
     let n = ki
+    if n < 0 { n = 0 - n }
     while n > 0 {
         let half = n / 2
         if n - half * 2 > 0 { p = p * b }

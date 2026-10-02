@@ -3353,6 +3353,13 @@ fn emit_bltn2(nmi,nl,ii) {
         eb(102); eb(72); eb(15); eb(110); eb(199)      // movq xmm0, rdi
         eb(242); eb(15); eb(81); eb(192)               // sqrtsd xmm0, xmm0 (F2 0F 51 C0)
         eb(102); eb(72); eb(15); eb(126); eb(192)      // movq rax, xmm0
+        // The result IS an f64 bit pattern. Without this tag the enclosing
+        // arithmetic takes the INTEGER path over the pattern:
+        //     let k: f64 = floor(q)
+        //     k * ln2      -> 4883635614223334241, not 4604418534313441775
+        // which is bit arithmetic on the float's encoding, and it is what broke
+        // gguf_exp's range reduction (`let r: f64 = x - k * ln2`).
+        w8(vfloat+irres(ii), 1)
         return 1
     }
     // floor(a), ceil(a): use roundsd
@@ -3361,6 +3368,9 @@ fn emit_bltn2(nmi,nl,ii) {
         eb(102); eb(72); eb(15); eb(110); eb(199)
         eb(102); eb(15); eb(58); eb(11); eb(192); eb(1)  // roundsd xmm0, xmm0, 1 (66 0F 3A 0B C0 01)
         eb(102); eb(72); eb(15); eb(126); eb(192)
+        // imm 1 is round-down = floor, so the result is a float. Tag it, or the
+        // enclosing multiply/add subtracts the raw pattern as an integer.
+        w8(vfloat+irres(ii), 1)
         return 1
     }
     if nl==4&&r8(nm)=='c'&&r8(nm+1)=='e'&&r8(nm+2)=='i'&&r8(nm+3)=='l' {
@@ -3368,6 +3378,9 @@ fn emit_bltn2(nmi,nl,ii) {
         eb(102); eb(72); eb(15); eb(110); eb(199)
         eb(102); eb(15); eb(58); eb(11); eb(192); eb(2)  // roundsd xmm0, xmm0, 2 (66 0F 3A 0B C0 02)
         eb(102); eb(72); eb(15); eb(126); eb(192)
+            // Result is an f64 bit pattern; tag it or the enclosing arithmetic
+            // runs the INTEGER path over the pattern (add/sub/mul/div).
+        w8(vfloat+irres(ii), 1)
         return 1
     }
     // abs(a) for f64: clear sign bit
@@ -3378,6 +3391,9 @@ fn emit_bltn2(nmi,nl,ii) {
         eb(72); eb(137); eb(192)           // mov rax, rdi
         ri64(1, 0x7FFFFFFFFFFFFFFF)        // mov rcx, mask
         eb(72); eb(33); eb(200)            // and rax, rcx (48 21 C8)
+            // Result is an f64 bit pattern; tag it or the enclosing arithmetic
+            // runs the INTEGER path over the pattern (add/sub/mul/div).
+        w8(vfloat+irres(ii), 1)
         return 1
     }
     // ---- P2: fmin / fmax (SSE, branchless via comisd + cmov) ----
@@ -3396,6 +3412,9 @@ fn emit_bltn2(nmi,nl,ii) {
         rr(0, 7)                                   // mov rax, rdi (default a)
         rr(2, 6)                                   // mov rdx, rsi (b)
         rcmov(0, 0, 2)                             // cmovae rax, rdx (a>=b keep a else b) => min
+            // Result is an f64 bit pattern; tag it or the enclosing arithmetic
+            // runs the INTEGER path over the pattern (add/sub/mul/div).
+        w8(vfloat+irres(ii), 1)
         return 1
     }
     if nl==4&&r8(nm)=='f'&&r8(nm+1)=='m'&&r8(nm+2)=='a'&&r8(nm+3)=='x' {
@@ -3412,6 +3431,9 @@ fn emit_bltn2(nmi,nl,ii) {
         rr(0, 7)                                   // mov rax, rdi (default a)
         rr(2, 6)                                   // mov rdx, rsi (b)
         rcmov(1, 0, 2)                             // cmovb rax, rdx (a<b take b) => max
+            // Result is an f64 bit pattern; tag it or the enclosing arithmetic
+            // runs the INTEGER path over the pattern (add/sub/mul/div).
+        w8(vfloat+irres(ii), 1)
         return 1
     }
     // ---- P2: transcendentals via x87 FPU (freestanding, no libm) ----
@@ -3431,6 +3453,9 @@ fn emit_bltn2(nmi,nl,ii) {
         eb(221); eb(28); eb(36)                   // fstp qword [rsp]  (DD 1C 24)
         eb(72); eb(139); eb(4); eb(36)            // mov rax, [rsp]
         abi(16)                                 // add rsp, 16 (undo sbi(16))
+            // Result is an f64 bit pattern; tag it or the enclosing arithmetic
+            // runs the INTEGER path over the pattern (add/sub/mul/div).
+        w8(vfloat+irres(ii), 1)
         return 1
     }
     // cos(a): fld a; fcos
@@ -3444,6 +3469,9 @@ fn emit_bltn2(nmi,nl,ii) {
         eb(221); eb(28); eb(36)                   // fstp qword [rsp]
         eb(72); eb(139); eb(4); eb(36)            // mov rax, [rsp]
         abi(16)
+            // Result is an f64 bit pattern; tag it or the enclosing arithmetic
+            // runs the INTEGER path over the pattern (add/sub/mul/div).
+        w8(vfloat+irres(ii), 1)
         return 1
     }
     if nl==3&&r8(nm)=='t'&&r8(nm+1)=='a'&&r8(nm+2)=='n' {
@@ -3457,6 +3485,9 @@ fn emit_bltn2(nmi,nl,ii) {
         eb(221); eb(28); eb(36)                   // fstp qword [rsp]
         eb(72); eb(139); eb(4); eb(36)            // mov rax, [rsp]
         abi(16)
+            // Result is an f64 bit pattern; tag it or the enclosing arithmetic
+            // runs the INTEGER path over the pattern (add/sub/mul/div).
+        w8(vfloat+irres(ii), 1)
         return 1
     }
     // log(a) = ln(a): fldln2; fld a; fyl2x  (st0 = ln2 * log2(a) = ln(a))
@@ -3473,6 +3504,9 @@ fn emit_bltn2(nmi,nl,ii) {
         eb(221); eb(28); eb(36)                   // fstp qword [rsp]
         eb(72); eb(139); eb(4); eb(36)            // mov rax, [rsp]
         abi(16)
+            // Result is an f64 bit pattern; tag it or the enclosing arithmetic
+            // runs the INTEGER path over the pattern (add/sub/mul/div).
+        w8(vfloat+irres(ii), 1)
         return 1
     }
     // pow(a,b) = exp(b * ln(a)). Compute ln(a) via fyl2x*ln2, multiply by b, exp.
@@ -3512,6 +3546,9 @@ fn emit_bltn2(nmi,nl,ii) {
         eb(221); eb(28); eb(36)                   // fstp qword [rsp]
         eb(72); eb(139); eb(4); eb(36)            // mov rax, [rsp]
         abi(32)                                 // add rsp, 32 (undo sbi(32))
+            // Result is an f64 bit pattern; tag it or the enclosing arithmetic
+            // runs the INTEGER path over the pattern (add/sub/mul/div).
+        w8(vfloat+irres(ii), 1)
         return 1
     }
     // ---- P2: random / fs-meta / introspection builtins (syscall-backed) ----

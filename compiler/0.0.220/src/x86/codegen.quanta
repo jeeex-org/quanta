@@ -362,6 +362,24 @@ fn opt_func() {
                             w64(ir+opt_i*IRS,IR_FCONST); w64(ir+opt_i*IRS+8,r0)
                             w64(ir+opt_i*IRS+16, b ^ SIGNBIT)
                             w64(ir+opt_i*IRS+24,0); w64(ir+opt_i*IRS+32,0)
+                            // Tag the result HERE, not at parse time.
+                            //
+                            // This fold CREATES an IR_FCONST, and it runs AFTER
+                            // the float-tagging pass at the top of opt_func, which
+                            // is the only place a literal normally gets its
+                            // vfloat tag before aclr(). So a NEGATIVE float
+                            // literal was left untagged for the whole of
+                            // opt_func, and every arithmetic on it took the
+                            // INTEGER path over the bit pattern:
+                            //     let q: f64 = 0.0 - 1.0
+                            //     q * ln2      -> -4618953502541334033
+                            //     (-ln2) * q  ->  4604418534313441775  (right)
+                            // Only the positive literal worked, because the parser
+                            // emitted it as an IR_FCONST that the tagging pass
+                            // actually saw. That is why gguf_exp's whole negative
+                            // half was garbage while exp(1), exp(2), exp(10)
+                            // came out within 1-2 ULP.
+                            w8(vfloat+r0, 1)
                             return 1
                         }
                         f=0-b
