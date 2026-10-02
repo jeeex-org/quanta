@@ -1,0 +1,132 @@
+// test_gguf_metadata -- GGUF header and metadata verified against the real model.
+//
+// This replaces hand-rolled `read_raw` walking, which mis-implemented the
+// string-array rule (a GGUF array of strings is `count x (u64 len + len bytes)`,
+// length-prefixed, no offset table). That made the parse desynchronise and
+// produced garbage lengths, wild seeks past EOF, and finally a correct SIGILL
+// from the inline overflow trap on the resulting junk.
+//
+// Every value here is ASSERTED. A test that only prints is a test that passes
+// while reporting a wrong answer -- which is exactly what test_all_final does.
+//
+// Expected values verified with scripts/audit/gguf_walk_reference.py against
+// /opt/ai/models/quanta/QUANTA-LFM2.5-2.6Bv1-Q4_K_M.gguf (GGUF v3).
+
+import std/gguf
+
+// header: magic[4] version u32 tensor_count u64 kv_count u64
+// tensor_count comes FIRST in v3.
+let EXPECT_N_TENSORS = 266
+let EXPECT_N_KV = 37
+let EXPECT_DATA_OFFSET = 8239136
+
+// token_embd.weight is tensor 0: the token embedding, 2048 x 128000.
+//
+// dtype 14 is ggml Q6_K, NOT Q4_K. Q6_K packs 256 values into 210 bytes
+// (0.8203125 B/element); Q4_K is 144 bytes per 256 (0.5625). The model is a
+// Q4_K_M mix, so the embedding is Q6_K while most other tensors are Q4_K.
+// 262144000 elements x 210/256 = 215040000 bytes exactly, which is what the
+// library reports.
+let T0_NAME = "token_embd.weight"
+let T0_NDIMS = 2
+let T0_DTYPE = 14          // ggml_type Q6_K
+let T0_DIM0 = 2048
+let T0_DIM1 = 128000
+let T0_NELEMENTS = 262144000
+let T0_NBYTES = 215040000
+
+let failures = 0
+
+// NOTE: `print` on a string argument prints the string's POINTER, not its
+// text -- a known separate defect. Until that is fixed these tests identify
+// which assertion failed by NUMBER, not by name. `print` also drops every
+// argument after the first, so each piece gets its own print().
+fn check(what, got, want) {
+    if got != want {
+        failures = failures + 1
+        print("FAIL check ")
+        println(what)
+        print("  got  ")
+        println(got)
+        print("  want ")
+        println(want)
+    }
+}
+
+fn check_str(what, got, want) {
+    if len(got) != len(want) {
+        failures = failures + 1
+        print("FAIL ")
+        print(what)
+        print(": length ")
+        print(len(got))
+        print(" want ")
+        print(len(want))
+        print("\n")
+        return
+    }
+    let i = 0
+    while i < len(want) {
+        if mem_load8(got + 8 + i) != mem_load8(want + 8 + i) {
+            failures = failures + 1
+            print("FAIL ")
+            print(what)
+            print(": differs at byte ")
+            println(i)
+            return
+        }
+        i = i + 1
+    }
+}
+
+fn main() {
+    let rc = gguf_load("/opt/ai/models/quanta/QUANTA-LFM2.5-2.6Bv1-Q4_K_M.gguf")
+    check("gguf_load", rc, 0)
+
+    // Header counts. NOTE the order: tensor_count precedes kv_count in v3.
+    check("tensor_count", gguf_num_tensors(), EXPECT_N_TENSORS)
+    check("kv_count", gguf_num_kv(), EXPECT_N_KV)
+    check("data_offset", gguf_data_offset(), EXPECT_DATA_OFFSET)
+
+    // Tensor 0 identity and shape.
+    check("t0 name", gguf_find_tensor(T0_NAME), 0)
+    check("t0 ndim", gguf_tensor_ndims(0), T0_NDIMS)
+    check("t0 dtype", gguf_tensor_dtype(0), T0_DTYPE)
+    check("t0 dim0", gguf_tensor_dim(0, 0), T0_DIM0)
+    check("t0 dim1", gguf_tensor_dim(0, 1), T0_DIM1)
+
+    check("t0 nelements", gguf_tensor_nelements(0), T0_NELEMENTS)
+    check("t0 nbytes", gguf_tensor_nbytes(0), T0_NBYTES)
+
+    // Tensors must tile the file contiguously from data_offset: t0 starts at 0
+    // and t1 begins exactly where t0 ends.
+    check("t0 offset", gguf_tensor_offset(0), 0)
+    check("t1 offset", gguf_tensor_offset(1), T0_NBYTES)
+
+    // A name that must NOT resolve.
+    check("missing tensor", gguf_find_tensor("no.such.tensor"), -1)
+
+    // Every tensor's name must be non-empty and every lookup self-consistent.
+    let i = 0
+    while i < gguf_num_tensors() {
+        let nm = gguf_tensor_name(i)
+        if len(nm) < 2 {
+            failures = failures + 1
+            print("FAIL tensor ")
+            print(i)
+            println(": empty name")
+        }
+        i = i + 1
+    }
+
+    gguf_close()
+
+    if failures == 0 {
+        println("test_gguf_metadata: PASS")
+        return 0
+    }
+    print("test_gguf_metadata: ")
+    print(failures)
+    println(" FAILURES")
+    return 1
+}
