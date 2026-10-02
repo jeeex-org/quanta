@@ -1,20 +1,63 @@
 // std/math - numeric helpers (pure Quanta; builtins wrap syscalls/asm).
 // Import with:  import std/math
 
-// Absolute value of a signed i64 (two's-complement safe).
-fn abs(x) {
+// INTEGER absolute value, signed i64, two's-complement safe.
+//
+// NAMED iabs, NOT abs, and that is not a style choice -- it is the same trap
+// that forced `pow` to become `ipow` (see the note on ipow below). A user-defined
+// function of the same name SHADOWS the builtin for every module in scope, and
+// abs/min/max are BUILTINS with working f64 implementations.
+//
+// What the shadowing cost, measured on the pre-fix tree:
+//
+//   abs(-5.0) / 2.0   without `import std/math`  ->  2.5            correct
+//                     with    `import std/math`  ->  9223372036854.775808
+//
+// The user fn returns an UNTYPED value, so the caller's result vreg was never
+// tagged float and `abs(-5.0) / 2.0` divided the raw bit pattern with idiv --
+// a silently wrong number, not a crash, which is the worst failure mode there is.
+//
+//   abs(-5.0)  with the import  ->  4617315517961601024  (bits, not 5.0)
+//   min(3.0, 7.0) with the import  ->  4613937818241073152  (bits, not 3.0)
+//   min(3, 7)   WITHOUT the import  ->  does not compile: no integer min builtin
+//
+// So `abs`/`min`/`max` belong to the builtin namespace for floats, and these
+// integer forms take distinct names. Importing std/math must not change the
+// meaning of `abs` for a caller who passed a float.
+fn iabs(x) {
   if x < 0 { return 0 - x }
   return x
 }
 
-// Minimum of two i64.
-fn min(a, b) {
+// Minimum of two i64. Named imin; see iabs for why.
+fn imin(a, b) {
   if a < b { return a }
   return b
 }
 
-// Maximum of two i64.
-fn max(a, b) {
+// Maximum of two i64. Named imax; see iabs for why.
+fn imax(a, b) {
+  if a > b { return a }
+  return b
+}
+
+// Minimum of two f64. Named fmin/fmax, NOT min/max, for the reason above --
+// and because there is no float min/max BUILTIN to fall back to. The emitter
+// has fadd/fsub/fmul/fdiv and abs, but no fmin/fmax, so the old untyped
+// `fn min(a,b)` was the ONLY implementation of min in the language. Renaming it
+// to imin therefore removed float min/max entirely rather than freeing the name;
+// they are re-provided here with explicit f64 typing so the result vreg is
+// tagged and arithmetic downstream stays on the float path.
+//
+// Note the `-> f64` on the signature. Without it the return is inferred as an
+// integer and the caller divides bit patterns -- the same failure that made
+// `import std/math` turn abs(-5.0) / 2.0 into 9223372036854.775808.
+fn fmin(a: f64, b: f64) -> f64 {
+  if a < b { return a }
+  return b
+}
+
+fn fmax(a: f64, b: f64) -> f64 {
   if a > b { return a }
   return b
 }
@@ -47,8 +90,8 @@ fn ipow(base, exp) {
 
 // Greatest common divisor (Euclidean).
 fn gcd(a, b) {
-  let x = abs(a)
-  let y = abs(b)
+  let x = iabs(a)
+  let y = iabs(b)
   while y != 0 {
     let t = y
     y = x % y
@@ -61,7 +104,7 @@ fn gcd(a, b) {
 fn lcm(a, b) {
   let g = gcd(a, b)
   if g == 0 { return 0 }
-  return abs(a) / g * abs(b)
+  return iabs(a) / g * iabs(b)
 }
 
 // The INTEGER helpers above are unchanged. This section adds the f64

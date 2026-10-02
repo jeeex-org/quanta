@@ -1,0 +1,126 @@
+// Importing std/math must not change what a builtin's name means.
+//
+// Regression test for a silent-wrong-answer defect, not a crash:
+//
+//   abs(-5.0) / 2.0   without `import std/math`  ->  2.5
+//                     with    `import std/math`  ->  9223372036854.775808
+//
+// std/math defined `fn abs(x)`, `fn min(a,b)` and `fn max(a,b)` as UNTYPED
+// integer helpers. A user-defined function SHADOWS a builtin of the same name for
+// every module in scope, so importing std/math replaced the f64 `abs` builtin
+// with an integer loop. The call's result vreg was never tagged float, so the
+// division took the integer path and divided the raw bit pattern.
+//
+// This is the same trap that forced `pow` to become `ipow`; std/math's own
+// comment on ipow records it. abs/min/max were missed.
+//
+// The integer helpers are now iabs/imin/imax, and float min/max -- which had NO
+// builtin to fall back to, so renaming them would have removed them outright --
+// are now fmin/fmax with an explicit `-> f64` return.
+
+import std/math
+
+let failures = 0
+
+// `print` on a string argument emits the string's POINTER rather than its text
+// (a separate known defect), so failures are identified by NUMBER. Float
+// comparisons go through the raw bit pattern, never formatted output, because
+// print formatting rounds and cannot distinguish 2.5 from a wrong neighbour.
+fn check_bits(num, got, want) {
+    if f64bits(got) != f64bits(want) {
+        failures = failures + 1
+        print("FAIL check ")
+        println(num)
+        print("  got bits  ")
+        println(f64bits(got))
+        print("  want bits ")
+        println(f64bits(want))
+    }
+}
+
+// Compare within a tolerance measured in ULPs of the expected value, on raw bit
+// patterns rather than formatted output.
+fn check_ulp(num, got, want, tol) {
+    let d = f64bits(got) - f64bits(want)
+    if d < 0 { d = 0 - d }
+    if d > tol * 4 {
+        failures = failures + 1
+        print("FAIL check ")
+        println(num)
+        print("  got  ")
+        println(f64bits(got))
+        print("  want ")
+        println(f64bits(want))
+        print("  ULP  ")
+        println(d)
+    }
+}
+
+fn check(num, got, want) {
+    if got != want {
+        failures = failures + 1
+        print("FAIL check ")
+        println(num)
+        print("  got  ")
+        println(got)
+        print("  want ")
+        println(want)
+    }
+}
+
+fn main() {
+    // ---- the f64 builtins must be reachable through the import -------------
+    check_bits(10, abs(0 - 5.0), 5.0)
+    // The arithmetic-after-call case is the one that was silently wrong: the
+    // result vreg has to carry the float tag or this divides bit patterns.
+    check_bits(11, abs(0 - 5.0) / 2.0, 2.5)
+    check_bits(12, abs(5.0) / 2.0, 2.5)
+    check_bits(13, abs(0.0), 0.0)
+    // fabs-style: a float min/max must round-trip through arithmetic too.
+    check_bits(14, fmin(3.0, 7.0), 3.0)
+    check_bits(15, fmin(3.0, 7.0) / 2.0, 1.5)
+    check_bits(16, fmax(3.0, 7.0), 7.0)
+    check_bits(17, fmax(3.0, 7.0) / 2.0, 3.5)
+    check_bits(18, fmax(0 - 1.0, 0 - 2.0), 0 - 1.0)
+    check_bits(19, fmin(0 - 1.0, 0 - 2.0), 0 - 2.0)
+
+    // ---- the integer helpers under their own names -------------------------
+    check(30, iabs(0 - 5), 5)
+    check(31, iabs(5), 5)
+    check(32, iabs(0), 0)
+    check(33, imin(3, 7), 3)
+    check(34, imin(7, 3), 3)
+    check(35, imax(3, 7), 7)
+    check(36, imax(7, 3), 7)
+
+    // ---- the rest of the module still works after the rename ---------------
+    check(40, gcd(12, 18), 6)
+    check(41, gcd(18, 12), 6)
+    check(42, gcd(7, 13), 1)
+    check(43, lcm(4, 6), 12)
+    check(44, lcm(0, 5), 0)
+    check(45, clamp(5, 1, 3), 3)
+    check(46, clamp(0, 1, 3), 1)
+    check(47, clamp(2, 1, 3), 2)
+    check(48, ipow(2, 10), 1024)
+    check(49, ipow(3, 4), 81)
+    check(50, ipow(5, 0), 1)
+
+    // expf still holds its audited accuracy after the file was edited around it.
+    //
+    // A ULP tolerance, not a bit comparison: expf is measured within 1 ULP of
+    // the true value everywhere (better than glibc, but not bit-identical), so
+    // demanding exact bits would require more accuracy than any implementation
+    // provides. exp(0) is exact because it is the empty product.
+    check_bits(60, expf(0.0), 1.0)
+    check_ulp(61, expf(1.0), 2.718281828459045, 2)
+    check_ulp(62, expf(0 - 1.0), 0.36787944117144233, 2)
+
+    print("test_math_shadow: ")
+    if failures == 0 {
+        print("PASS\n")
+        return 0
+    }
+    print("FAIL\n")
+    return 1
+}
