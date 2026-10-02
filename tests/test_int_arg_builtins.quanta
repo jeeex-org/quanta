@@ -1,0 +1,122 @@
+// Single-argument f64 builtins must accept an INTEGER argument.
+//
+//     sqrt(4.0) -> 2.0          sqrt(4)  -> 4.445517498970155e-162
+//     log(2.0)  -> 0.693147...   log(2)   -> -743.7469247408213
+//     sin(1.0)  -> 0.841471...   sin(1)   -> 5e-324
+//     cos(1.0)  -> 0.540302...   cos(1)   -> 1.0
+//     tan(1.0)  -> 1.557408...   tan(1)   -> 5e-324
+//     abs(-3.0) -> 3.0           abs(-3)  -> NaN
+//
+// These builtins read their operand out of rdi and feed it to an x87 or SSE
+// instruction that consumes f64 BITS. For a float argument rdi already holds
+// bits; for an integer it holds the integer, which is then reinterpreted as a
+// denormal. `fadd`, `fsub`, `fmul`, `fdiv` and `pow` all branch on is_float_vr()
+// for exactly this; these six did not.
+//
+// Note what the failure mode is: every one of those returned *something*.
+// Nothing crashed and nothing was obviously NaN, so the defect was invisible to
+// an exit-code check -- sqrt(4) returning 4.4e-162 looks like a legitimate
+// answer if nobody compares it.
+//
+// The fix normalises the operand in place (cvtsi2sd, then move the f64 bits back
+// into rdi) and only for a non-float argument, so the float path is untouched.
+
+let failures = 0
+
+// Failures are identified by NUMBER: `print` on a string argument emits the
+// string's POINTER rather than its text, a separate known defect. Values are
+// compared as raw bit patterns, never formatted output -- print rounds, and
+// 4.445517498970155e-162 would print identically to a correct answer.
+fn check(num, got, want) {
+    if f64bits(got) != f64bits(want) {
+        failures = failures + 1
+        print("FAIL check ")
+        println(num)
+        print("  got bits  ")
+        println(f64bits(got))
+        print("  want bits ")
+        println(f64bits(want))
+    }
+}
+
+fn main() {
+    // ---- sqrt -------------------------------------------------------------
+    check(10, sqrt(4.0), 2.0)
+    check(11, sqrt(4), 2.0)
+    check(12, sqrt(2.0), 1.4142135623730951)
+    check(13, sqrt(2), 1.4142135623730951)
+    check(14, sqrt(16), 4.0)
+    check(15, sqrt(9), 3.0)
+    check(16, sqrt(0), 0.0)
+
+    // ---- log --------------------------------------------------------------
+    check(20, log(1.0), 0.0)
+    check(21, log(1), 0.0)
+    check(22, log(2.0), 0.6931471805599453)
+    check(23, log(2), 0.6931471805599453)
+    check(24, log(10.0), 2.302585092994046)
+    check(25, log(10), 2.302585092994046)
+    check(26, log(1000), 6.907755278982137)
+
+    // ---- sin --------------------------------------------------------------
+    check(30, sin(0.0), 0.0)
+    check(31, sin(0), 0.0)
+    check(32, sin(1.0), 0.8414709848078965)
+    check(33, sin(1), 0.8414709848078965)
+    check(34, sin(2.0), 0.9092974268256817)
+    check(35, sin(2), 0.9092974268256817)
+
+    // ---- cos --------------------------------------------------------------
+    check(40, cos(0.0), 1.0)
+    check(41, cos(0), 1.0)
+    check(42, cos(1.0), 0.5403023058681398)
+    check(43, cos(1), 0.5403023058681398)
+
+    // ---- tan --------------------------------------------------------------
+    check(50, tan(1.0), 1.5574077246549023)
+    check(51, tan(1), 1.5574077246549023)
+
+    // ---- abs --------------------------------------------------------------
+    check(60, abs(0 - 3.0), 3.0)
+    check(61, abs(0 - 3), 3.0)
+    check(62, abs(3), 3.0)
+    check(63, abs(3.0), 3.0)
+    check(64, abs(0), 0.0)
+
+    // ---- integer and float spellings must agree ---------------------------
+    // The disagreement between the two is what exposed the defect, so it is
+    // asserted directly rather than only against a reference.
+    check(70, f64bits(sqrt(4)) - f64bits(sqrt(4.0)), 0)
+    check(71, f64bits(log(2)) - f64bits(log(2.0)), 0)
+    check(72, f64bits(sin(1)) - f64bits(sin(1.0)), 0)
+    check(73, f64bits(cos(1)) - f64bits(cos(1.0)), 0)
+    check(74, f64bits(tan(1)) - f64bits(tan(1.0)), 0)
+    check(75, f64bits(abs(0 - 3)) - f64bits(abs(0 - 3.0)), 0)
+
+    // ---- a runtime integer, not a literal ---------------------------------
+    // A literal may be folded; a loop is the real shape.
+    let n = 4
+    check(80, sqrt(n), 2.0)
+    // acc = 2*2*2*2*2 = 32, so sqrt(32) = 5.656854249492381 and ln(32) is
+    // 3.4657359027997265. k starts at 0 and runs to 5, so five doublings.
+    let k = 0
+    let acc = 1
+    while k < 5 {
+        acc = acc * 2
+        k = k + 1
+    }
+    check(81, sqrt(acc), 5.656854249492381)
+    check(82, log(acc), 3.4657359027997265)
+
+    // ---- pow, the same class of defect, fixed earlier ---------------------
+    check(90, pow(2.0, 10), 1024.0)
+    check(91, pow(2.0, 0 - 1), 0.5)
+
+    print("test_int_arg_builtins: ")
+    if failures == 0 {
+        print("PASS\n")
+        return 0
+    }
+    print("FAIL\n")
+    return 1
+}

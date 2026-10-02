@@ -677,6 +677,46 @@ fn fdiv(d,s) { eb(0xF2); eb(15); eb(94); mr(3,d,s) }   // divsd xmm(d), xmm(s)
 // REX.B is also required when the GP register is r8..r15: without it r8..r15
 // encode as rdi..rsi, so fld_x would read a different register than named and
 // a comparison would compare a value against itself.
+// Normalise a possibly-INTEGER f64 operand that the call ABI left in rdi, so
+// that rdi holds f64 BITS afterwards. Single-argument f64 builtins (sqrt, log,
+// sin, cos, tan) all read their operand out of rdi and feed it to an x87 or SSE
+// instruction that consumes f64 bits. For a float argument that is already true;
+// for an integer it is not, and the integer is reinterpreted as a denormal:
+//
+//     sqrt(4.0) -> 2.0    sqrt(4)   -> 4.445517498970155e-162
+//     log(2.0)  -> 0.693..  log(2)    -> -743.7469247408213
+//     sin(1.0)  -> 0.841..  sin(1)   -> 5e-324
+//     cos(1.0)  -> 0.540..  cos(1)    -> 1.0
+//     tan(1.0)  -> 1.557..  tan(1)    -> 5e-324
+//     abs(0-3.0)-> 3.0      abs(0-3)  -> NaN
+//
+// All of those returned *something*, so nothing looked broken -- they returned
+// plausible-looking wrong numbers, which is the worst failure mode. fadd/fsub/
+// fmul/fdiv/pow already branch on is_float_vr for exactly this; these did not.
+//
+//     cvtsi2sd xmm0, rdi = F2 48 0F 2A C7
+//     movq   rdi, xmm0  = 66 48 0F 7E C7
+//
+// A float argument needs no work: rdi already holds its bits, and the movq is a
+// no-op, so this is safe to call unconditionally for a float-typed operand.
+// `is_float` is passed in rather than computed here, because the call sites must
+// evaluate is_float_vr BEFORE flush_all(): that spills every live vreg, after
+// which the float tag is no longer reliable and the conversion is skipped.
+//   cvtsi2sd xmm0, rdi = F2 48 0F 2A C7   (xmm0 = f64 value)
+//   movq   rdi, xmm0  = 66 48 0F 7E C7   (STORE: xmm0 -> rdi)
+//
+// The second instruction is `fst_x`, not `fld_x`. The direction is fixed by the
+// opcode, not by the ModRM fields:
+//
+//     0F 6E   movq r/m64, xmm     LOAD:   gp -> xmm
+//     0F 7E   movq xmm, r/m64     STORE:  xmm -> gp
+//
+// Using fld_x here emits a LOAD, which re-reads rdi and throws the conversion
+// away -- the vreg ends up holding the integer as bits again and sqrt returns
+// sqrt(4) as a denormal (4.445517498970155e-162).
+fn as_f64_rdi(is_float) {
+    if is_float == 0 { eb(242); eb(72); eb(15); eb(42); eb(199); fst_x(7, 0) }
+}
 fn fld_x(rdx_gp, xmm) {
     if rdx_gp >= 8 { eb(0x66); eb(0x49); eb(15); eb(110); mr(3, xmm, rdx_gp-8) }
     else { eb(0x66); eb(0x48); eb(15); eb(110); mr(3, xmm, rdx_gp) }
@@ -3355,8 +3395,10 @@ fn emit_bltn2(nmi,nl,ii) {
     // ---- P2: math builtins (SSE, f64 bit-pattern in/out) ----
     // sqrt(a): a=rdi
     if nl==4&&r8(nm)=='s'&&r8(nm+1)=='q'&&r8(nm+2)=='r'&&r8(nm+3)=='t' {
+        let pfa = is_float_vr(irres(ira2(ii)))               // BEFORE flush_all
         flush_all()
-        eb(102); eb(72); eb(15); eb(110); eb(199)      // movq xmm0, rdi
+        as_f64_rdi(pfa)                                      // rdi holds f64 BITS now
+        fld_x(7, 0)                                         // movq xmm0, rdi
         eb(242); eb(15); eb(81); eb(192)               // sqrtsd xmm0, xmm0 (F2 0F 51 C0)
         eb(102); eb(72); eb(15); eb(126); eb(192)      // movq rax, xmm0
         // The result IS an f64 bit pattern. Without this tag the enclosing
@@ -3406,13 +3448,18 @@ fn emit_bltn2(nmi,nl,ii) {
     }
     // abs(a) for f64: clear sign bit
     if nl==3&&r8(nm)=='a'&&r8(nm+1)=='b'&&r8(nm+2)=='s' {
+        let pfa = is_float_vr(irres(ira2(ii)))               // BEFORE flush_all
         flush_all()
         let arg0v = irres(ira2(ii))
         rbp(0, spill_home(arg0v))                     // mov rax, [arg0 spill home]
         eb(72); eb(137); eb(199)           // mov rdi, rax   (arg0 also goes to rdi
                                             //  for the marshalled-arg convention)
+        as_f64_rdi(pfa)                                // rdi = f64 BITS of the value
+        eb(72); eb(139); eb(199)          // mov rax, rdi   ... and the MASK is
+                                            // applied to rax, so put rdi there
         ri64(1, 0x7FFFFFFFFFFFFFFF)        // mov rcx, 0x7FFF_FFFF_FFFF_FFFF
-        eb(72); eb(33); eb(200)            // and rax, rcx   (48 21 C8)
+        eb(72); eb(33); eb(200)            // and rax, rcx   (48 21 C8)   clear
+                                            // the sign bit of the f64 pattern
             // Result is an f64 bit pattern; tag it or the enclosing arithmetic
             // runs the INTEGER path over the pattern (add/sub/mul/div).
         w8(vfloat+irres(ii), 1)
@@ -3481,7 +3528,9 @@ fn emit_bltn2(nmi,nl,ii) {
     // The old code reloaded via rbp(7, spill_home(irres(ira2(ii)))) which
     // resolved to the wrong vreg -> loaded 0. Use rdi directly like sqrt.
     if nl==3&&r8(nm)=='s'&&r8(nm+1)=='i'&&r8(nm+2)=='n' {
+        let pfa = is_float_vr(irres(ira2(ii)))               // BEFORE flush_all
         flush_all()
+        as_f64_rdi(pfa)                    // rdi must hold f64 BITS
         sbi(16)                                  // sub rsp, 16
         fx87prep()                               // force 64-bit FPU precision
         eb(72); eb(137); eb(60); eb(36)   // mov [rsp], rdi (48 89 3C 24)
@@ -3502,7 +3551,9 @@ fn emit_bltn2(nmi,nl,ii) {
     }
     // cos(a): fld a; fcos
     if nl==3&&r8(nm)=='c'&&r8(nm+1)=='o'&&r8(nm+2)=='s' {
+        let pfa = is_float_vr(irres(ira2(ii)))               // BEFORE flush_all
         flush_all()
+        as_f64_rdi(pfa)                                      // rdi must hold f64 BITS
         sbi(16)
         fx87prep()                               // force 64-bit FPU precision
         eb(72); eb(137); eb(60); eb(36)   // mov [rsp], rdi (48 89 3C 24)
@@ -3522,7 +3573,9 @@ fn emit_bltn2(nmi,nl,ii) {
         return 1
     }
     if nl==3&&r8(nm)=='t'&&r8(nm+1)=='a'&&r8(nm+2)=='n' {
+        let pfa = is_float_vr(irres(ira2(ii)))               // BEFORE flush_all
         flush_all()
+        as_f64_rdi(pfa)                    // rdi must hold f64 BITS
         sbi(16)
         fx87prep()                               // force 64-bit FPU precision
         eb(72); eb(137); eb(60); eb(36)   // mov [rsp], rdi (48 89 3C 24)
@@ -3546,7 +3599,9 @@ fn emit_bltn2(nmi,nl,ii) {
     if nl==3&&r8(nm)=='l'&&r8(nm+1)=='o'&&r8(nm+2)=='g' {
         flush_all()
         let arg0v = irres(ira2(ii))
+        let pfa = is_float_vr(arg0v)                        // BEFORE flush_all
         rbp(7, spill_home(arg0v))                     // rdi = a (arg0 from spill home)
+        as_f64_rdi(pfa)                                      // rdi must hold f64 BITS
         sbi(16)
         fx87prep()                               // force 64-bit FPU precision
         eb(72); eb(137); eb(60); eb(36)   // mov [rsp], rdi (CORRECT: 48 89 3C 24, mod=00 no disp)
