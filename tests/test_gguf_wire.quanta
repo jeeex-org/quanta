@@ -1,0 +1,443 @@
+// GGUF wire format, read with raw file calls and asserted against exact bytes.
+//
+// This replaces ~26 hand-rolled GGUF readers that all shared one wrong rule.
+// A GGUF string array is
+//
+//     u32  element_type
+//     u64  element_count
+//     repeat element_count times:
+//         u64  byte_length
+//         byte_length bytes
+//
+// LENGTH-PREFIXED, with no offset table, no alignment padding, and no terminator
+// beyond the bytes the length already covers. Every one of the 26 original tests
+// skipped a string array as `alen * 4`, which desynchronised the metadata walk:
+// the next key length came back as garbage (0x666c000000000000 was observed),
+// lseek ran past EOF, and the compiler's overflow trap fired on the junk. The
+// trap was right; the parser was wrong.
+//
+// std/gguf gets this right and is the production path -- see
+// test_gguf_metadata.quanta. This test keeps the low-level `read_raw` coverage
+// those 26 provided, and asserts instead of printing.
+//
+// STRUCTURE. Each phase is its own function. Phasing them separately is not
+// cosmetic: with all of it inlined in main() the compiler ran out of registers
+// and the process died with SIGILL before printing anything -- which looks
+// exactly like a data bug and sent the investigation down the wrong path. One
+// phase per function keeps live state small and each phase is runnable.
+//
+// Every offset below was walked out of the real file with an independent
+// parser. The file is authoritative; where an expectation of mine disagreed
+// with it, the file won.
+
+import std/fs
+import std/mmap_access
+
+let MODEL = "/opt/ai/models/quanta/QUANTA-LFM2.5-2.6Bv1-Q4_K_M.gguf"
+
+let failures = 0
+
+// `print` on a string argument emits the string's POINTER rather than its text,
+// and indexing a string PARAMETER yields garbage rather than a character (both
+// separate known defects). So check() identifies itself by NUMBER, expected
+// bytes are passed as flat integer arrays, and each piece gets its own print()
+// because print() keeps only its first argument.
+fn check(num, got, want) {
+    if got != want {
+        failures = failures + 1
+        print("FAIL check ")
+        println(num)
+        print("  got  ")
+        println(got)
+        print("  want ")
+        println(want)
+    }
+}
+
+// Every read is: absolute lseek, then an 8-byte read. Three rules, each learned
+// the hard way here:
+//
+//  1. lseek RETURNS the resulting absolute offset -- it is not a 0-on-success
+//     status like read().
+//  2. mem_load() always reads 8 bytes. Reading a 4-byte field into a 4-byte
+//     buffer and then mem_load() overreads the allocation and returns garbage.
+//  3. mem_alloc() must NOT be called inside a loop body. Allocate up front, as
+//     lib/std/gguf.quanta does; allocating per iteration hands back a pointer
+//     that the next iteration's work overwrites, so a walk reads the same bytes
+//     every pass.
+//
+// A u32 field is read 8 bytes wide and masked, because the extra 4 bytes land in
+// the high half (0x4_00000008 for a type of 8 followed by the next field) and
+// mem_load() would return them.
+fn rd32(fd, off, buf) {
+    check(900, lseek(fd, off, 0), off)   // lseek returns the absolute offset
+    check(901, read_raw(fd, buf, 8), 8)  // always 8 bytes; u32 callers mask
+}
+
+fn rd64(fd, off, buf) {
+    check(902, lseek(fd, off, 0), off)
+    check(903, read_raw(fd, buf, 8), 8)
+}
+
+// A u32 field: read 4 bytes into an 8-byte buffer and take the low 32 bits.
+// Reading 8 bytes at a u32 field pulls in the next field and produces
+// 0x1_00000001 -- a plausible-looking wrong answer.
+fn u32_at(fd, off) {
+    let b = mem_alloc(8)
+    rd32(fd, off, b)
+    return mem_load(b) & 4294967295     // keep the low 32 bits
+}
+
+// Compare `len` bytes at `off` against `lit`, a flat array of byte codes.
+fn bytes_eq(fd, off, lit, len, num) {
+    let buf = mem_alloc(256)
+    if len > 256 { check(907, len, 0) return }
+    check(904, lseek(fd, off, 0), off)
+    check(905, read_raw(fd, buf, len), len)
+    let i = 0
+    let bad = 0
+    while i < len {
+        if mem_load8(buf + i) != lit[i] { bad = bad + 1 }
+        i = i + 1
+    }
+    check(num, bad, 0)
+}
+
+fn scalar_size(vt) {
+    if vt == 0 { return 1 }
+    if vt == 1 { return 1 }
+    if vt == 2 { return 2 }
+    if vt == 3 { return 2 }
+    if vt == 4 { return 4 }
+    if vt == 5 { return 4 }
+    if vt == 6 { return 4 }
+    if vt == 7 { return 1 }
+    if vt == 10 { return 8 }
+    if vt == 11 { return 8 }
+    if vt == 12 { return 8 }
+    return 0
+}
+
+fn align32(p) {
+    return ((p + 31) / 32) * 32
+}
+
+// ggml type 14 is Q6_K: 210 bytes per 256 values = 0.8203125 B/element.
+// ggml type 12 is Q4_K: 144 bytes per 256 = 0.5625.
+fn q6k_bytes(nelem) {
+    return (nelem / 256) * 210
+}
+
+fn q4k_bytes(nelem) {
+    return (nelem / 256) * 144
+}
+
+// ---- phase 1: header ---------------------------------------------------------
+// GGUF v3: magic[4], version u32, tensor_count u64, kv_count u64.
+// The TENSOR count comes FIRST. An earlier note had these the other way round,
+// which inverted every expectation derived from it.
+fn phase_header(fd) {
+    bytes_eq(fd, 0, [71, 71, 85, 70], 4, 10)        // "GGUF"
+    check(11, u32_at(fd, 4), 3)                     // version 3
+    let b = mem_alloc(8)
+    rd64(fd, 8, b)
+    check(12, mem_load(b), 266)                     // tensor_count
+    rd64(fd, 16, b)
+    check(13, mem_load(b), 37)                      // kv_count
+}
+
+// ---- phase 2: the first metadata key -----------------------------------------
+// A key is `u64 len` then `len` bytes -- never a bare offset. Reading the text
+// AT the length field silently compares the wrong bytes and looks like a data
+// bug. general.architecture: len 20 at byte 24, text at 32.
+fn phase_first_key(fd) {
+    let b = mem_alloc(8)
+    rd64(fd, 24, b)
+    check(20, mem_load(b), 20)
+    bytes_eq(fd, 32, [103,101,110,101,114,97,108,46,97,114,99,104,105,116,101,99,116,117,114,101], 20, 21)
+    check(22, u32_at(fd, 52), 8)                    // value type = STRING
+    rd64(fd, 56, b)
+    check(23, mem_load(b), 4)
+    bytes_eq(fd, 64, [108,102,109,50], 4, 24)        // "lfm2"
+}
+
+// ---- phase 3: a u32 metadata value -------------------------------------------
+// general.base_model.count: len 24 at 439, text at 447, type u32 at 471, value
+// at 475. The value is 1 -- an earlier expectation of 30 was a guess, and the
+// file disagreed.
+fn phase_u32_value(fd) {
+    let b = mem_alloc(8)
+    rd64(fd, 439, b)
+    check(29, mem_load(b), 24)
+    bytes_eq(fd, 447, [103,101,110,101,114,97,108,46,98,97,115,101,95,109,111,100,101,108,46,99,111,117,110,116], 24, 30)
+    check(32, u32_at(fd, 471), 4)                   // type = U32
+    check(33, u32_at(fd, 475), 1)                   // this model lists 1 base model
+}
+
+// ---- phase 4: the string array, walked correctly -----------------------------
+fn phase_tags(fd) {
+    let b = mem_alloc(8)
+    let tag = find_key_off(fd, [103,101,110,101,114,97,108,46,116,97,103,115], 12)
+    check(39, tag, 698)
+
+    // tag is the KEY offset. The value follows the key text, 8 + 12 = 20 on.
+    let vp = tag + 20
+    check(40, u32_at(fd, vp), 9)                    // metadata type = ARRAY
+    check(41, u32_at(fd, vp + 4), 8)                // element type = STRING
+    rd64(fd, vp + 8, b)
+    check(42, mem_load(b), 4)                       // element count
+
+    // Each element is `u64 len` then `len` bytes, no padding, so the advance is
+    // 8 + len -- never a fixed stride. Advancing by a guessed 16 put every read
+    // 2 bytes into the element text, which then decoded as an absurd length.
+    let p = vp + 16
+    rd64(fd, p, b)
+    let l0 = mem_load(b)
+    check(43, l0, 6)
+    bytes_eq(fd, p + 8, [108,105,113,117,105,100], 6, 44)          // "liquid"
+    p = p + 8 + l0
+
+    rd64(fd, p, b)
+    let l1 = mem_load(b)
+    check(45, l1, 6)
+    bytes_eq(fd, p + 8, [108,102,109,50,46,53], 6, 46)              // "lfm2.5"
+    p = p + 8 + l1
+
+    rd64(fd, p, b)
+    let l2 = mem_load(b)
+    check(47, l2, 4)
+    bytes_eq(fd, p + 8, [101,100,103,101], 4, 48)                   // "edge"
+    p = p + 8 + l2
+
+    rd64(fd, p, b)
+    let l3 = mem_load(b)
+    check(49, l3, 15)
+    bytes_eq(fd, p + 8, [116,101,120,116,45,103,101,110,101,114,97,116,105,111,110], 15, 50)
+    p = p + 8 + l3
+
+    // The next key starts exactly here. A wrong skip lands in the middle of the
+    // token table -- that is how the old tests corrupted every later length.
+    check(53, p, 797)
+    // 17 bytes, not 18. Passing 18 read one element past the literal and died
+    // with SIGILL: Quanta does not bounds-check array indexing, so an over-read
+    // runs off the end of the constant pool and hits the overflow trap.
+    bytes_eq(fd, p + 8, [103,101,110,101,114,97,108,46,108,97,110,103,117,97,103,101,115], 17, 51)
+    // Next key: len@797, text 17 bytes at 805, so the ARRAY count u64 is at
+    // 805 + 17 + 4 (type) + 4 (elem type) = 830.
+    check(52, u32_at(fd, 822), 9)                   // next key's type = ARRAY
+    check(54, u32_at(fd, 826), 8)                   // element type = STRING
+    rd64(fd, 830, b)
+    check(55, mem_load(b), 16)                      // 16 languages
+}
+
+// ---- phase 5: section boundaries ---------------------------------------------
+// 37 kv entries end at 8222781; the 266 tensor-info records end at 8239107; data
+// starts at 8239136, which is 8239107 rounded up to 32. A parser that
+// desynchronises lands somewhere else entirely.
+fn phase_bounds(fd, kv_end) {
+    check(60, kv_end, 8222781)
+    let info_end = info_end_off(fd, kv_end)
+    check(61, info_end, 8239107)
+    check(62, align32(info_end), 8239136)
+}
+
+// ---- phase 5b: the other read primitives -------------------------------------
+// The 26 superseded tests also covered file_read() and mmap(), so those are
+// asserted here rather than lost.
+fn phase_read_primitives(fd) {
+    // file_read is the buffered/whole-buffer form of read_raw; it must agree
+    // byte for byte with what read_raw sees at the same offset.
+    let a = mem_alloc(8)
+    let b = mem_alloc(8)
+    check(80, lseek(fd, 8, 0), 8)
+    check(81, read_raw(fd, a, 8), 8)
+    check(82, lseek(fd, 8, 0), 8)
+    check(83, file_read(fd, b, 8), 8)
+    let same = 1
+    let i = 0
+    while i < 8 {
+        if mem_load8(a + i) != mem_load8(b + i) { same = 0 }
+        i = i + 1
+    }
+    check(84, same, 1)                 // read_raw and file_read agree
+    check(85, mem_load(b), 266)        // and both read tensor_count
+
+    // The whole-file path used by inference: mmap_load() allocates one buffer
+    // and file_read()s the model into it, then fields are read by offset. It
+    // must agree with the lseek+read_raw walk on every value.
+    //
+    // (std/fs's own `mmap(path)` returns a pointer that is not directly
+    // dereferenceable -- mem_load8 on it reads 0 -- so the supported entry
+    // point is mmap_load/mmap_read_u64, not the raw syscall wrapper.)
+    check(86, mmap_load(MODEL), 0)
+    check(87, mmap_read_u64(0), 14064895815)          // "GGUF" as a LE u64
+    check(88, mmap_read_u64(8), 266)                 // tensor_count
+    check(89, mmap_read_u64(16), 37)                 // kv_count
+    check(90, mmap_read_u64(726), 4)              // tags element count
+    check(92, mmap_read_u64(830), 16)              // languages element count
+    mmap_free()
+}
+
+// ---- phase 6: the first tensor record ----------------------------------------
+// token_embd.weight: u64 len 17, text, n_dims u32 = 2, dims[2] = {2048, 128000},
+// dtype u32 = 14, offset u64 = 0. dtype 14 is ggml Q6_K, NOT Q4_K -- this is a
+// Q4_K_M mix, so the token embedding is Q6_K while most other tensors are Q4_K.
+fn phase_tensor0(fd, kv_end) {
+    let b = mem_alloc(8)
+    let tp = kv_end
+    rd64(fd, tp, b)
+    check(64, mem_load(b), 17)                       // name length
+    bytes_eq(fd, tp + 8, [116,111,107,101,110,95,101,109,98,100,46,119,101,105,103,104,116], 17, 65)
+    // Fields follow the name: n_dims u32, n_dims * u64 dims, dtype u32, offset
+    // u64. Compute them from the name length so a wrong length shows up as a
+    // failed assertion rather than a wild offset.
+    let f = tp + 8 + 17
+    check(66, u32_at(fd, f), 2)                      // n_dims
+    rd64(fd, f + 4, b)
+    check(67, mem_load(b), 2048)                     // dim 0
+    rd64(fd, f + 12, b)
+    check(68, mem_load(b), 128000)                   // dim 1, 128k vocab
+    check(69, u32_at(fd, f + 20), 14)                // ggml Q6_K
+    rd64(fd, f + 24, b)
+    check(70, mem_load(b), 0)                        // relative offset
+
+    // 262144000 elements * 210/256 = 215040000 exactly, and the next tensor
+    // begins there, so the tensors tile the file with no gaps.
+    check(71, q6k_bytes(2048 * 128000), 215040000)
+    check(72, q4k_bytes(2048 * 128000), 147456000)   // the Q4_K size it is NOT
+}
+
+// KNOWN COMPILER DEFECT, found by writing this test: array indexing has NO
+// bounds check. `lit[i]` with `i` past the end of the literal runs off the end
+// of the constant pool and the process dies with SIGILL rather than returning a
+// value or raising a diagnosable error. Every `len` below is therefore the exact
+// literal length -- an off-by-one here is a hard crash, not a wrong answer.
+//     bytes_eq(fd, 32, [103,101,110,101,114,97,108,46,108,97,110,103,117,97,103,101,115],
+//              18, 51)   // 17 codes + len 18  ->  SIGILL
+//
+// A bounds check that returned a sentinel would make this class of mistake a
+// wrong answer instead of a crash.
+//
+// ---- key lookup ---------------------------------------------------------------
+// `name` is a flat array of byte codes, NOT a string: indexing a string PARAMETER
+// returns garbage rather than a character, so a string argument is unusable as a
+// byte source. Indexing works on locals and array literals.
+fn find_key_off(fd, name, nl) {
+    let b = mem_alloc(8)
+    let kb = mem_alloc(64)            // hoisted: no mem_alloc in the loop
+    let p = 24
+    let i = 0
+    while i < 37 {
+        let h = p
+        rd64(fd, p, b)
+        let kl = mem_load(b)
+        p = p + 8
+        if kl > 64 { return 0-1 }
+        if lseek(fd, p, 0) != p { return 0-1 }
+        if read_raw(fd, kb, kl) != kl { return 0-1 }
+        p = skip_value(fd, p + kl)
+        let same = 1
+        if kl != nl { same = 0 }
+        if same == 1 {
+            let j = 0
+            while j < kl {
+                if mem_load8(kb + j) != name[j] { same = 0 }
+                j = j + 1
+            }
+        }
+        if same == 1 { return h }
+        i = i + 1
+    }
+    return 0-1
+}
+
+// Skip one metadata value, returning the offset just past it.
+fn skip_value(fd, p) {
+    let b = mem_alloc(8)
+    let vt = u32_at(fd, p)
+    p = p + 4
+    if vt == 8 {
+        rd64(fd, p, b)
+        return p + 8 + mem_load(b)
+    }
+    if vt == 9 {
+        let et = u32_at(fd, p)
+        p = p + 4
+        rd64(fd, p, b)
+        let cnt = mem_load(b)
+        p = p + 8
+        if et == 8 {
+            let e = 0
+            while e < cnt {
+                rd64(fd, p, b)
+                p = p + 8 + mem_load(b)
+                e = e + 1
+            }
+            return p
+        }
+        return p + cnt * scalar_size(et)
+    }
+    return p + scalar_size(vt)
+}
+
+fn kv_end_off(fd) {
+    let b = mem_alloc(8)
+    let p = 24
+    let i = 0
+    while i < 37 {
+        rd64(fd, p, b)
+        p = skip_value(fd, p + 8 + mem_load(b))
+        i = i + 1
+    }
+    return p
+}
+
+// info_end_off re-derives kv_end_off, and the tensor record address is passed in
+// rather than recomputed, so no phase walks the file more than it must.
+
+// Each tensor-info record is: u64 name_len, name bytes, u32 n_dims, n_dims * u64
+// dims, u32 dtype, u64 offset.
+// Each tensor-info record is: u64 name_len, name_len bytes of name, u32 n_dims,
+// n_dims * u64 dims, u32 dtype, u64 offset.
+//
+// The name length is a u64, so its LOW 32 bits are at `p` and its high 32 at
+// `p + 4`. Reading u32_at(p + 4) returns 0 -- the high half -- and every
+// subsequent offset collapses, which desynchronises the whole walk. That was
+// 530 consecutive check-901 failures in one phase.
+fn info_end_off(fd, kv_end) {
+    let p = kv_end
+    let i = 0
+    while i < 266 {
+        let nl = u32_at(fd, p)                      // low 32 bits of the u64
+        p = p + 8 + nl
+        let nd = u32_at(fd, p)
+        p = p + 4 + 8 * nd + 4 + 8
+        i = i + 1
+    }
+    return p
+}
+
+fn main() {
+    let fd = open(MODEL, 0, 0)
+    if fd < 0 {
+        print("cannot open model\n")
+        return 1
+    }
+    phase_header(fd)
+    phase_first_key(fd)
+    phase_u32_value(fd)
+    phase_tags(fd)
+    let kv_end = kv_end_off(fd)
+    phase_bounds(fd, kv_end)
+    phase_read_primitives(fd)
+    phase_tensor0(fd, kv_end)
+    close(fd)
+
+    print("test_gguf_wire: ")
+    if failures == 0 {
+        print("PASS\n")
+        return 0
+    }
+    print("FAIL\n")
+    return 1
+}
