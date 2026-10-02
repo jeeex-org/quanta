@@ -15,82 +15,85 @@ happens here; `0.0.220/src` is never modified.
 (The WIP.md copied from an older tree was stale — 0.0.218's, describing
 `--emit-dynamic` work. Replaced, not appended to.)
 
-## Plan
+## Current state (measured, not asserted)
 
-### Phase 0 — promotion
+    compiler/0.0.221/bin/x86/qc
+    size=2921088
+    md5=33df91c3bcf9a091632edffa43f93c4b
+    self-hosted 3 generations byte-identical
+    gate PASS=117 CFAIL=0 RFAIL=34 of 151    deterministic over repeated runs
 
-Done: copy, VERSION pointer moved, gate re-verified on the copy.
+An earlier "PASS=118 ... RFAIL=33" in this file was WRONG -- it was measured
+against a stale failure list in /tmp. The baseline above is the verified one.
 
-### Phase 1 — `std/math` as a real module
+## Done in 0.0.221
 
-**Blocking: a second-module import SIGILLs the compiler.**
+- `expf` in lib/std/math.quanta, replacing gguf_exp's private copy. Three
+  overflow/underflow defects fixed: 2^1024 is unrepresentable so the 2^k
+  scaling had to be split; the mirror bug at x=-745 where 2^1075 overflows the
+  divisor; and a guard that returned 1.0e308 for anything above 709.0, wrong by
+  ~600x across the whole finite 709..709.78 band. Now 278 of 278 finite audit
+  cases within 1e-12 relative, median 3.8e-15.
+- `pow` renamed to `ipow` in std/math. A user function SHADOWS a builtin of the
+  same name, so std/math's integer `pow` was replacing the float `pow` builtin
+  for every importer and SIGILLing two inference tests. Verified directly: with
+  a user `fn pow`, `pow(2.0, 3.0)` returned the integer result.
+- Float literals with more than 17 significant digits were silently wrong --
+  a scaling error of 10x per extra digit, because the lexer froze the mantissa
+  while still counting fraction digits. Found via fdlibm's pi/2 high word
+  (21 digits), which materialised as 3.86e+03. Now exact to within 2 ULP for
+  every literal, and that residual is the token format's 55-bit mantissa field,
+  not the algorithm.
 
-Adding `import std/math` to `lib/std/gguf.quanta` — with `std/math` having no
-imports of its own and no globals, so it is not circular — produces SIGILL at
-run time in `test_all_final` and `test_inference_verify`, dropping the suite to
-PASS=116. Removing the import makes `expf` undeclared (compile failure), so both
-symptoms have one cause: the second module is what breaks.
+## RFAIL=34: the cause is the TESTS, not the compiler
 
-Diagnose this before any further stdlib work. Nothing below is safe while a
-second import can corrupt code generation.
+All 34 are GGUF tests that hand-roll the parse with `read_raw`. They
+mis-implement one rule: **a GGUF array of strings is `count x (u64 len + len
+bytes)`** -- length-prefixed, no offset table, no per-element NUL. They skip
+`alen * 4` instead.
 
-Then finish the `expf` extraction and run a clean audit. Work preserved at
-`/tmp/keep/` (`math_expf.quanta`, `gguf_expf.quanta`,
-`expf_extraction.patch`). The earlier "246 bad" was a broken harness — duplicate
-JSON keys, then `inf` comparisons — not a real result. `expf` passes standalone
-but has never had a clean full audit.
+    698  u64 key_len = 12
+    706  "general.tags"
+    718  u32 vtype = 9        (ARRAY)
+    722  u32 elem_type = 8   (STRING)
+    726  u64 count = 4
+    734  u64 6    "liquid\0"
+    750  u64 6    "lfm2.5\0"
+    766  u64 4    "edge\0"
+    782  u64 15   "text-generation\0"
 
-### Phase 2 — transcendentals as reduced-argument polynomials
+The failure chain: wrong skip -> parse desyncs -> `klen` becomes
+`0x666c000000000000` (ASCII "lf") -> seek runs past EOF -> `read_raw` returns
+junk -> `alen * 4` overflows -> the inline trap (`jno +2 ; ud2`) fires
+CORRECTLY on garbage. The SIGILL is the fourth symptom.
 
-`sin`/`cos`/`tan`/`log`/`pow` are x87 today (`fsin`, `fyl2x`). x87 gives ~1 ULP
-*absolute* error, so relative accuracy collapses near roots:
+`std/gguf` already implements this correctly with a per-element loop, and it
+parses the real model: 266 tensors, 37 kv entries, data_offset 8239136.
 
-    sin(0.001)  result 1.0e-03   exact
-    sin(1.0)    result 8.4e-01   exact
-    sin(pi)     result 3.2e-15   rel err 1.25e-06
+Header order is `magic[4], version u32, tensor_count u64, kv_count u64` --
+**tensor count comes first**. This model has 266 tensors and 37 metadata
+entries. Walking all 37 metadata records with the corrected rules lands exactly
+on offset 8222781, where the tensor-info section begins.
 
-glibc reduces `x = n + r` with `|r| <= pi/4` and evaluates a polynomial, so
-absolute error stays proportional to `r` and relative accuracy holds. Same
-treatment fixes accuracy and speed at once, which is why it precedes the AVX
-work.
+## Compiler changes TRIED AND REVERTED (each regressed the gate)
 
-Bar: raw bits vs glibc, <= 1 ULP.
+- LRU eviction in `afree` (evict the oldest mapping instead of the newest).
+- Adding R11 to the allocator's 14 register slots.
+- Making `aphys` reload from the home slot instead of trusting the register.
 
-### Phase 3 — FMA in the inference inner loops
+All three are in /tmp/keep/ for reference only. Do not re-apply. The operand was
+never stale -- the program was wrong.
 
-Never emitted anywhere in the compiler today. `acc = fma(x, w, acc)` in
-`gguf_matvec`, `rms_norm`, `dequant_q4k` — one rounding instead of two, and the
-largest speed win for the smallest change.
+## Next
 
-### Phase 4 — AVX2 matvec
+1. Rewrite the failing tests against `std/gguf` with real assertions. They
+   currently print values and exit 0 or crash; none compare.
+2. `test_all_final` is a false pass: it prints `Matvec: 0, 0 (expect 17, 39)`
+   then `All 7 tests PASSED`.
+3. `abs`, `min`, `max` in std/math still shadow builtins. Integer-only callers
+   today, but rename to iabs/imin/imax before any float use lands there.
 
-4 doubles per `ymm` instead of scalar SSE. **Measure before building**: at
-2048x10752 f64 the working set is large enough that this is likely
-bandwidth-bound, so 4x may not appear. The i9-13905H has AVX2 but not AVX512.
+## Carried over
 
-### Phase 5 — runtime CPUID dispatch
-
-Must precede any FMA/AVX2 code intended to run on older hardware. The compiler
-emits no dispatch today.
-
-## Sequencing
-
-Phase 1 gates everything. Phases 3 and 4 do not depend on 2 and could overlap.
-
-## Standing open
-
-- Multi-argument `print`/`println` drops every argument after the first. The
-  emitter treats `argc == 2` as its internal `print(buf, len)` form, so a
-  user-written `println("a", 42)` is routed into it. Root cause identified; a
-  parser-lowering attempt got values printing but emitted a spurious blank
-  line and raw float bits, then broke the compiler outright (`CFAIL=151`) and
-  was reverted.
-- Q6_K and Q8_0 dequantisation are invalid for real data.
-- 33 suite failures, triaged only far enough to confirm none are new.
-
-## Carried over from earlier notes
-
-The root cause of much register corruption is `codegen.quanta` /
-`funcscan.quanta` losing long-lived locals rather than any individual site. Any
-new value that must survive more than a few dozen lines in one function should
-be parked in a global, commented with which slot is which.
+New values must be parked in a global when they must survive more than a few
+dozen lines in one function; codegen/funcscan lose long-lived locals.
