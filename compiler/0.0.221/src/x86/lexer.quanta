@@ -248,9 +248,46 @@ fn tokenize() {
                         // packed token at all, so the extra digits were always
                         // going to be lost. Saturation (rather than wrap) keeps the
                         // packed value positive and keeps the compiler alive.
-                        if val < 36028797018963967 { val = val*10 + d }
-                        if fval < 36028797018963967 { fval = fval*10 + d }
-                        fdigits = fdigits + 1
+                        // `val` accumulates every digit of the literal and is the
+                        // only value packed into the token as (val << 8) | fdigits.
+                        // `val << 8` must stay inside a signed i64, so
+                        // val < 2^55 = 36028797018963968 -- that is at most 16
+                        // significant digits, because 17-digit values start at
+                        // 1e16 and 8.42894206204953964 << 8 = 2.1e19 overflows
+                        // 2^63 = 9.2e18. (17 digits only fits when the leading
+                        // digit is 1 or 2, which is why 1.3333333333333333 packed
+                        // fine while 8.42894206204953964 did not.)
+                        //
+                        // val, fval and fdigits must all STOP together. Counting
+                        // fdigits on after val has stopped inflates the divisor by a
+                        // power of ten per extra digit, so every literal with more
+                        // than 17 significant digits came out silently wrong:
+                        //     1.33333333333333333e+00 -> 0.612757392954054
+                        //     8.42894206204953964e+00  -> 1.223182658256746
+                        //
+                        // Found via fdlibm's pi/2 high word 1.57079632673412561417e+00
+                        // (21 digits), which materialised as 3.86e+03 and made
+                        // sinf(0.5) return 0.999999 because x/hi came out as 3856.7
+                        // instead of 0.3183.
+                        //
+                        // Stopping at 17 significant digits is CORRECT, not lossy: an
+                        // f64 carries 17 significant digits, so nothing past the 17th
+                        // can change the correctly rounded result except at an exact
+                        // tie, and fconst rounds to nearest-even on the exact value
+                        // handed to it.
+                        //
+                        // The guard is on val's LENGTH, not a magnitude constant,
+                        // because the integer part consumes the same budget: 17
+                        // fraction digits are exact after a leading 1, but only 16
+                        // after a leading 8 (18 digits of val in total either way).
+                        // Test the MAGNITUDE, not the digit count: whether a 17-digit
+                        // mantissa fits depends on its leading digit, so a digit-count
+                        // test is off by one for some literals and wrong for others.
+                        if val < 3602879701896397 {
+                            val = val*10 + d
+                            if fval < 36028797018963967 { fval = fval*10 + d }
+                            fdigits = fdigits + 1
+                        }
                         p = p + 1; c = c + 1
                     }
                     let nlen = p - sp
