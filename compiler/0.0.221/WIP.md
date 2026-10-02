@@ -19,9 +19,9 @@ happens here; `0.0.220/src` is never modified.
 
     compiler/0.0.221/bin/x86/qc
     size=2929280
-    md5=dd025dcef8090492b1d6736c3f7b2d0b
+    md5=46e64c2ec6c47abc28fac2471572039c
     self-hosted 3 generations byte-identical
-    gate PASS=123 CFAIL=0 RFAIL=0 of 123          deterministic over repeated runs
+    gate PASS=125 CFAIL=0 RFAIL=0 of 125          deterministic over repeated runs
 
 RFAIL is now zero. It took replacing the failing tests, not patching the
 compiler: 26 GGUF readers and 7 inference tests were wrong in ways no compiler
@@ -34,27 +34,31 @@ count as authoritative without re-running the gate; the number moved 33 -> 34 ->
 
 ## OPEN DEFECTS (measured, not suspected)
 
-### pow ignores an INTEGER exponent
+### RESOLVED: pow ignored an INTEGER exponent
 
-    pow(2.0, 3)     -> 1.0     want 8.0
-    pow(2.0, 3.0)   -> 8.0     correct
+    pow(2.0, 3)     -> 1.0     was: want 8.0
+    pow(2.0, 3.0)   -> 8.0     was: correct
 
-The two spellings of the same call disagree, which is the tell. `pow` loads both
-operands into rdi/rsi and stores them to the slots the x87 sequence `fld`s from,
-but it never checks `is_float_vr()` the way fadd/fsub/fmul/fdiv do. An integer
-argument's bits are therefore reinterpreted as a denormal, and 0x3 as bits is
-why 1.0 comes out.
+Fixed in 93321d08, and the same defect was then found in six more builtins and
+fixed in 0d7950b6:
 
-`pow(2.0, n)` in a loop is the usual spelling, so this matters. It fails
-silently -- a plausible wrong number, not a crash.
+    sqrt(4.0) -> 2.0            sqrt(4)  -> 4.445517498970155e-162
+    log(2.0)  -> 0.693147...    log(2)   -> -743.7469247408213
+    sin(1.0)  -> 0.841471...    sin(1)   -> 5e-324
+    cos(1.0)  -> 0.540302...    cos(1)   -> 1.0
+    tan(1.0)  -> 1.557408...    tan(1)   -> 5e-324
+    abs(-3.0) -> 3.0            abs(-3)  -> NaN
 
-Fix identified and attempted (emitter.quanta's pow handler: convert an integer
-operand in place with cvtsi2sd, then move the f64 bits back into rdi/rsi; a
-float needs no conversion since rdi already holds its bits). Saved at
-/tmp/keep/emitter_pow_int_exp_attempt.quanta. It builds and does not regress the
-gate but does not yet produce correct values -- see
-quanta-compiler-development/references/pow-ignores-integer-exponent.md for the
-three encoding traps on the way, which cost most of the attempt.
+All of them read their operand out of rdi and feed it to an x87 or SSE instruction
+that consumes f64 BITS; for an integer argument rdi holds the integer, which is
+reinterpreted as a denormal. fadd/fsub/fmul/fdiv already branched on
+is_float_vr(); these seven did not.
+
+The reason this class matters more than it looks: every one of those returned
+*something*. Nothing crashed, nothing was visibly NaN, and an exit-code check
+passes. sqrt(4) returning 4.4e-162 is indistinguishable from a real answer unless
+it is compared against one. Any builtin whose output is only ever printed and
+never compared can hide a defect of this shape indefinitely.
 
 ### sin/cos near roots -- NOT a defect, and the earlier claim was wrong
 
