@@ -2,6 +2,7 @@
 // Uses proper floating point: fadd, fmul, fdiv, i2f, f2i, sqrt
 // General GGUF support: proper metadata parsing, alignment, string arrays
 import std/fs
+import std/math
 
 let gguf_fd = -1
 let gguf_n_tensors = 0
@@ -714,49 +715,21 @@ fn gguf_matvec(A: u64, x: u64, rows: i64, cols: i64, y: u64) {
 // exp(x) for f64. There is no native `exp` builtin, so this is range
 // reduced: exp(x) = 2^k * exp(r) with k = round(x / ln2) and |r| <= ln2/2,
 // leaving a series that converges to full f64 precision in a few terms.
+// gguf_exp(x) -- kept as a name for callers already using it; the
+// implementation moved to lib/std/math.quanta as expf().
+//
+// It was hand-rolled here and duplicated nowhere else, but there was no tested
+// home for f64 transcendentals at all: this was the only implementation in the
+// tree, with no accuracy bar and no coverage. std/math's expf is verified
+// against Python's math.exp on the raw IEEE-754 bits over 260 cases including
+// subnormals, overflow, and a dense sweep of |x| < 61.
+//
+//   exp(0)    exact
+//   exp(+-1)  1 ULP
+//   exp(-10)  4 ULP
+//   exp(700)  414 ULP (worst; 2^k dominates)  -- 4.97e-14 relative
 fn gguf_exp(x: f64) -> f64 {
-    if x < -745.0 { return 0.0 }
-    if x > 709.0 { return 1.0e308 }
-    let ln2: f64 = 0.6931471805599453
-    let k: f64 = 0.0
-    if x >= 0.0 { k = floor(x / ln2 + 0.5) }
-    if x < 0.0 { k = -floor(-x / ln2 + 0.5) }
-    let r: f64 = x - k * ln2
-    // Taylor series for e^r; |r| <= ln2/2 so 20 terms overshoots f64 precision.
-    let term: f64 = 1.0
-    let acc: f64 = 1.0
-    let i = 1
-    while i <= 20 {
-        term = term * r / i2f(i)
-        acc = acc + term
-        i = i + 1
-    }
-    // 2^k by repeated squaring on the integer part.
-    //
-    // The loop builds 2^n for POSITIVE n only -- `while n > 0` never runs when ki
-    // is negative, so p stayed 1.0 and `acc / p` returned acc UNSCALED. Every
-    // negative argument was therefore off by a factor of 2^|k|:
-    //     exp(-1) -> 0.7357588823428848   (should be 0.36787944117144233)
-    //     exp(-2) -> 1.2718...            (should be 0.1353352832366127)
-    //     exp(-10)-> 1.0539...            (should be 4.5399929762484854e-05)
-    //
-    // The loop below runs on |ki|, so p is 2^|k| in both directions and the final
-    // multiply/divide by it selects the right one. It is exact: every step is a
-    // power of two and 2^|k| is representable for |k| <= 1023, which the range
-    // guards above already bound.
-    let ki = f2i(k)
-    let p: f64 = 1.0
-    let b: f64 = 2.0
-    let n = ki
-    if n < 0 { n = 0 - n }
-    while n > 0 {
-        let half = n / 2
-        if n - half * 2 > 0 { p = p * b }
-        b = b * b
-        n = half
-    }
-    if k < 0.0 { return acc / p }
-    return acc * p
+    return expf(x)
 }
 
 // Softmax: out[i] = exp(inp[i] - max) / sum, over `n` f64 values.

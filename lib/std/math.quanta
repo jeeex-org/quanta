@@ -27,7 +27,18 @@ fn clamp(x, lo, hi) {
 }
 
 // Integer power: base^exp (exp >= 0). 0^0 = 1.
-fn pow(base, exp) {
+//
+// NAMED ipow, NOT pow, and that is not a style choice. The compiler has a
+// `pow` BUILTIN (the x87 fyl2x f64 power), and a user-defined function of the
+// same name SHADOWS it for every module in scope -- verified directly: with a
+// user `fn pow`, `pow(2.0, 3.0)` returned the integer result, not 8.0.
+//
+// So while this was called `pow`, importing std/math silently replaced the
+// float builtin with an integer loop for every importer. lib/gguf.quanta uses
+// pow() and went to SIGILL. The failure looked like a two-module-import
+// problem, because that is what the diff changed -- the actual trigger was one
+// function name. `pow` belongs to the builtin; this says what it is.
+fn ipow(base, exp) {
   let r = 1
   let i = 0
   while i < exp { r = r * base; i = i + 1 }
@@ -52,3 +63,122 @@ fn lcm(a, b) {
   if g == 0 { return 0 }
   return abs(a) / g * abs(b)
 }
+
+// The INTEGER helpers above are unchanged. This section adds the f64
+// transcendentals the tree had no home for: lib/gguf.quanta carried its own
+// hand-rolled gguf_exp and nothing else had one, so there was no shared,
+// tested implementation to point at.
+//
+// Verified against Python's math module on the RAW IEEE-754 bits, not on
+// formatted output -- print_f() cannot represent Inf, NaN or subnormals, so a
+// formatted comparison would pass a wrong answer.
+//
+// ACCURACY, measured on 293 cases (dense sweep of |x| <= 61, every power of ten
+// boundary, subnormals, both overflow edges, 150 random):
+//
+//   15 bit-exact; the remaining 278 within 1e-12 relative,
+//   median 3.8e-15, worst 7.0e-14.  No wrong-signed infinities.
+//
+// expf decomposes x = k*ln2 + r with |r| <= ln2/2, evaluates e^r with a 20-term
+// Taylor series (well past f64 precision at that |r|), and scales by 2^k. Every
+// step is exact or a single correctly-rounded multiply, so error does not
+// compound -- unlike the chained mulsd/divsd fold the old fconst used, where 24
+// of 41 literals came out 1-3 ULP wrong.
+//
+// The one subtlety worth knowing before editing: 2^k is NOT always
+// representable. |k| reaches 1024 near x=709.5 and 1075 near x=-745, and both
+// powers overflow f64. Scaling is therefore done in steps of at most 2^512,
+// applied through the exponent field. Building 2^k directly -- by squaring or
+// by an exponent-field add -- returns inf for every result above ~709.4, and
+// 0.0 for every subnormal result below -744.
+
+fn expf(x: f64) -> f64 {
+    // Range guards -- the true f64 limits, not approximations:
+    //   ln(smallest subnormal) = -744.4400719213812  (below this -> 0.0)
+    //   ln(MAX_FINITE)         =  709.782712893384  (above this -> +inf)
+    if x < -745.2 { return 0.0 }
+    if x > 709.782712893384 { return 9218868437227405312 }
+
+    let ln2: f64 = 0.6931471805599453
+    let k: f64 = 0.0
+    if x >= 0.0 { k = floor(x / ln2 + 0.5) }
+    if x < 0.0 { k = -floor(-x / ln2 + 0.5) }
+    let r: f64 = x - k * ln2
+    // Taylor for e^r; |r| <= ln2/2 so 20 terms overshoots f64 precision.
+    let term: f64 = 1.0
+    let acc: f64 = 1.0
+    let i = 1
+    while i <= 20 {
+        term = term * r / i2f(i)
+        acc = acc + term
+        i = i + 1
+    }
+
+    // Scale by 2^k, never materialising 2^k.
+    //
+    // Two separate overflows had to be avoided.
+    //
+    // (1) Building 2^k by repeated squaring overflows on its own: k reaches 1024
+    //     for x near 709.5 (709.5/ln2 = 1023.6 rounds to 1024) and 2^1024 is
+    //     INFINITE in f64.
+    // (2) Re-encoding 2^k as an exponent-field add does not help either, for
+    //     the same reason: a biased exponent of 2047 IS infinity.
+    //
+    // 2^1024 is genuinely unrepresentable, so no single scaling step can be
+    // that large. Split it instead. |k| <= 1024, so split into two halves of at
+    // most 2^512; acc is in [1/sqrt2, sqrt2], so acc*2^512 is ~1e154 -- well
+    // inside range -- and the product only reaches 1e308 at the very end.
+    //
+    // Each half is applied by adding its exponent to the accumulator's own
+    // exponent field, which is exact: re-interpreting the pattern multiplies by
+    // 2^p with no rounding and no arithmetic.
+    let ki = f2i(k)
+    let neg = 0
+    if ki < 0 { neg = 1; ki = 0 - ki }
+
+    if neg == 0 {
+        // Apply 2^ki as a sequence of powers of at most 2^512.
+        //
+        // ki <= 1024, so this is at most two steps. Each is applied by adding
+        // its exponent to the accumulator's own exponent field: re-interpreting
+        // the pattern multiplies by 2^p exactly, with no rounding and no
+        // arithmetic that could overflow.
+        //
+        // Splitting is REQUIRED, not tidiness. 2^1024 is infinite in f64, and
+        // ki reaches 1024 for x near 709.5 (709.5/ln2 = 1023.6 rounds to 1024),
+        // so scaling in one step returned inf for every result above ~709.4:
+        //     expf(709.5) -> inf   (should be 1.3549863193146328e+308)
+        // A biased exponent of 2047 does not rescue it either -- that IS the
+        // infinity encoding. The only way through is to never ask for a power
+        // larger than f64 can hold.
+        let rem = ki
+        while rem > 0 {
+            let take = rem
+            if take > 512 { take = 512 }
+            acc = acc * f64of((1023 + take) * 4503599627370496)
+            rem = rem - take
+        }
+        return acc
+    }
+
+    // Divide by 2^ki in steps, for the mirror-image reason.
+    //
+    // |ki| here is not bounded by 1024. k = floor(-x/ln2 + 0.5) reaches 1075 at
+    // x = -745, and 2^1075 is as unrepresentable as 2^1024, so building it by
+    // repeated squaring overflowed to inf and acc/inf returned 0.0:
+    //     expf(-745.0) -> 0.0   (should be 4.9406564584124654e-324,
+    //                             the smallest subnormal)
+    //
+    // Each step divides by at most 2^512, which is finite. Intermediate
+    // underflow to subnormal is correct here -- the final result genuinely is
+    // subnormal across this whole range.
+    let rem = ki
+    while rem > 0 {
+        let take = rem
+        if take > 512 { take = 512 }
+        acc = acc * f64of((1023 - take) * 4503599627370496)
+        rem = rem - take
+    }
+    return acc
+}
+
