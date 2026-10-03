@@ -90,11 +90,20 @@ fn main() {
     let c = C { c0: B { b0: A { a0: 9 } } }
     check(21, c.c0.b0.a0, 9)
 
-    // A struct-typed field read off a CALL RESULT still core-dumps the compiler,
-    // and a scalar one silently yields the wrong value in a non-first argument
-    // position. Both are recorded rather than asserted, so this test stays a
-    // regression gate for what is fixed instead of quietly passing. See
-    // docs/research/struct-return-defects.md.
+    // 8: a field read off a CALL RESULT, at every chain depth and in every
+    //    argument position. parse_dot_chain is iterative: the tail-recursive
+    //    form handled one link and core-dumped the COMPILER on the second.
+    check(70, mk().b0.a0, 9)
+    check(71, mk_nested().b0.a0, 9)
+    let chained = mk().b0
+    check(72, chained.a0, 9)
+    check(73, third_link(), 9)
+    // A call result in a NON-FIRST argument position used to read as 0.
+    // arg2 returns its SECOND parameter, so check 74 is the regression: a call
+    // result there used to read as 0. Checks 75/76 pin the other two shapes.
+    check(74, arg2(99, mkp().f0), 3)
+    check(75, arg2(mkp().f0, 99), 99)
+    check(76, arg2(mk_a(), mk_b()), 4)
 
     // 4: the field values must be RIGHT, not merely present. A rewrite that
     //    dropped the wrong token pair would compile and give wrong numbers.
@@ -128,3 +137,12 @@ fn main() {
 
 fn mk_a() -> i64 { let p = P { f0: 3 } return p.f0 }
 fn mk_b() -> i64 { let p = P { f0: 4 } return p.f0 }
+
+// 8: helpers for the call-result chain assertions above.
+struct Inner { a0: i64 }
+struct Outer { b0: Inner }
+fn mk() -> Outer { return Outer { b0: Inner { a0: 9 } } }
+fn mk_nested() -> Outer { return Outer { b0: Inner { a0: 9 } } }
+fn third_link() -> i64 { return mk().b0.a0 }
+fn mkp() -> P { return P { f0: 3 } }
+fn arg2(a: i64, b: i64) -> i64 { return b }

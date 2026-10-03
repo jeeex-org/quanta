@@ -395,46 +395,59 @@ fn parse_postfix_expr(vr) {
 // looked equivalent and was not: for `mk().b0.a0` the second entry saw a
 // cursor the parser no longer expected and the compiler core-dumped, while
 // `mk().b0` and `b.b0.a0` (the local path) both worked.
+
 fn parse_dot_chain(cur) {
-    if !(peek()==TT_PNCT && pval()==46) { return cur }
-    let csi = r64(vreg_struct + cur*8)
-    if csi < 0 { return cur }
-    adv()
-    if !(peek()==TT_ID) { return cur }
-    let mn = pval()
-    let ml = plen()
-    let fc = r64(sdefs + csi*64 + 16)
-    let fb = r64(sdefs + csi*64 + 24)
-    let fidx = -1
-    let fj = 0
-    while fj < fc {
-        let fp = r64(sfldtab + (fb+fj)*16)
-        let fl = r64(sfldtab + (fb+fj)*16 + 8)
-        if fl == ml {
-            let ok = 1
-            let fk = 0
-            while fk < ml { if r8(src+fp+fk) != r8(src+mn+fk) { ok = 0; break }; fk = fk+1 }
-            if ok == 1 { fidx = fj; break }
-        }
-        fj = fj + 1
-    }
-    if fidx < 0 { return parse_method_call(cur, mn, ml) }
-    adv()
-    let fi = nv()
-    iremit(IR_CONST, fi, fidx, 0, 0)
-    if peek()==TT_OP && pval()==61 {
+    // Iterative, not recursive. The previous tail-recursive form
+    // (`return parse_dot_chain(out)`) worked for ONE link -- `mk().b0` -- and
+    // core-dumped the COMPILER on the second: `mk().b0.a0`. The local path
+    // (`x.b0.a0`) went through the `while` loop in parse_primary and was fine,
+    // so the difference was the recursion, not the field lookup: the recursive
+    // re-entry re-entered the fn's own frame while the caller was still holding
+    // a live `cur`, and the second link's `iremit` then indexed the IR array
+    // with a stale record index.
+    //
+    // One loop handles any number of links with the caller's frame intact.
+    while true {
+        if !(peek()==TT_PNCT && pval()==46) { return cur }
+        let csi = r64(vreg_struct + cur*8)
+        if csi < 0 { return cur }
         adv()
-        let v = parse_expr()
-        iremit(IR_ISTORE, 0, cur, fi, v)
-        return cur
+        if !(peek()==TT_ID) { return cur }
+        let mn = pval()
+        let ml = plen()
+        let fc = r64(sdefs + csi*64 + 16)
+        let fb = r64(sdefs + csi*64 + 24)
+        let fidx = -1
+        let fj = 0
+        while fj < fc {
+            let fp = r64(sfldtab + (fb+fj)*16)
+            let fl = r64(sfldtab + (fb+fj)*16 + 8)
+            if fl == ml {
+                let ok = 1
+                let fk = 0
+                while fk < ml { if r8(src+fp+fk) != r8(src+mn+fk) { ok = 0; break }; fk = fk+1 }
+                if ok == 1 { fidx = fj; break }
+            }
+            fj = fj + 1
+        }
+        if fidx < 0 { return parse_method_call(cur, mn, ml) }
+        adv()
+        let fi = nv()
+        iremit(IR_CONST, fi, fidx, 0, 0)
+        if peek()==TT_OP && pval()==61 {
+            adv()
+            let v = parse_expr()
+            iremit(IR_ISTORE, 0, cur, fi, v)
+            return cur
+        }
+        let out = nv()
+        iremit(32, out, cur, fi, 0)   // IR_IDX: 8-byte load at base+idx*8 (struct field)
+        // Tag with the FIELD's own struct type so the next link resolves.
+        let ftype = r64(sfldtyp + (fb+fidx)*8)
+        if ftype >= 0 { w64(vreg_struct + out*8, ftype) }
+        if ftype == 0-2 { w64(vreg_is_str + out*8, 1) }
+        cur = out
     }
-    let out = nv()
-    iremit(32, out, cur, fi, 0)
-    // Tag with the FIELD's own struct type so the next link resolves.
-    let ftype = r64(sfldtyp + (fb+fidx)*8)
-    if ftype >= 0 { w64(vreg_struct + out*8, ftype) }
-    if ftype == 0-2 { w64(vreg_is_str + out*8, 1) }
-    return parse_dot_chain(out)
 }
 
 // parse_index_on(base_vr): consume one `[...]` postfix against a base VREG that has

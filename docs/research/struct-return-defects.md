@@ -178,3 +178,43 @@ structurally instead of lexically:
 2. `two(99, mk().f0)` -- a call result in a NON-FIRST argument position evaluates
    to 0. `two(mk().f0, 99)` prints 99 correctly, and `two(99, 5)` prints 5, so
    the first argument is unaffected.
+
+
+## Defect 4 (FIXED): tail recursion in `parse_dot_chain`
+
+`parse_dot_chain` was written as a self tail-call: after resolving a field it did
+`return parse_dot_chain(out)`. One link worked (`mk().b0`); a second link
+(`mk().b0.a0`) **core-dumped the compiler itself**, so the failing program never
+even produced an object file.
+
+The discriminator that isolated it:
+
+| expression                        | before      | cause                       |
+|-----------------------------------|-------------|-----------------------------|
+| `mk().b0`                         | OK          | one link                   |
+| `mk().b0.a0`                      | CFAIL (core)| two links                  |
+| `mk().a0.b0.c0` (three links)     | CFAIL (core)| any depth > 1              |
+| `let x = mk()` then `x.b0.a0`     | OK          | local path, not this fn    |
+| `let x = mk().b0` then `x.a0`     | CFAIL (core)| one link stored back       |
+
+The local path was always safe because `parse_primary`'s identifier branch walks
+its own `while peek()==TT_PNCT && pval()==46` loop; only call results went
+through `parse_dot_chain`. So the recursion -- not the field lookup, not
+`sfldtyp`, not `vreg_struct` -- was the variable. Probing inside the function
+was self-defeating: any probe there sits in the crashing frame and the probe
+binary also dumped core, which is why several earlier bisections produced no
+trace at all.
+
+**Fix:** `parse_dot_chain` is now a single `while true` loop over the links,
+with `cur = out` carrying the previous link's result forward and the field's own
+type written to `vreg_struct[out*8]` so the next iteration resolves against the
+right struct. Depth is now unbounded and the caller's frame stays intact.
+
+This also fixed the non-first-argument value defect (`two(99, mk().f0)`
+printing `0` instead of `3`): the nested call was being parsed as a method call
+with a bogus `selfv = 0`, which prepended a phantom argument. With the loop in
+place the parser no longer takes that fallback path.
+
+Assertions `70`-`76` in `tests/test_struct_return.quanta` now cover chains of
+two and three links, a stored intermediate, and call results in the first, the
+non-first, and the nested argument position.
