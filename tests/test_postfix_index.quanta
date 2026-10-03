@@ -1,0 +1,150 @@
+// Indexing and slicing a base that is an EXPRESSION, not a name.
+//
+//     print(m[1][0])          SIGILL while COMPILING
+//     print(len(m[1][0]))     SIGILL while COMPILING
+//     print([70,80][0])       SIGILL while COMPILING
+//     print(g()[0])           SIGILL while COMPILING
+//     print(len([1,2,3][1:3])) SIGILL while COMPILING
+//
+// parse_primary's identifier branch always handled `a[i]` and `a.f`, then RETURNED
+// after the first `[...]`. Every other primary -- an array literal, a call result,
+// a parenthesised expression -- returned immediately too, so nothing consumed a
+// trailing bracket.
+//
+// In a `let` the leftover tokens were harmless. As a CALL argument they were not:
+// parse_call_impl:101 saw `[` where it expected `,` or `)`, and mpnct() is lenient
+// (parse.quanta:13 returns 0 on a mismatch and every caller ignores the result).
+// The argument count silently over-counted, the permutation at 139-146 read an
+// arg_tgt slot that was never written, and that garbage index reached
+// `ir + idx*IRS + field`. The multiply overflowed and the COMPILER's own
+// checked-arithmetic trap fired -- so a caller-side mistake reported as an
+// illegal instruction inside the compiler, with no diagnostic and no line number.
+//
+// Fixed by parse_index_on(base_vr), which consumes one `[...]` against an already
+// produced VREG and returns the result VREG, plus parse_postfix_expr, which loops
+// it and is now applied to the non-name primaries.
+//
+// Note the trap shape: `n[1][0]` on a FLAT array is NOT valid Quanta and is not
+// tested here -- n[1] is the integer 80, and indexing an integer reads a header
+// off whatever 80 happens to point at. The nested cases below use real nested
+// arrays, which is what the syntax is for.
+
+let failures = 0
+
+fn check(num, got, want) {
+    if got != want {
+        failures = failures + 1
+        print("FAIL check ")
+        println(num)
+        print("  got  ")
+        println(got)
+        print("  want ")
+        println(want)
+    }
+}
+
+fn main() {
+    // ---- nested arrays -----------------------------------------------------
+    let m = [[1, 2], [3, 4]]
+    check(10, len(m), 2)
+    check(11, len(m[0]), 2)
+    check(12, m[0][0], 1)
+    check(13, m[0][1], 2)
+    check(14, m[1][0], 3)
+    check(15, m[1][1], 4)
+
+    // ---- three deep --------------------------------------------------------
+    let d = [[[1, 2], [3, 4]], [[5, 6], [7, 8]]]
+    check(20, d[1][0][1], 6)
+    check(21, d[0][1][0], 3)
+
+    // ---- a runtime index at every level ------------------------------------
+    let i = 1
+    let j = 0
+    check(30, m[i][j], 3)
+    let k = i + 1
+    check(31, m[i][k - 1], 4)
+
+    // ---- an array LITERAL base ---------------------------------------------
+    check(40, [8, 9][1], 9)
+    check(41, [8, 9][0], 8)
+    check(42, len([8, 9, 10]), 3)
+
+    // ---- a CALL RESULT base ------------------------------------------------
+    check(50, g()[2], 7)
+    check(51, g()[0], 5)
+    check(52, len(g()), 3)
+
+    // ---- a PARENTHESISED base ----------------------------------------------
+    let a = [4, 5, 6]
+    check(60, (a)[1], 5)
+    check(61, (g())[1], 6)
+
+    // ---- a string array: elements are string POINTERS ----------------------
+    let p = ["one", "two", "three"]
+    check(70, len(p), 3)
+    check(71, len(p[0]), 3)
+    check(72, len(p[1]), 3)
+    check(73, len(p[2]), 5)
+    // p[i][j] reads the i-th element's own length header, not the outer array's.
+    check(74, len(p[2]) - len(p[0]), 2)
+
+    // ---- slicing a non-name base ------------------------------------------
+    check(80, len([1, 2, 3, 4, 5][1:3]), 2)
+    check(81, [1, 2, 3, 4, 5][1:3][0], 2)
+    check(82, len(g()[1:3]), 2)
+    // g() is [5,6,7], so g()[1:3] is [6,7] and element 1 of THAT is 7.
+    check(83, g()[1:3][1], 7)
+    check(84, len([1, 2, 3, 4, 5][2:]), 3)
+    check(85, len([1, 2, 3, 4, 5][:2]), 2)
+
+    // ---- the named-base forms still work -----------------------------------
+    // These are the ones that worked before; they must keep working.
+    let n = [70, 80]
+    check(90, n[0], 70)
+    check(91, n[1], 80)
+    check(92, len(n[1:]), 1)
+    let s = "abc"
+    check(93, s[0], 97)
+    check(94, s[2], 99)
+    let w = [0, 0]
+    w[0] = 5
+    w[1] = 6
+    check(95, w[0], 5)
+    check(96, w[1], 6)
+    let t = (7, 8)
+    check(97, t.0, 7)
+    check(98, t.1, 8)
+
+    // ---- an index passed straight to a user function ----------------------
+    // The exact shape that crashed: a nested index as a call argument.
+    check(100, identity(m[1][0]), 3)
+    check(101, identity([8, 9][1]), 9)
+    check(102, identity(g()[2]), 7)
+    check(103, identity(s[1]), 98)
+
+    // ---- mixed with other arguments ----------------------------------------
+    check(110, add3(m[1][0], 10, 100), 113)
+    check(111, add3(identity(m[0][1]), 1, 2), 5)
+
+    // ---- report ------------------------------------------------------------
+    print("test_postfix_index: ")
+    if failures == 0 {
+        print("PASS\n")
+        return 0
+    }
+    print("FAIL\n")
+    return 1
+}
+
+fn g() {
+    return [5, 6, 7]
+}
+
+fn identity(x) {
+    return x
+}
+
+fn add3(a, b, c) {
+    return a + b + c
+}

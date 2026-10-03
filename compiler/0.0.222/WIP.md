@@ -54,23 +54,50 @@ history but wrong as a header. Replaced, not appended to.)
 
 ## OPEN DEFECTS
 
-### Nested indexing into a string-array element CRASHES THE COMPILER
+### RESOLVED: a nested index / a non-name base CRASHED THE COMPILER
 
-    let p = ["one", "two", "three"]
-    println(p[1][0])        // SIGILL while COMPILING, before any run
+    print(m[1][0])            SIGILL while COMPILING
+    print(len(m[1][0]))       SIGILL while COMPILING
+    print([70,80][0])         SIGILL while COMPILING
+    print(g()[0])             SIGILL while COMPILING
+    print(len([1,2,3][1:3]))  SIGILL while COMPILING
 
-This is not a miscompilation -- the compiler itself dies with SIGILL on this
-source. `p[1]` alone works (it yields the element's string pointer), so the crash
-is specific to indexing a second time into an IR_IDX result.
+Two independent defects, both in parse_primary's postfix handling.
 
-The emitter already has the machinery for it: `vreg_str_arr` is set on a string
-array's result vreg, and the IR_IDX array branch reads it to tag the RESULT as a
-byte-stride string, which is what would make the second index stride by 1. That
-tagging is at codegen.quanta:1580. So the intent is implemented and something in
-the path still faults -- worth an actual diagnosis before guessing.
+1. The `[` arm resolved its base with vfind(nm,nl)/gfind(nm,nl) and RETURNED
+   after the first `[...]`. So a base that is not a name -- an array literal, a
+   call result, a parenthesised expression -- had nothing to resolve, and
+   `n[1][0]` left the `[0]` in the token stream.
 
-Not asserted in tests/test_indexing_bounds.quanta on purpose: a compile-time
-SIGILL would take the whole suite down and hide every other check in the file.
+2. That leftover token was harmless in a `let` and fatal as a CALL argument.
+   parse_call_impl:101 saw `[` where it expected `,` or `)`, and mpnct() is
+   lenient -- parse.quanta:13 returns 0 on a mismatch and every caller ignores the
+   result. The argument count silently over-counted, the permutation at 139-146
+   read an arg_tgt slot that was never written, and that garbage index reached
+   `ir + idx*IRS + field`. The multiply overflowed and the COMPILER's own
+   checked-arithmetic trap (jno/ud2, confirmed at 0x42fd9a) fired.
+
+The worst part is the failure SHAPE: a caller-side mistake reported as an
+illegal instruction inside the compiler, with no diagnostic and no line number.
+The traceback points at the compiler, not at the code that caused it.
+
+Fix: `parse_index_on(base_vr)` consumes one `[...]` against an already-produced
+VREG and returns the result VREG; `parse_postfix_expr(vr)` loops it. The named-base
+path resolves nm/nl once and then chains; the non-name primaries -- array literal,
+call result, parenthesised expression, numeric literal -- return through
+parse_postfix_expr.
+
+`n[1][0]` on a FLAT array is not valid Quanta and is not tested: n[1] is the
+integer 80, and indexing an integer reads a header off whatever 80 points at.
+tests/test_postfix_index.quanta uses real nested arrays. That mis-designed probe
+was mine, and it is worth naming -- `n[1][0]` looks like the obvious test and it
+is not one.
+
+tests/test_postfix_index.quanta: 38 checks over nested arrays, three-deep,
+runtime indices at every level, literal/call/paren bases, string arrays, slicing a
+non-name base, the named forms that had to keep working, and a nested index passed
+straight to a user function with other arguments. Verified to crash the pre-fix
+compiler and pass on this one.
 
 ### A slice whose HIGH bound exceeds the length traps instead of clamping
 

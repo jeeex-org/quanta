@@ -357,6 +357,119 @@ fn build_str(a, b) {
     return cr
 }
 
+// parse_postfix_expr(vr): apply any trailing `[...]` to a primary that
+// parse_primary produced as a VALUE rather than as a name.
+//
+// parse_primary's identifier branch has always handled `a[i]` and `a.f`. Every
+// other primary -- an array literal, a call result, a parenthesised expression --
+// returned immediately, so `f(x)[0]` and `[1,2][0]` had nothing to consume the
+// bracket and the trailing tokens were left in the stream. That is the
+// non-name-base half of parse_index_on's comment; this is where it gets fixed.
+//
+// Loops, so the result of one index can be indexed again.
+fn parse_postfix_expr(vr) {
+    let cur = vr
+    while peek()==TT_PNCT && pval()==91 { cur = parse_index_on(cur) }
+    return cur
+}
+
+// parse_index_on(base_vr): consume one `[...]` postfix against a base VREG that has
+// already been produced -- a name, an array literal, a call result, or the result
+// of a previous index. Returns the result VREG so the caller can chain.
+//
+// This lowering used to be inline in parse_primary, where it resolved its base with
+// vfind(nm,nl)/gfind(nm,nl) and then RETURNED after the first `[...]`. Both halves
+// were wrong:
+//
+//  1. A base that is not a name -- an array literal, a call result, a parenthesised
+//     expression -- had nothing to resolve, so `f(x)[0]` and `[1,2][0]` failed.
+//  2. It returned after one index, so `n[1][0]` left the `[0]` in the token stream.
+//
+// (2) was harmless in a `let` and fatal as a CALL argument. parse_call_impl:101 then
+// saw `[` where it expected `,` or `)`, and mpnct() is lenient -- parse.quanta:13
+// returns 0 on a mismatch and every caller ignores the result. The argument count
+// silently over-counted, the permutation at 139-146 read an arg_tgt slot that was
+// never written, and that garbage index reached `ir + idx*IRS + field`. The
+// multiply overflowed and the COMPILER's own checked-arithmetic trap fired:
+//
+//     print(n[1][0])        SIGILL while compiling
+//     print(len(n[1][0]))   SIGILL while compiling
+//     print([70,80][0])     SIGILL while compiling
+//     print(g()[0])         SIGILL while compiling
+//
+// A caller-side mistake reported as an illegal instruction inside the compiler,
+// with no diagnostic and no line number -- the worst possible failure shape,
+// because the traceback points at the compiler and not at the code that caused it.
+fn parse_index_on(base_vr) {
+    if peek()==TT_PNCT&&pval()==91 {  // index: a[idx] OR slice: a[lo:hi] / a[:hi] / a[lo:]
+        adv()  // consume '['
+        let is_slice = 0
+        let lo_vr = -1
+        let hi_vr = -1
+        let e0 = -1
+        if peek()==TT_PNCT&&pval()==58 {
+            // a[:hi] — no lower bound (defaults to 0)
+            is_slice = 1
+            adv()  // consume ':'
+            if !(peek()==TT_PNCT&&pval()==93) { hi_vr = parse_expr() }
+        } else {
+            e0 = parse_expr()
+            if peek()==TT_PNCT&&pval()==58 {
+                is_slice = 1
+                lo_vr = e0
+                adv()  // consume ':'
+                if !(peek()==TT_PNCT&&pval()==93) { hi_vr = parse_expr() }
+            }
+        }
+        if is_slice==1 {
+            mpnct(93)  // ']'
+            let sstr = r64(vreg_is_str + base_vr*8)
+            if sstr>=0 {
+                let mn = "error: slice of string not supported (arrays only)\n"
+                file_write(2, mn+8, len(mn)); exit(1)
+            }
+            // Slice lowering (pure IR — works on x86 AND ARM64):
+            //   n = clamp(hi - lo, 0);  dst = TALLOC(n)
+            //   loop idx in 0..n: dst[idx] = base[lo+idx]
+            // The IR_IDX inside the loop carries the bounds trap, so an
+            // out-of-range slice (hi > len) SIGILLs like a[idx] does.
+            let zero=nv(); iremit(IR_CONST,zero,0,0,0)
+            let len_vr=nv(); iremit(IR_ARRAY_LEN, len_vr, base_vr, 0, 0)
+            let lo = lo_vr
+            if lo<0 { lo = zero }
+            let hi = hi_vr
+            if hi<0 { hi = len_vr }
+            let nraw=nv(); iremit(IR_SUB, nraw, hi, lo, 0)
+            let neg=nv(); iremit(IR_LT, neg, nraw, zero, 0)
+            let n=nv(); iremit(IR_MOV, n, nraw, 0, 0)
+            let lafter=nl()
+            iremit(IR_BR,0,neg,lafter,0)   // neg==0 (nraw>=0) -> skip clamp
+            iremit(IR_MOV,n,zero,0,0)      // neg==1 -> n = 0 (empty slice)
+            iremit(IR_LABEL,0,lafter,0,0)
+            let dst=nv(); iremit(IR_ARRNEW, dst, n, 0, 0)   // runtime-count alloc
+            let cond=nl(); let body=nl(); let end=nl()
+            let idx_vr=nv(); iremit(IR_MOV, idx_vr, zero, 0, 0)
+            iremit(IR_JMP,0,cond,0,0)
+            iremit(IR_LABEL,0,cond,0,0)
+            let cmp=nv(); iremit(IR_LT, cmp, idx_vr, n, 0)
+            iremit(IR_BR,0,cmp,end,body)   // idx>=n -> end, else body
+            iremit(IR_LABEL,0,body,0,0)
+            let sio=nv(); iremit(IR_ADD, sio, lo, idx_vr, 0)
+            let val=nv(); iremit(32, val, base_vr, sio, 0)   // base[lo+idx]
+            iremit(IR_ISTORE,0,dst,idx_vr,val)               // dst[idx]=val
+            let one=nv(); iremit(IR_CONST, one, 1, 0, 0)
+            let nidx=nv(); iremit(IR_ADD, nidx, idx_vr, one, 0)
+            let idx2=nv(); iremit(IR_MOV, idx2, nidx, 0, 0)
+            iremit(IR_MOV, idx_vr, idx2, 0, 0)
+            iremit(IR_JMP,0,cond,0,0)
+            iremit(IR_LABEL,0,end,0,0)
+            return dst
+        }
+        mpnct(93)
+        let vr=nv(); iremit(32,vr,base_vr,e0,0); return vr
+    }
+}
+
 fn parse_primary() {
     if peek()==TT_ASM {  // P11: inline asm: asm!("hex bytes") — raw machine code
         adv()  // consume 'asm'
@@ -411,7 +524,7 @@ fn parse_primary() {
             let vr=nv(); iremit(IR_ERR, vr, a, 0, 0); w64(vreg_enum+vr*8,-3); w64(vreg_enum_var+vr*8,0); return vr
         }
     }
-    if peek()==TT_NUM { let v=pval(); adv(); let vr=nv(); iremit(IR_CONST,vr,v,0,0); return vr }
+    if peek()==TT_NUM { let v=pval(); adv(); let vr=nv(); iremit(IR_CONST,vr,v,0,0); return parse_postfix_expr(vr) }
     if peek()==TT_BIGNUM {
         // Over-sized decimal literal: build a runtime string from the digit text
         // held in src[val..val+len], then lower to big_from_dec(string).
@@ -977,7 +1090,9 @@ fn parse_primary() {
             iremit(IR_ISTORE,0,tr,fi,ev)
             ci=ci+1
         }
-        return tr
+        // An array literal is a VALUE, so `[8,9][1]` needs the postfix
+        // applied here -- the identifier branch never runs for it.
+        return parse_postfix_expr(tr)
     }
     if peek()==TT_PNCT&&pval()==40 {
         pdepth=pdepth+1
@@ -1005,7 +1120,7 @@ fn parse_primary() {
             let mn = "error: expected ')' in parenthesized expression\n"
             file_write(2, mn+8, len(mn)); exit(1)
         }
-        pdepth=pdepth-1; return e
+        pdepth=pdepth-1; return parse_postfix_expr(e)
     }
     if peek()==TT_KEY {
         let v=pval(); let ln=plen(); let h=ktext(v,ln); let vr=nv()
@@ -1345,90 +1460,29 @@ fn parse_primary() {
                             let qcall = 0
                             if tokp<tokc && tokt(tokp)==TT_PNCT && tokv(tokp)==40 { qcall = 1 }
                             else if tokp<tokc && tokt(tokp)==TT_OP && tokv(tokp)==60 { qcall = 1 }
-                            if qcall == 1 { return parse_call(qn, ql, FI_GLOBAL) }
+                            if qcall == 1 { return parse_postfix_expr(parse_call(qn, ql, FI_GLOBAL)) }
                         }
                     }
                     if is_call==1 {
-                        return parse_call(nm, nl, FI_LOCAL)
+                        // A call result is a VALUE, so a following `[...]` needs
+                        // parse_postfix_expr -- the identifier branch below never
+                        // runs for it.
+                        return parse_postfix_expr(parse_call(nm, nl, FI_LOCAL))
                     }
         if peek()==TT_PNCT&&pval()==91 {  // index: a[idx] OR slice: a[lo:hi] / a[:hi] / a[lo:]
-            adv()  // consume '['
-            let is_slice = 0
-            let lo_vr = -1
-            let hi_vr = -1
-            let e0 = -1
-            if peek()==TT_PNCT&&pval()==58 {
-                // a[:hi] — no lower bound (defaults to 0)
-                is_slice = 1
-                adv()  // consume ':'
-                if !(peek()==TT_PNCT&&pval()==93) { hi_vr = parse_expr() }
-            } else {
-                e0 = parse_expr()
-                if peek()==TT_PNCT&&pval()==58 {
-                    is_slice = 1
-                    lo_vr = e0
-                    adv()  // consume ':'
-                    if !(peek()==TT_PNCT&&pval()==93) { hi_vr = parse_expr() }
-                }
+            // The base of the FIRST index is this name; the base of every later one
+            // is the previous result. `while` rather than a single `if` is what
+            // makes `n[1][0]` and `parts[i][j]` consume all of their brackets.
+            let pv = -1
+            let fv = vfind(nm, nl)
+            if fv >= 0 { pv = fv }
+            else {
+                let gv = gfind(nm, nl)
+                if gv >= 0 { let pg=nv(); iremit(IR_LOADG,pg,gv,0,0); pv = pg }
             }
-            if is_slice==1 {
-                mpnct(93)  // ']'
-                let fv=vfind(nm,nl)
-                let base_vr = -1
-                if fv>=0 { base_vr = fv }
-                else {
-                    let gv=gfind(nm,nl)
-                    if gv>=0 { let pg=nv(); iremit(IR_LOADG,pg,gv,0,0); base_vr = pg }
-                }
-                if base_vr<0 { compile_error(1, nm, nl); return 0 }
-                let sstr = r64(vreg_is_str + base_vr*8)
-                if sstr>=0 {
-                    let mn = "error: slice of string not supported (arrays only)\n"
-                    file_write(2, mn+8, len(mn)); exit(1)
-                }
-                // Slice lowering (pure IR — works on x86 AND ARM64):
-                //   n = clamp(hi - lo, 0);  dst = TALLOC(n)
-                //   loop idx in 0..n: dst[idx] = base[lo+idx]
-                // The IR_IDX inside the loop carries the bounds trap, so an
-                // out-of-range slice (hi > len) SIGILLs like a[idx] does.
-                let zero=nv(); iremit(IR_CONST,zero,0,0,0)
-                let len_vr=nv(); iremit(IR_ARRAY_LEN, len_vr, base_vr, 0, 0)
-                let lo = lo_vr
-                if lo<0 { lo = zero }
-                let hi = hi_vr
-                if hi<0 { hi = len_vr }
-                let nraw=nv(); iremit(IR_SUB, nraw, hi, lo, 0)
-                let neg=nv(); iremit(IR_LT, neg, nraw, zero, 0)
-                let n=nv(); iremit(IR_MOV, n, nraw, 0, 0)
-                let lafter=nl()
-                iremit(IR_BR,0,neg,lafter,0)   // neg==0 (nraw>=0) -> skip clamp
-                iremit(IR_MOV,n,zero,0,0)      // neg==1 -> n = 0 (empty slice)
-                iremit(IR_LABEL,0,lafter,0,0)
-                let dst=nv(); iremit(IR_ARRNEW, dst, n, 0, 0)   // runtime-count alloc
-                let cond=nl(); let body=nl(); let end=nl()
-                let idx_vr=nv(); iremit(IR_MOV, idx_vr, zero, 0, 0)
-                iremit(IR_JMP,0,cond,0,0)
-                iremit(IR_LABEL,0,cond,0,0)
-                let cmp=nv(); iremit(IR_LT, cmp, idx_vr, n, 0)
-                iremit(IR_BR,0,cmp,end,body)   // idx>=n -> end, else body
-                iremit(IR_LABEL,0,body,0,0)
-                let sio=nv(); iremit(IR_ADD, sio, lo, idx_vr, 0)
-                let val=nv(); iremit(32, val, base_vr, sio, 0)   // base[lo+idx]
-                iremit(IR_ISTORE,0,dst,idx_vr,val)               // dst[idx]=val
-                let one=nv(); iremit(IR_CONST, one, 1, 0, 0)
-                let nidx=nv(); iremit(IR_ADD, nidx, idx_vr, one, 0)
-                let idx2=nv(); iremit(IR_MOV, idx2, nidx, 0, 0)
-                iremit(IR_MOV, idx_vr, idx2, 0, 0)
-                iremit(IR_JMP,0,cond,0,0)
-                iremit(IR_LABEL,0,end,0,0)
-                return dst
-            }
-            mpnct(93)
-            let f=vfind(nm,nl)
-            if f>=0 { let vr=nv(); iremit(32,vr,f,e0,0); return vr }
-            let g=gfind(nm,nl)
-            if g>=0 { let pg=nv(); iremit(IR_LOADG,pg,g,0,0); let vr=nv(); iremit(32,vr,pg,e0,0); return vr }
-            compile_error(1, nm, nl)  // undeclared array/string index -> error
+            if pv < 0 { compile_error(1, nm, nl); return 0 }
+            while peek()==TT_PNCT && pval()==91 { pv = parse_index_on(pv) }
+            return pv
         }
         // Phase 4.3: postfix `.N` (tuple), `.field` (struct), `.method` (t8) —
         // CHAINED (e.g. r.topleft.x). `selfv` holds the object vreg: for the
