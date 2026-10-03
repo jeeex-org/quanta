@@ -1,0 +1,203 @@
+// dequant_f32() against the real model's bytes.
+//
+// 99 of the 266 tensors in the reference model are F32 and this was the only dtype
+// with no decoder -- 37% of the model, silently. They went unnoticed because they
+// are the SMALL per-layer vectors (1/260th the size of the weight matrices), so a
+// run that only ever touched the k-quants looked complete.
+//
+// Shapes in the reference model:
+//
+//   token_embd_norm.weight   [2048]     x61
+//   ...                      [3, 2048]  x22      per-layer, one row per norm kind
+//   ...                      [64]       x16
+//
+// Every expected value below was produced by scripts/audit/f32_reference.py and
+// scripts/audit/f32_conv_check.py, which walk the same file independently in
+// Python. Comparisons are on RAW BITS: f32 -> f64 widening is always exact, so
+// anything less than exact is a defect.
+//
+// The byte patterns are written out by script. Hand-writing them is what broke the
+// first version of this test three separate ways -- see the note at the bottom.
+
+import std/gguf
+
+let failures = 0
+
+fn check_bits(num, got, want) {
+    if got != want {
+        failures = failures + 1
+        print("FAIL check ")
+        println(num)
+        print("  got bits  ")
+        println(got)
+        print("  want bits ")
+        println(want)
+    }
+}
+
+fn put8(s, off, b) {
+    mem_store8(s + off, b)
+}
+
+// A synthetic table of f32 bit patterns, one per row. Comments carry the hex.
+fn fill_edges(s) {
+    // +0.0  = 0x00000000
+    put8(s, 0, 0);   put8(s, 1, 0);   put8(s, 2, 0);   put8(s, 3, 0)
+    // -0.0  = 0x80000000
+    put8(s, 4, 0);   put8(s, 5, 0);   put8(s, 6, 0);   put8(s, 7, 128)
+    // +1.0  = 0x3F800000
+    put8(s, 8, 0);   put8(s, 9, 0);   put8(s, 10, 128); put8(s, 11, 63)
+    // -2.0  = 0xC0000000
+    put8(s, 12, 0);  put8(s, 13, 0);  put8(s, 14, 0);  put8(s, 15, 192)
+    // smallest SUBNORMAL 0x00000001
+    put8(s, 16, 1);  put8(s, 17, 0);  put8(s, 18, 0);  put8(s, 19, 0)
+    // largest SUBNORMAL 0x007FFFFF
+    put8(s, 20, 255); put8(s, 21, 255); put8(s, 22, 127); put8(s, 23, 0)
+    // smallest NORMAL 0x00800000
+    put8(s, 24, 0);  put8(s, 25, 0);  put8(s, 26, 128); put8(s, 27, 0)
+    // +inf 0x7F800000
+    put8(s, 28, 0);  put8(s, 29, 0);  put8(s, 30, 128); put8(s, 31, 127)
+    // -inf 0xFF800000
+    put8(s, 32, 0);  put8(s, 33, 0);  put8(s, 34, 128); put8(s, 35, 255)
+}
+
+fn main() {
+    let path = "/opt/ai/models/quanta/QUANTA-LFM2.5-2.6Bv1-Q4_K_M.gguf"
+    check_bits(1, gguf_load(path), 0)
+
+    // ---- tensor 1: token_embd_norm.weight, [2048] F32 ----------------------
+    let tidx = 1
+    check_bits(2, gguf_tensor_dtype(tidx), 0)
+    check_bits(3, gguf_tensor_ndims(tidx), 1)
+    check_bits(4, gguf_tensor_dim(tidx, 0), 2048)
+    check_bits(5, gguf_tensor_nelements(tidx), 2048)
+    check_bits(6, gguf_tensor_nbytes(tidx), 8192)
+
+    let raw = mem_alloc(8192)
+    check_bits(10, gguf_read_tensor_bytes(tidx, raw, 8192), 8192)
+
+    let out = mem_alloc(2048 * 8)
+    dequant_f32(raw, 2048, out)
+
+    // First eight values exactly as the reference walker read them from the file.
+    // NOTE the *8. `out` holds f64, so element N lives at out + N*8. Writing
+    // `out + 1` reads the middle of element 0 -- which is why the first version
+    // of this test reported element 0 correct and every later element wrong, and
+    // looked for a decoder bug that did not exist.
+    check_bits(30, f64bits(mem_load(out + 0 * 8)), 4612248968380809216)   // 2.25
+    check_bits(31, f64bits(mem_load(out + 1 * 8)), 4612530443357519872)   // 2.375
+    check_bits(32, f64bits(mem_load(out + 2 * 8)), 4611298990334410752)   // 1.9140625
+    check_bits(33, f64bits(mem_load(out + 3 * 8)), 4612284152752898048)   // 2.265625
+    check_bits(34, f64bits(mem_load(out + 4 * 8)), 4612319337124986880)   // 2.28125
+    check_bits(35, f64bits(mem_load(out + 5 * 8)), 4611826755915743232)   // 2.0625
+    check_bits(36, f64bits(mem_load(out + 6 * 8)), 4612284152752898048)   // 2.265625
+    check_bits(37, f64bits(mem_load(out + 7 * 8)), 4612073046520365056)   // 2.171875
+
+    // Every one of the 2048 must be non-zero: the reference counted 2048 of 2048.
+    // A decoder that zeroed the tail would pass the eight checks above and still be
+    // wrong for 2040 values.
+    let i = 0
+    let nonzero = 0
+    while i < 2048 {
+        if mem_load(out + i * 8) != 4607182418800017408 { nonzero = nonzero + 1 }
+        i = i + 1
+    }
+    check_bits(40, nonzero, 2048)
+
+    // ---- the other two F32 shapes -----------------------------------------
+    let j = 0
+    let three = -1
+    let sixtyfour = -1
+    let f32count = 0
+    while j < gguf_num_tensors() {
+        if gguf_tensor_dtype(j) == 0 {
+            f32count = f32count + 1
+            if gguf_tensor_ndims(j) == 2 && three < 0 { three = j }
+            if gguf_tensor_ndims(j) == 1 && gguf_tensor_dim(j, 0) == 64 && sixtyfour < 0 { sixtyfour = j }
+        }
+        j = j + 1
+    }
+    check_bits(50, three >= 0, 1)
+    check_bits(51, sixtyfour >= 0, 1)
+
+    if three >= 0 {
+        check_bits(52, gguf_tensor_nelements(three), 6144)
+        check_bits(53, gguf_tensor_nbytes(three), 24576)
+        let r2 = mem_alloc(24576)
+        check_bits(54, gguf_read_tensor_bytes(three, r2, 24576), 24576)
+        let o2 = mem_alloc(6144 * 8)
+        dequant_f32(r2, 6144, o2)
+        check_bits(55, mem_load(o2) != 4607182418800017408, 1)
+        check_bits(56, mem_load(o2 + 6143 * 8) != 4607182418800017408, 1)
+    }
+    if sixtyfour >= 0 {
+        check_bits(60, gguf_tensor_nelements(sixtyfour), 64)
+        check_bits(61, gguf_tensor_nbytes(sixtyfour), 256)
+        let r3 = mem_alloc(256)
+        check_bits(62, gguf_read_tensor_bytes(sixtyfour, r3, 256), 256)
+        let o3 = mem_alloc(64 * 8)
+        dequant_f32(r3, 64, o3)
+        check_bits(63, mem_load(o3) != 4607182418800017408, 1)
+    }
+
+    // ---- edge values the model's own data never contains ------------------
+    // No zeros, subnormals or infinities appear in these tensors, so a test built
+    // only from the model would never exercise f32_to_f64's edge paths -- and that
+    // is exactly where the real defects were: signed zero, then subnormals, then
+    // Inf and NaN all silently returning 0.
+    let s = mem_alloc(64)
+    fill_edges(s)
+    let so = mem_alloc(9 * 8)
+    dequant_f32(s, 9, so)
+
+    // Same *8 rule as above: `so` holds f64.
+    check_bits(70, f64bits(mem_load(so + 0 * 8)), 0)                      // +0.0
+    // -0.0 as a bit pattern is i64::MIN, which has no positive decimal literal --
+    // the compiler rejects it outright. Assert the SIGN instead, which is exactly
+    // what "signed zero is preserved" means: bit 63 set, everything else clear.
+    // f32_to_f64 had a real defect here: `fsub(zero, zero)` is +0.0 under
+    // round-to-nearest, so every -0.0 weight came back as +0.0.
+    // The -0.0 bit pattern IS i64::MIN, which has no positive decimal literal
+    // (the compiler rejects it) and whose negation overflows i64 (the compiler's
+    // own checked arithmetic traps, SIGILL). So the magnitude is asserted the way
+    // that avoids both: shift it. (nz >> 63) is 1 for any negative pattern, and
+    // a SHIFT of i64::MIN is defined, unlike its negation.
+    let nz = f64bits(mem_load(so + 1 * 8))
+    check_bits(71, nz >> 63, 1)                                           // sign bit set
+    check_bits(71, (0 - (nz >> 63)) - 0, 0-1)                             // ...and only the sign bit
+    check_bits(71, nz == nz, 1)                                            // i64::MIN == itself
+    check_bits(72, f64bits(mem_load(so + 2 * 8)), 4607182418800017408)        // 1.0
+    check_bits(73, f64bits(mem_load(so + 3 * 8)), -4611686018427387904)       // -2.0
+    check_bits(74, f64bits(mem_load(so + 4 * 8)), 3936146074321813504)        // smallest subnormal
+    check_bits(75, f64bits(mem_load(so + 5 * 8)), 4039728864677593088)        // largest subnormal
+    check_bits(76, f64bits(mem_load(so + 6 * 8)), 4039728865751334912)        // smallest normal
+    check_bits(77, f64bits(mem_load(so + 7 * 8)), 9218868437227405312)        // +inf
+    check_bits(78, f64bits(mem_load(so + 8 * 8)), -4503599627370496)         // -inf
+
+    // ---- every F32 tensor in the model decodes ---------------------------
+    let t = 0
+    let ok = 0
+    while t < gguf_num_tensors() {
+        if gguf_tensor_dtype(t) == 0 {
+            let ne = gguf_tensor_nelements(t)
+            let nb = gguf_tensor_nbytes(t)
+            let rb = mem_alloc(nb)
+            if gguf_read_tensor_bytes(t, rb, nb) == nb {
+                let ob = mem_alloc(ne * 8)
+                dequant_f32(rb, ne, ob)
+                ok = ok + 1
+            }
+        }
+        t = t + 1
+    }
+    check_bits(80, f32count, 99)
+    check_bits(81, ok, 99)
+
+    print("test_dequant_f32: ")
+    if failures == 0 {
+        print("PASS\n")
+        return 0
+    }
+    print("FAIL\n")
+    return 1
+}

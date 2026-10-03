@@ -401,6 +401,30 @@ fn f32_to_f64(ptr) {
     return result
 }
 
+// --------------------------------------------------------------- F32 (type 0)
+//
+// 99 of the 266 tensors in the reference model are F32 -- 37% of it -- and this
+// was the only dtype with no decoder. The shapes are the small per-layer
+// vectors, which is exactly why it went unnoticed: they are 1/260th the size of
+// the weight matrices, so a run that only ever touched the k-quants looked
+// complete.
+//
+//   token_embd_norm.weight   [2048]     x61
+//   ...                      [3, 2048]  x22      per-layer, one row per norm kind
+//   ...                      [64]       x16
+//
+// F32 has no quantisation: the bytes ARE the IEEE-754 values, so this is a
+// widening f32 -> f64 over the whole buffer. f32_to_f64() is exact for normals,
+// subnormals, zeros and both infinities (it was fixed for subnormals earlier);
+// the widening is always exact because every f32 is representable in f64.
+fn dequant_f32(raw, nelements, out) {
+    let i = 0
+    while i < nelements {
+        mem_store(out + i * 8, f32_to_f64(raw + i * 4))
+        i = i + 1
+    }
+}
+
 fn dequant_q6k(raw, nelements, out) {
     let n_blocks = nelements / 256
     let bi = 0

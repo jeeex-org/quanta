@@ -19,12 +19,12 @@ history but wrong as a header. Replaced, not appended to.)
 ## Current state (measured, not asserted)
 
     compiler/VERSION                 0.0.222
-    gate                             PASS=127 CFAIL=0 RFAIL=0 of 127
+    gate                             PASS=128 CFAIL=0 RFAIL=0 of 128
     compiler/0.0.222/bin/x86/qc
     md5=1d71a0165d0f409ce8381d679f3e68fb
     self-hosted 3 generations byte-identical
     full suite: 127 tests, each compiled AND run individually -> all pass
-    scripts/audit/run_gguf_tests.py PASS=127 FAIL=0 COMPILE-FAIL=0
+    scripts/audit/run_gguf_tests.py PASS=128 FAIL=0 COMPILE-FAIL=0
     tests/run_bounds_trap.py PASS, tests/run_string_params.py PASS
 
 ## Done in 0.0.221 (inherited, for reference)
@@ -54,8 +54,35 @@ history but wrong as a header. Replaced, not appended to.)
   `fn min` was the only implementation in the language.
 - pow honoured an integer exponent, and then six more builtins with the same
   omission: sqrt, log, sin, cos, tan, abs.
+- dequant_f32() added to lib/std/gguf.quanta. 99 of the reference model's 266
+  tensors are F32 -- 37% -- and it was the only dtype with no decoder. They went
+  unnoticed because they are the SMALL per-layer vectors, 1/260th the size of the
+  weight matrices, so a run that only ever touched the k-quants looked complete:
+
+      token_embd_norm.weight   [2048]     x61
+      ...                      [3, 2048]  x22
+      ...                      [64]       x16
+
+  F32 has no quantisation, so the decoder is a widening over the existing
+  (already exact) f32_to_f64. Decoder coverage is now 266 of 266.
 
 ## OPEN DEFECTS
+
+### No decoder for F16, Q5_K, Q8_0 or any IQ type
+
+`std/gguf.quanta` now covers every dtype THIS model uses (F32, Q4_K, Q6_K =
+266/266), but the other families are absent. `gguf_type_size` returns a byte size
+for types 0..13 plus 30, and a caller can therefore size a buffer it has no way to
+decode -- the same shape of defect F32 had, one step further out:
+
+    Q8_0  (type 8)   32 values / 34 B     -- the standard KV-cache quant
+    Q5_K  (type 13) 256 values / 176 B
+    F16   (type 1)    1 value  / 2 B
+    IQ2_XXS .. IQ4_XS (16..23)
+
+Nothing in the reference model needs them, so this is not blocking today. It is
+recorded because `gguf_type_size` succeeding where no decoder exists is the exact
+trap that hid the F32 gap: a caller allocates correctly and then reads garbage.
 
 ### RESOLVED: a nested index / a non-name base CRASHED THE COMPILER
 
