@@ -425,31 +425,372 @@ fn dequant_f32(raw, nelements, out) {
     }
 }
 
+// f16_to_f64(ptr): widen an IEEE 754 binary16 at `ptr` to binary64.
+//
+// Every binary16 is exactly representable in binary32 and binary64, so this is a
+// widening with no rounding at all -- only exponent rebasing and a mantissa
+// shift. Handles both zeros, subnormals, the normal range, and both infinities;
+// NaN is produced as Inf - Inf, the canonical quiet NaN.
+//
+// Transcribed from ggml's GGML_FP16_TO_FP32, which in ggml-impl.h is POWER8
+// inline assembly (mtfprd / xscvhpdp) and so cannot be used directly. Verified
+// bit-for-bit against a compiled reference by scripts/audit/dequant_oracle.py.
+// f16_to_f64(ptr): widen an IEEE 754 binary16 at `ptr` to binary64.
+//
+// Every binary16 is exactly representable in binary32 and binary64, so this is a
+// widening with no rounding at all -- only exponent rebasing and a mantissa
+// shift. Handles both zeros, subnormals, the normal range, both infinities; NaN
+// is produced as Inf - Inf, the canonical quiet NaN.
+//
+// Bit layout, little-endian:
+//
+//   lo = bits 0..7   -> mantissa bits 0..7
+//   hi = bits 8..15  -> mantissa bits 8..9, exponent bits 0..4, sign
+//
+// so exp = (hi >> 2) & 31 and mant = lo | ((hi & 3) << 8). The FIRST version of
+// this function masked lo to SEVEN bits and read only hi bit 0 for the top of the
+// mantissa, which is correct for neither: it lost the low 7 bits of every value's
+// mantissa and one of its top bits. Verified bit-for-bit against a compiled
+// reference by scripts/audit/dequant_diff.py.
+//
+// ggml's GGML_FP16_TO_FP32 is POWER8 inline assembly (mtfprd / xscvhpdp) in
+// ggml-impl.h, so it cannot be used directly here.
+fn f16_to_f64(ptr) {
+    let lo = mem_load8(ptr)
+    let hi = mem_load8(ptr + 1)
+
+    let sign = hi / 128                                  // 0 or 1
+    let hib = hi - sign * 128                            // bits 0..6 of hi
+    let exp = hib / 4                                    // (hi >> 2) & 31
+    let mant = lo + (hib - (hib / 4) * 4) * 256          // lo | ((hi & 3) << 8)
+
+    let two = i2f(2)
+    let one = i2f(1)
+    let zero = i2f(0)
+
+    if exp == 0 {
+        if mant == 0 {
+            // Signed zero. Negating the zero variable produces -0.0 exactly. The
+            // sign is applied to the zero itself, not to a subtraction, because
+            // 0.0 - 0.0 is +0.0 under round-to-nearest.
+            if sign == 1 { return fmul(zero, i2f(0 - 1)) }
+            return zero
+        }
+        // Subnormal: value = mant * 2^-24. Build the scale by repeated halving
+        // and multiply the integer mantissa in. A plain (exp - 15) rebasing
+        // returns 0 for every subnormal, which is a real defect class -- f32's
+        // own converter had it and it silently discarded subnormal weights.
+        let scale = one
+        let i = 0
+        while i < 24 { scale = fdiv(scale, two); i = i + 1 }
+        let v = fmul(i2f(mant), scale)
+        if sign == 1 { return fsub(zero, v) }
+        return v
+    }
+
+    if exp == 31 {
+        // Inf when mant == 0, NaN otherwise. 2^1023 is the largest finite f64, so
+        // one more doubling overflows to exactly +Inf.
+        let pinf = one
+        let i = 0
+        while i < 1023 { pinf = fmul(pinf, two); i = i + 1 }
+        pinf = fmul(pinf, two)
+        if mant != 0 {
+            // Inf - Inf produces x87's "indefinite" value 0xC000000000000000,
+            // which is a NEGATIVE quiet NaN -- so a positive input NaN came out
+            // with its sign flipped. Build the NaN from its bits instead:
+            // exponent all ones, quiet bit set, sign copied from the input. That
+            // is deterministic and matches what a widening conversion owes the
+            // caller (IEEE does not fix the payload, but it does fix the class
+            // and the sign).
+            let nanpat = 9221120237041090560    // 0x7FF8000000000000, quiet NaN
+            if sign == 1 { return f64of(0 - nanpat) }
+            return f64of(nanpat)
+        }
+        if sign == 1 { return fsub(zero, pinf) }
+        return pinf
+    }
+
+    // Normal: value = (1 + mant/1024) * 2^(exp - 15). Since f16 and f64 share a
+    // biased-exponent convention with the same bias offset relationship here,
+    // the exponent shift is exp - 15 + 1023 applied to the f64 exponent field;
+    // done here by multiplying out a power of two, which is exact.
+    let leading = fadd(one, fdiv(i2f(mant), i2f(1024)))
+    let e = exp - 15
+    let pow2 = one
+    let i = 0
+    if e >= 0 {
+        while i < e { pow2 = fmul(pow2, two); i = i + 1 }
+    } else {
+        let neg = 0 - e
+        while i < neg { pow2 = fdiv(pow2, two); i = i + 1 }
+    }
+    let v = fmul(leading, pow2)
+    if sign == 1 { return fsub(zero, v) }
+    return v
+}
+
+// -------------------------------------------------------------- Q6_K (type 14)
+//
+// Q6_K super-block: 210 bytes -> 256 weights, in ggml-quants.h order:
+//
+//   +0   u8  ql[128]    quants, LOW 4 bits, interleaved
+//   +128 u8  qh[64]     quants, UPPER 2 bits
+//   +192 i8  scales[16] per-16-element scales
+//   +208 f16 d          super-block scale
+//
+// THE PREVIOUS BODY OF THIS FUNCTION WAS NOT Q6_K. It read a 2-byte scale at
+// offset 0 and 3-byte quant groups from offset 2 -- which is not any GGML block
+// layout at all. It read the FIRST QUANT BYTE as the super-block scale and
+// produced plausible numbers, so nothing caught it: it is used for 19 of the
+// reference model's 266 tensors, including token_embd.weight (the whole
+// embedding table), and tests/test_inference_ops.quanta only asserted the Q4_K
+// path, so Q6_K was never checked against a value.
+//
+// Verified bit-for-bit against the compiled reference (scripts/audit/
+// dequant_oracle.py extracts dequantize_row_q6_K verbatim and links it).
+//
+// The quant packing, transcribed from ggml-quants.c:
+//
+//   q1 = (ql[l]      & 0xF) | ((qh[l] >> 0 & 3) << 4) - 32
+//   q2 = (ql[l+32]   & 0xF) | ((qh[l] >> 2 & 3) << 4) - 32
+//   q3 = (ql[l]      >> 4)  | ((qh[l] >> 4 & 3) << 4) - 32
+//   q4 = (ql[l+32]   >> 4)  | ((qh[l] >> 6 & 3) << 4) - 32
+//   y[l+0]  = d * sc[is+0] * q1
+//   y[l+32] = d * sc[is+2] * q2
+//   y[l+64] = d * sc[is+4] * q3
+//   y[l+96] = d * sc[is+6] * q4        is = l/16
 fn dequant_q6k(raw, nelements, out) {
     let n_blocks = nelements / 256
     let bi = 0
     while bi < n_blocks {
         let bo = bi * 210
-        let scale = i2f(mem_load8(raw + bo) + mem_load8(raw + bo + 1) * 256)
-        
-        let gi = 0
-        while gi < 64 {
-            let b0 = mem_load8(raw + bo + 2 + gi * 3)
-            let b1 = mem_load8(raw + bo + 2 + gi * 3 + 1)
-            let b2 = mem_load8(raw + bo + 2 + gi * 3 + 2)
-            
-            let q0 = b0 - (b0 / 64) * 64
-            let q1 = (b0 / 64) + (b1 - (b1 / 16) * 16) * 4
-            let q2 = (b1 / 16) + (b2 - (b2 / 4) * 4) * 16
-            let q3 = b2 / 4
-            
-            mem_store(out + (bi * 256 + gi * 4) * 8, fdiv(fmul(scale, i2f(q0)), i2f(63)))
-            mem_store(out + (bi * 256 + gi * 4 + 1) * 8, fdiv(fmul(scale, i2f(q1)), i2f(63)))
-            mem_store(out + (bi * 256 + gi * 4 + 2) * 8, fdiv(fmul(scale, i2f(q2)), i2f(63)))
-            mem_store(out + (bi * 256 + gi * 4 + 3) * 8, fdiv(fmul(scale, i2f(q3)), i2f(63)))
-            gi = gi + 1
+        let d = f16_to_f64(raw + bo + 208)
+        // The C runs TWO passes of 128 elements per 256-element block:
+        //
+        //     for (n = 0; n < 256; n += 128) {
+        //         for (l = 0; l < 32; ++l) { ... }
+        //         y += 128; ql += 64; qh += 32; sc += 8;
+        //     }
+        //
+        // The first version ran a SINGLE pass, so it filled elements 0..127 and
+        // left 128..255 as whatever the buffer held -- which was zero. Every
+        // Q6_K tensor was half garbage. The audit caught it only because one
+        // assertion read element 254; the first eight all matched the oracle.
+        let n = 0
+        while n < 2 {
+            let ql = bo + n * 64
+            let qh = bo + 128 + n * 32
+            let sc = bo + 192 + n * 8
+            let ybase = bi * 256 + n * 128
+            let l = 0
+            while l < 32 {
+                let is = l / 16
+                let ql0 = mem_load8(raw + ql + l)
+                let ql1 = mem_load8(raw + ql + l + 32)
+                let qhb = mem_load8(raw + qh + l)
+
+                let h0 = qhb - (qhb / 4) * 4
+                let t1 = qhb / 4
+                let h1 = t1 - (t1 / 4) * 4
+                let t2 = t1 / 4
+                let h2 = t2 - (t2 / 4) * 4
+                let h3 = t2 / 4
+
+                let q1 = (ql0 - (ql0 / 16) * 16 + h0 * 16) - 32
+                let q2 = (ql1 - (ql1 / 16) * 16 + h1 * 16) - 32
+                let q3 = (ql0 / 16 + h2 * 16) - 32
+                let q4 = (ql1 / 16 + h3 * 16) - 32
+
+                mem_store(out + (ybase + l) * 8, fmul(d, fmul(i2f(i8_at(raw + sc + is)), i2f(q1))))
+                mem_store(out + (ybase + l + 32) * 8, fmul(d, fmul(i2f(i8_at(raw + sc + is + 2)), i2f(q2))))
+                mem_store(out + (ybase + l + 64) * 8, fmul(d, fmul(i2f(i8_at(raw + sc + is + 4)), i2f(q3))))
+                mem_store(out + (ybase + l + 96) * 8, fmul(d, fmul(i2f(i8_at(raw + sc + is + 6)), i2f(q4))))
+                l = l + 1
+            }
+            n = n + 1
         }
         bi = bi + 1
+    }
+}
+
+// -------------------------------------------------------------- Q5_K (type 13)
+//
+// Q5_K super-block: 176 bytes -> 256 weights:
+//
+//   +0   f16 d          super-block scale
+//   +2   f16 dmin       super-block minimum scale
+//   +4   u8 scales[12]  eight (scale, min) pairs, 6 bits each, bit-packed
+//   +16  u8 qh[32]      5th bit of each quant
+//   +48  u8 qs[128]     low 4 bits, nibble-packed
+//
+// Same shape as Q4_K plus the qh high-bit plane. Transcribed from
+// dequantize_row_q5_K in ggml-quants.c and verified bit-for-bit against the
+// compiled reference (scripts/audit/dequant_diff.py).
+
+// pow4i(n): 4^n for n in 0..3 -- the Q5_K high-bit mask sequence.
+//
+// The C advances the masks with `u1 <<= 2`, i.e. it QUADRUPLES them each
+// 64-element group: u1 = 1, 4, 16, 64 with u2 = 2, 8, 32, 128 alongside. The
+// first version used a powers-of-TWO table (1, 2, 4, 8), which is right for
+// Q4_K's single mask and wrong for Q5_K's pair from group 1 on -- so elements
+// 0..63 matched and 64..255 did not.
+fn pow4i(n) {
+    if n <= 0 { return 1 }
+    if n == 1 { return 4 }
+    if n == 2 { return 16 }
+    return 64
+}
+
+fn dequant_q5k(raw, nelements, out) {
+    let n_blocks = nelements / 256
+    let bi = 0
+    while bi < n_blocks {
+        let bo = bi * 176
+        let d = f16_to_f64(raw + bo)
+        let dmin = f16_to_f64(raw + bo + 2)
+        let ybase = bi * 256
+        // Four groups of 64 elements. Each group uses TWO (scale,min) pairs and
+        // TWO high-bit masks, u1 and u2, which advance by a factor of 2 per group
+        // -- so group g uses masks 2^g and 2^(g+1). Within a group the first 32
+        // elements take the LOW nibble of ql[l] and mask u1; the next 32 take
+        // the HIGH nibble and mask u2.
+        let grp = 0
+        while grp < 4 {
+            let is = grp * 2
+            let sc1 = q5_scale(raw + bo + 4, is)
+            let mn1 = q5_min(raw + bo + 4, is)
+            let sc2 = q5_scale(raw + bo + 4, is + 1)
+            let mn2 = q5_min(raw + bo + 4, is + 1)
+            let d1 = fmul(d, i2f(sc1))
+            let m1 = fmul(dmin, i2f(mn1))
+            let d2 = fmul(d, i2f(sc2))
+            let m2 = fmul(dmin, i2f(mn2))
+            // The C carries the high-bit masks in u1/u2 and advances them with
+            // `u1 <<= 2` each group, so group g uses (2^g, 2^(g+1)).
+            //
+            // They are read from a table rather than computed with a runtime
+            // division: `hbit / u1` is a DIVIDE, not a bit test, and it silently
+            // produced 0 for every odd group, dropping the +16 on half the
+            // elements. `x & mask` is the operation the C means by
+            // `qh[l] & u1`.
+            let u1 = pow4i(grp)
+            let u2 = u1 * 2
+            let ql = bo + 48 + grp * 32
+            // qh does NOT advance: the C keeps `const uint8_t *qh = x[i].qh;`
+            // and indexes qh[l] with l in 0..31 for EVERY group, letting only the
+            // u1/u2 masks move. Advancing qh per group reads different bytes.
+            let qh = bo + 16
+            let l = 0
+            while l < 32 {
+                let qlo = mem_load8(raw + ql + l)
+                let qhi = mem_load8(raw + qh + l)
+                // (ql[l] & 0xF) + (qh[l] & u1 ? 16 : 0)
+                let nib_a = qlo - (qlo / 16) * 16
+                // `qh[l] & u1 ? 16 : 0`. u1 is a power of two, so bit k of qhi is
+                // set iff floor(qhi / u1) is ODD. The first version wrote
+                // `qhi % u1 != 0`, which is a MODULO and is zero for every
+                // u1 == 1 -- so bit 0 was never set and half the elements lost
+                // their +16.
+                let bit_a = 0
+                if (qhi / u1) - ((qhi / u1) / 2) * 2 == 1 { bit_a = 16 }
+                // (ql[l] >> 4) + (qh[l] & u2 ? 16 : 0)
+                let nib_b = qlo / 16
+                let bit_b = 0
+                if (qhi / u2) - ((qhi / u2) / 2) * 2 == 1 { bit_b = 16 }
+                mem_store(out + (ybase + grp * 64 + l) * 8,
+                          fsub(fmul(d1, i2f(nib_a + bit_a)), m1))
+                mem_store(out + (ybase + grp * 64 + 32 + l) * 8,
+                          fsub(fmul(d2, i2f(nib_b + bit_b)), m2))
+                l = l + 1
+            }
+            grp = grp + 1
+        }
+        bi = bi + 1
+    }
+}
+
+// The six-bit (scale, min) pairs in a k-quant block's scales[12] array.
+// ggml's get_scale_min_k4: for k < 4 the low nibbles carry it; for k >= 4 the
+// value straddles two bytes, two bits in scales[k+4] and four in the high bits
+// of scales[k-4].
+fn q5_scale(q, k) {
+    if k < 4 { return mem_load8(q + k) - (mem_load8(q + k) / 64) * 64 }
+    let a = mem_load8(q + k + 4)
+    let b = mem_load8(q + k - 4)
+    return (a - (a / 16) * 16) + (b / 64) * 16
+}
+
+fn q5_min(q, k) {
+    if k < 4 { return mem_load8(q + k + 4) - (mem_load8(q + k + 4) / 64) * 64 }
+    let a = mem_load8(q + k + 4)
+    let b = mem_load8(q + k)
+    return (a / 16) + (b / 64) * 16
+}
+
+// The six-bit (scale, min) pairs in a k-quant block's scales[12] array.
+// ggml's get_scale_min_k4: for k < 4 the low nibbles carry it; for k >= 4 the
+// value straddles two bytes, two bits in scales[k+4] and four in the high bits
+// of scales[k-4].
+fn q5_scale(q, k) {
+    if k < 4 { return mem_load8(q + k) - (mem_load8(q + k) / 64) * 64 }
+    let a = mem_load8(q + k + 4)
+    let b = mem_load8(q + k - 4)
+    return (a - (a / 16) * 16) + (b / 64) * 16
+}
+
+fn q5_min(q, k) {
+    if k < 4 { return mem_load8(q + k + 4) - (mem_load8(q + k + 4) / 64) * 64 }
+    let a = mem_load8(q + k + 4)
+    let b = mem_load8(q + k)
+    return (a / 16) + (b / 64) * 16
+}
+
+// -------------------------------------------------------------- Q8_0 (type 8)
+//
+// 34 bytes -> 32 weights. d f16 at +0, then 32 signed bytes.
+//
+//   y[i*32 + j] = qs[j] * d
+//
+// The standard KV-cache quant, and the one a caller is most likely to reach for
+// after Q6_K. Verified against the compiled dequantize_row_q8_0.
+// i8_at(ptr): read one byte as a SIGNED int8.
+//
+// Two's complement: b >= 128 means b - 256. The first version of dequant_q8_0
+// wrote `b - (b / 128) * 128 - (b / 128) * 256`, which subtracts 128 AND 256 and
+// so turns 240 (which is -16) into -144 -- off by 128 for every byte with the
+// high bit set, i.e. for every negative quant, which is exactly the half of the
+// range that matters.
+fn i8_at(ptr) {
+    let b = mem_load8(ptr)
+    if b >= 128 { return b - 256 }
+    return b
+}
+
+fn dequant_q8_0(raw, nelements, out) {
+    let n_blocks = nelements / 32
+    let bi = 0
+    while bi < n_blocks {
+        let bo = bi * 34
+        let d = f16_to_f64(raw + bo)
+        let j = 0
+        while j < 32 {
+            let q = i8_at(raw + bo + 2 + j)
+            mem_store(out + (bi * 32 + j) * 8, fmul(d, i2f(q)))
+            j = j + 1
+        }
+        bi = bi + 1
+    }
+}
+
+// ---------------------------------------------------------------- F16 (type 1)
+//
+// 1 value / 2 bytes, no quantisation. Just the widening.
+fn dequant_f16(raw, nelements, out) {
+    let i = 0
+    while i < nelements {
+        mem_store(out + i * 8, f16_to_f64(raw + i * 2))
+        i = i + 1
     }
 }
 
