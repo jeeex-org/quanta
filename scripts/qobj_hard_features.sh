@@ -4,9 +4,12 @@
 # representation of a module rather than a faithful one.
 # Bounded: at most 16 lines.
 ulimit -c 0
-Q=${QC:-/opt/tali/quanta/compiler/0.0.217/bin/x86/qc}
+REPO=$(cd "$(dirname "$(readlink -f "$0")")/.." && pwd)
+# Read VERSION rather than hardcoding a tree: a pinned old compiler makes a gate
+# report about a compiler nobody is shipping. Same bug as build_one.sh.
+V=$(cat "$REPO/VERSION")
+Q=${QC:-$REPO/compiler/$V/bin/x86/qc}
 case $Q in /*) ;; *) Q=$(cd "$(dirname "$Q")" 2>/dev/null && pwd)/$(basename "$Q") ;; esac
-REPO=/opt/tali/quanta
 W=/tmp/qobjhard
 PASS=0; GAP=0; SKIP=0
 rm -rf $W; mkdir -p $W/lib/std; cd $W || exit 1

@@ -15,7 +15,10 @@
 #
 # Bounded: at most 10 lines.
 ulimit -c 0
-REPO=/opt/tali/quanta
+REPO=$(cd "$(dirname "$(readlink -f "$0")")/.." && pwd)
+# Read VERSION rather than hardcoding a tree: a pinned old compiler makes a gate
+# report about a compiler nobody is shipping. Same bug as build_one.sh.
+V=$(cat "$REPO/VERSION")
 V=0.0.217
 QC=${QC:-$REPO/compiler/$V/bin/x86/qc}
 case $QC in /*) ;; *) QC=$(cd "$(dirname "$QC")" 2>/dev/null && pwd)/$(basename "$QC") ;; esac

@@ -1,8 +1,12 @@
 #!/bin/bash
+REPO=$(cd "$(dirname "$(readlink -f "$0")")/.." && pwd)
+# Read VERSION rather than hardcoding a tree: a pinned old compiler makes a gate
+# report about a compiler nobody is shipping. Same bug as build_one.sh.
+V=$(cat "$REPO/VERSION")
 # G5 verification: cache CONTENT correctness + cache-only consumption, with
 # controls that must never regress. Bounded: prints at most 18 lines.
 ulimit -c 0
-Q=${QC:-/opt/tali/quanta/compiler/0.0.217/bin/x86/qc}
+Q=${QC:-$REPO/compiler/$V/bin/x86/qc}
 # Absolute path: the compile runs from $W, so a repo-relative QC would not
 # resolve there and every check would measure "command not found" (127).
 case $Q in /*) ;; *) Q=$(cd "$(dirname "$Q")" 2>/dev/null && pwd)/$(basename "$Q") ;; esac
@@ -20,9 +24,15 @@ d=open(f,'rb').read()
 m,v,nf,irn,nb,mb,pb,prb=struct.unpack_from('<8I',d,0)
 if m!=0x514F424A: print("BADMAGIC"); raise SystemExit
 # Header size grew with the format: 32 (v8), 40 (v9, own fingerprint),
-# 48 (v10, + dependency list). Derive it from the version rather than assuming,
-# or every region after the header is read at the wrong offset.
-hs={8:32,9:40,10:48}.get(v)
+# 48 (v10, + dependency list), and v11 KEEPS the 48-byte header -- only the
+# version number moved. Derive it from the version rather than assuming, or
+# every region after the header is read at the wrong offset.
+#
+# v11 was missing here, so this audit reported BADVER:11 on every cache the
+# compiler actually writes and the check silently stopped running. A table that
+# falls behind the writer turns a real gate into a no-op that looks like a
+# finding. See compiler/0.0.222/src/x86/qobj_write.quanta:3-4 for the layout.
+hs={8:32,9:40,10:48,11:48}.get(v)
 if hs is None: print("BADVER:%d"%v); raise SystemExit
 no=hs+nf*32; names=d[no:no+nb]
 o=no+nb+mb+prb+pb; irb=d[o:o+irn*40]

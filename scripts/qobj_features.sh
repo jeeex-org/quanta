@@ -1,4 +1,8 @@
 #!/bin/bash
+REPO=$(cd "$(dirname "$(readlink -f "$0")")/.." && pwd)
+# Read VERSION rather than hardcoding a tree: a pinned old compiler makes a gate
+# report about a compiler nobody is shipping. Same bug as build_one.sh.
+V=$(cat "$REPO/VERSION")
 # Feature-coverage probe for the .qobj module cache.
 #
 # The qobj gate proves a cache round-trips for one narrow shape: plain scalar
@@ -11,7 +15,7 @@
 # cache is not a faithful representation of a module.
 # Bounded: at most 20 lines.
 ulimit -c 0
-Q=${QC:-/opt/tali/quanta/compiler/0.0.217/bin/x86/qc}
+Q=${QC:-$REPO/compiler/$V/bin/x86/qc}
 case $Q in /*) ;; *) Q=$(cd "$(dirname "$Q")" 2>/dev/null && pwd)/$(basename "$Q") ;; esac
 W=/tmp/qobjfeat
 PASS=0; GAP=0

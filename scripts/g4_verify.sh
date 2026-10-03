@@ -5,9 +5,10 @@
 # still be reusable when S is unchanged or absent. Bounded: at most 12 lines.
 REPO=$(cd "$(dirname "$(readlink -f "$0")")/.." && pwd)
 V=$(cat "$REPO/VERSION")
+cd "$REPO" || exit 1
 ulimit -c 0
 # Resolve the compiler to an ABSOLUTE path before the cd to $W below. The gate
-# passes QC=compiler/0.0.217/bin/x86/qc -- a repo-relative path that no longer
+# passes QC=$REPO/compiler/$V/bin/x86/qc -- a repo-relative path that no longer
 # resolves once the working directory is $W, and every assertion then measured
 # "command not found" (rc 127) rather than the cache behaviour.
 Q=${QC:-/tmp/g4d/qc}

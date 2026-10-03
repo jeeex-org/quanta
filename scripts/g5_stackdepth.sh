@@ -3,7 +3,10 @@
 # arena mapping. Prints at most 20 lines. No unbounded dumps.
 ulimit -c 0
 REPO=/opt/tali/quanta
-Q=${QC:-$REPO/compiler/0.0.217/bin/x86/qc}
+# Read VERSION rather than hardcoding a tree: a pinned old compiler makes a gate
+# report about a compiler nobody is shipping. Same bug as build_one.sh.
+V=$(cat "$REPO/VERSION")
+Q=${QC:-${REPO}/compiler/$V/bin/x86/qc}
 P=/tmp/g9/stk
 D=/tmp/g9/stk
 rm -rf $P; mkdir -p $P/lib/std
