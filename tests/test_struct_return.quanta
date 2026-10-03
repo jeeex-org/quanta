@@ -45,6 +45,11 @@ fn check(num, got, want) {
 }
 
 struct P { f0: i64 }
+struct M {
+    x: i64
+    y: i64
+    z: i64
+}
 struct Q { p0: P }
 struct A { a0: i64 }
 struct B { b0: A }
@@ -102,11 +107,15 @@ fn main() {
 
     // 6: a literal whose field value is itself a call.
     check(50, caller_after_literal(literal_isolated(), 1), 12)
-    // NOTE: `ret_plain().f0` -- a scalar field read off a call result -- returns
-    // 0 instead of 1 in this compiler. check 51 asserted that and failed, which
-    // is how the defect was confirmed; it is removed here so this file is a
-    // clean gate for the parts that are fixed. The defect is written down in
-    // docs/research/struct-return-defects.md.
+    // 7: a MULTI-FIELD literal. The constructor argument loop is driven by the
+    //    declared field count, not by commas, so all three spellings agree:
+    //    comma-separated, space-separated, and mixed.
+    let m1 = M { x: 1, y: 2, z: 3 }
+    check(60, m1.x + m1.y + m1.z, 6)
+    let m2 = M { x: 1 y: 2 z: 3 }
+    check(61, m2.x + m2.y + m2.z, 6)
+    let m3 = M { x: 1, y: 2, z: 3 }
+    check(62, m3.x + m3.y + m3.z, 6)
 
     print("test_struct_return: ")
     if failures == 0 {

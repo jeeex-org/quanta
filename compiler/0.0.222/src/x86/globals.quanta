@@ -357,10 +357,16 @@ let structc = 0
 let sdefs = mmap(256 * 64)        // 64B/struct: [nameptr,namelen,fldcount,fldbase,0,0,0,0]
 let sfldtab = mmap(256 * 64 * 16) // flat field names: [fldptr,fldlen]*N (64 slots/struct max)
 let sfldtyp = mmap(256 * 64 * 8)  // per-field struct-type index (-1 if scalar); parallels sfldtab slots
-let vreg_struct = mmap(400000 * 8)  // vreg -> struct index (-1 if none); sized to VREG_CAP
-let vreg_is_str = mmap(400000 * 8)  // vreg -> 1 if it holds a byte-stride string (els -1); sized to VREG_CAP
-let vreg_is_big = mmap(400000 * 8)  // 0.0.114: vreg -> 1 if it holds a big-int (els -1); sized to VREG_CAP
-let vreg_str_arr = mmap(400000 * 8) // vreg -> 1 if it holds a qword-array of STRING-PTR elements (els -1); sized to VREG_CAP
+// VREG_CAP is the single source of truth for the per-vreg side tables' extent.
+// The startup loop that initialises them to -1 must iterate over all of it:
+// these tables are mmap'd, so mmap zero-fills them, and 0 is a VALID struct
+// index (struct 0) and a VALID string tag -- an uninitialised tail therefore
+// reads as "struct 0" / "is a string" rather than "no struct" / "not a string".
+let VREG_CAP = 400000
+let vreg_struct = mmap(VREG_CAP * 8)  // vreg -> struct index (-1 if none)
+let vreg_is_str = mmap(VREG_CAP * 8)  // vreg -> 1 if it holds a byte-stride string (els -1); sized to VREG_CAP
+let vreg_is_big = mmap(VREG_CAP * 8)  // 0.0.114: vreg -> 1 if it holds a big-int (els -1); sized to VREG_CAP
+let vreg_str_arr = mmap(VREG_CAP * 8) // vreg -> 1 if it holds a qword-array of STRING-PTR elements (els -1); sized to VREG_CAP
 let tdefs = mmap(256 * 80)
 let tmethods = mmap(256 * 32 * 24)
 let idefs = mmap(256 * 96)

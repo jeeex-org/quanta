@@ -1310,14 +1310,27 @@ fn parse_primary() {
                     let vr = nv(); iremit(IR_TALLOC, vr, fc, 0, 0)
                     let ac = 0
                     if !(peek()==TT_PNCT&&pval()==41) {
-                        while true {
+                        // Field SEPARATORS: loop on the DECLARED FIELD COUNT,
+                        // not on commas.
+                        //
+                        // The struct-literal rewriter compacts `S { a: 1 b: 2 }`
+                        // into `S(1 2)`. A loop that stopped at the first
+                        // non-comma token parsed only the FIRST field and left
+                        // `2` in the stream, corrupting every following
+                        // statement -- the compiler core-dumped on every
+                        // space-separated multi-field literal, while
+                        // `S { a: 1, b: 2 }` and single-field literals worked.
+                        //
+                        // `fc` is the source of truth (sfldtyp already carries the
+                        // per-field types), so both spellings are accepted and the
+                        // loop can never under-parse. A present comma is still
+                        // consumed, so `S(1, 2)` is unchanged.
+                        while ac < fc {
                             let a = parse_expr()
-                            if ac < fc {
-                                let fi = nv(); iremit(IR_CONST, fi, ac, 0, 0)
-                                iremit(IR_ISTORE, 0, vr, fi, a)
-                            }
+                            let fi = nv(); iremit(IR_CONST, fi, ac, 0, 0)
+                            iremit(IR_ISTORE, 0, vr, fi, a)
                             ac = ac + 1
-                            if peek()==TT_PNCT&&pval()==44 { adv() } else { break }
+                            if peek()==TT_PNCT&&pval()==44 { adv() }
                         }
                     }
                     mpnct(41)  // consume ')'

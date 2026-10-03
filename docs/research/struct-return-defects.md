@@ -124,3 +124,57 @@ reason a real one survived.
 - `sizeof` exists.
 - Nested and triple-nested struct literals work, including the field values.
 - Field assignment through a call result works (`let p = mk() p.f0 = 9` → 9).
+## 0.0.222 follow-up: the `lstyped` runaway scan (FIXED)
+
+**Symptom.** `struct P { f1: i64 }` followed anywhere earlier in the file by a
+`let` and later by any function with TWO OR MORE parameters failed to compile:
+
+    struct P { f1: i64 }
+    fn a() -> i64 { let p = P { f1: 1 } return p.f1 }
+    fn b(x: i64, y: i64) -> i64 { return x+y }
+
+    line 4: error: call to undeclared function: f1
+
+**Root cause.** `parse_let` looks ahead to decide whether the declaration is a
+comma-separated BINDING LIST (`let a: i64, b: i64 = 1, 2`). The scan walked the
+token array from the current cursor looking for a depth-0 comma, and stopped only
+on a newline (token value 10) or a `;` (59). The lexer emits NEITHER: newlines
+are discarded during tokenisation. The scan therefore ran on past the brace that
+closes the enclosing block, into the next function, and found the depth-0 comma
+in `fn b(x: i64, y: i64)`. It set `lstyped = 1`, so a plain `let p = P ( 1 )`
+took the multi-binding branch -- which propagates only string and big tags and
+never `vreg_struct`. The binding lost its struct type, so the following `p.f1`
+found no struct on the base vreg, fell through to method-call resolution, and
+reported a field name as an undeclared function.
+
+The same run-on scan is what made the failure depend on a LATER function: no
+comma anywhere in the token stream means `lstyped` stays 0 and the single-binding
+path (which does propagate `vreg_struct`) is taken.
+
+**Fix.** `compiler/0.0.222/src/x86/parse.quanta` -- the lookahead is now bounded
+structurally instead of lexically:
+
+* a closing brace encountered at depth 0 ends the block the `let` lives in
+* depth dropping below 0 means the scan left the enclosing construct
+* `;` and the 64-step cap still terminate it
+
+## 0.0.222: other fixes in this batch
+
+* `parse_primary`'s struct-constructor argument loop is driven by the DECLARED
+  FIELD COUNT (`sdefs[si*64+16]`), not by commas. The literal rewriter compacts
+  `S { a: 1 b: 2 }` to `S(1 2)`, and the old loop stopped at the first non-comma
+  token, parsing one field and leaving the rest in the stream.
+* `nv()` and the startup loop now initialise EVERY per-vreg tag
+  (`vreg_struct`, `vreg_is_str`, `vreg_str_arr`, `vreg_is_big`) across the full
+  `VREG_CAP = 400000` table. The startup loop had covered only the first 8192
+  entries of a 400000-entry mmap table; the remainder read as 0, which is a
+  VALID struct index, so an uninitialised vreg silently claimed struct 0.
+
+## OPEN (not yet fixed)
+
+1. `mk().b0.a0` -- a chained field read on a call result still core-dumps the
+   COMPILER (not the compiled program). `mk().b0` alone compiles and runs;
+   `let x = mk(); x.b0.a0` compiles and prints 4 correctly.
+2. `two(99, mk().f0)` -- a call result in a NON-FIRST argument position evaluates
+   to 0. `two(mk().f0, 99)` prints 99 correctly, and `two(99, 5)` prints 5, so
+   the first argument is unaffected.

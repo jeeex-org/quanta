@@ -546,6 +546,23 @@ fn parse_let() {
     // printing (index, type, value).
     let lstyped = 0
     {
+        // Scan AHEAD for a top-level ',' that separates BINDINGS. This must
+        // terminate at the END OF THE STATEMENT, not run on.
+        //
+        // The scan previously stopped only on a newline (10) or ';', but the
+        // lexer does NOT emit newline tokens, so neither ever appeared: the
+        // scan walked straight past the '}' that closes the current block and
+        // into the NEXT function, where a parameter list such as
+        // `fn b(x: i64, y: i64)` supplies a depth-0 ','. That made a plain
+        // `let p = P ( 1 )` take the multi-binding path, which propagates only
+        // string/big tags -- never vreg_struct -- so the binding lost its
+        // struct type and the following `p.f1` fell through to method-call
+        // resolution: "call to undeclared function: f1".
+        //
+        // Termination is now structural, not lexical:
+        //   * a '}' whose depth is already 0 ends the block the `let` lives in
+        //   * any depth below 0 means we left the enclosing construct
+        //   * ';', ',' (once found) and the 64-step cap still apply
         let si = tokp
         let steps = 0
         let depth = 0
@@ -555,9 +572,13 @@ fn parse_let() {
             if tk==TT_OP && tv==124 { depth = depth + 1 }               // closure '|'
             if tk==TT_PNCT {
                 if tv==91 || tv==123 || tv==40 { depth = depth + 1 }    // '[' '{' '('
-                if tv==93 || tv==125 || tv==41 { depth = depth - 1 }    // ']' '}' ')'
+                if tv==93 || tv==125 || tv==41 {
+                    if tv==125 && depth == 0 { si = tokc }             // '}' closes the block
+                    depth = depth - 1                                   // ']' '}' ')'
+                    if depth < 0 { si = tokc }                          // left the construct
+                }
                 if tv==44 && depth==0 { lstyped = 1; si = tokc }        // ',' at top level
-                if tv==10 || tv==59 { si = tokc }                       // newline or ';' ends it
+                if tv==59 { si = tokc }                                 // ';' ends it
             }
             si = si + 1
             steps = steps + 1

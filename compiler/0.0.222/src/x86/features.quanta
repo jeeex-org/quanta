@@ -259,7 +259,21 @@ fn lblf(l) { let i=0; while i<lblc { if r64(lblmap+i*LBS)==l { return r64(lblmap
 // Resolved by ci_func's per-function label fixup (after emit_bltn runs).
 fn emit_patch(po, lbl, ty) { if patchc >= PATCH_CAP { emit_ovf(94) }; w64(patches+patchc*PCS, po); w64(patches+patchc*PCS+8, lbl); w64(patches+patchc*PCS+16, ty); patchc=patchc+1 }
 
-fn nv() { if vreg_n >= VREG_CAP { emit_ovf(70) }; let v=vreg_n; vreg_n=vreg_n+1; w64(vreg_is_str + v*8, 0-1); w64(vreg_is_big + v*8, 0-1); w64(vreg_clo + v*8, 0-1);
+fn nv() {
+    if vreg_n >= VREG_CAP { emit_ovf(70) }
+    let v=vreg_n
+    vreg_n=vreg_n+1
+    // Every per-vreg tag table is mmap'd, so mmap zero-fills it and 0 is a
+    // MEANINGFUL value in several of them: struct index 0 for vreg_struct, and
+    // 0 = "false" is not the -1 "unset" these tables use. A fresh vreg that
+    // inherited zeros therefore read as struct 0, and field access on it
+    // resolved against struct 0's field base -- a garbage base that made the
+    // compiler itself SIGSEGV. The startup loop cannot cover this: it ran over
+    // a fixed prefix, and any vreg allocated past that prefix was uninitialised.
+    // Initialising at allocation is the only place that is correct by
+    // construction, and it is what the string/big/clo tags below already do.
+    w64(vreg_struct + v*8, 0-1)
+    w64(vreg_is_str + v*8, 0-1); w64(vreg_is_big + v*8, 0-1); w64(vreg_clo + v*8, 0-1);
     // vreg_to_param is read by the param-passing helper (helpers.quanta) and
     // had no writer anywhere in the tree, so a fresh vreg inherited whatever
     // the page held. Default 0 = not a parameter.
