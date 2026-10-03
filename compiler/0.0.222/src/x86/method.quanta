@@ -429,17 +429,39 @@ fn parse_index_on(base_vr) {
                 file_write(2, mn+8, len(mn)); exit(1)
             }
             // Slice lowering (pure IR — works on x86 AND ARM64):
-            //   n = clamp(hi - lo, 0);  dst = TALLOC(n)
-            //   loop idx in 0..n: dst[idx] = base[lo+idx]
-            // The IR_IDX inside the loop carries the bounds trap, so an
-            // out-of-range slice (hi > len) SIGILLs like a[idx] does.
+            //   lo = max(lo, 0);  hi = min(hi, len);  n = max(0, hi - lo)
+            //   dst = TALLOC(n);  loop idx in 0..n: dst[idx] = base[lo+idx]
+            // BOTH ends are clamped, so every index the loop makes is in range
+            // and the IR_IDX bounds trap cannot fire.
             let zero=nv(); iremit(IR_CONST,zero,0,0,0)
             let len_vr=nv(); iremit(IR_ARRAY_LEN, len_vr, base_vr, 0, 0)
             let lo = lo_vr
             if lo<0 { lo = zero }
             let hi = hi_vr
             if hi<0 { hi = len_vr }
-            let nraw=nv(); iremit(IR_SUB, nraw, hi, lo, 0)
+            // Clamp BOTH ends against the real length:
+            //   lo   -> 0        (already done above)
+            //   hi   -> len      <-- was MISSING; hi > len walked off the end
+            //   n    -> max(0, hi-lo)
+            //
+            // Python, Rust and Go all clamp the high bound, so `b[0:99]` on a
+            // 5-element array is the whole array rather than a trap. Without the
+            // hi clamp the copy loop ran `n` iterations reading base[lo+idx],
+            // the IR_IDX bounds trap fired once lo+idx reached len, and the
+            // whole program died with SIGILL -- for what is an entirely ordinary
+            // slice expression.
+            //
+            // A NEGATIVE lo also has to clamp: `b[-2:]` means the last two
+            // elements in Python, but this language has no negative indexing, so
+            // a negative bound is 0 (the same choice the existing `if lo<0` makes
+            // for the omitted-bound sentinel).
+            let oc=nv(); iremit(IR_LT, oc, hi, len_vr, 0)    // 1 = hi < len
+            let one=nv(); iremit(IR_CONST, one, 1, 0, 0)
+            let om=nv(); iremit(IR_SUB, om, one, oc, 0)      // 1 = hi >= len
+            let t1=nv(); iremit(IR_MUL, t1, hi, oc, 0)       // hi*oc
+            let t2=nv(); iremit(IR_MUL, t2, len_vr, om, 0)    // len*om
+            let hic=nv(); iremit(IR_ADD, hic, t1, t2, 0)     // min(hi, len)
+            let nraw=nv(); iremit(IR_SUB, nraw, hic, lo, 0)
             let neg=nv(); iremit(IR_LT, neg, nraw, zero, 0)
             let n=nv(); iremit(IR_MOV, n, nraw, 0, 0)
             let lafter=nl()

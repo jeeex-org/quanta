@@ -98,6 +98,46 @@ fn main() {
     check(84, len([1, 2, 3, 4, 5][2:]), 3)
     check(85, len([1, 2, 3, 4, 5][:2]), 2)
 
+    // ---- slicing clamps BOTH ends ------------------------------------------
+    //
+    // `b[0:99]` on a 5-element array is the whole array, as in Python, Rust and
+    // Go. The high bound was NOT clamped: the copy loop ran n iterations reading
+    // base[lo+idx], the IR_IDX bounds trap fired once lo+idx reached len, and the
+    // program died with SIGILL -- for an entirely ordinary slice expression.
+    let b = [10, 20, 30, 40, 50]
+    check(200, len(b), 5)
+    check(201, len(b[3:5]), 2)
+    check(202, len(b[0:5]), 5)
+    check(203, len(b[0:99]), 5)      // hi clamped to len
+    check(204, len(b[3:99]), 2)
+    check(205, len(b[:5]), 5)
+    check(206, len(b[3:]), 2)
+    check(207, len(b[:]), 5)
+    check(208, len(b[3:3]), 0)      // hi == lo -> empty
+    check(209, len(b[4:2]), 0)      // hi <  lo -> empty, not a wrap
+    check(210, len(b[9:9]), 0)      // lo > len -> empty
+    check(211, len(b[9:2]), 0)
+
+    // Clamping the length is not enough -- the VALUES must come from the right
+    // elements, which a wrong lo would also get wrong.
+    let wide = b[0:99]
+    check(212, wide[0], 10)
+    check(213, wide[4], 50)
+    let tail = b[3:99]
+    check(214, tail[0], 40)
+    check(215, tail[1], 50)
+    let lit_wide = [7, 8, 9][0:99]
+    check(216, lit_wide[0], 7)
+    check(217, lit_wide[2], 9)
+
+    // A slice of a call result, and of a slice -- both are non-name bases.
+    check(220, len([1, 2, 3][0:99]), 3)
+    check(221, len(g()[0:99]), 3)
+    check(222, g()[0:99][2], 7)
+    check(223, len(g()[0:2]), 2)
+    check(224, len(g()[1:]), 2)
+    check(225, len(m[0:1][0:9]), 1)
+
     // ---- the named-base forms still work -----------------------------------
     // These are the ones that worked before; they must keep working.
     let n = [70, 80]

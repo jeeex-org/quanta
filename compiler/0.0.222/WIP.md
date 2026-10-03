@@ -19,10 +19,13 @@ history but wrong as a header. Replaced, not appended to.)
 ## Current state (measured, not asserted)
 
     compiler/VERSION                 0.0.222
-    gate                             see below -- not yet run for this tree
-    fallback compiler/0.0.221/bin/x86/qc
-    md5=46e64c2ec6c47abc28fac2471572039c
+    gate                             PASS=127 CFAIL=0 RFAIL=0 of 127
+    compiler/0.0.222/bin/x86/qc
+    md5=1d71a0165d0f409ce8381d679f3e68fb
     self-hosted 3 generations byte-identical
+    full suite: 127 tests, each compiled AND run individually -> all pass
+    scripts/audit/run_gguf_tests.py PASS=127 FAIL=0 COMPILE-FAIL=0
+    tests/run_bounds_trap.py PASS, tests/run_string_params.py PASS
 
 ## Done in 0.0.221 (inherited, for reference)
 
@@ -99,26 +102,48 @@ non-name base, the named forms that had to keep working, and a nested index pass
 straight to a user function with other arguments. Verified to crash the pre-fix
 compiler and pass on this one.
 
-### A slice whose HIGH bound exceeds the length traps instead of clamping
+### RESOLVED: a slice did not clamp its HIGH bound
 
     let b = [10, 20, 30, 40, 50]
-    b[3:5]   -> len 2   correct
-    b[3:3]   -> len 0   correct
-    b[3:99]  -> SIGILL
+    b[0:99]        SIGILL
+    b[3:99]        SIGILL
+    [1,2,3][0:99]  SIGILL
+    g()[0:99]      SIGILL
 
-method.quanta's slice lowering clamps only the LOW side:
+Every in-range slice was already correct; only `hi > len` trapped. method.quanta's
+lowering clamped ONE side:
 
     nraw = hi - lo
     neg  = nraw < 0
-    n    = neg ? 0 : nraw        // clamps nraw < 0 to an empty slice
-    dst  = TALLOC(n)
-    loop idx in 0..n: dst[idx] = base[lo+idx]
+    n    = neg ? 0 : nraw        // clamps nraw < 0 only
 
-So `hi` is never bounded by the array length, and when `hi > len` the loop walks
-past the end and `idx_trap_emit` fires. Python, Rust and Go all clamp the high
-bound; this does not. Whether that is the right choice is a design question --
-but it is currently silent, since the comment at method.quanta describes the
-clamp as if it covered both ends.
+`hi` was never bounded by the length, so the copy loop ran n iterations reading
+base[lo+idx], the IR_IDX bounds trap fired once lo+idx reached len, and the whole
+program died -- for what is an entirely ordinary slice expression. Python, Rust
+and Go all clamp the high bound.
+
+Fixed to `lo = max(lo,0); hi = min(hi,len); n = max(0, hi-lo)`.
+
+The clamp is BRANCHLESS on purpose:
+
+    oc  = hi < len
+    om  = 1 - oc
+    hic = hi*oc + len*om          // min(hi, len)
+
+The obvious branch form
+
+    BR(oc, l_hi); MOV(hic, len); LABEL(l_hi)
+
+compiled and was WRONG: it broke even the slices that used to work
+(`b[3:3]` returned 2 instead of 0, `b[4:2]` returned 1 instead of 0). A value
+defined before a branch and used after it does not survive here -- codegen's
+dead-definition pass rewrites a def whose result is not read back along the same
+path, so `hic` came back as garbage. Empirically confirmed: the same code with a
+branch is wrong, the same code branchless is right.
+
+That is a second-order trap worth remembering: a value live ACROSS an IR_BR or
+IR_LABEL in parser-emitted IR is not reliably live. Prefer arithmetic selection
+in generated IR.
 
 ### CORRECTION: array indexing IS bounds-checked
 

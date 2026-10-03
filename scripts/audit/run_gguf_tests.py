@@ -4,7 +4,13 @@ from the real tests, which has already cost three false conclusions."""
 import subprocess, os, sys
 
 R = '/opt/tali/quanta'
-QC = sys.argv[1] if len(sys.argv) > 1 else R + '/compiler/0.0.221/bin/x86/qc'
+# Read VERSION rather than hardcoding a tree. It was pinned to 0.0.221 while
+# VERSION was 0.0.222, so a default invocation silently tested the PREVIOUS
+# compiler -- and reported a spurious COMPILE-FAIL for the test that the current
+# one passes. A stale default is worse than no default: it looks like a real
+# failure. build_one.sh had this exact bug, for the same reason.
+QC = sys.argv[1] if len(sys.argv) > 1 else R + '/compiler/' + \
+    open(R + '/VERSION').read().strip() + '/bin/x86/qc'
 
 # Discovered, not hardcoded. The previous list named 33 tests that no longer
 # exist; a stale list makes this script silently test nothing.
