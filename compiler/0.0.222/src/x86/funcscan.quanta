@@ -409,6 +409,40 @@ fn scanfns() {
     }
 }
 
+// shift_tok_indexes(at, gap): subtract `gap` from every recorded token index
+// greater than `at`.
+//
+// A struct-literal rewrite compacts the token stream in place, so every token
+// index scanfns() recorded BEFORE the rewrite is stale for everything after the
+// literal. The tables that hold indices (rather than source offsets) are the
+// function body index (fns + i*FNS + 16, sfn's `bt`) and the default-argument token ranges
+// (fn_defargs). Source OFFSETS in fn_pnames are unaffected -- the source text
+// did not move.
+//
+// This was the second half of the crash: the first was not advancing the scan
+// position past the compacted literal. With only that fixed, a struct literal
+// in one function still corrupted every function after it.
+fn shift_tok_indexes(at, gap) {
+    let i = 0
+    while i < fnc {
+        // Slot 16 is the body TOKEN INDEX (sfn's `bt` parameter). Slot 24 is
+        // `co`, a CODE OFFSET that the cache path overwrites -- shifting that
+        // would corrupt every cached function, which is why the first version
+        // of this helper made things worse rather than better.
+        let bt = r64(fns + i*FNS + 16)
+        if bt > at { w64(fns + i*FNS + 16, bt - gap) }
+        i = i+1
+    }
+    let d = 0
+    while d < fnc*64 {
+        let d0 = r64(fn_defargs + d*16)
+        let d1 = r64(fn_defargs + d*16 + 8)
+        if d0 > at { w64(fn_defargs + d*16, d0 - gap) }
+        if d1 > at { w64(fn_defargs + d*16 + 8, d1 - gap) }
+        d = d+1
+    }
+}
+
 fn scan_aliases() {
     let p=0
     while p<tokc {
@@ -573,7 +607,28 @@ fn scanimpls() {
 // constructor-call tokens IN PLACE, so parse_primary (which only understands
 // `Name(...)`) never sees the new syntax. Runs after scanstructs so struct
 // names are known. The parser then treats it exactly like a constructor call.
+// rewrite_struct_literals: rewrite every `Name { f: v, ... }` into
+// `Name(v, ...)`, innermost first.
+//
+// NESTED literals need more than one pass. `Q { p0: P { f0: 3 } }` has an inner
+// literal inside the outer one's braces: compacting the outer copies the inner
+// across verbatim -- braces and field name intact -- and the scan then resumes
+// past it, so the inner one is never rewritten and the parser meets a '{' where
+// a constructor call's '(' belongs. Each pass rewrites the literals it can
+// reach; a nested literal becomes reachable only once the one enclosing it is
+// gone. Bounded at 4 passes, which is generous -- a struct literal nested five
+// deep is not a real program.
 fn rewrite_struct_literals() {
+    let pass = 0
+    while pass < 4 {
+        let before = tokc
+        rewrite_struct_literals_pass()
+        if tokc == before { break }
+        pass = pass + 1
+    }
+}
+
+fn rewrite_struct_literals_pass() {
     let p = 0
     while p < tokc {
         if tokt(p)==TT_ID {
@@ -600,6 +655,27 @@ fn rewrite_struct_literals() {
             // simply cannot precede a struct-literal name in a way that matters,
             // so skip them.
             let prev_ok = 1
+            // A function's return type is `-> StructName {` ... and that is
+            // byte-identical to a struct literal `StructName { ... }`. The
+            // rewrite fired on the return type, turned `-> P {` into
+            // `-> P(`, and consumed the function body -- the compiler then
+            // core-dumped on every `fn f() -> SomeStruct`. It needed a
+            // declared struct to match; an undefined name was left alone,
+            // which is why `-> Q` worked and `-> P` did not.
+            //
+            // Skip an identifier preceded by the '->' arrow. The arrow is ONE
+            // multichar operator token with value 45*256+62 == 11582 (see the
+            // return-type scan in this same file).
+            // Scan back over any run of '*' (and '&') to find the arrow. Written
+            // as a loop rather than one case per star count: `-> **P` was a third
+            // spelling and enumerating them is how the two-token case got fixed
+            // while the three-token one stayed broken.
+            if p>=1 {
+                let bk = p-1
+                while bk>=0 && tokt(bk)==TT_OP && (tokv(bk)==42 || tokv(bk)==38) { bk = bk-1 }
+                if bk>=0 && bk<p-1 && tokt(bk)==TT_OP && tokv(bk)==11582 { prev_ok = 0 }
+                if bk>=0 && bk==p-1 && tokt(bk)==TT_OP && tokv(bk)==11582 { prev_ok = 0 }
+            }
             if p>=1 && tokt(p-1)==TT_ID {
                 let pv = tokv(p-1); let pl = tokln(p-1)
                 // byte-compare regardless of token type (struct/impl/trait/for
@@ -622,6 +698,15 @@ fn rewrite_struct_literals() {
                     }
                     q = q+1
                 }
+                // NESTED LITERALS: rewrite INNERMOST FIRST.
+                //
+                // `Q { p0: P { f0: 3 } }` -- compacting the outer literal copies
+                // the inner one across verbatim, braces and field name intact, and
+                // the outer loop then resumes past it. The inner literal was never
+                // rewritten, so the parser reached a '{' where a '(' belonged and
+                // the compiler core-dumped. Skipping any literal that still
+                // contains a '{' means the outer one is handled on a later pass,
+                // by which time the inner is already a constructor call.
                 if end>=0 {
                     // rewrite '{' -> '(' and '}' -> ')'
                     w64(toks + (p+1)*TKS, TT_PNCT); w64(toks + (p+1)*TKS + 8, 40)
@@ -667,7 +752,24 @@ fn rewrite_struct_literals() {
                             w64(toks + (s-gap)*TKS + 40, toke(s))
                             s = s+1
                         }
+                        // Shifting the tail down by `gap` invalidates EVERY token
+                        // index already recorded above this point -- fn_btok,
+                        // fn_pbase/fn_pnames, sfldtab slots are source offsets
+                        // (fine), but scanfns() stores token INDICES into the
+                        // tables, and those all sit after the literal.
+                        //
+                        // shift_fn_toks() walks the recorded index tables and
+                        // subtracts gap from every index greater than `end`.
+                        shift_tok_indexes(end, gap)
                         tokc = tokc - gap
+                        // The outer scan must resume AFTER the literal that was
+                        // just compacted, not from its old position. Without
+                        // this, p stays inside the region that just shifted and
+                        // walks past the new tokc, reading stale token slots --
+                        // which corrupted every function that FOLLOWED the one
+                        // holding the literal, and core-dumped the compiler.
+                        //
+                        p = w
                     }
                 }
             }

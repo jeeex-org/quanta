@@ -825,6 +825,38 @@ fn scan_retstructs() {
       else if tokt(p)==TT_PNCT&&tokv(p)==125 { depth = depth-1; if started==1&&depth==0 { end = p; break } }
       p = p+1
     }
+    // 0.0.222: a DECLARED `-> StructName` return type also sets fn_retstruct.
+    //
+    // scan_retstructs only looked for `return StructName(` in the body, so a
+    // function that DECLARED its return type and then returned a local --
+    // `fn mk() -> P { let p = P { f0: 3 }  return p }` -- left fn_retstruct at -1.
+    // parse_call_impl reads it to tag the caller's result vreg, so the tag was
+    // missing and `mk().f0` had no receiver to resolve the field against.
+    //
+    // Reading the declared type from the signature makes the two spellings agree:
+    // `return P { ... }` and `-> P { ... return p }` now tag identically.
+    //
+    // fn_rettype_name/len hold the token AFTER '->'. For `-> *P` that token is
+    // '*', so a pointer return does not match here -- and does not need to: a
+    // pointer is a raw address and its fields go through an explicit deref.
+    let drtn = r64(fn_rettype_name + fi*8)
+    let drtl = r64(fn_rettype_len + fi*8)
+    if drtn != 0 && drtl > 0 {
+        let dsi = 0
+        let dfound = 0
+        while dsi < structc {
+            let donm = r64(sdefs + dsi*64)
+            let donl = r64(sdefs + dsi*64 + 8)
+            if donl == drtl {
+                let dok = 1
+                let dk = 0
+                while dk < drtl { if r8(src+donm+dk) != r8(src+drtn+dk) { dok = 0; break }; dk = dk+1 }
+                if dok == 1 { dfound = 1; break }
+            }
+            dsi = dsi+1
+        }
+        if dfound == 1 { w64(fn_retstruct + fi*8, dsi) }
+    }
     // scan body for `return StructName(` -> record struct index
     let q = bt
     while q < end {
