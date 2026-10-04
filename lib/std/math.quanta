@@ -225,3 +225,48 @@ fn expf(x: f64) -> f64 {
     return acc
 }
 
+// ---- sqrt ----
+//
+// There was no sqrt anywhere in the language: not a builtin, not in this
+// module. RMSNorm needs it, so a forward pass could not be written at all.
+//
+// Method: read the biased exponent of x, form a power-of-two initial guess,
+// then Newton-Raphson. Newton converges quadratically, so 8 iterations from a
+// guess within 2x of the root is at or past double precision (f64 has ~15.95
+// decimal digits; 8 halvings of the error takes it far below the ULP).
+//
+// The initial guess uses only the exponent field: x in [2^k, 2^(k+1)) implies
+// sqrt(x) in [2^(k/2), 2^((k+1)/2)), so 2^ceil(k/2) is an upper bound within
+// a factor of sqrt(2) and Newton converges monotonically from above.
+//
+// NOTE: this is written against the real language. Two things that are NOT
+// available and are easy to reach for by mistake:
+//   - `print(f64)` emits the raw bit pattern (there is no float formatter);
+//     verify with f2i(fmul(v, 1000000.0)) or a comparison, not by printing.
+//   - `sizeof`, `mem_copy` and `mem_zero` do not exist. mem_alloc(8) returns a
+//     RAW pointer (no header) -- unlike malloc, which returns a base whose
+//     payload is base+8.
+fn sqrtf(x: f64) -> f64 {
+    if x <= 0.0 { return 0.0 }
+    let b = mem_alloc(8)
+    mem_store(b, x)
+    let bits = mem_load(b)
+    let e = (bits >> 52) & 2047
+    // 2^ceil((e-1023)/2): the exponent field alone, mantissa bits zero.
+    let r = f64of((((e - 1023 + 1) / 2) + 1023) << 52)
+    let i = 0
+    while i < 8 {
+        r = fmul(0.5, fadd(r, fdiv(x, r)))
+        i = i + 1
+    }
+    return r
+}
+
+// f64of: reinterpret an i64 bit pattern as an f64. The value must round-trip
+// through memory -- the runtime tags floats by their bit pattern, and the
+// conversion needs the store/load pair to establish it.
+fn f64of(bits: i64) -> f64 {
+    let b = mem_alloc(8)
+    mem_store(b, bits)
+    return f64_load(b)
+}
