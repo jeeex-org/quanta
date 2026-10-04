@@ -49,7 +49,16 @@ let VAR_CAP = 250000       // vars arena 2MB / 24B (VRS=24? keep headroom)
 // to the arena's true capacity and derive it from FNS so the two cannot drift
 // apart again.
 let FN_CAP  = 35714        // fns arena 2MB / FNS(56)
-let ALLOC_CAP = 131000     // alloc arena 2MB / 16B
+//
+// Same class of defect as FN_CAP above, and same reason for the shape: the two
+// numbers cannot be allowed to drift. `alloc` (and `falloc`) are mmap(2000000)
+// and aset/fset write 16 bytes per entry, so the arena holds 2000000/16 =
+// 125000 entries -- NOT the 131000 the cap claimed. aset/fset check
+// allocfc >= ALLOC_CAP before writing, so the last 6000 permitted entries
+// wrote straight past the end of the mapping into whichever arena the
+// allocator placed next, corrupting it with silent vreg->register pairs. Bound
+// the cap to the arena's real capacity.
+let ALLOC_CAP = 125000       // alloc/falloc arena 2MB / 16B
 let GVAR_CAP = 83000       // gvars arena 2MB / 24B (VRS=24), keep headroom
 let VREG_CAP = 400000      // raised 0.0.98 to fit compiler self-build with feature source
 let LBL_CAP  = 124000      // lblmap arena 2MB / 16B (LBS=16), keep headroom

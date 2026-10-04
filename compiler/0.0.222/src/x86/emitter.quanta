@@ -1713,7 +1713,16 @@ fn emit_bltn(nmi,nl,ii) {
         flush_all()
         // rdi = n (bytes). Compute qword count: (n+7)>>3
         eb(72); eb(131); eb(199); eb(7)   // add rdi, 7   (n+7)
-        eb(72); eb(193); eb(230); eb(3)   // shr rdi, 3   ((n+7)/8)
+        // 48 C1 EF 03 = shr rdi, 3. The ModRM byte MUST be 0xEF (reg=rdi).
+        // This sequence was the byte-for-byte copy of the `shl rsi, 3` sites
+        // above -- 0xE6, reg=rsi -- so malloc's own shift target was esi while
+        // the value being converted sat in rdi. rdi never shifted, the stored
+        // header was the raw BYTE count instead of the qword count, and every
+        // free() then passed that byte count to munmap as the length: freeing a
+        // 32-byte tensor issued munmap(ptr, 32) for a 4-page-roundable region
+        // and left live mappings behind, while malloc(4) stored 11 and could
+        // unmap a page the block did not own. 0x0E6 vs 0x0EF is the whole bug.
+        eb(72); eb(193); eb(239); eb(3)   // shr rdi, 3   ((n+7)/8)
         // Now rdi = qword count. Fall through to mem_alloc logic.
         eb(72); eb(137); eb(251)        // mov rbx, rdi   (rbx = qcount, saved across syscall)
         eb(72); eb(137); eb(249)        // mov rcx, rdi   (rcx = qcount)
@@ -2193,8 +2202,31 @@ fn emit_bltn2(nmi,nl,ii) {
             let a0 = irres(sc_base)
             let a1 = irres(sc_base + 1)
             let a2 = irres(sc_base + 2)
+            // The buffer may be a QUANTA string (a length-header word followed
+            // by the bytes) OR a raw pointer -- from file_read, mmap or
+            // mem_alloc, which carry no header. file_open above already
+            // discriminates these two shapes for its path argument; write did
+            // not, so it always used the raw pointer. For a Quanta literal that
+            // is the HEADER, and `file_write(1, hello, 5)` emitted the 8-byte
+            // little-endian length (05 00 00 00 00 ...) instead of "hello" --
+            // writing the header to stdout and never the string. Detect the
+            // tag the same way file_open does and add the 8 only when the
+            // value really is a Quanta string.
+            let _wb = a1
+            let _wisop = irop(sc_base + 1)
+            let _wisstr = r64(vreg_is_str + _wb*8)
+            if _wisstr!=1 && _wisop==IR_MOV {
+                let _wsrcv = ira0(sc_base + 1)
+                if r64(vreg_is_str + _wsrcv*8)==1 { _wisstr = 1 }
+            }
+            if _wisstr!=1 && _wisop==IR_STR { _wisstr = 1 }
+            if _wisstr!=1 {
+                let _wsrc2 = find_str_source(_wb)
+                if r64(vreg_is_str + _wsrc2*8) == 1 { _wisstr = 1 }
+            }
             rbp(7, spill_home(a0))   // rdi = fd
-            rbp(6, spill_home(a1))   // rsi = buf
+            if _wisstr==1 { argp8(6, sc_base, 1) }   // rsi = buf + 8 (skip length header)
+            // else rsi already holds the raw pointer from the IR_CALL arg load
             rbp(2, spill_home(a2))   // rdx = count
             ri(0,1); sysc(); return 1
         }
@@ -3534,23 +3566,73 @@ fn emit_bltn2(nmi,nl,ii) {
             sdef(irres(ii), 0)
         return 1
     }
-    // abs(a) for f64: clear sign bit
+    // abs(a): clear the sign bit. DUAL-DOMAIN -- the domain is the ARGUMENT's,
+    // and the two domains need genuinely different code, not one sequence
+    // plus a different tag.
+    //
+    // This used to have a single float-only implementation: convert the
+    // argument to f64 with as_f64_rdi (which is cvtsi2sd for an integer
+    // input, i.e. it CHANGES the value's domain), mask the float's sign bit,
+    // and tag the result float. Every integer abs() therefore came back as
+    // the bit pattern of a float -- abs(42) returned 42.0's pattern
+    // (4631107791820423168), abs(-1) returned 1.0's. That is not a tagging
+    // bug alone: the conversion itself corrupted the value.
+    //
+    // f64: the argument vreg already holds f64 BITS, so the sign bit of the
+    // 64-bit pattern is bit 63. Mask and keep the float tag.
+    //
+    // i64: the argument vreg holds a two's-complement INTEGER, and masking
+    // bit 63 is NOT the absolute value there. -42 is 0xFFFF_FFFF_FFFF_FFD6;
+    // clearing bit 63 yields 0x7FFF_FFFF_FFFF_FFD6, which is still an enormous
+    // number, not 42. The mask idiom is only valid for float bit patterns,
+    // where bit 63 happens to be the sign. This produced
+    // abs(-42) == 0x7fffffffffffffd6 (printed as 9223372036854775766) and
+    // abs(-1) == 0x7fffffffffffffff, so every `abs(-n) != n` check failed --
+    // which is exactly what kept the extern gates red while standalone
+    // probes that only printed the value looked plausible.
+    //
+    // The correct branch-free integer absolute value uses a SIGN MASK that is
+    // all-ones for negatives, not a bit-63 clear:
+    //   mov rdx, rax   ; sar rdx, 63   -> rdx = -1 if rax<0, else 0
+    //   xor rax, rdx   ; n ^ -1 == ~n == -n-1
+    //   sub rax, rdx   ; -n-1 - (-1) == -n
+    // Verified encodings: 48 89 C2 / 48 C1 FA 3F / 48 31 D0 / 48 29 D0.
+    // (The xor/sub ModRM is 0xD0 = mod11 reg=rax(000) rm=rdx(010); 0xC2
+    // would be the rdx,rax operand order and decodes as a different pair.)
     if nl==3&&r8(nm)=='a'&&r8(nm+1)=='b'&&r8(nm+2)=='s' {
         let pfa = is_float_vr(irres(ira2(ii)))               // BEFORE flush_all
         flush_all()
         let arg0v = irres(ira2(ii))
         rbp(0, spill_home(arg0v))                     // mov rax, [arg0 spill home]
-        eb(72); eb(137); eb(199)           // mov rdi, rax   (arg0 also goes to rdi
-                                            //  for the marshalled-arg convention)
-        as_f64_rdi(pfa)                                // rdi = f64 BITS of the value
-        eb(72); eb(139); eb(199)          // mov rax, rdi   ... and the MASK is
-                                            // applied to rax, so put rdi there
-        ri64(1, 0x7FFFFFFFFFFFFFFF)        // mov rcx, 0x7FFF_FFFF_FFFF_FFFF
-        eb(72); eb(33); eb(200)            // and rax, rcx   (48 21 C8)   clear
-                                            // the sign bit of the f64 pattern
-            // Result is an f64 bit pattern; tag it or the enclosing arithmetic
-            // runs the INTEGER path over the pattern (add/sub/mul/div).
-        w8(vfloat+irres(ii), 1)
+        if pfa==1 {
+            eb(72); eb(137); eb(199)       // mov rdi, rax   (arg0 also goes to
+                                            //  rdi for the marshalled-arg
+                                            //  convention; rdi already holds
+                                            //  the f64 bits, no conversion)
+            eb(72); eb(139); eb(199)       // mov rax, rdi   (mask applies to rax)
+            ri64(1, 0x7FFFFFFFFFFFFFFF)    // mov rcx, 0x7FFF_FFFF_FFFF_FFFF
+            eb(72); eb(33); eb(200)        // and rax, rcx   (48 21 C8)
+        } else {
+            // INTEGER DOMAIN -- sign-mask xor/sub, not a bit-63 mask.
+            // Byte-exact encodings, all four verified against `as`:
+            //   48 89 C2    mov rdx, rax
+            //   48 C1 FA 3F sar rdx, 63      (0xC1 = shift-by-imm8; 0xC7 is mov)
+            //   48 31 D0    xor rax, rdx      (0x31 = xor r/m64,r64; 0x30 is r/m8)
+            //   48 29 D0    sub rax, rdx      (0x29 = sub r/m64,r64; 0x2B is r/m8)
+            // eb() takes DECIMALS. The opcodes are 0x31=49 and 0x29=41;
+            // writing eb(33)/eb(51) emits 0x21/0x33, i.e. and/shl, not
+            // xor/sub -- the binary decodes cleanly and silently computes
+            // the wrong thing instead of trapping. Always cross-check the
+            // decimal against `as` output before trusting a hand-encoded
+            // instruction.
+            eb(72); eb(137); eb(194)        // mov rdx, rax     48 89 C2
+            eb(72); eb(193); eb(250); eb(63) // sar  rdx, 63  48 C1 FA 3F
+            eb(72); eb(49); eb(208)           // xor  rax, rdx 48 31 D0
+            eb(72); eb(41); eb(208)           // sub  rax, rdx 48 29 D0
+        }
+            // Result tag follows the INPUT's domain: float in, float out;
+            // integer in, integer out.
+        if pfa==1 { w8(vfloat+irres(ii), 1) } else { w8(vfloat+irres(ii), 0) }
             // Bind the computed %rax to the result vreg. Without this the
             // caller reads whatever the result register happens to hold, so
             // the builtin's value never arrives: abs() returned 4 for every

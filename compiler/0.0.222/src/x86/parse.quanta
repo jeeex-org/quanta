@@ -752,7 +752,12 @@ fn parse_let() {
                     // `IR_MOV(bsz, 3)` would copy whatever is in vreg 3 rather
                     // than the literal 3. Put the count in the vreg with
                     // IR_CONST and hand THAT vreg to IR_ARRNEW.
-                    let bsz = nv(); iremit(IR_CONST, bsz, barsz, 0, 0)
+                    // Same defect as the single-binding path, fixed there
+                    // first: IR_CONST does not store, so the count slot stayed
+                    // uninitialised and IR_ARRNEW read it as a wild size. MOV
+                    // from a constant source so the vreg really holds the count.
+                    let baszsrc = nv(); iremit(IR_CONST, baszsrc, barsz, 0, 0)
+                    let bsz = nv(); iremit(IR_MOV, bsz, baszsrc, 0, 0)
                     bvr = nv(); iremit(IR_ARRNEW, bvr, bsz, 0, 0)
                     w64(vreg_type + bvr*8, 11)
                 } else {
@@ -1120,7 +1125,26 @@ fn parse_let() {
             // IR_ARRNEW reads the count from vreg a0's slot, so the count must
             // be a vreg holding it -- IR_CONST, not IR_MOV, whose a1 is also read
             // as a vreg.
-            let szr = nv(); iremit(IR_CONST, szr, arrsz, 0, 0)
+            //
+            // UNINITIALISED COUNT SLOT. The vreg handed to IR_ARRNEW must HOLD
+            // the element count at run time, because IR_ARRNEW reads it from
+            // spill_home(a0) -- the register's value slot, not the IR literal.
+            // IR_CONST does NOT store: it marks the destination as a
+            // compile-time constant, so codegen emits no runtime write and the
+            // slot keeps whatever the page held. IR_ARRNEW then allocated
+            // from that garbage as a size and every `let x: T[N]` with no
+            // initialiser read wild memory -- a bare `let q: i64[1]` in main
+            // SIGSEGVed the compiler whenever an earlier function had shifted
+            // vreg numbering enough for the stale slot to look like a pointer.
+            //
+            // MOV the count from a separate constant source, exactly as the
+            // scalar branch below does. IR_MOV's a1 is also read as a vreg, so
+            // the source has to be a real vreg holding the literal: IR_CONST
+            // into the source, IR_MOV into the destination. The destination is
+            // not marked constant, so the store survives and later assignment
+            // into the array still works.
+            let aszsrc = nv(); iremit(IR_CONST, aszsrc, arrsz, 0, 0)
+            let szr = nv(); iremit(IR_MOV, szr, aszsrc, 0, 0)
             let zr = nv(); iremit(IR_ARRNEW, zr, szr, 0, 0)
             w64(vreg_type + zr*8, 11)
             vadd(nm,nl,zr)
