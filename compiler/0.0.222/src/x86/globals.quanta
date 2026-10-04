@@ -419,6 +419,48 @@ fn sfield_idx(si, fld, fl) {
   }
   return -1
 }
+//
+// zero_struct -- give an ANNOTATED but UNINITIALISED struct declaration real
+// storage.
+//
+// `let a: P` (no `= ...`) used to bind the name to an integer zero. A zero is not
+// a struct handle: it is not a pointer, so the first `a.f0` dereferenced address 0
+// and the program died with SIGILL instead of reporting anything useful. Stamping
+// vreg_struct alone is not enough either -- the tag says "this vreg holds a P",
+// but nothing was ever allocated for it.
+//
+// So allocate the declared field count and zero every slot. A field whose own
+// declared type is a struct needs its OWN storage too, so recurse; that is what
+// makes a nested `struct N { p: P }` declaration work instead of leaving the inner
+// P as a bare integer.
+//
+// `depth` guards against a type that (incorrectly) contains itself. Without it a
+// self-referential declaration would recurse until the stack ran out.
+//
+fn zero_struct(si, depth) {
+    if si < 0 { return 0 }
+    if depth > 8 { return 0 }
+    let fc = r64(sdefs + si*64 + 16)
+    let fb = r64(sdefs + si*64 + 24)
+    // Allocate fc slots. IR_TALLOC is an IR instruction, not a runtime call, so it
+    // has to be emitted into the enclosing function's IR list and its result read
+    // back as the CURRENT value -- the caller does the same for struct literals.
+    let ptr = nv(); iremit(IR_TALLOC, ptr, fc, 0, 0)
+    let i = 0
+    while i < fc {
+        let fi = nv(); iremit(IR_CONST, fi, i, 0, 0)
+        let zv = nv(); iremit(IR_CONST, zv, 0, 0, 0)
+        // IR_ISTORE is (base=arg1, index=arg2, value=arg3): the struct-literal
+        // emitter writes it as iremit(IR_ISTORE, 0, base, index, value), so
+        // putting the base in arg0 stores to vreg 0 instead of into the struct.
+        iremit(IR_ISTORE, 0, ptr, fi, zv)
+        let fsi = r64(sfldtyp + (fb+i)*8)
+        if fsi >= 0 { zero_struct(fsi, depth+1) }
+        i = i + 1
+    }
+    return ptr
+}
+
 fn sfield_type(si, fidx) {
   let fb = r64(sdefs + si*64 + 24)
   return r64(sfldtyp + (fb+fidx)*8)

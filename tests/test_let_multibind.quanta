@@ -1,0 +1,152 @@
+// Multi-binding `let` -- both grammars.
+//
+// A comma-separated `let` has two distinct forms, and the compiler used to accept
+// only one while silently MIS-COMPILING the other. Every check here is a real
+// runtime value check: the harness treats a compiler core-dump as a failure too
+// (no binary, no PASS line).
+//
+//   Shape A -- names first, ONE shared '=', one value per name.
+//              `let a, b = 1, 2` and `let a: i64, b: i64 = 1, 2`
+//   Shape B -- per-binding ': T' and its own '='.
+//              `let a: P = P{f0:1}, b: P = P{f0:2}`
+//
+// Shape A was the silent-wrong-answer case. The names-first handler treated the
+// first expression as a TUPLE POINTER and emitted field-index reads against it, so
+// `let a, b = 1, 2` read 8 bytes at offset 0 and 8 bytes at offset 8 of a single
+// i64 and bound both names to 0 -- a complete compile, a wrong program, and no
+// diagnostic. The same handler also desynchronised the parse on some inputs, which
+// killed the compiler with SIGILL at a null call target.
+//
+// The two grammars are now told apart by the ORDER of the first top-level ',' and
+// the first top-level '=': shape B puts '=' before ',', shape A the other way
+// round. Before that discrimination existed, the per-binding handler consumed the
+// names-first form too, binding each name to the NEXT name's value.
+
+let failures = 0
+
+fn check(num, got, want) {
+    if got != want {
+        failures = failures + 1
+        print("FAIL check ")
+        println(num)
+        print("  got  ")
+        println(got)
+        print("  want ")
+        println(want)
+        return 0
+    }
+    print("ok ")
+    println(num)
+    return 1
+}
+
+struct P { f0: i64 }
+struct Q { a0: i64 }
+
+// `pair()` returns an aggregate, and `let a, b = pair()` DESTRUCTURES it into
+// field 0 and field 1. This is the form the names-first handler was written for
+// and it must keep working.
+fn pair() -> [i64] { return [7, 8] }
+
+fn main() -> i64 {
+    print("test_let_multibind: ")
+
+    // ---- Shape A, untyped: one value per name --------------------------------
+    //  1-2: the exact case that used to print `0 0`.
+    let a, b = 1, 2
+    check(1, a, 1)
+    check(2, b, 2)
+
+    //  3: three names, three values.
+    let c, d, e = 1, 2, 3
+    check(3, c + d + e, 6)
+
+    //  4: negative initialisers -- the sign is a separate token, so the
+    //     "another value follows?" test has to recognise it.
+    let f, g = -1, -2
+    check(4, f + g, -3)
+
+    //  5: a call result as each value.
+    let h, i2 = pair0(), pair1()
+    check(5, h + i2, 15)
+
+    // ---- Shape A, typed: each name carries its own annotation ----------------
+    //  6: annotations that are plain scalars.
+    let j: i64, k: i64 = 4, 5
+    check(6, j + k, 9)
+
+    // ---- Shape A, struct initialisers ---------------------------------------
+    //  7-8: struct literal per name, UNANNOTATED. The initializer's own tag is
+    //       what makes `.f0` resolve here -- a missing or wrong vreg_struct entry
+    //       is what produced `call to undeclared function: f0`.
+    let l, m = P { f0: 9 }, P { f0: 11 }
+    check(7, l.f0, 9)
+    check(8, m.f0, 11)
+
+    //  9-10: the same with explicit annotations. The annotation's declared-struct
+    //        index has to be stamped, and it has to be looked up from the TYPE
+    //        NAME's own token -- reading it after `adv()` picks up whatever token
+    //        follows the annotation and returns the wrong struct, or none.
+    let n: P, o: P = P { f0: 12 }, P { f0: 13 }
+    check(9, n.f0, 12)
+    check(10, o.f0, 13)
+
+    // 11: mixed -- a struct value beside a scalar value in the same list.
+    let p2, q2 = P { f0: 14 }, 15
+    check(11, p2.f0 + q2, 29)
+
+    // ---- Shape A, aggregate destructuring (must NOT regress) ----------------
+    // 12-13: no comma follows `pair()`, so `rv` IS an aggregate pointer and each
+    //        name is bound to a field of it. This is the discriminator's other
+    //        side; getting it backwards would turn 7/8 into 0.
+    let r2, s2 = pair()
+    check(12, r2, 7)
+    check(13, s2, 8)
+
+    // ---- Shape B: per-binding ': T' and its own '=' --------------------------
+    // 14-15: the production form. `lib/std/ai.quanta:37` declares exactly this.
+    let sa: i64[2] = { 2, 3 }, sb: i64[2] = { 3, 2 }
+    check(14, sa[0], 2)
+    check(15, sb[1], 2)
+
+    // 16-17: per-binding struct declaration.
+    let ta: P = P { f0: 21 }, tb: P = P { f0: 22 }
+    check(16, ta.f0, 21)
+    check(17, tb.f0, 22)
+
+    // 18: per-binding, three of them.
+    let ua: P = P { f0: 1 }, ub: P = P { f0: 2 }, uc: P = P { f0: 3 }
+    check(18, ua.f0 + ub.f0 + uc.f0, 6)
+
+    // ---- Shape A with sized-array annotations -------------------------------
+    // 19-20: `T[N]` in the annotation position, two array names.
+    let va: i64[2], vb: i64[2] = { 1, 2 }, { 3, 4 }
+    check(19, va[1], 2)
+    check(20, vb[0], 3)
+
+    // ---- Nesting: a multi-binding inside a loop -----------------------------
+    // 21: the parse must stay balanced when the statement repeats.
+    let total = 0
+    let w = 0
+    while w < 3 {
+        let x2, y2 = w, w * 2
+        total = total + x2 + y2
+        w = w + 1
+    }
+    check(21, total, 9)
+
+    // ---- Nested structs in shape A -----------------------------------------
+    // 22: field access two levels down through a list-bound struct.
+    let z1, z2 = Q { a0: 31 }, Q { a0: 32 }
+    check(22, z1.a0 + z2.a0, 63)
+
+    if failures == 0 {
+        print("PASS\n")
+        return 0
+    }
+    print("FAIL\n")
+    return 1
+}
+
+fn pair0() -> i64 { return 5 }
+fn pair1() -> i64 { return 10 }
