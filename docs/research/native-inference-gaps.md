@@ -42,10 +42,24 @@ There is no forward pass, no sampling, no output.
 `tokenizer_load` never reads the GGUF vocab. BPE must be implemented to feed
 the model real text.
 
-### 4. NO `sqrt` ANYWHERE
+### 4. ~~NO `sqrt` ANYWHERE~~ -- WRONG, retracted
 
-Not a builtin, not in `lib/std/math.quanta`. RMSNorm requires it. This must
-be written (expf exists as a model for a correct software implementation).
+There is no `sqrt` in `lib/std/math.quanta`, but it is a **BUILTIN** in the
+emitter (`sqrtsd xmm0, xmm0`, emitter.quanta ~line 3517), as are `sin`,
+`cos`, `tan`, `log`, `pow`, `floor`, `ceil`, `f64of`, `fisnan`, `fisinf`.
+All verified correct to 6 decimals.
+
+I first "discovered" this as missing and wrote a software Newton-Raphson
+`sqrtf`. It works and is committed, but it is redundant -- the builtin `sqrt`
+is exact and a single instruction. Do NOT reach for the software version.
+
+The real lesson: **the emitter has a large builtin surface and none of it is
+documented in one place.** Extract it by grepping the emitter for the
+`if nl==N&&r8(nm)=='x'&&...` builtin-name comparisons. Doing that first would
+have saved the detour.
+
+Also note `q4k_dot` and `qaddf_avx2` exist as builtins -- these are directly
+on the critical path for a fast Q4_K_M path.
 
 ### 5. NO `mem_copy`, `mem_zero`, `mem_fill`, `sizeof`
 

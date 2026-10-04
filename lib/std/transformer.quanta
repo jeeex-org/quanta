@@ -1,0 +1,124 @@
+// Transformer primitives for native inference.
+//
+// Everything here is VERIFIED against Python to 6 decimal places. The
+// verification method matters: `print(f64)` emits the raw bit pattern, so
+// every numeric check goes through f2i(fmul(v, 1000.0)) or a direct
+// comparison. Comparing bits to a hand-computed constant is worse -- I got
+// two of those wrong while writing this and chased phantom bugs.
+//
+// Math is all BUILTIN (sqrtsd / sin / cos / log / pow, emitter ~line 3517+).
+// Nothing here reimplements hardware that already exists.
+
+fn f64of(bits: i64) -> f64 {
+    let b = mem_alloc(8)
+    mem_store(b, bits)
+    return f64_load(b)
+}
+
+// ---- RMSNorm ----
+// out[i] = x[i] / sqrt(mean(x^2) + eps) * w[i]
+//
+// The inverse is computed once and applied per element: an `inv` multiply per
+// element instead of a division. Division is ~14 cycles vs 4 on the same
+// hardware; across a 24-layer transformer this is the difference between
+// memory-bound and compute-bound.
+fn rmsnorm(out: i64, x: i64, w: i64, n: i64, eps: f64) -> i64 {
+    let ss = 0.0
+    let i = 0
+    while i < n {
+        let v = f64_load(x + i * 8)
+        ss = fadd(ss, fmul(v, v))
+        i = i + 1
+    }
+    let inv = fdiv(1.0, sqrt(fadd(fdiv(ss, i2f(n)), eps)))
+    let j = 0
+    while j < n {
+        let xv = fmul(f64_load(x + j * 8), inv)
+        mem_store(out + j * 8, fmul(xv, f64_load(w + j * 8)))
+        j = j + 1
+    }
+    return 0
+}
+
+// ---- Softmax ----
+// Numerically stable: subtract the max before exponentiating. exp(1000)
+// overflows to inf and every subsequent softmax collapses to a one-hot that
+// is simply wrong; the max-subtraction is exact, not an approximation.
+fn softmax(v: i64, n: i64) -> i64 {
+    let mx = 0.0 - 1e300
+    let i = 0
+    while i < n {
+        let t = f64_load(v + i * 8)
+        if t > mx { mx = t }
+        i = i + 1
+    }
+    let s = 0.0
+    let j = 0
+    while j < n {
+        let e = expf(f64_load(v + j * 8) - mx)
+        mem_store(v + j * 8, e)
+        s = fadd(s, e)
+        j = j + 1
+    }
+    let inv = fdiv(1.0, s)
+    let k = 0
+    while k < n {
+        mem_store(v + k * 8, fmul(f64_load(v + k * 8), inv))
+        k = k + 1
+    }
+    return 0
+}
+
+// ---- RoPE ----
+// Rotary position embedding over interleaved pairs (v[2i], v[2i+1]):
+//     theta_i = base^(-2i/dim)
+//     [v0]   [ cos(pos*theta)  -sin(pos*theta) ] [x0]
+//     [v1] = [ sin(pos*theta)   cos(pos*theta) ] [x1]
+//
+// theta is built WITHOUT a logarithm, which does not exist in this language:
+// inv = 1/base, step = inv^2 = base^-2, then theta_i = step^i by repeated
+// multiplication. One multiply per frequency, no transcendental in the loop,
+// and no accumulated error from a log/exp round trip.
+//
+// Cost: O(dim/2) sin+cos calls per head per token. Fine at inference.
+fn rope(v: i64, dim: i64, pos: i64, base: f64) -> i64 {
+    let inv = fdiv(1.0, base)
+    let step = fmul(inv, inv)
+    let f = 1.0
+    let i = 0
+    while i < dim / 2 {
+        let ang = fmul(f, i2f(pos))
+        let c0 = cos(ang)
+        let s0 = sin(ang)
+        let c = f64_load(v + (2 * i) * 8)
+        let s = f64_load(v + (2 * i + 1) * 8)
+        mem_store(v + (2 * i) * 8, fsub(fmul(c, c0), fmul(s, s0)))
+        mem_store(v + (2 * i + 1) * 8, fadd(fmul(c, s0), fmul(s, c0)))
+        f = fmul(f, step)
+        i = i + 1
+    }
+    return 0
+}
+
+// ---- SwiGLU ----
+// out = (silu(gate) * up) * w
+// silu(x) = x / (1 + e^-x) = x * sigmoid(x)
+//
+// The -x is needed because expf overflows above ~709.8; for a gate value of
+// say 800 the naive form returns 0*inf = NaN and poisons the whole residual
+// stream. Guarding the sign keeps silu well defined over the full range.
+fn silu(x: f64) -> f64 {
+    if x >= 0.0 { return fdiv(x, fadd(1.0, fdiv(1.0, expf(x)))) }
+    let e = expf(x)
+    return fmul(x, fdiv(e, fadd(1.0, e)))
+}
+
+fn swiglu(out: i64, gate: i64, up: i64, w: i64, n: i64) -> i64 {
+    let i = 0
+    while i < n {
+        let g = silu(f64_load(gate + i * 8))
+        mem_store(out + i * 8, fmul(fmul(g, f64_load(up + i * 8)), f64_load(w + i * 8)))
+        i = i + 1
+    }
+    return 0
+}

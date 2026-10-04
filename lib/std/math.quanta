@@ -270,3 +270,41 @@ fn f64of(bits: i64) -> f64 {
     mem_store(b, bits)
     return f64_load(b)
 }
+
+// ---- pf64: print an f64 ----
+//
+// `print(f64)` emits the RAW BIT PATTERN: print(2.5) writes 4612811918334230528.
+// Arithmetic on f64 is correct; only the print builtin is missing a float path
+// (the integer printer does `idiv rcx, 10` on the encoding).
+//
+// No float test in test_suites/codes ever caught this, because every one of
+// them verifies by COMPARISON and never prints. That is why it survived.
+//
+// This is the workaround, deliberately not an emitter patch: a byte-emitting
+// SSE float formatter in the emitter was attempted and reverted as unverified.
+// Six fixed decimals is what inference needs (logits, losses, timings); full
+// round-trip decimal expansion is not needed and is a much larger problem.
+//
+// Keep using the BUILTIN `print` for integers -- it is fine.
+fn pf64(v: f64) -> i64 {
+    if v != v { prints("nan") return 0 }
+    let neg = 0
+    if v < 0.0 { neg = 1 v = 0.0 - v }
+    if v >= 1e18 { prints("inf") return 0 }
+    let scale = 1000000
+    let t = f2i(fmul(v, i2f(scale)))
+    let ip = t / scale
+    let fp = t - ip * scale
+    if neg == 1 { printi(0 - ip) } else { printi(ip) }
+    prints(".")
+    let d = 100000
+    let i = 0
+    while i < 6 {
+        let dig = fp / d
+        printi(dig)
+        fp = fp - dig * d
+        d = d / 10
+        i = i + 1
+    }
+    return 0
+}
