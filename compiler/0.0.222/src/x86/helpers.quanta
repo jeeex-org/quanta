@@ -497,6 +497,14 @@ fn vclr() {
     // a stale 11 would falsely route `f(21)` through IR_CLOSURE_CALL.
     let vci = 0
     while vci < vreg_n { w64(vreg_type + vci*8, 0); vci = vci + 1 }
+    // vfloat is a BYTE-per-vreg table whose "unset" value is 0, not -1, so it
+    // cannot be folded into the loop above. vreg_n is reset to 0 here, which
+    // makes every vreg index reusable by the next function -- including any
+    // index an imported -> f64 function had tagged 1. An integer local
+    // inheriting that tag reaches IR_ADD/IR_SUB/IR_MUL's SSE branch and comes
+    // back as the bit pattern of a float. Clear it over the same range.
+    let vfi = 0
+    while vfi < vreg_n { w8(vfloat + vfi, 0); vfi = vfi + 1 }
     varc = 0; vreg_n = 0
 }
 

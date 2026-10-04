@@ -277,7 +277,11 @@ fn gguf_tensor_nbytes(idx) {
 // data section, so the file position must include gguf_data_start.
 fn gguf_read_tensor_bytes(idx, buf, nbytes) {
     if idx < 0 || idx >= gguf_n_tensors { return -1 }
-    let abs_pos = gguf_data_start + gguf_tensor_offset(idx)
+    // gguf_tensor_offset() already returns an ABSOLUTE file offset (it adds
+    // gguf_data_start itself). Adding it again here seeked 8239136 bytes past
+    // the tensor, so every tensor read returned unrelated file data instead of
+    // failing.
+    let abs_pos = gguf_tensor_offset(idx)
     if lseek(gguf_fd, abs_pos, 0) < 0 { return -2 }
     return read_raw(gguf_fd, buf, nbytes)
 }
@@ -1077,6 +1081,16 @@ fn gguf_read_tensor(idx) {
     let buf = mem_alloc(nbytes)
     if gguf_read_tensor_bytes(idx, buf, nbytes) < 0 { return 0 }
     return buf
+}
+
+// Read a contiguous slice of a tensor, `byte_off` bytes into it. Needed for
+// token embeddings: token_embd.weight is [2048, 128000] Q6_K = 262 MB, so
+// reading the whole tensor to fetch one 1680-byte row wastes both memory and
+// time on every single token. Callers pass byte_off = row * bytes_per_row.
+fn gguf_read_tensor_bytes_at(idx, byte_off, buf, nbytes) {
+    if idx < 0 || idx >= gguf_n_tensors { return -1 }
+    if lseek(gguf_fd, gguf_tensor_offset(idx) + byte_off, 0) < 0 { return -2 }
+    return read_raw(gguf_fd, buf, nbytes)
 }
 
 // ------------------------------------------------------------- linear algebra
