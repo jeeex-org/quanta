@@ -1383,7 +1383,19 @@ fn expand_includes(buf, len, depth) {
               if emit_qobj == 0 { take_cache = qobj_try_cache(buf+ns, nl) }
               if take_cache == 1 { if fd>=0 { file_close(fd) } }
               else if fd>=0 { imp_load(fd, depth) }
-              else { imp_err=1 }
+              else {
+                // Record the unresolvable module name so the exit in
+                // entry.quanta can name it. A bare `exit(16)` with no
+                // message leaves `import std/typo` indistinguishable from
+                // a compiler fault -- there is no way for the user to tell
+                // which import failed or that it was an import at all.
+                imp_badname_len = nl
+                if nl > 255 { imp_badname_len = 255 }
+                let bi=0
+                while bi<imp_badname_len { w8(imp_badname+bi, r8(buf+ns+bi)); bi=bi+1 }
+                w8(imp_badname+imp_badname_len, 0)
+                imp_err=1
+              }
             }
             i=j
           }

@@ -444,7 +444,20 @@ fn main(argc, argv) {
         w8(src+srclen, 125); srclen = srclen + 1   // "}"
         w8(src+srclen, 10); srclen = srclen + 1     // newline
     }
-    if imp_err==1 { exit(16) }
+    if imp_err==1 {
+      // A module that failed to resolve is an ordinary user error (a typo in
+      // `import std/...`), not a compiler fault. Exiting 16 with no message
+      // makes it indistinguishable from a genuine internal failure, and left
+      // `import std/mem` -- which does not exist -- silently killing the
+      // compile of native_inference.quanta. Name the module and list the
+      // prefixes that were searched.
+      let m1 = "qc: cannot resolve imported module '"
+      file_write(2, m1+8, len(m1))
+      file_write(2, imp_badname, imp_badname_len)
+      let m2 = "'\n  searched: ./, std/, ext/, lib/  (.quanta or .qobj)\n"
+      file_write(2, m2+8, len(m2))
+      exit(16)
+    }
     // 7.F / NEW-1: detect source truncation. The expanded source must fit the
     // src buffer; a source that fills it was truncated -> abort immediately.
     if srclen >= 16777216 {
