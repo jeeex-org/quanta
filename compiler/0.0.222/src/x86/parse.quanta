@@ -606,8 +606,67 @@ fn parse_let() {
             si = si + 1
             steps = steps + 1
         }
+        //
         // Only the per-binding grammar is this branch's business.
-        if first_comma >= 0 && (first_eq < 0 || first_eq < first_comma) { lstyped = 1 }
+        //
+        // '=' before ',' decides the initialised cases, but it is NOT sufficient on
+        // its own, because `first_eq` may come from the statement AFTER this one.
+        // The scan is bounded by 256 tokens and a ';' or a closing '}', not by a
+        // newline -- the lexer emits no newline token -- so with the semicolons
+        // optional a declaration that ends in ']' has nothing at all to stop on:
+        //
+        //     let d: i64[1], e: i64[1]
+        //     d[0] = 5
+        //
+        // has its '=' AFTER the comma, from `d[0]=5`, and this test alone therefore
+        // called it names-first. The shape-A handler then collected `d` and `e` as
+        // names awaiting values, consumed `d [ 0 ]` as the first value, and bound
+        // nothing usable: "undeclared variable: d" followed by a compiler SIGILL.
+        //
+        // The remaining ambiguity is exactly one shape: a comma BEFORE any '=' where
+        // the SECOND binding carries its own annotation. Both grammars look alike
+        // there, and they part ways on one token -- what follows that annotation.
+        //
+        //     '='   the shared initialiser, so names-first:  let a: i64, b: i64 = 1, 2
+        //     ','   another binding follows
+        //     other the declaration ended with no initialiser, so per-binding owns
+        //          these uninitialised names:            let d: i64[1], e: i64[1]
+        //
+        // That third case is the only local, escape-proof discriminator there is.
+        // `let a, b = 1, 2` never reaches it -- the second name is unannotated, and
+        // the per-binding grammar requires an annotation on every binding.
+        let comma_shape = 0
+        if first_comma >= 0 && first_eq >= 0 && first_eq > first_comma {
+            let m = first_comma + 1
+            if m < tokc && (tokt(m)==TT_ID || tokt(m)==TT_KEY) {
+                let k = m + 1
+                if k < tokc && tokt(k)==TT_PNCT && tokv(k)==58 {
+                    k = k + 1
+                    if k < tokc && tokt(k)==TT_OP && tokv(k)==42 { k = k + 1 }
+                    if k < tokc && (tokt(k)==TT_ID || tokt(k)==TT_KEY || tokt(k)==TT_MUT) { k = k + 1 }
+                    // sized array `T[N]`. k_d starts at 0 because the walk begins AT
+                    // the opening bracket; starting at 1 double-counted it and the
+                    // walk never closed. EVERY bracket counts, so a value like
+                    // `{1,2}` or a call `f(a,b)` cannot unbalance it.
+                    if k < tokc && tokt(k)==TT_PNCT && tokv(k)==91 {
+                        let k_d = 0
+                        while k < tokc {
+                            if tokt(k)==TT_PNCT {
+                                if tokv(k)==91 || tokv(k)==123 || tokv(k)==40 { k_d = k_d + 1 }
+                                if tokv(k)==93 || tokv(k)==125 || tokv(k)==41 {
+                                    k_d = k_d - 1
+                                    if k_d == 0 { k = k + 1; break }
+                                }
+                                if tokv(k)==59 { break }
+                            }
+                            k = k + 1
+                        }
+                    }
+                    if k >= tokc || !(tokt(k)==TT_OP && tokv(k)==61) { comma_shape = 1 }
+                }
+            }
+        }
+        if first_comma >= 0 && (first_eq < 0 || first_eq < first_comma || comma_shape == 1) { lstyped = 1 }
     }
     if lstyped == 1 {
         // One binding per name: NAME [':' type] '=' expr, repeated while a comma
