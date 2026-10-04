@@ -1,36 +1,47 @@
 import std/fs
 
-// Test: faddf without flush_all issue
+// Test: fadd/faddf result representation.
+//
+// The four float builtins (fadd/fsub/fmul/fdiv) return f64, so their result is
+// the DOUBLE'S BIT PATTERN and must be tagged float. They used to carry an
+// integer fast-path that did plain 64-bit arithmetic and returned it untagged,
+// which is why this file's old assertion
+//
+//     let r1 = fadd(1, 2)
+//     if r1 != 3 { return 2 }
+//
+// passed: `r1` held the integer 3. With the fast path removed `r1` holds 3.0's
+// bit pattern, so `r1 != 3` is TRUE and the test began failing on its own
+// assertion rather than on any real defect. The assertion encoded the bug; it is
+// corrected here to consume a float builtin the way one must be consumed -- via
+// f2i.
+//
+// A caller that genuinely wants the integer 3 uses the integer `+`, which is
+// untouched: `a + b` on two ints is still integer arithmetic.
 fn main() {
-    // Test basic integer ops first
+    // Integer arithmetic is unchanged.
     let a = 1
     let b = 2
     let c = a + b
     if c != 3 { return 1 }
-    
-    // Test fadd (truncates to int)
-    let r1 = fadd(1, 2)
-    if r1 != 3 { return 2 }
-    
-    // Test i2f
+
+    // fadd returns an f64 bit pattern, so read it back as a float.
+    if f2i(fadd(1, 2)) != 3 { return 2 }
+    if f2i(faddf(i2f(1), i2f(2))) != 3 { return 3 }
+    if f2i(faddf(i2f(0), i2f(0))) != 0 { return 4 }
+
+    // A float literal operand gives the same result, which is what proves the
+    // integer path and the SSE path now agree.
+    if f2i(fadd(1.0, 2)) != 3 { return 5 }
+
     let f1 = i2f(1)
     let f2 = i2f(2)
-    
-    // Test faddf - should return float bit-pattern
     let r2 = faddf(f1, f2)
-    
-    // The result should be i2f(3) = 4613937818241073152
-    // But we're getting 12, which suggests something is wrong
-    
-    // Let's try a simpler test: just return faddf(0, 0)
-    let r3 = faddf(i2f(0), i2f(0))
-    
+    if f2i(r2) != 3 { return 6 }
+
     print("faddf(0,0)=")
-    print(r3)
+    print(f2i(faddf(i2f(0), i2f(0))))
     print("\n")
-    print("i2f(0)=")
-    print(i2f(0))
-    print("\n")
-    
+
     return 0
 }

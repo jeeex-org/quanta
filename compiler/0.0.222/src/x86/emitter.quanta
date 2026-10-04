@@ -1185,7 +1185,29 @@ fn emit_bltn(nmi,nl,ii) {
         // NO flush_all — uses only xmm0/xmm1, result in rax
         let fa0=0; if ira1(ii)>=1 { if is_float_vr(irres(ira2(ii)))==1 { fa0=1 } }
         let fa1=0; if ira1(ii)>=2 { if is_float_vr(irres(ira2(ii)+1))==1 { fa1=1 } }
-        if fa0==0 && fa1==0 { eb(72); eb(141); eb(4); eb(55); return 1 }  // lea rax,[rdi+rsi] — integer fast-path
+        //
+        // There is NO integer fast-path here. One used to be:
+        //
+        //     if fa0==0 && fa1==0 { <integer arithmetic>; return 1 }
+        //
+        // It was arithmetically correct and semantically wrong. These four
+        // builtins return f64, so the result must be the DOUBLE'S BIT PATTERN,
+        // and that fast path left it as a plain 64-bit integer AND untagged it.
+        // Every mixed case passed while the all-integer case failed, which is
+        // what pinned it down: with either operand float the SSE path ran and the
+        // result was tagged, so f2i() read it correctly; with BOTH operands
+        // integer the fast path ran and f2i() converted the integer 7 as though
+        // its bits were a double -- 7 as a bit pattern is 3.5e-323, a denormal.
+        //
+        //     f2i(fadd(3, 4))    -> 0   (expected 7)
+        //     f2i(fadd(3, 4.5))  -> 7   (expected 7)  <- one float operand, fine
+        //     f2i(fmul(6, 7))    -> 0   (expected 42)
+        //
+        // The two lines below already handle this case correctly: each operand is
+        // loaded with movq when it is float and cvtsi2sd when it is not, so
+        // removing the fast path routes all-integer operands through the same
+        // correct conversion as the mixed ones. The result is then stored with
+        // MOVQ and tagged float below, as the SSE path always did.
         if fa0==1 { eb(102); eb(72); eb(15); eb(110); eb(199) } else { eb(242); eb(72); eb(15); eb(42); eb(199) }
         if fa1==1 { eb(102); eb(72); eb(15); eb(110); eb(206) } else { eb(242); eb(72); eb(15); eb(42); eb(206) }
         // FIX 0.0.220 -- two defects, both in the RESULT STORE.
@@ -1221,7 +1243,29 @@ fn emit_bltn(nmi,nl,ii) {
         // NO flush_all — uses only xmm0/xmm1
         let fa0=0; if ira1(ii)>=1 { if is_float_vr(irres(ira2(ii)))==1 { fa0=1 } }
         let fa1=0; if ira1(ii)>=2 { if is_float_vr(irres(ira2(ii)+1))==1 { fa1=1 } }
-        if fa0==0 && fa1==0 { eb(72); eb(137); eb(248); eb(72); eb(41); eb(240); return 1 }  // mov rax,rdi; sub rax,rsi — integer fast-path
+        //
+        // There is NO integer fast-path here. One used to be:
+        //
+        //     if fa0==0 && fa1==0 { <integer arithmetic>; return 1 }
+        //
+        // It was arithmetically correct and semantically wrong. These four
+        // builtins return f64, so the result must be the DOUBLE'S BIT PATTERN,
+        // and that fast path left it as a plain 64-bit integer AND untagged it.
+        // Every mixed case passed while the all-integer case failed, which is
+        // what pinned it down: with either operand float the SSE path ran and the
+        // result was tagged, so f2i() read it correctly; with BOTH operands
+        // integer the fast path ran and f2i() converted the integer 7 as though
+        // its bits were a double -- 7 as a bit pattern is 3.5e-323, a denormal.
+        //
+        //     f2i(fadd(3, 4))    -> 0   (expected 7)
+        //     f2i(fadd(3, 4.5))  -> 7   (expected 7)  <- one float operand, fine
+        //     f2i(fmul(6, 7))    -> 0   (expected 42)
+        //
+        // The two lines below already handle this case correctly: each operand is
+        // loaded with movq when it is float and cvtsi2sd when it is not, so
+        // removing the fast path routes all-integer operands through the same
+        // correct conversion as the mixed ones. The result is then stored with
+        // MOVQ and tagged float below, as the SSE path always did.
         if fa0==1 { eb(102); eb(72); eb(15); eb(110); eb(199) } else { eb(242); eb(72); eb(15); eb(42); eb(199) }
         if fa1==1 { eb(102); eb(72); eb(15); eb(110); eb(206) } else { eb(242); eb(72); eb(15); eb(42); eb(206) }
         // FIX 0.0.220 -- two defects, both in the RESULT STORE.
@@ -1257,7 +1301,29 @@ fn emit_bltn(nmi,nl,ii) {
         // NO flush_all — uses only xmm0/xmm1
         let fa0=0; if ira1(ii)>=1 { if is_float_vr(irres(ira2(ii)))==1 { fa0=1 } }
         let fa1=0; if ira1(ii)>=2 { if is_float_vr(irres(ira2(ii)+1))==1 { fa1=1 } }
-        if fa0==0 && fa1==0 { eb(72); eb(137); eb(248); eb(72); eb(15); eb(175); eb(198); return 1 }  // mov rax,rdi; imul rax,rsi — integer fast-path
+        //
+        // There is NO integer fast-path here. One used to be:
+        //
+        //     if fa0==0 && fa1==0 { <integer arithmetic>; return 1 }
+        //
+        // It was arithmetically correct and semantically wrong. These four
+        // builtins return f64, so the result must be the DOUBLE'S BIT PATTERN,
+        // and that fast path left it as a plain 64-bit integer AND untagged it.
+        // Every mixed case passed while the all-integer case failed, which is
+        // what pinned it down: with either operand float the SSE path ran and the
+        // result was tagged, so f2i() read it correctly; with BOTH operands
+        // integer the fast path ran and f2i() converted the integer 7 as though
+        // its bits were a double -- 7 as a bit pattern is 3.5e-323, a denormal.
+        //
+        //     f2i(fadd(3, 4))    -> 0   (expected 7)
+        //     f2i(fadd(3, 4.5))  -> 7   (expected 7)  <- one float operand, fine
+        //     f2i(fmul(6, 7))    -> 0   (expected 42)
+        //
+        // The two lines below already handle this case correctly: each operand is
+        // loaded with movq when it is float and cvtsi2sd when it is not, so
+        // removing the fast path routes all-integer operands through the same
+        // correct conversion as the mixed ones. The result is then stored with
+        // MOVQ and tagged float below, as the SSE path always did.
         if fa0==1 { eb(102); eb(72); eb(15); eb(110); eb(199) } else { eb(242); eb(72); eb(15); eb(42); eb(199) }
         if fa1==1 { eb(102); eb(72); eb(15); eb(110); eb(206) } else { eb(242); eb(72); eb(15); eb(42); eb(206) }
         // FIX 0.0.220 -- two defects, both in the RESULT STORE.
@@ -1293,7 +1359,29 @@ fn emit_bltn(nmi,nl,ii) {
         // NO flush_all — uses only xmm0/xmm1
         let fa0=0; if ira1(ii)>=1 { if is_float_vr(irres(ira2(ii)))==1 { fa0=1 } }
         let fa1=0; if ira1(ii)>=2 { if is_float_vr(irres(ira2(ii)+1))==1 { fa1=1 } }
-        if fa0==0 && fa1==0 { eb(72); eb(137); eb(248); eb(72); eb(153); eb(72); eb(247); eb(254); return 1 }  // mov rax,rdi; cqo; idiv rsi — integer fast-path
+        //
+        // There is NO integer fast-path here. One used to be:
+        //
+        //     if fa0==0 && fa1==0 { <integer arithmetic>; return 1 }
+        //
+        // It was arithmetically correct and semantically wrong. These four
+        // builtins return f64, so the result must be the DOUBLE'S BIT PATTERN,
+        // and that fast path left it as a plain 64-bit integer AND untagged it.
+        // Every mixed case passed while the all-integer case failed, which is
+        // what pinned it down: with either operand float the SSE path ran and the
+        // result was tagged, so f2i() read it correctly; with BOTH operands
+        // integer the fast path ran and f2i() converted the integer 7 as though
+        // its bits were a double -- 7 as a bit pattern is 3.5e-323, a denormal.
+        //
+        //     f2i(fadd(3, 4))    -> 0   (expected 7)
+        //     f2i(fadd(3, 4.5))  -> 7   (expected 7)  <- one float operand, fine
+        //     f2i(fmul(6, 7))    -> 0   (expected 42)
+        //
+        // The two lines below already handle this case correctly: each operand is
+        // loaded with movq when it is float and cvtsi2sd when it is not, so
+        // removing the fast path routes all-integer operands through the same
+        // correct conversion as the mixed ones. The result is then stored with
+        // MOVQ and tagged float below, as the SSE path always did.
         if fa0==1 { eb(102); eb(72); eb(15); eb(110); eb(199) } else { eb(242); eb(72); eb(15); eb(42); eb(199) }
         if fa1==1 { eb(102); eb(72); eb(15); eb(110); eb(206) } else { eb(242); eb(72); eb(15); eb(42); eb(206) }
         // FIX 0.0.220 -- two defects, both in the RESULT STORE.
