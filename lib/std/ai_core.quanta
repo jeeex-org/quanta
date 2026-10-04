@@ -22,19 +22,30 @@ fn ai_shape_count(shape: i64[], ndim: i64): i64 {
     return total
 }
 
+// ALLOCATION ABI. malloc returns the BASE of the block and stores the
+// element count in the header word at [base]; the payload starts at base+8.
+// ai_tensor_create used to publish `ptr` (the base) as the tensor's data
+// pointer, so the very first f64_write landed on the header word and
+// overwrote it with float bits. free() reads that word as the munmap
+// LENGTH, so the corrupted header made every free pass a garbage length to
+// munmap -- which rounds up to pages, so it "worked" often enough to hide
+// the defect until it unmapped memory the block never owned.
+//
+// Fix: publish base+8 as the data pointer (every access site already offsets
+// by idx*8 from data[0], so they are unchanged) and subtract 8 before free.
 fn ai_tensor_create(out_data: i64[], out_shape: i64[], out_ndim: i64[], out_dtype: i64[], shape: i64[], ndim: i64, dtype: i64): i64 {
     let total: i64 = ai_shape_count(shape, ndim)
     let elem_sz: i64 = 8
     if dtype == 3 { elem_sz = 1 }
     if dtype == 4 { elem_sz = 2 }
     let ptr: i64 = malloc(total * elem_sz)
-    out_data[0] = ptr; out_ndim[0] = ndim; out_dtype[0] = dtype
+    out_data[0] = ptr + 8; out_ndim[0] = ndim; out_dtype[0] = dtype
     let i: i64 = 0
     while i < ndim { out_shape[i] = shape[i]; i = i + 1 }
     return 0
 }
 
-fn ai_tensor_free(data: i64[]): i64 { if data[0] != 0 { free(data[0]); data[0] = 0 }; return 0 }
+fn ai_tensor_free(data: i64[]): i64 { if data[0] != 0 { free(data[0] - 8); data[0] = 0 }; return 0 }
 fn ai_tensor_get(data: i64[], idx: i64): f64 { return f64_read(data[0] + idx * 8) }
 fn ai_tensor_set(data: i64[], idx: i64, val: f64): i64 { f64_write(data[0] + idx * 8, val); return 0 }
 
@@ -108,13 +119,17 @@ fn ai_swiglu(out: i64[], x: i64[], y: i64[], n: i64): i64 {
     return 0
 }
 
+// Same allocation ABI as ai_tensor_create: malloc returns the base, the
+// payload starts at base+8, and free() reads the header word as the munmap
+// length. KV writes go straight to k[0]/v[0], so a base-valued handle would
+// overwrite the header on the first stored vector.
 fn ai_kv_create(k: i64[], v: i64[], pos: i64[], nkh: i64, msl: i64, hd: i64): i64 {
     let bytes: i64 = nkh * msl * hd * 8
-    k[0] = malloc(bytes); v[0] = malloc(bytes); pos[0] = 0
+    k[0] = malloc(bytes) + 8; v[0] = malloc(bytes) + 8; pos[0] = 0
     return 0
 }
 
-fn ai_kv_free(k: i64[], v: i64[]): i64 { if k[0]!=0 { free(k[0]); k[0]=0 }; if v[0]!=0 { free(v[0]); v[0]=0 }; return 0 }
+fn ai_kv_free(k: i64[], v: i64[]): i64 { if k[0]!=0 { free(k[0]-8); k[0]=0 }; if v[0]!=0 { free(v[0]-8); v[0]=0 }; return 0 }
 
 fn ai_kv_append(k: i64[], v: i64[], pos: i64[], kn: i64[], vn: i64[], nkh: i64, hd: i64, sln: i64, msl: i64): i64 {
     let p: i64 = pos[0]
