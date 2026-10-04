@@ -194,7 +194,12 @@ fn gguf_load(path) {
 
 fn gguf_tensor_name(idx) { return mem_load(gguf_tensor_data + idx * TINFO_SIZE) }
 fn gguf_tensor_dtype(idx) { return mem_load(gguf_tensor_data + idx * TINFO_SIZE + 16) }
-fn gguf_tensor_offset(idx) { return mem_load(gguf_tensor_data + idx * TINFO_SIZE + 24) }
+// Absolute file offset of a tensor's data. The GGUF header stores each
+// tensor's offset RELATIVE to the start of the tensor-data section, so
+// callers seeking to a tensor must add gguf_data_offset() or they land at
+// file offset 0 -- the magic bytes -- and dequantize reads garbage.
+fn gguf_tensor_offset(idx) {
+    return gguf_data_offset() + mem_load(gguf_tensor_data + idx * TINFO_SIZE + 24) }
 fn gguf_tensor_nelements(idx) { return mem_load(gguf_tensor_data + idx * TINFO_SIZE + 32) }
 fn gguf_tensor_ndims(idx) { return mem_load(gguf_tensor_data + idx * TINFO_SIZE + 8) }
 fn gguf_tensor_dim(idx, d) {
