@@ -1,94 +1,54 @@
-// Fused Q4_K_M matvec: dequantize + dot product on-the-fly
-// This is the key optimization that makes llama.cpp fast.
-// Instead of materializing full f64 weight matrix, we dequantize blocks
-// directly into SIMD registers and accumulate.
+// Fused Q4_K_M matvec -- DEPRECATED. Use lib/std/matmul_q4k.quanta.
+//
+// This file was WRONG in four independent ways and never worked. Kept only
+// as a record of the failures, because each one produces plausible garbage
+// rather than a crash, which is the expensive kind of bug to rediscover.
+//
+// 1. BLOCK SIZE. The comments talked themselves into 146 bytes:
+//      "2 bytes scale (f16) + 128 bytes quads = 144 bytes per 256 elements
+//       Actually ... = 146 bytes?
+//       Let me use the standard: Q4_K = 2 + 16 + 128 = 146 bytes
+//       But the file uses Q4_K_M which is 2 + 2 + 128 = 132 bytes?"
+//    The real super-block is 144 bytes:
+//      +0  f16 d        (2)   scale for sub-block scales
+//      +2  f16 dmin     (2)   scale for sub-block mins
+//      +4  u8 scales[12] (12) eight (scale,min) 6-bit pairs, bit-packed
+//      +16 u8 qs[128]   (128) 4-bit quants, low nibble even / high odd
+//    A 146 stride walks 2 bytes out of alignment per block, so every block
+//    after the first reads garbage.
+//
+// 2. FIELD OFFSETS. It read quads at +18 with a 16-byte scale table. Both are
+//    off: the table is 12 bytes at +4, quads are at +16.
+//
+// 3. NIBBLE SEMANTICS. It used (nibble - 8), which is Q4_0's signed
+//    4-bit-with-bias-8 encoding. Q4_K nibbles are UNSIGNED 0..15; the
+//    negative direction comes entirely from the per-sub-block min term.
+//    Applying a -8 bias here is roughly a factor-of-2 scale error on every
+//    weight.
+//
+// 4. NO SCALE BIT-PACKING. The 12-byte table holds 6-bit (scale, min) pairs
+//    whose layout differs above and below index 4:
+//      j < 4 : sc[j] & 63            -> scale
+//              sc[j+4] & 63           -> min
+//      j >= 4: sc[j+4] & 0xF          scale low nibble
+//              (sc[j-4] >> 6) << 4    scale high bits   <- j-4, not j
+//              sc[j+4] >> 4           min low nibble
+//              (sc[j]   >> 6) << 4    min high bits      <- j,   not j-4
+//    This file used the raw byte as a scale, ignoring the min entirely, so
+//    even with the right offsets the weights would be wrong.
+//
+// The verified replacement is lib/std/matmul_q4k.quanta. Its
+// q4k_matvec_real() dequantizes each 144-byte super-block on the fly (never
+// materializing an f32 weight copy) and is bit-for-bit identical to Python
+// on the same bytes -- see test_suites/codes/q4k_matvec_test.quanta, which
+// also asserts that the compiler's own q4k_matvec builtin is still a stub.
+//
+// matvec_q4k() is kept as a thin alias so any existing caller keeps working,
+// but it is no longer an independent implementation.
 
-// Q4_K_M block layout: 2 bytes scale (f16) + 128 bytes quads = 144 bytes per 256 elements
-// Actually for Q4_K: 2 bytes scale + 16 bytes scales + 128 bytes quads = 146 bytes? 
-// Let me use the standard: Q4_K = 2 + 16 + 128 = 146 bytes per 256 elements
-// But the file uses Q4_K_M which is 2 + 2 + 128 = 132 bytes per 256 elements? 
-// Standard Q4_K: 2 (d scale) + 16 (8-bit scales) + 128 (4-bit quads) = 146 bytes per 256 values
+import std/gguf
+import std/matmul_q4k
 
-// For simplicity, let's use the Q4_K layout:
-// Block = 146 bytes: [scale_f16(2)] [scales_byte(16)] [quads(128)]
-// Each quad = 2 nibbles = 2 values (low nibble first, then high nibble)
-
-// Fused matvec for Q4_K weights: y = W * x where W is Q4_K quantized
-// W is [rows, cols], x is [cols], y is [rows]
-fn matvec_q4k(W_raw, x, rows, cols, y) {
-    let n_blocks_per_row = cols / 256
-    let i = 0
-    while i < rows {
-        let sum = i2f(0)
-        let bi = 0
-        while bi < n_blocks_per_row {
-            let block_offset = (i * n_blocks_per_row + bi) * 146
-            
-            // Read scale (f16, 2 bytes)
-            let scale_bits = mem_load8(W_raw + block_offset) + mem_load8(W_raw + block_offset + 1) * 256
-            let scale = f16_to_f64(scale_bits)
-            
-            // Read 16 sub-scales (8-bit each)
-            let subscales = W_raw + block_offset + 2
-            
-            // Read 128 bytes of quads (256 4-bit values)
-            let quads = W_raw + block_offset + 18
-            
-            // Process 256 elements in this block
-            let qi = 0
-            while qi < 256 {
-                // Get sub-scale index (4 bits per sub-block of 16 elements)
-                let sub_idx = qi / 16
-                let sub_scale_byte = mem_load8(subscales + sub_idx)
-                let sub_scale = i2f(sub_scale_byte)
-                
-                // Get quad value
-                let byte_idx = qi / 2
-                let byte_val = mem_load8(quads + byte_idx)
-                let nibble = 0
-                if qi - (qi / 2) * 2 == 0 {
-                    nibble = byte_val - (byte_val / 16) * 16  // low nibble
-                } else {
-                    nibble = byte_val / 16  // high nibble
-                }
-                
-                // Dequantize: value = scale * sub_scale * (nibble - 8)
-                let quant_val = fmul(fmul(scale, sub_scale), i2f(nibble - 8))
-                
-                // Multiply by x and accumulate
-                let xv = mem_load(x + (bi * 256 + qi) * 8)
-                sum = fadd(sum, fmul(quant_val, xv))
-                
-                qi = qi + 1
-            }
-            
-            bi = bi + 1
-        }
-        mem_store(y + i * 8, sum)
-        i = i + 1
-    }
-}
-
-// Convert f16 (16-bit) to f64 bit pattern
-fn f16_to_f64(f16_bits) {
-    let sign = (f16_bits / 32768) * 32768
-    let exp = (f16_bits - sign) / 1024
-    let mant = f16_bits - sign - exp * 1024
-    
-    if exp == 0 {
-        // Subnormal or zero
-        if mant == 0 { return i2f(0) }
-        // Very small number, approximate
-        return fdiv(i2f(mant), i2f(1048576))
-    }
-    
-    if exp == 31 {
-        // Inf or NaN
-        return i2f(0)
-    }
-    
-    // Normal: value = (-1)^sign * 2^(exp-15) * (1 + mant/1024)
-    let new_exp = exp - 15 + 1023  // Bias adjustment
-    let result = sign + new_exp * 1024 + mant
-    return i2f(result)
+fn matvec_q4k(W_raw, x, rows, cols, y) -> i64 {
+    return q4k_matvec_real(W_raw, x, rows, cols, y)
 }

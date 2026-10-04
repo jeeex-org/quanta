@@ -82,11 +82,30 @@ Workaround verified working — fixed-point formatting in pure Quanta:
 Do NOT hand-patch the emitter for this; an attempt at a byte-emitting SSE
 float formatter was started and reverted as unverified.
 
-## Suggested order
+### 7. The Q4_K fast path is a STUB -- this is the "fast" blocker
 
-1. `sqrt` in std/math (needed by RMSNorm, blocks everything downstream)
-2. `print` float fix, ideally as a stdlib `pf64` using the fixed-point form
-3. Real BPE tokenizer from GGUF vocab
-4. Q4_K_M dequant -> real weight buffers
-5. Vertical slice: embed -> 1 layer -> logits for ONE token
-6. Only then 24 layers, KV cache, sampling, benchmark vs llama-server
+Two builtins exist under exactly the names a fast Q4_K_M path needs. Both
+lie:
+
+- `q4k_matvec(W_q4, x_q8, rows, cols, y)` -- emitter.quanta ~line 1546 is
+  literally `// Placeholder: just return y` / `rr(0, 8)`. Verified: it
+  returns its 5th argument and writes nothing. Calling it looks like it
+  works and silently leaves the output buffer untouched.
+- `q4k_dot(W, x, n_blocks)` -- ~line 1470. Its own comments admit it:
+  "For now, assume scale = 1.0", "Simplified: just process first 2
+  nibbles from first byte", "Actually, let's just process one block and
+  return", "Real implementation would loop". It returns a partial sum from
+  a single nibble pair.
+
+This is worse than a missing function. A missing builtin fails to compile;
+these compile, run, and produce wrong numbers.
+
+**What DOES work** (verified):
+- `faddf_avx2(dst, a, b)` / `fmulf_avx2` / `fsubf_avx2` / `fdivf_avx2` --
+  real AVX2, 4-wide f32: 2+3=5, 2*3=6 confirmed.
+- There is NO accumulate variant, NO FMA, and NO horizontal reduction.
+  A dot product therefore still needs a scalar loop, which is what makes
+  the current matmul O(rows*cols) with no vectorization.
+
+So "fast" is blocked on: a real `q4k_matvec`, plus an accumulate + reduce
+for the AVX2 ops.
