@@ -279,14 +279,17 @@ fn sqrtf(x: f64) -> f64 {
     return r
 }
 
-// f64of: reinterpret an i64 bit pattern as an f64. The value must round-trip
-// through memory -- the runtime tags floats by their bit pattern, and the
-// conversion needs the store/load pair to establish it.
-fn f64of(bits: i64) -> f64 {
-    let b = mem_alloc(8)
-    mem_store(b, bits)
-    return f64_load(b)
-}
+// f64of is the BUILTIN (features.quanta:598, inlined by emit_bltn). It used to
+// be re-declared here as a user function that did mem_alloc(8) + mem_store +
+// f64_load. That shadow was numerically correct but allocated on EVERY call and
+// never freed: a 72-byte mmap per f64of, ~4KB effective RSS per call. Any file
+// importing std/math (directly, or transitively via std/gguf) turned every
+// f64of() into that call -- an 11M-element tensor reduction grew ~16GB RSS and
+// was OOM-killed under the 6GB scope. A user function shadows a same-named
+// builtin in EVERY importing scope, so this silently disarmed the inline.
+// Verified: the builtin gives identical results (f64of(4612811918334230528)
+// = 2.5, f64of(f64bits(2.5))*2 = 5.0, sum of five f64of(f64bits(1.0)) = 5.0)
+// with zero allocation. Do not re-add this.
 
 // ---- pf64: print an f64 ----
 //

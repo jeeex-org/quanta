@@ -395,12 +395,14 @@ fn gguf_find_tensor(name) {
 // elements is 10.2 GB of f64 for a tensor that cannot be read at all, which
 // blows the 6 GB inference scope before any error is reported.
 fn gguf_dtype_supported(dtype) {
-    if dtype == 0 { return 1 }
-    if dtype == 1 { return 1 }
-    if dtype == 8 { return 1 }
-    if dtype == 12 { return 1 }
-    if dtype == 13 { return 1 }
-    if dtype == 14 { return 1 }
+    if dtype == 0 { return 1 }   // F32
+    if dtype == 1 { return 1 }   // F16
+    if dtype == 2 { return 1 }   // Q4_0
+    if dtype == 8 { return 1 }   // Q8_0
+    if dtype == 12 { return 1 }  // Q4_K
+    if dtype == 13 { return 1 }  // Q5_K
+    if dtype == 14 { return 1 }  // Q6_K
+    if dtype == 30 { return 1 }  // BF16
     return 0
 }
 
@@ -461,6 +463,20 @@ fn read_tensor_f64(idx, buf) {
         lseek(gguf_fd, offset, 0)
         file_read(gguf_fd, raw, n)
         dequant_q8_0(raw, nelem, buf)
+        mem_free(raw)
+    } else if dtype == 2 {
+        let n = gguf_tensor_nbytes(idx)
+        let raw = mem_alloc(n)
+        lseek(gguf_fd, offset, 0)
+        file_read(gguf_fd, raw, n)
+        dequant_q4_0(raw, nelem, buf)
+        mem_free(raw)
+    } else if dtype == 30 {
+        let n = nelem * 2
+        let raw = mem_alloc(n)
+        lseek(gguf_fd, offset, 0)
+        file_read(gguf_fd, raw, n)
+        dequant_bf16(raw, nelem, buf)
         mem_free(raw)
     } else {
         // Explicit failure. An unsupported dtype must NOT silently return 0,
@@ -917,6 +933,89 @@ fn dequant_q8_0(raw, nelements, out) {
             j = j + 1
         }
         bi = bi + 1
+    }
+}
+
+// --------------------------------------------------------------- Q4_0 (type 2)
+//
+// 32 values / 18 bytes. ggml-common.h: block_q4_0 { fp16 d; uint8 qs[16]; }.
+// ggml-quants.c: dequantize_row_q4_0() is just a nibble split with no min term --
+//     y[j]      = (qs[j] & 0xF) - 8) * d
+//     y[j + 16] = (qs[j] >> 4)  - 8) * d
+// so element j and element j+16 come from the SAME byte, low nibble then high.
+// There is no `m`, unlike Q4_1.
+//
+// This is NOT Q4_1 and NOT Q4_K. An earlier body here read a second scale at
+// +2 and used the Q4_1/K layout, which silently produced garbage for every
+// Q4_0 tensor.
+fn dequant_q4_0(raw, nelements, out) {
+    let n_blocks = nelements / 32
+    let bi = 0
+    while bi < n_blocks {
+        let bo = bi * 18
+        let d = f16_to_f64(raw + bo)
+        let j = 0
+        while j < 16 {
+            // NOTE: this local must NOT be named `byte` -- that is a reserved
+            // type keyword and the parser rejects it as a binding name.
+            let qb = mem_load8(raw + bo + 2 + j)
+            let lo = qb & 15
+            let hi = qb >> 4
+            mem_store(out + (bi * 32 + j) * 8, fmul(d, i2f(lo - 8)))
+            mem_store(out + (bi * 32 + 16 + j) * 8, fmul(d, i2f(hi - 8)))
+            j = j + 1
+        }
+        bi = bi + 1
+    }
+}
+
+// -------------------------------------------------------------- BF16 (type 30)
+//
+// 1 value / 2 bytes. BF16 is the top 16 bits of an IEEE binary32 with a zero
+// exponent field and no mantissa -- i.e. bf16 == fp32 with the low half
+// discarded. So widening is a SHIFT, not a conversion: there is no separate
+// exponent or rounding rule to get wrong.
+//
+// NOTE this is NOT f16_to_f64(). A BF16 bit pattern is an fp16 bit pattern only
+// by coincidence; feeding one to the half-precision converter reads the exponent
+// at the wrong width and returns values that are wrong by powers of two.
+fn dequant_bf16(raw, nelements, out) {
+    let i = 0
+    // Scratch is hoisted out of the loop: mem_alloc inside a loop body is unsafe
+    // (the next iteration can clobber the block).
+    // mem_alloc returns a HEADER-CARRYING pointer: [ptr] is the element count and
+    // the data begins at ptr+8. Writing at scratch+0 wrote the header and the
+    // converter then read the count 8 as an fp32 exponent-zero pattern -- every
+    // element came back 0.0. All access below is via p = scratch + 8.
+    let scratch = mem_alloc(8)
+    let p = scratch + 8
+    // Bytes 0 and 1 of the fp32 pattern are the mantissa's LOW half and must be
+    // zero for every element, so they are zeroed ONCE here and never touched
+    // again. Only bytes 2 and 3 are rewritten per iteration. (Building the 4-byte
+    // pattern with an inner per-byte loop instead returned 0.0 for every element,
+    // and lifted out into its own function it SIGILLed -- so it stays flattened.)
+    mem_store8(p + 0, 0)
+    mem_store8(p + 1, 0)
+    while i < nelements {
+        // A bf16 element is EXACTLY bytes [i*2, i*2+2). Placed in the HIGH half of
+        // the 4-byte fp32 scratch, the 32-bit pattern the converter reads IS
+        // bf16<<16 -- the authoritative C-oracle form.
+        //
+        // Two earlier forms were wrong. f32_to_f64(raw + i*2) read 4 bytes and
+        // folded the NEXT element into the mantissa low bits (sum off by 0.033 on
+        // the 27.5M-element per_layer_model_proj.weight, plus every min/max).
+        // Shifting straight into an f64 was worse: an f64 whose pattern is
+        // bf16<<48 has bias 1023 where fp32 has 127, so it is off by a factor of
+        // 2^896 -- 16561 widened to 4352.0 instead of 1.0. No shift works: the
+        // exponent must be REBASED, which is exactly what f32_to_f64 does.
+        // Little-endian: the fp32 SIGN+EXPONENT byte is b3 and the top mantissa
+        // byte is b2. So bf16<<16 lands in bytes 2 and 3 -- bytes 0 and 1 would
+        // build the pattern 0x00003f80, a subnormal ~1.7e-38, not 1.0. Every
+        // element came back 0.0 at 6 decimal places until this was corrected.
+        mem_store8(p + 2, mem_load8(raw + i * 2))
+        mem_store8(p + 3, mem_load8(raw + i * 2 + 1))
+        mem_store(out + i * 8, f32_to_f64(p))
+        i = i + 1
     }
 }
 

@@ -37,6 +37,8 @@ import std/math
 const Q4_PATH = "/opt/ai/models/quanta/QUANTA-LFM2.5-2.6Bv1-Q4_K_M.gguf"
 const F16_PATH = "/opt/ai/models/quanta/QUANTA-LFM2.5-2.6Bv1.gguf"
 const Q5Q8_PATH = "/opt/ai/models/quanta/QUANTA-GW38-27B-IQ4.gguf"
+const Q40_PATH = "/opt/ai/models/quanta/QUANTA-GG4-30B-Q4KXL.gguf"
+const BF16_PATH = "/opt/ai/models/quanta/QUANTA-GG4-E4B-Q4_K_M.gguf"
 
 let failures = 0
 
@@ -332,6 +334,46 @@ fn main() {
     else { print("  Q5_K in the same file still reads (", nok, " elements)\n") }
     mem_free(bok)
     gguf_close()
+
+
+// ------------------------------------------------------------ Q4_0 and BF16
+//
+// Neither LFM2 nor the 27B fixture uses these, so the fixtures are:
+//   Q4_0  QUANTA-GG4-30B-Q4KXL.gguf  blk.5.attn_k.weight [5376,2048] = 11,010,048 elems
+//   BF16  QUANTA-GG4-E4B-Q4_K_M.gguf per_layer_model_proj.weight [2560,10752] = 27,525,120
+//
+// Expected values come from scripts/audit/c_oracle.c, which calls the real
+// dequantize_row_q4_0 out of libggml-base and widens BF16 as fp32 << 16.
+
+if gguf_load(Q40_PATH) < 0 { fail("cannot open Q4_0 model") }
+{
+    let q40 = gguf_find_tensor("blk.5.attn_k.weight")
+    if q40 == -1 { fail("Q4_0 tensor not found") }
+    else {
+        if gguf_tensor_supported(q40) != 1 { fail("Q4_0 dtype not reported supported") }
+        // check_oracle allocates the WHOLE tensor by design, so the read length
+        // comes from gguf_tensor_nbytes() rather than hand arithmetic that
+        // could be wrong independently of the dequantizer.
+        print("  loaded Q4_0 model, probing...\n")
+        check_oracle(q40, 11010048, 11010048,
+                     -781.592564, 1960.441500, -0.135376, 0.134583, "Q4_0 blk.5.attn_k")
+        print("  Q4_0 probe done\n")
+    }
+}
+gguf_close()
+
+if gguf_load(BF16_PATH) < 0 { fail("cannot open BF16 model") }
+{
+    let bf = gguf_find_tensor("per_layer_model_proj.weight")
+    if bf == -1 { fail("BF16 tensor not found") }
+    else {
+        if gguf_tensor_supported(bf) != 1 { fail("BF16 dtype not reported supported") }
+        check_oracle(bf, 27525120, 10240,
+                     -0.511763, 6.810468, -0.121582, 0.100586, "BF16 per_layer_model_proj")
+    }
+}
+gguf_close()
+
 
     print("\n")
     if failures > 0 {

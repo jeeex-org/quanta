@@ -1,3 +1,4 @@
+#define _GNU_SOURCE
 // Compiled oracle: reads a tensor out of a real GGUF and reduces it with the
 // SAME dequantize_row_* algorithm as upstream llama.cpp.
 //
@@ -27,36 +28,107 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/mman.h>
+#include <fcntl.h>
+#include <unistd.h>
+
+
 #include <stdint.h>
 #include <math.h>
 
 // Real ggml: fp16 conversion and the authoritative dequantize_row_* kernels.
 #include "ggml.h"
 
-// dequantize_row_* are exported from libggml-base but not declared in any
-// installed ggml header, so declare them here rather than reimplementing them.
-// block_q5_K / block_q8_0 come from ggml-common.h via ggml.h.
-// The block types live in ggml-common.h, which is not part of the installed
-// include dir, so the prototypes take void* and the casts happen at the call.
-extern void dequantize_row_q5_K(const void *, float *, int64_t);
-extern void dequantize_row_q8_0(const void *, float *, int64_t);
-
+// ---- block layouts, copied from ggml/src/ggml-common.h ----
+// Only the LAYOUTS are needed; the dequantization itself always comes from
+// libggml, never from a transcription here.
 #define QK_K   256
-#define K_SCALE_SIZE 12
 #define QK8_0  32
+#define QK4_0  32
+#define QK4_1  32
+#define QK5_0  32
+#define QK5_1  32
+#define QK8_1  32
 
-// ---- block layouts, copied verbatim from ggml/src/ggml-common.h ----
-typedef struct {
-    uint16_t d;                        // union with { d, dmin }
-    uint16_t dmin;
-    uint8_t  scales[K_SCALE_SIZE];
-    uint8_t  qh[QK_K/8];
-    uint8_t  qs[QK_K/2];
-} block_q5_K;
-typedef struct {
-    uint16_t d;
-    int8_t   qs[QK8_0];
-} block_q8_0;
+typedef struct { uint16_t d; int8_t   qs[QK8_0];    } block_q8_0;
+typedef struct { uint16_t d; uint16_t m; uint8_t qs[QK4_0/2]; } block_q4_0;
+typedef struct { uint16_t d; uint16_t m; uint8_t qs[QK4_1/2]; } block_q4_1;
+typedef struct { uint16_t d; uint8_t  qh[4]; uint8_t qs[QK5_0/2]; } block_q5_0;
+typedef struct { uint16_t d; uint16_t m; uint8_t qh[4]; uint8_t qs[QK5_1/2]; } block_q5_1;
+typedef struct { float d; float s; uint8_t qs[QK8_1/4]; } block_q8_1;
+
+// The real dequantizers. These are exported from libggml-base but not declared
+// in any installed ggml header, so they are declared here rather than
+// reimplemented. ggml-common.h is not in the installed include dir either,
+// which is why the prototypes take void*.
+extern void dequantize_row_q2_K   (const void *, float *, int64_t);
+extern void dequantize_row_q3_K   (const void *, float *, int64_t);
+extern void dequantize_row_q4_0   (const void *, float *, int64_t);
+extern void dequantize_row_q4_1   (const void *, float *, int64_t);
+extern void dequantize_row_q5_0   (const void *, float *, int64_t);
+extern void dequantize_row_q5_1   (const void *, float *, int64_t);
+extern void dequantize_row_q8_0   (const void *, float *, int64_t);
+extern void dequantize_row_q8_K   (const void *, float *, int64_t);
+extern void dequantize_row_q4_K   (const void *, float *, int64_t);
+extern void dequantize_row_q5_K   (const void *, float *, int64_t);
+extern void dequantize_row_q6_K   (const void *, float *, int64_t);
+extern void dequantize_row_iq3_s  (const void *, float *, int64_t);
+extern void dequantize_row_iq4_nl (const void *, float *, int64_t);
+extern void dequantize_row_iq4_xs (const void *, float *, int64_t);
+
+// Q8_1 has no exported dequantize_row_* (it is only ever produced/consumed by
+// the Q8_1 intermediate path), so its per-element rule is the struct's own
+// definition: y = d*q_lo - s*q_hi over 32 four-bit pairs.
+static void deq_q8_1(const block_q8_1 *x, float *y, int64_t k) {
+    for (int64_t i = 0; i < k/32; i++) {
+        for (int j = 0; j < 16; j++) {
+            int v = x[i].qs[j];
+            y[i*32 + 2*j    ] = x[i].d * ((v & 0xF) - 8) - x[i].s * ((v >> 4) - 8);
+            y[i*32 + 2*j + 1] = x[i].d * ((v >> 4) - 8);
+        }
+    }
+}
+
+// One dispatch table for every format Quanta can read. A new format costs one
+// line here and one branch in read_tensor_f64(), and the two must agree.
+static int dequant_row(uint32_t tt, const void *base, float *y, int64_t n) {
+    switch (tt) {
+        case 0: {
+            const uint32_t *b = base;
+            for (int64_t i = 0; i < n; i++) memcpy(&y[i], &b[i], 4);
+            return 0;
+        }
+        case 1: {
+            const uint16_t *b = base;
+            for (int64_t i = 0; i < n; i++) y[i] = ggml_fp16_to_fp32(b[i]);
+            return 0;
+        }
+        case 30: {                            // BF16 = upper half of an fp32
+            const uint16_t *b = base;
+            for (int64_t i = 0; i < n; i++) {
+                uint32_t w = (uint32_t)b[i] << 16;
+                memcpy(&y[i], &w, 4);
+            }
+            return 0;
+        }
+        case  2: dequantize_row_q4_0(base, y, n); return 0;
+        case  3: dequantize_row_q4_1(base, y, n); return 0;
+        case  6: dequantize_row_q5_0(base, y, n); return 0;
+        case  7: dequantize_row_q5_1(base, y, n); return 0;
+        case  8: dequantize_row_q8_0(base, y, n); return 0;
+        case  9: { for (int64_t b=0;b<n/32;b++) deq_q8_1((const block_q8_1*)base+b, y+b*32, 32); return 0; }
+        case 10: dequantize_row_q2_K(base, y, n); return 0;
+        case 11: dequantize_row_q3_K(base, y, n); return 0;
+        case 12: dequantize_row_q4_K(base, y, n); return 0;
+        case 13: dequantize_row_q5_K(base, y, n); return 0;
+        case 14: dequantize_row_q6_K(base, y, n); return 0;
+        case 15: dequantize_row_q8_K(base, y, n); return 0;
+        case 21: dequantize_row_iq3_s(base, y, n); return 0;
+        case 20: dequantize_row_iq4_nl(base, y, n); return 0;
+        case 23: dequantize_row_iq4_xs(base, y, n); return 0;
+        default: return 1;
+    }
+}
 
 static uint32_t rd32(const uint8_t *p){ return (uint32_t)p[0]|(p[1]<<8)|(p[2]<<16)|((uint32_t)p[3]<<24); }
 static uint64_t rd64(const uint8_t *p){ return (uint64_t)rd32(p) | ((uint64_t)rd32(p+4)<<32); }
@@ -69,12 +141,6 @@ static uint64_t rd64(const uint8_t *p){ return (uint64_t)rd32(p) | ((uint64_t)rd
 static inline float fp16_to_fp32(uint16_t h) { return ggml_fp16_to_fp32(h); }
 
 
-static void deq_q5k(const void *base, float *y, int64_t k) {
-    dequantize_row_q5_K(base, y, k);
-}
-static void deq_q8_0(const void *base, float *y, int64_t k) {
-    dequantize_row_q8_0(base, y, k);
-}
 
 static int64_t skip_value(const uint8_t *m, int64_t o, uint32_t t) {
     switch (t) {
@@ -89,12 +155,32 @@ static int64_t skip_value(const uint8_t *m, int64_t o, uint32_t t) {
             uint64_t n  = rd64(m+o); o += 8;
             // Arrays of STRING/ARRAY do not occur in the keys we scan.
             if (et == 8) { for (uint64_t k = 0; k < n; k++) { uint64_t l = rd64(m+o); o += 8 + (int64_t)l; } return o; }
-            int64_t esz = (et <= 1) ? 1 : (et <= 3) ? 2 : (et <= 7) ? 4 : (et <= 11) ? 8 : 0;
+            // Element size by GGUF metadata type. This MUST cover 0..12.
+            // An earlier table stopped at 11 and returned 0 for FLOAT64, so an
+            // array-of-f64 key advanced the cursor by NOTHING. Every later field
+            // then read from the wrong place and the header walk ran off the end
+            // of the mapping -- a crash that looks like a corrupt file rather
+            // than an off-by-one in a switch.
+            int64_t esz;
+            switch (et) {
+                case 0: case 1: case 7:   esz = 1; break;  // u8 i8 bool
+                case 2: case 3:            esz = 2; break;  // u16 i16
+                case 4: case 5: case 6:    esz = 4; break;  // u32 i32 f32
+                case 10: case 11: case 12: esz = 8; break;  // u64 i64 f64
+                default: {
+                    fprintf(stderr, "array of unsupported metadata type %u -- cannot skip\n", et);
+                    return -1;
+                }
+            }
             return o + (int64_t)n * esz;
         }
         case 10: case 11: return o + 8;  // UINT64, INT64
         case 12:          return o + 8;  // FLOAT64
-        default:          return o;      // unknown type: cannot skip safely
+        default:
+            // Returning o here means "consumed nothing", which silently
+            // desynchronises every subsequent field. Refuse loudly instead.
+            fprintf(stderr, "unsupported metadata type %u -- cannot skip\n", t);
+            return -1;
     }
 }
 
@@ -102,12 +188,18 @@ int main(int argc, char **argv) {
     if (argc < 3) { fprintf(stderr, "usage: %s file.gguf tensor [n]\n", argv[0]); return 2; }
     long want = argc > 3 ? atol(argv[3]) : 4096;
 
+    // mmap, NOT malloc+fread. These fixtures are 16-30 GB; reading the whole
+    // file into the heap segfaults on a normal machine and would make the oracle
+    // useless for exactly the models that need checking. Only one tensor's
+    // blocks are ever touched.
     FILE *f = fopen(argv[1], "rb");
     if (!f) { perror("open"); return 2; }
-    fseek(f, 0, SEEK_END); long sz = ftell(f); fseek(f, 0, SEEK_SET);
-    uint8_t *m = malloc(sz);
-    if (fread(m, 1, sz, f) != (size_t)sz) { fprintf(stderr, "short read\n"); return 2; }
-    fclose(f);
+    fseek(f, 0, SEEK_END); long sz = ftell(f); fclose(f);
+    int fd = open(argv[1], O_RDONLY);
+    if (fd < 0) { perror("open"); return 2; }
+    uint8_t *m = mmap(NULL, (size_t)sz, PROT_READ, MAP_PRIVATE, fd, 0);
+    if (m == MAP_FAILED) { perror("mmap"); return 2; }
+    madvise(m, (size_t)sz, MADV_RANDOM);
 
     if (memcmp(m, "GGUF", 4)) { fprintf(stderr, "not GGUF\n"); return 2; }
     if (rd32(m+4) != 3)       { fprintf(stderr, "not GGUF v3\n"); return 2; }
@@ -125,7 +217,11 @@ int main(int argc, char **argv) {
         o += 8 + (int64_t)klen;
         uint32_t vt = rd32(m+o); o += 4;
         if (!strcmp(key, "general.alignment") && vt == 4) align = rd32(m + o);
-        o = skip_value(m, o, vt);
+        {
+            int64_t nx = skip_value(m, o, vt);
+            if (nx < 0) return 5;
+            o = nx;
+        }
     }
     const uint64_t align_ten = align;
 
@@ -154,9 +250,10 @@ int main(int argc, char **argv) {
         long n = want < (long)want_ne ? want : (long)want_ne;
         const uint8_t *base = m + data_off + want_off;
         float *y = malloc((size_t)n * 4);
-        if      (want_tt == 13) deq_q5k(base, y, n);
-        else if (want_tt == 8)  deq_q8_0(base, y, n);
-        else { fprintf(stderr, "dtype %u not built into this oracle\n", want_tt); return 3; }
+        if (dequant_row(want_tt, base, y, n) != 0) {
+            fprintf(stderr, "dtype %u not built into this oracle\n", want_tt);
+            return 3;
+        }
 
         double s = 0, sq = 0;
         float mn = y[0], mx = y[0];

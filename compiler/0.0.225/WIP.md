@@ -811,3 +811,74 @@ Results:
 Q2_K, Q3_K, Q4_0, Q4_1, Q5_0, Q5_1, Q8_1, Q8_K, BF16, TQ1_0, TQ2_0, MXFP4,
 NVFP4, Q1_0, Q2_0 and the remaining IQ types have no native dequantizer.
 `scripts/audit/c_oracle.c` is the reference to extend as each is added.
+
+## 0.0.225 — Q4_0 + BF16, and two loader-path defects found by them
+
+Q4_0 (dtype 2) and BF16 (dtype 30) are wired into `lib/std/gguf.quanta`
+(support table + dispatch + `dequant_q4_0` / `dequant_bf16`) and verified
+against the compiled C oracle in `scripts/audit/c_oracle.c`:
+
+    Q4_0  QUANTA-GG4-30B-Q4KXL.gguf  blk.5.attn_k.weight      n=11010048
+          sum   = -781.592564  sumsq = 1960.441500
+          min   =   -0.135376  max   =   0.134583
+
+    BF16  QUANTA-GG4-E4B-Q4_K_M.gguf  per_layer_model_proj.weight  n=27525120
+          sum   =   -0.511763  sumsq =    6.810468
+          min   =   -0.121582  max   =    0.100586
+
+### FIX 1 — the `f64of` leak (one 72-byte mmap per call)
+
+`lib/std/math.quanta:285` re-declared `f64of` as a USER function:
+
+    fn f64of(bits: i64) -> f64 {
+        let b = mem_alloc(8)
+        mem_store(b, bits)
+        return f64_load(b)
+    }
+
+A user function shadows a same-named builtin in EVERY importing scope, so any
+file importing `std/math` (directly, or transitively via `std/gguf`) turned every
+`f64of()` into that call: `mem_alloc(8)` with no matching `mem_free`. One 72-byte
+mmap per call, ~4KB effective RSS per call. The 11,010,048-element Q4_0 reduction
+grew to ~16GB RSS and was OOM-killed (RC=137) under `MemoryMax=6G`.
+
+The builtin is inlined by `emit_bltn` (features.quanta:598) and allocates nothing.
+Measured on a 200k-iteration loop: 200,001 mmaps with the import, 1 without. The
+shadow was numerically correct, so nothing failed loudly — it only leaked.
+
+Removed from BOTH `lib/std/math.quanta` and `lib/std/transformer.quanta:12`
+(identical copy). Verified the builtin gives identical results:
+`f64of(4612811918334230528)` = 2.5, `f64of(f64bits(2.5))*2.0` = 5.0, sum of five
+`f64of(f64bits(1.0))` = 5.0.
+
+### FIX 2 — BF16 endianness and header offset
+
+`dequant_bf16` went through three wrong forms before the oracle agreed. Each was
+wrong in a way that returned plausible-looking numbers or exact zeros:
+
+1. `f32_to_f64(raw + i*2)` reads 4 bytes, so the NEXT element's two bytes landed
+   in the mantissa's low half. Sum off by 0.033, every min/max wrong.
+2. Shifting into an f64 directly (`f64of(bits << 48)`) is not a widening: an f64
+   pattern of `bf16<<48` has bias 1023 where fp32 has 127, so it is off by a
+   factor of 2^896. 16561 became 4352.0 instead of 1.0. The exponent must be
+   REBASED, which is exactly what `f32_to_f64` does.
+3. Placing the bf16 bytes at scratch offsets +0/+1 built the pattern `0x00003f80`
+   — a subnormal ~1.7e-38, so every element printed 0.000000. Little-endian fp32
+   puts sign+exponent in b3 and the top mantissa byte in b2, so `bf16<<16` lands
+   in offsets +2/+3.
+
+Also note `mem_load8`/`mem_store8` are RAW (no header skip) while `mem_load`/
+`mem_store` skip the 8-byte alloc header — measured directly, not assumed. The
+working dequantizers are unaffected because they go through `f16_to_f64`/`i8_at`.
+
+Verified in isolation first: bf16 [1.0, -2.0, 0.5, 3.0] round-trips exactly.
+
+### Verification
+
+    tests/test_read_formats      all pass (RC=0, MemoryMax=6G)
+    tests/test_nbytes_table      all pass (6 models, 0 wrong)
+    scripts/run_gate.sh          green=19 red=0
+    test_suites/scripts/run_tests.sh   813/813 pass, 0 fail
+
+Still zero local fixtures, so still unverified natively: Q2_K, Q3_K, Q4_1, Q5_0,
+Q5_1, Q8_1, Q8_K. Upstream exports dequantizers for all of those except Q8_1.
