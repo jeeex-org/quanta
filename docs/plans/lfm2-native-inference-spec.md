@@ -148,6 +148,109 @@ from the role. This is already how `read_tensor_f64()` works.
 
 ---
 
+## GGML format coverage — the full 43-type taxonomy
+
+Verified against `/opt/ai/llama.cpp/ggml/src/ggml-common.h`, whose
+`static_assert(sizeof(block_x) == ...)` lines state each block's true size.
+
+### Uniform-scale — dequantize is self-contained, verifiable per type
+
+| Format | dtype | bytes | block | dequantizer | wired |
+|---|---|---|---|---|---|
+| F32 | 0 | 4 | 1 | yes | yes |
+| F16 | 1 | 2 | 1 | yes | yes |
+| Q4_0 | 2 | 18 | 32 | — | no |
+| Q4_1 | 3 | 20 | 32 | — | no |
+| Q5_0 | 6 | 22 | 32 | — | no |
+| Q5_1 | 7 | 24 | 32 | — | no |
+| Q8_0 | 8 | 34 | 32 | **exists, unwired** | no |
+| Q8_1 | 9 | 36 | 32 | — | no |
+| Q2_K | 10 | 84 | 256 | — | no |
+| Q3_K | 11 | 110 | 256 | — | no |
+| Q4_K | 12 | 144 | 256 | yes | yes |
+| Q5_K | 13 | 176 | 256 | **exists, unwired, unverified** | no |
+| Q6_K | 14 | 210 | 256 | yes | yes |
+| Q8_K | 15 | 292 | 256 | — | no |
+| BF16 | 30 | 2 | 1 | — | no |
+| TQ1_0 | 34 | 54 | 256 | — | no |
+| TQ2_0 | 35 | 66 | 256 | — | no |
+
+### Codebook / IQ — need the codebook tensor from the same file
+
+Each 2-bit (or 3-bit) index selects from a learned codebook shipped *in the
+GGUF as its own tensor*. These cannot be written in isolation; each needs the
+codebook plus a `ggml_vec_dot` variant.
+
+| Format | dtype | bytes | block |
+|---|---|---|---|
+| IQ2_XXS | 16 | 66 | 256 |
+| IQ2_XS | 17 | 74 | 256 |
+| IQ3_XXS | 18 | 98 | 256 |
+| IQ1_S | 19 | 50 | 256 |
+| IQ4_NL | 20 | 18 | **32** |
+| IQ3_S | 21 | 110 | 256 |
+| IQ2_S | 22 | 82 | 256 |
+| IQ4_XS | 23 | 136 | 256 |
+| IQ1_M | 29 | 56 | 256 |
+
+### FP4 and the newest types
+
+| Format | dtype | bytes | block | notes |
+|---|---|---|---|---|
+| MXFP4 | 39 | 17 | 32 | E8M0 scale |
+| NVFP4 | 40 | 36 | 64 | 4× UE4M3 scales per block |
+| Q1_0 | 41 | 18 | 128 | ternary, 1-bit |
+| Q2_0 | 42 | 18 | 64 | 2-bit |
+
+### Plain integer
+`I8`(24) `I16`(25) `I32`(26) `I64`(27) `F64`(28) — 1/2/4/8/8 bytes.
+
+Removed and never to be implemented: `Q4_2`(4), `Q4_3`(5),
+`Q4_0_4_4/4_8/8_8`(31-33), `IQ4_NL_4_4/4_8/8_8`(36-38).
+
+### Byte-size bug found and fixed (2026-10-05)
+
+`gguf_tensor_nbytes()` had wrong values for **six IQ types and BF16**:
+
+```
+IQ4_NL  18 vs 110   (used a 256-block for a 32-block type)
+IQ3_S  110 vs  82
+IQ2_S   82 vs 136   (swapped with IQ4_XS)
+IQ4_XS 136 vs 186
+IQ1_M   56 vs  54
+BF16     2 vs  56   (treated 2 bytes/elem as a 256-element block)
+```
+
+Summing the wrong table overran the file:
+
+```
+                        old sum_nbytes      new sum_nbytes     filesize
+GG4-26B4-IQ4        11,093,359,736      13,581,352,056   13,597,177,568   (was short 2.50 GB)
+GW38-27B-IQ4        16,777,233,024      13,894,652,544   13,905,647,712   (was over  2.87 GB)
+GG4-E4B              4,912,314,536       4,961,343,656    4,977,171,584   (was short   65 MB)
+```
+
+Every other model already landed within ~15 MB of metadata padding; the three
+files above did not, which is how the bug was isolated. Fixed and pinned by
+`tests/test_nbytes_table.quanta` (3,496 tensors across 6 real models, 0 wrong).
+
+### Formats actually present in models on this box
+
+```
+LFM2.5-2.6Bv1            F32=99   F16=167
+LFM2.5-2.6Bv1-Q4_K_M     F32=99   Q4_K=148  Q6_K=19
+GG4-E4B-Q4_K_M           F32=423  Q4_K=253  Q5_K=1  Q6_K=42  BF16=1
+GG4-26B4-IQ4             F32=392  Q8_0=207  IQ4_NL=29  IQ3_S=29  IQ4_XS=1
+GW38-27B-Q4KM            F32=456  Q8_0=1  Q4_K=294  Q5_K=48  Q6_K=67
+GW38-27B-IQ4             F32=408  Q8_0=5  Q4_K=5  Q5_K=21  Q6_K=59  IQ3_S=75  IQ4_XS=293
+```
+
+Q2_K and Q3_K appear in **no** model on this box. No `gguf`/`numpy` package is
+installed, so an independent reference for those two would have to come from
+llama.cpp itself.
+
+---
+
 ## The real blocking constraint: weight memory
 
 Full dequantization to f64 is **20.1 GB**; to f32, **10.05 GB**. The box has 62 GB

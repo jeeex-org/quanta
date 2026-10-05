@@ -1,0 +1,161 @@
+// gguf_tensor_nbytes() must match the upstream GGML block layouts EXACTLY.
+//
+// This is a pure table test -- it loads each real model, walks every descriptor,
+// and checks gguf_tensor_nbytes() against the (bytes, elems_per_block) pair
+// taken from the static_assert in upstream ggml-common.h. No tensor data is
+// read and no weights are materialised.
+//
+// Why this test exists: the previous table gave IQ4_NL Q4_K's byte count and
+// block size, IQ2_S and IQ4_XS each other's, and treated BF16 as a 256-element
+// block. Summing the wrong table over QUANTA-GW38-27B-IQ4.gguf overran the
+// file by 2.87 GB, so those tensors silently read unrelated bytes as weights.
+//
+// The file-size check at the end is the strongest assertion available without a
+// reference dequantizer: if every nbytes is right, the sum of all tensor sizes
+// must land within the file's metadata block.
+//
+// Exit 0 = table matches upstream for every tensor in every model found.
+
+import std/gguf
+import std/fs
+
+// (bytes_per_block, elems_per_block) from ggml-common.h static_asserts.
+fn tb(dtype) {
+    if dtype == 0 { return 4 }              // F32
+    if dtype == 1 { return 2 }              // F16
+    if dtype == 2 { return 18 }             // Q4_0
+    if dtype == 3 { return 20 }             // Q4_1
+    if dtype == 6 { return 22 }             // Q5_0
+    if dtype == 7 { return 24 }             // Q5_1
+    if dtype == 8 { return 34 }             // Q8_0
+    if dtype == 9 { return 36 }             // Q8_1
+    if dtype == 10 { return 84 }            // Q2_K
+    if dtype == 11 { return 110 }           // Q3_K
+    if dtype == 12 { return 144 }           // Q4_K
+    if dtype == 13 { return 176 }           // Q5_K
+    if dtype == 14 { return 210 }           // Q6_K
+    if dtype == 15 { return 292 }           // Q8_K
+    if dtype == 16 { return 66 }            // IQ2_XXS
+    if dtype == 17 { return 74 }            // IQ2_XS
+    if dtype == 18 { return 98 }            // IQ3_XXS
+    if dtype == 19 { return 50 }            // IQ1_S
+    if dtype == 20 { return 18 }            // IQ4_NL
+    if dtype == 21 { return 110 }           // IQ3_S
+    if dtype == 22 { return 82 }            // IQ2_S
+    if dtype == 23 { return 136 }           // IQ4_XS
+    if dtype == 24 { return 1 }             // I8
+    if dtype == 25 { return 2 }             // I16
+    if dtype == 26 { return 4 }             // I32
+    if dtype == 27 { return 8 }             // I64
+    if dtype == 28 { return 8 }             // F64
+    if dtype == 29 { return 56 }            // IQ1_M
+    if dtype == 30 { return 2 }             // BF16
+    if dtype == 34 { return 54 }            // TQ1_0
+    if dtype == 35 { return 66 }            // TQ2_0
+    if dtype == 39 { return 17 }            // MXFP4
+    if dtype == 40 { return 36 }            // NVFP4
+    if dtype == 41 { return 18 }            // Q1_0
+    if dtype == 42 { return 18 }            // Q2_0
+    return 0
+}
+
+fn blk(dtype) {
+    if dtype == 0 { return 1 }
+    if dtype == 1 { return 1 }
+    if dtype == 2 { return 32 }
+    if dtype == 3 { return 32 }
+    if dtype == 6 { return 32 }
+    if dtype == 7 { return 32 }
+    if dtype == 8 { return 32 }
+    if dtype == 9 { return 32 }
+    if dtype == 20 { return 32 }
+    if dtype == 39 { return 32 }
+    if dtype == 40 { return 64 }
+    if dtype == 41 { return 128 }
+    if dtype == 42 { return 64 }
+    if dtype == 24 { return 1 }
+    if dtype == 25 { return 1 }
+    if dtype == 26 { return 1 }
+    if dtype == 27 { return 1 }
+    if dtype == 28 { return 1 }
+    if dtype == 30 { return 1 }
+    // remaining quantised types are all QK_K
+    return 256
+}
+
+let failures = 0
+
+fn path_size(path) {
+    let fd = open(path, 0, 0)
+    if fd < 0 { return 0 }
+    let sz = file_size(fd)
+    close(fd)
+    return sz
+}
+
+fn check_file(path, expect_tensors) {
+    let fsz = path_size(path)
+    if gguf_load(path) < 0 {
+        print("FAIL cannot open ", path, "\n")
+        failures = failures + 1
+        return
+    }
+    let nt = gguf_n_tensors
+    let bad = 0
+    let total = 0
+    let i = 0
+    while i < nt {
+        let dt = gguf_tensor_dtype(i)
+        let ne = gguf_tensor_nelements(i)
+        let want = (ne / blk(dt)) * tb(dt)
+        let got = gguf_tensor_nbytes(i)
+        total = total + got
+        if got != want {
+            if bad < 6 {
+                print("  dtype ", dt, " nelem ", ne, " nbytes ", got, " want ", want, "\n")
+            }
+            bad = bad + 1
+        }
+        i = i + 1
+    }
+    print("  tensors=", nt, " wrong=", bad, " sum_nbytes=", total, " filesize=", fsz, "\n")
+    if expect_tensors > 0 && nt != expect_tensors {
+        print("  FAIL tensor count ", nt, " want ", expect_tensors, "\n")
+        failures = failures + 1
+    }
+    if bad > 0 {
+        print("  FAIL ", bad, " tensors with wrong nbytes\n")
+        failures = failures + 1
+    }
+    // The sum must not exceed the file. Metadata padding sits above the data, so
+    // sum <= filesize is the invariant that catches an inflated table.
+    if total > fsz {
+        print("  FAIL sum_nbytes ", total, " EXCEEDS filesize ", fsz, "\n")
+        failures = failures + 1
+    }
+    gguf_close()
+}
+
+fn main() {
+    print("=== gguf_tensor_nbytes table vs upstream ggml-common.h ===\n")
+    print("-- LFM2 F16\n")
+    check_file("/opt/ai/models/quanta/QUANTA-LFM2.5-2.6Bv1.gguf", 266)
+    print("-- LFM2 Q4_K_M\n")
+    check_file("/opt/ai/models/quanta/QUANTA-LFM2.5-2.6Bv1-Q4_K_M.gguf", 266)
+    print("-- GG4 E4B Q4_K_M (has Q5_K and BF16)\n")
+    check_file("/opt/ai/models/quanta/QUANTA-GG4-E4B-Q4_K_M.gguf", 720)
+    print("-- GG4 26B4 IQ4 (IQ4_NL, IQ3_S, IQ4_XS)\n")
+    check_file("/opt/ai/models/quanta/QUANTA-GG4-26B4-IQ4.gguf", 658)
+    print("-- GW38 Q4KM (Q8_0, Q5_K)\n")
+    check_file("/opt/ai/models/quanta/QUANTA-GW38-27B-Q4KM.gguf", 866)
+    print("-- gemma e4b (F32/F16 only)\n")
+    check_file("/opt/ai/models/gemma-4b-e4b.gguf", 720)
+
+    print("\n")
+    if failures > 0 {
+        print("test_nbytes_table: ", failures, " FAILURES\n")
+        return 1
+    }
+    print("test_nbytes_table: all pass\n")
+    return 0
+}

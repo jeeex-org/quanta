@@ -263,50 +263,75 @@ fn gguf_type_size(dtype) {
 // blk.0.ffn_gate.weight instead of 12386304 -- a tensor then read as f32 would
 // run 1.8x past the end of its own storage.
 //
-//   type                      elems  bytes
-//   F32   (0)  /  I32  (12 n/a)    1      4
-//   F16   (1)  /  I16   (2)        1      2
-//   Q4_0  (2)  / Q4_1  (3)         32    18 / 20
-//   Q5_0  (6)  / Q5_1  (7)         32    22 / 24
-//   Q8_0  (8)  / Q8_1  (9)         32    34 / 36
-//   Q2_K  (10) / Q3_K  (11)       256    84 / 110
-//   Q4_K  (12) / Q5_K  (13)       256   144 / 176
-//   Q6_K  (14) / Q8_K  (15)       256   210 / 292
-//   IQ2_XXS(16) / IQ2_XS (17)      256    66 / 74
-//   IQ3_XXS(18) / IQ1_S   (19)     256    98 / 50
-//   IQ4_NL  (20) / IQ3_S  (21)     256   110 / 82
-//   IQ2_S   (22) / IQ4_XS (23)     256   136 / 186
-//   I8 (24) I16 (25) I32 (26) I64 (27) F64 (28)   1  1 / 2 / 4 / 8 / 8
-//   IQ1_M   (29) / IQ4_NL_4_4 (30)  256   54 / 56
+// Every (bytes, block) pair below is derived from the static_assert in upstream
+// ggml-common.h, which states each block's own size:
+//
+//   type                       elems  bytes
+//   F32   (0)                    1      4
+//   F16   (1)                    1      2
+//   Q4_0  (2) / Q4_1  (3)       32    18 / 20
+//   Q5_0  (6) / Q5_1  (7)       32    22 / 24
+//   Q8_0  (8) / Q8_1  (9)       32    34 / 36
+//   Q2_K (10) / Q3_K (11)      256    84 / 110
+//   Q4_K (12) / Q5_K (13)      256   144 / 176
+//   Q6_K (14) / Q8_K (15)      256   210 / 292
+//   IQ2_XXS(16) / IQ2_XS (17)  256    66 / 74
+//   IQ3_XXS(18) / IQ1_S  (19)  256    98 / 50
+//   IQ4_NL(20)                  32     18   <- 32-element block, not 256
+//   IQ3_S (21) / IQ2_S (22)     256   110 /  82
+//   IQ4_XS(23)                  256   136
+//   I8(24) I16(25) I32(26) I64(27) F64(28)   1  1/2/4/8/8
+//   IQ1_M(29)                   256    56
+//   BF16 (30)                     1      2   <- 2 bytes/elem, not a 256 block
+//   TQ1_0(34) / TQ2_0(35)       256    54 / 66
+//   MXFP4(39)                    32     17
+//   NVFP4(40)                    64     36
+//   Q1_0 (41) / Q2_0 (42)       128/64 18 / 18
+//
+// IQ4_NL, IQ2_S and IQ4_XS previously carried Q4_K/Q4_1/Q4_K's numbers, and
+// IQ3_S and IQ1_M were short. That made the loader's total tensor-data footprint
+// overrun the file by 2.50 GB on QUANTA-GG4-26B4-IQ4.gguf and 2.87 GB on
+// QUANTA-GW38-27B-IQ4.gguf, silently reading unrelated bytes as weights. The
+// corrected table brings both files into the same ~15 MB of metadata padding as
+// every other model on the box.
 fn gguf_tensor_nbytes(idx) {
     let dtype = gguf_tensor_dtype(idx)
     let n = gguf_tensor_nelements(idx)
-    if dtype == 0 || dtype == 26 { return n * 4 }
-    if dtype == 1 || dtype == 25 { return n * 2 }
-    if dtype == 24 { return n }
-    if dtype == 27 || dtype == 28 { return n * 8 }
-    if dtype == 2 { return (n / 32) * 18 }
-    if dtype == 3 { return (n / 32) * 20 }
-    if dtype == 6 { return (n / 32) * 22 }
-    if dtype == 7 { return (n / 32) * 24 }
-    if dtype == 8 { return (n / 32) * 34 }
-    if dtype == 9 { return (n / 32) * 36 }
-    if dtype == 10 { return (n / 256) * 84 }
-    if dtype == 11 { return (n / 256) * 110 }
-    if dtype == 12 { return (n / 256) * 144 }
-    if dtype == 13 { return (n / 256) * 176 }
-    if dtype == 14 { return (n / 256) * 210 }
-    if dtype == 15 { return (n / 256) * 292 }
-    if dtype == 16 { return (n / 256) * 66 }
-    if dtype == 17 { return (n / 256) * 74 }
-    if dtype == 18 { return (n / 256) * 98 }
-    if dtype == 19 { return (n / 256) * 50 }
-    if dtype == 20 { return (n / 256) * 110 }
-    if dtype == 21 { return (n / 256) * 82 }
-    if dtype == 22 { return (n / 256) * 136 }
-    if dtype == 23 { return (n / 256) * 186 }
-    if dtype == 29 { return (n / 256) * 54 }
-    if dtype == 30 { return (n / 256) * 56 }
+    if dtype == 0 { return n * 4 }        // F32
+    if dtype == 1 { return n * 2 }        // F16
+    if dtype == 2 { return (n / 32) * 18 }   // Q4_0
+    if dtype == 3 { return (n / 32) * 20 }   // Q4_1
+    if dtype == 6 { return (n / 32) * 22 }   // Q5_0
+    if dtype == 7 { return (n / 32) * 24 }   // Q5_1
+    if dtype == 8 { return (n / 32) * 34 }   // Q8_0
+    if dtype == 9 { return (n / 32) * 36 }   // Q8_1
+    if dtype == 10 { return (n / 256) * 84 }   // Q2_K
+    if dtype == 11 { return (n / 256) * 110 }  // Q3_K
+    if dtype == 12 { return (n / 256) * 144 }  // Q4_K
+    if dtype == 13 { return (n / 256) * 176 }  // Q5_K
+    if dtype == 14 { return (n / 256) * 210 }  // Q6_K
+    if dtype == 15 { return (n / 256) * 292 }  // Q8_K
+    if dtype == 16 { return (n / 256) * 66 }   // IQ2_XXS
+    if dtype == 17 { return (n / 256) * 74 }   // IQ2_XS
+    if dtype == 18 { return (n / 256) * 98 }   // IQ3_XXS
+    if dtype == 19 { return (n / 256) * 50 }   // IQ1_S
+    if dtype == 20 { return (n / 32) * 18 }    // IQ4_NL  (QK4_NL=32, NOT 256)
+    if dtype == 21 { return (n / 256) * 110 }  // IQ3_S
+    if dtype == 22 { return (n / 256) * 82 }   // IQ2_S
+    if dtype == 23 { return (n / 256) * 136 }  // IQ4_XS
+    if dtype == 24 { return n }                 // I8
+    if dtype == 25 { return n * 2 }             // I16
+    if dtype == 26 { return n * 4 }             // I32
+    if dtype == 27 { return n * 8 }             // I64
+    if dtype == 28 { return n * 8 }             // F64
+    if dtype == 29 { return (n / 256) * 56 }    // IQ1_M
+    if dtype == 30 { return n * 2 }             // BF16  (2 bytes/elem, NOT a 256 block)
+    if dtype == 34 { return (n / 256) * 54 }    // TQ1_0
+    if dtype == 35 { return (n / 256) * 66 }    // TQ2_0
+    if dtype == 39 { return (n / 32) * 17 }     // MXFP4  (QK_MXFP4=32)
+    if dtype == 40 { return (n / 64) * 36 }     // NVFP4  (QK_NVFP4=64, 4 E4M3 scales)
+    if dtype == 41 { return (n / 128) * 18 }    // Q1_0    (QK1_0=128)
+    if dtype == 42 { return (n / 64) * 18 }     // Q2_0    (QK2_0=64)
     return n
 }
 

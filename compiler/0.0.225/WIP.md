@@ -548,6 +548,73 @@ each defect is caught.
 
 ## 0.0.225 -- string consts and variadic print
 
+## Loader: corrected `gguf_tensor_nbytes()` block-size table
+
+Derived every quantised block size from the `static_assert(sizeof(block_x) == ...)`
+lines in `/opt/ai/llama.cpp/ggml/src/ggml-common.h` and diffed against the loader.
+
+Six IQ types and BF16 were wrong:
+
+```
+IQ4_NL  18 vs 110   used a 256-element block for a 32-element type
+IQ3_S  110 vs  82
+IQ2_S   82 vs 136   swapped with IQ4_XS
+IQ4_XS 136 vs 186
+IQ1_M   56 vs  54
+BF16     2 vs  56   treated 2 bytes/elem as a 256-element block
+```
+
+`gguf_tensor_nbytes()` drives the read length, so a wrong value silently read
+past or short of a tensor and returned plausible weights -- the same failure
+mode as the Q4_K/Q6_K bugs fixed earlier. Summing the wrong table over the
+real models proved it:
+
+```
+                        old sum_nbytes      new sum_nbytes     filesize
+GG4-26B4-IQ4        11,093,359,736      13,581,352,056   13,597,177,568
+GW38-27B-IQ4        16,777,233,024      13,894,652,544   13,905,647,712
+GG4-E4B              4,912,314,536       4,961,343,656    4,977,171,584
+```
+
+Two of the three missed by >2.5 GB; every other model on the box was already
+within ~15 MB. That gap is how the bug was isolated without needing a
+reference dequantizer.
+
+Also corrected the comment block above the function, which mislabelled dtype 30
+as `IQ4_NL_4_4` (removed upstream); it is **BF16**. Added the six newer types
+that were absent entirely: TQ1_0(34), TQ2_0(35), MXFP4(39), NVFP4(40),
+Q1_0(41), Q2_0(42).
+
+Pinned by `tests/test_nbytes_table.quanta` -- 3,496 tensors across 6 real
+models, checked against the upstream (bytes, elems_per_block) pairs, plus the
+invariant that the sum of all nbytes must not exceed the file size.
+
+Verification (compiler `0.0.225`, md5 f6e7e40d735b953babebb53f16862c27):
+
+```
+test_nbytes_table  RC=0   wrong=0 across all 6 models
+test_read_formats  RC=0   F32/F16/Q4_K/Q6_K oracle agreement intact
+gate               rc=0   green=19 red=0
+official suite     RC=0   813/813 pass, 0 fail
+```
+
+## GGML format coverage decision
+
+Full taxonomy (43 types) recorded in
+`docs/plans/lfm2-native-inference-spec.md`. Coverage directed for **everything,
+including the IQ codebook and FP4 types (~26 formats)**.
+
+The split that matters: ~17 uniform-scale types (F32/F16/BF16, Q4_0-Q8_1,
+Q2_K-Q8_K, TQ1_0/TQ2_0) are self-contained dequantizers, each verifiable
+against a real tensor. The ~11 IQ + FP4 types are **codebook lookups** -- each
+index selects from a learned codebook shipped in the GGUF as its own tensor --
+so they need the codebook plus a `ggml_vec_dot` variant, and cannot be written
+or tested in isolation.
+
+Q2_K and Q3_K are present in **no** model on this box, and neither `gguf` nor
+`numpy` is installed, so an independent oracle for those two would have to be
+built from llama.cpp itself.
+
 ## Stage 1 (post-0.0.225) -- LFM2 descriptor table
 
 - Removed `lib/std/native_inference.quanta`: dead, unimported, and did not
