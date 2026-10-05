@@ -21,10 +21,19 @@ measured, not planned.
 
 - Metadata parsing works.
 - KV entries: the model has 37.
-- Tensors: the model has **266**. `TensorInfo` is `[TensorInfo; 128]` — this is
-  a hard truncation and is one of the blocking defects below.
-- Tensor data offsets are absolute. An earlier double-offset bug is fixed.
-- Partial tensor reads work; token `5000` was verified against the F16 model.
+### Tensors
+
+The model has **266** tensor descriptors and the loader holds all of them:
+`lib/std/gguf.quanta:96` allocates `mem_alloc(gguf_n_tensors * TINFO_SIZE)`, so
+the table is sized from the header count rather than a fixed cap. Names are
+materialised as real strings by `gguf_tensor_name_str()`.
+
+An earlier version of this doc claimed `TensorInfo` was `[TensorInfo; 128]` and
+that 266 tensors did not fit, as a blocking defect. **That was wrong** — it
+described `lib/std/native_inference.quanta`, which nothing imported, did not
+compile, and which has since been deleted. The real loader was never capped. The
+actual weight-memory constraint is documented in
+`docs/plans/lfm2-native-inference-spec.md`.
 
 ### Dequantizers
 
@@ -60,37 +69,31 @@ rejected. The real path is `lib/std/matmul_q4k.quanta`, a pure-Quanta
 
 ## Inference engine — absent
 
-Nothing in this section exists. `lib/std/native_inference.quanta` lines 537–551
-are comments where execution belongs.
+Nothing in this section exists. The `lib/std/native_inference.quanta` that this
+table originally described has been deleted: nothing imported it, it did not
+compile (`cannot resolve imported module 'std/mem'`), and its `tokenizer_encode`
+returned placeholder IDs 1, 2, 3.
 
 | Component | State |
 |---|---|
-| GPT-2/LFM2 BPE tokenizer | `tokenizer_encode` returns placeholder IDs 1, 2, 3 |
+| GPT-2/LFM2 BPE tokenizer | absent |
 | Token embeddings | not wired |
 | All 30 layers | not wired |
 | Short convolution + cache | not wired |
 | Attention, RoPE, KV cache | not wired |
 | Logits, sampling, generation | not wired |
-| TensorInfo capacity 128 < 266 tensors | **blocking defect** |
 
 ### Order of work
 
+Superseded by `docs/plans/lfm2-native-inference-spec.md`, which replaces the
+"raise TensorInfo capacity" step (there is no such defect) with the real weight
+memory constraint and corrects the architecture facts: no separate output head
+(`token_embd.weight` is tied to the output projection), attention and conv layers
+are mutually exclusive, `attn_k`/`attn_v` are 512 wide (GQA 4:1), and the
+attention layers are `[2, 5, 9, 13, 17, 21, 24, 27]`.
+
 Each stage is gated on the one before it producing correct numbers against the
 F16 reference, not on compiling.
-
-1. **`TensorInfo` capacity.** 266 tensors do not fit in a 128-entry array. This
-   blocks everything downstream and is the cheapest fix.
-2. **Tokenizer.** GPT-2 byte-level BPE, verified against the F16 model's own
-   vocabulary. Until this is right, no output means anything.
-3. **Embeddings.** Token 5000 is already verified as a decode, so the primitive
-   exists; wiring it into the graph is the work.
-4. **Short convolution + cache.** LFM2's conv layers are position-sensitive, so
-   cache correctness is observable immediately.
-5. **Attention, RoPE, KV cache.** RoPE frequencies must match the reference or
-   attention silently degrades — a wrong-but-plausible failure mode.
-6. **All 30 layers**, checked layer by layer against F16 rather than only at
-   the end.
-7. **Logits, sampler, generation loop.**
 
 ## Design constraints
 

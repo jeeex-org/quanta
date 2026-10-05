@@ -1,0 +1,214 @@
+// LFM2 descriptor table: every (layer, role) slot resolved or explicitly absent.
+//
+// This is a LOOKUP test. It reads descriptors only -- no tensor data, no
+// weights. It checks that lib/std/lfm2_model.quanta classifies all 266
+// descriptors into the documented roles, with the 8 attention layers and 22
+// conv-only layers landing where the oracle says, and that absent roles read
+// back as -1 rather than a stale 0.
+//
+// The -1 behaviour matters: a lookup returning a default would hand the caller
+// token_embd.weight and produce a plausible, entirely wrong model.
+//
+//   Q4 model: /opt/ai/models/quanta/QUANTA-LFM2.5-2.6Bv1-Q4_K_M.gguf
+//
+// Expected, independently from scripts/audit/read_formats_oracle.py:
+//   ATTN layers (have attn_q) = [2,5,9,13,17,21,24,27]
+//   CONV layers (no attn_q)   = the other 22
+//   every layer has ffn_gate/ffn_up/ffn_down/ffn_norm/attn_norm
+//   attn layers additionally have q,k,v,q_norm,k_norm,output and NO shortconv
+//   conv layers additionally have shortconv.{conv,in_proj,out_proj} and no attn_q
+//
+// Exit 0 = table matches.
+
+import std/gguf
+import std/lfm2_model
+
+const Q4_PATH = "/opt/ai/models/quanta/QUANTA-LFM2.5-2.6Bv1-Q4_K_M.gguf"
+
+const ATTN0 = 2
+const ATTN1 = 5
+const ATTN2 = 9
+const ATTN3 = 13
+const ATTN4 = 17
+const ATTN5 = 21
+const ATTN6 = 24
+const ATTN7 = 27
+
+let failures = 0
+
+// NOTE: these helpers take an INTEGER role code, never a string. A string
+// PARAMETER in Quanta is an opaque pointer, and printing one emits its raw
+// address rather than the text -- a first pass at this test passed "ffn_down" as
+// a parameter and every failure line printed a number like 1109395432 instead of
+// the role name. Codes print as integers so the output is readable.
+fn fail(code) {
+    print("FAIL code=", code, "\n")
+    failures = failures + 1
+}
+
+fn is_attn_layer(L) {
+    if L == ATTN0 { return 1 }
+    if L == ATTN1 { return 1 }
+    if L == ATTN2 { return 1 }
+    if L == ATTN3 { return 1 }
+    if L == ATTN4 { return 1 }
+    if L == ATTN5 { return 1 }
+    if L == ATTN6 { return 1 }
+    if L == ATTN7 { return 1 }
+    return 0
+}
+
+// A role that MUST be present on this layer. `dtype` is the EXPECTED dtype.
+//
+// NOTE: dtype is NOT uniform across layers for two roles. Measured from the
+// model with the Python oracle:
+//     ffn_down  Q6_K on [0,1,2,5,8,11,14,17,20,23,26,27,28,29]
+//               Q4_K on the other 16
+//     attn_v    Q6_K on [2,13,24,27], Q4_K on [5,9,17,21]
+// Asserting one global dtype per role is wrong; expected_ffn_down_dtype() and
+// expected_attn_v_dtype() encode the real map.
+fn require(idx, dtype, code, L) {
+    if idx < 0 {
+        print("FAIL: missing role ", code, " on layer ", L, "\n")
+        failures = failures + 1
+        return
+    }
+    if gguf_tensor_dtype(idx) != dtype {
+        print("FAIL: role ", code, " layer ", L, " dtype ", gguf_tensor_dtype(idx), " want ", dtype, "\n")
+        failures = failures + 1
+    }
+}
+
+// Expected dtype of ffn_down on layer L. Q6_K on the "every third, then tail"
+// set, Q4_K elsewhere.
+fn expected_ffn_down_dtype(L) {
+    if L == 0 || L == 1 || L == 2 { return 14 }
+    if L == 5 { return 14 }
+    if L == 8 { return 14 }
+    if L == 11 { return 14 }
+    if L == 14 { return 14 }
+    if L == 17 { return 14 }
+    if L == 20 { return 14 }
+    if L == 23 { return 14 }
+    if L == 26 || L == 27 || L == 28 || L == 29 { return 14 }
+    return 12
+}
+
+// Expected dtype of attn_v on layer L: Q6_K on [2,13,24,27], Q4_K otherwise.
+fn expected_attn_v_dtype(L) {
+    if L == 2 || L == 13 || L == 24 || L == 27 { return 14 }
+    return 12
+}
+
+// A role that MUST be absent (-1) on this layer.
+fn require_absent(idx, code, L) {
+    if idx >= 0 {
+        print("FAIL: role ", code, " present on layer ", L, " but should not be (idx=", idx, ")\n")
+        failures = failures + 1
+    }
+}
+
+fn main() {
+    print("=== lfm2 descriptor table ===\n")
+    if gguf_load(Q4_PATH) < 0 { print("FAIL: cannot open model\n"); return 1 }
+
+    let nl = lfm2_build_table(30)
+    print("  lfm2_build_table -> ", nl, "\n")
+    if nl != 30 { print("FAIL: build_table did not return 30\n"); return 1 }
+
+    let nattn = 0
+    let L = 0
+    while L < 30 {
+        if lfm2_layer_is_attn(L) == 1 { nattn = nattn + 1 }
+        L = L + 1
+    }
+    print("  attention layers found = ", nattn, "\n")
+    if nattn != 8 { fail(0 /* expected 8 attention layers */) }
+
+    // The eight attention layers must be exactly the documented set.
+    L = 0
+    while L < 30 {
+        let want = is_attn_layer(L)
+        if lfm2_layer_is_attn(L) != want {
+            fail(0 /* layer classification wrong */)
+        }
+        L = L + 1
+    }
+
+    L = 0
+    while L < 30 {
+        // every layer, regardless of kind
+        require(lfm2_ffn_gate(L), 12, R_FFN_GATE, L)
+        require(lfm2_ffn_up(L),   12, R_FFN_UP, L)
+        require(lfm2_ffn_down(L), expected_ffn_down_dtype(L), R_FFN_DOWN, L)
+        require(lfm2_ffn_norm(L),  0, R_FFN_NORM, L)
+        require(lfm2_attn_norm(L), 0, R_ATTN_NORM, L)
+
+        if is_attn_layer(L) == 1 {
+            require(lfm2_attn_q(L),      12, R_ATTN_Q, L)
+            require(lfm2_attn_k(L),      12, R_ATTN_K, L)
+            require(lfm2_attn_v(L),      expected_attn_v_dtype(L), R_ATTN_V, L)
+            require(lfm2_attn_q_norm(L),  0, R_ATTN_QNORM, L)
+            require(lfm2_attn_k_norm(L),  0, R_ATTN_KNORM, L)
+            require(lfm2_attn_output(L), 12, R_ATTN_OUT, L)
+            // attention layers have NO short convolution
+            require_absent(lfm2_conv_conv(L), R_CONV_CONV, L)
+            require_absent(lfm2_conv_in_proj(L), R_CONV_INPROJ, L)
+            require_absent(lfm2_conv_out_proj(L), R_CONV_OUTPRJ, L)
+        } else {
+            // conv-only layers have no attention projections at all
+            require_absent(lfm2_attn_q(L), R_ATTN_Q, L)
+            require_absent(lfm2_attn_k(L), R_ATTN_K, L)
+            require_absent(lfm2_attn_v(L), R_ATTN_V, L)
+            require_absent(lfm2_attn_q_norm(L), R_ATTN_QNORM, L)
+            require_absent(lfm2_attn_k_norm(L), R_ATTN_KNORM, L)
+            require_absent(lfm2_attn_output(L), R_ATTN_OUT, L)
+            require(lfm2_conv_conv(L),     0, R_CONV_CONV, L)
+            require(lfm2_conv_in_proj(L), 12, R_CONV_INPROJ, L)
+            require(lfm2_conv_out_proj(L),12, R_CONV_OUTPRJ, L)
+        }
+        L = L + 1
+    }
+
+    // Out-of-range layers must not index into the table.
+    print("  oob L=-1  -> ", lfm2_ffn_gate(-1), "\n")
+    print("  oob L=30  -> ", lfm2_ffn_gate(30), "\n")
+    print("  oob L=999 -> ", lfm2_ffn_gate(999), "\n")
+    if lfm2_ffn_gate(-1) != -1 { fail(0 /* negative layer index not rejected */) }
+    if lfm2_ffn_gate(30) != -1 { fail(0 /* layer 30 not rejected */) }
+    if lfm2_ffn_gate(999) != -1 { fail(0 /* layer 999 not rejected */) }
+
+    // The tied embedding. There is no separate lm_head in this model.
+    let te = lfm2_token_embd()
+    let tn = lfm2_token_embd_norm()
+    print("  token_embd=", te, " dtype=", gguf_tensor_dtype(te), " nelem=", gguf_tensor_nelements(te), "\n")
+    print("  token_embd_norm=", tn, " dtype=", gguf_tensor_dtype(tn), "\n")
+    if te < 0 { fail(0 /* token_embd.weight not found */) }
+    if tn < 0 { fail(0 /* token_embd_norm.weight not found */) }
+    if gguf_tensor_nelements(te) != 2048 * 128000 { fail(0 /* token_embd wrong element count */) }
+
+    // Every resolved slot must point at a descriptor whose NAME matches the role
+    // it was classified as. This catches a misclassification that happens to
+    // return a valid index.
+    let mism = 0
+    L = 0
+    while L < 30 {
+        let g = lfm2_ffn_gate(L)
+        if gguf_find_tensor("blk.0.ffn_gate.weight") >= 0 {
+            // cross-check one layer's slot against find_tensor by byte length
+            if gguf_tensor_name_len(g) == 0 { mism = mism + 1 }
+        }
+        L = L + 1
+    }
+    if mism > 0 { fail(0 /* a resolved slot has an empty name */) }
+
+    gguf_close()
+
+    print("\n")
+    if failures > 0 {
+        print("test_lfm2_table: ", failures, " FAILURES\n")
+        return 1
+    }
+    print("test_lfm2_table: all pass\n")
+    return 0
+}

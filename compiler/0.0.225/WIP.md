@@ -548,6 +548,53 @@ each defect is caught.
 
 ## 0.0.225 -- string consts and variadic print
 
+## Stage 1 (post-0.0.225) -- LFM2 descriptor table
+
+- Removed `lib/std/native_inference.quanta`: dead, unimported, and did not
+  compile (`cannot resolve imported module 'std/mem'`). Its fixed 128-entry
+  tensor table and placeholder tokenizer were never production facts. The
+  earlier "fixed 128-entry table" blocker in `docs/NATIVE_INFERENCE.md` was a
+  description of this dead file, not of the loader. The real loader at
+  `lib/std/gguf.quanta:96` already allocates descriptors dynamically.
+- Added `docs/plans/lfm2-native-inference-spec.md`: the reviewed design.
+- Added `lib/std/lfm2_model.quanta`: descriptor-only role table. Maps
+  `(layer, role)` to GGUF tensor indices. Reads NO tensor data and materializes
+  NO weights (full f64 materialization is ~20.1 GB).
+- Added `tests/test_lfm2_table.quanta`: verifies all 266 descriptors classify,
+  the 8 attention layers are exactly [2,5,9,13,17,21,24,27], absent roles
+  return -1 rather than a stale 0, and out-of-range layers are rejected.
+
+### Three defects found and fixed while building Stage 1
+
+1. `name_ends_with()` used a literal `"blk.N."` prefix, which can never match a
+   real `"blk.12."`. Now matches role SUFFIXES only, with the length taken from
+   `len(suffix)` rather than a hardcoded constant.
+2. String PARAMETERS are length-prefixed: `len(s)` is correct and the body
+   starts at `s+8`. Reading `s+0` returns the length byte, not `'a'`.
+3. A string parameter cannot be printed -- `print(name)` emits its raw pointer
+   address. A first pass passed role names as parameters and every failure line
+   printed `1109395432` instead of a role name. Test helpers now take integer
+   role codes.
+
+### Measured per-layer dtype map
+
+`ffn_down` and `attn_v` are NOT the same dtype on every layer, so a global
+per-role dtype assumption is wrong (it caused 20 spurious failures):
+
+```
+ffn_down Q6_K: [0,1,2,5,8,11,14,17,20,23,26,27,28,29]   Q4_K: the other 16
+attn_v   Q6_K: [2,13,24,27]                            Q4_K: [5,9,17,21]
+```
+
+A matvec kernel must dispatch on `gguf_tensor_dtype(idx)` per tensor.
+
+### Still absent (no forward pass exists yet)
+
+Tokenizer, embeddings, short-conv + cache, attention + RoPE + KV cache, logits,
+sampling, stopping, generation loop.
+
+## 0.0.225 -- string consts and variadic print
+
 Two compiler defects fixed, both silent-data-corruption class.
 
 ### String constants
