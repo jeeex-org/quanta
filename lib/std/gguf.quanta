@@ -11,7 +11,30 @@ let gguf_data_start = 0
 let gguf_tensor_dims = 0
 let gguf_tensor_data = 0
 
+// Byte offset of each metadata KV record, plus the shape of any string array
+// it carries. Built by scan_metadata() so metadata VALUES -- not just their
+// sizes -- become reachable. The tokenizer needs the actual token strings and
+// the merge list, and no existing API exposed them: scan_metadata() only ever
+// skipped over them.
+//
+// Layout, parallel to the tensor-info table, 4 i64s per KV record:
+//   gguf_kv_index[i]    : file offset of KV record i
+//   gguf_kv_arr_off[i]  : file offset of element 0 of its string array,
+//                         or -1 when the value is not a string array
+//   gguf_kv_arr_len[i]  : element count, 0 when not a string array
+//   gguf_kv_etype[i]    : element type ID, 0 when not an array
+//
+// String array elements are variable length, so the array is walked on demand
+// (gguf_arr_elem_off) rather than indexed up front. The tokenizer arrays are
+// 128000 and 293320 entries; an offset index for them would cost 3.4 MB and
+// buy nothing, since both are read front to back exactly once.
+let gguf_kv_index = 0
+let gguf_kv_arr_off = 0
+let gguf_kv_arr_len = 0
+let gguf_kv_etype = 0
+
 const TINFO_SIZE = 40
+const KVREC_SIZE = 24
 
 // GGUF layout: the tensor DATA section begins after the tensor-info table,
 // padded to a 32-byte boundary. Each tensor's `offset` is RELATIVE to this
@@ -26,14 +49,30 @@ fn record_data_start(fd) {
 
 // Walk the metadata KV block, leaving fd at the tensor-info table.
 // Returns the metadata byte count excluding the 24-byte header.
+//
+// Also records, per KV, where its value lives (gguf_kv_*), so the value can
+// be fetched later by gguf_kv_find(). Recording the offset costs one lseek(0,1)
+// per record; the alternative -- re-walking the block on every lookup -- turns
+// a vocab search into an O(n_kv * n_tokens) scan of a 20 MB region.
 fn scan_metadata(fd, n_kv) {
     let klen_buf = mem_alloc(8)
     let vtype_buf = mem_alloc(4)
     let slen_buf = mem_alloc(8)
+
+    gguf_kv_index = mem_alloc(n_kv * KVREC_SIZE)
+    gguf_kv_arr_off = mem_alloc(n_kv * 8)
+    gguf_kv_arr_len = mem_alloc(n_kv * 8)
+    gguf_kv_etype = mem_alloc(n_kv * 8)
+
     let meta_size = 0
     let i = 0
     
     while i < n_kv {
+        mem_store(gguf_kv_index + i * 8, lseek(fd, 0, 1))
+        mem_store(gguf_kv_arr_off + i * 8, -1)
+        mem_store(gguf_kv_arr_len + i * 8, 0)
+        mem_store(gguf_kv_etype + i * 8, 0)
+
         read_raw(fd, klen_buf, 8)
         let klen = mem_load(klen_buf)
         meta_size = meta_size + 8 + klen
@@ -67,6 +106,9 @@ fn scan_metadata(fd, n_kv) {
             let alen = mem_load(slen_buf)
             let etype = mem_load(vtype_buf)
             if etype == 8 {
+                mem_store(gguf_kv_etype + i * 8, etype)
+                mem_store(gguf_kv_arr_off + i * 8, lseek(fd, 0, 1))
+                mem_store(gguf_kv_arr_len + i * 8, alen)
                 let ai = 0
                 while ai < alen {
                     read_raw(fd, slen_buf, 8)
@@ -353,6 +395,280 @@ fn gguf_num_tensors() { return gguf_n_tensors }
 fn gguf_num_kv() { return gguf_n_kv }
 fn gguf_data_offset() { return gguf_data_start }
 fn gguf_close() { if gguf_fd >= 0 { close(gguf_fd); gguf_fd = -1 } }
+
+// ---- metadata value access -------------------------------------------------
+//
+// The tensor APIs can name and read tensors but nothing could reach a metadata
+// VALUE: scan_metadata() only ever skipped over them. The LFM2 tokenizer needs
+// tokenizer.ggml.tokens (128000 strings), tokenizer.ggml.merges (293320
+// strings) and the three special token IDs, so the offsets recorded by
+// scan_metadata() are turned into reads here.
+//
+// These accessors are for the header region only. The file is opened normally
+// and read with read_raw(); nothing here materialises the tensor data, so a
+// 2.6B model costs a few KB of state, not its 1.5 GB of weights.
+
+// Index of the KV record named `name`, or -1. `name` is a Quanta string.
+fn gguf_kv_find(name) {
+    let want = len(name)
+    let i = 0
+    while i < gguf_n_kv {
+        lseek(gguf_fd, mem_load(gguf_kv_index + i * 8), 0)
+        let lb = mem_alloc(8)
+        read_raw(gguf_fd, lb, 8)
+        let klen = mem_load(lb)
+        let kb = mem_alloc(klen + 1)
+        read_raw(gguf_fd, kb, klen)
+        let ok = 1
+        if klen != want {
+            ok = 0
+        } else {
+            let j = 0
+            while j < want {
+                if mem_load8(kb + j) != mem_load8(name + 8 + j) { ok = 0; j = want }
+                j = j + 1
+            }
+        }
+        if ok == 1 { return i }
+        i = i + 1
+    }
+    return -1
+}
+
+// Value type ID of KV `i` (see gguf_vtype_* below).
+fn gguf_kv_type(i) {
+    lseek(gguf_fd, mem_load(gguf_kv_index + i * 8), 0)
+    let lb = mem_alloc(8)
+    read_raw(gguf_fd, lb, 8)
+    let klen = mem_load(lb)
+    lseek(gguf_fd, klen, 1)
+    let tb = mem_alloc(4)
+    read_raw(gguf_fd, tb, 4)
+    return mem_load(tb)
+}
+
+// Byte offset of the VALUE of KV `i` (i.e. just past its key and type field).
+fn gguf_kv_value_off(i) {
+    let off = mem_load(gguf_kv_index + i * 8)
+    lseek(gguf_fd, off, 0)
+    let lb = mem_alloc(8)
+    read_raw(gguf_fd, lb, 8)
+    let klen = mem_load(lb)
+    return off + 8 + klen + 4
+}
+
+// Integer value of a scalar u32/i32/u64/i64 KV. Returns -1 if `i` is not a
+// scalar integer, so a type mismatch cannot be mistaken for a real value.
+fn gguf_kv_int(i) {
+    let vt = gguf_kv_type(i)
+    lseek(gguf_fd, gguf_kv_value_off(i), 0)
+    let b = mem_alloc(8)
+    if vt == 1 || vt == 2 || vt == 3 || vt == 4 || vt == 5 {
+        read_raw(gguf_fd, b, 4)
+        if vt == 1 || vt == 3 || vt == 5 {
+            // signed: sign-extend from 32 bits
+            let v = mem_load(b)
+            if v > 2147483647 { v = v - 4294967296 }
+            return v
+        }
+        return mem_load(b)
+    }
+    if vt == 7 { read_raw(gguf_fd, b, 1); return mem_load8(b) }
+    if vt == 10 || vt == 11 || vt == 12 {
+        read_raw(gguf_fd, b, 8)
+        return mem_load(b)
+    }
+    return -1
+}
+
+// Floating value of a scalar f32/f64 KV, as f64.
+fn gguf_kv_float(i) {
+    let vt = gguf_kv_type(i)
+    lseek(gguf_fd, gguf_kv_value_off(i), 0)
+    let b = mem_alloc(8)
+    if vt == 6 {
+        read_raw(gguf_fd, b, 4)
+        return f64of(mem_load(b))
+    }
+    if vt == 12 {
+        read_raw(gguf_fd, b, 8)
+        return mem_load(b)
+    }
+    return 0.0
+}
+
+// String value of a scalar string KV, as a real Quanta string.
+// GGUF stores a string as u64 length + raw bytes, with NO NUL terminator.
+fn gguf_kv_str(i) {
+    if gguf_kv_type(i) != 8 { return 0 }
+    let off = gguf_kv_value_off(i)
+    lseek(gguf_fd, off, 0)
+    let lb = mem_alloc(8)
+    read_raw(gguf_fd, lb, 8)
+    let n = mem_load(lb)
+    let buf = mem_alloc((n + 9 + 7) / 8)
+    mem_store(buf, n)
+    if n > 0 { read_raw(gguf_fd, buf + 8, n) }
+    return buf
+}
+
+// Byte length of a scalar string KV, or -1 if `i` is not a string.
+// Prefer this over len(gguf_kv_str(i)) at a call site: a Quanta string RETURNED
+// from a function prints as a raw pointer, and passing one back IN as a
+// parameter is unreliable (len()/index of a string parameter reads adjacent
+// memory). Working with explicit length + buffer keeps every access byte-exact.
+fn gguf_kv_str_len(i) {
+    if gguf_kv_type(i) != 8 { return -1 }
+    lseek(gguf_fd, gguf_kv_value_off(i), 0)
+    let lb = mem_alloc(8)
+    read_raw(gguf_fd, lb, 8)
+    return mem_load(lb)
+}
+
+// Copy the bytes of scalar string KV `i` into `dst`. Returns the byte count.
+fn gguf_kv_str_bytes(i, dst) {
+    let n = gguf_kv_str_len(i)
+    if n < 0 { return -1 }
+    lseek(gguf_fd, gguf_kv_value_off(i) + 8, 0)
+    if n > 0 { read_raw(gguf_fd, dst, n) }
+    return n
+}
+
+// Element count of a string array KV, or -1 if `i` is not a string array.
+fn gguf_kv_arr_count(i) {
+    if mem_load(gguf_kv_arr_len + i * 8) == 0 { return -1 }
+    if mem_load(gguf_kv_etype + i * 8) != 8 { return -1 }
+    return mem_load(gguf_kv_arr_len + i * 8)
+}
+
+// File offset of element `idx` of the string array in KV `i`.
+//
+// Walks the variable-length elements from the start every call, so this is
+// O(idx). That is deliberate: the tokenizer reads each array front to back
+// exactly once, and a persistent offset index for 293320 merges would cost
+// 2.3 MB of resident state for a single pass. Callers that need random access
+// should build their own index once.
+fn gguf_kv_arr_elem_off(i, idx) {
+    let pos = mem_load(gguf_kv_arr_off + i * 8)
+    if pos < 0 { return -1 }
+    let lb = mem_alloc(8)
+    let k = 0
+    while k < idx {
+        lseek(gguf_fd, pos, 0)
+        read_raw(gguf_fd, lb, 8)
+        let n = mem_load(lb)
+        pos = pos + 8 + n
+        k = k + 1
+    }
+    lseek(gguf_fd, pos, 0)
+    read_raw(gguf_fd, lb, 8)
+    return pos + 8
+}
+
+// Length in bytes of element `idx` of the string array in KV `i`.
+fn gguf_kv_arr_elem_len(i, idx) {
+    let at = gguf_kv_arr_elem_off(i, idx)
+    if at < 0 { return 0 }
+    lseek(gguf_fd, at - 8, 0)
+    let lb = mem_alloc(8)
+    read_raw(gguf_fd, lb, 8)
+    return mem_load(lb)
+}
+
+// Element `idx` of a string array KV, as a real Quanta string.
+fn gguf_kv_arr_elem(i, idx) {
+    let at = gguf_kv_arr_elem_off(i, idx)
+    if at < 0 { return 0 }
+    let n = gguf_kv_arr_elem_len(i, idx)
+    if n == 0 { return 0 }
+    let buf = mem_alloc((n + 9 + 7) / 8)
+    mem_store(buf, n)
+    read_raw(gguf_fd, buf + 8, n)
+    return buf
+}
+
+// Read `n` raw bytes of element `idx` into `dst`. Used by the tokenizer, which
+// compares byte-level encoded forms against the vocab and must not pay for a
+// string object per candidate.
+fn gguf_kv_arr_elem_bytes(i, idx, dst, n) {
+    let at = gguf_kv_arr_elem_off(i, idx)
+    if at < 0 { return -1 }
+    lseek(gguf_fd, at, 0)
+    read_raw(gguf_fd, dst, n)
+    return n
+}
+
+// Total bytes of all elements in a string array KV, so a caller can size one
+// buffer for the whole array and slurp it in a single sequential read.
+//
+// Single pass by construction: it seeks to the array start once and then reads
+// forward through the 8-byte length / n-byte payload sequence, rather than
+// calling gguf_kv_arr_elem_off() per element (which would be O(n^2) over
+// 293320 merges).
+fn gguf_kv_arr_total_bytes(i) {
+    let cnt = gguf_kv_arr_count(i)
+    if cnt < 0 { return 0 }
+    let pos = mem_load(gguf_kv_arr_off + i * 8)
+    if pos < 0 { return 0 }
+    lseek(gguf_fd, pos, 0)
+    let lb = mem_alloc(8)
+    let total = 0
+    let k = 0
+    while k < cnt {
+        read_raw(gguf_fd, lb, 8)
+        let n = mem_load(lb)
+        if n > 0 { lseek(gguf_fd, n, 1) }
+        // The 8-byte length prefix is part of the packed record, so it counts
+        // toward the size. Omitting it under-reports by exactly 8*count, which
+        // for the 128000-entry vocab is a 1.02 MB shortfall -- enough to
+        // overrun the destination on the last few entries.
+        total = total + 8 + n
+        k = k + 1
+    }
+    return total
+}
+
+// Slurp a whole string array KV into `dst` as a packed sequence of
+// [u64 length][length bytes] records, in file order -- the same encoding
+// gguf_kv_arr_elem_off() describes, so the two can be used interchangeably.
+//
+// Returns the number of bytes written. The tokenizer does exactly this once for
+// tokenizer.ggml.tokens and once for tokenizer.ggml.merges, then works from
+// memory: the merges array is ~5 MB and searching it per BPE step from the
+// file would dominate the run.
+fn gguf_kv_arr_slurp(i, dst) {
+    let cnt = gguf_kv_arr_count(i)
+    if cnt < 0 { return 0 }
+    let pos = mem_load(gguf_kv_arr_off + i * 8)
+    if pos < 0 { return 0 }
+    lseek(gguf_fd, pos, 0)
+    let lb = mem_alloc(8)
+    let at = dst
+    let k = 0
+    while k < cnt {
+        read_raw(gguf_fd, lb, 8)
+        let n = mem_load(lb)
+        mem_store(at, n)
+        if n > 0 { read_raw(gguf_fd, at + 8, n) }
+        at = at + 8 + n
+        k = k + 1
+    }
+    return at - dst
+}
+
+// Offset of element `idx` within a buffer packed by gguf_kv_arr_slurp().
+// Walks the packed records, so O(idx) -- callers that need many random lookups
+// should build their own index in one pass.
+fn slurp_elem_off(packed, idx) {
+    let at = packed
+    let k = 0
+    while k < idx {
+        let n = mem_load(at)
+        at = at + 8 + n
+        k = k + 1
+    }
+    return at + 8
+}
 
 fn gguf_find_tensor(name) {
     let name_len = len(name)
