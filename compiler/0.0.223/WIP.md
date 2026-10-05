@@ -98,10 +98,20 @@ so an impl-contained method's body can begin parsing in the wrong place and
 function identity is unreliable.
 
 For `trait_test.quanta` / `trait_test2.quanta` this is not a parser bug at all:
-they need trait-typed parameters and dynamic dispatch. There is **no writer of a
-negative trait encoding into `fn_partype` anywhere in the compiler**, so no
-amount of body-position work provides it. Missing feature; needs its own
-increment with its own design.
+they need trait-typed parameters and dynamic dispatch. CORRECTION — an earlier
+note here claimed no writer of a negative trait encoding into `fn_partype`
+exists anywhere in the compiler. That was WRONG and was repeated without
+re-reading the source. `globals.quanta:849` writes `ptyp = 0 - (ti + 2)` and
+`entry.quanta:770` consumes it into `vreg_trait`. Both ends exist.
+
+The actual missing link is narrower: `method.quanta:1699-1707`, the
+trait-tagged-receiver branch, resolves the method by NAME rather than by trait
+(its own comment says "a real vtable dispatch can replace this later"), and
+`imethods` — the (impl, trait-method) -> fn-index table — is written at
+`funcscan.quanta:574,586` and read NOWHERE. So the dispatch data is all recorded
+and then never consulted. This is why no parser work can supply it.
+
+Plan for the fix: docs/research/trait-dispatch-increment-plan.md
 
 ## Native inference status
 
