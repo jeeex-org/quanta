@@ -385,7 +385,32 @@ fn gguf_find_tensor(name) {
 //
 // Returning 0 on an unsupported type is deliberate: an unsupported dtype must
 // fail explicitly, not substitute another format's bytes for this one.
+// TRUE when read_tensor_f64() can materialize this dtype into caller-provided
+// f64 storage.
+//
+// Callers MUST ask this before allocating. read_tensor_f64() reports failure by
+// returning 0, but the buffer it fills is sized by the caller from
+// gguf_tensor_nelements(), and an unimplemented dtype still demands the FULL
+// allocation before the refusal is discovered -- token_embd.weight at 1.27e9
+// elements is 10.2 GB of f64 for a tensor that cannot be read at all, which
+// blows the 6 GB inference scope before any error is reported.
+fn gguf_dtype_supported(dtype) {
+    if dtype == 0 { return 1 }
+    if dtype == 1 { return 1 }
+    if dtype == 8 { return 1 }
+    if dtype == 12 { return 1 }
+    if dtype == 13 { return 1 }
+    if dtype == 14 { return 1 }
+    return 0
+}
+
+// TRUE when this tensor's dtype can be materialized natively.
+fn gguf_tensor_supported(idx) {
+    return gguf_dtype_supported(gguf_tensor_dtype(idx))
+}
+
 fn read_tensor_f64(idx, buf) {
+    if gguf_dtype_supported(gguf_tensor_dtype(idx)) == 0 { return 0 }
     let dtype = gguf_tensor_dtype(idx)
     let offset = gguf_tensor_offset(idx)
     let nelem = gguf_tensor_nelements(idx)
@@ -416,6 +441,13 @@ fn read_tensor_f64(idx, buf) {
         file_read(gguf_fd, raw, n)
         dequant_q4k(raw, nelem, buf)
         mem_free(raw)
+    } else if dtype == 13 {
+        let n = gguf_tensor_nbytes(idx)
+        let raw = mem_alloc(n)
+        lseek(gguf_fd, offset, 0)
+        file_read(gguf_fd, raw, n)
+        dequant_q5k(raw, nelem, buf)
+        mem_free(raw)
     } else if dtype == 14 {
         let n = gguf_tensor_nbytes(idx)
         let raw = mem_alloc(n)
@@ -423,7 +455,16 @@ fn read_tensor_f64(idx, buf) {
         file_read(gguf_fd, raw, n)
         dequant_q6k(raw, nelem, buf)
         mem_free(raw)
+    } else if dtype == 8 {
+        let n = gguf_tensor_nbytes(idx)
+        let raw = mem_alloc(n)
+        lseek(gguf_fd, offset, 0)
+        file_read(gguf_fd, raw, n)
+        dequant_q8_0(raw, nelem, buf)
+        mem_free(raw)
     } else {
+        // Explicit failure. An unsupported dtype must NOT silently return 0,
+        // which a caller cannot distinguish from "success, all zeroes".
         return 0
     }
     return 1
@@ -822,24 +863,6 @@ fn dequant_q5k(raw, nelements, out) {
         }
         bi = bi + 1
     }
-}
-
-// The six-bit (scale, min) pairs in a k-quant block's scales[12] array.
-// ggml's get_scale_min_k4: for k < 4 the low nibbles carry it; for k >= 4 the
-// value straddles two bytes, two bits in scales[k+4] and four in the high bits
-// of scales[k-4].
-fn q5_scale(q, k) {
-    if k < 4 { return mem_load8(q + k) - (mem_load8(q + k) / 64) * 64 }
-    let a = mem_load8(q + k + 4)
-    let b = mem_load8(q + k - 4)
-    return (a - (a / 16) * 16) + (b / 64) * 16
-}
-
-fn q5_min(q, k) {
-    if k < 4 { return mem_load8(q + k + 4) - (mem_load8(q + k + 4) / 64) * 64 }
-    let a = mem_load8(q + k + 4)
-    let b = mem_load8(q + k)
-    return (a / 16) + (b / 64) * 16
 }
 
 // The six-bit (scale, min) pairs in a k-quant block's scales[12] array.

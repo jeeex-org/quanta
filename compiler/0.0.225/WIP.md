@@ -730,3 +730,84 @@ output byte-identical to its documented golden output.
 
 Binary: compiler/0.0.225/bin/x86/qc md5=f6e7e40d735b953babebb53f16862c27
 Built from source with compiler/0.0.224/bin/x86/qc as the seed.
+
+## Q5_K and Q8_0 wired and verified against upstream C
+
+### Changes
+
+`read_tensor_f64()` now dispatches dtype 13 (Q5_K) and dtype 8 (Q8_0) through
+`gguf_tensor_nbytes()`, absolute `lseek()`, raw allocate/read, native
+dequantization and `mem_free()`. Removed a duplicated pair of `q5_scale()` /
+`q5_min()` definitions that existed twice, byte-identical.
+
+Added `gguf_dtype_supported(dtype)` and `gguf_tensor_supported(idx)`. This is
+not a convenience wrapper: `read_tensor_f64()` signals failure by returning 0,
+but the buffer is sized by the caller from `gguf_tensor_nelements()`, so an
+unimplemented dtype still demanded the FULL allocation before the refusal was
+discovered. `token_embd.weight` at 1,271,398,400 elements is 10.2 GB of f64 for
+a tensor that cannot be read at all, which exceeds the 6 GB inference scope
+before any error surfaces. Callers must be able to ask first.
+
+### Why a compiled oracle was added
+
+Two independent Python transcriptions of `dequantize_row_q5_K` disagreed on
+sum and sumsq while AGREEING on min and max, so neither could be trusted. All
+three candidate values (two Python, one native) were plausible; only one was
+right. `scripts/audit/c_oracle.c` resolves this by calling the real
+`dequantize_row_q5_K` / `dequantize_row_q8_0` and `ggml_fp16_to_fp32` out of
+the prebuilt `libggml-base.so`.
+
+It is TEST SCAFFOLDING ONLY. It is not in `lib/`, the native inference path
+never calls it, and Quanta does not link C.
+
+Two traps hit while building it, both of which the native code does NOT have:
+
+1. `ldexpf(1.0f, mant) * 2^-149` is wrong for subnormal halves. The ldexpf
+   argument is the UNSHIFTED mantissa (0..1023), so a subnormal half asks for
+   2^914, which overflows to inf, and inf * tiny stays inf. Both `d` and `dmin`
+   of the Q5_K blocks here are subnormal (0x0392, 0x1375), so every weight came
+   out inf. Fixed by calling `ggml_fp16_to_fp32` instead of hand-rolling.
+2. Computing the data section offset in a single pass -- stopping at the
+   matching tensor name -- lands short by the size of all remaining tensor-info
+   records. That reads garbage which still looks like plausible weights. The
+   walk must cover every record.
+
+The Q5_K `ql` pointer DOES advance 32 bytes per group while `qh` does not; only
+the u1/u2 masks move. Holding `ql` fixed as well reproduces a plausible wrong
+sum, which is exactly what both Python transcriptions did.
+
+### Verification
+
+`tests/test_read_formats.quanta` extended with a `check_oracle()` that asserts
+sum, sumsq, min and max rather than merely that values are finite, so a
+dequantizer returning the right SHAPE of wrong numbers cannot pass.
+
+Real fixture `QUANTA-GW38-27B-IQ4.gguf` (866 tensors) is used because no LFM2
+tensor is Q5_K or Q8_0. Its dtype histogram is F32 408, IQ4_XS 293, IQ3_S 75,
+Q6_K 59, Q5_K 21, Q8_0 5, Q4_K 5 -- one file, five dtypes, four wired, which
+also proves dispatch is per-tensor dtype and not per-model.
+
+Native vs compiled upstream, all four fields within 1e-6:
+
+| tensor | dtype | sum | sumsq | min | max |
+|---|---|---|---|---|---|
+| blk.3.attn_k.weight | Q5_K | 0.615401 | 0.932176 | -0.068733 | 0.079718 |
+| blk.11.attn_k.weight | Q5_K | -0.303321 | 0.725723 | -0.056386 | 0.066370 |
+| blk.1.ssm_beta.weight | Q8_0 | 0.816602 | 0.580516 | -0.064434 | 0.044934 |
+| blk.16.ssm_beta.weight | Q8_0 | -1.099899 | 0.334722 | -0.076667 | 0.061769 |
+
+IQ3_S and IQ4_XS are confirmed refused by `gguf_tensor_supported()` before
+any allocation, and Q5_K in the same file still reads 5242880 elements, so the
+new guard is not over-broad.
+
+Results:
+- `tests/test_read_formats.quanta` -- all pass
+- `tests/test_nbytes_table.quanta` -- all pass, 0 mismatches
+- gate -- green=19 red=0
+- official suite -- 813/813 pass, 0 fail
+
+### Still missing
+
+Q2_K, Q3_K, Q4_0, Q4_1, Q5_0, Q5_1, Q8_1, Q8_K, BF16, TQ1_0, TQ2_0, MXFP4,
+NVFP4, Q1_0, Q2_0 and the remaining IQ types have no native dequantizer.
+`scripts/audit/c_oracle.c` is the reference to extend as each is added.

@@ -36,6 +36,7 @@ import std/math
 
 const Q4_PATH = "/opt/ai/models/quanta/QUANTA-LFM2.5-2.6Bv1-Q4_K_M.gguf"
 const F16_PATH = "/opt/ai/models/quanta/QUANTA-LFM2.5-2.6Bv1.gguf"
+const Q5Q8_PATH = "/opt/ai/models/quanta/QUANTA-GW38-27B-IQ4.gguf"
 
 let failures = 0
 
@@ -62,6 +63,7 @@ fn probe(idx, nelem_full, nprobe) {
     print("      dtype=", dt, " nelem=", gguf_tensor_nelements(idx), " nbytes=", nb, "\n")
 
     let buf = mem_alloc(nelem_full * 8)
+    // 1/0 success flag -- 0 means unsupported dtype or read failure.
     let r = read_tensor_f64(idx, buf)
     if r == 0 {
         print("FAIL: read_tensor_f64 returned 0 (unsupported dtype ", dt, ")\n")
@@ -117,6 +119,73 @@ fn report_counts(path) {
     print("  tensors=", gguf_num_tensors(), " kv=", gguf_num_kv(), "\n")
     if gguf_num_tensors() != 266 { fail(path) }
     if gguf_num_kv() != 37 { fail(path) }
+}
+
+// absf does not exist in std/math (only pf64 lives there), and this test must
+// not import an extern C libm. Relative tolerance needs it.
+fn ab(v: f64) -> f64 {
+    if v < 0.0 { return 0.0 - v }
+    return v
+}
+
+// Assert the reduction of the first `nprobe` elements against the independent
+// Python oracle (scripts/audit/read_formats_oracle.py).
+//
+// This is the assertion that actually pins a dequantizer: `probe()` only proves
+// the values are finite, so a dequantizer that returns the right SHAPE of wrong
+// numbers would pass. The tolerance is relative, because f64 accumulation order
+// differs between the two implementations.
+fn check_oracle(idx, nelem_full, nprobe, exp_sum, exp_sumsq, exp_min, exp_max, label) {
+    let buf = mem_alloc(nelem_full * 8)
+    // 1/0 success flag -- 0 means unsupported dtype or read failure.
+    let r = read_tensor_f64(idx, buf)
+    if r == 0 {
+        print("FAIL: ", label, " read_tensor_f64 returned 0\n")
+        failures = failures + 1
+        mem_free(buf)
+        return
+    }
+    let sum = 0.0
+    let sumsq = 0.0
+    let mn = 0.0
+    let mx = 0.0
+    let i = 0
+    while i < nprobe {
+        let v = f64of(mem_load(buf + i * 8))
+        sum = sum + v
+        sumsq = sumsq + v * v
+        if i == 0 { mn = v; mx = v }
+        if v < mn { mn = v }
+        if v > mx { mx = v }
+        i = i + 1
+    }
+    mem_free(buf)
+
+    // Relative tolerance: sums near zero need absolute slack, large sums need
+    // proportional slack.
+    let atol = 1e-4
+    let rtol = 1e-6
+    let ds = ab(sum - exp_sum)
+    let dq = ab(sumsq - exp_sumsq)
+    let dm = ab(mn - exp_min)
+    let dx = ab(mx - exp_max)
+    let ts = atol + rtol * ab(exp_sum)
+    let tq = atol + rtol * ab(exp_sumsq)
+    print("      got sum="); pf64(sum)
+    print(" sumsq="); pf64(sumsq)
+    print(" min="); pf64(mn)
+    print(" max="); pf64(mx)
+    print("\n")
+    if ds > ts {
+        print("FAIL: ", label, " sum off by "); pf64(ds); print("\n")
+        failures = failures + 1
+    }
+    if dq > tq {
+        print("FAIL: ", label, " sumsq off by "); pf64(dq); print("\n")
+        failures = failures + 1
+    }
+    if dm > atol { print("FAIL: ", label, " min mismatch\n"); failures = failures + 1 }
+    if dx > atol { print("FAIL: ", label, " max mismatch\n"); failures = failures + 1 }
 }
 
 fn main() {
@@ -178,6 +247,90 @@ fn main() {
 
     print("  token_embd_norm.weight (F32 cross-check)\n")
     probe(f_tenorm, 2048, 2048)
+    gguf_close()
+
+    // ---------------------------------------------------------------
+    // Q5_K and Q8_0. These dtypes exist in NO LFM2 tensor, so they need a
+    // model that actually carries them. Both live in QUANTA-GW38-27B-IQ4,
+    // which also has Q4_K/Q6_K/IQ3_S/IQ4_XS -- so this load also proves the
+    // branch dispatch is per-tensor dtype, not per-model.
+    //
+    // Expected values are NOT from the Python oracle. Two hand-written Python
+    // transcriptions of Q5_K disagreed with each other on sum while agreeing on
+    // min/max, so these come from scripts/audit/c_oracle.c, which calls the real
+    // dequantize_row_q5_K / dequantize_row_q8_0 out of libggml-base. See the
+    // script's header for why that indirection is load-bearing.
+    print("-- Q5_K / Q8_0 model --\n")
+    if gguf_load(Q5Q8_PATH) < 0 { print("FAIL: cannot open Q5_K/Q8_0 model\n"); return 1 }
+    print("  tensors=", gguf_num_tensors(), " kv=", gguf_num_kv(), "\n")
+
+    let q5a = gguf_find_tensor("blk.3.attn_k.weight")
+    let q5b = gguf_find_tensor("blk.11.attn_k.weight")
+    let q8a = gguf_find_tensor("blk.1.ssm_beta.weight")
+    let q8b = gguf_find_tensor("blk.16.ssm_beta.weight")
+    if q5a < 0 || q5b < 0 || q8a < 0 || q8b < 0 {
+        print("FAIL: a required Q5_K/Q8_0 tensor was not found\n")
+        return 1
+    }
+
+    print("  blk.3.attn_k.weight (Q5_K, [5120,1024])\n")
+    //          sum        sumsq      min        max        window
+    check_oracle(q5a, 5120 * 1024, 4096,
+                 0.615401, 0.932176, -0.068733, 0.079718, "Q5_K blk.3.attn_k")
+    print("  blk.11.attn_k.weight (Q5_K, second layer)\n")
+    check_oracle(q5b, 5120 * 1024, 4096,
+                 -0.303321, 0.725723, -0.056386, 0.066370, "Q5_K blk.11.attn_k")
+    print("  blk.1.ssm_beta.weight (Q8_0, [5120,48])\n")
+    check_oracle(q8a, 5120 * 48, 4096,
+                 0.816602, 0.580516, -0.064434, 0.044934, "Q8_0 blk.1.ssm_beta")
+    print("  blk.16.ssm_beta.weight (Q8_0, second)\n")
+    check_oracle(q8b, 5120 * 48, 2048,
+                 -1.099899, 0.334722, -0.076667, 0.061769, "Q8_0 blk.16.ssm_beta")
+
+    // This model also carries IQ3_S (dtype 21, 75 tensors) and IQ4_XS
+    // (dtype 23, 293 tensors). Neither is implemented natively, so both must
+    // fail EXPLICITLY -- a silent zero-fill is indistinguishable from a real
+    // all-zero tensor and would poison the forward pass.
+    //
+    // Note this also proves dispatch is per-tensor dtype, not per-model: one
+    // file, five dtypes, four wired.
+    let iq4 = gguf_find_tensor("blk.0.attn_qkv.weight")
+    let iq3 = gguf_find_tensor("token_embd.weight")
+    if iq4 < 0 { print("FAIL: IQ4_XS probe tensor missing\n"); return 1 }
+    if iq3 < 0 { print("FAIL: IQ3_S probe tensor missing\n"); return 1 }
+    if gguf_tensor_dtype(iq4) != 23 { print("FAIL: IQ4_XS probe is dtype ", gguf_tensor_dtype(iq4), "\n"); return 1 }
+    if gguf_tensor_dtype(iq3) != 21 { print("FAIL: IQ3_S probe is dtype ", gguf_tensor_dtype(iq3), "\n"); return 1 }
+
+    // gguf_tensor_supported() must let a caller refuse BEFORE allocating. Using
+    // token_embd.weight (dtype 21, 1.27e9 elements) as the probe is deliberate:
+    // materializing it as f64 would need 10.2 GB and blow the 6 GB scope, so
+    // this also pins the check-ahead-of-allocation contract.
+    if gguf_tensor_supported(iq3) != 0 {
+        print("FAIL: IQ3_S (dtype 21) reports supported -- it is not implemented\n")
+        failures = failures + 1
+    }
+    if gguf_tensor_supported(iq4) != 0 {
+        print("FAIL: IQ4_XS (dtype 23) reports supported -- it is not implemented\n")
+        failures = failures + 1
+    }
+    print("  IQ3_S (dtype 21, 1.27e9 elem) refused before allocating\n")
+    print("  IQ4_XS (dtype 23) refused before allocating\n")
+
+    // And the wired dtypes in the SAME file must still report supported and
+    // read -- if the guard were too broad it would swallow everything.
+    let okq = gguf_find_tensor("blk.3.attn_k.weight")
+    if gguf_tensor_supported(okq) != 1 {
+        print("FAIL: Q5_K does not report supported\n")
+        failures = failures + 1
+    }
+    // read_tensor_f64 returns a 1/0 SUCCESS FLAG, not an element count.
+    // A Q5_K [5120,1024] tensor reads 5242880 elements; do not assert on rok.
+    let nok = gguf_tensor_nelements(okq)
+    let bok = mem_alloc(nok * 8)
+    let rok = read_tensor_f64(okq, bok)
+    if rok != 1 { print("FAIL: Q5_K in the same file did not report success\n"); failures = failures + 1 }
+    else { print("  Q5_K in the same file still reads (", nok, " elements)\n") }
+    mem_free(bok)
     gguf_close()
 
     print("\n")
