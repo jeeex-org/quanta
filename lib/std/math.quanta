@@ -49,9 +49,26 @@ fn imax(a, b) {
 // they are re-provided here with explicit f64 typing so the result vreg is
 // tagged and arithmetic downstream stays on the float path.
 //
-// Note the `-> f64` on the signature. Without it the return is inferred as an
-// integer and the caller divides bit patterns -- the same failure that made
-// `import std/math` turn abs(-5.0) / 2.0 into 9223372036854.775808.
+// That note is now HISTORICAL. The emitter grew real SSE fmin/fmax builtins
+// (features.quanta:574-575, emitter.quanta:3643) -- comisd+cmov, branchless --
+// so `fmin`/`fmax` became hardwired BUILTIN names that a user fn cannot shadow.
+// That freed `min`/`max` again, and the integer forms are restored below as
+// `min`/`max` so `min(2,3)` resolves the way callers expect. The float forms
+// stay on `fmin`/`fmax`, which the emitter now lowers directly.
+//
+// An untyped `fn min` is correct here BECAUSE the arguments decide the path:
+// the builtin fmin is only selected for a call whose resolved name is `fmin`,
+// so `min` on two ints keeps the integer compare.
+fn min(a, b) {
+  if a < b { return a }
+  return b
+}
+
+fn max(a, b) {
+  if a > b { return a }
+  return b
+}
+
 fn fmin(a: f64, b: f64) -> f64 {
   if a < b { return a }
   return b
