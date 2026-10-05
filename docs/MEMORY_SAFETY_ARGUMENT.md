@@ -1,5 +1,10 @@
 # Quanta Memory-Safety Argument (v0.0.169)
 
+> **Currency:** written against `0.0.169`; the tree is now `0.0.223`.
+> Not re-verified against current source. Read `compiler/0.0.223/WIP.md`
+> for the measured current state, and treat anything below as design intent
+> rather than a description of today's compiler.
+
 > Companion to `docs/SAFETY_MANUAL.md` (§6.3) and `docs/SECURITY_TOOLING.md`
 > (§6). This document states, rigorously and honestly, what memory-safety
 > property Quanta's native compiler currently HAS, HOW it is enforced, and

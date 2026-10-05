@@ -1,5 +1,10 @@
 # Quanta Language Specification (v0.0.169)
 
+> **Currency:** written against `0.0.169`; the tree is now `0.0.223`.
+> Not re-verified against current source. Read `compiler/0.0.223/WIP.md`
+> for the measured current state, and treat anything below as design intent
+> rather than a description of today's compiler.
+
 > Status: DRAFT / WORKING SPECIFICATION. Derived from the self-hosting
 > compiler source at `compiler/0.0.169/` (x86-64 native AOT; AArch64 backend planned POST-0.1.0).
 > This document is the authoritative definition of Quanta semantics for

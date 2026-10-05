@@ -1,5 +1,10 @@
 # Quanta Safety Manual & Qualification Status
 
+> **Currency:** written against `0.0.169`; the tree is now `0.0.223`.
+> Not re-verified against current source. Read `compiler/0.0.223/WIP.md`
+> for the measured current state, and treat anything below as design intent
+> rather than a description of today's compiler.
+
 > Companion to `docs/SPEC.md`.
 > Purpose: record the safety-relevant properties of the Quanta native
 > compiler, the evidence supporting each claim, and the gaps that block

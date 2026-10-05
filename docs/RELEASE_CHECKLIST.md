@@ -56,7 +56,7 @@ These are non-negotiable. Violating any of them is a gate failure by itself.
    a fallback to downgrade to. ("Make sure you keep fix forward... never revert
    to older version unless absolutely necessary.")
 9. **All docs in sync after EVERY version.** roadmap/quanta.md, SPEC,
-   STATE.md, and this checklist must agree on version numbers, status,
+   WIP.md, and this checklist must agree on version numbers, status,
    feature claims. ("roadmap/quanta.md and SPEC in sync. All docs must be in sync
    after completing each version." / "every in sync?")
 10. **Mandatory gate layers — never drop any.** functional, extern-c, security,
@@ -115,7 +115,7 @@ These are non-negotiable. Violating any of them is a gate failure by itself.
 - Current stable compiler: **0.0.169** (2026-08-27)
 - Golden binary: `compiler/0.0.169/bin/x86/qc`
 - Self-host fixpoint md5: `a4affa951d64304946862358316240c1` (B==C byte-identical)
-- Per-version state is recorded in `compiler/<VER>/STATE.md` and MUST be updated
+- Per-version state is recorded in `compiler/<VER>/WIP.md` and MUST be updated
   each promotion.
 
 ---
@@ -153,7 +153,7 @@ md5sum /tmp/f1.bin /tmp/f2.bin /tmp/f3.bin | awk '{print $1}' | uniq | wc -l   #
 rm -f /tmp/f1.bin /tmp/f2.bin /tmp/f3.bin
 ```
 - [ ] distinct md5 == 1 (all three stages byte-identical). Record the md5 in
-      `compiler/<NEXT>/STATE.md`. Each version has its OWN fixpoint md5 — what
+      `compiler/<NEXT>/WIP.md`. Each version has its OWN fixpoint md5 — what
       matters is internal B==C, not matching any older golden.
 
 ## 4. Functional smoke (CORE language only — no stdlib; stdlib is deferred)
@@ -198,7 +198,7 @@ QC=./compiler/$(cat VERSION)/bin/x86/qc bash test_suites/scripts/run_tests.sh
 ## 8. Doc/rule sync (after each version — rule #9)
 - [ ] roadmap/quanta.md header `Current compiler: <VER>` == `cat VERSION`; the version's
       row is marked done with what was ACTUALLY verified (no stale "BLOCKED").
-- [ ] roadmap/quanta.md, SPEC.md, and `compiler/<VER>/STATE.md` agree on
+- [ ] roadmap/quanta.md, SPEC.md, and `compiler/<VER>/WIP.md` agree on
       version numbers, status, and feature claims.
 - [ ] No dangling references to removed paths (old `bootstrap/`, root `bin/`,
       stale `qc-bootstrap-*` seeds).
@@ -207,9 +207,9 @@ QC=./compiler/$(cat VERSION)/bin/x86/qc bash test_suites/scripts/run_tests.sh
 ## 9. Promote <NEXT> (only after 0–8 all pass) — then KEEP GOING (rule #7)
 - [ ] `compiler/<NEXT>/bin/x86/qc` is the promoted golden (committed).
 - [ ] Bump `VERSION` to <NEXT> via `echo "<NEXT>" > VERSION`.
-- [ ] Write/update `compiler/<NEXT>/STATE.md` (fixpoint md5, gate status, what landed).
+- [ ] Write/update `compiler/<NEXT>/WIP.md` (fixpoint md5, gate status, what landed).
 - [ ] Re-run §2 drift check against the new seed before declaring done.
-- [ ] Commit (only `src/`, `STATE.md`, docs, `test_suites/` tests, `EXPECTED.tsv`,
+- [ ] Commit (only `src/`, `WIP.md`, docs, `test_suites/` tests, `EXPECTED.tsv`,
       `VERSION` — NEVER `bin/`, `debug/`, or scratch). Push. Verify remote CI uses
       the new pin.
 - [ ] **If all green, do NOT stop — proceed to the next core** (rule #7).

@@ -1,5 +1,10 @@
 # Quanta Language Syntax Reference
 
+> **Currency:** written against `0.0.169`; the tree is now `0.0.223`.
+> Not re-verified against current source. Read `compiler/0.0.223/WIP.md`
+> for the measured current state, and treat anything below as design intent
+> rather than a description of today's compiler.
+
 Quanta is designed to be simple and supports multiple modes—interpreter, WASM, JIT, pre‑compiler (e.g., `quanta run`), and native compilation to binary (`qc`).
 
 This document describes the language as implemented by the current compiler in

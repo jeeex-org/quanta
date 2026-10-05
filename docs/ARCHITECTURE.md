@@ -1,5 +1,10 @@
 # Quanta — SME HANDOFF (read this first when taking over)
 
+> **Currency:** written against `0.0.169`; the tree is now `0.0.223`.
+> Not re-verified against current source. Read `compiler/0.0.223/WIP.md`
+> for the measured current state, and treat anything below as design intent
+> rather than a description of today's compiler.
+
 Last updated: 2026-08-22. Author: JEEEX.ORG. Status: x86-64 (AArch64 backend planned POST-0.1.0)
 native AOT compiler verified + hardened; multi-mode architecture designed
 but only the native AOT backend is built.

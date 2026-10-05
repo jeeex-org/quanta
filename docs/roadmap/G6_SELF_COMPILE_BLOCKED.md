@@ -1,8 +1,28 @@
-# G6 — self-compile from module caches: BLOCKED by a structural fact
+# G6 — self-compile from module caches
 
-**Status: not achievable as written. G6 as specified requires a module boundary
-the compiler's source does not have. Not a bug in the cache, and not fixable by
-changing the cache.**
+**Status: SUPERSEDED — this finding no longer holds. The gate now passes G6.**
+
+Measured 2026-09-30 with binary `0768168f`, this document concluded:
+
+> not achievable as written. G6 as specified requires a module boundary
+> the compiler's source does not have.
+
+and recorded `modules cacheable: ok=3 fail=16 of 19`.
+
+That is no longer true. The current official gate reports:
+
+```
+qobj : GREEN  (module cache write/read/cache-only, G1+G3+G5+G4, plus G6 cache self-compile)
+```
+
+as of `0.0.223` (`6454f037`). The G4/G5 work that followed resolved the
+per-module cacheability problem this document identified — see
+`G4_TRANSITIVE_DESIGN.md` and `QOBJ_FEATURE_COVERAGE.md`.
+
+The rest of this document is kept because the original measurement is still the
+clearest record of *why* the problem existed, and because a future regression
+in cache self-compile would look exactly like this. **Do not read the
+conclusion above as current.**
 
 ## What G6 asks
 
