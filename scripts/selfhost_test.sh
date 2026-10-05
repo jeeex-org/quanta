@@ -21,6 +21,20 @@ REPO=/opt/tali/quanta
 # evidence for that source at all. SRC, QC0 and the gate binaries must all be
 # the tree actually being verified.
 V=$(cat $REPO/VERSION)
+# GUARD: compiler/VERSION must name the current stable, always.
+# It was left at 0.0.192 for 30 promotes because nothing read it and nothing
+# updated it, so it drifted silently while claiming to be authoritative. Nothing
+# here DEPENDS on it (this script and build_one.sh both read root VERSION), so a
+# stale pointer breaks nothing and no gate noticed. Assert the invariant here --
+# the self-host gate is the one place that must never run against a tree whose
+# version metadata is a lie.
+CV=$(cat $REPO/compiler/VERSION 2>/dev/null || echo MISSING)
+[ "$CV" = "$V" ] || { echo "  FAIL compiler/VERSION=$CV != VERSION=$V (must be current stable)"; exit 1; }
+# ...and that version must actually exist as a real compiler tree.
+[ -d "$REPO/compiler/$CV" ] || { echo "  FAIL compiler/$CV does not exist"; exit 1; }
+# And it must be the highest version present, or the pointer is behind.
+HIGHEST=$(ls -1 "$REPO/compiler" 2>/dev/null | grep -E '^[0-9]+\.[0-9]+\.[0-9]+$' | sort -t. -k1,1n -k2,2n -k3,3n | tail -1)
+[ "$CV" = "$HIGHEST" ] || { echo "  FAIL compiler/VERSION=$CV but $HIGHEST exists (not latest stable)"; exit 1; }
 SRC=$REPO/compiler/$V/src/x86
 QC0=${QC:-$REPO/compiler/$V/bin/x86/qc}
 [ -f "$QC0" ] || { echo "  FAIL no builder at $QC0"; exit 1; }
