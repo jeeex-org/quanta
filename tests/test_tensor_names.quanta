@@ -1,58 +1,130 @@
-import std/fs
+// Tensor-name enumeration via gguf_tensor_name_str().
+//
+// gguf_tensor_name() returns a RAW C pointer into the mmap'd header region. That
+// is fine for byte comparison -- it is how gguf_find_tensor matches -- but it is
+// not a string: printing it emits an address ("name@140353555505152"), and it
+// carries no length prefix, so len() on it reads the 8 bytes preceding it. The
+// weight table has to key on real strings, which is what this test exercises.
+//
+// Checks:
+//   - every one of the 266 descriptors materialises a non-empty string;
+//   - each body is NUL-terminated at exactly its reported length;
+//   - all names are distinct (a duplicate would make the table ambiguous);
+//   - a known name round-trips byte-for-byte and find_tensor agrees.
+//
+//   Q4 model: /opt/ai/models/quanta/QUANTA-LFM2.5-2.6Bv1-Q4_K_M.gguf
+//
+// Exit 0 = all names materialised cleanly.
+
 import std/gguf
 
-// Debug: print all tensor names
-fn main() {
-    let rc = gguf_load("/opt/ai/models/quanta/QUANTA-LFM2.5-2.6Bv1-Q4_K_M.gguf")
-    if rc != 0 { print("load failed\n"); return 1 }
-    
-    // Sanity-check the decoded names rather than just dumping bytes: the first
-    // record must be token_embd.weight with ndims=2, dims=[2048,128000], dtype=14.
-    // Compare the name BYTES rather than printing them: a raw mem_alloc buffer
-    // carries no 8-byte length header, so print() treats it as an integer and
-    // emits an address. Quanta strings need the header to be printable.
-    let t0 = gguf_tensor_name(0)
-    if mem_load8(t0 + 0) != 116 { print("FAIL name byte0 (want 't')\n") ; return 1 }
-    if mem_load8(t0 + 16) != 116 { print("FAIL name byte16 (want 't')\n") ; return 1 }
-    if gguf_tensor_ndims(0) != 2 { print("FAIL ndims\n") ; return 1 }
-    if gguf_tensor_dim(0, 0) != 2048 { print("FAIL dim0\n") ; return 1 }
-    if gguf_tensor_dim(0, 1) != 128000 { print("FAIL dim1\n") ; return 1 }
-    if gguf_tensor_dtype(0) != 14 { print("FAIL dtype\n") ; return 1 }
-    print("tensor[0]=token_embd.weight ndims=2 dims=[2048,128000] dtype=14\n")
+const Q4_PATH = "/opt/ai/models/quanta/QUANTA-LFM2.5-2.6Bv1-Q4_K_M.gguf"
 
-    print("tensors=")
-    print(gguf_num_tensors())
-    print("\n")
-    
+let failures = 0
+
+fn fail(msg) {
+    print("FAIL: ", msg, "\n")
+    failures = failures + 1
+}
+
+// Byte-compare a materialised string's body against raw bytes at `b`, for `n`
+// bytes. Both sides are handled as raw bytes so no string is ever passed as a
+// parameter (a string parameter is an opaque pointer in Quanta).
+fn body_equals(s, b, n) {
     let i = 0
-    let n = gguf_num_tensors()
     while i < n {
-        // gguf_tensor_name() does no bounds check of its own -- read_tensor_info()
-        // allocates exactly n_tensors records, so index n is one past the table.
-        // Without this guard the loop still runs a 267th iteration, reads
-        // gguf_tensor_name(266), and dereferences whatever follows the table.
-        if i >= n { print("FAIL past end\n") ; return 1 }
-        let tname = gguf_tensor_name(i)
-        print("[")
-        print(i)
-        print("] ")
-        // Print the name character by character
-        let j = 0
-        while j < 64 {
-            let c = mem_load8(tname + j)
-            if c == 0 { j = 64 }
-            else {
-                // Print as character (simple: just print the byte value)
-                print(c)
-                print(" ")
-                j = j + 1
-            }
-        }
-        print("\n")
+        if mem_load8(s + 8 + i) != mem_load8(b + i) { return 0 }
         i = i + 1
     }
-    
-    print("PASS\n")
+    return 1
+}
+
+fn main() {
+    print("=== tensor name enumeration ===\n")
+    if gguf_load(Q4_PATH) < 0 { print("FAIL: cannot open model\n"); return 1 }
+
+    let n = gguf_num_tensors()
+    print("  tensors=", n, "\n")
+    if n != 266 { fail("expected 266 tensors") }
+
+    let names = mem_alloc(n * 8)
+    let lens = mem_alloc(n * 8)
+    let total = 0
+    let empty = 0
+    let unterm = 0
+    let i = 0
+    while i < n {
+        let s = gguf_tensor_name_str(i)
+        let l = gguf_tensor_name_len(i)
+        if s == 0 || l == 0 { empty = empty + 1 }
+        // The body must be NUL-terminated at exactly l. A mismatch means the
+        // length scan overran into the next descriptor's name.
+        if s != 0 && mem_load8(s + 8 + l) != 0 { unterm = unterm + 1 }
+        mem_store(names + i * 8, s)
+        mem_store(lens + i * 8, l)
+        total = total + l
+        i = i + 1
+    }
+    print("  materialised=", n, " total_name_bytes=", total, "\n")
+    if empty > 0 { print("FAIL: ", empty, " names were empty\n"); failures = failures + 1 }
+    if unterm > 0 { print("FAIL: ", unterm, " names not NUL-terminated at their length\n"); failures = failures + 1 }
+
+    // Distinctness. 266^2/2 = 35k byte comparisons over short names; cheap.
+    let dup = 0
+    i = 0
+    while i < n {
+        let j = i + 1
+        while j < n {
+            let li = mem_load(lens + i * 8)
+            if li == mem_load(lens + j * 8) {
+                if body_equals(mem_load(names + i * 8), mem_load(names + j * 8) + 8, li) == 1 { dup = dup + 1 }
+            }
+            j = j + 1
+        }
+        i = i + 1
+    }
+    print("  duplicate_pairs=", dup, "\n")
+    if dup > 0 { fail("tensor names are not unique") }
+
+    // prints() takes a real string, which is exactly what the materialiser is
+    // for -- these lines could not be produced from gguf_tensor_name() at all.
+    print("  first descriptors:\n")
+    i = 0
+    while i < 4 {
+        prints("    ")
+        prints(mem_load(names + i * 8))
+        print("  len=", mem_load(lens + i * 8), "\n")
+        i = i + 1
+    }
+    print("  last descriptor:\n    ")
+    prints(mem_load(names + (n - 1) * 8))
+    print("  len=", mem_load(lens + (n - 1) * 8), "\n")
+
+    // Round-trip: the materialised bytes equal the literal, and find_tensor on
+    // the literal returns the same index.
+    let idx0 = gguf_find_tensor("blk.0.ffn_gate.weight")
+    if idx0 < 0 {
+        fail("blk.0.ffn_gate.weight not found")
+    } else {
+        let want = "blk.0.ffn_gate.weight"
+        let wl = len(want)
+        if mem_load(lens + idx0 * 8) != wl {
+            fail("round-trip length mismatch")
+        } else {
+            if body_equals(mem_load(names + idx0 * 8), want + 8, wl) == 0 { fail("round-trip bytes mismatch") }
+        }
+        prints("  round-trip ok: ")
+        prints(mem_load(names + idx0 * 8))
+        print(" len=", wl, " idx=", idx0, "\n")
+    }
+
     gguf_close()
+
+    print("\n")
+    if failures > 0 {
+        print("test_tensor_names: ", failures, " FAILURES\n")
+        return 1
+    }
+    print("test_tensor_names: all pass\n")
     return 0
 }

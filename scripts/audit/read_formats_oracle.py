@@ -273,7 +273,11 @@ def summarize(vals):
 PROBES = [
     (Q4_PATH, 'blk.0.ffn_norm.weight', 2048),
     (Q4_PATH, 'blk.0.ffn_gate.weight', 8192),
-    (Q4_PATH, 'blk.0.ffn_down.weight', 8192),
+    # The Q6_K window MUST match the native test's 4096 elements. It read 8192
+    # here before, which made the two sides reduce different prefixes and report
+    # different sums (0.707706 vs -0.074374) -- a window mismatch, not a
+    # dequantizer defect.
+    (Q4_PATH, 'blk.0.ffn_down.weight', 4096),
     (Q4_PATH, 'blk.0.shortconv.conv.weight', 6144),
     (Q4_PATH, 'token_embd_norm.weight', 2048),
     (F16_PATH, 'blk.0.ffn_norm.weight', 2048),

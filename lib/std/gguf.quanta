@@ -193,6 +193,44 @@ fn gguf_load(path) {
 }
 
 fn gguf_tensor_name(idx) { return mem_load(gguf_tensor_data + idx * TINFO_SIZE) }
+// Materialise a tensor's name as a real Quanta string object.
+//
+// gguf_tensor_name() returns the RAW C pointer into the mmap'd header region.
+// It is usable for byte comparison (that is how gguf_find_tensor works) but not
+// for anything else: printing it emits the address ("name@140353555505152") and
+// the pointer is not length-prefixed, so len()/str operations read whatever
+// 8 bytes precede it. The weight table needs real strings to key on.
+//
+// The string object layout is [i64 length][bytes...], matching str::substr and
+// the emitter's str() builtin. The GGUF name is NUL-terminated, so the length is
+// found by scanning for the terminator rather than stored anywhere.
+fn gguf_tensor_name_str(idx) {
+    let p = gguf_tensor_name(idx)
+    if p == 0 { return 0 }
+    let n = 0
+    while mem_load8(p + n) != 0 { n = n + 1 }
+    if n == 0 { return 0 }
+    let buf = mem_alloc((n + 9 + 7) / 8)
+    mem_store(buf, n)
+    let i = 0
+    while i < n {
+        mem_store8(buf + 8 + i, mem_load8(p + i))
+        i = i + 1
+    }
+    return buf
+}
+
+// Number of bytes in a tensor's name, excluding the NUL terminator. This is a
+// length, not a string, so it is safe to call from a context where a string
+// cannot be passed around.
+fn gguf_tensor_name_len(idx) {
+    let p = gguf_tensor_name(idx)
+    if p == 0 { return 0 }
+    let n = 0
+    while mem_load8(p + n) != 0 { n = n + 1 }
+    return n
+}
+
 fn gguf_tensor_dtype(idx) { return mem_load(gguf_tensor_data + idx * TINFO_SIZE + 16) }
 // Absolute file offset of a tensor's data. The GGUF header stores each
 // tensor's offset RELATIVE to the start of the tensor-data section, so

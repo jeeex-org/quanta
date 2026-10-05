@@ -1,0 +1,58 @@
+import std/fs
+import std/gguf
+
+// Debug: print all tensor names
+fn main() {
+    let rc = gguf_load("/opt/ai/models/quanta/QUANTA-LFM2.5-2.6Bv1-Q4_K_M.gguf")
+    if rc != 0 { print("load failed\n"); return 1 }
+    
+    // Sanity-check the decoded names rather than just dumping bytes: the first
+    // record must be token_embd.weight with ndims=2, dims=[2048,128000], dtype=14.
+    // Compare the name BYTES rather than printing them: a raw mem_alloc buffer
+    // carries no 8-byte length header, so print() treats it as an integer and
+    // emits an address. Quanta strings need the header to be printable.
+    let t0 = gguf_tensor_name(0)
+    if mem_load8(t0 + 0) != 116 { print("FAIL name byte0 (want 't')\n") ; return 1 }
+    if mem_load8(t0 + 16) != 116 { print("FAIL name byte16 (want 't')\n") ; return 1 }
+    if gguf_tensor_ndims(0) != 2 { print("FAIL ndims\n") ; return 1 }
+    if gguf_tensor_dim(0, 0) != 2048 { print("FAIL dim0\n") ; return 1 }
+    if gguf_tensor_dim(0, 1) != 128000 { print("FAIL dim1\n") ; return 1 }
+    if gguf_tensor_dtype(0) != 14 { print("FAIL dtype\n") ; return 1 }
+    print("tensor[0]=token_embd.weight ndims=2 dims=[2048,128000] dtype=14\n")
+
+    print("tensors=")
+    print(gguf_num_tensors())
+    print("\n")
+    
+    let i = 0
+    let n = gguf_num_tensors()
+    while i < n {
+        // gguf_tensor_name() does no bounds check of its own -- read_tensor_info()
+        // allocates exactly n_tensors records, so index n is one past the table.
+        // Without this guard the loop still runs a 267th iteration, reads
+        // gguf_tensor_name(266), and dereferences whatever follows the table.
+        if i >= n { print("FAIL past end\n") ; return 1 }
+        let tname = gguf_tensor_name(i)
+        print("[")
+        print(i)
+        print("] ")
+        // Print the name character by character
+        let j = 0
+        while j < 64 {
+            let c = mem_load8(tname + j)
+            if c == 0 { j = 64 }
+            else {
+                // Print as character (simple: just print the byte value)
+                print(c)
+                print(" ")
+                j = j + 1
+            }
+        }
+        print("\n")
+        i = i + 1
+    }
+    
+    print("PASS\n")
+    gguf_close()
+    return 0
+}
