@@ -882,3 +882,87 @@ Verified in isolation first: bf16 [1.0, -2.0, 0.5, 3.0] round-trips exactly.
 
 Still zero local fixtures, so still unverified natively: Q2_K, Q3_K, Q4_1, Q5_0,
 Q5_1, Q8_1, Q8_K. Upstream exports dequantizers for all of those except Q8_1.
+
+## 0.0.225 — uniform-scale GGUF formats: Q2_K, Q3_K, Q4_1, Q5_0, Q5_1, Q8_K
+
+The remaining legacy row-storage formats are now natively supported. Supported
+dtype IDs in `lib/std/gguf.quanta` are now:
+
+    0 F32   1 F16   2 Q4_0   3 Q4_1   6 Q5_0   7 Q5_1   8 Q8_0
+   10 Q2_K 11 Q3_K 12 Q4_K 13 Q5_K 14 Q6_K 15 Q8_K  30 BF16
+
+**Q8_1 (9) is deliberately still unsupported and must stay that way at the
+dequantizer level.** It is not a row-storage format: upstream exports no
+`dequantize_row_q8_1` because its `qs[]` bytes have no per-element meaning on
+their own. They are consumed as int8 multipliers inside `vec_dot`, paired with a
+matching weight block. Supporting Q8_1 means writing that paired matvec kernel,
+not adding a dequant function. An earlier hand-written `deq_q8_1` invented
+semantics and is discredited.
+
+### Verification boundary
+
+None of these six formats appears in any local GGUF, so they cannot be verified
+against a real model. They are verified against committed block fixtures:
+
+- `tests/fixtures/blocks_<fmt>.bin` — raw quantized blocks, produced ONCE by
+  `scripts/audit/gen_fixtures.py` calling upstream `quantize_row_*_ref` and
+  `dequantize_row_*` out of `/opt/ai/llama.cpp/bin/libggml-base.so`.
+- The expected reductions are baked into `tests/test_read_formats.quanta` as
+  literals. The test never invokes the generator or the shared library.
+- Reading the block, dequantizing it, and computing sum/sumsq/min/max all happen
+  in Quanta. Only the one-time quantization is foreign — a native Quanta
+  quantizer would share any layout or arithmetic mistake with the native
+  dequantizer and would happily agree with itself.
+
+Expected values are the ROUND-TRIPPED ones, not the original f32 input. A 2-bit
+quantizer discards most of its input, so comparing against the input would demand
+an exact dequantizer for a format defined by being inexact.
+
+### Defects found and fixed while bringing these up
+
+1. **`read_block_f64()` added.** `read_tensor_f64()` dispatched off a GGUF file
+   on disk. Fixture tests (and any future direct kernel caller) have raw bytes
+   and no file, so the dispatch table is now factored out and shared. A dtype can
+   no longer be supported in one entry point and missing in the other.
+
+2. **Q2_K field order.** `scales[16]` is at block offset **0**, `qs[64]` at 16,
+   `d` at 80, `dmin` at 82. Reading `d` at +64 returns a garbage half
+   (`d = -0.000195` instead of ~0.0018) and inflates every element by 4e5. The
+   scales come FIRST in `block_q2_K`, unlike most other K formats.
+
+3. **Q2_K/Q3_K pass offset.** The output index must advance by 128 per
+   128-element pass. Without `pass * 128` every pass overwrote pass 0, which
+   looks like a plausible tensor rather than an error.
+
+4. **Q3_K hmask polarity inverted.** Upstream is
+   `low2 - ((hm & m) ? 0 : 4)`: the bit being SET means the high bit was NOT
+   consumed, so subtract 0. Written as `(hi << 2)` it compiles, runs, and yields
+   values wrong by exactly the 4-offset — the failure mode is silently plausible
+   output, not a crash. The parser also rejects `!=` inside that expression form,
+   so the correction is an explicit `sub` branch.
+
+5. **Q3_K SWAR mask constants were mistyped.** `km1` was written as `75796967`,
+   which is `0x48491e7` — not `0x03030303` (`50529027`). This is the single
+   worst defect in the batch: a garbage mask still compiles and still produces
+   plausible-looking scale bytes. Worth noting that the initial suspicion landed
+   on the compiler's `&` operator, and an exhaustive runtime-operand sweep of
+   `&` came back clean — the constant, not the codegen, was wrong. Both masks are
+   now decimal literals with a comment giving the hex.
+
+6. **Q8_K int8 sign extension.** `mem_load8()` returns 0..255 **unsigned**
+   (measured, not assumed). A bare `q - 256` maps 0..127 to -256..-129 and
+   inflates every magnitude. Correct form branches on bit 7.
+
+### Not attempted
+
+IQ, MXFP4, NVFP4, Q1_0 and Q2_0 families. These need codebooks and
+format-specific unpacking plus their own matvec paths; they are not reachable
+from the uniform-scale dequantizer dispatch.
+
+### Still open
+
+The LFM2 forward path remains unimplemented: tokenizer/detokenizer with
+`pre='lfm2'`, embedding wiring, short-convolution execution and cache,
+attention with RoPE and KV cache, logits, sampling, stopping, generation. Full
+f64 materialization is ~20.1 GB against a verified 6 GB scope, so bounded or
+quantized in-place weight access stays mandatory.

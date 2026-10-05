@@ -402,13 +402,72 @@ fn gguf_dtype_supported(dtype) {
     if dtype == 12 { return 1 }  // Q4_K
     if dtype == 13 { return 1 }  // Q5_K
     if dtype == 14 { return 1 }  // Q6_K
+    if dtype == 3 { return 1 }   // Q4_1
+    if dtype == 6 { return 1 }   // Q5_0
+    if dtype == 7 { return 1 }   // Q5_1
+    if dtype == 10 { return 1 }  // Q2_K
+    if dtype == 11 { return 1 }  // Q3_K
+    if dtype == 15 { return 1 }  // Q8_K
     if dtype == 30 { return 1 }  // BF16
+    // NOTE: Q8_1 (9) is deliberately ABSENT and must stay absent. It is not a
+    // row-storage format -- upstream exports no dequantize_row_q8_1 because it
+    // has no per-element meaning. Its qs[] bytes are only ever consumed as int8
+    // multipliers inside vec_dot, paired with a matching weight block. A
+    // "dequantizer" for it would have to invent semantics, and an earlier
+    // hand-written deq_q8_1 did exactly that. Supporting Q8_1 means a matvec
+    // kernel, not a dequant function.
     return 0
 }
 
 // TRUE when this tensor's dtype can be materialized natively.
 fn gguf_tensor_supported(idx) {
     return gguf_dtype_supported(gguf_tensor_dtype(idx))
+}
+
+// read_block_f64(dtype, raw, nelem, out): dequantize a RAW block buffer that the
+// caller already has in memory, without a GGUF file in the picture.
+//
+// Split out from read_tensor_f64() so fixture-based tests (and any future
+// direct kernel use) can hand over bytes and get f64 out, instead of the only
+// entry point being "point me at a tensor in a model on disk". Both share the
+// same dispatch table below, so a dtype cannot be supported in one and missing
+// in the other.
+//
+// `raw` must hold exactly gguf_nbytes(dtype, nelem) bytes.
+fn read_block_f64(dtype, raw, nelem, out) {
+    if gguf_dtype_supported(dtype) == 0 { return 0 }
+    if dtype == 0 {
+        dequant_f32(raw, nelem, out)
+    } else if dtype == 1 {
+        dequant_f16(raw, nelem, out)
+    } else if dtype == 12 {
+        dequant_q4k(raw, nelem, out)
+    } else if dtype == 13 {
+        dequant_q5k(raw, nelem, out)
+    } else if dtype == 14 {
+        dequant_q6k(raw, nelem, out)
+    } else if dtype == 8 {
+        dequant_q8_0(raw, nelem, out)
+    } else if dtype == 2 {
+        dequant_q4_0(raw, nelem, out)
+    } else if dtype == 30 {
+        dequant_bf16(raw, nelem, out)
+    } else if dtype == 3 {
+        dequant_q4_1(raw, nelem, out)
+    } else if dtype == 6 {
+        dequant_q5_0(raw, nelem, out)
+    } else if dtype == 7 {
+        dequant_q5_1(raw, nelem, out)
+    } else if dtype == 10 {
+        dequant_q2k(raw, nelem, out)
+    } else if dtype == 11 {
+        dequant_q3k(raw, nelem, out)
+    } else if dtype == 15 {
+        dequant_q8k(raw, nelem, out)
+    } else {
+        return 0
+    }
+    return 1
 }
 
 fn read_tensor_f64(idx, buf) {
@@ -477,6 +536,24 @@ fn read_tensor_f64(idx, buf) {
         lseek(gguf_fd, offset, 0)
         file_read(gguf_fd, raw, n)
         dequant_bf16(raw, nelem, buf)
+        mem_free(raw)
+    } else if dtype == 3 {
+        dequant_q4_1(raw, nelem, buf)
+        mem_free(raw)
+    } else if dtype == 6 {
+        dequant_q5_0(raw, nelem, buf)
+        mem_free(raw)
+    } else if dtype == 7 {
+        dequant_q5_1(raw, nelem, buf)
+        mem_free(raw)
+    } else if dtype == 10 {
+        dequant_q2k(raw, nelem, buf)
+        mem_free(raw)
+    } else if dtype == 11 {
+        dequant_q3k(raw, nelem, buf)
+        mem_free(raw)
+    } else if dtype == 15 {
+        dequant_q8k(raw, nelem, buf)
         mem_free(raw)
     } else {
         // Explicit failure. An unsupported dtype must NOT silently return 0,
@@ -1022,6 +1099,289 @@ fn dequant_bf16(raw, nelements, out) {
 // ---------------------------------------------------------------- F16 (type 1)
 //
 // 1 value / 2 bytes, no quantisation. Just the widening.
+// --------------------------------------------------------------- Q4_1 (type 3)
+//
+// 32 values / 20 bytes. Two scales -- delta AND min -- so unlike Q4_0 the
+// reconstruction is affine, not multiplicative:
+//     y = q*d + m
+// Element order is the split-nibble order shared by every Q4x format: the low
+// nibble of byte j is element j, the HIGH nibble is element j+16. Not
+// interleaved.
+fn dequant_q4_1(raw, nelements, out) {
+    let n_blocks = nelements / 32
+    let bi = 0
+    while bi < n_blocks {
+        let bo = bi * 20
+        let d = f16_to_f64(raw + bo)
+        let m = f16_to_f64(raw + bo + 2)
+        let j = 0
+        while j < 16 {
+            let qb = mem_load8(raw + bo + 4 + j)
+            let lo = qb & 15
+            let hi = qb >> 4
+            mem_store(out + (bi * 32 + j) * 8, fadd(fmul(d, i2f(lo)), m))
+            mem_store(out + (bi * 32 + 16 + j) * 8, fadd(fmul(d, i2f(hi)), m))
+            j = j + 1
+        }
+        bi = bi + 1
+    }
+}
+
+// --------------------------------------------------------------- Q5_0 (type 6)
+//
+// 32 values / 22 bytes. Delta only (no min), but 5-bit: the low 4 bits come
+// from the nibble and the 5th bit from a 32-bit `qh` read little-endian, which
+// is why qh must be assembled from 4 bytes by hand rather than loaded as one.
+//
+// The -16 is the Q5 signed offset (5-bit range is -16..15).
+//
+// qh bit layout: element j's high bit is (qh >> j) & 1, and element j+16's is
+// (qh >> (j+16)) & 1. Upstream writes this as `((qh >> (j+0)) << 4) & 0x10`
+// and `((qh >> (j+12)) & 0x10)`, i.e. the same two bits moved into bit 4 so they
+// can be OR'd with a 4-bit nibble.
+fn dequant_q5_0(raw, nelements, out) {
+    let n_blocks = nelements / 32
+    let bi = 0
+    while bi < n_blocks {
+        let bo = bi * 22
+        let d = f16_to_f64(raw + bo)
+        let qh = mem_load32(raw + bo + 2)
+        let j = 0
+        while j < 16 {
+            let qb = mem_load8(raw + bo + 6 + j)
+            let h0 = (qh >> j) & 1
+            let h1 = (qh >> (j + 16)) & 1
+            let x0 = ((qb & 15) | (h0 << 4)) - 16
+            let x1 = ((qb >> 4) | (h1 << 4)) - 16
+            mem_store(out + (bi * 32 + j) * 8, fmul(d, i2f(x0)))
+            mem_store(out + (bi * 32 + 16 + j) * 8, fmul(d, i2f(x1)))
+            j = j + 1
+        }
+        bi = bi + 1
+    }
+}
+
+// --------------------------------------------------------------- Q5_1 (type 7)
+//
+// 32 values / 24 bytes. Q5_0 plus a min, so affine like Q4_1, and UNSIGNED:
+// the 5-bit value is 0..31 with no -16 offset.
+fn dequant_q5_1(raw, nelements, out) {
+    let n_blocks = nelements / 32
+    let bi = 0
+    while bi < n_blocks {
+        let bo = bi * 24
+        let d = f16_to_f64(raw + bo)
+        let m = f16_to_f64(raw + bo + 2)
+        let qh = mem_load32(raw + bo + 4)
+        let j = 0
+        while j < 16 {
+            let qb = mem_load8(raw + bo + 8 + j)
+            let h0 = (qh >> j) & 1
+            let h1 = (qh >> (j + 16)) & 1
+            let x0 = (qb & 15) | (h0 << 4)
+            let x1 = (qb >> 4) | (h1 << 4)
+            mem_store(out + (bi * 32 + j) * 8, fadd(fmul(d, i2f(x0)), m))
+            mem_store(out + (bi * 32 + 16 + j) * 8, fadd(fmul(d, i2f(x1)), m))
+            j = j + 1
+        }
+        bi = bi + 1
+    }
+}
+
+// --------------------------------------------------------------- Q8_K (type 15)
+//
+// 256 values / 292 bytes. The simplest K format and the only one that is not
+// sub-block scaled: a single f32 delta and 256 signed bytes.
+//     y = d * qs[j]
+// The 16 int16 bsums are block SUMS, used for activation quantization, and are
+// not part of dequantization -- reading them as data shifts every element.
+fn dequant_q8k(raw, nelements, out) {
+    let n_blocks = nelements / 256
+    let bi = 0
+    while bi < n_blocks {
+        let bo = bi * 292
+        // `d` is a raw f32, not f16 -- this is the one K block with a full-
+        // precision scale, so f16_to_f64 here would halve the mantissa.
+        let d = f32_to_f64(raw + bo)
+        let j = 0
+        while j < 256 {
+            let q = mem_load8(raw + bo + 4 + j)
+            // Sign-extend from int8. mem_load8() returns 0..255 UNSIGNED (measured,
+            // not assumed), so a bare `q - 256` maps 0..127 to -256..-129 and
+            // inflates every magnitude. Branch instead of biasing: `q & 0x80`
+            // set means negative.
+            let sv = q
+            if (q & 128) != 0 { sv = q - 256 }
+            mem_store(out + (bi * 256 + j) * 8, fmul(d, i2f(sv)))
+            j = j + 1
+        }
+        bi = bi + 1
+    }
+}
+
+// --------------------------------------------------------------- Q2_K (type 10)
+//
+// 256 values / 84 bytes. 16 groups of 16, each with a 4-bit scale AND a 4-bit
+// min packed in one scales byte (low nibble = scale, high nibble = min):
+//     y = d * (sc & 0xF) * q - dmin * (sc >> 4)
+//
+// Layout order matters twice over, and both are easy to get backwards:
+//   * quants are stored in FOUR passes of 64 (two halves of 32 bytes), each
+//     pass holding one 2-bit shift of 16+16 elements, so element order is
+//     NOT the flat order of the qs array;
+//   * the `q` cursor advances 32 bytes per 128-element pass, so the two 128-
+//     element halves of a super-block read from disjoint qs regions.
+fn dequant_q2k(raw, nelements, out) {
+    let n_blocks = nelements / 256
+    let bi = 0
+    while bi < n_blocks {
+        let bo = bi * 84
+        // Layout: scales[16]@+0, qs[64]@+16, f16 d@+80, f16 dmin@+82.
+        // The scales come FIRST in block_q2_K, not last -- reading d at +64
+        // returns a garbage half (d=-0.000195 instead of ~0.0018) and inflates
+        // every element by 4e5.
+        let d = f16_to_f64(raw + bo + 80)
+        let dmin = f16_to_f64(raw + bo + 82)
+        let is = 0
+        let yo = bi * 256
+        // n steps over 128-element passes; qcursor walks the qs region.
+        let pass = 0
+        while pass < 2 {
+            let qc = bo + 16 + pass * 32
+            let shift = 0
+            let j = 0
+            while j < 4 {
+                let sc = mem_load8(raw + bo + is)
+                let dl = fmul(d, i2f(sc & 15))
+                let ml = fmul(dmin, i2f(sc >> 4))
+                let l = 0
+                while l < 16 {
+                    let q = mem_load8(raw + qc + l)
+                    let v = (q >> shift) & 3
+                    mem_store(out + (yo + pass * 128 + j * 32 + l) * 8, fsub(fmul(dl, i2f(v)), ml))
+                    l = l + 1
+                }
+                is = is + 1
+                let sc2 = mem_load8(raw + bo + is)
+                let dl2 = fmul(d, i2f(sc2 & 15))
+                let ml2 = fmul(dmin, i2f(sc2 >> 4))
+                l = 0
+                while l < 16 {
+                    let q = mem_load8(raw + qc + 16 + l)
+                    let v = (q >> shift) & 3
+                    mem_store(out + (yo + pass * 128 + j * 32 + 16 + l) * 8, fsub(fmul(dl2, i2f(v)), ml2))
+                    l = l + 1
+                }
+                is = is + 1
+                shift = shift + 2
+                j = j + 1
+            }
+            pass = pass + 1
+        }
+        bi = bi + 1
+    }
+}
+
+// --------------------------------------------------------------- Q3_K (type 11)
+//
+// 256 values / 110 bytes. 16 groups of 16, each with a 6-bit scale, plus a
+// per-element high bit in `hmask`:
+//     y = d * (scale - 32) * (q_low2 - (hmask_bit ? 0 : 4))
+//
+// The 6-bit scales are stored PACKED 12 bytes, not one byte each, so they must
+// be unpacked before use. Upstream does this with 32-bit SWAR masks
+// (kmask1/kmask2) in one shot over four u32 words; doing it with four
+// independent 12-byte reads and a bit cursor avoids depending on 32-bit shifts
+// being correct, at the cost of being slower -- which is irrelevant here.
+fn dequant_q3k(raw, nelements, out) {
+    let n_blocks = nelements / 256
+    let bi = 0
+    while bi < n_blocks {
+        let bo = bi * 110
+        // Layout: hmask[32]@+0, qs[64]@+32, scales[12]@+96, f16 d@+108.
+        let d = f16_to_f64(raw + bo + 108)
+
+        // Unpack the 16 six-bit scales from 12 packed bytes, 8 per 32-bit word.
+        // Upstream does this with SWAR masks on four u32s; here the four
+        // resulting words are written to a 16-byte scratch and read back as
+        // bytes, so the per-byte extraction needs no 32-bit shift assumptions.
+        let a0 = mem_load32(raw + bo + 96)
+        let a1 = mem_load32(raw + bo + 100)
+        let tm = mem_load32(raw + bo + 104)
+        // 0x03030303 and 0x0f0f0f0f. Written as decimal because a hex literal
+        // is not worth the transcription risk here: a mistyped mask still
+        // compiles and still yields plausible-looking scales.
+        let km1 = 50529027
+        let km2 = 252645135
+        let n2 = ((a0 >> 4) & km2) | (((tm >> 4) & km1) << 4)
+        let n3 = ((a1 >> 4) & km2) | (((tm >> 6) & km1) << 4)
+        let n0 = (a0 & km2) | ((tm & km1) << 4)
+        let n1 = (a1 & km2) | (((tm >> 2) & km1) << 4)
+        let sb = mem_alloc(32)
+        let sp = sb + 8
+        mem_store(sp, n0)
+        mem_store(sp + 4, n1)
+        mem_store(sp + 8, n2)
+        mem_store(sp + 12, n3)
+
+        let is = 0
+        let yo = bi * 256
+        // Two 128-element passes. NOTE: upstream advances the `q` cursor by 32
+        // per pass but leaves `hm` pointing at the start of hmask for BOTH
+        // passes -- only the mask BIT index moves. Advancing hmask by pass is
+        // the natural mistake and silently corrupts the upper half.
+        let pass = 0
+        while pass < 2 {
+            let qc = bo + 32 + pass * 32
+            let shift = 0
+            let j = 0
+            while j < 4 {
+                let dl = fmul(d, i2f(mem_load8(sp + is) - 32))
+                let mbit = j + pass * 4
+                let l = 0
+                while l < 16 {
+                    let q = mem_load8(raw + qc + l)
+                    let hb = mem_load8(raw + bo + l)
+                    let hi = (hb >> mbit) & 1
+                    // hmask bit SET means the high bit was NOT consumed, so
+                    // subtract 0; bit CLEAR means it WAS, so subtract 4. This
+                    // polarity is the easy thing to invert: writing `(hi << 2)`
+                    // compiles, runs, and produces values that look plausible
+                    // but are wrong by exactly the 4-offset.
+                    let sub = 4
+                    if hi != 0 { sub = 0 }
+                    let v = ((q >> shift) & 3) - sub
+                    mem_store(out + (yo + pass * 128 + j * 32 + l) * 8, fmul(dl, i2f(v)))
+                    l = l + 1
+                }
+                is = is + 1
+                let dl2 = fmul(d, i2f(mem_load8(sp + is) - 32))
+                l = 0
+                while l < 16 {
+                    let q = mem_load8(raw + qc + 16 + l)
+                    let hb = mem_load8(raw + bo + 16 + l)
+                    let hi = (hb >> mbit) & 1
+                    // hmask bit SET means the high bit was NOT consumed, so
+                    // subtract 0; bit CLEAR means it WAS, so subtract 4. This
+                    // polarity is the easy thing to invert: writing `(hi << 2)`
+                    // compiles, runs, and produces values that look plausible
+                    // but are wrong by exactly the 4-offset.
+                    let sub = 4
+                    if hi != 0 { sub = 0 }
+                    let v = ((q >> shift) & 3) - sub
+                    mem_store(out + (yo + pass * 128 + j * 32 + 16 + l) * 8, fmul(dl2, i2f(v)))
+                    l = l + 1
+                }
+                is = is + 1
+                shift = shift + 2
+                j = j + 1
+            }
+            pass = pass + 1
+        }
+        bi = bi + 1
+    }
+}
+
 fn dequant_f16(raw, nelements, out) {
     let i = 0
     while i < nelements {

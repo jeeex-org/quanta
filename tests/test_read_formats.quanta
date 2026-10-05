@@ -114,6 +114,93 @@ fn probe(idx, nelem_full, nprobe) {
     mem_free(buf)
 }
 
+// ------------------------------------------------------------------ fixtures
+//
+// Q2_K, Q3_K, Q4_1, Q5_0, Q5_1 and Q8_K appear in NO local GGUF, so they are
+// verified against committed block fixtures instead. The fixtures were produced
+// ONCE by scripts/audit/gen_fixtures.py calling upstream llama.cpp's own
+// quantize_row_*_ref and dequantize_row_* out of libggml-base.so, then written
+// to tests/fixtures/blocks_<fmt>.bin. That script is not part of the test path:
+// nothing here shells out to it, and the expected numbers are baked in below.
+//
+// The reduction is deliberately done in QUANTA, not by the generator. Computing
+// sum/sumsq/min/max here means a mismatch surfaces as a Quanta failure with a
+// Quanta line number, instead of being adjudicated by the same foreign code
+// that produced the fixture.
+//
+// The expected values are the ROUND-TRIPPED ones, never the original f32
+// input: a 2-bit quantizer discards most of its input, so comparing against the
+// input would demand an exact dequantizer for a format defined by being inexact.
+fn check_fixture(path, dtype, nbytes, nelem, exp_sum, exp_sumsq, exp_min, exp_max, label) {
+    if gguf_dtype_supported(dtype) != 1 {
+        print("FAIL: ", label, " dtype ", dtype, " not reported supported\n")
+        failures = failures + 1
+        return
+    }
+    let fd = open(path, 0, 0)
+    if fd < 0 {
+        print("FAIL: ", label, " cannot open ", path, "\n")
+        failures = failures + 1
+        return
+    }
+    let sz = lseek(fd, 0, 2)
+    lseek(fd, 0, 0)
+    if sz != nbytes {
+        print("FAIL: ", label, " fixture is ", sz, " bytes, expected ", nbytes, "\n")
+        failures = failures + 1
+        close(fd)
+        return
+    }
+    let raw = mem_alloc(nbytes)
+    let got = read_raw(fd, raw, nbytes)
+    close(fd)
+    if got != nbytes {
+        print("FAIL: ", label, " short read ", got, "\n")
+        failures = failures + 1
+        mem_free(raw)
+        return
+    }
+    let out = mem_alloc(nelem * 8)
+    read_block_f64(dtype, raw, nelem, out)
+    mem_free(raw)
+
+    let sum = 0.0
+    let sumsq = 0.0
+    let mn = 0.0
+    let mx = 0.0
+    let i = 0
+    while i < nelem {
+        let v = f64of(mem_load(out + i * 8))
+        sum = sum + v
+        sumsq = sumsq + v * v
+        if i == 0 { mn = v; mx = v }
+        if v < mn { mn = v }
+        if v > mx { mx = v }
+        i = i + 1
+    }
+    mem_free(out)
+
+    let atol = 1e-4
+    let rtol = 1e-6
+    let ds = ab(sum - exp_sum)
+    let dq = ab(sumsq - exp_sumsq)
+    print("      got sum="); pf64(sum)
+    print(" sumsq="); pf64(sumsq)
+    print(" min="); pf64(mn)
+    print(" max="); pf64(mx)
+    print("\n")
+    if ds > atol + rtol * ab(exp_sum) {
+        print("FAIL: ", label, " sum off by "); pf64(ds); print("\n")
+        failures = failures + 1
+    }
+    if dq > atol + rtol * ab(exp_sumsq) {
+        print("FAIL: ", label, " sumsq off by "); pf64(dq); print("\n")
+        failures = failures + 1
+    }
+    if ab(mn - exp_min) > atol { print("FAIL: ", label, " min mismatch\n"); failures = failures + 1 }
+    if ab(mx - exp_max) > atol { print("FAIL: ", label, " max mismatch\n"); failures = failures + 1 }
+}
+
 // Report the tensor count / kv count for whichever model is open, and check the
 // descriptor count. The model is named by `path` purely so the failure line says
 // which one failed.
@@ -373,6 +460,27 @@ if gguf_load(BF16_PATH) < 0 { fail("cannot open BF16 model") }
     }
 }
 gguf_close()
+
+// ---- fixture-based formats (no local GGUF carries these) ----
+print("-- committed block fixtures (upstream-generated) --\n")
+    print("  q2_K (dtype 10, 2048 elems)\n")
+    check_fixture("tests/fixtures/blocks_q2_K.bin", 10, 672, 2048,
+                 2.003235, 10.830666, -0.141449, 0.133553, "q2_K")
+    print("  q3_K (dtype 11, 2048 elems)\n")
+    check_fixture("tests/fixtures/blocks_q3_K.bin", 11, 880, 2048,
+                 2.157348, 10.588071, -0.136971, 0.136971, "q3_K")
+    print("  q4_1 (dtype 3, 256 elems)\n")
+    check_fixture("tests/fixtures/blocks_q4_1.bin", 3, 160, 256,
+                 -0.089539, 1.433483, -0.124268, 0.124466, "q4_1")
+    print("  q5_0 (dtype 6, 256 elems)\n")
+    check_fixture("tests/fixtures/blocks_q5_0.bin", 6, 176, 256,
+                 -0.147537, 1.418340, -0.124268, 0.124512, "q5_0")
+    print("  q5_1 (dtype 7, 256 elems)\n")
+    check_fixture("tests/fixtures/blocks_q5_1.bin", 7, 192, 256,
+                 -0.187950, 1.429495, -0.124268, 0.124504, "q5_1")
+    print("  q8_K (dtype 15, 2048 elems)\n")
+    check_fixture("tests/fixtures/blocks_q8_K.bin", 15, 2336, 2048,
+                 1.192440, 10.625414, -0.124937, 0.124937, "q8_K")
 
 
     print("\n")

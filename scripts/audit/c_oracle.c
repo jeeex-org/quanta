@@ -55,7 +55,16 @@ typedef struct { uint16_t d; uint16_t m; uint8_t qs[QK4_0/2]; } block_q4_0;
 typedef struct { uint16_t d; uint16_t m; uint8_t qs[QK4_1/2]; } block_q4_1;
 typedef struct { uint16_t d; uint8_t  qh[4]; uint8_t qs[QK5_0/2]; } block_q5_0;
 typedef struct { uint16_t d; uint16_t m; uint8_t qh[4]; uint8_t qs[QK5_1/2]; } block_q5_1;
-typedef struct { float d; float s; uint8_t qs[QK8_1/4]; } block_q8_1;
+// NOTE: there is deliberately NO block_q8_1 typedef here, and no deq_q8_1.
+// An earlier version of this file declared a 20-byte {float d; float s;
+// uint8_t qs[8];} and wrote a decode for it. Both were wrong:
+//   - upstream block_q8_1 is 36 bytes: two 16-bit scale fields plus int8_t qs[32]
+//   - upstream has NO dequantize_row_q8_1 at all
+// Q8_1's qs[] bytes have no standalone per-element meaning; they are consumed
+// as int8 multipliers inside vec_dot, paired with a matching weight block. The
+// decode written here was invented, and it agreed with nothing except itself.
+// It has been removed rather than corrected, because there is nothing to
+// correct it TO. See WIP.md.
 
 // The real dequantizers. These are exported from libggml-base but not declared
 // in any installed ggml header, so they are declared here rather than
@@ -79,16 +88,6 @@ extern void dequantize_row_iq4_xs (const void *, float *, int64_t);
 // Q8_1 has no exported dequantize_row_* (it is only ever produced/consumed by
 // the Q8_1 intermediate path), so its per-element rule is the struct's own
 // definition: y = d*q_lo - s*q_hi over 32 four-bit pairs.
-static void deq_q8_1(const block_q8_1 *x, float *y, int64_t k) {
-    for (int64_t i = 0; i < k/32; i++) {
-        for (int j = 0; j < 16; j++) {
-            int v = x[i].qs[j];
-            y[i*32 + 2*j    ] = x[i].d * ((v & 0xF) - 8) - x[i].s * ((v >> 4) - 8);
-            y[i*32 + 2*j + 1] = x[i].d * ((v >> 4) - 8);
-        }
-    }
-}
-
 // One dispatch table for every format Quanta can read. A new format costs one
 // line here and one branch in read_tensor_f64(), and the two must agree.
 static int dequant_row(uint32_t tt, const void *base, float *y, int64_t n) {
@@ -116,7 +115,7 @@ static int dequant_row(uint32_t tt, const void *base, float *y, int64_t n) {
         case  6: dequantize_row_q5_0(base, y, n); return 0;
         case  7: dequantize_row_q5_1(base, y, n); return 0;
         case  8: dequantize_row_q8_0(base, y, n); return 0;
-        case  9: { for (int64_t b=0;b<n/32;b++) deq_q8_1((const block_q8_1*)base+b, y+b*32, 32); return 0; }
+        case  9: return -2;  // Q8_1: activation format, not row-storage. See note above.
         case 10: dequantize_row_q2_K(base, y, n); return 0;
         case 11: dequantize_row_q3_K(base, y, n); return 0;
         case 12: dequantize_row_q4_K(base, y, n); return 0;
