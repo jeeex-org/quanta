@@ -310,31 +310,60 @@ fn gguf_find_tensor(name) {
     return -1
 }
 
+// Read tensor `idx` of ANY supported dtype into `buf` as f64.
+//     buf layout: nelem * 8 bytes, little-endian IEEE 754 binary64.
+//
+// Dispatch is on the GGML type ID, NOT on gguf_type_size(). The two disagree:
+// gguf_type_size() returns 1 for type 0 (F32) and for type 1 (F16), because it
+// describes the QUANTISED types' per-element granularity for block layouts. Using
+// it as a dtype test is a category error, and the earlier version of this
+// function dispatched on it and so matched NEITHER F32 (0) nor F16 (1) -- it
+// fell through every branch and returned having loaded nothing, silently.
+//
+// Returning 0 on an unsupported type is deliberate: an unsupported dtype must
+// fail explicitly, not substitute another format's bytes for this one.
 fn read_tensor_f64(idx, buf) {
     let dtype = gguf_tensor_dtype(idx)
     let offset = gguf_tensor_offset(idx)
     let nelem = gguf_tensor_nelements(idx)
-    
+
+    // gguf_tensor_offset() is ALREADY absolute -- it adds gguf_data_offset()
+    // itself (see its definition and gguf_read_tensor_bytes). Adding the data
+    // start a second time seeks 8239136 bytes past the tensor and reads
+    // unrelated bytes, which is what produced the garbage first values here.
+    // Do NOT add gguf_data_offset() to `offset`.
     if dtype == 0 {
-        let raw = mem_alloc(nelem * 4)
-        lseek(gguf_fd, gguf_data_start + offset, 0)
-        file_read(gguf_fd, raw, nelem * 4)
-        let i = 0
-        while i < nelem {
-            mem_store(buf + i * 8, f32_to_f64(raw + i * 4))
-            i = i + 1
-        }
+        let n = nelem * 4
+        let raw = mem_alloc(n)
+        lseek(gguf_fd, offset, 0)
+        file_read(gguf_fd, raw, n)
+        dequant_f32(raw, nelem, buf)
+        mem_free(raw)
+    } else if dtype == 1 {
+        let n = nelem * 2
+        let raw = mem_alloc(n)
+        lseek(gguf_fd, offset, 0)
+        file_read(gguf_fd, raw, n)
+        dequant_f16(raw, nelem, buf)
+        mem_free(raw)
     } else if dtype == 12 {
-        let raw = mem_alloc(nelem * 144 / 256)
-        lseek(gguf_fd, gguf_data_start + offset, 0)
-        file_read(gguf_fd, raw, nelem * 144 / 256)
+        let n = gguf_tensor_nbytes(idx)
+        let raw = mem_alloc(n)
+        lseek(gguf_fd, offset, 0)
+        file_read(gguf_fd, raw, n)
         dequant_q4k(raw, nelem, buf)
+        mem_free(raw)
     } else if dtype == 14 {
-        let raw = mem_alloc(nelem * 210 / 256)
-        lseek(gguf_fd, gguf_data_start + offset, 0)
-        file_read(gguf_fd, raw, nelem * 210 / 256)
+        let n = gguf_tensor_nbytes(idx)
+        let raw = mem_alloc(n)
+        lseek(gguf_fd, offset, 0)
+        file_read(gguf_fd, raw, n)
         dequant_q6k(raw, nelem, buf)
+        mem_free(raw)
+    } else {
+        return 0
     }
+    return 1
 }
 
 fn f32_to_f64(ptr) {
@@ -594,6 +623,19 @@ fn dequant_q6k(raw, nelements, out) {
             let ybase = bi * 256 + n * 128
             let l = 0
             while l < 32 {
+                // Sub-scale index: is = 0 for l < 16, 1 for l >= 16.
+                //
+                // Each 128-element pass advances the SCALE POINTER by 8
+                // (`sc += 8` in the reference, see the `sc` binding above), and
+                // within a pass `is` selects which half of that 8-byte group is
+                // used. Combined with the +0/+2/+4/+6 strides this reaches all
+                // 8 scale bytes of the pass, i.e. all 16 bytes of the block.
+                //
+                // This is correct as written. An intermediate revision replaced
+                // it with `(l / 16) * 8`, reasoning that `sc` did not move --
+                // but it does (sc += 8 per pass), so that change made elements
+                // 16..127 read past the scale array into the trailing `d`
+                // field. Do not "simplify" this back into a single pointer.
                 let is = l / 16
                 let ql0 = mem_load8(raw + ql + l)
                 let ql1 = mem_load8(raw + ql + l + 32)

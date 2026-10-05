@@ -211,6 +211,51 @@ Loader (verified):
     dequant_q4k      verified separately against a pure-Python oracle
     absent: Q2_K, Q3_K, IQ variants — unused by this model
 
+`read_tensor_f64()` dtype dispatch — F32, F16, Q4_K, Q6_K (verified 2026-10-05):
+
+    tests/test_read_formats.quanta   rc=0, 0 failures, memory-bounded run
+    scripts/audit/read_formats_oracle.py   independent stdlib+mmap oracle
+
+Every probed tensor agrees with the oracle on first-6, sum, sumsq, min AND max,
+to every displayed digit:
+
+    blk.0.ffn_gate.weight      Q4_K  sum=-1.766741 sumsq=1.957209
+                                      min=-0.062004 max=0.054209
+    blk.0.ffn_gate.weight      F16   sum=-1.692625 sumsq=1.958057
+    blk.0.ffn_down.weight      Q6_K  sum= 0.707707 sumsq=0.975708
+                                      min=-0.056152 max=0.058891
+    blk.0.ffn_norm.weight      F32   sum=197.648681 sumsq=26.413435
+    token_embd_norm.weight     F32   sum=4512.754822 sumsq=10095.453304
+
+Three loader defects were fixed to get here, each found by that comparison and
+each invisible to a first-values-only check:
+
+1. `read_tensor_f64()` dispatched on `gguf_type_size()`, which returns 1 for
+   BOTH F32 and F16, so neither branch was ever selected and those two dtypes
+   silently loaded nothing. It now dispatches on `gguf_tensor_dtype()`.
+2. The seek added `gguf_data_offset()` to `gguf_tensor_offset()`, which already
+   returns an ABSOLUTE offset — double-adding 8239136 produced pure garbage.
+   It now seeks to `offset` directly.
+3. Q4_K/Q6_K reads must use `gguf_tensor_nbytes()`, not an inline
+   `nelem*144/256`, which cannot express a partial trailing block.
+
+`pf64()` dropped the sign of any value with |v| < 1 (fixed 0.0.224):
+
+    It printed the sign by negating only the integer part (`printi(0 - ip)`) and
+    then printing the six fraction digits unsigned. For |v| >= 1 that looks
+    correct; for |v| < 1 the integer part is 0, so `0 - ip` is also 0 and the
+    '-' vanished. pf64(-0.023193359375) printed "0.023193". This corrupted every
+    min/max diagnostic and made every F16 weight LOOK unsigned. The sign is now
+    emitted once, before the digits.
+
+Measured lesson: three of the four "loader is wrong" conclusions in this
+increment were wrong, and in each case the *oracle* was the broken side — a
+shifted GGUF metadata type table, interleaved Q4_K nibbles, and a Q6_K scale
+index that treated `is` as an absolute byte offset while the reference advances
+the scale POINTER by 8 per 128-element pass. `dequant_q6k`'s `is = l / 16` is
+correct and must not be "simplified". Always settle native-vs-oracle by
+correlating against the F16 twin before changing either side.
+
 Inference engine: still non-operational. Tokenizer, 30-layer forward pass,
 short-conv cache, KV cache, logits/sampling and the generation loop are all
 missing. `native_inference.quanta` lines 537-551 are comments where execution

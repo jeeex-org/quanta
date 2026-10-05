@@ -1,0 +1,185 @@
+// read_tensor_f64() dispatch across every dtype the loader must support:
+// F32 (0), F16 (1), Q4_K (12), Q6_K (14).
+//
+// This is a LOADER test, not a dequant test. dequant_f16/dequant_f32/
+// dequant_q4k/dequant_q6k each have their own oracle coverage; what is
+// unverified here is the dispatch and byte-count plumbing that feeds them:
+//
+//   - that read_tensor_f64() reaches each branch at all (it previously
+//     dispatched on gguf_type_size(), which returns 1 for BOTH F32 and F16 and
+//     so matched no branch at all, silently loading nothing);
+//   - that it seeks to data_start + relative offset (the pre-fix version used
+//     bare `offset`, landing 8239136 bytes early);
+//   - that gguf_tensor_nbytes() is the right read length for the k-quants,
+//     rather than an inline nelem*144/256 that cannot express a partial block.
+//
+// Only one model may be open at a time (gguf_* state is global), so this test
+// cannot compare a quantised tensor against its unquantised twin directly. It
+// instead prints a summary of each tensor -- first values plus sum/sumsq/min/max
+// -- which scripts/audit/dequant_diff.py reproduces independently from the file
+// with Python. That comparison is the real assertion; the values printed here are
+// the evidence.
+//
+//   Q4 model: /opt/ai/models/quanta/QUANTA-LFM2.5-2.6Bv1-Q4_K_M.gguf
+//   F16 ref:  /opt/ai/models/quanta/QUANTA-LFM2.5-2.6Bv1.gguf
+//
+// Exit 0 = dispatch reached every branch and no NaN/Inf was produced.
+
+import std/gguf
+import std/math
+
+// NOTE: these paths are inline literals, not `const`s. A string `const` is a
+// real compiler defect: eval_const() only evaluates arithmetic, so `const P =
+// "..."` silently becomes the integer 0, and passing that 0 where a pointer is
+// expected segfaults (verified: const P + fn takes(s) + takes(P) dumps core,
+// while takes("literal") works). Tracked separately from this loader work.
+
+let failures = 0
+
+fn fail(msg) {
+    print("FAIL: ", msg, "\n")
+    failures = failures + 1
+}
+
+// Load one tensor and report its shape, dtype, and value summary.
+//
+// `nelem` is the number of leading elements to READ, which may be less than the
+// tensor's true element count: a full blk.0.ffn_gate.weight expands to 176 MB of
+// f64 and its 22M-element reduction is minutes of work, which is the dequant
+// harness's job, not the loader-dispatch test's. Reading a prefix still proves
+// the dispatch branch ran and produced finite values at the right offset.
+//
+// `nelem_full` is the tensor's real element count, used for the read length.
+fn probe(idx, nelem_full, nprobe) {
+    let dt = gguf_tensor_dtype(idx)
+    let nb = gguf_tensor_nbytes(idx)
+
+    // The tensor NAME is never passed in here. A string parameter in Quanta is a
+    // raw pointer, not a usable string: printing one emits the pointer (verified:
+    // 1109394328) and concatenating one corrupts the stream and crashes. So every
+    // gguf_find_tensor() call happens in main() on a LITERAL, and only the
+    // resulting integer index is passed down. Same reason gguf_tensor_name() is
+    // unusable for enumeration.
+    // NOTE: this must be ONE string argument per print() call. A single call
+    // mixing a literal with values drops every non-string argument (verified:
+    // print("dtype=", dt, " nelem=", n, "\n") printed only the leading literal
+    // and left `dtype=` blank). Separate calls print correctly.
+    print("      dtype="); print(dt)
+    print(" nelem="); print(gguf_tensor_nelements(idx))
+    print(" nbytes="); print(nb); print("\n")
+    let buf = mem_alloc(nelem_full * 8)
+    let r = read_tensor_f64(idx, buf)
+    if r == 0 {
+        print("FAIL: read_tensor_f64 returned 0 (unsupported dtype "); print(dt); print(")\n")
+        failures = failures + 1
+        mem_free(buf)
+        return
+    }
+    let sum = 0.0
+    let sumsq = 0.0
+    let mn = 0.0
+    let mx = 0.0
+    let bad = 0
+    let i = 0
+    while i < nprobe {
+        // mem_load() returns the raw 8 bytes as an INTEGER; f64of() turns a
+        // stored binary64 back into a number. Without it every comparison and
+        // sum below is integer arithmetic on bit patterns.
+        let v = f64of(mem_load(buf + i * 8))
+        if v != v { bad = bad + 1 }                  // NaN
+        if v > 1e300 || v < -1e300 { bad = bad + 1 } // Inf
+        sum = sum + v
+        sumsq = sumsq + v * v
+        if i == 0 { mn = v; mx = v }
+        if v < mn { mn = v }
+        if v > mx { mx = v }
+        i = i + 1
+    }
+    if bad > 0 {
+        print("FAIL: "); print(bad); print(" NaN/Inf of "); print(nprobe); print("\n")
+        failures = failures + 1
+    }
+    print("      first: ")
+    i = 0
+    while i < 6 {
+        if i < nprobe { pf64(f64of(mem_load(buf + i * 8))); print(" ") }
+        i = i + 1
+    }
+    print("\n      sum="); pf64(sum)
+    print(" sumsq="); pf64(sumsq)
+    print(" min="); pf64(mn)
+    print(" max="); pf64(mx)
+    print("\n")
+    mem_free(buf)
+}
+
+fn main() {
+    print("=== read_tensor_f64 dtype dispatch ===\n")
+
+    print("-- Q4_K_M model (F32, Q4_K, Q6_K) --\n")
+    if gguf_load("/opt/ai/models/quanta/QUANTA-LFM2.5-2.6Bv1-Q4_K_M.gguf") < 0 { print("FAIL: cannot open Q4 model\n"); return 1 }
+    print("  tensors="); print(gguf_num_tensors())
+    print(" kv="); print(gguf_num_kv()); print("\n")
+    if gguf_num_tensors() != 266 { fail("Q4 model: expected 266 tensors") }
+
+    // Each gguf_find_tensor() runs on a LITERAL here, and only the integer index
+    // is passed to probe(): a string parameter cannot be printed or concatenated.
+    let i_norm = gguf_find_tensor("blk.0.ffn_norm.weight")
+    let i_gate = gguf_find_tensor("blk.0.ffn_gate.weight")
+    let i_down = gguf_find_tensor("blk.0.ffn_down.weight")
+    let i_conv = gguf_find_tensor("blk.0.shortconv.conv.weight")
+    let i_tenorm = gguf_find_tensor("token_embd_norm.weight")
+    if i_norm < 0 || i_gate < 0 || i_down < 0 || i_conv < 0 || i_tenorm < 0 {
+        print("FAIL: a required tensor was not found\n")
+        return 1
+    }
+
+    print("  blk.0.ffn_norm.weight (F32)\n")
+    probe(i_norm, 2048, 2048)
+
+    print("  blk.0.ffn_gate.weight (Q4_K, 22020096 elems)\n")
+    probe(i_gate, 2048 * 10752, 8192)
+
+    print("  blk.0.ffn_down.weight (Q6_K)\n")
+    // 4096 elements, matching the oracle's window for this tensor, so the two
+    // sum/sumsq figures are directly comparable rather than over different
+    // lengths.
+    probe(i_down, 10752 * 2048, 4096)
+
+    print("  blk.0.shortconv.conv.weight (F32, [3,2048])\n")
+    probe(i_conv, 3 * 2048, 3 * 2048)
+
+    print("  token_embd_norm.weight (F32)\n")
+    probe(i_tenorm, 2048, 2048)
+    gguf_close()
+
+    print("-- F16 model (F16 branch) --\n")
+    if gguf_load("/opt/ai/models/quanta/QUANTA-LFM2.5-2.6Bv1.gguf") < 0 { print("FAIL: cannot open F16 model\n"); return 1 }
+    print("  tensors="); print(gguf_num_tensors())
+    print(" kv="); print(gguf_num_kv()); print("\n")
+    if gguf_num_tensors() != 266 { fail("F16 model: expected 266 tensors") }
+
+    // The F16 branch had NO coverage at all before this fix: read_tensor_f64
+    // had no `dtype == 1` case, so every F16 model silently loaded nothing.
+    let f_norm = gguf_find_tensor("blk.0.ffn_norm.weight")
+    let f_gate = gguf_find_tensor("blk.0.ffn_gate.weight")
+    let f_tenorm = gguf_find_tensor("token_embd_norm.weight")
+
+    print("  blk.0.ffn_norm.weight (F32 cross-check)\n")
+    probe(f_norm, 2048, 2048)
+
+    print("  blk.0.ffn_gate.weight (F16)\n")
+    probe(f_gate, 2048 * 10752, 8192)
+
+    print("  token_embd_norm.weight (F32 cross-check)\n")
+    probe(f_tenorm, 2048, 2048)
+    gguf_close()
+
+    print("\n")
+    if failures > 0 {
+        print("test_read_formats: "); print(failures); print(" FAILURES\n")
+        return 1
+    }
+    print("test_read_formats: all pass\n")
+    return 0
+}

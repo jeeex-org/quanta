@@ -312,7 +312,17 @@ fn pf64(v: f64) -> i64 {
     let t = f2i(fmul(v, i2f(scale)))
     let ip = t / scale
     let fp = t - ip * scale
-    if neg == 1 { printi(0 - ip) } else { printi(ip) }
+    // Print the sign ONCE, before the digits.
+    //
+    // This used to emit the sign by negating only the integer part
+    // (`printi(0 - ip)`) and then printing the six fraction digits unsigned.
+    // For |v| >= 1 that happens to look right; for |v| < 1, ip is 0, so
+    // `0 - ip` is also 0 and the '-' disappears entirely:
+    //     pf64(-0.023193359375) printed "0.023193"
+    //     pf64(-1.5) printed "-1.500000"   (only correct by accident)
+    // Sign now applies to the whole magnitude, so any |v| prints correctly.
+    if neg == 1 { prints("-") }
+    printi(ip)
     prints(".")
     let d = 100000
     let i = 0
