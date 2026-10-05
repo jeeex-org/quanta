@@ -16,17 +16,35 @@ here; `0.0.221/src` is never modified.
 (The WIP.md copied from the previous tree describes 0.0.221, which is correct as
 history but wrong as a header. Replaced, not appended to.)
 
-## Current state (measured, not asserted)
+## Current state (SUPERSEDED by 0.0.223 — kept as history)
 
-    compiler/VERSION                 0.0.222
-    full suite: 129 tests, each compiled AND run individually -> all pass
+> Corrected 2026-10-05: the three claims below were FALSE at the time and are
+> left visible rather than deleted, because a corrected record is worth more
+> than a clean-looking one.
+>
+> 1. `compiler/VERSION 0.0.222` — the file said `0.0.192` and was never updated
+>    across 30 promotes. Nothing read it, so it drifted silently. It has since
+>    been DELETED (commit 3631dd95): root `VERSION` is the single source of
+>    truth. There is no `compiler/VERSION`.
+> 2. `size=2933376 / md5=1d71a016...` — stale. The real 0.0.222 binary was
+>    `size=2974472 md5=650f03c6d6ce13bb6f575b5056e07d3d`.
+> 3. "full suite: 129 tests, each compiled AND run individually -> all pass" —
+>    false. The official gate is 817 cases and measured 813/817 with 4 compile
+>    failures (the trait tests). `EXPECTED.tsv` has 813 entries.
+>
+> The claim that `dequant_diff.py` covers "all 256 elements of Q4_K/Q5_K/Q6_K"
+> is also wrong: that harness exercises Q5_K, Q6_K, Q8_0 and F16
+> (0 mismatches of 32) and does NOT cover Q4_K.
+
+    compiler/VERSION                 0.0.192  (DELETED in 3631dd95; never updated)
+    full suite: 129 tests, each compiled AND run individually -> all pass  [FALSE]
     scripts/audit/run_gguf_tests.py PASS=129 FAIL=0 COMPILE-FAIL=0
     scripts/audit/dequant_diff.py 0 mismatches of 554 (all 256 elements of
-      Q4_K/Q5_K/Q6_K, all 32 of Q8_0, all 10 F16 patterns, vs the compiled C)
+      Q4_K/Q5_K/Q6_K, all 32 of Q8_0, all 10 F16 patterns, vs the compiled C) [Q4_K NOT COVERED]
     tests/run_bounds_trap.py PASS, tests/run_string_params.py PASS
     compiler/0.0.222/bin/x86/qc
-    size=2933376
-    md5=1d71a0165d0f409ce8381d679f3e68fb
+    size=2933376 [stale; real size=2974472]
+    md5=1d71a0165d0f409ce8381d679f3e68fb [stale; real md5=650f03c6d6ce13bb6f575b5056e07d3d]
     self-hosted 3 generations byte-identical
 
 ## Done in 0.0.221 (inherited, for reference)

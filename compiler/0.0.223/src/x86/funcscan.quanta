@@ -1,0 +1,1290 @@
+// === FUNCTION SCANNER ===
+fn scanfns() {
+    fnc=0; let p=0
+    let encl = 0-1          // enclosing scope for the dup check; -1 = top-level
+    // P3: module tracking. cur_mod/cur_mod_len = active `mod X` name; cur_mod_close
+    // = token index of the `}` that closes the module block (so we clear cur_mod
+    // when the scanner passes it). Nested mods re-set these.
+    let cur_mod = 0; let cur_mod_len = 0; let cur_mod_close = 0-1
+    while p<tokc {
+        // P9: skip trait/interface blocks entirely (their `fn`s are body-less
+        // method declarations, not top-level functions).
+        if tokt(p)==TT_TRAIT || tokt(p)==TT_INTERFACE {
+            let sd=0; let sj=p
+            while sj<tokc {
+                if tokt(sj)==TT_PNCT {
+                    if tokv(sj)==123 { sd=sd+1 }
+                    else if tokv(sj)==125 { sd=sd-1; if sd==0 { sj=sj+1; break } }
+                }
+                sj=sj+1
+            }
+            p=sj
+            continue
+        }
+        // P3: clear active module when we pass its closing '}'.
+        if cur_mod_close >= 0 && p >= cur_mod_close {
+            cur_mod = 0; cur_mod_len = 0; cur_mod_close = 0-1
+        }
+        // P3: detect `mod X {` — open a module namespace. Find the matching '}'
+        // and record it so fns inside are registered with an `X.` name prefix.
+        if tokt(p)==TT_KEY && ktext(tokv(p),tokln(p))==58 {
+            let nx = p+1
+            if nx<tokc && tokt(nx)==TT_ID && nx+1<tokc && tokt(nx+1)==TT_PNCT && tokv(nx+1)==123 {
+                cur_mod = tokv(nx); cur_mod_len = tokln(nx)
+                // scan forward for the matching '}' (track {} depth)
+                let md=0; let mj=nx+1
+                while mj<tokc {
+                    if tokt(mj)==TT_PNCT {
+                        if tokv(mj)==123 { md=md+1 }
+                        else if tokv(mj)==125 { md=md-1; if md==0 { mj=mj+1; break } }
+                    }
+                    mj=mj+1
+                }
+                cur_mod_close = mj
+                // register the module name in modtab
+                w64(modtab + modc*16, cur_mod); w64(modtab + modc*16 + 8, cur_mod_len); modc = modc + 1
+                p = nx+2   // continue scanning inside the module block
+                continue
+            }
+        }
+        // P3: check for extern "C" fn OR bare extern fn
+        let is_extern = 0
+        if tokt(p)==TT_KEY&&ktext(tokv(p),tokln(p))==19 {
+            // extern keyword found - check for "C" or bare fn
+            // The string literal "C" is a SINGLE STR token (no separate quote
+            // tokens), so it sits at p+1. Advance p to p+2 to land on the next
+            // keyword. ONLY treat it as a function extern if that keyword is
+            // `fn` (ktext 1); `extern "C" global NAME` is a DATA import and is
+            // handled by scan_globals, not here.
+            let np = p+1
+            if np<tokc && tokt(np)==TT_STR {
+                let nk = p+2
+                if nk<tokc && tokt(nk)==TT_KEY && ktext(tokv(nk),tokln(nk))==1 {
+                    // Found `extern "C" fn` - advance past extern + the "C" token.
+                    is_extern = 1
+                    p = np + 1
+                }
+            } else if np<tokc && tokt(np)==TT_KEY && ktext(tokv(np),tokln(np))==1 {
+                // Found bare `extern fn` (no "C" string)
+                // Check if this is a builtin we should compile inline (not extern)
+                let fn_name_tok = np+1
+                if fn_name_tok<tokc && tokt(fn_name_tok)==TT_ID {
+                    let nm = tokv(fn_name_tok)
+                    let nl = tokln(fn_name_tok)
+                    // Builtins: malloc(6), free(4), mem_alloc(9), mem_free(8), mem_realloc(11), drop(4), exit(4), mmap(4)
+                    let is_malloc = (nl==6 && r8(src+nm)==109 && r8(src+nm+1)==97 && r8(src+nm+2)==108 && r8(src+nm+3)==108 && r8(src+nm+4)==111 && r8(src+nm+5)==99)
+                    let is_free = (nl==4 && r8(src+nm)==102 && r8(src+nm+1)==114 && r8(src+nm+2)==101 && r8(src+nm+3)==101)
+                    let is_mem_alloc = (nl==9 && r8(src+nm)==109 && r8(src+nm+1)==101 && r8(src+nm+2)==109 && r8(src+nm+3)==95 && r8(src+nm+4)==97 && r8(src+nm+5)==108 && r8(src+nm+6)==108 && r8(src+nm+7)==111 && r8(src+nm+8)==99)
+                    let is_mem_free = (nl==8 && r8(src+nm)==109 && r8(src+nm+1)==101 && r8(src+nm+2)==109 && r8(src+nm+3)==95 && r8(src+nm+4)==102 && r8(src+nm+5)==114 && r8(src+nm+6)==101 && r8(src+nm+7)==101)
+                    let is_mem_realloc = (nl==11 && r8(src+nm)==109 && r8(src+nm+1)==101 && r8(src+nm+2)==109 && r8(src+nm+3)==95 && r8(src+nm+4)==114 && r8(src+nm+5)==101 && r8(src+nm+6)==97 && r8(src+nm+7)==108 && r8(src+nm+8)==108 && r8(src+nm+9)==111 && r8(src+nm+10)==99)
+                    let is_drop = (nl==4 && r8(src+nm)==100 && r8(src+nm+1)==114 && r8(src+nm+2)==111 && r8(src+nm+3)==112)
+                    let is_exit = (nl==4 && r8(src+nm)==101 && r8(src+nm+1)==120 && r8(src+nm+2)==105 && r8(src+nm+3)==116)
+                    let is_mmap = (nl==4 && r8(src+nm)==109 && r8(src+nm+1)==109 && r8(src+nm+2)==97 && r8(src+nm+3)==112)
+                    if is_malloc||is_free||is_mem_alloc||is_mem_free||is_mem_realloc||is_drop||is_exit||is_mmap {
+                        // This is a builtin - compile it inline, not as extern
+                        is_extern = 0
+                    } else {
+                        is_extern = 1
+                    }
+                }
+                p = np + 1  // advance past 'fn' to register function in this iteration
+            }
+        }
+        // DISABLED: closure scanner (can't see inside function bodies)
+        // if tokt(p)==TT_OP && tokv(p)==124 { ... }
+        
+        if tokt(p)==TT_KEY&&ktext(tokv(p),tokln(p))==1 {
+            let nt=p+1
+            // Capture the signature-scan start IMMEDIATELY, before any other
+            // local assignment can alias the slot qc-1.0.1 places `nt` in.
+            let kstart = nt + 1
+            if nt<tokc && (tokt(nt)==TT_ID || tokt(nt)==TT_OP) {
+                let nm = tokv(nt); let nl = tokln(nt)
+                // 0.0.97: operator-overload fns (`fn +(a,b)`) name the fn after
+                // a TT_OP token. Register it by SOURCE TEXT (not the op-code int):
+                // inject the operator characters into src past srclen and use
+                // that pointer, so findfn() matches call sites (which inject the
+                // same text via op_inj_name).
+                if tokt(nt)==TT_OP {
+                    let opv = tokv(nt)
+                    opfn_set(opv, fnc)
+                    opfn_supp_set(fnc)   // mark fn index fnc as an operator-overload fn
+                }
+                // P3: if inside `mod X`, register this fn as `X.<base>` so calls use `X.fn()`.
+                // Compute the registered name/src-ptr here so both the dup-check and sfn use it.
+                let reg_nm = nm; let reg_nl = nl
+                if cur_mod != 0 {
+                    reg_nm = mod_synth_name(cur_mod, cur_mod_len, nm, nl)
+                    reg_nl = cur_mod_len + 1 + nl
+                }
+                let d=0; let bp=0; let j=nt+1
+                // P10: Parse generic parameters <T, U> after function name.
+                // State lives in globals (gscan_*) — nested-block locals in
+                // scanfns reuse register slots and would clobber each other.
+                gscan_gcount = 0
+                gscan_gpoff = 0
+                gscan_isgen = 0
+                if kstart<tokc && tokt(kstart)==TT_OP && tokv(kstart)==60 {
+                    gscan_isgen = 1
+                    let gk = kstart + 1
+                    while gk<tokc {
+                        let gtk = tokt(gk)
+                        if gtk==TT_OP && tokv(gk)==62 { gk=gk+1; break }
+                        if gtk==TT_ID || gtk==TT_KEY {
+                            w64(fn_genparam_names + gscan_gpoff, tokv(gk)); gscan_gpoff=gscan_gpoff+8
+                            w64(fn_genparam_names + gscan_gpoff, tokln(gk)); gscan_gpoff=gscan_gpoff+8
+                            gscan_gcount=gscan_gcount+1
+                            gk=gk+1
+                            // skip optional comma
+                            if gk<tokc && tokt(gk)==TT_PNCT && tokv(gk)==44 { gk=gk+1 }
+                        } else {
+                            gk=gk+1
+                        }
+                    }
+                    kstart = gk  // continue from after '>'
+                }
+                // Scan signature: count fixed params + detect trailing ...
+                let pcnt=0; let isvar=0; let depth=0; let k=kstart
+                let pnbase = fn_poff   // capture START offset BEFORE storing params
+                let saw_param = 0
+                let last_param_tok = -1   // t5: token index of the most recent param ID
+                let pdfixed = 0           // t5: count of leading params with NO default
+                let in_default = 0        // t5: 1 while scanning a '= expr' (skip its IDs/...)
+                while k<tokc {
+                    let tk=tokt(k)
+                    // t5: a default expression ends at the param terminator.
+                    if in_default==1 && tk==TT_PNCT {
+                        let tv=tokv(k)
+                        if tv==44 { in_default=0 }       // ',' -> next param starts
+                        else if tv==41 { in_default=0 }   // ')' -> end of signature
+                        else if tv==46 && k+2<tokc && tokt(k+1)==TT_PNCT && tokv(k+1)==46 && tokt(k+2)==TT_PNCT && tokv(k+2)==46 { in_default=0 }  // '...' -> next param
+                    }
+                    if tk==TT_PNCT {
+                        let tv=tokv(k)
+                        if tv==40 { depth=depth+1 }       // '('
+                        else if tv==41 { break }          // ')'
+                        // Bare function declaration: fn name; - terminate at ';'
+                        else if depth==0 && tv==59 { break }
+                        else if depth==1 && tv==44 { pcnt=pcnt+1 }  // top-level ','
+                        // detect '...' = three consecutive '.' puncts (value 46)
+                        else if depth==1 && in_default==0 && tv==46 && k+2<tokc && tokt(k+1)==TT_PNCT && tokv(k+1)==46 && tokt(k+2)==TT_PNCT && tokv(k+2)==46 {
+                            isvar=1; k=k+2   // skip the next two dots
+                        }
+                    }
+                    // t5: detect '= default' for the current param.
+                    // NOTE: '=' is TT_OP (value 61), not TT_PNCT.
+                    if tk==TT_OP && tokv(k)==61 && last_param_tok>=0 {
+                        // default expr spans [k+1 .. end of this param].
+                        // end = next ',' / ')' / '...' at depth 1, or tokc.
+                        let de=k+1; let dend=de
+                        while dend<tokc {
+                            let dtk=tokt(dend); let dtv=tokv(dend)
+                            if dtk==TT_PNCT {
+                                if dtv==44 { dend=dend+1; break }       // ','
+                                if dtv==41 { dend=dend+1; break }       // ')'
+                                if dtv==46 && dend+2<tokc && tokt(dend+1)==TT_PNCT && tokv(dend+1)==46 && tokt(dend+2)==TT_PNCT && tokv(dend+2)==46 { dend=dend+1; break }  // '...'
+                            }
+                            dend=dend+1
+                        }
+                        w64(fn_defargs + (fnc*64 + saw_param - 1)*16, de)
+                        w64(fn_defargs + (fnc*64 + saw_param - 1)*16 + 8, dend)
+                        in_default = 1   // t5: skip the default expr's IDs/... until terminator
+                    }
+                    if depth==1 && in_default==0 && tk==TT_ID {
+                        w64(fn_pnames + fn_poff, tokv(k)); fn_poff=fn_poff+8; w64(fn_pnames + fn_poff, tokln(k)); fn_poff=fn_poff+8
+                        saw_param=saw_param+1
+                        last_param_tok=k
+                        // Skip optional type annotation — BOTH `: Type` (colon form)
+                        // AND ` Type` (space form, e.g. `a i64`). Without this, the
+                        // type-name ID (e.g. `i64`) is counted as a phantom parameter,
+                        // breaking arity for every function call (P0 bug).
+                        {
+                          let nk = k+1
+                          if nk<tokc && tokt(nk)==TT_PNCT && tokv(nk)==58 { nk=nk+1 }  // skip ':'
+                          // TT_STRING belongs here. `string` and `String` both map to ktext 37,
+                            // which lexer.quanta rewrites to TT_STRING(29) -- a token class of
+                            // its own, distinct from TT_KEY. This guard accepted only
+                            // TT_ID, TT_KEY, '[' and '(', so a `: string` parameter
+                            // annotation was never entered: the declared type was not
+                            // recorded AND the type expression was not consumed, which
+                            // is why `fn b(s: string)` printed the heap pointer while
+                            // `fn a(s: str)` worked -- `str` lexes as a plain TT_ID.
+                            if nk<tokc && (tokt(nk)==TT_ID || tokt(nk)==TT_KEY || tokt(nk)==TT_STRING || (tokt(nk)==TT_PNCT && (tokv(nk)==91 || tokv(nk)==40))) {
+                            // P10: flag fn-pointer params (f: fn(...) -> ...)
+                            if ktext(tokv(nk), tokln(nk))==1 { w64(fn_parfn + (fnc*200 + saw_param-1)*8, 1) }
+                            // 0.0.114: flag big-typed params (x: big)
+                            if ktext(tokv(nk), tokln(nk))==62 { w64(fn_parbig + (fnc*200 + saw_param-1)*8, 1) }
+                            // Flag f64-typed params. f64 is not a keyword -- it lexes
+                            // as TT_ID -- so this is a byte compare on the token text,
+                            // the same way the string-param flag does it. Checked as
+                            // `x: f64` and `x f64` alike, since the ':' was already
+                            // skipped above.
+                            let fnl = tokln(nk)
+                            if fnl==3 && r8(src+tokv(nk))=='f' && r8(src+tokv(nk)+1)=='6' && r8(src+tokv(nk)+2)=='4' {
+                                w64(fn_parflt + (fnc*200 + saw_param-1)*8, 1)                            }
+                            // 0.0.221: flag string-typed params (s: str / s: string).
+                            // fn_parstr was allocated in 0.0.166 and read by
+                            // find_str_source() and arg_is_str(), but nothing ever
+                            // wrote 1 into it. So every string-typed parameter came
+                            // back untagged and print()/echo()/str() on it printed
+                            // the heap pointer instead of the text. Two spellings,
+                            // both seen in the tree: `s: str` and `s: string`.
+                            let snl = tokln(nk)
+                            if (snl==3 && r8(src+tokv(nk))=='s' && r8(src+tokv(nk)+1)=='t' && r8(src+tokv(nk)+2)=='r')
+                               || (snl==6 && r8(src+tokv(nk))=='s' && r8(src+tokv(nk)+1)=='t'
+                                                                   && r8(src+tokv(nk)+2)=='r' && r8(src+tokv(nk)+3)=='i'
+                                                                   && r8(src+tokv(nk)+4)=='n' && r8(src+tokv(nk)+5)=='g')
+                                                               // `String` with a capital S is the same ktext (37) and the
+                                                               // same TT_STRING token, so the byte compare above misses
+                                                               // it. Quanta's keyword table already treats the two
+                                                               // spellings as one word ("Only String gets a lowercase
+                                                               // alias"); the type-annotation check has to agree, or
+                                                               // `fn b(s: String)` prints a heap pointer while
+                                                               // `fn b(s: string)` works.
+                                                               || (snl==6 && r8(src+tokv(nk))=='S' && r8(src+tokv(nk)+1)=='t'
+                                                                   && r8(src+tokv(nk)+2)=='r' && r8(src+tokv(nk)+3)=='i'
+                                                                   && r8(src+tokv(nk)+4)=='n' && r8(src+tokv(nk)+5)=='g') {
+                                w64(fn_parstr + (fnc*200 + saw_param-1)*8, 1)
+                            }
+                            // Consume the full type expression, tracking [] and ()
+                            // nesting; stop at a top-level ',' or ')' (param boundary).
+                            let td = 0
+                            let kk = nk
+                            let done = 0
+                            while kk<tokc && done==0 {
+                                let ttk=tokt(kk); let ttv=tokv(kk)
+                                if ttk==TT_PNCT {
+                                    if ttv==91 { td=td+1 }        // '['
+                                    else if ttv==93 { td=td-1 }   // ']'
+                                    else if ttv==40 { td=td+1 }   // '('
+                                    else if ttv==41 { if td==0 { done=1 } else { td=td-1 } }  // ')' closes fn-type paren
+                                    else if td==0 && ttv==44 { done=1 }  // ',' ends type at top level
+                                    else if td==0 && ttv==46 && kk+2<tokc && tokt(kk+1)==TT_PNCT && tokv(kk+1)==46 && tokt(kk+2)==TT_PNCT && tokv(kk+2)==46 { done=1 }  // '...'
+                                }
+                                if done==1 { break }
+                                kk=kk+1
+                            }
+                            k = kk-1   // outer k=k+1 moves past the terminator
+                          }
+                        }
+                    }
+                    k=k+1
+                }
+                // t4: store param names into fn_pnames (flat [ptr,len] per param).
+                // Use saw_param (direct param-ID count) for the true param count,
+                // not the comma count (comma count = N-1 and is fragile here).
+                w64(fn_pcount + fnc*8, saw_param)
+                w64(fn_pbase + fnc*8, pnbase)
+                // P10: Store generic parameter info (from global scratch)
+                w64(fn_generic + fnc*8, gscan_isgen)
+                w64(fn_genparams + fnc*8, gscan_gcount)
+                w64(fn_genparam_base + fnc*8, gscan_gpoff - gscan_gcount*16)
+                // t5: count leading params (from index 0) that have NO default ->
+                // the mandatory minimum arg count at the call site.
+                let pfz=0
+                while pfz<saw_param {
+                    let dr = r64(fn_defargs + (fnc*64 + pfz)*16)
+                    if dr==0 { pfz=pfz+1 } else { break }
+                }
+                w64(fn_pdfixed + fnc*8, pfz)
+                // Re-init d/bp here: the generic-param and signature blocks above
+                // clobber the slot aliasing `d`/`bp` (bootstrap register reuse).
+                d=0; bp=0
+                while j<tokc {
+                    if tokt(j)==TT_PNCT {
+                        if tokv(j)==123 { if d==0&&bp==0 { bp=j }; d=d+1 }
+                        if tokv(j)==125 { d=d-1; if d<=0 { j=j+1; break } }
+                        // Bare function declaration (no body) terminates at ';' when no '{' was found
+                        if bp==0 && tokv(j)==59 { j=j+1; break }
+                        // extern "C" fn decl has no body; terminate at ';'
+                        if is_extern==1 && tokv(j)==59 { j=j+1; break }
+                    }
+                    j=j+1
+                }
+                // 0.0.220: capture the declared RETURN TYPE.
+                //
+                // This was hard-coded to 0 "return-type checking deferred (STATE.md
+                // F3)", which made sfn() record fn_retflt=0 for EVERY function. Both
+                // of codegen's reads of fn_retflt had therefore always seen 0, and
+                // the interprocedural float tag never fired: a call to a function
+                // declared `-> f64` produced an untagged vreg, so an enclosing float
+                // builtin such as `fadd(gg(), 1.0)` -- or ai_add()'s
+                // `fadd(f64_read(..), f64_read(..))` -- fed raw bit patterns to
+                // cvtsi2sd and returned garbage.
+                //
+                // Only the f64 case is interpreted, which is all sfn() reads (it
+                // matches exactly "f64", len 3). Other return types are still
+                // recorded as untyped, so return-type CHECKING remains deferred --
+                // this captures the name, it does not start validating signatures.
+                //
+                // The signature scan left `j` just past the parameter list, so the
+                // return type is the '->' immediately after it. TT_OP with value 62
+                // is '>' (matching the generic-parameter scan above), so '->' is
+                // TT_OP 45 followed by TT_OP 62.
+                let ret_type_name = 0; let ret_type_len = 0
+                // Scan forward from kstart (the token after '(') for the '-> TYPE'
+                // that follows the parameter list. Independent of where the signature
+                // scan above left `k`, which is position-sensitive and hard to reason
+                // about after the fact.
+                let rj = kstart
+                let rlim = tokc
+                if rj + 400 < rlim { rlim = rj + 400 }   // bounded: a signature is not 400 tokens
+                // '->' is lexed as ONE multichar operator token: ismop() matches
+                // `b1==45&&b2==62` and the token stores mopv(p) = c1*256 + c2, so its
+                // TT_OP value is 45*256+62 == 11582. It is NOT 45, and NOT two tokens
+                // (45 then 62) -- both were tried first and neither matched.
+                //
+                // Only the arrow at PARAMETER-LIST depth counts. A parameter's own type
+                // may contain one (a function-typed parameter, `f: fn(i64) -> f64`),
+                // and matching that would capture the parameter's return type as the
+                // function's own. Without the depth check, `fn gg(ptr: i64) -> f64`
+                // was fine but a function with such a parameter captured the wrong
+                // name -- and, measured, `fn_retflt` ended up 0 for any function with
+                // a parameter, because the nested arrow was matched first.
+                // kstart points AT the '(' that opens the parameter list, so the
+                // loop begins already inside it.
+                // The return-type arrow sits AFTER the parameter list's closing
+                // ')'. The old loop broke at that ')', so it never reached the arrow
+                // and ret_type_name/ret_type_len kept whatever they already held --
+                // measured: `fn aa(ptr: i64): f64` recorded the type as "i64",
+                // the PARAMETER's type, because the scan stopped inside the
+                // parameter list. Two explicit phases: walk to the ')' that closes
+                // the parameter list, then look for '->' from there.
+                let d1 = 0
+                while rj + 1 < rlim {
+                    if tokt(rj)==TT_PNCT {
+                        if tokv(rj)==40 { d1 = d1 + 1 }
+                        if tokv(rj)==41 {
+                            d1 = d1 - 1
+                            if d1 == 0 { break }
+                        }
+                    }
+                    rj = rj + 1
+                }
+                if rj < rlim { rj = rj + 1 }
+                while rj + 1 < rlim {
+                    if tokt(rj)==TT_OP && tokv(rj)==11582 {
+                        let rt = rj + 1
+                        if rt < tokc {
+                            if tokt(rt)==TT_ID { ret_type_name = tokv(rt) }
+                            if tokt(rt)==TT_KEY { ret_type_name = tokv(rt) }
+                            if tokt(rt)==TT_ID { ret_type_len = tokln(rt) }
+                            if tokt(rt)==TT_KEY { ret_type_len = tokln(rt) }
+                        }
+                        break
+                    }
+                    if tokt(rj)==TT_PNCT {
+                        if tokv(rj)==123 { break }
+                        if tokv(rj)==59 { break }
+                    }
+                    rj = rj + 1
+                }
+                // Same-scope duplicate function name: if already registered in this
+                // scope (same parent), it's a duplicate FROM AN IMPORT (source was
+                // inlined). First-wins: skip re-registering instead of erroring.
+                // This allows `import std/foo` in multiple TUs without duplicate errors.
+                let dup = 0; let di = 0
+                while di < fnc {
+                    if r64(fn_parent + di*8)==encl && fn_nlen(di) == reg_nl {
+                        let ok = 1; let k = 0
+                        while k < reg_nl { if r8(src+fn_name(di)+k) != r8(src+reg_nm+k) { ok = 0; break }; k = k+1 }
+                        if ok == 1 { dup = 1; break }
+                    }
+                    di = di + 1
+                }
+                if dup == 1 {
+                    // skip re-registration (import dedup)
+                    // advance p to after this function (j was set to end of body/decl)
+                    p = j
+                    continue
+                }
+                // Record this fn with its enclosing scope as parent (-1 = top-level
+                // for the flat model; fn_parent is used by resolve_call/findfn_global).
+                w64(fn_parent + fnc*8, encl)
+                sfn(fnc,reg_nm,reg_nl,bp,0,saw_param,ret_type_name,ret_type_len)
+            w64(fn_extern + fnc*8, is_extern)
+            fnc=fnc+1; p=j
+            } else { p=p+1 }
+        } else { p=p+1 }
+    }
+}
+
+// shift_tok_indexes(at, gap): subtract `gap` from every recorded token index
+// greater than `at`.
+//
+// A struct-literal rewrite compacts the token stream in place, so every token
+// index scanfns() recorded BEFORE the rewrite is stale for everything after the
+// literal. The tables that hold indices (rather than source offsets) are the
+// function body index (fns + i*FNS + 16, sfn's `bt`) and the default-argument token ranges
+// (fn_defargs). Source OFFSETS in fn_pnames are unaffected -- the source text
+// did not move.
+//
+// This was the second half of the crash: the first was not advancing the scan
+// position past the compacted literal. With only that fixed, a struct literal
+// in one function still corrupted every function after it.
+fn shift_tok_indexes(at, gap) {
+    let i = 0
+    while i < fnc {
+        // Slot 16 is the body TOKEN INDEX (sfn's `bt` parameter). Slot 24 is
+        // `co`, a CODE OFFSET that the cache path overwrites -- shifting that
+        // would corrupt every cached function, which is why the first version
+        // of this helper made things worse rather than better.
+        let bt = r64(fns + i*FNS + 16)
+        if bt > at { w64(fns + i*FNS + 16, bt - gap) }
+        i = i+1
+    }
+    let d = 0
+    while d < fnc*64 {
+        let d0 = r64(fn_defargs + d*16)
+        let d1 = r64(fn_defargs + d*16 + 8)
+        if d0 > at { w64(fn_defargs + d*16, d0 - gap) }
+        if d1 > at { w64(fn_defargs + d*16 + 8, d1 - gap) }
+        d = d+1
+    }
+}
+
+fn scan_aliases() {
+    let p=0
+    while p<tokc {
+        if tokt(p)==TT_KEY && ktext(tokv(p),tokln(p))==17 {
+            if p+3<tokc && tokt(p+1)==TT_ID && tokt(p+2)==TT_OP && tokv(p+2)==61 && tokt(p+3)==TT_ID {
+                let anm=tokv(p+1); let anl=tokln(p+1)
+                let tnm=tokv(p+3); let tnl=tokln(p+3)
+                let tfi=findfn(tnm, tnl)
+                if tfi>=0 {
+                    w64(alias_tab + alias_c*24, anm); w64(alias_tab + alias_c*24 + 8, anl)
+                    w64(alias_tab + alias_c*24 + 16, tfi)
+                    alias_c=alias_c+1
+                }
+            }
+        }
+        p=p+1
+    }
+}
+
+// P9: Scan for trait declarations (trait Name { fn method(...) ... })
+fn scantraits() {
+  let p = 0
+  while p < tokc {
+    if tokt(p) == TT_TRAIT {
+      let nt = p+1
+      if nt<tokc && tokt(nt)==TT_ID {
+        let onm = tokv(nt); let onl = tokln(nt)
+        let bp = nt+1
+        while bp<tokc && !(tokt(bp)==TT_PNCT && tokv(bp)==123) { bp = bp+1 }
+        if bp<tokc {
+          let ti = g_traitc; g_traitc = ti + 1
+          w64(tdefs + ti*80, onm); w64(tdefs + ti*80 + 8, onl)
+          w64(tdefs + ti*80 + 24, ti*32)   // method base = ti*32 (32 method slots/trait)
+          let mc = 0; let cp = bp+1
+          while cp<tokc && !(tokt(cp)==TT_PNCT && tokv(cp)==125) {
+            if tokt(cp)==TT_KEY && ktext(tokv(cp),tokln(cp))==1 {  // fn keyword
+              let mnm = tokv(cp+1); let mnl = tokln(cp+1)
+              if mc < 32 {  // bounds check
+                let slot = (ti*32 + mc)*24
+                w64(tmethods + slot, mnm); w64(tmethods + slot + 8, mnl)
+                // count params and check return type (simplified for now)
+                let pc = 0; let rp = cp+2
+                let depth = 0
+                while rp<tokc {
+                  let tk = tokt(rp); let tv = tokv(rp)
+                  if tk==TT_PNCT {
+                    if tv==40 { depth = depth+1 }
+                    else if tv==41 { depth = depth-1; if depth==0 { break } }
+                    else if depth==1 && tv==44 { pc = pc+1 }
+                  }
+                  rp = rp+1
+                }
+                w64(tmethods + slot + 16, pc)  // param count
+                w64(tmethods + slot + 24, 0-1) // ret struct (simplified)
+                mc = mc+1
+              }
+              cp = rp
+            }
+            cp = cp+1
+          }
+          w64(tdefs + ti*80 + 16, mc)
+        }
+      }
+    }
+    p = p+1
+  }
+}
+
+// P9: Scan for impl blocks (impl Trait for Struct { fn method(...) ... })
+fn scanimpls() {
+  let p = 0
+  while p < tokc {
+    if tokt(p) == TT_IMPL {
+      let nt = p+1
+      if nt<tokc && tokt(nt)==TT_ID {  // trait name is an ID, not TT_TRAIT
+        let tnm = tokv(nt); let tnl = tokln(nt)
+        let nf = nt+1
+        if nf<tokc && ktext(tokv(nf),tokln(nf))==7 {  // "for" keyword (ktext=7)
+          let snm = tokv(nf+1); let snl = tokln(nf+1)
+          let bp = nf+2
+          while bp<tokc && !(tokt(bp)==TT_PNCT && tokv(bp)==123) { bp = bp+1 }
+          if bp<tokc {
+            // find trait index
+            let ti = 0; let found_t = 0
+            let tcv = g_traitc
+            while ti < tcv {
+              let onm = r64(tdefs + ti*80); let onl = r64(tdefs + ti*80 + 8)
+              if onl == tnl {
+                let ok = 1; let k = 0
+                while k < tnl { if r8(src+onm+k) != r8(src+tnm+k) { ok = 0; break }; k = k+1 }
+                if ok == 1 { found_t = 1; break }
+              }
+              ti = ti+1
+            }
+            // find struct index
+            let si = 0; let found_s = 0
+            while si < structc {
+              let onm = r64(sdefs + si*64); let onl = r64(sdefs + si*64 + 8)
+              if onl == snl {
+                let ok = 1; let k = 0
+                while k < snl { if r8(src+onm+k) != r8(src+snm+k) { ok = 0; break }; k = k+1 }
+                if ok == 1 { found_s = 1; break }
+              }
+              si = si+1
+            }
+            if found_t == 1 && found_s == 1 {
+              let ii = g_implc; g_implc = ii + 1
+              w64(idefs + ii*96, ti); w64(idefs + ii*96 + 8, si)
+              w64(idefs + ii*96 + 24, ii*32)   // method base = ii*32
+              let mc = 0; let cp = bp+1
+              while cp<tokc && !(tokt(cp)==TT_PNCT && tokv(cp)==125) {
+                if tokt(cp)==TT_KEY && ktext(tokv(cp),tokln(cp))==1 {  // fn keyword
+                  let mnm = tokv(cp+1); let mnl = tokln(cp+1)
+                  let slot = (ii*32 + mc)*32
+                  // find matching trait method index
+                  let tmi = 0; let found_tm = 0
+                  while tmi < r64(tdefs + ti*80 + 16) {
+                    let tmnm = r64(tmethods + (ti*32 + tmi)*24)
+                    let tmnl = r64(tmethods + (ti*32 + tmi)*24 + 8)
+                    if tmnl == mnl {
+                      let ok = 1; let k = 0
+                      while k < mnl { if r8(src+tmnm+k) != r8(src+mnm+k) { ok = 0; break }; k = k+1 }
+                      if ok == 1 { found_tm = 1; break }
+                    }
+                    tmi = tmi+1
+                  }
+                  if found_tm == 1 {
+                    if mc < 32 {  // bounds check
+                      w64(imethods + slot, tmi)  // trait method index
+                      // find function index
+                      let fi = 0; let found_f = 0
+                      while fi < fnc {
+                        if fn_nlen(fi) == mnl {
+                          let fnm = fn_name(fi)
+                          let ok = 1; let k = 0
+                          while k < mnl { if r8(src+fnm+k) != r8(src+mnm+k) { ok = 0; break }; k = k+1 }
+                          if ok == 1 { found_f = 1; break }
+                        }
+                        fi = fi+1
+                      }
+                      w64(imethods + slot + 8, fi)
+                      // P9: tag impl method `self` (param 0) with the struct
+                      w64(fn_partype + (fi*200 + 0)*8, si)
+                      mc = mc+1
+                    }
+                  }
+                  cp = cp+1
+                }
+                cp = cp+1
+              }
+              w64(idefs + ii*96 + 16, mc)
+            }
+          }
+        }
+      }
+    }
+    p = p+1
+  }
+}
+
+// P9: struct literal `Name { f: e, ... }` -> rewrite to `Name(e, ...)`
+// constructor-call tokens IN PLACE, so parse_primary (which only understands
+// `Name(...)`) never sees the new syntax. Runs after scanstructs so struct
+// names are known. The parser then treats it exactly like a constructor call.
+// rewrite_struct_literals: rewrite every `Name { f: v, ... }` into
+// `Name(v, ...)`, innermost first.
+//
+// NESTED literals need more than one pass. `Q { p0: P { f0: 3 } }` has an inner
+// literal inside the outer one's braces: compacting the outer copies the inner
+// across verbatim -- braces and field name intact -- and the scan then resumes
+// past it, so the inner one is never rewritten and the parser meets a '{' where
+// a constructor call's '(' belongs. Each pass rewrites the literals it can
+// reach; a nested literal becomes reachable only once the one enclosing it is
+// gone. Bounded at 4 passes, which is generous -- a struct literal nested five
+// deep is not a real program.
+fn rewrite_struct_literals() {
+    let pass = 0
+    while pass < 4 {
+        let before = tokc
+        rewrite_struct_literals_pass()
+        if tokc == before { break }
+        pass = pass + 1
+    }
+}
+
+fn rewrite_struct_literals_pass() {
+    let p = 0
+    while p < tokc {
+        if tokt(p)==TT_ID {
+            // inline findstruct(tokv(p), tokln(p)) - no user-fn calls (clobber)
+            let nm = tokv(p); let nl = tokln(p)
+            let si = 0-1
+            let su = 0
+            while su < structc {
+                if r64(sdefs + su*64 + 8)==nl {
+                    let sp = r64(sdefs + su*64); let sm = 0; let smatch = 1
+                    while sm < nl { if r8(src+sp+sm)!=r8(src+nm+sm) { smatch=0; break }; sm = sm+1 }
+                    if smatch==1 { si = su; break }
+                }
+                su = su+1
+            }
+            // skip declaration contexts: `struct Name {`, `impl ... for Name {`,
+            // `trait Name {` - only rewrite in EXPRESSION position.
+            //
+            // Only a TT_ID token carries a SOURCE OFFSET in tokv(); a keyword
+            // token (fn, return, let, ...) carries its keyword ID there. Reading
+            // src+pv+k with a keyword ID is an out-of-range read: with a large
+            // decimal literal elsewhere in the same function it walked off the
+            // source arena and segfaulted the compiler. Non-identifier tokens
+            // simply cannot precede a struct-literal name in a way that matters,
+            // so skip them.
+            let prev_ok = 1
+            // A function's return type is `-> StructName {` ... and that is
+            // byte-identical to a struct literal `StructName { ... }`. The
+            // rewrite fired on the return type, turned `-> P {` into
+            // `-> P(`, and consumed the function body -- the compiler then
+            // core-dumped on every `fn f() -> SomeStruct`. It needed a
+            // declared struct to match; an undefined name was left alone,
+            // which is why `-> Q` worked and `-> P` did not.
+            //
+            // Skip an identifier preceded by the '->' arrow. The arrow is ONE
+            // multichar operator token with value 45*256+62 == 11582 (see the
+            // return-type scan in this same file).
+            // Scan back over any run of '*' (and '&') to find the arrow. Written
+            // as a loop rather than one case per star count: `-> **P` was a third
+            // spelling and enumerating them is how the two-token case got fixed
+            // while the three-token one stayed broken.
+            if p>=1 {
+                let bk = p-1
+                while bk>=0 && tokt(bk)==TT_OP && (tokv(bk)==42 || tokv(bk)==38) { bk = bk-1 }
+                if bk>=0 && bk<p-1 && tokt(bk)==TT_OP && tokv(bk)==11582 { prev_ok = 0 }
+                if bk>=0 && bk==p-1 && tokt(bk)==TT_OP && tokv(bk)==11582 { prev_ok = 0 }
+            }
+            if p>=1 && tokt(p-1)==TT_ID {
+                let pv = tokv(p-1); let pl = tokln(p-1)
+                // byte-compare regardless of token type (struct/impl/trait/for
+                // are TT_ID here)
+                if pl==6 && r8(src+pv)=='s'&&r8(src+pv+1)=='t'&&r8(src+pv+2)=='r'&&r8(src+pv+3)=='u'&&r8(src+pv+4)=='c'&&r8(src+pv+5)=='t' { prev_ok = 0 }  // struct
+                if pl==4 && r8(src+pv)=='i'&&r8(src+pv+1)=='m'&&r8(src+pv+2)=='p'&&r8(src+pv+3)=='l' { prev_ok = 0 }  // impl
+                if pl==5 && r8(src+pv)=='t'&&r8(src+pv+1)=='r'&&r8(src+pv+2)=='a'&&r8(src+pv+3)=='i'&&r8(src+pv+4)=='t' { prev_ok = 0 }  // trait
+                if pl==3 && r8(src+pv)=='f'&&r8(src+pv+1)=='o'&&r8(src+pv+2)=='r' { prev_ok = 0 }  // for (impl Trait for Struct)
+                if pl==9 && r8(src+pv)=='i'&&r8(src+pv+1)=='n'&&r8(src+pv+2)=='t'&&r8(src+pv+3)=='e'&&r8(src+pv+4)=='r'&&r8(src+pv+5)=='f'&&r8(src+pv+6)=='a'&&r8(src+pv+7)=='c'&&r8(src+pv+8)=='e' { prev_ok = 0 }  // interface
+            }
+            if si>=0 && prev_ok==1 && p+1<tokc && tokt(p+1)==TT_PNCT && tokv(p+1)==123 {
+                // scan to matching '}' (depth-tracked, skip nested)
+                let depth = 1
+                let end = 0-1
+                let q = p+2
+                while q<tokc {
+                    if tokt(q)==TT_PNCT {
+                        if tokv(q)==123 { depth = depth+1 }
+                        else if tokv(q)==125 { depth = depth-1; if depth==0 { end = q; break } }
+                    }
+                    q = q+1
+                }
+                // NESTED LITERALS: rewrite INNERMOST FIRST.
+                //
+                // `Q { p0: P { f0: 3 } }` -- compacting the outer literal copies
+                // the inner one across verbatim, braces and field name intact, and
+                // the outer loop then resumes past it. The inner literal was never
+                // rewritten, so the parser reached a '{' where a '(' belonged and
+                // the compiler core-dumped. Skipping any literal that still
+                // contains a '{' means the outer one is handled on a later pass,
+                // by which time the inner is already a constructor call.
+                if end>=0 {
+                    // rewrite '{' -> '(' and '}' -> ')'
+                    w64(toks + (p+1)*TKS, TT_PNCT); w64(toks + (p+1)*TKS + 8, 40)
+                    w64(toks + end*TKS, TT_PNCT); w64(toks + end*TKS + 8, 41)
+                    // drop field-name + ':' token pairs inside the braces.
+                    // Pattern: TT_ID followed by ':' (58) is a field name.
+                    let w = p+2
+                    let r = p+2
+                    while r < end {
+                        if tokt(r)==TT_ID && r+1<end && tokt(r+1)==TT_PNCT && tokv(r+1)==58 {
+                            r = r+2   // skip the field name and ':'
+                        } else {
+                            if w != r {
+                                // copy token r -> w (5 qwords)
+                                w64(toks + w*TKS,     tokt(r))
+                                w64(toks + w*TKS + 8,  tokv(r))
+                                w64(toks + w*TKS + 16, tokl(r))
+                                w64(toks + w*TKS + 24, tokc(r))
+                                w64(toks + w*TKS + 32, tokln(r))
+                                w64(toks + w*TKS + 40, toke(r))
+                            }
+                            w = w+1
+                            r = r+1
+                        }
+                    }
+                    // move the rewritten ')' token to position w
+                    if w != end {
+                        w64(toks + w*TKS,     TT_PNCT)
+                        w64(toks + w*TKS + 8,  41)
+                        w64(toks + w*TKS + 16, tokl(end))
+                        w64(toks + w*TKS + 24, tokc(end))
+                        w64(toks + w*TKS + 32, tokln(end))
+                        w64(toks + w*TKS + 40, 0)
+                        // shift everything after end down by (end - w)
+                        let gap = end - w
+                        let s = end + 1
+                        while s < tokc {
+                            w64(toks + (s-gap)*TKS,     tokt(s))
+                            w64(toks + (s-gap)*TKS + 8,  tokv(s))
+                            w64(toks + (s-gap)*TKS + 16, tokl(s))
+                            w64(toks + (s-gap)*TKS + 24, tokc(s))
+                            w64(toks + (s-gap)*TKS + 32, tokln(s))
+                            w64(toks + (s-gap)*TKS + 40, toke(s))
+                            s = s+1
+                        }
+                        // Shifting the tail down by `gap` invalidates EVERY token
+                        // index already recorded above this point -- fn_btok,
+                        // fn_pbase/fn_pnames, sfldtab slots are source offsets
+                        // (fine), but scanfns() stores token INDICES into the
+                        // tables, and those all sit after the literal.
+                        //
+                        // shift_fn_toks() walks the recorded index tables and
+                        // subtracts gap from every index greater than `end`.
+                        shift_tok_indexes(end, gap)
+                        tokc = tokc - gap
+                        // The outer scan must resume AFTER the literal that was
+                        // just compacted, not from its old position. Without
+                        // this, p stays inside the region that just shifted and
+                        // walks past the new tokc, reading stale token slots --
+                        // which corrupted every function that FOLLOWED the one
+                        // holding the literal, and core-dumped the compiler.
+                        //
+                        p = w
+                    }
+                }
+            }
+        }
+        p = p+1
+    }
+}
+
+// scan_call_float: mark a callee's parameters as f64 from the float arguments its
+// CALLERS pass, by walking the token stream.
+//
+// Why this exists
+// ---------------
+// `fn_parflt` was set ONLY for a parameter DECLARED `: f64`. Quanta's stdlib is
+// overwhelmingly UNTYPED (64 untyped fn definitions across gguf/fs/math against
+// only 7 `: f64` params), so an untyped float parameter reached every arithmetic
+// operation untagged and took the INTEGER code path on the raw bit patterns:
+//     rax=0x4008000000000000 (3.0)   rcx=0x4010000000000000 (4.0)
+//     imul %rcx,%rdx        <- integer multiply, not mulsd
+//     jno  <ok>             <- overflow trap, taken immediately
+//     ud2                   <- SIGILL
+// Reproduced: `fn helper(a,b){ return a*b }` then `helper(3.0, 4.0)` exits 132,
+// while `fn helper(a: f64, b: f64)` returned 12.0 correctly.
+//
+// Why it must live HERE and not in codegen
+// ----------------------------------------
+// Parse and emit are FUSED per function: entry.quanta parses a body and then
+// immediately calls ci_func on it. A callee is therefore fully emitted before any
+// call site that could say "a float is on the way" has been read, and there is no
+// "all functions parsed, none emitted" point at which an inference pass could run.
+// Inside ci_func it is equally impossible: IR_PARAM's result vreg lives in the
+// CALLEE's vreg space while the caller's float vreg lives in the CALLER's, and no
+// IR_MOV chain joins the two -- which is why an earlier attempt to spread the float
+// tag inside the vfloat fixpoint could not make the untyped helper work.
+//
+// scanfns is the one pass that sees every token of the whole file before any
+// function is emitted, so it is the only place where the callee's signature and the
+// caller's arguments are both visible.
+//
+// Rule
+// ----
+// For every call `name(arg0, arg1, ...)` where `name` resolves to a registered
+// function, if argument k is a float literal then parameter k of that function is a
+// float. Monotonic, so one float call site is enough. A parameter already declared
+// `: f64`, `: big`, string-typed or fn-typed is left alone (the declared type wins),
+// and integer call sites are untouched, so integer code is bit-for-bit unchanged.
+fn scan_call_float() {
+    let q = 0
+    while q < tokc {
+        if tokt(q)==TT_ID {
+            let cn = tokv(q)
+            let cl = tokln(q)
+            if q+1 < tokc && tokt(q+1)==TT_PNCT && tokv(q+1)==40 {
+                // Inline GLOBAL lookup. findfn_global() falls back to findfn(), whose
+                // per-function scope state is not yet populated at scan time and
+                // crashed the bootstrap build with exit 139. Matching registered
+                // top-level functions directly is both safe here and exactly the set
+                // callable by name at this point.
+                // EVERY registered top-level function with this name, not just the
+                // first. The name table can hold a function more than once -- the
+                // module itself plus the copy `import` registers -- and the
+                // registration the emitter will actually use is not necessarily the
+                // lowest index. Taking the first match marked the wrong slot: for
+                // `fn h(a,b){...}` (fi 1) called as `h(2, 3.0)`, the mark landed on
+                // fi 21, so parameter 1 of the real `h` stayed untagged and
+                // `a + b` took the integer path over the bit patterns. When both
+                // arguments were floats every candidate happened to be marked and
+                // the bug stayed invisible.
+                //
+                // Marking is monotonic and guarded (a slot already claimed by a
+                // declared type is skipped), so marking every same-named function
+                // is safe and is the only choice that does not depend on
+                // registration order.
+                let s = q + 2
+                let argi = 0
+                let depth = 1
+                while s < tokc && depth > 0 {
+                    let t = tokt(s)
+                    let v = tokv(s)
+                    // A STRING literal is ONE token whose text may contain any
+                    // bracket or paren: "(", ")", "[", "]", "{", "}" all appear
+                    // verbatim inside it. Counting those swung `depth` and, once
+                    // it went negative, the `depth > 0` loop condition ended the
+                    // scan -- dropping every call site after this one. Float
+                    // inference then silently missed the rest of the file:
+                    //
+                    //   import std/fs
+                    //   fn dd(a, b) { return a / b }
+                    //   dd(6.0, 2.0)   -> 0.000000   (integer idiv on bit patterns)
+                    //
+                    // std/fs has such strings, so the user's call -- which sits
+                    // after the import in the expanded source -- was never read.
+                    // A string is one token; skip it whole.
+                    if t == TT_STR { s = s + 1; continue }
+                    if t==TT_PNCT {
+                        if v==40 || v==91 || v==123 { depth = depth + 1 }
+                        if v==41 || v==93 || v==125 {
+                            depth = depth - 1
+                            if depth == 0 { s = s + 1; break }
+                        }
+                        if v==44 && depth == 1 { argi = argi + 1 }
+                    }
+                    // A float literal argument marks the parameter float.
+                    //
+                    // The lexer already classifies these: a number followed by a
+                    // decimal point or an exponent is emitted as TT_FNUM, not
+                    // TT_NUM. So the test is the token type itself -- no text
+                    // scan of the source is needed or correct.
+                    //
+                    // (An earlier version of this checked `t==TT_NUM` and then
+                    // scanned `src+tp` for a '.', 'e' or 'E'. Both halves were
+                    // wrong: TT_FNUM==7 is the float token, and `stok`'s `v`
+                    // field is the token's parsed INTEGER value, not a source
+                    // pointer, so `r8(src+tp+z)` read unrelated bytes and the
+                    // test never fired.)
+                    //
+                    // `-1.0` arrives as TT_OP 45 then TT_FNUM, so a negative
+                    // literal still presents the float as its own token; the
+                    // parameter index is unaffected because '-' is not a comma.
+                    if t==TT_FNUM && depth == 1 && argi < 200 {
+                        // Mark EVERY same-named top-level function, so the slot the
+                        // emitter reads is set regardless of which registration of
+                        // the name the emitter picked.
+                        let gj = 0
+                        while gj < fnc {
+                            if r64(fn_parent + gj*8) < 0 && fn_nlen(gj)==cl {
+                                let okk = 1
+                                let kk = 0
+                                while kk < cl {
+                                    if r8(src+fn_name(gj)+kk)!=r8(src+cn+kk) { okk = 0; break }
+                                    kk = kk + 1
+                                }
+                                if okk == 1 {
+                                    let slot = gj*200 + argi
+                                    if r64(fn_parflt + slot*8)==0
+                                       && r64(fn_parbig + slot*8)==0
+                                       && r64(fn_parstr + slot*8)==0
+                                       && r64(fn_parfn  + slot*8)==0 {
+                                        w64(fn_parflt + slot*8, 1)
+                                    }
+                                }
+                            }
+                            gj = gj + 1
+                        }
+                    }
+                    s = s + 1
+                }
+                // s must always move strictly forward, or the scan stalls.
+                // If depth never returned to 0 (an unbalanced '(' -- a '(' inside a
+                // STRING literal, or a 'fn(...)' TYPE that the depth counter reads
+                // as a call) the inner loop runs s to tokc and the whole pass ends
+                // there, silently missing every call site after it:
+                //
+                //     import std/fs
+                //     fn dd(a, b) { return a / b }
+                //     dd(6.0, 2.0)     -> 0.000000, dd is never marked
+                //
+                // The pass exists to infer float parameters from call sites in the
+                // WHOLE file, so dropping the tail loses real inference, not trivia.
+                // Advance one token past the '(' when the scan did not consume a
+                // balanced argument list, so the next candidate call is still seen.
+                // Resume at the token AFTER the call NAME, not past the whole
+                // argument list. Skipping the list hid every NESTED call:
+                //
+                //   print_f(dd(6.0, 2.0))
+                //
+                // The outer `print_f(` scan consumed `dd(6.0, 2.0)` wholesale, so
+                // the outer loop never presented `dd` as a candidate -- and `dd`'s
+                // float arguments were then seen at depth 2 of the print_f scan,
+                // where the depth-1 test ignores them. Zero inference, silently:
+                //
+                //   fn dd(a, b) { return a / b }
+                //   let q = dd(6.0, 2.0)      -> parameters marked, works
+                //   print_f(dd(6.0, 2.0))     -> 0.000000
+                //
+                // A float argument in real code is nearly always nested inside
+                // another call, so the nested form is the one that matters.
+                // Resuming at q+1 lets each call be visited in its own right.
+                q = q + 1
+                continue
+            }
+        }
+        q = q + 1
+    }
+}
+
+
+// scan_retfloat: mark a function as returning a float from its own body.
+//
+// Mirror of scan_retbig() in globals.quanta, deliberately. That pass iterates
+// `fi` over fnc and derives the body from fn_btok(fi), so the flag lands on the
+// SAME index the compiler assigns the function. An earlier version of this pass
+// walked the token stream looking for `fn` and then guessed the registration
+// index by re-matching the name; that index disagreed with findfn() whenever a
+// typed function preceded the target, and the flag was written to the wrong
+// slot. Symptom:
+//
+//     fn t1() -> f64 { return 3.0 }   ok
+//     fn g() { return 3.0 }
+//     fn main() { let b = g()   b - 1.0 }   -> garbage, but only if t1 came first
+//
+// Why this pass exists at all
+// -------------------------
+// scan_call_float() only marks CALLEE PARAMETERS, from the arguments seen at a
+// call site. It never considers what a function RETURNS, so an untyped function
+// returning a float literal kept fn_retflt == 0 and the caller's result vreg was
+// never tagged. vfloat[] is per-vreg, so the enclosing IR_SUB asked fopld_rr for
+// that operand, found it untagged, and emitted cvtsi2sd over the float's raw bit
+// pattern:
+//
+//     mov    -0x40(%rbp),%rcx
+//     cvtsi2sd %rcx,%xmm0        <- a float's raw bit pattern read as an integer
+//     subsd  %xmm1,%xmm0
+//
+// The declared `-> f64` form already worked because sfn() records the type. Only
+// the return TYPE differed between these, on identical source:
+//
+//     fn g3t() -> f64 { return 3.0 }   let a = g3t()   a - 1.0  -> 2.0  correct
+//     fn g3u() { return 3.0 }          let a = g3u()   a - 1.0  -> garbage
+//
+// Rule
+// ----
+// A `return` directly in a function body (brace depth 1) whose first token is a
+// float literal -- optionally after a unary '-' -- marks the function as
+// returning a float. `scan_retbig()`'s explicit `-> big` annotation is honoured
+// first so a function declared to return a big never gets flagged here, and
+// sfn() recomputes the DECLARED `-> f64` case on every pass.
+//
+// The body walk starts AT the opening brace, as in scan_retbig(): a `return`
+// sitting directly in the body is reached at depth 1, and one nested in an inner
+// block at depth 2+.
+// Float-producing builtin names, matched by prefix the same way is_float_vr()
+// does at each call site. A `return fmul(...)` or `return f16_to_f64(...)` is
+// just as float-valued as `return 1.5`; before this, only a bare FNUM literal set
+// the flag, so those functions went untagged and the caller read the bits out of
+// a GPR (f16_to_f64(p) * 50.0 -> 2.27e+20 instead of 0.0042, because the raw
+// 0x3F1644... pattern was multiplied).
+//
+// The matches are enumerated rather than prefix-matched on 'f', because 'f' also
+// introduces the float->int direction: f2i(), f2u(), and friends yield an
+// INTEGER, and a function ending in `return f2i(x)` must not be tagged or every
+// f2i call site would feed an integer to a float operand.
+fn ret_expr_is_float(start, end) {
+    let q = start
+    while q < end {
+        if tokt(q)==TT_FNUM { return 1 }
+        if tokt(q)==TT_ID {
+            let c = r8(src+tokv(q))
+            let c1 = r8(src+tokv(q)+1)
+            let c2 = r8(src+tokv(q)+2)
+            let c3 = r8(src+tokv(q)+3)
+            // i2f
+            if c=='i'&&c1=='2'&&c2=='f' { return 1 }
+            // fadd fsub fmul fdiv fconst f64_load f64bits f64of fmadd
+            if c=='f' {
+                if c1=='a'&&(c2=='d'||c2=='d') { return 1 }              // fadd
+                if c1=='s'&&c2=='u' { return 1 }                          // fsub
+                if c1=='m'&&(c2=='u'||c2=='a') { return 1 }              // fmul/fmadd
+                if c1=='d'&&c2=='i' { return 1 }                          // fdiv
+                if c1=='c'&&c2=='o' { return 1 }                          // fconst
+                if c1=='6'&&c2=='4'&&c3=='_' { return 1 }                 // f64_*
+                if c1=='q'&&c2=='r' { return 1 }                          // fq*
+            }
+            // sqrt
+            if c=='s'&&c1=='q'&&c2=='r' { return 1 }
+        }
+        q = q+1
+    }
+    return 0
+}
+
+// Resolve a returned identifier to the expression it was bound to, and ask
+// whether THAT is a float producer. The dominant shape in real code is
+//     let a = i2f(x); let b = a * 2.0; return b
+// where the returned token is a bare TT_ID carrying no float marker, so
+// ret_expr_is_float() alone says "not float" and the function goes untagged.
+// The caller then read the bits out of a GPR (f1(5) * 50.0 -> 4.2e+20 instead
+// of 500.0).
+//
+// `bind_depth` is the body's brace depth at which the binding was written;
+// `expr_end` is the token index one past the end of the bound expression.
+// Resolution is ONE hop, not transitive: it is applied to a single `let`
+// statement's initializer, and chained reassignments of the same name are rare
+// enough that recursing would risk a cycle. A chain `let a = i2f(x); let b = a;
+// return b` therefore resolves `b` to `a` and reports not-float; the dominant
+// real pattern (initialiser is a float expression, not another bare local) is
+// covered.
+//
+// Scans [bt, end) so a `let` from an ENCLOSING function or a sibling cannot be
+// mistaken for this function's binding. Depth parity is enforced so a `let`
+// inside a nested block is still seen (it is in scope) while a `let` from a
+// function whose body merely lexically follows is not.
+// True when the identifier token at `t` spells the name at source offset
+// `off` with length `len`. Token identity cannot be compared through tokv():
+// two occurrences of `b` in `let b = a * 2.0; return b` have different source
+// offsets, so an offset comparison never matches and every local binding looks
+// absent. The text has to be compared byte for byte.
+fn tok_id_eq(t, off, len) {
+    if tokt(t) != TT_ID { return 0 }
+    if tokln(t) != len { return 0 }
+    let k = 0
+    while k < len {
+        if r8(src+tokv(t)+k) != r8(src+off+k) { return 0 }
+        k = k+1
+    }
+    return 1
+}
+
+fn ret_id_bound_float(bt, end, r) {
+    return ret_id_bound_float_d(bt, end, r)
+}
+
+// Resolve the local named by the identifier token at `r` to the expression it is
+// bound to, then decide whether that expression produces a float. This is what
+// lets `fn f1(x) { let a = i2f(x); let b = a * 2.0; return b }` be tagged: the
+// returned expression `a * 2.0` contains no float producer of its own, so the
+// verdict has to come from what `b` is bound to and what THAT resolves to.
+//
+// The walk must be memoised and cycle-broken rather than depth-capped --
+// ret_id_bound_float_d explains both.
+fn ret_id_bound_float_d(bt, end, r) {
+    if r >= end { return 0 }
+    if tokt(r) != TT_ID { return 0 }
+    // Memoised per token, and the memo is also the cycle break. Each token is
+    // walked at most once: a re-entry finds 3 (in progress) and answers 0, which
+    // is the right answer for a genuine cycle since a cycle cannot introduce a
+    // float producer that the cycle itself does not contain.
+    //
+    // There is deliberately NO hop cap. A hop limit would make the result
+    // depend on the depth the name was reached at, so a token first resolved at
+    // depth 4 (cap hit, answer 0) would memoise 0 and then wrongly answer 0 when
+    // reached at depth 0. With the marker doing the breaking, each token costs
+    // one body scan, which is what makes this linear.
+    let mv = r64(bind_memo + r*8)
+    if mv == 1 { return 1 }
+    if mv == 2 { return 0 }
+    if mv == 3 { return 0 }
+    w64(bind_memo + r*8, 3)
+    let res = ret_id_bound_float_walk(bt, end, r)
+    if res == 1 { w64(bind_memo + r*8, 1) }
+    else { w64(bind_memo + r*8, 2) }
+    return res
+}
+
+fn ret_id_bound_float_walk(bt, end, r) {
+    if r >= end { return 0 }
+    if tokt(r) != TT_ID { return 0 }
+    let name = tokv(r)
+    // Length is the LEXER's token length, never a hand-rolled character scan.
+    // A terminator list that omits space (32) or tab (9) makes the scan run
+    // through `a * b` to the end of the statement, and the resulting nlen never
+    // equals tokln() of the binding token, so tok_id_eq can never match.
+    let nlen = tokln(r)
+    // Phase 1: record the LAST binding of `name` in this body.
+    let found = 0
+    let bstart = 0
+    let bend = 0
+    let q = bt
+    while q < end {
+        // `let name = ...`
+        if tokt(q)==TT_KEY && tokln(q)==3 && r8(src+tokv(q))=='l'&&r8(src+tokv(q)+1)=='e'&&r8(src+tokv(q)+2)=='t' {
+            let n1 = q+1
+            let op = q+2
+            if n1<end && tok_id_eq(n1, name, nlen)==1 && op<end && tokt(op)==TT_OP && tokv(op)==61 {
+                let d = 0
+                let s = op+1
+                let e = end
+                let g = 1
+                while s<end && g==1 {
+                    if tokt(s)==TT_PNCT && tokv(s)==123 { d = d+1 }
+                    else if tokt(s)==TT_PNCT && tokv(s)==125 { d = d-1; if d<0 { break } }
+                    else if tokt(s)==TT_OP && tokv(s)==59 && d==0 { g = 0; e = s; break }
+                    s = s+1
+                }
+                found = 1
+                bstart = op+1
+                bend = e
+            }
+        }
+        // `name = ...` (plain reassignment, no `let`). The preceding-token guard
+        // skips `a == b` / `a != b` / `a >= b` (a 61 byte preceded by 61) and
+        // skips the left operand of an augmented assignment (`a += x`), so a
+        // comparison is never mistaken for a binding.
+        else if tok_id_eq(q, name, nlen)==1 && q+1<end && tokt(q+1)==TT_OP && tokv(q+1)==61 && !(q>bt && tokt(q-1)==TT_OP && (tokv(q-1)==61 || tokv(q-1)==43 || tokv(q-1)==45 || tokv(q-1)==42 || tokv(q-1)==47)) {
+            let d = 0
+            let s = q+2
+            let e = end
+            let g = 1
+            while s<end && g==1 {
+                if tokt(s)==TT_PNCT && tokv(s)==123 { d = d+1 }
+                else if tokt(s)==TT_PNCT && tokv(s)==125 { d = d-1; if d<0 { break } }
+                else if tokt(s)==TT_OP && tokv(s)==59 && d==0 { g = 0; e = s; break }
+                s = s+1
+            }
+            found = 1
+            bstart = q+2
+            bend = e
+        }
+        q = q+1
+    }
+    if found != 1 { return 0 }
+    if ret_expr_is_float(bstart, bend)==1 { return 1 }
+    // The bound expression mentions no float producer of its own. If it is (or
+    // contains) a bare identifier, follow THAT name's binding instead.
+    let w = bstart
+    while w < bend {
+        if tokt(w)==TT_ID {
+            if ret_id_bound_float_d(bt, end, w)==1 { return 1 }
+        }
+        w = w+1
+    }
+    return 0
+}
+
+fn scan_retfloat() {
+    // bind_memo is keyed by token index, and token indices are reused across
+    // compiles, so a stale verdict from a previous file would mis-tag. Zero it
+    // over the token span actually in use. `tokp` is the token COUNT: `tokc` is
+    // a per-token accessor function, not the count.
+    let zq = 0
+    let zn = tokp
+    while zq < zn {
+        w64(bind_memo + zq*8, 0)
+        zq = zq+1
+    }
+  let fi = 0
+  while fi < fnc {
+    // Do NOT clobber the DECLARED `-> f64` tag that sfn() already recorded for
+    // this slot. The unconditional zero here ran after scanfns() and erased it,
+    // so a function explicitly declared `fn fc() -> f64 { return 1.0 + 1.0 }`
+    // ended up with fn_retflt==0: the inference then has to re-derive it, and
+    // whenever the body is not a bare literal (here, an expression) it did not,
+    // leaving `fmul(fc(), 50.0)` to multiply the raw bit pattern. Only CLEAR the
+    // flag when it was never set, and let the body analysis add to it.
+    let already = r64(fn_retflt + fi*8)
+    if already != 1 { w64(fn_retflt + fi*8, 0) }
+    let bt = fn_btok(fi)
+    let depth = 0; let p = bt; let end = tokc; let started = 0
+    while p < tokc {
+      if tokt(p)==TT_PNCT&&tokv(p)==123 { depth = depth+1; started = 1 }
+      else if tokt(p)==TT_PNCT&&tokv(p)==125 { depth = depth-1; if started==1&&depth==0 { end = p; break } }
+      p = p+1
+    }
+    let q = bt
+    while q < end {
+      if tokt(q)==TT_KEY && tokln(q)==6 && r8(src+tokv(q))=='r'&&r8(src+tokv(q)+1)=='e'&&r8(src+tokv(q)+2)=='t'&&r8(src+tokv(q)+3)=='u'&&r8(src+tokv(q)+4)=='r'&&r8(src+tokv(q)+5)=='n' && depth==1 {
+        let r = q+1
+        if r<end && tokt(r)==TT_OP && tokv(r)==45 { r = r+1 }
+        if r<end && tokt(r)==TT_FNUM { w64(fn_retflt + fi*8, 1) }
+        // Not a literal: look ahead over the whole returned expression, stopping
+        // at a `;` so a float appearing in a LATER statement cannot tag this
+        // function. (Written as a positive test, not `!(a && b)`, so it does not
+        // depend on the parser handling a negated compound condition.)
+        else {
+          let s = r
+          let go = 1
+          while s<end && go==1 {
+            if tokt(s)==TT_OP && tokv(s)==59 { go = 0 }
+            else { s = s+1 }
+          }
+          if ret_expr_is_float(r, s)==1 { w64(fn_retflt + fi*8, 1) }
+          // `return <ident>`: resolve the local to its bound expression. A float
+          //->int conversion in the returned expression has already been judged
+          // NOT-float by ret_expr_is_float (f2i is excluded), and that verdict
+          // stands; only fall through to the binding when the return is a bare
+          // name, so `return f2i(x)` on a float local stays an int return.
+          else if r<s && tokt(r)==TT_ID && ret_id_bound_float(bt, end, r)==1 { w64(fn_retflt + fi*8, 1) }
+        }
+      }
+      if tokt(q)==TT_PNCT {
+        if tokv(q)==123 { depth = depth+1 }
+        else if tokv(q)==125 { depth = depth-1 }
+      }
+      q = q+1
+    }
+    fi = fi+1
+  }
+}
+
+// Same shape as scan_retfloat(): walk the canonical function list with `fi`,
+// derive the body from fn_btok(fi), and record the flag against that same fi.
+// This deliberately does NOT reuse scan_retfloat's index guessing or a
+// name-rematching map -- findfn() resolves against this canonical index, so a
+// second numbering scheme silently mis-tags the caller (the bug that made
+// typed-before-untyped float functions interfere with each other).
+//
+// Without this, `fn lit() { return "hello" }` leaves fn_retstr unset. codegen
+// then leaves the caller's result vreg untagged, and print() reads the string
+// pointer's low 4 bytes as an integer: "hello" printed as 1109393744
+// (0x6c6c6568 == "hell"). Only a *declared* `-> string` return was tagged,
+// via the codegen.quanta check on fn_retstr[rfi].
+fn scan_retstr() {
+  let fi = 0
+  while fi < fnc {
+    w64(fn_retstr + fi*8, 0)
+    let bt = fn_btok(fi)
+    let depth = 0; let p = bt; let end = tokc; let started = 0
+    while p < tokc {
+      if tokt(p)==TT_PNCT&&tokv(p)==123 { depth = depth+1; started = 1 }
+      else if tokt(p)==TT_PNCT&&tokv(p)==125 { depth = depth-1; if started==1&&depth==0 { end = p; break } }
+      p = p+1
+    }
+    let q = bt
+    while q < end {
+      if tokt(q)==TT_KEY && tokln(q)==6 && r8(src+tokv(q))=='r'&&r8(src+tokv(q)+1)=='e'&&r8(src+tokv(q)+2)=='t'&&r8(src+tokv(q)+3)=='u'&&r8(src+tokv(q)+4)=='r'&&r8(src+tokv(q)+5)=='n' && depth==1 {
+        let r = q+1
+        if r<end && tokt(r)==TT_OP && tokv(r)==45 { r = r+1 }
+        if r<end && tokt(r)==TT_STR { w64(fn_retstr + fi*8, 1) }
+      }
+      if tokt(q)==TT_PNCT {
+        if tokv(q)==123 { depth = depth+1 }
+        else if tokv(q)==125 { depth = depth-1 }
+      }
+      q = q+1
+    }
+    fi = fi+1
+  }
+}
