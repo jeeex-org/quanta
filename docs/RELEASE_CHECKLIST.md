@@ -105,18 +105,29 @@ These are non-negotiable. Violating any of them is a gate failure by itself.
 ---
 
 ## Terminology (derive from `VERSION`, never hardcode)
-- `<VER>`   = released/live stable   -> `cat VERSION`        (currently **0.0.169**)
+- `<VER>`   = released/live stable   -> `cat VERSION`        (currently **0.0.224**)
 - `<NEXT>`  = the version being built -> exactly ONE patch above `<VER>`
 - `<PRIOR>` = `<VER>` itself; its committed golden `compiler/<VER>/bin/x86/qc`
   is the seed for `<NEXT>`. There is NO separate `bootstrap/` directory.
 - Golden binary: `compiler/<X>/bin/x86/qc` (committed). NEVER in `/tmp`.
+- **FROZEN BASELINE = `<VER>`, the release one behind stable.** After promoting
+  `<NEXT>`, `<VER>` is the baseline: its `src` is never modified again, and the
+  release after that opens as a copy of it. A baseline qualifies only if its
+  source rebuilds to its own committed md5 BIT-FOR-BIT (step 5) — otherwise it
+  is not a usable fallback and the promotion is not done.
 
 ## LIVE STATE (advance this on every promotion)
-- Current stable compiler: **0.0.169** (2026-08-27)
-- Golden binary: `compiler/0.0.169/bin/x86/qc`
-- Self-host fixpoint md5: `a4affa951d64304946862358316240c1` (B==C byte-identical)
+- Current stable compiler: **0.0.224** (2026-10-05)
+- Golden binary: `compiler/0.0.224/bin/x86/qc`
+- Self-host fixpoint md5: `d0aaa549c11361d27f7c9b91ffdc7dff` (gen0==gen1==gen2==binary)
+- Frozen baseline (one behind): `0.0.223`, md5 `ff78dcbbb0cbfb94a1127c7813595f83`
+- Older fallback: `0.0.222`, md5 `650f03c6d6ce13bb6f575b5056e07d3d`
 - Per-version state is recorded in `compiler/<VER>/WIP.md` and MUST be updated
   each promotion.
+
+> Never write the compiler's own binary in place: `qc -O src/x86/main.quanta
+> bin/x86/qc` truncates the file it is executing and leaves 0 bytes. Always
+> build to a separate output path, then install.
 
 ---
 

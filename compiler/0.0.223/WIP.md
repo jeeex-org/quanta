@@ -1,5 +1,12 @@
 # 0.0.223 — WIP
 
+> **FROZEN BASELINE.** Promoted to stable as `0.0.224` (commit `602bab90`).
+> `src` is frozen and must never be modified again; it reproduces its own
+> committed binary bit-for-bit (`md5=ff78dcbbb0cbfb94a1127c7813595f83`).
+> This release measured 813/817 with four trait COMPILE failures — those were
+> real and were fixed in `0.0.224`. The body below is this release's own
+> record and is kept accurate to `0.0.223`, not updated to `0.0.224`.
+
 Promoted from `0.0.222` by copy. `0.0.222/src` is frozen and never modified; it
 is the stable fallback. Verified before the copy:
 

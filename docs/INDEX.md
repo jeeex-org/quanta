@@ -16,13 +16,19 @@ source of truth. Anything not listed here has been removed as superseded.
 4. **Root `VERSION` is the only version pointer.** There is no `compiler/VERSION`.
    Deleted in `3631dd95` after it was found reading `0.0.192` across 30 releases
    while nothing consumed it.
+5. **The frozen baseline is the release one behind stable.** With stable at
+   `0.0.224` that is `0.0.223` (`md5=ff78dcbbb0cbfb94a1127c7813595f83`),
+   measured to rebuild bit-for-bit from its own source. It is never modified
+   after promotion; the next release opens as a copy of it. `0.0.222` is one
+   behind the baseline and is kept only because it reproduces bit-for-bit too.
 
 ## Compiler — current
 
 | Doc | What it is |
 |---|---|
-| `compiler/0.0.222/WIP.md` | Frozen fallback release record |
-| `compiler/0.0.223/WIP.md` | Current working release record |
+| `compiler/0.0.224/WIP.md` | Current stable release record |
+| `compiler/0.0.223/WIP.md` | Frozen baseline — one behind stable |
+| `compiler/0.0.222/WIP.md` | Older fallback, retained (reproduces bit-for-bit) |
 | `docs/SYNTAX.md` | Language syntax reference |
 | `docs/SPEC.md` | Language specification |
 | `docs/FLAGS.md` | Compiler flags |
@@ -88,7 +94,7 @@ The roadmaps were **not** up to date. Measured against reality:
   `test_suites/scripts/verify_status.quanta` and tracked in CI as the
   `verify-status` gate.
 - `docs/roadmap/quanta.md` last referenced version `0.0.169`; the tree is at
-  `0.0.223`.
+  `0.0.224`.
 - `docs/SPEC.md` and `docs/MEMORY_SAFETY_ARGUMENT.md` are labelled `v0.0.169`.
 - `docs/COMPILER_KNOWLEDGE.md` was labelled `0.0.190` and was generated from
   that source. Its generator had the version **hardcoded in the script**, so it
@@ -114,6 +120,6 @@ The roadmaps were **not** up to date. Measured against reality:
 
 ## The one thing to read first
 
-`compiler/0.0.223/WIP.md`. It states the measured current state of the compiler,
-what the four remaining failures are, and the exact commands that produced every
-number in it.
+`compiler/0.0.224/WIP.md`. It states the measured current state of the compiler,
+the root cause of the four trait failures it fixed, and the exact commands that
+produced every number in it.

@@ -71,6 +71,20 @@ were correct and had simply never been reached.
 
 All four trait tests compile AND return the correct value (exit 10).
 
+## Baseline
+
+`0.0.224` was opened as a copy of `0.0.223`, which is now the frozen baseline —
+one behind stable. Measured before the copy:
+
+    compiler/0.0.223/src rebuilt -> md5=ff78dcbbb0cbfb94a1127c7813595f83
+    i.e. the frozen baseline reproduces its own committed binary BIT-FOR-BIT.
+
+`0.0.223/src` is frozen and never modified after promotion. `0.0.222`
+(`md5=650f03c6d6ce13bb6f575b5056e07d3d`) is one behind the baseline and is kept
+only because it also reproduces bit-for-bit.
+
+Exactly one source file differs from the baseline: `src/x86/funcscan.quanta`.
+
 ---
 
 ## Inherited record (from 0.0.223)

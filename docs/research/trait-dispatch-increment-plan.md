@@ -1,6 +1,13 @@
 # Increment 0.0.224 — trait methods and dynamic dispatch
 
-Plan only. No code written yet. Baseline `0.0.223` @ `6454f037`, gate 813/817.
+> **SUPERSEDED — shipped in `0.0.224` (commit `602bab90`).** The plan below was
+> written against a wrong root cause: it assumed the trait metadata chain was
+> broken (`imethods` never read, no dispatch by trait). It was not. The four
+> tests had one unrelated cause in `rewrite_struct_literals()`, which rewrote
+> the impl header's `{` into `(` so `scanimpls()` never recognised the method.
+> Fix: one line in `funcscan.quanta`. Gate 813/813, self-host fixed point.
+> The gated steps below were never needed and are kept only to record what was
+> ruled out. See `compiler/0.0.224/WIP.md` for the real root cause.
 
 ## Baseline
 
@@ -8,7 +15,7 @@ Plan only. No code written yet. Baseline `0.0.223` @ `6454f037`, gate 813/817.
     size=2978568  md5=ff78dcbbb0cbfb94a1127c7813595f83
     gate 813/817 — 4 compile failures, all trait tests
     self-host fixed point holds
-    0.0.222 frozen, rebuilds bit-for-bit to 650f03c6
+    0.0.222 frozen at the time; the baseline is now 0.0.223
 
 ## Correction to the previous record
 
