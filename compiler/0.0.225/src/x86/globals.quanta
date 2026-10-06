@@ -1299,6 +1299,27 @@ let arg_filled = mmap(8000000) // t5: per-call bitmap of supplied param indices 
 // holds the token index of each global's initializer expression.  Globals live
 // at absolute address GDATA + index*8 in a dedicated writable segment.
 let gvars = mmap(2000000); let ginit = mmap(2000000); let gvarc = 0
+
+// gfloat[i] = 1 when global slot i holds an f64 bit-pattern.
+//
+// A module-level `let g = 0.0` was never float-tagged, so is_float_vr() said
+// false for every read of it and `+ - * /` ran the INTEGER path over the bit
+// pattern. The failure was silent and looked like a maths bug rather than a
+// codegen one:
+//
+//     let g = 0.0 ; g = 3.0 ; g + 1.0   ->  inf        want 4.0
+//     let l = 0.0 ; l = 3.0 ; l + 1.0   ->  4.0        (identical, but LOCAL)
+//     f64of(g)                         ->  3.0        (the VALUE was fine)
+//
+// Every symptom in the LFM2 forward pass pointed here: pow(g_base, e) gave
+// 0.260893 where 1e7^(-2/64) = 0.604296, log(g_base) gave 42.996565 where
+// log(1e7) = 16.118096, and fadd(g_a, g_b) gave inf. All three were the same
+// missing tag, not three arithmetic bugs.
+//
+// Recorded from the compiled INITIALISER in __init rather than by inspecting
+// tokens: the initialiser's result vreg is already tagged by the vfloat prepass,
+// so is_float_vr() there is authoritative and cannot be fooled by spelling.
+let gfloat = mmap(2000000)
 // F7: compile-time constants. `const NAME = EXPR` evaluates EXPR at compile time
 // (literal arithmetic only) and stores the value here. On use, parse_primary
 // substitutes IR_CONST directly ? true comptime substitution.

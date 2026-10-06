@@ -912,6 +912,86 @@ fn ci_func(fi, is_main) {
     // RE-MARK float vregs (vfloat was cleared by aclr). i2f(x) yields a float
     // result; follow IR_MOV chains so the float flag reaches the MUL/ADD/SUB
     // operands. Iterate to a fixpoint (multi-level MOV chains). Runs after aclr.
+    // ---- global float pre-pass ----
+    //
+    // Decide which module-level globals hold f64 BEFORE the vreg fixpoint below,
+    // because that fixpoint consults gfloat when it tags IR_LOADG destinations.
+    // Doing it inside the fixpoint was not enough: on the first sweep the tag for
+    // a literal initialised inside a function (`g = 3.0` in main) is not yet known
+    // at the point the store is visited, so the global stays untagged and every
+    // read of it in the same function is untagged too.
+    //
+    //   let g = 0.0 ; (in main) g = 3.0 ; g + 1.0   ->  inf    want 4.0
+    //
+    // Two sources feed gfloat, and both are needed:
+    //   1. scan_globals() records it from the DECLARATION's initialiser token
+    //      (`let g = 3.0`).
+    //   2. this pre-pass records it from any float STORE into the slot
+    //      (`g = 3.0` inside a function), because the declaration of a slot that
+    //      starts at 0.0 says nothing about what is later written to it.
+    //
+    // gfloat is only ever set 0 -> 1, never cleared, so a global cannot be
+    // un-tagged by a later integer store into the same slot. That is deliberate:
+    // an int store into a float global is a type error the caller should not rely
+    // on, whereas the reverse -- the common case -- must keep working.
+    {
+        // Settle the vreg tags first, so `is_float_vr` on a stored value means
+        // something. Two bounded rounds are enough: an f64 literal is already
+        // tagged by the IR_CALL case below, and an assignment chain in one
+        // function is at most one hop deep.
+        let gr = 0
+        while gr < 2 {
+            gr = gr + 1
+            let gp = ir_beg
+            while gp < ir_end {
+                if irop(gp)==IR_FCONST {
+                    // An f64 literal IS a float vreg. Dumping the IR for
+                    // `g = 3.0` shows op=38 (IR_FCONST) carrying the literal's
+                    // bit pattern and writing vreg 0, which the following
+                    // IR_STOREG then stores into the global -- so IR_FCONST, not
+                    // IR_CALL, is what a literal assigned inside a function
+                    // lowers to. The fixpoint below has an IR_FCONST case; this
+                    // pre-pass needs one too, or the store is seen before its
+                    // value is known to be a float.
+                    if r8(vfloat+irres(gp))!=1 { w8(vfloat+irres(gp), 1) }
+                }
+                else if irop(gp)==IR_CALL {
+                    let gnm = ira0(gp)
+                    let gf64 = 0
+                    if r8(src+gnm)=='i' && r8(src+gnm+1)=='2' && r8(src+gnm+2)=='f' { gf64 = 1 }
+                    if r8(src+gnm)=='f' && r8(src+gnm+1)=='c' && r8(src+gnm+2)=='o' { gf64 = 1 }
+                    if r8(src+gnm)=='f' && r8(src+gnm+1)=='6' && r8(src+gnm+2)=='4' { gf64 = 1 }
+                    if gf64==1 && r8(vfloat+irres(gp))!=1 { w8(vfloat+irres(gp), 1) }
+                }
+                gp = gp + 1
+            }
+        }
+        let gp = ir_beg
+        while gp < ir_end {
+            // iremit(IR_STOREG, 0, src_vreg, gvar_index): a0 is the source vreg
+            // and a1 is the global index (helpers.quanta).
+            if irop(gp)==IR_STOREG {
+                let sgv = ira0(gp)
+                let sgi = ira1(gp)
+                if sgv>=0 && sgi>=0 && sgi<gvarc && is_float_vr(sgv)==1 {
+                    w8(gfloat+sgi*8, 1)
+                }
+            }
+            // A global READ of an already-known-float global is itself float, so
+            // propagate through `let t = g` chains within this function.
+            else if irop(gp)==IR_LOADG {
+                let lgv = ira0(gp)
+                let lgi = ira1(gp)
+                if lgv>=0 && lgi>=0 && lgi<gvarc && r8(gfloat+lgi*8)==1 {
+                    if r8(vfloat+lgv)!=1 { w8(vfloat+lgv, 1) }
+                }
+            }
+            else if irop(gp)==IR_MOV {
+                if r8(vfloat+ira0(gp))==1 && r8(vfloat+irres(gp))!=1 { w8(vfloat+irres(gp), 1) }
+            }
+            gp = gp + 1
+        }
+    }
     {
         let changed=1
         while changed==1 {
@@ -970,6 +1050,17 @@ fn ci_func(fi, is_main) {
                                 ak = ak + 1
                             }
                         }
+                    }
+                } else if irop(mp)==IR_LOADG {
+                    // Reading a float module-level global yields an f64 bit
+                    // pattern, so the destination vreg is a float. IR_LOADG was
+                    // missing from this prepass entirely -- see gfloat in
+                    // globals.quanta. This is the fix for `g + 1.0` returning
+                    // inf, and for pow/log/fadd reading global operands wrongly.
+                    let lgv = ira0(mp)
+                    let lgi = ira1(mp)
+                    if lgv>=0 && lgi>=0 && lgi<gvarc && r8(gfloat+lgi*8)==1 {
+                        if r8(vfloat+lgv)!=1 { w8(vfloat+lgv, 1); changed=1 }
                     }
                 } else if irop(mp)==IR_MOV {
                     if r8(vfloat+ira0(mp))==1 && r8(vfloat+irres(mp))!=1 { w8(vfloat+irres(mp), 1); changed=1 }

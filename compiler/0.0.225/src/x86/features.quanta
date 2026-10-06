@@ -184,6 +184,36 @@ fn scan_globals() {
                     // ginit: skip name and '='; for `global NAME` with no init it
                     // still points past '=', harmless (initializer is empty / 0).
                     w64(ginit+gvarc*8, nt+2)
+                    // Is this global an f64? Decided HERE, from the initialiser's
+                    // leading token, because this is the only point where both the
+                    // token stream and the gvar index are in hand.
+                    //
+                    // It cannot be decided from the compiled initialiser later: an
+                    // f64 literal lowers to IR_CALL "fconst", and is_float_vr() is
+                    // only populated by the vfloat prepass, which runs per function
+                    // during EMIT -- long after aclr() has cleared the table. An
+                    // is_float_vr() probe in __init therefore always reads 0.
+                    //
+                    // This is the input to the IR_LOADG case in the vfloat prepass;
+                    // without it every float global read is untagged and `g + 1.0`
+                    // runs integer arithmetic over the bit pattern. See gfloat in
+                    // globals.quanta.
+                    let isf = 0
+                    let ip = nt+2
+                    if ip<tokc {
+                        let it = tokt(ip)
+                        if it==TT_FNUM { isf = 1 }                 // 0.0, 1e-5, 1.5
+                        else if it==TT_ID || it==TT_KEY {
+                            // i2f(n) is the other way a global becomes a float.
+                            if it==TT_ID {
+                                let fnm = src+tokv(ip)
+                                if tokln(ip)==3 && r8(fnm)=='i' && r8(fnm+1)=='2' && r8(fnm+2)=='f' { isf = 1 }
+                            }
+                        }
+                    }
+                    w64(gfloat+gvarc*8, isf)
+
+
                     if gvarc >= GVAR_CAP { emit_ovf(60) }
                     gvarc=gvarc+1
                 }
