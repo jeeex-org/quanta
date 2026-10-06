@@ -407,7 +407,14 @@ fn ascratch(ex) {
     return ev_pr
 }
 
-fn aclr() { allocfc=0; let i=0; while i<vreg_n { w8(vr_init+i,0); w8(vr_spill+i,0); w8(vfloat+i,0); i=i+1 } }
+// Clears to vreg_high, NOT vreg_n.
+//
+// ci_func() resets vreg_n = 0 before aclr() runs (that is the vreg_high reset in
+// codegen.quanta), so clearing to vreg_n iterated zero times and the per-vreg
+// tables -- vfloat above all -- kept whatever the previous function left in them.
+// A stale vfloat entry made is_float_vr() true for a vreg that held an integer,
+// which sent float arithmetic down fopld_rr's cvtsi2sd path.
+fn aclr() { allocfc=0; let i=0; while i<vreg_high { w8(vr_init+i,0); w8(vr_spill+i,0); w8(vfloat+i,0); i=i+1 } }
 
 // afree(): return a free physical reg, evicting a mapped vreg (spilling it) if needed.
 fn afree() {

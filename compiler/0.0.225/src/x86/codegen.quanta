@@ -783,6 +783,26 @@ fn ci_func(fi, is_main) {
     opt_beg = ir_beg
     opt_end = ir_end
     opt_func()
+    // Remember how high the vreg numbering got, then reset it.
+    //
+    // aclr() (emitter.quanta) clears vr_init / vr_spill / vfloat with
+    // `while i < vreg_n`. It runs LATER in this function than the reset below, so
+    // by then vreg_n is already 0 and the loop body never executes: the per-vreg
+    // side tables were NEVER cleared between functions.
+    //
+    // vfloat is what is_float_vr() reads, so a stale tag from a previously
+    // compiled function survived into the next one. The symptom was a float
+    // global whose arithmetic worked or failed depending on POSITION -- anything
+    // emitted before it shifted the vreg numbering -- which is the signature of a
+    // tag being inherited rather than derived. Disassembly confirmed it exactly:
+    // one program emitted `movq %rax,%xmm0` + `addsd` (correct) and another
+    // emitted `cvtsi2sd %rdx,%xmm0` + `addsd` for the identical expression,
+    // where cvtsi2sd is fopld_rr's INTEGER path and the operand is the bit
+    // pattern of the global read as a float.
+    //
+    // vreg_high carries the previous function's extent across the reset so aclr()
+    // can actually clear it.
+    vreg_high = vreg_n
     vreg_n = 0
     if is_cache == 1 {
       // Per-function context the source path establishes before parsing a body.
@@ -1631,6 +1651,29 @@ fn ci_func(fi, is_main) {
             w8(gpatches+gpatchc*24+16, 0)
             if gpatchc >= GPATCH_CAP { emit_ovf(10) }
             gpatchc=gpatchc+1
+            // Tag the RESULT here, at the load, rather than relying on the vfloat
+            // pre-pass alone.
+            //
+            // Disassembly of the same expression `a + 1.0` in two programs showed
+            // the whole bug in one instruction:
+            //
+            //     movq   %rax,%xmm0 ; addsd %xmm1,%xmm0        correct
+            //     cvtsi2sd %rdx,%xmm0 ; addsd %xmm1,%xmm0      WRONG
+            //
+            // cvtsi2sd is fopld_rr's INTEGER path, taken because is_float_vr() was
+            // false for this vreg, so the global's bit pattern was reinterpreted as
+            // a small integer and converted: 4607182418800017408 + 1.0 -> inf. The
+            // VALUE was always right (pf64 of the global printed 3.0); only the tag
+            // was missing, so every arithmetic result on a float global was wrong
+            // with no trap.
+            //
+            // Why the pre-pass alone was not enough: the tag was verified present
+            // when read back, yet the emit still saw it unset -- anything emitted
+            // earlier in the function changed the vreg numbering and the result was
+            // lost. Setting it here makes the load self-describing, which is where
+            // every other float-producing op already does it: IR_FCONST,
+            // IR_NEG and the arithmetic ops all write w8(vfloat+res, 1) at emit.
+            if a0>=0 && a0<gvarc && r8(gfloat+a0*8)==1 { w8(vfloat+res, 1) }
             sdef(res, rd)
         }
         else if op==IR_STOREG {
