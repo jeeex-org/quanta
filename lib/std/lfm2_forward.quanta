@@ -1,0 +1,150 @@
+// lib/std/lfm2_forward.quanta -- native LFM2 forward pass, one token at a time.
+//
+// Configuration is read from the model, never hardcoded. Measured from
+// QUANTA-LFM2.5-2.6Bv1-Q4_K_M.gguf:
+//
+//   lfm2.embedding_length                    2048      d_model
+//   lfm2.feed_forward_length                 10752     d_ff
+//   lfm2.block_count                         30
+//   lfm2.vocab_size                          128000
+//   lfm2.attention.head_count                32        query heads
+//   lfm2.attention.head_count_kv             per layer: 8 on attention layers
+//   lfm2.rope.freq_base                      1e7
+//   lfm2.attention.layer_norm_rms_epsilon    1e-5
+//   lfm2.shortconv.l_cache                   3         causal conv width
+//   general.file_type                        15        Q4_K_M
+//
+// head_dim = d_model / head_count = 64. The attention layers run 32 query heads
+// over 8 KV heads, so 4 queries share each KV head. Conv layers have no
+// attention at all.
+//
+// Memory: no weight is ever fully materialised. Every matvec goes through
+// lfm2_mm, which reads one row at a time, so peak cost is the widest single row
+// (1 MB for the embedding) rather than the 20 GB of weights.
+//
+// MEMORY ACCESS CONVENTION
+// ------------------------
+// A Quanta pointer is a raw address. Read f64 with f64of(mem_load(p + i * 8)),
+// write with mem_store(p + i * 8, v). Indexing p[i] faults. A typed `f64` local
+// holds a float bit-pattern; an UNTYPED `acc` turns arithmetic into integer
+// operations and trips the overflow trap (SIGILL, exit 132). print() shows the
+// bit pattern -- use pf64() from std/math to see a float.
+
+import std/gguf
+import std/lfm2_model
+import std/lfm2_mm
+import std/math
+
+// f32 metadata (rope.freq_base, layer_norm_rms_epsilon) comes back through
+// gguf_kv_float(), which already widens f32 to f64. Do NOT hand-roll this: an
+// earlier version read the raw bytes out of gguf_kv_int(), which is documented to
+// return -1 for a non-integer KV, and crashed.
+
+// ---- configuration ---------------------------------------------------------
+let fc_d_model = 0
+let fc_d_ff = 0
+let fc_n_layers = 0
+let fc_n_heads = 0
+let fc_head_dim = 0
+let fc_n_ctx = 0
+let fc_rope_base = 0.0
+let fc_rms_eps = 0.0
+let fc_conv_width = 0
+let fc_n_vocab = 0
+let fc_nkv_max = 0
+let fc_ready = 0
+
+let fc_nkv = 0            // per-layer KV head count, 0 = no attention
+
+fn fc_read_config() {
+    if fc_ready != 0 { return 0 }
+
+    fc_d_model = gguf_kv_int(gguf_kv_find("lfm2.embedding_length"))
+    fc_d_ff = gguf_kv_int(gguf_kv_find("lfm2.feed_forward_length"))
+    fc_n_layers = gguf_kv_int(gguf_kv_find("lfm2.block_count"))
+    fc_n_heads = gguf_kv_int(gguf_kv_find("lfm2.attention.head_count"))
+    fc_n_ctx = gguf_kv_int(gguf_kv_find("lfm2.context_length"))
+    fc_n_vocab = gguf_kv_int(gguf_kv_find("lfm2.vocab_size"))
+    fc_conv_width = gguf_kv_int(gguf_kv_find("lfm2.shortconv.l_cache"))
+
+    fc_rope_base = gguf_kv_float(gguf_kv_find("lfm2.rope.freq_base"))
+    fc_rms_eps = gguf_kv_float(gguf_kv_find("lfm2.attention.layer_norm_rms_epsilon"))
+
+    if fc_d_model <= 0 || fc_n_heads <= 0 || fc_n_layers <= 0 { return -1 }
+    fc_head_dim = fc_d_model / fc_n_heads
+    if fc_head_dim * fc_n_heads != fc_d_model { return -1 }
+    if fc_rope_base <= 0.0 { return -1 }
+    if fc_rms_eps <= 0.0 { return -1 }
+
+    if lfm2_build_table(fc_n_layers) <= 0 { return -1 }
+
+    // n_kv is per layer in LFM2. Cross-check it against the descriptor table: a
+    // layer claiming KV heads must actually have attn_k/attn_v tensors, and one
+    // with no KV heads must not. If the two sources disagree, every attention
+    // result would be garbage, so refuse rather than guess.
+    fc_nkv = mem_alloc(fc_n_layers * 8)
+    let kv = gguf_kv_find("lfm2.attention.head_count_kv")
+    let i = 0
+    while i < fc_n_layers { mem_store(fc_nkv + i * 8, 0); i = i + 1 }
+    if kv >= 0 {
+        // head_count_kv is an i32 array, NOT a string array: 4 bytes per element
+        // with no length prefix. gguf_kv_arr_elem_bytes() walks length-prefixed
+        // records and would read nonsense here, so slurp it as a fixed-stride i32
+        // block starting at the array's own offset.
+        let cnt = gguf_kv_arr_count_any(kv)
+        if cnt > 0 && gguf_kv_arr_etype(kv) == 5 {
+            // ONE cell for the whole loop: mem_alloc inside a loop is unsafe
+            // because the next iteration clobbers the pointer.
+            let cell = mem_alloc(8)
+            i = 0
+            while i < cnt && i < fc_n_layers {
+                if gguf_kv_arr_elem_num(kv, i, cell) != 4 { return -1 }
+                let v = mem_load(cell)
+                mem_store(fc_nkv + i * 8, v)
+                if v > fc_nkv_max { fc_nkv_max = v }
+                i = i + 1
+            }
+        }
+    }
+    i = 0
+    while i < fc_n_layers {
+        let want = mem_load(fc_nkv + i * 8)
+        let has = lfm2_layer_is_attn(i)
+        if want > 0 && has == 0 { return -1 }
+        if want == 0 && has != 0 { return -1 }
+        i = i + 1
+    }
+    if fc_nkv_max <= 0 { return -1 }
+
+    mm_init(fc_n_vocab)
+    fc_ready = 1
+    return 0
+}
+
+fn fc_nkv_of(L) { return mem_load(fc_nkv + L * 8) }
+
+// ---- RMSNorm WITH epsilon --------------------------------------------------
+// gguf.quanta's rms_norm(out, x, w, n) computes x * rsqrt(mean(x^2)) * w with NO
+// epsilon. Verified: on x = all 1e-3 it returns 1.000000, where an eps of 1e-5
+// would give 0.952379. Upstream applies
+// lfm2.attention.layer_norm_rms_epsilon, so on a small activation the missing
+// term is a 5% error. This version adds it.
+fn fc_rms_norm(out: u64, x: u64, w: u64, n: i64) {
+    if n <= 0 { return 0 }
+    let ss: f64 = 0.0
+    let i = 0
+    while i < n {
+        let v = f64of(mem_load(x + i * 8))
+        ss = ss + v * v
+        i = i + 1
+    }
+    let inv: f64 = 1.0 / sqrt(ss / i2f(n) + fc_rms_eps)
+    i = 0
+    while i < n {
+        let xv = f64of(mem_load(x + i * 8))
+        let wv = f64of(mem_load(w + i * 8))
+        mem_store(out + i * 8, xv * inv * wv)
+        i = i + 1
+    }
+    return 0
+}
