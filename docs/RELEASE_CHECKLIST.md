@@ -81,6 +81,16 @@ These are non-negotiable. Violating any of them is a gate failure by itself.
 14. **Safety / execution guardrails (protect the host):**
     - Memory guard `ulimit -c 0 -v 6000000` BEFORE any run that executes a
       compiled binary (prevents core-dump pollution / OOM).
+      **Use `scripts/qcrun.sh` rather than setting these by hand** — it applies
+      `ulimit -c 0`, a clamped `ulimit -v`, `nice -n 19`, and a `timeout` in one
+      place, so the cap cannot be forgotten or mis-typed. `-v` is in KB, and
+      QUANTA_MEM_MB is clamped to 1536 so an env var cannot raise it.
+      ⚠ The **compiler itself needs > 3 GB of address space and dies SILENTLY
+      (no output, no binary, exit 0) below that.** Measured 0.0.225: fails at
+      1536 MB and 3072 MB, succeeds at 6144 MB. The `6000000` in the gate command
+      below is 5.7 GB — only just above the threshold, so a single new arena in
+      the compiler would break every gate silently. Treat a missing binary from a
+      "successful" compile as a failed compile until the cap is proven sufficient.
     - Execute compiled `.bin` ONLY through the gate (`run_tests.sh`) or
       `quanta_run.sh` (768MB VSZ, nice 19). **NEVER run a `.bin` raw** (a raw
       run once hit 13–21TB VSZ and OOM-killed Hermes).
