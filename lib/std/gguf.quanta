@@ -105,10 +105,23 @@ fn scan_metadata(fd, n_kv) {
             meta_size = meta_size + 8
             let alen = mem_load(slen_buf)
             let etype = mem_load(vtype_buf)
+            // Record the element type, element count and data offset for EVERY
+            // array, not just string ones. Previously only the `etype == 8` branch
+            // below filled these three, so a numeric array reported count -1,
+            // etype 0 and offset -1 -- and a caller seeking to that offset read
+            // from before the start of the file. LFM2's
+            // lfm2.attention.head_count_kv is exactly such an array (i32, 30
+            // elements), so the per-layer KV head counts came back as zero and
+            // fc_read_config() failed closed rather than reporting it.
+            //
+            // The string-array walk below is kept for the length-prefixed
+            // elem_off()/elem_len()/slurp() helpers, which need per-element
+            // offsets; numeric arrays are read at gguf_kv_arr_off + 0 with
+            // esize bytes per element.
+            mem_store(gguf_kv_etype + i * 8, etype)
+            mem_store(gguf_kv_arr_off + i * 8, lseek(fd, 0, 1))
+            mem_store(gguf_kv_arr_len + i * 8, alen)
             if etype == 8 {
-                mem_store(gguf_kv_etype + i * 8, etype)
-                mem_store(gguf_kv_arr_off + i * 8, lseek(fd, 0, 1))
-                mem_store(gguf_kv_arr_len + i * 8, alen)
                 let ai = 0
                 while ai < alen {
                     read_raw(fd, slen_buf, 8)
@@ -488,7 +501,15 @@ fn gguf_kv_float(i) {
     let b = mem_alloc(8)
     if vt == 6 {
         read_raw(gguf_fd, b, 4)
-        return f64of(mem_load(b))
+        // f32 -> f64 must go through f32_to_f64(), which reinterprets the 4 bytes
+        // as an IEEE single and produces a real double.
+        //
+        // This used to be f64of(mem_load(b)), which reinterprets the FOUR bytes
+        // as the low half of an f64 bit pattern. That is not a valid f64: a
+        // zero-extended f32 pattern denormalises to ~1e-315, so every f32
+        // metadata value read 0 or a denormal. LFM2's rope.freq_base (1e7) and
+        // layer_norm_rms_epsilon (1e-5) both came back as 0.0.
+        return f32_to_f64(b)
     }
     if vt == 12 {
         read_raw(gguf_fd, b, 8)
@@ -539,6 +560,53 @@ fn gguf_kv_arr_count(i) {
     if mem_load(gguf_kv_arr_len + i * 8) == 0 { return -1 }
     if mem_load(gguf_kv_etype + i * 8) != 8 { return -1 }
     return mem_load(gguf_kv_arr_len + i * 8)
+}
+
+// Element count of ANY array KV, string or numeric. -1 only if the entry is not
+// an array at all (length 0).
+//
+// gguf_kv_arr_count() above deliberately rejects numeric arrays, because every
+// caller of it walks LENGTH-PREFIXED elements and would read nonsense on an i32
+// array. That guard is correct for them and must stay. Numeric arrays need their
+// own accessor: LFM2's lfm2.attention.head_count_kv is an i32 array of 30
+// per-layer KV head counts, and reading it needed count, element type and data
+// offset without the string precondition.
+fn gguf_kv_arr_count_any(i) {
+    let n = mem_load(gguf_kv_arr_len + i * 8)
+    if n <= 0 { return -1 }
+    return n
+}
+
+// Element type of array KV `i`: 5 = i32, 12 = f64, 8 = string. -1 if not an array.
+fn gguf_kv_arr_etype(i) {
+    if mem_load(gguf_kv_arr_len + i * 8) <= 0 { return -1 }
+    return mem_load(gguf_kv_etype + i * 8)
+}
+
+// Bytes per element of a numeric array, from its element type.
+fn gguf_kv_arr_esize(i) {
+    let et = gguf_kv_arr_etype(i)
+    if et == 0 || et == 1 || et == 7 { return 1 }
+    if et == 2 || et == 3 { return 2 }
+    if et == 4 || et == 5 || et == 6 { return 4 }
+    if et == 10 || et == 11 || et == 12 { return 8 }
+    return 0
+}
+
+// Read `idx` of a numeric array into `dst` as its raw little-endian bytes.
+// Returns the element size, or -1 if the array is a string array or the read is
+// short. Use mem_load(dst) to decode an i32, f32_bits_to_f64-style helpers for a
+// float -- this deliberately does not interpret the value.
+fn gguf_kv_arr_elem_num(i, idx, dst) {
+    let es = gguf_kv_arr_esize(i)
+    if es <= 0 { return -1 }
+    let cnt = gguf_kv_arr_count_any(i)
+    if idx < 0 || idx >= cnt { return -1 }
+    let pos = mem_load(gguf_kv_arr_off + i * 8)
+    if pos < 0 { return -1 }
+    lseek(gguf_fd, pos + idx * es, 0)
+    if read_raw(gguf_fd, dst, es) != es { return -1 }
+    return es
 }
 
 // File offset of element `idx` of the string array in KV `i`.
