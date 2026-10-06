@@ -34,6 +34,11 @@ let mm_rowbuf = 0       // f64 scratch for one dequantized row
 let mm_rowraw = 0       // raw quantized bytes for one row
 let mm_rowraw_cap = 0
 
+// Element ceiling for mm_load_small(), i.e. the largest tensor that may be
+// materialized whole. Kept small on purpose: the point of the row-wise path is
+// that nothing this big is ever dequantized at once.
+let mm_small_cap = 8388608
+
 fn mm_init(maxcols) {
     if mm_rowbuf != 0 { return 0 }
     let c = 1024
@@ -138,4 +143,18 @@ fn mm_embed_logits(idx: u64, x: u64, v0: i64, vcount: i64, ncols: i64, y: u64) {
         v = v + 1
     }
     return 0
+}
+// Load a WHOLE small tensor into `dst` as f64, using read_tensor_f64.
+//
+// For a tensor small enough to hold (the short-conv kernel is [3, 2048] = 6144
+// elements, and out_proj is 4.2 M) this is simpler and cheaper than a matvec per
+// output element. It is NOT a general escape hatch: read_tensor_f64 materializes
+// the whole tensor, so calling it on an FFN weight is exactly the 20 GB problem
+// this file exists to avoid. The caller must size-check first.
+fn mm_load_small(idx: u64, expect: i64, dst: u64) {
+    if expect <= 0 { return -1 }
+    if gguf_tensor_nelements(idx) != expect { return -1 }
+    if expect > mm_small_cap { return -1 }
+    read_tensor_f64(idx, dst)
+    return expect
 }

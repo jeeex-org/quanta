@@ -56,6 +56,15 @@ let fc_ready = 0
 
 let fc_nkv = 0            // per-layer KV head count, 0 = no attention
 
+// short-conv scratch, allocated once on first use (mem_alloc in a loop is unsafe)
+let fc_sc_ip = 0
+let fc_sc_bx = 0
+let fc_sc_g = 0
+let fc_sc_k = 0
+let fc_sc_y = 0
+let fc_sc_kw = 0
+
+
 fn fc_read_config() {
     if fc_ready != 0 { return 0 }
 
@@ -147,4 +156,136 @@ fn fc_rms_norm(out: u64, x: u64, w: u64, n: i64) {
         i = i + 1
     }
     return 0
+}
+// ===========================================================================
+// SHORT CONVOLUTION PATH (the 22 conv layers)
+//
+// Transcribed from llama.cpp src/models/lfm2.cpp, build_shortconv_block(),
+// which is authoritative:
+//
+//   d_conv = l_cache - 1 = 2                  STATE width
+//   bcx    = in_proj @ x                      [d_model, 3 * d_model]
+//   split  bcx into b, c, x                   each d_model wide
+//   bx     = transpose(b * x)                the gated pre-activation
+//   bx     = concat(conv_state, bx)           causal: state PREPENDED -> 3 wide
+//   state' = the last 2 positions of bx
+//   out    = ssm_conv(bx, conv.weight)
+//   y      = c * out
+//   y      = out_proj @ y
+//
+// The three details that are easy to get wrong:
+//
+//   - The state is PREPENDED, not appended. Getting that backwards shifts the
+//     convolution by one position, which is a plausible-looking but wrong answer.
+//
+//   - b and x are MULTIPLIED before the convolution, and c gates the OUTPUT.
+//     Both gates are separate tensors; applying only one leaves the layer
+//     roughly half-right, which is very hard to spot.
+//
+//   - conv.weight is [l_cache, d_model] = [3, 2048], NOT [d_conv, d_model].
+//     d_conv = 2 is the STATE width; the kernel has all 3 taps. Verified in
+//     llama.cpp: create_tensor(..., {n_shortconv_l_cache, n_embd}, 0).
+//     A version here that sized the kernel by d_conv silently loaded the wrong
+//     number of elements; mm_load_small()'s element-count check caught it.
+//
+// The kernel is applied as a CORRELATION with taps in increasing time order
+// (ggml_compute_forward_ssm_conv_f32: `sumf += s[i0] * c[i0]` over nc taps).
+// With the causal window [s0, s1, g] the output is
+//   k0*s0 + k1*s1 + k2*g
+// and the new state is (s1, g).
+
+// One short-conv layer. `x` is d_model values, `state` holds 2 * d_model values
+// (state[k * d_model + c] is token t-1-k for channel c). Returns 0 on success.
+fn fc_short_conv(L, x: u64, state: u64, out: u64) {
+    let dm = fc_d_model
+    let dc = fc_conv_width - 1          // 2: STATE width
+    let kw = fc_conv_width               // 3: KERNEL width (l_cache, not d_conv)
+    let cin = lfm2_conv_in_proj(L)
+    let cwt = lfm2_conv_conv(L)
+    let cout = lfm2_conv_out_proj(L)
+    if cin < 0 || cwt < 0 || cout < 0 { return -1 }
+
+    if fc_sc_ip == 0 {
+        // in_proj is [d_model, 3*d_model], so in_proj @ x yields 3 * d_model
+        // values -- NOT d_model * 3 * d_model. The output is one column.
+        fc_sc_ip = mem_alloc(3 * dm * 8)
+        fc_sc_bx = mem_alloc(kw * dm * 8)         // state + current, time-major
+        fc_sc_kw = mem_alloc(kw * dm * 8)         // dequantized kernel
+        fc_sc_g = mem_alloc(dm * 8)               // b * x
+        fc_sc_k = mem_alloc(dm * 8)               // conv output
+        fc_sc_y = mem_alloc(dm * 8)
+    }
+
+    // bcx = in_proj @ x  -> [3 * d_model]
+    if mm_matvec(cin, x, dm * 3, dm, fc_sc_ip) != 0 { return -1 }
+
+    // Gate: bx[t] = b[t] * x[t], reading the three chunks in order.
+    let cs = dm
+    let t = 0
+    while t < dm {
+        let bv = f64of(mem_load(fc_sc_ip + t * 8))
+        let xv = f64of(mem_load(fc_sc_ip + (2 * cs + t) * 8))
+        mem_store(fc_sc_g + t * 8, bv * xv)
+        t = t + 1
+    }
+
+    // Prepend the causal state: bx = [state[0..dc), g[0..dm)] along time.
+    t = 0
+    while t < dc {
+        let c = 0
+        while c < dm {
+            mem_store(fc_sc_bx + (t * dm + c) * 8, f64of(mem_load(state + (t * dm + c) * 8)))
+            c = c + 1
+        }
+        t = t + 1
+    }
+    t = 0
+    while t < dm {
+        mem_store(fc_sc_bx + (dc * dm + t) * 8, f64of(mem_load(fc_sc_g + t * 8)))
+        t = t + 1
+    }
+
+    // conv_out[c] = sum_k conv[k][c] * bx[t_last - k][c]
+    //
+    // The kernel is [l_cache, d_model] = [3, 2048] = 6144 elements, small enough
+    // to dequantize whole. out_proj is [d_model, d_model] = 4.2 M elements and
+    // goes through the row-wise matvec instead. Both are under mm_small_cap; a
+    // weight that were not returns -1 rather than silently materializing 20 GB.
+    if mm_load_small(cwt, kw * dm, fc_sc_kw) != kw * dm { return -1 }
+
+    // One output time step, correlation with taps in increasing time order:
+    //   k0*s0 + k1*s1 + k2*g
+    let c = 0
+    while c < dm {
+        let acc: f64 = 0.0
+        let k = 0
+        while k < kw {
+            let w = f64of(mem_load(fc_sc_kw + (k * dm + c) * 8))
+            acc = acc + w * f64of(mem_load(fc_sc_bx + (k * dm + c) * 8))
+            k = k + 1
+        }
+        mem_store(fc_sc_k + c * 8, acc)
+        c = c + 1
+    }
+
+    // New state: the LAST dc positions of the 3-wide window, i.e. (s1, g).
+    // Positions dc-1 .. kw-1, so the oldest retained token drops out each call.
+    t = 0
+    while t < dc {
+        let c = 0
+        while c < dm {
+            mem_store(state + (t * dm + c) * 8, f64of(mem_load(fc_sc_bx + ((dc - 1 + t) * dm + c) * 8)))
+            c = c + 1
+        }
+        t = t + 1
+    }
+
+    // y = c * conv_out, then out_proj @ y
+    t = 0
+    while t < dm {
+        let cv = f64of(mem_load(fc_sc_ip + (cs + t) * 8))
+        mem_store(fc_sc_y + t * 8, cv * f64of(mem_load(fc_sc_k + t * 8)))
+        t = t + 1
+    }
+    return mm_matvec(cout, fc_sc_y, dm, dm, out)
 }
