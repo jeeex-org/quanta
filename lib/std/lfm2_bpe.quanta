@@ -1,0 +1,419 @@
+// lib/std/lfm2_bpe.quanta -- native GPT-2 byte-level BPE for LFM2 (pre='lfm2').
+//
+// The pre-tokenizer (std/lfm2_pretok) splits text into pre-tokens; this turns
+// each pre-token into vocabulary ids by applying GPT-2 BPE merges in rank order.
+// Together they reproduce llama.cpp's LLAMA3/LFM2 path byte-exactly.
+//
+// Verified against upstream: scripts/audit/gen_tokenizer_ref.py drives
+// llama.cpp's own test-tokenizer-0 against the real model and writes
+// tests/fixtures/tokenizer_ref.txt. The gate test compares ids exactly.
+//
+// Traps this file respects (each one cost real debugging time):
+//
+//  - A Quanta string expression is the [u64 len][chars][NUL] HEADER pointer:
+//    length at [s], bytes at s+8. Indexing a string literal at +0 returns the
+//    LENGTH, not the first character.
+//
+//  - Token id is NOT the byte value. In this model byte 32 (space) is id 229 and
+//    byte 33 ('!') is id 9. The map is therefore DERIVED from the vocab at load
+//    time by bpe_build_byte_ids(), never assumed.
+//
+//  - The vocab genuinely contains odd entries (id 0 is a run of 0xC4 0x8A,
+//    byte-encoded U+010A). Real content, byte-identical under two independent
+//    readers -- not corruption.
+//
+//  - mem_alloc inside a loop is unsafe: the next iteration clobbers it. Every
+//    buffer is allocated once, in bpe_init_from_gguf.
+//
+//  - The compiler traps signed overflow, so the hash is reduced mod a prime on
+//    every step rather than allowed to grow.
+//
+// Requires std/gguf: the vocab and merge arrays are read from a loaded GGUF, and
+// the dependency is real -- calling gguf_kv_find() without importing it is an
+// undeclared-symbol error, not a link that resolves at run time.
+import std/gguf
+import std/lfm2_pretok
+
+// Memory: vocab and merges are slurped once (~8 MB) and indexed with open-
+// addressing hash tables. Reading 293320 merges from the file per BPE step
+// would dominate the run. The 1 GB ceiling for compiled binaries has ample room.
+
+// ---- loaded state -----------------------------------------------------------
+let bpe_vocab = 0            // packed [u64 len][bytes] records
+let bpe_vocab_n = 0
+let bpe_merges = 0           // packed [u64 len][bytes] records
+let bpe_merges_n = 0
+
+// vocab table: key = record header offset, val = id + 1 (0 means empty slot)
+let vt_size = 0
+let vt_key = 0
+let vt_val = 0
+
+// merge table: key = record header offset, val = rank (stored as rank + 1)
+let mt_size = 0
+let mt_key = 0
+let mt_val = 0
+
+let bpe_byte_id = 0          // 256 entries: GPT-2 byte symbol -> token id
+let bpe_bos = 0
+let bpe_eos = 0
+let bpe_ready = 0
+
+// Working state for one encode. Kept as module globals because an out-parameter
+// must be a mem_alloc'd cell (see the note in std/lfm2_pretok); these are read
+// immediately after the call returns.
+let bpe_sym_n = 0            // symbol byte length in the working buffer
+let bpe_sym_cap = 0
+let bpe_sym_off = 0          // symbol i's byte offset within the buffer
+let bpe_sym_cap_arr = 0
+
+// ---- hashing ----------------------------------------------------------------
+fn bpe_hash(p, n) {
+    let h = 0
+    let i = 0
+    while i < n {
+        h = (h * 131 + mem_load8(p + i)) % 1000000007
+        i = i + 1
+    }
+    return h
+}
+
+// Smallest power of two >= n. Used as the open-addressing table size; must
+// actually be a power of two so probe sequences wrap cleanly. `c = c + 2` is a
+// BUG here, not a style choice: it counts up by two and yields odd sizes (256001
+// for 256000), which makes the probe loop's wrap and the modulo disagree and the
+// table build crash.
+fn pow2_at_least(n) {
+    let c = 1
+    while c < n { c = c * 2 }
+    return c
+}
+
+// ---- packed-array access ---------------------------------------------------
+fn bpe_rec_at(packed, idx) {
+    let at = packed
+    let k = 0
+    while k < idx {
+        let n = mem_load(at)
+        at = at + 8 + n
+        k = k + 1
+    }
+    return at
+}
+
+fn bpe_rec_bytes(packed, idx) { return bpe_rec_at(packed, idx) + 8 }
+fn bpe_rec_len(packed, idx) { return mem_load(bpe_rec_at(packed, idx)) }
+
+// ---- string -> id hash tables ----------------------------------------------
+// Fills the module globals vt_* or mt_* depending on `use_merges`.
+fn bpe_build_table(packed, count, use_merges) {
+    let cap = pow2_at_least(count * 2)
+    let key = mem_alloc(cap * 8)
+    let val = mem_alloc(cap * 8)
+    // Plain assignment, NOT mem_store: these are module-global CELLS, and
+    // mem_store writes through its pointer argument -- storing the integer `cap`
+    // would be treated as an address and fault. Same trap as any out-parameter.
+    if use_merges == 1 {
+        mt_size = cap; mt_key = key; mt_val = val
+    } else {
+        vt_size = cap; vt_key = key; vt_val = val
+    }
+
+    // WALK THE RECORDS FORWARD, do not call bpe_rec_at(packed, i): that helper
+    // restarts at `packed` for every index, so using it here is O(count^2) --
+    // 293320 inserts walked ~43 billion bytes and appeared to hang. The same
+    // loop with a running offset builds the full merge table in well under a
+    // second.
+    let at = packed
+    let i = 0
+    while i < count {
+        let n = mem_load(at)
+        let h = bpe_hash(at + 8, n) % cap
+        while mem_load(val + h * 8) != 0 {
+            h = h + 1
+            if h >= cap { h = 0 }
+        }
+        mem_store(key + h * 8, at)
+        mem_store(val + h * 8, i + 1)
+        at = at + 8 + n
+        i = i + 1
+    }
+}
+
+// Byte-identical test against the record behind a table slot.
+fn bpe_same(rec, p, n) {
+    if mem_load(rec) != n { return 0 }
+    let i = 0
+    while i < n {
+        if mem_load8(rec + 8 + i) != mem_load8(p + i) { return 0 }
+        i = i + 1
+    }
+    return 1
+}
+
+// Vocab lookup: token id for the bytes at `p`, or -1.
+fn bpe_vocab_id(p, n) {
+    if vt_size == 0 { return -1 }
+    let h = bpe_hash(p, n) % vt_size
+    let probes = 0
+    while probes < vt_size {
+        let v = mem_load(vt_val + h * 8)
+        if v == 0 { return -1 }
+        let rec = mem_load(vt_key + h * 8)
+        if bpe_same(rec, p, n) == 1 { return v - 1 }
+        h = h + 1
+        if h >= vt_size { h = 0 }
+        probes = probes + 1
+    }
+    return -1
+}
+
+// Merge lookup: lowest rank for the pair (left, right), or -1.
+// The merge key is "left<space>right" in byte-level form.
+let ml_buf = 0
+fn bpe_merge_rank(lp, ln, rp, rn) {
+    if mt_size == 0 { return -1 }
+    if ml_buf == 0 { ml_buf = mem_alloc(1024) }
+    if ln + rn + 1 > 1024 { return -1 }
+    let i = 0
+    while i < ln { mem_store8(ml_buf + i, mem_load8(lp + i)); i = i + 1 }
+    mem_store8(ml_buf + ln, 32)
+    i = 0
+    while i < rn { mem_store8(ml_buf + ln + 1 + i, mem_load8(rp + i)); i = i + 1 }
+    let total = ln + rn + 1
+
+    let h = bpe_hash(ml_buf, total) % mt_size
+    let probes = 0
+    while probes < mt_size {
+        let v = mem_load(mt_val + h * 8)
+        if v == 0 { return -1 }
+        let rec = mem_load(mt_key + h * 8)
+        if bpe_same(rec, ml_buf, total) == 1 { return v - 1 }
+        h = h + 1
+        if h >= mt_size { h = 0 }
+        probes = probes + 1
+    }
+    return -1
+}
+
+// ---- GPT-2 byte-level alphabet ---------------------------------------------
+// Standard bytes_to_unicode(): 33..126, 161..172 and 174..255 keep their value;
+// the remaining 68 bytes map to 256+n in ascending order.
+fn bpe_byte_cp(b) {
+    if b >= 33 && b <= 126 { return b }
+    if b >= 161 && b <= 172 { return b }
+    if b >= 174 && b <= 255 { return b }
+    if b <= 32 { return 256 + b }
+    if b <= 160 { return b + 162 }
+    return 323
+}
+
+fn bpe_cp_utf8(u, dst) {
+    if u < 128 { mem_store8(dst, u); return 1 }
+    if u < 2048 {
+        mem_store8(dst, 192 + (u / 64))
+        mem_store8(dst + 1, 128 + (u % 64))
+        return 2
+    }
+    mem_store8(dst, 224 + (u / 4096))
+    mem_store8(dst + 1, 128 + ((u / 64) % 64))
+    mem_store8(dst + 2, 128 + (u % 64))
+    return 3
+}
+
+// Encode `n` raw bytes at `src` into GPT-2 byte-level form at `dst`.
+// Returns the byte length written; never 0 when n > 0.
+fn bpe_byte_encode(src, n, dst) {
+    let i = 0
+    let out = 0
+    while i < n {
+        let u = bpe_byte_cp(mem_load8(src + i))
+        out = out + bpe_cp_utf8(u, dst + out)
+        i = i + 1
+    }
+    return out
+}
+
+// ---- load ------------------------------------------------------------------
+// Requires std/gguf to have loaded the model already.
+fn bpe_init_from_gguf() {
+    let tv = gguf_kv_find("tokenizer.ggml.tokens")
+    let tm = gguf_kv_find("tokenizer.ggml.merges")
+    if tv < 0 || tm < 0 { return 0 }
+
+    bpe_vocab_n = gguf_kv_arr_count(tv)
+    bpe_merges_n = gguf_kv_arr_count(tm)
+    if bpe_vocab_n <= 0 || bpe_merges_n <= 0 { return 0 }
+
+    bpe_vocab = mem_alloc(gguf_kv_arr_total_bytes(tv))
+    gguf_kv_arr_slurp(tv, bpe_vocab)
+    bpe_merges = mem_alloc(gguf_kv_arr_total_bytes(tm))
+    gguf_kv_arr_slurp(tm, bpe_merges)
+
+    bpe_build_table(bpe_vocab, bpe_vocab_n, 0)
+    bpe_build_table(bpe_merges, bpe_merges_n, 1)
+
+    let bi = gguf_kv_find("tokenizer.ggml.bos_token_id")
+    if bi >= 0 { bpe_bos = gguf_kv_int(bi) }
+    let ei = gguf_kv_find("tokenizer.ggml.eos_token_id")
+    if ei >= 0 { bpe_eos = gguf_kv_int(ei) }
+
+    bpe_build_byte_ids()
+    bpe_ready = 1
+    return 1
+}
+
+// Derive byte -> token id by matching each of the 256 GPT-2 symbols against the
+// vocab. NEVER assume id == byte: this model has byte 32 at id 229.
+fn bpe_build_byte_ids() {
+    if bpe_byte_id == 0 { bpe_byte_id = mem_alloc(256 * 8) }
+    let tmp = mem_alloc(8)
+    let i = 0
+    while i < 256 {
+        let n = bpe_cp_utf8(bpe_byte_cp(i), tmp)
+        mem_store(bpe_byte_id + i * 8, bpe_vocab_id(tmp, n))
+        i = i + 1
+    }
+}
+
+fn bpe_byte_symbol_id(b) {
+    return mem_load(bpe_byte_id + b * 8)
+}
+
+// ---- BPE over one pre-token -------------------------------------------------
+// Encode a single pre-token's bytes (already in byte-level form) into ids
+// written to `ids`, returning the count. `max_ids` bounds the output.
+//
+// Standard GPT-2 BPE: repeatedly find the lowest-rank adjacent pair, merge it,
+// repeat until no known pair remains.
+fn bpe_encode_pretok(bl, blen, ids, max_ids) {
+    if blen <= 0 || max_ids <= 0 { return 0 }
+
+    // llama.cpp sets ignore_merges for pre='lfm2' (llama-vocab.cpp:2143), and
+    // llama-vocab.cpp:618 uses it as a SHORTCUT: if the whole pre-token is itself
+    // a vocabulary entry, emit that one token and skip merging entirely.
+    //
+    // This is not an optimisation, it changes the output. "  " is in the vocab as
+    // U+0120 U+0120 (id 266) and must come out as one token, but "  a" is not in
+    // the vocab, so it falls through to merge ranking and yields 229 + 267. Without
+    // the shortcut, rank-based merging produces 266 + ... for "  a" and diverges
+    // from upstream on 3 of 26 reference blocks.
+    let whole = bpe_vocab_id(bl, blen)
+    if whole >= 0 {
+        mem_store(ids, whole)
+        return 1
+    }
+
+    // Initial symbols are the individual GPT-2 BYTE SYMBOLS -- i.e. whole
+    // codepoints of the byte-level text, NOT source bytes. They are 1..3 UTF-8
+    // bytes each: 'a' is one byte but '\u0120' (the space symbol) is two. Splitting
+    // per byte fragments those, no merge key ever matches, and the whole
+    // pre-token falls apart into individual byte ids.
+    //
+    // Derive the symbol boundaries from the leading byte's UTF-8 length so this
+    // cannot drift from bpe_byte_encode().
+    if bpe_sym_cap < blen + 8 {
+        bpe_sym_off = mem_alloc((blen + 8) * 8)
+        bpe_sym_cap_arr = mem_alloc((blen + 8) * 8)
+        bpe_sym_cap = blen + 8
+    }
+    let count = 0
+    let i = 0
+    while i < blen {
+        let c = mem_load8(bl + i)
+        let w = 1
+        if c >= 240 { w = 4 }
+        else if c >= 224 { w = 3 }
+        else if c >= 192 { w = 2 }
+        if i + w > blen { w = blen - i }
+        mem_store(bpe_sym_off + count * 8, i)
+        mem_store(bpe_sym_cap_arr + count * 8, w)
+        count = count + 1
+        i = i + w
+    }
+
+    while true {
+        let best = -1
+        let best_rank = 0
+        let k = 0
+        while k + 1 < count {
+            let o1 = mem_load(bpe_sym_off + k * 8)
+            let l1 = mem_load(bpe_sym_cap_arr + k * 8)
+            let o2 = mem_load(bpe_sym_off + (k + 1) * 8)
+            let l2 = mem_load(bpe_sym_cap_arr + (k + 1) * 8)
+            let r = bpe_merge_rank(bl + o1, l1, bl + o2, l2)
+            if r >= 0 && (best < 0 || r < best_rank) { best = k; best_rank = r }
+            k = k + 1
+        }
+        if best < 0 { break }
+
+        let o1 = mem_load(bpe_sym_off + best * 8)
+        let l1 = mem_load(bpe_sym_cap_arr + best * 8)
+        let l2 = mem_load(bpe_sym_cap_arr + (best + 1) * 8)
+        mem_store(bpe_sym_cap_arr + best * 8, l1 + l2)
+        // drop symbol best+1
+        let j = best + 1
+        while j + 1 < count {
+            mem_store(bpe_sym_off + j * 8, mem_load(bpe_sym_off + (j + 1) * 8))
+            mem_store(bpe_sym_cap_arr + j * 8, mem_load(bpe_sym_cap_arr + (j + 1) * 8))
+            j = j + 1
+        }
+        count = count - 1
+    }
+
+    // Emit ids. Each symbol's bytes must be a vocab entry; a symbol with no id
+    // is emitted byte-by-byte through the byte table, which is what upstream
+    // does for anything outside the merged vocabulary.
+    let out = 0
+    let k = 0
+    while k < count && out < max_ids {
+        let o = mem_load(bpe_sym_off + k * 8)
+        let l = mem_load(bpe_sym_cap_arr + k * 8)
+        let id = bpe_vocab_id(bl + o, l)
+        if id >= 0 {
+            mem_store(ids + out * 8, id)
+            out = out + 1
+        } else {
+            let q = 0
+            while q < l && out < max_ids {
+                let bid = bpe_byte_symbol_id(mem_load8(bl + o + q))
+                if bid < 0 { return -1 }
+                mem_store(ids + out * 8, bid)
+                out = out + 1
+                q = q + 1
+            }
+        }
+        k = k + 1
+    }
+    return out
+}
+
+// ---- top level ---------------------------------------------------------------
+// Encode `n` bytes of text at `src` into ids at `ids` (max `max_ids`).
+//
+// The full pipeline: pre-tokenize (std/lfm2_pretok, pre='lfm2'), then byte-level
+// encode each pre-token, then BPE-merge it. Returns the id count, or -1 on a
+// symbol with no vocab entry.
+//
+// `src` is the CHARACTER data of a Quanta string -- callers holding a string
+// expression pass `s + 8` with `mem_load(s)` as the length, because a string
+// expression is the [u64 len] header pointer.
+fn bpe_encode(src, n, ids, max_ids) {
+    let out = 0
+    let i = 0
+    while i < n {
+        if pretok_next(src, n, i) == 0 { break }
+        let off = pretok_off
+        let len = pretok_len
+        if len <= 0 { i = i + 1; continue }
+
+        // Byte-encode this pre-token. Worst case 3 bytes per source byte.
+        let bl = mem_alloc(len * 3 + 8)
+        let blen = bpe_byte_encode(src + off, len, bl)
+        let got = bpe_encode_pretok(bl, blen, ids + out * 8, max_ids - out)
+        if got < 0 { return -1 }
+        out = out + got
+        i = i + len
+    }
+    return out
+}
