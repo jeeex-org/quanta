@@ -4,14 +4,12 @@ Quanta designed with simple syntax that supports multiple execution modes: Nativ
 
 ## Status (verified)
 
-- **Native AOT compilation (`qc`)** — **ACTIVE, 0.0.135**. x86-64 only
+- **Native AOT compilation (`qc`)** — **ACTIVE, 0.0.225**. x86-64 only
   (AArch64 backend deferred POST-0.1.0).
-  Bootstraps via a **self-host fixpoint**: the committed
-  `compiler/${VERSION}/bin/x86/qc` compiles its own source to a byte-identical
-  `qc` (verified fixed point). Full gate (all 11 layers GREEN): functional **163/163** (+ extern-c,
-  extern-ld, security, perf 3/3, valgrind-clean, fuzz fail-closed 0 crashes,
-  differential -O==no-O + vs-seed consistent, generics-negative, stdlib 9/9,
-  multi-tu 3/3).
+  Full gate **813/813, all 19 stages GREEN**; `scripts/selfhost_consistency.sh`
+  **7/7** — a compiler rebuilt from source now agrees with the shipped binary.
+  Compare behaviour, not bytes: a self-rebuild embeds absolute build-time
+  addresses, so the binaries never match byte-for-byte even when correct.
 - **Interpreter (`qc --interp`)** — PLANNED (Stage 1). Not yet landed.
 - **Pre-compilation (`go run` style)** — PLANNED (Stage 2).
 - **WebAssembly** — PLANNED (Stage 3).
@@ -20,6 +18,70 @@ Quanta designed with simple syntax that supports multiple execution modes: Nativ
 
 Security: secure-by-default — signed-overflow and out-of-bounds traps
 (`SIGILL`, exit 132), opt-out via `unsafe {}` or `--no-overflow-trap` for crypto/unsigned-bitwise code.
+
+## Working rules — READ ON ARRIVAL, BEFORE ANY EDIT
+
+These exist because work was lost to a mid-task context/model switch, and because
+a regression shipped that every existing gate reported GREEN. Both are fixed by
+**re-deriving** state at the moment you check it, never by trusting what was
+written down earlier. Prose written by a previous model is a hint; the commands
+below are the truth.
+
+### 1. On arrival (a switch may have happened mid-edit)
+
+```sh
+cat VERSION && git log --oneline -3 && git status --porcelain
+```
+
+Read `compiler/$(cat VERSION)/WIP.md` for intent, then **verify its claims** —
+it is routinely stale. `0.0.225/WIP.md` is titled `0.0.224 — WIP`: wrong
+information, not none. Never continue a task from a WIP claim you have not run.
+
+### 2. Before you claim anything works
+
+```sh
+bash test_suites/scripts/run_tests.sh          # full gate
+bash scripts/selfhost_consistency.sh           # source vs shipped binary
+```
+
+`selfhost_consistency.sh` is not optional. Every other stage compiles with the
+**shipped** `qc`, so if the compiler source has drifted from that binary they all
+still pass — they use the correct binary. Only rebuilding from source sees the
+drift. It reported `SELFHOST: 6/7` while this was true: `parse_while()`'s
+`continue` target disagreed with the shipped binary, so `break_continue.quanta`
+computed `s=25` against a golden `36` — and that golden had been captured from
+the broken output, so the test passed while `continue` was a no-op. It is 7/7
+now. **Run it before claiming a compiler change works.**
+
+Compare *behaviour*, not bytes, when checking a self-rebuild: the rebuild embeds
+absolute build-time addresses in 32-byte stack-slot initialisers, so the two
+binaries never match byte-for-byte even when correct.
+
+### 3. Never commit unverified work
+
+One verified result per commit, message stating the **observed output**, not the
+intent. HEAD~1 (`3136229b`) bundles three unrelated changes — the pretokenizer,
+an unverified codegen change, and a stale edit — under a message describing a
+"fix" that was in fact the bug it introduced. Unverifiable bundling is what made
+the regression survive.
+
+### 4. Record what you disproved, immediately
+
+Before switching models you cannot run anything. Write the ruled-out lines to
+`compiler/$(cat VERSION)/WIP.md` **as you rule them out**, not at the end. Two
+phantoms were chased to ground and then re-derived from scratch after one switch
+(this session, and again after a second): `continue` in `while` "not
+re-evaluating" (it does), and `mem_load8(literal + i)` reading 8 bytes early (that
+is the documented `[u64 len][chars][NUL]` **header** layout — `print`, `str`,
+`substr`, `file_open`, `qc_sys_cmd` all read length at `[s]`, bytes at `s+8`).
+Both cost hours. One line each prevents it.
+
+### 5. Source and binary are one unit
+
+`compiler/${VERSION}/bin/x86/qc` is the pointer to the current stable build. A
+source edit without a matching rebuild ships broken silently. Never let them
+diverge across a commit; `scripts/selfhost_consistency.sh` exists to prove they
+have not.
 
 ## Syntax at a glance
 

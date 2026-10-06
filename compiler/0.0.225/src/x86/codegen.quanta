@@ -2470,20 +2470,11 @@ fn ci_func(fi, is_main) {
             eb(0x0F); eb(0xAE); eb(0xF0)  // mfence
         }
         // P10: IR_ARRAY_LEN (op 69) — get array length from header [base]
-        //
-        // A string literal is laid out [u64 len][chars][NUL] and a string
-        // expression evaluates to a pointer to the CHARACTERS, so the length
-        // field sits at [base-8]. Subtract 8 before the load; reading [base]
-        // returned the first 8 characters as a length.
         else if op==IR_ARRAY_LEN {
             flush_all()
             let rs=aphys(a0)
             let rd=aphys(res)
-            if rd!=rs { rr(rd, rs) }
-            // sub rd, 8  -> address of the [u64 len] header at [base-8]
-            eb(72); eb(131); mr(3, rd%8, rd%8); eb(8)
-            // mov rd, [rd]
-            eb(72); eb(139); mr(0, rd, rd)
+            eb(0x48); eb(0x8B); mr(0, rd, rs)  // mov rd, [rs]  (64-bit load from header)
             sdef(res, rd)
         }
         else if op==IR_STR {
@@ -2497,23 +2488,17 @@ fn ci_func(fi, is_main) {
             // Emit to output binary's data section (absolute address). String literals
             // live AFTER all global slots: GDATA + (INTERNAL_GLOBAL_COUNT+gvarc)*8 + data_off.
             //
-            // Each literal is laid out [u64 len][chars][NUL] (see the w64(data+data_off, ln)
-            // below), so data_off addresses the 8-byte LENGTH field, not the characters.
-            // The value of a string expression is a pointer to its CHARACTER DATA, so it
-            // must be str_addr+8. Using str_addr made every raw byte read of a literal
-            // (`mem_load8(s + k)`) land 8 bytes early -- s+0 read the length and s+k read
-            // character k-8. `.len()` and `print()` hid the bug because they re-read the
-            // header. Point at the characters so string+0 is the first character.
+            // A string expression evaluates to the HEADER pointer of the literal, not
+            // the characters: the layout is [u64 len][chars][NUL], and every consumer
+            // (print, str(), substr, qc_sys_cmd, file_open paths) reads the length at
+            // [s] and the bytes at s+8. Keep that invariant -- IR_ARRAY_LEN loads
+            // [base], and emit_bltn does cmd+8 itself. Pointing the vreg at the
+            // characters instead shifts both by 8 and silently breaks print().
             let gdata_size = (INTERNAL_GLOBAL_COUNT + gvarc)*8
-            // Header address = the 8-byte length field.
-            let str_hdr = GDATA + gdata_size + data_off
-            // Character-data address: what a string expression evaluates to.
-            let str_addr = str_hdr + 8
-            // 0.0.55: record this literal's HEADER address keyed by its
+            let str_addr = GDATA + gdata_size + data_off
+            // 0.0.55: record this literal's data-section address keyed by its
             // result vreg, so qc_sys_cmd's emit_bltn can load the cmd directly.
-            // emit_bltn does `cmd+8` itself to reach the bytes (it also reads the
-            // length at cmd+0), so it needs the header, NOT the data pointer.
-            w64(lit_addr + res*8, str_hdr)
+            w64(lit_addr + res*8, str_addr)
             let rd=aphys(res)
             if emit_obj == 1 {
                 // OBJECT mode: RIP-relative lea rd, [rip+disp32]; disp32 patched by an
