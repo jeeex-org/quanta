@@ -1,0 +1,141 @@
+// lib/std/lfm2_mm.quanta -- bounded, descriptor-driven matvec for LFM2.
+//
+// WHY THIS FILE EXISTS
+// --------------------
+// The obvious implementation -- dequantize a weight tensor to f64, then matvec --
+// needs 20.1 GB for this model, and the binary runs under MemoryMax=6G. So the
+// weights are NEVER fully materialised. Every matvec here walks the tensor ROW BY
+// ROW, dequantizes one row, accumulates, and reuses the same buffer.
+//
+// Peak cost is set by the widest single row, not by the tensor:
+//
+//     ffn_gate/up   2048 x 10752   row = 10752 f64 =  84 KB
+//     attn_q/out    2048 x  2048   row =  2048 f64 =  16 KB
+//     token_embd       1 x 128000  row = 128000 f64 = 1 MB
+//
+// 1 MB worst case, paid once, not per layer.
+//
+// MEMORY ACCESS CONVENTION (the part that is easy to get wrong)
+// -------------------------------------------------------------
+// A Quanta pointer is a raw address, not an array. Pointer arguments are read
+// with mem_load(p + i * 8) wrapped in f64of(), and written with
+// mem_store(p + i * 8, v). Writing `p[i]` -- or indexing a module GLOBAL this
+// module allocated -- compiles to something that faults at run time. Every
+// function below follows the shape of gguf_matvec() in gguf.quanta, which is the
+// reference implementation.
+//
+// mem_alloc inside a loop is unsafe: the next iteration clobbers the pointer, so
+// every buffer is allocated once in mm_init() and reused.
+
+import std/gguf
+
+let mm_rowcap = 0       // f64 elements per row, rounded up to a power of two
+let mm_rowbuf = 0       // f64 scratch for one dequantized row
+let mm_rowraw = 0       // raw quantized bytes for one row
+let mm_rowraw_cap = 0
+
+fn mm_init(maxcols) {
+    if mm_rowbuf != 0 { return 0 }
+    let c = 1024
+    while c < maxcols { c = c * 2 }
+    mm_rowcap = c
+    mm_rowbuf = mem_alloc(c * 8)
+    // Raw buffer must hold the WIDEST per-element encoding: Q8_K is 292 bytes per
+    // 256 elements (1.14 bytes/elem). 2 bytes/elem truncates a Q8_K row.
+    mm_rowraw = mem_alloc(c * 2 + 4096)
+    mm_rowraw_cap = c * 2 + 4096
+    return 0
+}
+
+// Bytes for one row of `ncols` elements at `dtype`.
+//
+// (elements_per_block, bytes_per_block) from the table in gguf.quanta, itself
+// derived from upstream ggml-common.h's static_asserts. The K-quants are NOT
+// 18/22 per 256 elements: Q4_K is 144 and Q5_K is 176. A wrong size reads a
+// fraction of the row, or past it.
+fn mm_row_bytes(dtype, ncols) {
+    if dtype == 0  { return ncols * 4 }        // F32
+    if dtype == 1  { return ncols * 2 }        // F16
+    if dtype == 30 { return ncols * 2 }        // BF16: 2 bytes/elem, not a 256 block
+    if dtype == 2  { return (ncols / 32) * 18 }
+    if dtype == 3  { return (ncols / 32) * 20 }
+    if dtype == 6  { return (ncols / 32) * 22 }
+    if dtype == 7  { return (ncols / 32) * 24 }
+    if dtype == 8  { return (ncols / 32) * 34 }
+    if dtype == 10 { return (ncols / 256) * 84 }
+    if dtype == 11 { return (ncols / 256) * 110 }
+    if dtype == 12 { return (ncols / 256) * 144 }
+    if dtype == 13 { return (ncols / 256) * 176 }
+    if dtype == 14 { return (ncols / 256) * 210 }
+    if dtype == 15 { return (ncols / 256) * 292 }
+    return 0
+}
+
+// Read + dequantize row `r` of tensor `idx` into mm_rowbuf. 0 on success.
+fn mm_load_row(idx, r, row_elems) {
+    let dtype = gguf_tensor_dtype(idx)
+    let rb = mm_row_bytes(dtype, row_elems)
+    if rb <= 0 || rb > mm_rowraw_cap { return -1 }
+    // gguf_read_tensor_bytes_at returns the BYTE COUNT, not a status. Requiring an
+    // exact match distinguishes a whole row from a short read; accepting a short
+    // one dequantizes a partly-stale buffer into a plausible wrong answer.
+    if gguf_read_tensor_bytes_at(idx, r * rb, mm_rowraw, rb) != rb { return -2 }
+    if read_block_f64(dtype, mm_rowraw, row_elems, mm_rowbuf) == 0 { return -3 }
+    return 0
+}
+
+// y = W x. W is `rows` x `cols`; x holds cols f64 values, y receives rows.
+fn mm_matvec(idx: u64, x: u64, rows: i64, cols: i64, y: u64) {
+    if gguf_dtype_supported(gguf_tensor_dtype(idx)) == 0 { return -1 }
+    if mm_rowcap < cols { return -1 }
+    let row_elems = gguf_tensor_nelements(idx) / rows
+    if row_elems != cols { return -1 }
+
+    let r = 0
+    while r < rows {
+        if mm_load_row(idx, r, row_elems) != 0 { return -1 }
+        // acc MUST be typed f64. mem_load returns a raw 64-bit pattern, so an
+        // untyped acc turns this into an integer multiply and trips the overflow
+        // trap (SIGILL, exit 132) instead of producing a result.
+        let acc: f64 = 0.0
+        let c = 0
+        while c < cols {
+            acc = acc + f64of(mem_load(mm_rowbuf + c * 8)) * f64of(mem_load(x + c * 8))
+            c = c + 1
+        }
+        mem_store(y + r * 8, acc)
+        r = r + 1
+    }
+    return 0
+}
+
+// One embedding row -> y, as f64 values of length ncols.
+fn mm_lookup_row(idx: u64, row: i64, ncols: i64, y: u64) {
+    if gguf_dtype_supported(gguf_tensor_dtype(idx)) == 0 { return -1 }
+    if mm_rowcap < ncols { return -1 }
+    return mm_load_row(idx, row, ncols)
+}
+
+// y[v] = dot(embd_row(v0 + v), x) for v in [0, vcount).
+//
+// Reading all 128000 rows per token would dominate generation cost, so the caller
+// chooses the window: a sampled shortlist while sampling, or the full vocabulary
+// once a token is settled.
+fn mm_embed_logits(idx: u64, x: u64, v0: i64, vcount: i64, ncols: i64, y: u64) {
+    if gguf_dtype_supported(gguf_tensor_dtype(idx)) == 0 { return -1 }
+    if mm_rowcap < ncols { return -1 }
+
+    let v = 0
+    while v < vcount {
+        if mm_load_row(idx, v0 + v, ncols) != 0 { return -1 }
+        let acc: f64 = 0.0
+        let c = 0
+        while c < ncols {
+            acc = acc + f64of(mem_load(mm_rowbuf + c * 8)) * f64of(mem_load(x + c * 8))
+            c = c + 1
+        }
+        mem_store(y + v * 8, acc)
+        v = v + 1
+    }
+    return 0
+}

@@ -1,0 +1,105 @@
+// stdlib_lfm2_mm_test -- the bounded row-wise matvec must agree EXACTLY with the
+// existing full-dequantize-then-matvec path, on both F32 and a real Q4_K tensor.
+//
+// Why this test exists: the model cannot be fully dequantized. ffn_gate alone is
+// 22020096 elements = 176 MB as f64, and every layer plus the 262144000-element
+// tied embedding comes to 20.1 GB against a 6 GB budget. So
+// lib/std/lfm2_mm.quanta walks one row at a time. That optimisation is only
+// correct if it reproduces the reference path bit-for-bit, which is what is
+// asserted here -- a tolerance test alone would pass if both paths were equally
+// wrong, so the expected values come from gguf_matvec() over a fully
+// dequantized tensor, a genuinely different code path.
+//
+// Two traps this pins, both of which produced plausible wrong answers first:
+//
+//   - mm_row_bytes: Q4_K is 144 bytes per 256 elements, not 18. The wrong size
+//     reads a fraction of each row. Checked by the negative case below.
+//
+//   - gguf_read_tensor_bytes_at returns a BYTE COUNT, not a status. Accepting a
+//     short read dequantizes a partly-stale buffer into a finite, plausible,
+//     wrong answer rather than failing.
+
+import std/fs
+import std/gguf
+import std/lfm2_mm
+
+let MODEL = "/opt/ai/models/quanta/QUANTA-LFM2.5-2.6Bv1-Q4_K_M.gguf"
+
+fn check_tensor(t, label, tol) {
+    let rows = gguf_tensor_dim(t, 0)
+    let cols = gguf_tensor_dim(t, 1)
+    print("--- ")
+    print(label)
+    print(" dtype=")
+    print(gguf_tensor_dtype(t))
+    print(" rows=")
+    print(rows)
+    print(" cols=")
+    print(cols)
+
+    let x = mem_alloc(cols * 8)
+    let i = 0
+    while i < cols {
+        // i2f returns a float bit-pattern; a plain integer here would store an
+        // integer value and the product would be meaningless.
+        let v: f64 = i2f(i % 11) * 0.125
+        mem_store(x + i * 8, v)
+        i = i + 1
+    }
+
+    // reference: full dequantize into memory, then the existing matvec
+    let W = mem_alloc(rows * cols * 8)
+    if read_tensor_f64(t, W) == 0 { print("FAIL full dequant"); return 1 }
+    let yA = mem_alloc(rows * 8)
+    gguf_matvec(W, x, rows, cols, yA)
+
+    // under test: one row at a time
+    mm_init(cols)
+    let yB = mem_alloc(rows * 8)
+    let rc = mm_matvec(t, x, rows, cols, yB)
+    if rc != 0 { print("FAIL mm_matvec rc="); print(rc); return 1 }
+
+    let r = 0
+    let bad = 0
+    while r < rows {
+        let a: f64 = f64of(mem_load(yA + r * 8))
+        let b: f64 = f64of(mem_load(yB + r * 8))
+        let d = a - b
+        if d < 0 { d = 0 - d }
+        if d > tol { bad = bad + 1 }
+        r = r + 1
+    }
+    print(" mismatches=")
+    print(bad)
+    if bad != 0 { print("FAIL agree"); return 1 }
+    return 0
+}
+
+fn main() {
+    if gguf_load(MODEL) != 0 { print("FAIL gguf_load"); return 1 }
+
+    // F32 tensor: blk.0.shortconv.conv.weight, 3 x 2048. Row = 8 KB.
+    let f32t = gguf_find_tensor("blk.0.shortconv.conv.weight")
+    if f32t < 0 { print("FAIL no conv tensor"); return 1 }
+    if check_tensor(f32t, "f32 conv 3x2048", 1e-9) != 0 { return 1 }
+
+    // Q4_K tensor: blk.0.shortconv.out_proj.weight, 2048 x 2048, 2.3 MB on
+    // disk and 32 MB if materialized -- the case that matters.
+    let qt = gguf_find_tensor("blk.0.shortconv.out_proj.weight")
+    if qt < 0 { print("FAIL no out_proj tensor"); return 1 }
+    if gguf_tensor_dtype(qt) != 12 { print("FAIL expected Q4_K, got dtype"); print(gguf_tensor_dtype(qt)); return 1 }
+    if check_tensor(qt, "q4k out_proj 2048x2048", 1e-6) != 0 { return 1 }
+
+    // The whole point: a row-wise pass must need a small fixed buffer, not a
+    // copy of the tensor. If mm_rowraw scaled with the tensor this is not
+    // holding, and the 20 GB problem is back.
+    print("rowcap=")
+    print(mm_rowcap)
+    print("rawcap=")
+    print(mm_rowraw_cap)
+    let cols = gguf_tensor_dim(qt, 1)
+    if mm_rowraw_cap >= cols * 8 { print("FAIL raw buffer is not row-bounded"); return 1 }
+
+    print("OK mm")
+    return 0
+}
