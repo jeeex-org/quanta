@@ -29,6 +29,12 @@
 # Correct shape: un-ignore the DIRECTORY, then blanket-ignore its contents with
 # `test_suites/*`, then re-include only what CI actually reads. Inside a
 # re-included tree, later exclusions do win, so generated output stays out.
+# The handoff file. /scripts/* and the /* catch-all below ignore new top-level
+# files, and a model that dies mid-flight has no chance to add its own. This one
+# must be committed, or the state is lost on the next context reset -- which is
+# the exact failure it exists to prevent.
+!/HANDOFF.md
+
 !/test_suites/
 # Un-ignore the two directories CI reads. No blanket `test_suites/*` here: it
 # would also exclude the 18k test sources and the gate scripts, and gitignore
@@ -136,6 +142,11 @@ tools/**/*.bin
 !/scripts/
 /scripts/*
 !/scripts/rag_config.py
+# The self-host consistency gate. /scripts/* is ignored, but this one is part of
+# the release contract -- it is what catches a compiler whose source and binary
+# have drifted apart, which no other stage can see. Un-ignored so it survives a
+# model switch instead of living as an untracked local file.
+!/scripts/selfhost_consistency.sh
 !/scripts/build_rag.py
 !/scripts/build_rag_sqlite.py
 !/scripts/fast_rag.py
