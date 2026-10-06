@@ -101,11 +101,44 @@ These are non-negotiable. Violating any of them is a gate failure by itself.
     or docs/roadmap/domains/*.md). **Never mark a version ✅ in
     ROADMAP/docs unless a `compiler/<VER>/` folder exists on disk.** No folder = no
     release = the ✅ is a lie.
+16. **A gate stage must be able to FAIL for the reason it exists.** A golden value
+    captured from a broken compiler turns the test into a bug shield — the golden
+    and the defect agree, so it reports GREEN indefinitely. This is not
+    hypothetical: `break_continue.quanta` asserted `s==36` while `continue` was a
+    no-op, and 36 *was* the broken output, so the test passed while the feature it
+    names did nothing. When fixing a defect, re-derive every affected golden by
+    hand from the specification, assert the answer you computed, and prove the test
+    fails against the pre-fix binary (`git show <old>:path/to/qc`).
+    A test that cannot fail is worse than no test.
+17. **Never weaken a golden to make a failing test pass.** If a test disagrees with
+    your expectation, first decide which one is wrong by working the arithmetic —
+    do not assume the test is stale. Two of the four `continue` cases in
+    `break_continue.quanta` "looked wrong" and were not; only one golden was
+    actually wrong, and the others were arithmetic I had skipped. Prove the value
+    before changing it.
+18. **Know where the work is, from tools — never from memory or prose.** On arrival:
+    ```bash
+    cat VERSION && git log --oneline -3 && git status --porcelain
+    ```
+    Then read `compiler/<VER>/WIP.md` **and verify its claims by running them** —
+    WIP files go stale and mislead. `0.0.225/WIP.md` was titled `0.0.224 — WIP`,
+    which is worse than no information. A finished result that lives only in an
+    untracked scratch file is not a result: put the test in `test_suites/codes/`
+    with a row in `EXPECTED.tsv`, where the gate runs it. Re-derive state at check
+    time; do not trust what was written down earlier.
+19. **Before editing any file, check whether it is finished work.**
+    ```bash
+    git log -1 --format=%s -- path/to/file
+    ```
+    If the last commit touching it describes a completed fix or a GREEN stage, you
+    are about to regress it — stop and confirm. Do not go looking for work in
+    infrastructure (`qobj_gate`, `g6_selfcache`, bisect scripts) when a functional
+    task is already verified and in progress.
 
 ---
 
 ## Terminology (derive from `VERSION`, never hardcode)
-- `<VER>`   = released/live stable   -> `cat VERSION`        (currently **0.0.224**)
+- `<VER>`   = released/live stable   -> `cat VERSION`        (currently **0.0.225**; never type a literal — read it)
 - `<NEXT>`  = the version being built -> exactly ONE patch above `<VER>`
 - `<PRIOR>` = `<VER>` itself; its committed golden `compiler/<VER>/bin/x86/qc`
   is the seed for `<NEXT>`. There is NO separate `bootstrap/` directory.
@@ -117,13 +150,12 @@ These are non-negotiable. Violating any of them is a gate failure by itself.
   is not a usable fallback and the promotion is not done.
 
 ## LIVE STATE (advance this on every promotion)
-- Current stable compiler: **0.0.224** (2026-10-05)
-- Golden binary: `compiler/0.0.224/bin/x86/qc`
-- Self-host fixpoint md5: `d0aaa549c11361d27f7c9b91ffdc7dff` (gen0==gen1==gen2==binary)
-- Frozen baseline (one behind): `0.0.223`, md5 `ff78dcbbb0cbfb94a1127c7813595f83`
-- Older fallback: `0.0.222`, md5 `650f03c6d6ce13bb6f575b5056e07d3d`
+- Current stable compiler: **0.0.225** — see `cat VERSION`, this literal goes stale.
+- Golden binary: `compiler/$(cat VERSION)/bin/x86/qc`
+- Gate: 813/813, 19/19 stages GREEN. Self-host behaviour: SELFHOST 7/7.
 - Per-version state is recorded in `compiler/<VER>/WIP.md` and MUST be updated
-  each promotion.
+  each promotion — and its title must match its directory. `0.0.225/WIP.md` was
+  headed `0.0.224 — WIP`, which misinforms a reader who trusts it (rule #18).
 
 > Never write the compiler's own binary in place: `qc -O src/x86/main.quanta
 > bin/x86/qc` truncates the file it is executing and leaves 0 bytes. Always
@@ -152,6 +184,24 @@ rm -f /tmp/_drift.bin
 ```
 - [ ] IDENTICAL. If DIVERGED: seed stale -> re-promote <VER> (rebuild from <VER>
       source, save to `compiler/<VER>/bin/x86/qc`), re-run before any new work.
+
+## 2b. Source-vs-binary behaviour — the check §2/§3 cannot make
+```bash
+cd /opt/tali/quanta
+bash scripts/selfhost_consistency.sh          # want SELFHOST: 7/7, rc 0
+```
+- [ ] 7/7. Every other stage compiles with the **shipped** `qc`, so if source has
+      drifted from that binary they all still pass — they use the correct binary.
+      Only a rebuild from source sees the drift. That is how a broken
+      `parse_while()` shipped with the whole gate GREEN.
+- [ ] Compare BEHAVIOUR, not bytes. A self-rebuild embeds absolute build-time
+      addresses in 32-byte stack-slot initialisers, so the binaries never match
+      byte-for-byte even when correct (~44 bytes differ). Byte comparison against
+      a freshly built binary will report a permanent false failure — §2/§3 compare
+      against the *committed* binary of the same build, which is a different test.
+- [ ] After ANY `src/x86/` change, before any test change: run this first. If it
+      reports a disagreement, the compiler is what is wrong — fix forward from
+      there. Do not adjust a golden to silence it (rule #17).
 
 ## 3. Self-host fixpoint — 3-step chain, byte-identical gen2==gen3
 ```bash
