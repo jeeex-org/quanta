@@ -404,21 +404,13 @@ fn fc_rope_cache(pos) {
         fc_cos = mem_alloc(hd * 8)
         fc_sin = mem_alloc(hd * 8)
     }
-    // fc_rope_base is a module-level float global, and the vfloat table now
-    // carries the tag for those (codegen: gfloat), so `pow(fc_rope_base, ...)`
-    // takes the float path and reads the base's actual value.
-    //
-    // The workaround this replaces -- routing the base through i2f() -- was
-    // needed while globals were untagged, and it was never more than that: i2f is
-    // integer->float, so i2f(fc_rope_base) reinterpreted 1e7's bits as an integer
-    // and produced inf, making theta_scale 1.0 and freezing every pair at the
-    // same angle. Two compiler bugs were stacked on this one line.
+    let base: f64 = f64of(fc_rope_base)
     let hd2: f64 = i2f(hd)
-    let theta_scale: f64 = pow(fc_rope_base, (0.0 - 2.0) / hd2)
+    let theta_scale: f64 = pow(base, (0.0 - 2.0) / hd2)
     // theta_scale is TYPED f64 on purpose. An untyped accumulator makes
     // `theta * theta_scale` an integer multiply over the bit patterns, which
-    // corrupts theta after the first pair: pair 0 came out right and every
-    // later pair was garbage. Verified against Python for pos=100.
+    // corrupts theta after the first pair: pair 0 came out right and every later
+    // pair was garbage. Verified against Python for pos=100.
     let theta: f64 = i2f(pos)
     let p = 0
     while p < half {
