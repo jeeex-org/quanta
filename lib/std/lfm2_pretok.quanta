@@ -177,12 +177,26 @@ fn pretok_next(s, n, i) {
     //
     // branch 6: \s+(?!\S)
     //
-    // On a maximal whitespace run this also spans the whole run. If a non-space
-    // follows, the greedy \s+ fails the lookahead and backtracks by one, where
-    // the next codepoint is whitespace and so satisfies (?!\S). Branch 7 (\s+)
-    // is therefore unreachable and is not implemented separately.
+    // (?!\S) means "not followed by a NON-space", so this branch only takes a
+    // whitespace run that reaches the END of the text. When a non-space
+    // follows, \s+ must BACKTRACK by one codepoint and stop, leaving that last
+    // whitespace character for branch 2 ([^\r\n\p{L}\p{N}]? \p{L}+), which then
+    // absorbs it into the following word.
+    //
+    // "test  d" must therefore split as "test" / " " / " d" -- NOT "test" /
+    // "  " / "d". Consuming the whole run instead makes the two spaces one
+    // pre-token, which is a vocabulary entry (U+0120 U+0120, id 266), and
+    // llama.cpp's ignore_merges shortcut then emits 266 where upstream emits
+    // 229 + 277. Verified against test-tokenizer-0.
     if uni_is_space(cp0) {
         let ws_end = pretok_run(s, n, i, 4)
+        // Backtrack one codepoint ONLY when the run is longer than one and a
+        // non-space follows. A one-codepoint run has nothing to give up: without
+        // the length test the subtraction lands back on i and the scan makes no
+        // progress, which spins forever on input like "1 22".
+        if ws_end < n && ws_end - i > l0 {
+            ws_end = ws_end - uni_decode_len(s + ws_end - 1)
+        }
         pretok_off = start
         pretok_len = ws_end - i
         return 1
