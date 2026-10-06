@@ -90,7 +90,7 @@ fn tokenize() {
             let sp=p; let sc=c
             if ch==48 && p+1<srclen && (r8(src+p+1)==120 || r8(src+p+1)==88) {
                 // hex literal 0x... / 0X...
-                // NOTE: do NOT mask with 0xFFFFFFFFFFFFFFFF here — that literal
+                // NOTE: do NOT mask with 0xFFFFFFFFFFFFFFFF here ? that literal
                 // is itself truncated by the (pre-fix) hex lexer, so the mask
                 // would silently clobber the high 32 bits. `val` is a 64-bit
                 // slot and val*16+digit stays within 64 bits for any valid hex
@@ -106,7 +106,7 @@ fn tokenize() {
                 // genuinely overflows 64 bits -> reject.
                 // G2 overflow-trap gate means val*16 / val+val both SIGILL once
                 // val nears 2^63, so we fold into two 32-bit halves (hi:lo) and
-                // combine with (hi << 32) + lo — shifts are not trap-checked and
+                // combine with (hi << 32) + lo ? shifts are not trap-checked and
                 // that add cannot overflow signed i64.
                 while p<srclen {
                     let d=r8(src+p)
@@ -128,7 +128,7 @@ fn tokenize() {
                 let val = 0
                 if hdig <= 8 { val = hi } else { val = (hi << 32) + lo }
                 // NEW-5: a bare `0x` / `0X` with no hex digits must not silently
-                // compile to 0 — reject it as a malformed numeric literal.
+                // compile to 0 ? reject it as a malformed numeric literal.
                 if hdig==0 {
                     let mh = "error: malformed hex literal (no digits after 0x)\n"
                     file_write(2, mh+8, len(mh)); exit(1)
@@ -155,7 +155,7 @@ fn tokenize() {
                     if idigit(dch)==0 { break }
                     let d = dch-48
                     if val > IMAXD || (val == IMAXD && d > 7) {
-                        // Over-sized decimal literal: don't reject — emit a
+                        // Over-sized decimal literal: don't reject ? emit a
                         // TT_BIGNUM token carrying the SOURCE OFFSET (sp) and the
                         // digit count (nlen) so the parser can build a big via
                         // big_from_dec. Keep scanning the remaining digits so the
@@ -422,7 +422,7 @@ stok(tokc, TT_NUM, val, l, sc, nlen); tokc = tokc + 1
             else if kt==31 { ty=TT_ID }   // Result
             else if kt==32 { ty=TT_ID }   // Ok
             else if kt==33 { ty=TT_ID }   // Err
-            else if kt==62 { ty=TT_ID }   // 0.0.114: big — plain ID; type-annotation position checks ktext (parse_let), so `let big = 70000` stays legal
+            else if kt==62 { ty=TT_ID }   // 0.0.114: big ? plain ID; type-annotation position checks ktext (parse_let), so `let big = 70000` stays legal
             else if kt==34 { ty=TT_REF }
             else if kt==35 { ty=TT_MUT }
             else if kt==36 { ty=TT_MOVE }
@@ -512,7 +512,7 @@ stok(tokc, TT_NUM, val, l, sc, nlen); tokc = tokc + 1
             // $(name) or $(name(args)): explicit EXTERNAL / GLOBAL function call.
             // Tokenized as TT_CALL (distinct from TT_ID, so a bare `name)` in
             // normal code is never mistaken for a call). Resolves via the global
-            // function table only (findfn_global) — reaching the top-level
+            // function table only (findfn_global) ? reaching the top-level
             // definition even when a local same-named function shadows it.
             p=p+2; c=c+2   // skip $(
             let sp2=p; let sc2=c
@@ -528,14 +528,14 @@ stok(tokc, TT_NUM, val, l, sc, nlen); tokc = tokc + 1
             } else {
                 // 0-arg form $(name): no source '(' exists. Emit a single
                 // synthetic '(' so the stream is TT_CALL(name) '(' and the real
-                // ')' that follows closes the call — identical to a real name()
+                // ')' that follows closes the call ? identical to a real name()
                 // call. (Do NOT emit a synthetic ')'; the source ')' is the close.)
                 stok(tokc,TT_PNCT,40,l,c,1); tokc=tokc+1
             }
         } else if ch==36&&p+1<srclen&&r8(src+p+1)==123&&p+2<srclen&&ialpha(r8(src+p+2)) {
             // ${name} : a GLOBAL reference (read-only cross-scope handle). The
             // inner name is tokenized as TT_DOLLAR so it resolves to a `global`
-            // declaration via gfind() — distinct from any local `name`.
+            // declaration via gfind() ? distinct from any local `name`.
             p=p+2; c=c+2   // skip ${
             let sp2=p; let sc2=c
             while p<srclen&&r8(src+p)!=125 { p=p+1; c=c+1 }

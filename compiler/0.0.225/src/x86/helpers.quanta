@@ -21,7 +21,7 @@ fn tokln(i) { return r64(toks + i*TKS + 32) }
 // Emitters below (stok/tkemit, iremit, vadd, sfn, aset) were previously
 // UNBOUNDED: their counters (tokc/irc/varc/fnc/allocfc) could run past the
 // fixed mmap arenas, causing an out-of-bounds write into an unmapped guard
-// page -> SIGSEGV (a crafted ≤16MB source with very high token density could
+// page -> SIGSEGV (a crafted ?16MB source with very high token density could
 // trigger this). As of 1.1.0 each emitter bounds its counter and aborts with a
 // clean error (exit 17) instead of corrupting memory.
 let TOK_CAP = 10000000     // toks is mmap(512000000) and TKS is 48, so the arena
@@ -205,7 +205,7 @@ fn khash(p,ln) {
     return h
 }
 
-// Keyword detection by EXACT TEXT (not hash) — hash collisions (e.g. the
+// Keyword detection by EXACT TEXT (not hash) ? hash collisions (e.g. the
 // compiler's own globals H_FN, H_LET, H_RET, ...) must never be mistaken
 // for keywords. Returns 1..15 for a keyword, 0 otherwise.
 fn ktext(sv, ln) {
@@ -269,10 +269,10 @@ fn ktext(sv, ln) {
     if ln==4 && r8(src+sv)==98 && r8(src+sv+1)==111 && r8(src+sv+2)==111 && r8(src+sv+3)==108 { return 49 } // bool
     if ln==4 && r8(src+sv)==99 && r8(src+sv+1)==104 && r8(src+sv+2)==97 && r8(src+sv+3)==114 { return 50 } // char
     if ln==4 && r8(src+sv)==98 && r8(src+sv+1)==121 && r8(src+sv+2)==116 && r8(src+sv+3)==101 { return 51 } // byte
-    // removed duplicate 'raw' (was 52) — 38 is canonical
-    // removed duplicate 'asm' (was 53) — 40 is canonical
+    // removed duplicate 'raw' (was 52) ? 38 is canonical
+    // removed duplicate 'asm' (was 53) ? 40 is canonical
     if ln==3 && r8(src+sv)==105 && r8(src+sv+1)==110 && r8(src+sv+2)==116 { return 55 } // int (signed default, alias for bare literal type)
-    // removed duplicate 'volatile' (was 54) — 39 is canonical
+    // removed duplicate 'volatile' (was 54) ? 39 is canonical
     if ln==5 && r8(src+sv)==100 && r8(src+sv+1)==101 && r8(src+sv+2)==102 && r8(src+sv+3)==101 && r8(src+sv+4)==114 { return 56 } // defer
     if ln==5 && r8(src+sv)==99 && r8(src+sv+1)==111 && r8(src+sv+2)==110 && r8(src+sv+3)==115 && r8(src+sv+4)==116 { return 57 } // const
     if ln==3 && r8(src+sv)==109 && r8(src+sv+1)==111 && r8(src+sv+2)==100 { return 58 } // mod
@@ -284,7 +284,7 @@ fn ktext(sv, ln) {
     // recognized in type-annotation position via ktext (parse_let), stays TT_ID
     // elsewhere so `big` remains usable as a plain identifier (as_cast_test).
     if ln==3 && r8(src+sv)==98 && r8(src+sv+1)==105 && r8(src+sv+2)==103 { return 62 } // big
-    // 0.0.78: case-insensitive ADT keyword — simplicity: String/string both OK.
+    // 0.0.78: case-insensitive ADT keyword ? simplicity: String/string both OK.
     // Only String gets a lowercase alias. some/ok/err/option/result are left
     // UPPERCASE-ONLY because 'ok'/'some'/'err' are common variable names
     // (e.g. logical_keywords.quanta uses `let ok = 0`) and would collide.
@@ -493,7 +493,7 @@ fn vfind(nm,nl) {
 }
 fn vclr() {
     // P10: also clear vreg_type (fn-value tag 11 / generic-marker 10) so a
-    // recycled vreg index can't carry a stale tag into the next function —
+    // recycled vreg index can't carry a stale tag into the next function ?
     // a stale 11 would falsely route `f(21)` through IR_CLOSURE_CALL.
     let vci = 0
     while vci < vreg_n { w64(vreg_type + vci*8, 0); vci = vci + 1 }

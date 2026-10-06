@@ -216,7 +216,7 @@ fn shl_trap_emit(ii) { if ovf_trap==1 && r8(ir_unsafe+ii)==0 { eb(72); eb(131); 
 // For ymm registers (256-bit), we need 3-byte VEX: 0xC4, ~R~X~B, W=1, ~vvvv, L=1, pp=11
 // Simplified: C4 E1 79 = VEX.W=1, vvvv=1111(~0=xmm0), L=1(256-bit), pp=11(66 prefix)
 // 
-// vaddpd ymm0, ymm1, ymm2: C4 E1 75 58 C2  (VEX.W=0 → use C5 F8 for W=0)
+// vaddpd ymm0, ymm1, ymm2: C4 E1 75 58 C2  (VEX.W=0 ? use C5 F8 for W=0)
 // Actually for packed doubles:
 //   vaddpd ymmD, ymmA, ymmB = C4 E1 75 58 | modrm(A, D)  -- wait, wrong order
 // Correct VEX 3-byte: REX.R X B, W vvvv L pp, opcode, modrm(rm, reg)
@@ -233,7 +233,7 @@ fn faddf_avx2(dst_ptr, a_ptr, b_ptr) {
     // Load 4 doubles from [rdx] into ymm1  
     eb(196); eb(225); eb(125); eb(16); eb(10)     // vmovupd ymm1, [rdx] (C4 E1 7D 10 0A)
     // Add: ymm0 = ymm0 + ymm1
-    eb(197); eb(253); eb(88); eb(193)              // vaddpd ymm0, ymm0, ymm1 (C5 FD 58 C1 — L=1)
+    eb(197); eb(253); eb(88); eb(193)              // vaddpd ymm0, ymm0, ymm1 (C5 FD 58 C1 ? L=1)
     // Store ymm0 to [rdi]
     eb(196); eb(225); eb(125); eb(17); eb(7)       // vmovupd [rdi], ymm0 (C4 E1 7D 11 07)
     // Return dst_ptr
@@ -245,7 +245,7 @@ fn fmulf_avx2(dst_ptr, a_ptr, b_ptr) {
     flush_all()
     eb(196); eb(225); eb(125); eb(16); eb(6)      // vmovupd ymm0, [rsi]
     eb(196); eb(225); eb(125); eb(16); eb(10)     // vmovupd ymm1, [rdx]
-    eb(197); eb(253); eb(89); eb(193)               // vmulpd ymm0, ymm0, ymm1 (C5 FD 59 C1 — L=1)
+    eb(197); eb(253); eb(89); eb(193)               // vmulpd ymm0, ymm0, ymm1 (C5 FD 59 C1 ? L=1)
     eb(196); eb(225); eb(125); eb(17); eb(7)       // vmovupd [rdi], ymm0
     eb(72); eb(137); eb(248)
     return 1
@@ -255,7 +255,7 @@ fn fsubf_avx2(dst_ptr, a_ptr, b_ptr) {
     flush_all()
     eb(196); eb(225); eb(125); eb(16); eb(6)      // vmovupd ymm0, [rsi]
     eb(196); eb(225); eb(125); eb(16); eb(10)     // vmovupd ymm1, [rdx]
-    eb(197); eb(253); eb(92); eb(193)               // vsubpd ymm0, ymm0, ymm1 (C5 FD 5C C1 — L=1)
+    eb(197); eb(253); eb(92); eb(193)               // vsubpd ymm0, ymm0, ymm1 (C5 FD 5C C1 ? L=1)
     eb(196); eb(225); eb(125); eb(17); eb(7)       // vmovupd [rdi], ymm0
     eb(72); eb(137); eb(248)
     return 1
@@ -265,7 +265,7 @@ fn fdivf_avx2(dst_ptr, a_ptr, b_ptr) {
     flush_all()
     eb(196); eb(225); eb(125); eb(16); eb(6)      // vmovupd ymm0, [rsi]
     eb(196); eb(225); eb(125); eb(16); eb(10)     // vmovupd ymm1, [rdx]
-    eb(197); eb(253); eb(94); eb(193)               // vdivpd ymm0, ymm0, ymm1 (C5 FD 5E C1 — L=1)
+    eb(197); eb(253); eb(94); eb(193)               // vdivpd ymm0, ymm0, ymm1 (C5 FD 5E C1 ? L=1)
     eb(196); eb(225); eb(125); eb(17); eb(7)       // vmovupd [rdi], ymm0
     eb(72); eb(137); eb(248)
     return 1
@@ -277,7 +277,7 @@ fn fdivf_avx2(dst_ptr, a_ptr, b_ptr) {
 //   SIGILL rc=132. Suppressed inside unsafe{} (same ir_unsafe gate). The +8 data
 //   offset is applied in the lea that follows this check.
 fn idx_trap_emit(ii) { if ovf_trap==1 && r8(ir_unsafe+ii)==0 { eb(72); eb(59); eb(8); eb(114); eb(2); eb(15); eb(11) } }
-// P10: ARM64 bounds-check trap for `a[idx]` — parity with x86 idx_trap_emit.
+// P10: ARM64 bounds-check trap for `a[idx]` ? parity with x86 idx_trap_emit.
 // At the call site x0 = base ptr, x1 = idx. Emit:
 //   ldr x9,[x0]    ; x9 = len (header)
 //   cmp x1, x9     ; idx - len (unsigned)
@@ -728,7 +728,7 @@ fn fst_x(gp, xmm) {
     else { eb(0x66); eb(0x48); eb(15); eb(126); mr(3, xmm, gp) }
 }
 // ---------------------------------------------------------------------------
-// PREFIX ORDER — the rule that every SSE encode below must follow.
+// PREFIX ORDER ? the rule that every SSE encode below must follow.
 //
 // x86 requires legacy prefixes (66 / F2 / F3) FIRST and the REX prefix LAST,
 // immediately before the opcode:
@@ -1004,11 +1004,11 @@ fn emit_bltn(nmi,nl,ii) {
         eb(184); ei(11)                // mov eax, 11      (munmap)
         sysc(); return 1
     }
-    // P6.1a: float builtins (0.0.198: no flush_all — float ops use xmm regs only,
+    // P6.1a: float builtins (0.0.198: no flush_all ? float ops use xmm regs only,
     // integer registers (r11-r14) holding loop vars/pointers are untouched)
     // Args arrive as raw 64-bit bit-patterns in rdi (arg0) / rsi (arg1)
     if nl==3&&r8(nm)=='i'&&r8(nm+1)=='2'&&r8(nm+2)=='f' {  // i2f(x): int64 -> f64
-        // NO flush_all — uses only xmm0, result in rax
+        // NO flush_all ? uses only xmm0, result in rax
         eb(242); eb(72); eb(15); eb(42); eb(199)  // cvtsi2sd xmm0, rdi
         eb(102); eb(72); eb(15); eb(126); eb(192) // movq rax, xmm0
         sdef(irres(ii), 0)
@@ -1016,7 +1016,7 @@ fn emit_bltn(nmi,nl,ii) {
         return 1
     }
     if nl==3&&r8(nm)=='f'&&r8(nm+1)=='2'&&r8(nm+2)=='i' {  // f2i(x): f64 -> int64 (trunc)
-        // NO flush_all — uses only xmm0
+        // NO flush_all ? uses only xmm0
         eb(102); eb(72); eb(15); eb(110); eb(199) // movq xmm0, rdi
         eb(242); eb(72); eb(15); eb(44); eb(192)  // cvttsd2si rax, xmm0
         sdef(irres(ii), 0)
@@ -1024,7 +1024,7 @@ fn emit_bltn(nmi,nl,ii) {
         return 1
     }
     if nl==6&&r8(nm)=='f'&&r8(nm+1)=='c'&&r8(nm+2)=='o'&&r8(nm+3)=='n'&&r8(nm+4)=='s'&&r8(nm+5)=='t' {  // fconst(M, scale, exp10): float literal = (M/scale)*10^exp10
-        // NO flush_all — uses only xmm0/xmm1 and rax
+        // NO flush_all ? uses only xmm0/xmm1 and rax
         //
         // 0.0.221: a THIRD argument (the signed decimal exponent) plus a real
         // floating-point power of ten, replacing the lexer's integer
@@ -1182,7 +1182,7 @@ fn emit_bltn(nmi,nl,ii) {
         return 1
     }
     if nl==4&&r8(nm)=='f'&&r8(nm+1)=='a'&&r8(nm+2)=='d'&&r8(nm+3)=='d' {  // fadd(a,b): int or float args -> int
-        // NO flush_all — uses only xmm0/xmm1, result in rax
+        // NO flush_all ? uses only xmm0/xmm1, result in rax
         let fa0=0; if ira1(ii)>=1 { if is_float_vr(irres(ira2(ii)))==1 { fa0=1 } }
         let fa1=0; if ira1(ii)>=2 { if is_float_vr(irres(ira2(ii)+1))==1 { fa1=1 } }
         //
@@ -1240,7 +1240,7 @@ fn emit_bltn(nmi,nl,ii) {
         return 1
     }
     if nl==4&&r8(nm)=='f'&&r8(nm+1)=='s'&&r8(nm+2)=='u'&&r8(nm+3)=='b' {  // fsub(a,b)
-        // NO flush_all — uses only xmm0/xmm1
+        // NO flush_all ? uses only xmm0/xmm1
         let fa0=0; if ira1(ii)>=1 { if is_float_vr(irres(ira2(ii)))==1 { fa0=1 } }
         let fa1=0; if ira1(ii)>=2 { if is_float_vr(irres(ira2(ii)+1))==1 { fa1=1 } }
         //
@@ -1298,7 +1298,7 @@ fn emit_bltn(nmi,nl,ii) {
         return 1
     }
     if nl==4&&r8(nm)=='f'&&r8(nm+1)=='m'&&r8(nm+2)=='u'&&r8(nm+3)=='l' {  // fmul(a,b)
-        // NO flush_all — uses only xmm0/xmm1
+        // NO flush_all ? uses only xmm0/xmm1
         let fa0=0; if ira1(ii)>=1 { if is_float_vr(irres(ira2(ii)))==1 { fa0=1 } }
         let fa1=0; if ira1(ii)>=2 { if is_float_vr(irres(ira2(ii)+1))==1 { fa1=1 } }
         //
@@ -1356,7 +1356,7 @@ fn emit_bltn(nmi,nl,ii) {
         return 1
     }
     if nl==4&&r8(nm)=='f'&&r8(nm+1)=='d'&&r8(nm+2)=='i'&&r8(nm+3)=='v' {  // fdiv(a,b)
-        // NO flush_all — uses only xmm0/xmm1
+        // NO flush_all ? uses only xmm0/xmm1
         let fa0=0; if ira1(ii)>=1 { if is_float_vr(irres(ira2(ii)))==1 { fa0=1 } }
         let fa1=0; if ira1(ii)>=2 { if is_float_vr(irres(ira2(ii)+1))==1 { fa1=1 } }
         //
@@ -1743,7 +1743,7 @@ fn emit_bltn(nmi,nl,ii) {
         eb(72); eb(137); eb(24)          // mov [rax], rbx   ([base] = qcount header; rbx preserved)
         return 1
     }
-    // 0.0.111: mem_free(ptr) — push block onto free-list at HEAP_CTRL.
+    // 0.0.111: mem_free(ptr) ? push block onto free-list at HEAP_CTRL.
     // (Deferred reuse: mem_alloc left UNCHANGED to keep emitted bytes stable -> fixpoint-safe.)
     //   [ptr+8] = [HEAP_CTRL];  [HEAP_CTRL] = ptr
     if nl==8&&r8(nm)=='m'&&r8(nm+1)=='e'&&r8(nm+2)=='m'&&r8(nm+3)=='_'&&r8(nm+4)=='f'&&r8(nm+5)=='r'&&r8(nm+6)=='e'&&r8(nm+7)=='e' {
@@ -1764,7 +1764,7 @@ fn emit_bltn(nmi,nl,ii) {
         ri(R_RAX, 0)                              // rax = 0  (clean return value)
         return 1
     }
-    // 0.0.111: mem_realloc(ptr, newn) — new block via mmap(len=newn*8+8),
+    // 0.0.111: mem_realloc(ptr, newn) ? new block via mmap(len=newn*8+8),
     //   copy min(old_count=[ptr], newn) qwords old+8 -> new+8 via rep movsq,
     //   return new. (Free-list recycling deferred; mem_alloc unchanged ->
     //   fixpoint-safe. The old block is simply leaked here; full GC later.)
@@ -1785,7 +1785,7 @@ fn emit_bltn(nmi,nl,ii) {
         ri(R_R9, 0)             // r9d = offset 0
         ri(R_RAX, 9)            // eax = 9 (mmap)
         sysc()                  // rax = new block
-        // FIX-0.0.1 (C1): MAP_FAILED guard — identical to mem_alloc/mmap above.
+        // FIX-0.0.1 (C1): MAP_FAILED guard ? identical to mem_alloc/mmap above.
         eb(72); eb(131); eb(248); eb(0)   // cmp rax, 0
         eb(125); eb(12)                   // jge +12 (skip exit if rax >= 0)
         eb(191); ei(1); eb(184); ei(60); eb(15); eb(5)  // mov edi,1; mov eax,60; syscall (exit 1)
@@ -1808,7 +1808,7 @@ fn emit_bltn(nmi,nl,ii) {
         rr(R_RAX, R_R13)        // rax = new
         return 1
     }
-    // 0.0.112: drop(ptr) — destructor hook. For a mem_alloc-owned heap pointer
+    // 0.0.112: drop(ptr) ? destructor hook. For a mem_alloc-owned heap pointer
     // this recycles the block to the free-list (same op as mem_free). Emitted
     // identically to mem_free so the two share one code path. RAII default:
     // owned bindings auto-call drop() at scope exit (see owned_scope_pop_one).
@@ -1890,7 +1890,7 @@ fn emit_bltn(nmi,nl,ii) {
         // --- walk loop ---
         let f_loop = nl(); let f_done = nl()
         lbladd(f_loop, codelen)
-        // guard: a real frame pointer is always high (≫ 4KB). The entry stub sets
+        // guard: a real frame pointer is always high (? 4KB). The entry stub sets
         // rbp = argv (a low relocated-stack base like 0x202); stop before deref.
         eb(73); eb(129); eb(251); ei(4096)   // cmp r11, 0x1000  (49 81 FB 00 10 00 00)
         let pfl = codelen; jb32(0); emit_patch(pfl, f_done, 1)   // jb done (r11 < 0x1000: not a frame)
@@ -2459,7 +2459,7 @@ fn emit_bltn2(nmi,nl,ii) {
     //   instead we reload each arg vreg from its SPILL HOME directly into the
     //   exact syscall-ABI register:
     //     rax=num, rdi=a, rsi=b, rdx=c, r10=d, r8=e, r9=f
-    //   (the 4th syscall arg is r10, not rcx — that's why we reload from homes
+    //   (the 4th syscall arg is r10, not rcx ? that's why we reload from homes
     //   rather than just shuffling IR_CALL's registers; arg6 also lives on the
     //   stack in IR_CALL's layout, so reloading from home covers it too.)
     if nl==7&&r8(nm)=='s'&&r8(nm+1)=='y'&&r8(nm+2)=='s'&&r8(nm+3)=='c'&&r8(nm+4)=='a'&&r8(nm+5)=='l'&&r8(nm+6)=='l' {
@@ -3104,7 +3104,7 @@ fn emit_bltn2(nmi,nl,ii) {
         rmr(0,3)           // rax = [rbx] = la
         rr(15,0)           // r15 = la
         rmr(0,14)          // rax = [r14] = lb
-        rr(13,0)           // rbp = lb  (13↔rbp under %8)
+        rr(13,0)           // rbp = lb  (13?rbp under %8)
         rcmp(13,15)        // cmp rbp, r15  (lb vs la)
         jcc32(1, 54)       // jne -> lengths differ -> forward to MISMATCH (rxor)
         rr(6,3); eb(72); eb(131); eb(198); eb(8)   // rsi = a+8
@@ -3170,14 +3170,14 @@ fn emit_bltn2(nmi,nl,ii) {
             rbp(7, spill_home(_cmdv))             // variable/fn-param: runtime ptr
         }
         let l_parent=nl(); let l_rdbrk=nl(); let l_disc=nl()
-        // Preserve callee-saved regs (r12-r15) per x86-64 ABI — this builtin
+        // Preserve callee-saved regs (r12-r15) per x86-64 ABI ? this builtin
         // clobbers them, so save/restore to avoid corrupting caller state (e.g.
         // the result struct ptr held in r12 by the caller).
         eb(65); eb(84)   // push r12  (41 54)
         eb(65); eb(85)   // push r13  (41 55)
         eb(65); eb(86)   // push r14  (41 56)
         eb(65); eb(87)   // push r15  (41 57)
-        // SAVE cmd (rdi) FIRST — every syscall below clobbers rdi. r14 = cmd+8 (bytes ptr).
+        // SAVE cmd (rdi) FIRST ? every syscall below clobbers rdi. r14 = cmd+8 (bytes ptr).
         rr(14,7); ri(8,8); ra(14,8)
         // Allocate result struct: mmap(0, 48, RW, ANON|PRIVATE, -1, 0). The extra
         // 16 bytes past the 32-byte [len,out,code,err] header serve as the .err
@@ -3833,7 +3833,7 @@ fn emit_bltn2(nmi,nl,ii) {
         if pa1==0 { eb(242); eb(72); eb(15); eb(42); eb(206); eb(242); eb(15); eb(17); eb(76); eb(36); eb(8) }
         // ln(a): fldln2; fld [rsp]; fyl2x
         // z = b * log2(a). log2(a) via fyl2x: fld1; fld a; fyl2x -> st0 = 1.0*log2(a) = log2(a)
-        // (z = b*ln(a)*log2(e) = b*log2(a) since ln(a)*log2(e)=log2(a) exactly — avoids rounding error)
+        // (z = b*ln(a)*log2(e) = b*log2(a) since ln(a)*log2(e)=log2(a) exactly ? avoids rounding error)
         eb(217); eb(232)                          // fld1               (D9 E8)
         eb(221); eb(4); eb(36)                    // fld qword [rsp]     (a)
         eb(217); eb(241)                          // fyl2x -> st0 = log2(a)
@@ -3844,7 +3844,7 @@ fn emit_bltn2(nmi,nl,ii) {
         eb(219); eb(227)                          // fninit             (DB E3) clean FPU (clears stack + tags)
         fx87prep()                               // re-assert 64-bit precision (fninit defaulted 80-bit)
         eb(221); eb(4); eb(36)                    // fld qword [rsp]     (DD 04 24)  reload z clean
-        // exp2(z) — verified-correct x87 sequence (clean .S test: 2^10=1024, 2^0.5=1.414, 2^-1=0.5, 2^3=8)
+        // exp2(z) ? verified-correct x87 sequence (clean .S test: 2^10=1024, 2^0.5=1.414, 2^-1=0.5, 2^3=8)
         eb(217); eb(192)                          // fld st(0)          (D9 C0) [z, z]
         eb(217); eb(252)                          // frndint            (D9 FC) [trunc(z), z]
         eb(217); eb(201)                          // fxch st(1)         (D9 C9) [z, trunc(z)]  st0=z, st1=trunc

@@ -36,7 +36,7 @@ fn owned_pop_to(base_sctop) {
 fn owned_add(vr) {
     // FIX-0.0.8: owned_stk is an 8192-slot arena. Without a cap, 8192+ live
     // mem_alloc bindings (deeply nested scopes/loops) write past the arena and
-    // corrupt adjacent compiler state — breaks the "all arenas capped" invariant.
+    // corrupt adjacent compiler state ? breaks the "all arenas capped" invariant.
     if owned_top >= 8192 { exit(1) }
     w64(owned_stk + owned_top*8, vr)
     owned_top = owned_top + 1
@@ -338,7 +338,7 @@ fn findparam(fi, nm, nl) {
 }
 // t4: length of a call-site named-arg name: scan from nm until ':' (58) or a
 // generic delimiter. (nm points at the name ID, which is immediately followed
-// by ': value' at the call site — so the name stops at the ':'.)
+// by ': value' at the call site ? so the name stops at the ':'.)
 fn len_name_colon(nm) {
     let l=0
     while l<256 {
@@ -530,16 +530,16 @@ fn is_bltn(nm,nl) {
     if nl==12&&r8(src+nm)=='g'&&r8(src+nm+1)=='e'&&r8(src+nm+2)=='t'&&r8(src+nm+3)=='t'&&r8(src+nm+4)=='i'&&r8(src+nm+5)=='m'&&r8(src+nm+6)=='e'&&r8(src+nm+7)=='o'&&r8(src+nm+8)=='f'&&r8(src+nm+9)=='d'&&r8(src+nm+10)=='a'&&r8(src+nm+11)=='y' { return 1 } // gettimeofday(tv_ptr, tz_ptr): sc 96
     if nl==9&&r8(src+nm)=='n'&&r8(src+nm+1)=='a'&&r8(src+nm+2)=='n'&&r8(src+nm+3)=='o'&&r8(src+nm+4)=='s'&&r8(src+nm+5)=='l'&&r8(src+nm+6)=='e'&&r8(src+nm+7)=='e'&&r8(src+nm+8)=='p' { return 1 } // nanosleep(req_ptr, rem_ptr): sc 35
     if nl==5&&r8(src+nm)=='s'&&r8(src+nm+1)=='l'&&r8(src+nm+2)=='e'&&r8(src+nm+3)=='e'&&r8(src+nm+4)=='p' { return 1 } // sleep(sec): internal mmap + nanosleep + munmap
-    // 0.0.125: time core — zero-arg monotonic/epoch wrappers.
+    // 0.0.125: time core ? zero-arg monotonic/epoch wrappers.
     if nl==5&&r8(src+nm)=='c'&&r8(src+nm+1)=='l'&&r8(src+nm+2)=='o'&&r8(src+nm+3)=='c'&&r8(src+nm+4)=='k' { return 1 } // clock(): CLOCK_MONOTONIC ns
-    // 0.0.126: process core — fork/exec/wait/kill builtins (low-level, no std IO).
+    // 0.0.126: process core ? fork/exec/wait/kill builtins (low-level, no std IO).
     if nl==4&&r8(src+nm)=='f'&&r8(src+nm+1)=='o'&&r8(src+nm+2)=='r'&&r8(src+nm+3)=='k' { return 1 } // fork(): sc 57, 0=child, >0=pid, <0=errno
     if nl==4&&r8(src+nm)=='e'&&r8(src+nm+1)=='x'&&r8(src+nm+2)=='e'&&r8(src+nm+3)=='c' { return 1 } // exec(cmd): replace image with /bin/sh -c cmd
     // 0.0.139: execve(path, argv, envp) - raw syscall wrapper for direct execve (not via /bin/sh)
     if nl==6&&r8(src+nm)=='e'&&r8(src+nm+1)=='x'&&r8(src+nm+2)=='e'&&r8(src+nm+3)=='c'&&r8(src+nm+4)=='v'&&r8(src+nm+5)=='e' { return 1 }
     if nl==4&&r8(src+nm)=='w'&&r8(src+nm+1)=='a'&&r8(src+nm+2)=='i'&&r8(src+nm+3)=='t' { return 1 } // wait(pid): sc 61 wait4, returns WEXITSTATUS
     if nl==4&&r8(src+nm)=='k'&&r8(src+nm+1)=='i'&&r8(src+nm+2)=='l'&&r8(src+nm+3)=='l' { return 1 } // kill(pid,sig): sc 62
-    // 0.0.127: PTY core — pseudo-terminal allocation (posix_openpt/grantpt/unlockpt/ptsname).
+    // 0.0.127: PTY core ? pseudo-terminal allocation (posix_openpt/grantpt/unlockpt/ptsname).
     if nl==8&&r8(src+nm)=='p'&&r8(src+nm+1)=='t'&&r8(src+nm+2)=='y'&&r8(src+nm+3)=='_'&&r8(src+nm+4)=='o'&&r8(src+nm+5)=='p'&&r8(src+nm+6)=='e'&&r8(src+nm+7)=='n' { return 1 } // pty_open(): open /dev/ptmx, unlock, return master fd
     if nl==9&&r8(src+nm)=='p'&&r8(src+nm+1)=='t'&&r8(src+nm+2)=='y'&&r8(src+nm+3)=='_'&&r8(src+nm+4)=='s'&&r8(src+nm+5)=='l'&&r8(src+nm+6)=='a'&&r8(src+nm+7)=='v'&&r8(src+nm+8)=='e' { return 1 } // pty_slave(master): open /dev/pts/N, return slave fd
     if nl==8&&r8(src+nm)=='p'&&r8(src+nm+1)=='t'&&r8(src+nm+2)=='y'&&r8(src+nm+3)=='_'&&r8(src+nm+4)=='n'&&r8(src+nm+5)=='a'&&r8(src+nm+6)=='m'&&r8(src+nm+7)=='e' { return 1 } // pty_name(master): return "/dev/pts/N" string

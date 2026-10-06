@@ -1,4 +1,4 @@
-// === COMPILE IR → X86-64 ===
+// === COMPILE IR ? X86-64 ===
 // Per function - emits code, records labels and patches
 let func_code_starts = mmap(2000000)  // start offset of each func's code
 
@@ -8,7 +8,7 @@ let func_code_starts = mmap(2000000)  // start offset of each func's code
 // As of 1.0.12 `opt_on` defaults to 1 (optimizer ON for every build); it is no
 // longer opt-in. opt_func is called AFTER parse fills [0,irc) for the current
 // function and BEFORE ci_func emits it. All rewrites are in-place (no IR record
-// deletion — label fixups in ci_func rely on indices and irc staying stable).
+// deletion ? label fixups in ci_func rely on indices and irc staying stable).
 let opt_on = 1
 // G2: overflow-trap gate. ON by default (secure by default): emits `jno +2; ud2`
 // after signed add/sub/mul/neg -> SIGILL on overflow, eliminating the
@@ -100,7 +100,7 @@ fn constfold(i, op, r0, a0, a1) {
     // Leave the MUL/DIV/ADD/SUB for the emit path to handle via SSE.
     if (r8(vfloat+a0)==1 || r8(vfloat+a1)==1) { return 0 }
     // both operands foldable -> fold to a MOV r0, f
-    // G2: when overflow trapping is ON, do NOT fold signed add/sub/mul — the
+    // G2: when overflow trapping is ON, do NOT fold signed add/sub/mul ? the
     // emitted `jo` is a deliberate side effect that must survive. (Bitwise and
     // logical compares have no trap, so they still fold.)
     if ovf_trap==1 {
@@ -157,7 +157,7 @@ fn width_mask(o0, o1, rd) {
     //   2=u16                 -> 0xFFFF
     //   3=u32                 -> 0xFFFFFFFF
     // (4=u64, 5=usize are 64-bit -> no mask; 6=bool is logical 0/1 and is NOT
-    //  width-masked on arithmetic — bool math is plain integer, so true+true=2;
+    //  width-masked on arithmetic ? bool math is plain integer, so true+true=2;
     //  0=signed -> no mask.)
     if (vt==1||vt==7||vt==8||vt==2||vt==3) && rd != 0 {
         // modrm: mod=11, reg=100 (AND), rm=result reg. The result may be an
@@ -256,7 +256,7 @@ fn opt_func() {
                     // time), so compute the power-of-two via repeated *2
                     // (reliable) and apply with * / (reliable). If a0 is not a
                     // constant we must NOT use a0 (it is a vreg number, not a
-                    // value) — let it fall through to the runtime shift emit.
+                    // value) ? let it fall through to the runtime shift emit.
                     let va0 = op_const_val(a0)
                     let pw = 1
                     let pk = 0
@@ -1440,7 +1440,7 @@ fn ci_func(fi, is_main) {
             fst_x(rd, 0)                         // movq rd, xmm0 (raw float bits)
             sdef(res, rd); w8(vfloat+res, 1)
           } else {
-          // P3: power-of-2 division → arithmetic shift right (1 instruction vs 30)
+          // P3: power-of-2 division ? arithmetic shift right (1 instruction vs 30)
           let div_const = 0
           let shift_amt = 0
           if op_is_const(a1)==1 {
@@ -1558,7 +1558,7 @@ fn ci_func(fi, is_main) {
             // IR_IDX  a[idx]: header-carrying [base]=len. Strings (vreg_is_str>=0,
             // NOT a struct) use byte stride [base+8+i]; arrays/structs use qword
             // stride [base+8+i*8]. NOTE: a vreg slot recycled from a string may
-            // retain a stale vreg_is_str tag — so check vreg_struct first and
+            // retain a stale vreg_is_str tag ? so check vreg_struct first and
             // prefer qword stride for struct bases (field access).
             flush_all()
             rbp(0, spill_home(a0))   // rax = base
@@ -1618,9 +1618,9 @@ fn ci_func(fi, is_main) {
             eb(72); eb(137); eb(16)             // mov [rax], rdx   ([base] = len header)
             sdef(res, rd)
         }
-        // P10: IR_ARRNEW (op 73) — runtime-count array alloc, same layout as
+        // P10: IR_ARRNEW (op 73) ? runtime-count array alloc, same layout as
         // IR_TALLOC ([base]=n, elems at base+8). Unlike TALLOC (count is a
-        // compile-time literal), n is the RUNTIME VALUE of vreg a0 — needed by
+        // compile-time literal), n is the RUNTIME VALUE of vreg a0 ? needed by
         // slice lowering where n = hi-lo is dynamic. Mirrors mem_alloc's bytes.
         else if op==IR_ARRNEW {
             flush_all()
@@ -1906,8 +1906,8 @@ fn ci_func(fi, is_main) {
             xpop(5); ret()
         }
         else if op==IR_FNPTR {
-            // 0.0.72: fnptr(FNAME) now returns a [codeptr, env=0] tuple — the
-            // SAME layout as IR_FNVAL — so the result can be passed directly to
+            // 0.0.72: fnptr(FNAME) now returns a [codeptr, env=0] tuple ? the
+            // SAME layout as IR_FNVAL ? so the result can be passed directly to
             // closure_call (which expects a tuple and does mov rdx,[rax] then
             // call r11). Before 0.0.72 fnptr emitted a RAW pointer (lea rax,
             // [rip+disp]), and feeding it to closure_call dereferenced the raw
@@ -1937,7 +1937,7 @@ fn ci_func(fi, is_main) {
             if rres!=0 { rr(rres,0) }; sdef(res, rres)
         }
         else if op==IR_FNVAL {
-            // P10: fn-value tuple [codeptr, env=0] (16 bytes, NO length header —
+            // P10: fn-value tuple [codeptr, env=0] (16 bytes, NO length header ?
             // same layout as mk_any so IR_CLOSURE_CALL can read it directly).
             flush_all()
             ri(7, 16)                          // rdi = 16 bytes
@@ -2095,7 +2095,7 @@ fn ci_func(fi, is_main) {
             if rres!=0 { rr(rres,0) }; sdef(res, rres)
         }
         else if op==IR_APUSH {
-            // P10: array push — append a QWORD element (array header counts
+            // P10: array push ? append a QWORD element (array header counts
             // elements, qword stride; IR_ISTORE/IR_IDX read base+8+i*8).
             // v=rdi (arg0), e=rsi (arg1). Returns new header ptr.
             flush_all()
@@ -2143,7 +2143,7 @@ fn ci_func(fi, is_main) {
             // registers -- no aliasing hazard (matches the Python oracle).
             let arg_start = a2; let arg_cnt = a1
             // 0.0.55: qc_sys_cmd ($$(cmd)) carries the cmd vreg in a1 (NOT an arg
-            // count) with a2=0. Skip the generic arg-loader — emit_bltn loads the
+            // count) with a2=0. Skip the generic arg-loader ? emit_bltn loads the
             // cmd itself from the lit_addr map. Detect the name by its bytes at
             // src+a0 (the name "qc_sys_cmd" is 10 chars, null-terminated).
             let is_syscmd = 0
@@ -2167,7 +2167,7 @@ fn ci_func(fi, is_main) {
                 }
                 callee=findfn(nm,nl)
             }
-            // 0.0.119: thread_create(worker, arg) — resolve the worker function name
+            // 0.0.119: thread_create(worker, arg) ? resolve the worker function name
             // (first source argument) and stash its SOURCE OFFSET in g_thread_ffi so
             // emit_bltn can emit a type-2 (name-resolved) call relocation into the
             // child trampoline, exactly like a normal function call (which works).
@@ -2216,7 +2216,7 @@ fn ci_func(fi, is_main) {
                         if arg_i==4 { preg=8 }
                         if arg_i==5 { preg=9 }
                         rbp(preg, spill_home(av))
-                        // P5: extern "C" — skip the 8-byte Quanta length header on
+                        // P5: extern "C" ? skip the 8-byte Quanta length header on
                         // a string-valued arg so C receives a char* to the data.
                         if is_ext_call==1 {
                             let _isstr = r64(vreg_is_str + av*8)
@@ -2419,12 +2419,12 @@ fn ci_func(fi, is_main) {
         }
         else if op==IR_PTR_CAST {  // P6: &p or cast to raw pointer
             // a2: 1 = address-of, 0 = cast. (a1 is the type tag from the
-            // `x as T` cast path — the address-of marker is passed in a2 by
+            // `x as T` cast path ? the address-of marker is passed in a2 by
             // parse_unary's `&` branch: iremit(IR_PTR_CAST, vr, o, 0, 1).)
             if a2==1 {
                 // address-of LOCAL: lea rd, [rbp + spill_home(a0)] gives the
                 // stack address of the local's home slot. (Globals: the a0
-                // vreg is an IR_LOADG temp, so &global is not yet supported —
+                // vreg is an IR_LOADG temp, so &global is not yet supported ?
                 // same limitation as before, but locals now work.)
                 let rd=aphys(res)
                 let off=spill_home(a0)
@@ -2469,7 +2469,7 @@ fn ci_func(fi, is_main) {
             // Compiler barrier
             eb(0x0F); eb(0xAE); eb(0xF0)  // mfence
         }
-        // P10: IR_ARRAY_LEN (op 69) — get array length from header [base]
+        // P10: IR_ARRAY_LEN (op 69) ? get array length from header [base]
         else if op==IR_ARRAY_LEN {
             flush_all()
             let rs=aphys(a0)
@@ -2683,7 +2683,7 @@ fn ci_func(fi, is_main) {
             // No-op: unsafe{} is a compile-time construct
         }
         else if op==IR_ASM {
-            // P11: inline asm — template at src+a0 is a hex byte string like
+            // P11: inline asm ? template at src+a0 is a hex byte string like
             // "b8 2a 00 00 00" (mov eax, 42). Emit each byte verbatim.
             // Result register convention: RAX.
             flush_all()

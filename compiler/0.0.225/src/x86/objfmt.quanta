@@ -81,7 +81,7 @@ fn p5_elf_obj(out_p) {
     // p5_mksym(namep, namen, info, shndx, value) -> symidx
     symc = 0; strtablen = 1
     let s_null = p5_add_symbol_b(0,0)          // index 0: null symbol
-    // _gdata (STB_LOCAL) — start of the .data region (globals + string literals).
+    // _gdata (STB_LOCAL) ? start of the .data region (globals + string literals).
     // LOCAL binding keeps it before any globals (ELF ordering) and prevents a
     // "multiple definition of _gdata" collision when linking multiple Quanta
     // object files (each TU gets its own local _gdata; ld resolves this TU's
@@ -96,7 +96,7 @@ fn p5_elf_obj(out_p) {
     gdata_sym = sg
     // first non-local symbol index (set when we add the first GLOBAL symbol)
     let symtab_shinfo = -1
-    // __init (STB_LOCAL) — only the entry TU's _start calls it internally;
+    // __init (STB_LOCAL) ? only the entry TU's _start calls it internally;
     // LOCAL avoids a cross-TU collision on the name.
     let si = p5_add_symbol_b(0,0)
     w8(strtab + symc_stname(si), 95); w8(strtab + symc_stname(si)+1, 95); w8(strtab + symc_stname(si)+2, 105)
@@ -135,7 +135,7 @@ fn p5_elf_obj(out_p) {
             // _start: created below as the (sole) GLOBAL symbol in the entry TU.
         } else {
             // P5.1: extern "C" fns are UNDEF symbols (created at their call
-            // sites via p5_sym_for_name), NOT defined here — so linking a TU
+            // sites via p5_sym_for_name), NOT defined here ? so linking a TU
             // that declares `extern "C" fn foo` against a TU that DEFINES foo
             // gives exactly one definition.
             if r64(fn_extern + fi*8)==1 { fi=fi+1; continue }
@@ -148,7 +148,7 @@ fn p5_elf_obj(out_p) {
         }
         fi=fi+1
     }
-    // _start (STB_GLOBAL) — ONLY in the entry TU (no_start==0). It is the sole
+    // _start (STB_GLOBAL) ? ONLY in the entry TU (no_start==0). It is the sole
     // GLOBAL symbol there; all locals (__init, main, _gdata) precede it, so the
     // ELF locals-before-globals ordering holds.
     let ss = -1
@@ -195,7 +195,7 @@ fn p5_elf_obj(out_p) {
     }
     // 3. relocations for intra-TU and extern calls (ty==2 patches)
     relc = 0
-    // x86 object-mode global relocations: inline loop (no patch_globals call) —
+    // x86 object-mode global relocations: inline loop (no patch_globals call) ?
     // for each recorded RIP-relative global access emit R_X86_64_PC32 against
     // _gdata with addend gidx*8 - 4 (RIP is 4 bytes past the disp32 field).
     if target_arch == 0 {
@@ -268,7 +268,7 @@ fn p5_elf_obj(out_p) {
                 }
             }
         } else if r64(patches+pi*PCS+16)==3 {
-            // extern "C" call in OBJECT mode — resolve to the UNDEF GLOBAL symbol
+            // extern "C" call in OBJECT mode ? resolve to the UNDEF GLOBAL symbol
             // (created on demand by p5_sym_for_name) and emit a PLT32/CALL26
             // relocation. This is what the external linker binds to the defining
             // TU's GLOBAL symbol at link time.

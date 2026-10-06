@@ -1,5 +1,5 @@
 // link_object_with_libc: links a Quanta --emit-obj object file with libc using system ld
-// Replaces quanta_link.sh — native implementation in Quanta compiler
+// Replaces quanta_link.sh ? native implementation in Quanta compiler
 // obj_path: path to input .o file (raw C string from argv), out_path: path to output executable (raw C string)
 fn link_object_with_libc(obj_path, out_path) {
     // Find the glibc dynamic linker (PT_INTERP)
@@ -253,19 +253,19 @@ fn main(argc, argv) {
                 }
 
                 
-                // P5.1: try "--no-start" (9 chars) — secondary object TU
+                // P5.1: try "--no-start" (9 chars) ? secondary object TU
                 let is_nostart=1; let kc=0
                 let nostr = "no-start"
                 while kc<9 { if r8(ap+2+kc) != r8(nostr+8+kc) { is_nostart=0; break }; kc=kc+1 }
                 if is_nostart==1 { no_start=1 }
                 
-                // P5.3: try "--link" (6 chars) — link object file with libc (replaces quanta_link.sh)
+                // P5.3: try "--link" (6 chars) ? link object file with libc (replaces quanta_link.sh)
                 let is_link=1; let ol=0
                 let lstr = "link"
                 while ol<4 { if r8(ap+2+ol) != r8(lstr+8+ol) { is_link=0; break }; ol=ol+1 }
                 if is_link==1 { do_link=1 }
                 
-                // P5.4: try "--emit-qobj" (11 chars) — emit .qobj module cache
+                // P5.4: try "--emit-qobj" (11 chars) ? emit .qobj module cache
                 let is_qobj=1; let oq=0
                 let qobjstr = "emit-qobj"
                 while oq<9 { if r8(ap+2+oq) != r8(qobjstr+8+oq) { is_qobj=0; break }; oq=oq+1 }
@@ -333,7 +333,7 @@ fn main(argc, argv) {
     let fd=file_open(srcp,0)
     if fd<0 { exit(14) }
     // FIX-0.0.9 (LOW): a source file larger than the 16MB read buffer was
-    // silently truncated — file_read stops at 16777216 bytes and the old
+    // silently truncated ? file_read stops at 16777216 bytes and the old
     // post-expansion check only caught the EXPANSION overflow, so a 17MB main
     // file compiled its first 16MB with no diagnostic (mid-token truncation
     // silently changes semantics). Pre-check the real size via stat() and
@@ -547,7 +547,7 @@ fn main(argc, argv) {
         // Stack relocation: under `setarch -R` (ADDR_NO_RANDOMIZE, used by the
         // self-host fixpoint test for determinism) the kernel pins the stack
         // vma at a fixed base with entry rsp only ~123KB above the mapping
-        // floor, and the vma is already the full 8MB RLIMIT — so there is no
+        // floor, and the vma is already the full 8MB RLIMIT ? so there is no
         // room for the kernel to grow the stack, and any frame larger than
         // ~123KB (e.g. t3's main+try ~2MB) faults permanently. Relocate the
         // stack to a fresh 8MB mmap'd region with full headroom regardless of
@@ -571,7 +571,7 @@ fn main(argc, argv) {
         eb(72); eb(131); eb(236); eb(16)           // sub rsp, 16       (16-byte align)
         eb(72); eb(137); eb(223)                   // mov rdi, rbx      (restore argc)
         eb(72); eb(137); eb(238)                   // mov rsi, rbp      (restore argv)
-        // P2: proc/env — capture argc/argv/environ into globals for builtins.
+        // P2: proc/env ? capture argc/argv/environ into globals for builtins.
         // Use the STOREG RIP-relative form and register gpatches so patch_globals()
         // binds them to the real GDATA addresses (writing to literal 0 would crash).
         // Store argc -> g_argc  (mov [rip+disp], rdi)
@@ -673,7 +673,7 @@ fn main(argc, argv) {
 
 
 
-    // For each fn: parse body → IR, then compile IR → code, record offset
+    // For each fn: parse body ? IR, then compile IR ? code, record offset
     let fi=0
     // The while condition alone is not sufficient here. Measured: with fnc=3 the
     // body was entered at fi=3, where fi<fnc is false, and the compiler then
@@ -685,7 +685,7 @@ fn main(argc, argv) {
     while fi<fnc {
       if fi>=fnc { break }
 
-    // P5.1: extern "C" fns have no body — skip compilation/codegen here;
+    // P5.1: extern "C" fns have no body ? skip compilation/codegen here;
     // their UNDEF symbol is emitted by p5_elf_obj and resolved at link time.
     // Also skip bare function declarations (no body, not extern "C") - they have fn_btok=0.
     if r64(fn_extern + fi*8)==1 { fi=fi+1; continue }
@@ -830,7 +830,7 @@ fn main(argc, argv) {
         
         // P10: cur_fi must be set BEFORE parse_block so that parse_call_impl's
         // fn-typed-param lookup (findparam(cur_fi, ...)) sees THIS function's
-        // param table while the body is parsed — not the previous fn's (the
+        // param table while the body is parsed ? not the previous fn's (the
         // register-slot hazard: cross-block state must live in globals).
         cur_fi=fi
 // P11 (0.0.67): if THIS fn is a closure body (anonymous: name length 0
@@ -863,7 +863,7 @@ fn main(argc, argv) {
         }
         // 0.0.97: operator-overload suppression. Inside an operator-named fn
         // body (e.g. `fn +(a,b)`), the same operator must resolve to the BUILTIN
-        // primitive — otherwise `fn +(a,b){ return a + b }` would infinitely
+        // primitive ? otherwise `fn +(a,b){ return a + b }` would infinitely
         // recurse through the overload. So set overload_suppressed when the fn
         // name's first byte is an operator symbol.
         overload_suppressed = 0
@@ -920,7 +920,7 @@ fn main(argc, argv) {
     escape_run()
 
     // Resolve function-call patches (ty==2) now that all offsets are known.
-    // In object mode (emit_obj==1) these are NOT resolved here — p5_elf_obj
+    // In object mode (emit_obj==1) these are NOT resolved here ? p5_elf_obj
     // emits R_X86_64_PC32 relocations against the function symbols instead.
     if emit_obj == 0 {
     let pi=0
@@ -973,7 +973,7 @@ fn main(argc, argv) {
                 }
             } else { file_write(2, src+tg, tg_nl); file_write(2, 0x100000+0, 1); exit(7) }
         } else if r64(patches+pi*PCS+16)==5 {
-            // 0.0.97: IR_CALL_IDX — patches+8 carries the fn INDEX directly.
+            // 0.0.97: IR_CALL_IDX ? patches+8 carries the fn INDEX directly.
             // Resolve to that function's code offset (no name lookup).
             let po5=r64(patches+pi*PCS)
             let tfi5=r64(patches+pi*PCS+8)

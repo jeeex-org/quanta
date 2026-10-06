@@ -28,7 +28,7 @@ fn resolve_fn(nm, nl, mode) {
 
 fn parse_call_impl(nm, nl, selfv, mode) {
     // P10: Check for generic type arguments <T, U> after function name
-    // '<' and '>' are TT_OP (values 60/62) — parser checks context
+    // '<' and '>' are TT_OP (values 60/62) ? parser checks context
     let gen_args_count = 0
     let gen_args = mmap(8000)  // store type argument identifiers
     if tokp<tokc && tokt(tokp)==TT_OP && tokv(tokp)==60 {
@@ -388,7 +388,7 @@ fn parse_call_impl(nm, nl, selfv, mode) {
             }
         // G2: builtins str()/push() return a byte-stride string -> tag vr2.
         // nm is an offset; builtin names are at src+nm (same as is_bltn()).
-        // P10: array push (is_arr_push) returns an ARRAY — do NOT tag as str.
+        // P10: array push (is_arr_push) returns an ARRAY ? do NOT tag as str.
         if vr2>=0 && vr2<8192 {
             if nl==3&&r8(src+nm)=='s'&&r8(src+nm+1)=='t'&&r8(src+nm+2)=='r' { w64(vreg_is_str + vr2*8, 1) }
             // Removed: tagging "push" result as str. A user-defined fn push(...)
@@ -541,7 +541,7 @@ fn parse_index_on(base_vr) {
         let hi_vr = -1
         let e0 = -1
         if peek()==TT_PNCT&&pval()==58 {
-            // a[:hi] — no lower bound (defaults to 0)
+            // a[:hi] ? no lower bound (defaults to 0)
             is_slice = 1
             adv()  // consume ':'
             if !(peek()==TT_PNCT&&pval()==93) { hi_vr = parse_expr() }
@@ -561,7 +561,7 @@ fn parse_index_on(base_vr) {
                 let mn = "error: slice of string not supported (arrays only)\n"
                 file_write(2, mn+8, len(mn)); exit(1)
             }
-            // Slice lowering (pure IR — works on x86 AND ARM64):
+            // Slice lowering (pure IR ? works on x86 AND ARM64):
             //   lo = max(lo, 0);  hi = min(hi, len);  n = max(0, hi - lo)
             //   dst = TALLOC(n);  loop idx in 0..n: dst[idx] = base[lo+idx]
             // BOTH ends are clamped, so every index the loop makes is in range
@@ -626,7 +626,7 @@ fn parse_index_on(base_vr) {
 }
 
 fn parse_primary() {
-    if peek()==TT_ASM {  // P11: inline asm: asm!("hex bytes") — raw machine code
+    if peek()==TT_ASM {  // P11: inline asm: asm!("hex bytes") ? raw machine code
         adv()  // consume 'asm'
         if !(peek()==TT_OP && pval()==33) {
             let mn = "error: expected '!' after asm\n"; file_write(2, mn+8, len(mn)); exit(1)
@@ -1285,7 +1285,7 @@ fn parse_primary() {
         // P7 fix: type keywords (u8/u16/u32/u64/...) used as BUILTIN CALLS,
         // e.g. `u8(511)`. The tokenizer marks them TT_KEY for `let x: u64 = 5`
         // annotations, but as expression-primary they must route to parse_call
-        // when followed by '(' — otherwise `u8(511)` silently became CONST 0
+        // when followed by '(' ? otherwise `u8(511)` silently became CONST 0
         // (phantom value, `(511)` left unparsed). is_bltn matches the name at
         // src+v (same source-offset layout as TT_ID tokens). Consume the
         // keyword first (parse_call_impl's adv() then eats the '(').
@@ -1327,7 +1327,7 @@ fn parse_primary() {
         return vr2
     }
     if peek()==TT_SHCMD {
-        // $$(cmd) runs an EXTERNAL command via fork/execve — a privileged
+        // $$(cmd) runs an EXTERNAL command via fork/execve ? a privileged
         // escape from the memory-safe language. Secure-by-default: require it
         // to be wrapped in `unsafe {}`. Reject at compile time otherwise.
         if unsafe_depth==0 {
@@ -1542,7 +1542,7 @@ fn parse_primary() {
                     // Check for function call: name(args) - this comes AFTER enum/struct checks
                         // Not an enum variant, now consume the ID token for regular handling
                         let nm=pval(); let nl=plen(); adv()
-                    // F7: compile-time constant substitution — emit IR_CONST directly.
+                    // F7: compile-time constant substitution ? emit IR_CONST directly.
                     // A bare enum-variant name is registered as a MARKED const (bvmark()+ei*1048576+vidx);
                     // detect the mark and emit the heap unit-variant (consistent with match).
                     // cfind returns an INDEX (or -1); cval dereferences it, so the
@@ -1669,11 +1669,11 @@ fn parse_primary() {
             while peek()==TT_PNCT && pval()==91 { pv = parse_index_on(pv) }
             return pv
         }
-        // Phase 4.3: postfix `.N` (tuple), `.field` (struct), `.method` (t8) —
+        // Phase 4.3: postfix `.N` (tuple), `.field` (struct), `.method` (t8) ?
         // CHAINED (e.g. r.topleft.x). `selfv` holds the object vreg: for the
         // first `.` it is resolved from the name `nm`/`nl`; for later chain
         // links it is the previous field's result vreg (tagged via sfldtyp so
-        // the next `.` resolves). All name lookups are INLINED — calling a
+        // the next `.` resolves). All name lookups are INLINED ? calling a
         // user-fn with live locals trips the allocator clobber bug.
         let selfv = -1
         while peek()==TT_PNCT&&pval()==46 {
@@ -1711,7 +1711,7 @@ fn parse_primary() {
                 let vr=nv(); iremit(32,vr,selfv,fi,0); selfv=vr
             } else if peek()==TT_ID {
                 if selfv<0 {
-                    // F7: compile-time constant substitution — emit IR_CONST directly.
+                    // F7: compile-time constant substitution ? emit IR_CONST directly.
                     // cfind returns an INDEX (or -1), not the value; dereference
                     // only after confirming the entry exists. A string const
                     // must go through IR_STR so the literal is materialised.
