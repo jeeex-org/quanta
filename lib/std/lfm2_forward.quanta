@@ -289,3 +289,163 @@ fn fc_short_conv(L, x: u64, state: u64, out: u64) {
     }
     return mm_matvec(cout, fc_sc_y, dm, dm, out)
 }
+
+// ===========================================================================
+// GQA ATTENTION PATH (the 8 attention layers)
+//
+// Transcribed from llama.cpp src/models/lfm2.cpp build_attn_block():
+//
+//   q = q_proj @ x        [d_model, n_head * head_dim]  = [2048, 2048]
+//   k = k_proj @ x        [d_model, n_kv  * head_dim]  = [2048,  512]
+//   v = v_proj @ x        [d_model, n_kv  * head_dim]  = [2048,  512]
+//   q = rms_norm(q, attn_q_norm)     per HEAD, over head_dim
+//   k = rms_norm(k, attn_k_norm)     per HEAD, over head_dim
+//   q = rope(q, pos);  k = rope(k, pos)
+//   k,v are appended to the per-layer KV cache
+//   scores[h] = q[h] . k[t]/sqrt(head_dim)   for every cached t <= pos
+//   softmax over t
+//   out[h] = sum_t scores[h][t] * v[t]
+//   y = out_proj @ concat(out[0..n_head))
+//
+// n_head = 32, n_kv = 8, head_dim = 64, so the GQA group is 4: query heads
+// 4h..4h+3 share KV head h.
+//
+// Three details that each produce a plausible but wrong result:
+//
+//   - attn_q_norm / attn_k_norm are PER HEAD over head_dim (64 elements each),
+//     NOT over d_model. Normalizing the whole 2048-wide vector at once gives a
+//     different scale and silently wrecks every score.
+//   - The RMSNorm here carries the epsilon (fc_rms_norm), like the others.
+//   - No RoPE scaling: the model has NO lfm2.rope.scaling.* keys and no
+//     lfm2.rope.dimension_count, so n_rot is the full head_dim and the only
+//     parameter is freq_base = 1e7. Verified against the model's own metadata.
+//
+// RoPE convention is NEOX, and the pairing is HALF-SPLIT, not adjacent.
+// From ggml's rotate_pairs():
+//   for i0 in 0..n step 2:  ic = i0/2
+//     x0 = src[ic],  x1 = src[ic + head_dim/2]
+//     dst[ic]               = x0*cos - x1*sin
+//     dst[ic + head_dim/2]  = x0*sin + x1*cos
+// and from ggml_rope_cache_init():
+//   theta starts at 1.0 and is multiplied by theta_scale = base^(-2/head_dim)
+//   once per PAIR, so pair i uses theta = base^(-2i/head_dim)
+// with cache[i0] = cos, cache[i0+1] = sin.
+//
+// Pairing element 0 with element 32 (head_dim/2) rather than element 0 with
+// element 1 is the difference between a correct rotation and one that looks
+// plausible but scrambles every head. head_dim = 64 is even, so all components
+// are rotated.
+
+// ---- KV cache -------------------------------------------------------------
+// One contiguous block for every attention layer: layer L owns
+//   kcache: n_kv * head_dim * n_ctx
+//   vcache: n_kv * head_dim * n_ctx
+// f64, NOT f32. Storing f32 would halve the footprint (1 GB vs 2 GB for the K
+// cache of one attention layer at 131072 context), but there is no f64->f32
+// narrowing conversion in the language -- only f32_to_f64() -- so an f32 cache
+// needs a hand-rolled pack that is exactly where the f32_to_f64 bug came from.
+// f64 is correct, simple and verifiable; narrowing can come later with a real
+// conversion and a test that pins the rounding.
+
+let fc_kvbuf = 0
+let fc_kv_cap = 0        // max positions per layer
+let fc_kv_len = 0        // positions currently filled
+
+// Bytes one layer's K cache needs: n_kv * head_dim * 4 bytes in f32.
+fn fc_kv_layer_stride() { return fc_nkv_max * fc_head_dim * 8 }
+
+fn fc_kv_init(nctx) {
+    if fc_kvbuf != 0 { return 0 }
+    if fc_nkv_max <= 0 || fc_head_dim <= 0 { return -1 }
+    fc_kv_cap = nctx
+    // n_layers slots for K and the same again for V.
+    fc_kvbuf = mem_alloc(fc_kv_layer_stride() * fc_n_layers * 2 + 4096)
+    if fc_kvbuf == 0 { return -1 }
+    fc_kv_len = 0
+    return 0
+}
+
+fn fc_kv_reset() { fc_kv_len = 0 }
+
+// K (or V) cache base for layer L: 0 = K, 1 = V.
+// Absolute byte address of position `pos` of KV head `h` in layer L.
+fn fc_kv_at(L, which, pos, h) {
+    return fc_kvbuf + (which * fc_n_layers + L) * fc_kv_cap * fc_head_dim * 8
+           + ((pos * fc_nkv_of(L) + h) * fc_head_dim) * 8
+}
+
+// Write one value into the KV cache.
+fn fc_kv_put(L, which, pos, h, j, v) {
+    mem_store(fc_kv_at(L, which, pos, h) + j * 8, v)
+    return 0
+}
+
+// Read one value back out of the KV cache.
+//
+// The `-> f64` is REQUIRED, not decoration. An untyped return carries the value
+// as a raw bit pattern, and a caller doing `want - got` against it gets INTEGER
+// subtraction: verified, two identical float bit patterns subtracted to inf
+// rather than 0.0. That silently turns a correct comparison into a garbage one,
+// and the value only shows up as a wrong answer far downstream.
+fn fc_kv_get(L, which, pos, h, j) -> f64 {
+    return f64of(mem_load(fc_kv_at(L, which, pos, h) + j * 8))
+}
+
+// ---- RoPE -----------------------------------------------------------------
+
+// Fill the cos/sin cache for one head position. `theta` accumulates the
+// base^(-2i/head_dim) progression exactly as ggml_rope_cache_init does, rather
+// than calling pow() per pair: one power and a multiply per pair instead of 32
+// powers, and it matches ggml's own loop order.
+fn fc_rope_cache(pos) {
+    let hd = fc_head_dim
+    let half = hd / 2
+    if fc_cos == 0 {
+        fc_cos = mem_alloc(hd * 8)
+        fc_sin = mem_alloc(hd * 8)
+    }
+    // fc_rope_base is a module-level float global, and the vfloat table now
+    // carries the tag for those (codegen: gfloat), so `pow(fc_rope_base, ...)`
+    // takes the float path and reads the base's actual value.
+    //
+    // The workaround this replaces -- routing the base through i2f() -- was
+    // needed while globals were untagged, and it was never more than that: i2f is
+    // integer->float, so i2f(fc_rope_base) reinterpreted 1e7's bits as an integer
+    // and produced inf, making theta_scale 1.0 and freezing every pair at the
+    // same angle. Two compiler bugs were stacked on this one line.
+    let hd2: f64 = i2f(hd)
+    let theta_scale: f64 = pow(fc_rope_base, (0.0 - 2.0) / hd2)
+    // theta_scale is TYPED f64 on purpose. An untyped accumulator makes
+    // `theta * theta_scale` an integer multiply over the bit patterns, which
+    // corrupts theta after the first pair: pair 0 came out right and every
+    // later pair was garbage. Verified against Python for pos=100.
+    let theta: f64 = i2f(pos)
+    let p = 0
+    while p < half {
+        mem_store(fc_cos + p * 8, cos(theta))
+        mem_store(fc_sin + p * 8, sin(theta))
+        theta = theta * theta_scale
+        p = p + 1
+    }
+    return 0
+}
+
+// Rotate one head's worth of values in place. `v` holds head_dim f64 values.
+fn fc_rope_apply(v: u64) {
+    let hd = fc_head_dim
+    let half = hd / 2
+    let p = 0
+    while p < half {
+        let x0 = f64of(mem_load(v + p * 8))
+        let x1 = f64of(mem_load(v + (p + half) * 8))
+        let c = f64of(mem_load(fc_cos + p * 8))
+        let s = f64of(mem_load(fc_sin + p * 8))
+        mem_store(v + p * 8, x0 * c - x1 * s)
+        mem_store(v + (p + half) * 8, x0 * s + x1 * c)
+        p = p + 1
+    }
+    return 0
+}
+
+let fc_cos = 0
+let fc_sin = 0

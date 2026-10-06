@@ -3793,11 +3793,38 @@ fn emit_bltn2(nmi,nl,ii) {
     }
     // pow(a,b) = exp(b * ln(a)). Compute ln(a) via fyl2x*ln2, multiply by b, exp.
     if nl==3&&r8(nm)=='p'&&r8(nm+1)=='o'&&r8(nm+2)=='w' {
-        flush_all()
         let arg0v = irres(ira2(ii))
         let arg1v = irres(ira2(ii)+1)
-        rbp(7, spill_home(arg0v))                     // rdi = a (arg0 from spill home)
-        rbp(6, spill_home(arg1v))                     // rsi = b (arg1 from spill home)
+        // Load the operands through aphys(), NOT spill_home().
+        //
+        // spill_home(v) is a fixed per-vreg slot, and it only holds v's value if v
+        // was actually spilled there. When the value instead lives in a physical
+        // register -- which is the case for anything read from a module global,
+        // an array, or an inline expression -- the home slot holds something else
+        // and pow silently computes on the wrong bits. aphys() is the accessor
+        // that handles this: it returns the live register, or reloads from home
+        // only when the vreg is initialised.
+        //
+        // Verified, correct value 1e7^(-2/64) = 0.604296:
+        //
+        //     pow(local_from_i2f_literal, arg)   -> 0.604296  correct
+        //     pow(module_global, arg)            -> 0.260893  WRONG
+        //     pow(array_element, arg)            -> 0.260893  WRONG
+        //
+        // and pow(b, e) with the operands swapped SEGFAULTED. Nothing traps: the
+        // base printed correctly on its own, so this read as a maths bug rather
+        // than a codegen one. No user-side workaround existed -- every route from
+        // a float global back into pow gave a wrong answer or crashed.
+        //
+        // pa0/pa1 must be read BEFORE flush_all(): that spills every live vreg,
+        // after which the float tag is no longer reliable.
+        let pa0 = is_float_vr(arg0v)
+        let pa1 = is_float_vr(arg1v)
+        let pr0 = aphys(arg0v)
+        let pr1 = aphys(arg1v)
+        flush_all()
+        rr(7, pr0)                                     // rdi = a
+        rr(6, pr1)                                     // rsi = b
         sbi(32)                                  // sub rsp, 32 (slots: a[rsp], b[rsp+8])
         fx87prep()                               // force 64-bit FPU precision
         eb(72); eb(137); eb(60); eb(36)   // mov [rsp], rdi      (a bits)
@@ -3827,8 +3854,6 @@ fn emit_bltn2(nmi,nl,ii) {
         //   movsd [rsp], xmm0   = F2 0F 11 04 24
         //   cvtsi2sd xmm1, rsi  = F2 48 0F 2A CE
         //   movsd [rsp+8], xmm1 = F2 0F 11 4C 24 08
-        let pa0 = is_float_vr(arg0v)
-        let pa1 = is_float_vr(arg1v)
         if pa0==0 { eb(242); eb(72); eb(15); eb(42); eb(199); eb(242); eb(15); eb(17); eb(4); eb(36) }
         if pa1==0 { eb(242); eb(72); eb(15); eb(42); eb(206); eb(242); eb(15); eb(17); eb(76); eb(36); eb(8) }
         // ln(a): fldln2; fld [rsp]; fyl2x
