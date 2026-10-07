@@ -181,8 +181,18 @@ fn parse_block() {
             // continue to the NEXT token so trailing statements in the same block
             // (e.g. code after a `try {} catch {}`) are still parsed. Sibling
             // keyword handlers (parse_if/parse_while/...) do not return either.
-            if hk0==59 { parse_try(); continue }   // consumes whole `try{}catch{}`; re-read fresh token
-            else if hk0==61 {
+            // 0.0.225: `try` is a CONTEXT keyword -- `try { } catch { }` is a
+            // statement, `fn try()` is a definition. Deciding from the text alone
+            // routed `fn try()` into parse_try(), which consumed the entire
+            // function definition and left nothing to emit. Require the `{` that
+            // makes it a statement. Verified: the statement form still compiles
+            // and `fn try()` now compiles.
+            let try_is_stmt = 0
+            if hk0==59 && tokp+1<tokc && tokt(tokp+1)==TT_PNCT && tokv(tokp+1)==123 { try_is_stmt = 1 }
+            if try_is_stmt==1 { parse_try(); continue }   // consumes whole `try{}catch{}`; re-read fresh token
+            // 0.0.225: same context rule. `throw` is a statement only when an
+            // expression FOLLOWS it; `fn throw()` is a definition.
+            else if hk0==61 && !(tokp+1<tokc && tokt(tokp+1)==TT_PNCT && tokv(tokp+1)==40) {
                 adv()   // consume 'throw'
                 if peek()==TT_PNCT && (pval()==59 || pval()==125) {
                     let sv = nv(); iremit(IR_CONST, sv, -1, 0, 0)
@@ -293,6 +303,18 @@ fn parse_block() {
                 if in_fn_body==1 && blk_depth==1 && peek()==TT_PNCT && pval()==125 { iremit(IR_RET,0,mv,0,0) }
             }
             else if h==H_DEFER { parse_defer(my_scope) }
+            // 0.0.225: a keyword-named VARIABLE at statement level. `let try = 5`
+            // lexes `try` as TT_KEY, so it entered this chain, matched none of
+            // the keyword handlers, and fell through to a bare adv() that skipped
+            // the name and left `= 5` to be parsed as a stray assignment (rc=7).
+            // When an '=' follows, this is a declaration: bind the name, then
+            // parse the value.
+            else if tokp+1<tokc && tokt(tokp+1)==TT_PNCT && tokv(tokp+1)==61 {
+                let bn2 = pval(); let bl2 = plen(); adv()
+                vadd(bn2, bl2, nv())
+                adv()   // consume '='
+                parse_assign()
+            }
             else { adv() }
         } else if t==TT_MATCH {
             let mv = parse_match()

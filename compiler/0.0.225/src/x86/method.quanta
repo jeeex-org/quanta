@@ -1289,8 +1289,17 @@ fn parse_primary() {
         // (phantom value, `(511)` left unparsed). is_bltn matches the name at
         // src+v (same source-offset layout as TT_ID tokens). Consume the
         // keyword first (parse_call_impl's adv() then eats the '(').
-        if tokp+1<tokc && tokt(tokp+1)==TT_PNCT && tokv(tokp+1)==40 && is_bltn(v,ln)==1 {
-            adv(); return parse_call(v, ln, FI_LOCAL)
+        // 0.0.225: also route a KEYWORD-named USER function followed by '(' to
+        // parse_call. try/catch/throw/defer lex as TT_KEY, so `try()` hit the
+        // is_bltn() test, failed it (it is not a builtin), fell through to
+        // IR_CONST 0 -- a phantom value with the '(...)' left unparsed. That is
+        // the SIGILL: the compiler desynchronised and died emitting nothing.
+        // `let a = try()` worked because no '(' followed, so it took the normal
+        // variable path; `print(try())` failed because of the '('.
+        if tokp+1<tokc && tokt(tokp+1)==TT_PNCT && tokv(tokp+1)==40 {
+            if is_bltn(v,ln)==1 { adv(); return parse_call(v, ln, FI_LOCAL) }
+            // a registered user function whose name collides with a keyword
+            if findfn(v,ln)>=0 { adv(); return parse_call(v, ln, FI_LOCAL) }
         }
         adv(); iremit(IR_CONST,vr,0,0,0); return vr
     }

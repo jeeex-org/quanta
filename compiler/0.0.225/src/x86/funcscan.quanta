@@ -98,7 +98,16 @@ fn scanfns() {
             // Capture the signature-scan start IMMEDIATELY, before any other
             // local assignment can alias the slot qc-1.0.1 places `nt` in.
             let kstart = nt + 1
-            if nt<tokc && (tokt(nt)==TT_ID || tokt(nt)==TT_OP) {
+            // 0.0.225: accept a TT_KEY name here.
+            //
+            // try/catch/throw/defer all lex as TT_KEY (ktext 59/60/61/56). This
+            // gate required TT_ID, so `fn try()` was NEVER REGISTERED. The call
+            // site then resolved to no index, do_call stayed 0, no IR_CALL was
+            // emitted, and the program crashed with SIGILL (rc=132) rather than a
+            // diagnostic. Established by instrumenting this exact site: a control
+            // function named `t` registers with tok=1 (TT_ID); `try` registers
+            // with tok=6 (TT_KEY) and was being skipped.
+            if nt<tokc && ((tokt(nt)==TT_ID) || (tokt(nt)==TT_KEY) || tokt(nt)==TT_OP) {
                 let nm = tokv(nt); let nl = tokln(nt)
                 // 0.0.97: operator-overload fns (`fn +(a,b)`) name the fn after
                 // a TT_OP token. Register it by SOURCE TEXT (not the op-code int):
