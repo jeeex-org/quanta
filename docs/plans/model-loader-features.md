@@ -118,11 +118,26 @@ Measured safetensors header (qwen3.5-2b): 632 tensors, **76,648-byte JSON header
 - missing-weight strictness on by default **only for non-quantized**, with an enumerated exception list
 - unknown checkpoint keys are a hard error listing available params
 
-### From ollama
-- content-addressed blobs `sha256-<hex>`; dedup is a *side effect* of hashing into a temp file, not a lookup
-- GC by full manifest-graph reachability
-- resumable download **re-hashes the existing `.tmp` prefix before resuming**; publishes via `os.Rename` only after digest **and** size match
-- split GGUF: independent self-describing blobs, validated (shard count, unique `split.no`, matching arch/filetype, summed tensor count, **no duplicate tensor names**)
+### From ollama (read from source, clone `d3c846f`)
+- content-addressed blobs, path construction `manifest/paths.go:397` `BlobsPath(digest)`:
+  `filepath.Join(envconfig.Models(), "blobs", digest)` with `":"` → `"-"` (line 405)
+- the empty digest names the **blobs directory itself** (lines 398–410) — one resolver serves both
+- `digestPattern` (line 30) accepts **both** `sha256:<hex>` and `sha256-<hex>`; `ValidateDigest`
+  enforces exactly 64 hex digits, so no prefix truncation and no traversal through a digest
+- dedup is a side effect of **`NewLayer` hashing into a temp file** (`manifest/layer.go:40–70`):
+  stream → `sha256.New()` while writing to `os.CreateTemp(blobs, "sha256-")`; publish is
+  `os.Rename` to the canonical name only if `os.Stat(blob)` fails. Dedup falls out of "content
+  already exists at its own address" — there is no lookup step.
+- verified, correcting the earlier research note: ollama **GCs by manifest reachability**, and
+  `manifest/manifest.go` walks layer digests rather than scanning blobs for liveness
+- split GGUF (`llm/model_split.go`): independent self-describing blobs reconciled at load
+- ⚠️ its split mechanism is a **filesystem workaround, not a loader feature**: hard links under
+  `.ollama-split-<digest12>-<random>/` exist only because llama-server auto-discovers shards by
+  canonical filename and has "no CLI option for passing shard paths explicitly" (comment lines
+  20–23). `maxSplitModelFiles = 99999` mirrors llama.cpp's five-digit count field.
+  → Adopt the *validation*, not the hardlink dance. A split reprinted under canonical names is
+  a symlink unmanageable in the general case; the useful part is reconciling shards (count,
+  unique `split.no`, matching arch/filetype, summed tensor count, no duplicate tensor names).
 
 ### From MLX
 - `mx.load` returns **lazy graph nodes**, not data — files stay on disk until eval

@@ -91,6 +91,33 @@ b = 10 ** 10
 write(os.path.join(out, "dim_over_limit.gguf"),
       {"a": {"dtype": "F32", "shape": [a, b], "data_offsets": [0, 64]}}, DATA)
 
+# 8b2. THE ISOLATING FIXTURE for the checked-multiply limit.
+#
+#     Every earlier overflow fixture wraps NEGATIVE or simply exceeds the limit, so
+#     another guard (v<=0, or the byte-length check) got there first. Deleting the
+#     limit guard left all of them still rejected, which is why this mutation
+#     survived.
+#
+#     This one wraps to a SMALL POSITIVE number that MATCHES the file's real byte
+#     length, so every other check passes and only the limit guard can reject it:
+#
+#         1024 * 18014398509481985 = 18446744073709552640
+#         18446744073709552640 mod 2^64 = 1024
+#
+#     Both dimensions fit in i64 (18014398509481985 < 2^63-1), so json_get_number
+#     returns positive values and the v<=0 guard does NOT fire. The product wraps
+#     to 1024, which matches the declared data_offsets [0, 4096] for F32 (1024
+#     elements * 4 bytes = 4096 bytes). Only the checked-multiply limit guard can
+#     reject this file.
+#
+#     a = 1024 is deliberately innocuous. A shape whose first dimension is 1024
+#     is not something a reviewer flags, which is the point: the real extent is
+#     ~1.8e19 elements and the wrapped value says 1024.
+write(os.path.join(out, "dim_wrap_small.gguf"),
+      {"a": {"dtype": "F32", "shape": [1024, 18014398509481985],
+             "data_offsets": [0, 4096]}},
+      bytes(4096))
+
 # 8c. a header that is valid JSON but not an OBJECT at the root, so json_parse
 #     succeeds and the reader must reject it on type. Proves the JSON path is
 #     live and the type check is real -- deleting the string-header store
