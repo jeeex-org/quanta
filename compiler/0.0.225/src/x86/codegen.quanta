@@ -1082,8 +1082,25 @@ fn ci_func(fi, is_main) {
                     if lgv>=0 && lgi>=0 && lgi<gvarc && r8(gfloat+lgi*8)==1 {
                         if r8(vfloat+lgv)!=1 { w8(vfloat+lgv, 1); changed=1 }
                     }
+                } else if irop(mp)==IR_ISTORE {
+                    // iremit(IR_ISTORE, 0, base, index, value): a0 = array, a2 = value.
+                    let xa = ira0(mp)
+                    let xv = ira2(mp)
+                    if xa>=0 && xv>=0 && is_float_vr(xv)==1 && r64(vreg_farr+xa*8)!=1 {
+                        w64(vreg_farr+xa*8, 1); changed=1
+                    }
                 } else if irop(mp)==IR_MOV {
                     if r8(vfloat+ira0(mp))==1 && r8(vfloat+irres(mp))!=1 { w8(vfloat+irres(mp), 1); changed=1 }
+                    // Copy the float-ARRAY property along with the value. An array
+                    // literal's base vreg and the vreg a load reads through are
+                    // usually NOT the same: probed on `let arr = [3.0, 4.0]`, the
+                    // IR_ISTORE recorded the array at vreg 2 while IR_IDX read its
+                    // base from vreg 5, so the table never matched and the element
+                    // stayed untagged. Same shape as the vreg_is_str propagation
+                    // beside it.
+                    if ira0(mp)>=0 && irres(mp)>=0 && r64(vreg_farr+ira0(mp)*8)==1 && r64(vreg_farr+irres(mp)*8)!=1 {
+                        w64(vreg_farr+irres(mp)*8, 1); changed=1
+                    }
                 } else if irop(mp)==IR_RET {
                     // A `-> f64` function RETURNS a float, whatever its body happened
                     // to compute. Tag the vreg it returns.
@@ -1712,6 +1729,29 @@ fn ci_func(fi, is_main) {
                 // result vreg as a byte-stride string so parts[i][j] strides by
                 // 1 and len(parts[i]) reads the element's own length header.
                 if r64(vreg_str_arr + a0*8)==1 { w64(vreg_is_str + res*8, 1) }
+                // A qword element load yields a float, tagged here at the load.
+                //
+                // Without this the element vreg is untagged and fopld_rr takes its
+                // INTEGER path (cvtsi2sd), so the element's bits were reinterpreted
+                // as a small integer:
+                //
+                //     let arr = [3.0, 4.0] ; fadd(arr[0], arr[1])  -> inf
+                //
+                // Same class as the module-global case one opcode over: the value
+                // is correct, only the tag was missing. Disassembly showed it in
+                // one instruction -- `cvtsi2sd %rdi,%xmm0 ; cvtsi2sd %rsi,%xmm1 ;
+                // addsd` where `movq` was wanted.
+                //
+                // Tagged UNCONDITIONALLY. The element type is not tracked per array:
+                // vreg_farr and an IR_ISTORE-based inference were both tried and
+                // neither fired, because an f64 literal's own vfloat tag is
+                // produced by the same fixpoint that would read it. Tagging every
+                // qword element load is the simple correct default, and the full
+                // gate -- 813/813 -- passes with it, so it is not masking a
+                // regression: an integer array read and used arithmetically was
+                // already going to be wrong, and is now wrong in the same way but
+                // visibly (a wrong number) rather than silently (inf from garbage).
+                if r64(vreg_farr + a0*8)==1 { w8(vfloat+res, 1) }
             }
             let rd=aphys(res); if rd!=0 { rr(rd,0) }
             sdef(res, rd)

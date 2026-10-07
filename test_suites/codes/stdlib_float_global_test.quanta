@@ -114,6 +114,22 @@ fn main() {
     reassign()
     if check(10, g_a + 1.0, 4.0) != 0 { return 1 }
 
+    // ---- 11-13: float ARRAY elements. Same defect class, IR_IDX this time. ----
+    // The element load did not tag its result, so fopld_rr took its cvtsi2sd path
+    // and the element's bits were reinterpreted as a small integer:
+    //     fadd(arr[0], arr[1])  ->  inf     want 7.0
+    let arr = [3.0, 4.0]
+    if check(11, fadd(arr[0], arr[1]), 7.0) != 0 { return 1 }
+    let e0 = arr[0]
+    if check(12, e0 + 1.0, 4.0) != 0 { return 1 }
+    if check(13, arr[1] * 2.0, 8.0) != 0 { return 1 }
+
+    // An INTEGER array must still behave as integers -- tagging every element
+    // load as a float would quietly break arithmetic on int arrays. Regression
+    // guard for that: an unconditional tag was tried and broke six gate tests.
+    let iarr = [3, 4]
+    if check(14, fadd(iarr[0], iarr[1]), 7.0) != 0 { return 1 }
+
     print("OK float-global")
     return 0
 }

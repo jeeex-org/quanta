@@ -414,7 +414,9 @@ fn ascratch(ex) {
 // tables -- vfloat above all -- kept whatever the previous function left in them.
 // A stale vfloat entry made is_float_vr() true for a vreg that held an integer,
 // which sent float arithmetic down fopld_rr's cvtsi2sd path.
-fn aclr() { allocfc=0; let i=0; while i<vreg_high { w8(vr_init+i,0); w8(vr_spill+i,0); w8(vfloat+i,0); i=i+1 } }
+// vreg_farr is cleared too: a stale "this vreg is a float array" would make
+// IR_IDX tag an integer element's load as a float.
+fn aclr() { allocfc=0; let i=0; while i<vreg_high { w8(vr_init+i,0); w8(vr_spill+i,0); w8(vfloat+i,0); w64(vreg_farr+i*8, -1); i=i+1 } }
 
 // afree(): return a free physical reg, evicting a mapped vreg (spilling it) if needed.
 fn afree() {
