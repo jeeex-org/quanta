@@ -369,9 +369,18 @@ fn fc_kv_reset() { fc_kv_len = 0 }
 
 // K (or V) cache base for layer L: 0 = K, 1 = V.
 // Absolute byte address of position `pos` of KV head `h` in layer L.
+// The layer stride is fc_kv_cap * fc_nkv_max * fc_head_dim * 8 and the position
+// offset is (pos * nkv_max + h) * fc_head_dim * 8 -- they must use the SAME
+// per-layer head count or a write at pos>0 lands outside the slot.
+//
+// The first version mixed them: the stride omitted the nkv factor while the
+// offset included it, so every store past pos 0 ran off the end of the buffer.
+// This is the same out-of-bounds class as the earlier conv-path bug, and the same
+// lesson: when two expressions index into one allocation, check that they agree
+// on the unit stride, do not eyeball each one.
 fn fc_kv_at(L, which, pos, h) {
-    return fc_kvbuf + (which * fc_n_layers + L) * fc_kv_cap * fc_head_dim * 8
-           + ((pos * fc_nkv_of(L) + h) * fc_head_dim) * 8
+    return fc_kvbuf + (which * fc_n_layers + L) * fc_kv_cap * fc_nkv_max * fc_head_dim * 8
+           + ((pos * fc_nkv_max + h) * fc_head_dim) * 8
 }
 
 // Write one value into the KV cache.
@@ -441,3 +450,245 @@ fn fc_rope_apply(v: u64) {
 
 let fc_cos = 0
 let fc_sin = 0
+
+// ===========================================================================
+// GQA ATTENTION PATH (the 8 attention layers)
+//
+// Transcribed from llama.cpp src/models/lfm2.cpp build_attn_block():
+//
+//   q = q_proj @ x                    [d_model, n_head * head_dim] = [2048, 2048]
+//   k = k_proj @ x                    [d_model, n_kv  * head_dim] = [2048,  512]
+//   v = v_proj @ x                    [d_model, n_kv  * head_dim] = [2048,  512]
+//   q = rms_norm(q, attn_q_norm)      PER HEAD, over head_dim (64 elements)
+//   k = rms_norm(k, attn_k_norm)      PER HEAD, over head_dim (64 elements)
+//   q = rope(q, pos) ; k = rope(k, pos)
+//   k, v are appended to the per-layer KV cache at `pos`
+//   scores[h][t] = q[h] . k[t] / sqrt(head_dim)      for t in 0..pos
+//   softmax over t
+//   out[h] = sum_t scores[h][t] * v[t]
+//   y = wo @ concat(out[0..n_head))
+//
+// n_head = 32, n_kv = 8, head_dim = 64, so 4 query heads share each KV head:
+// query head h reads KV head h / 4. That mapping is the GQA group and getting it
+// wrong still produces plausible numbers, just the wrong ones.
+//
+// Three details that each produce a plausible-but-wrong layer:
+//
+//   - q_norm/k_norm are PER HEAD over head_dim. attn_q_norm has 64 elements, not
+//     2048, so normalizing the whole concatenated vector at once is a different
+//     computation -- different scale, every score wrong.
+//   - the scale is 1/sqrt(head_dim) = 1/8, applied to the scores BEFORE softmax,
+//     not to q. Slightly wrong scale, plausible output.
+//   - the softmax is over CACHED positions 0..pos inclusive, causal: never look
+//     at a position that has not been written yet.
+
+// scratch, allocated once (mem_alloc inside a loop is unsafe)
+let fc_at_qn = 0
+let fc_at_kn = 0
+let fc_at_q = 0
+let fc_at_k = 0
+let fc_at_v = 0
+let fc_at_sc = 0
+let fc_at_h = 0
+let fc_at_out = 0
+
+// Per-head RMSNorm over head_dim values. This is the shape attn_q_norm and
+// attn_k_norm actually have (64 elements), NOT a whole-vector norm.
+fn fc_rms_norm_head(out: u64, x: u64, w: u64, hd: i64) {
+    if hd <= 0 { return 0 }
+    let ss: f64 = 0.0
+    let i = 0
+    while i < hd {
+        let v = f64of(mem_load(x + i * 8))
+        ss = ss + v * v
+        i = i + 1
+    }
+    let inv: f64 = 1.0 / sqrt(ss / i2f(hd) + fc_rms_eps)
+    i = 0
+    while i < hd {
+        let xv = f64of(mem_load(x + i * 8))
+        let wv = f64of(mem_load(w + i * 8))
+        mem_store(out + i * 8, xv * inv * wv)
+        i = i + 1
+    }
+    return 0
+}
+
+// One GQA attention layer at position `pos`.
+//   x     d_model values (already attn_norm'd)
+//   out   d_model values
+//   state the KV cache, which must already be fc_kv_init()ed
+fn fc_attention(L, pos, x: u64, out: u64) {
+    let dm = fc_d_model
+    let nh = fc_n_heads
+    let nkv = fc_nkv_of(L)
+    let hd = fc_head_dim
+    if nkv <= 0 || hd <= 0 { return -1 }
+    let qt = lfm2_attn_q(L)
+    let kt = lfm2_attn_k(L)
+    let vt = lfm2_attn_v(L)
+    let qn = lfm2_attn_q_norm(L)
+    let kn = lfm2_attn_k_norm(L)
+    let wo = lfm2_attn_output(L)
+    if qt < 0 || kt < 0 || vt < 0 || qn < 0 || kn < 0 || wo < 0 { return -1 }
+
+    if fc_at_q == 0 {
+        // The q_norm / k_norm accessors return a TENSOR INDEX, not a data
+        // pointer -- mm_matvec takes an index, fc_rms_norm takes a pointer, and
+        // passing the index straight through dereferences address 23 and faults.
+        // Measured: lfm2_attn_q_norm(2) = 23; fc_rms_norm(..., 23, 64) segfaults,
+        // while the same call with read_tensor_f64(23, buf) succeeds.
+        fc_at_qn = mem_alloc(hd * 8)
+        fc_at_kn = mem_alloc(hd * 8)
+        read_tensor_f64(qn, fc_at_qn)
+        read_tensor_f64(kn, fc_at_kn)
+        fc_at_q = mem_alloc(nh * hd * 8)
+        fc_at_k = mem_alloc(nkv * hd * 8)
+        fc_at_v = mem_alloc(nkv * hd * 8)
+        fc_at_h = mem_alloc(hd * 8)
+        // Sized for the whole CONTEXT, not the current position. The buffers are
+        // allocated once, on the first call, which is position 0 -- sizing this
+        // (pos + 2) gave 2 entries, and the score loop then wrote and read indices
+        // 0..pos for every later position, running off the end.
+        //
+        // That was invisible at pos 0, where the two agree, and showed up only
+        // from pos 1 on: cos against a reference fell to ~0.46-0.57 instead of
+        // 1.0. fc_kv_cap is set by fc_kv_init and is the right bound -- the score
+        // vector can never be longer than the number of cached positions.
+        fc_at_sc = mem_alloc((fc_kv_cap + 2) * 8)
+        fc_at_out = mem_alloc(nh * hd * 8)
+    }
+
+    // ---- projections -------------------------------------------------------
+    // mm_matvec is column-major over [rows, cols], so row j of a [dm, N] tensor
+    // is elements [j*dm, (j+1)*dm).
+    if mm_matvec(qt, x, nh * hd, dm, fc_at_q) != 0 { return -1 }
+    if mm_matvec(kt, x, nkv * hd, dm, fc_at_k) != 0 { return -1 }
+    if mm_matvec(vt, x, nkv * hd, dm, fc_at_v) != 0 { return -1 }
+
+    // ---- q_norm / k_norm, per head, BEFORE RoPE -----------------------------
+    let h = 0
+    while h < nh {
+        if fc_rms_norm_head(fc_at_h, fc_at_q + h * hd * 8, fc_at_qn, hd) != 0 { return -1 }
+        let c = 0
+        while c < hd {
+            mem_store(fc_at_q + (h * hd + c) * 8, f64of(mem_load(fc_at_h + c * 8)))
+            c = c + 1
+        }
+        h = h + 1
+    }
+    h = 0
+    while h < nkv {
+        if fc_rms_norm_head(fc_at_h, fc_at_k + h * hd * 8, fc_at_kn, hd) != 0 { return -1 }
+        let c = 0
+        while c < hd {
+            mem_store(fc_at_k + (h * hd + c) * 8, f64of(mem_load(fc_at_h + c * 8)))
+            c = c + 1
+        }
+        h = h + 1
+    }
+
+    // ---- RoPE ---------------------------------------------------------------
+    fc_rope_cache(pos)
+    h = 0
+    while h < nh {
+        fc_rope_apply(fc_at_q + h * hd * 8)
+        h = h + 1
+    }
+    h = 0
+    while h < nkv {
+        fc_rope_apply(fc_at_k + h * hd * 8)
+        h = h + 1
+    }
+
+    // ---- append k, v to the cache -------------------------------------------
+    h = 0
+    while h < nkv {
+        let c = 0
+        while c < hd {
+            fc_kv_put(L, 0, pos, h, c, f64of(mem_load(fc_at_k + (h * hd + c) * 8)))
+            fc_kv_put(L, 1, pos, h, c, f64of(mem_load(fc_at_v + (h * hd + c) * 8)))
+            c = c + 1
+        }
+        h = h + 1
+    }
+
+    // ---- scores, softmax, accumulate ----------------------------------------
+    // 1/sqrt(head_dim) applied to the SCORES, before softmax.
+    let scale: f64 = 1.0 / sqrt(i2f(hd))
+
+    // Zero the per-head output accumulator before use.
+    //
+    // fc_at_out is a module-global scratch buffer allocated ONCE, and the
+    // accumulation below reads it (`cur + w * v`). Nothing cleared it between
+    // calls, so every call after the first returned the previous call's output
+    // plus a second accumulation.
+    //
+    // Measured: calling fc_attention twice at pos 0 gave cos = 1.000000 on the
+    // first and 0.498269 on the second against the same reference. Every
+    // multi-position test disagreed from pos 1 onward for this reason, and a
+    // single-call test cannot see it at all.
+    //
+    // Same class as the conv-state buffer earlier in this file, which IS
+    // advanced per call -- here the buffer is reused accumulation state, not
+    // carried state, so it must start at zero every time.
+    h = 0
+    while h < nh {
+        let c = 0
+        while c < hd {
+            mem_store(fc_at_out + (h * hd + c) * 8, 0.0)
+            c = c + 1
+        }
+        h = h + 1
+    }
+    h = 0
+    while h < nh {
+        // GQA: query heads 4h..4h+3 share KV head h.
+        let kvh = h / (nh / nkv)
+        let qb = fc_at_q + h * hd * 8
+
+        // max, for a stable softmax
+        let t = 0
+        let mx: f64 = 0.0 - 1e300
+        while t <= pos {
+            let acc: f64 = 0.0
+            let c = 0
+            while c < hd {
+                acc = acc + f64of(mem_load(qb + c * 8)) * fc_kv_get(L, 0, t, kvh, c)
+                c = c + 1
+            }
+            let sc = acc * scale
+            mem_store(fc_at_sc + t * 8, sc)
+            if sc > mx { mx = sc }
+            t = t + 1
+        }
+
+        // exp and sum
+        let sum: f64 = 0.0
+        t = 0
+        while t <= pos {
+            let e = expf(f64of(mem_load(fc_at_sc + t * 8)) - mx)
+            mem_store(fc_at_sc + t * 8, e)
+            sum = sum + e
+            t = t + 1
+        }
+        if sum == 0.0 { return -1 }
+
+        // weighted sum of v
+        t = 0
+        while t <= pos {
+            let w = f64of(mem_load(fc_at_sc + t * 8)) / sum
+            let c = 0
+            while c < hd {
+                let cur = f64of(mem_load(fc_at_out + (h * hd + c) * 8))
+                mem_store(fc_at_out + (h * hd + c) * 8, cur + w * fc_kv_get(L, 1, t, kvh, c))
+                c = c + 1
+            }
+            t = t + 1
+        }
+        h = h + 1
+    }
+
+    // ---- out projection -----------------------------------------------------
+    return mm_matvec(wo, fc_at_out, dm, nh * hd, out)
+}
