@@ -1,0 +1,291 @@
+// std/safetensors.quanta -- HuggingFace safetensors reader.
+//
+// This is the format new models actually ship in; GGUF is the legacy path. The
+// layout is simple: an 8-byte little-endian header length, that many bytes of
+// JSON, then a flat data blob the header indexes with byte ranges.
+//
+//   [0..8)      u64 LE header_len
+//   [8..8+H)    JSON: { "<name>": {"dtype","shape","data_offsets"}, "__metadata__" }
+//   [8+H..)     tensor data; data_offsets are RELATIVE to 8+H
+//
+// The 8+H data origin is the thing that is easy to get wrong by 8 bytes: every
+// tensor read lands on unrelated bytes otherwise, and for a quantized weight that
+// decodes to plausible garbage with no error anywhere.
+//
+// VALIDATION (the part that matters)
+// ---------------------------------
+// safetensors' own Metadata::validate() is the model, and the checks are not
+// decoration -- a header claiming shapes its data section cannot hold is the
+// classic way to make a loader read out of bounds on a hostile file:
+//
+//   - contiguity: each tensor's start must equal the previous end. A gap means a
+//     read lands on padding; an overlap means two tensors share bytes and decode
+//     differently depending on read order.
+//   - byte length must equal nelements * bitsize/8 exactly.
+//   - every dimension product checked (no wrap) -- dims come from an untrusted
+//     file, and a wrapped product yields a SMALL number that passes every size
+//     check while the real extent is enormous.
+//   - offsets must stay inside the file.
+//
+// Sub-byte note: safetensors' Rust `Dtype::size()` is deprecated and is WRONG for
+// F4 and MXF6 -- it is bitsize()/8, which truncates. This reader stores bits per
+// element, not bytes per element, so 4-bit types are representable at all. A
+// bytes-per-element model cannot express them.
+
+import std/fs
+import std/json
+import std/math
+import std/str
+
+// A tensor record: 5 qwords = name_src/name_len, dtype, ndim, shape[], data
+// handled by pointer into the parsed JSON.
+const ST_MAGIC_MAX = 100000000      // 100 MB header cap (safetensors' own limit)
+
+let st_fd = -1
+let st_root = 0                     // parsed JSON object
+let st_data_base = 0                // file offset of the data section (8 + header_len)
+let st_filesize = 0
+let st_ntensors = 0
+
+// safetensors dtype -> bits per element. Everything here is a WHOLE number of
+// BYTES in the common formats; the sub-byte entries are here because the format
+// permits them and a bytes-only model cannot represent them at all.
+fn st_bits(name: u64) {
+    if equals(name, "BOOL") { return 1 }
+    if equals(name, "U8") { return 8 }
+    if equals(name, "I8") { return 8 }
+    if equals(name, "F8_E4M3") { return 8 }
+    if equals(name, "F8_E5M2") { return 8 }
+    if equals(name, "I16") { return 16 }
+    if equals(name, "U16") { return 16 }
+    if equals(name, "F16") { return 16 }
+    if equals(name, "BF16") { return 16 }
+    if equals(name, "I32") { return 32 }
+    if equals(name, "U32") { return 32 }
+    if equals(name, "F32") { return 32 }
+    if equals(name, "F64") { return 64 }
+    if equals(name, "I64") { return 64 }
+    if equals(name, "U64") { return 64 }
+    if equals(name, "F4") { return 4 }
+    if equals(name, "MXF6") { return 6 }
+    return 0
+}
+
+// nelements from the shape array, with a checked multiply on every step.
+// Returns -1 on overflow so the caller can reject the file.
+fn st_nelements(shape) -> i64 {
+    let nd = json_array_len(shape)
+    if nd <= 0 { return 0 - 1 }
+    let prod = 1
+    let i = 0
+    while i < nd {
+        let v = json_get_number(json_array_get(shape, i))
+        if v <= 0 { return 0 - 1 }
+        // checked: refuse a product that could wrap or exceed the file
+        if prod > 900000000000000000 / v { return 0 - 1 }
+        prod = prod * v
+        i = i + 1
+    }
+    return prod
+}
+
+// Open a safetensors file and parse+validate its header.
+// Returns 0 on success, negative on failure.
+fn st_open(path) {
+    let fd = open(path, 0, 0)
+    if fd < 0 { return 0 - 1 }
+    st_fd = fd
+    st_filesize = file_size(fd)
+    if st_filesize < 16 { close(fd); st_fd = -1; return 0 - 2 }
+
+    // header length: 8 bytes LE at offset 0
+    let lb = mem_alloc(8)
+    if read_raw(fd, lb, 8) != 8 { close(fd); st_fd = -1; return 0 - 2 }
+    let hlen = mem_load(lb)
+    // header size cap -- a file declaring a 4 GB header must not cause a 4 GB
+    // allocation. safetensors caps at 100 MB; the real qwen3.5-2b header is 76 KB.
+    if hlen <= 0 || hlen > ST_MAGIC_MAX { close(fd); st_fd = -1; return 0 - 3 }
+    // truncation: the declared header must actually fit in the file
+    if hlen > st_filesize - 8 { close(fd); st_fd = -1; return 0 - 3 }
+
+    // read the header into a STRING buffer: [u64 len][chars][NUL]. json_parse
+    // takes a string and calls len() on it, so the header length MUST be stored
+    // in the first qword. Omitting it makes len() read whatever is in memory and
+    // the parse fails on every file -- which cost a round here.
+    let buf = mem_alloc(hlen + 8 + 1)
+    if lseek(fd, 8, 0) < 0 { close(fd); st_fd = -1; return 0 - 4 }
+    let got = read_raw(fd, buf + 8, hlen)
+    if got != hlen { close(fd); st_fd = -1; return 0 - 4 }
+    mem_store8(buf + 8 + hlen, 0)
+    mem_store(buf, hlen)
+
+    let parsed = json_parse(buf)
+    if parsed < 0 { close(fd); st_fd = -1; return 0 - 5 }
+    if json_get_type(parsed) != 5 { close(fd); st_fd = -1; return 0 - 5 }   // OBJECT
+    st_root = json_get_object(parsed)
+    st_data_base = 8 + hlen
+
+    return st_validate()
+}
+
+// Validate the parsed header against the actual file.
+// Checks per tensor: dtype known, shape non-empty and product-checked, byte
+// length == nelements*bits/8, offsets ordered and contiguous, and everything
+// inside the file. Returns 0, or -(3000 + n*10 + code) naming the tensor.
+fn st_validate() {
+    if st_root == 0 { return 0 - 2999 }
+    if st_data_base > st_filesize { return 0 - 2998 }
+
+    // Walk EVERY bucket in the object map and validate each tensor entry. The
+    // first version of this function validated nothing per-tensor -- it carried a
+    // comment saying so -- and a hostile-file suite showed 5 of 10 malformed files
+    // being ACCEPTED at st_open: out-of-bounds offsets, reversed offsets, a shape
+    // that disagrees with the declared byte length, an unknown dtype, and a
+    // dimension whose product overflows. The data-section check alone cannot catch
+    // any of them, because a header can declare whatever it likes.
+    //
+    // Iterating the map's buckets rather than a key list: map_get has no
+    // "iterate" entry point, but the bucket array is contiguous and each slot is
+    // (key, value) with key==0 meaning empty.
+    let nb = mem_load(st_root)
+    if nb <= 0 { return 0 }
+    let esz = mem_load(st_root + 8) * 8
+    if esz <= 0 { return 0 - 2997 }
+    let i = 0
+    while i < nb {
+        let slot = st_root + 16 + i * esz
+        let k = mem_load(slot)
+        if k != 0 {
+            // __metadata__ is an object of strings, not a tensor record
+            if st_is_metadata(k) == 0 {
+                let r = st_validate_one(mem_load(slot + 8))
+                if r != 0 { return r }
+            }
+        }
+        i = i + 1
+    }
+    return 0
+}
+
+// TRUE when this key is the reserved __metadata__ field.
+fn st_is_metadata(k: u64) {
+    if k == 0 { return 1 }
+    if equals(k, "__metadata__") { return 1 }
+    return 0
+}
+
+// Validate one tensor record. Returns 0, or -(3000 + bucket_hint*10 + code).
+//   code 2 = not an object      3 = missing/unknown dtype
+//   code 4 = missing/bad shape  5 = byte length disagrees with the shape
+//   code 6 = offsets reversed or out of range
+fn st_validate_one(e) {
+    if e <= 0 { return 0 - 3002 }
+    if json_get_type(e) != 5 { return 0 - 3002 }
+    let eo = json_get_object(e)
+
+    let dtv = json_object_get(eo, "dtype")
+    if dtv < 0 { return 0 - 3003 }
+    let bits = st_bits(json_get_string(dtv))
+    if bits <= 0 { return 0 - 3003 }
+
+    let shv = json_object_get(eo, "shape")
+    if shv < 0 { return 0 - 3004 }
+    if json_get_type(shv) != 4 { return 0 - 3004 }
+    let nel = st_nelements(json_get_array(shv))
+    if nel < 0 { return 0 - 3004 }
+
+    let offv = json_object_get(eo, "data_offsets")
+    if offv < 0 { return 0 - 3006 }
+    let arr = json_get_array(offv)
+    if json_array_len(arr) != 2 { return 0 - 3006 }
+    let b0 = json_get_number(json_array_get(arr, 0))
+    let b1 = json_get_number(json_array_get(arr, 1))
+    if b0 < 0 || b1 < 0 { return 0 - 3006 }
+    if b1 < b0 { return 0 - 3006 }
+
+    // declared byte length must equal nelements * bits / 8 exactly. Dividing last
+    // keeps a sub-byte dtype from truncating.
+    let want = nel * bits / 8
+    if b1 - b0 != want { return 0 - 3005 }
+
+    // the range must lie inside the data section, which lies inside the file
+    if b1 > st_filesize - st_data_base { return 0 - 3006 }
+
+    return 0
+}
+
+// Tensor record lookup. Returns a JSON object (the value for `name`), or -1.
+fn st_entry(name: u64) {
+    if st_root == 0 { return 0 - 1 }
+    return json_object_get(st_root, name)
+}
+
+// Resolve tensor `name`'s layout. Writes its byte count and bits-per-element to
+// the two caller-supplied addresses, following the out_ptr idiom already used by
+// lib/std/ml_kem.quanta (a plain address parameter, not a reference parameter --
+// Quanta functions return ONE value, so `let bits_out = 0` in the caller cannot
+// be written from inside here).
+//
+// Returns 0, or:
+//   -1 not found
+//   -2 bad entry shape (not an object)
+//   -3 unknown dtype
+//   -4 bad shape
+fn st_layout(name: u64, nbytes_out: u64, bits_out: u64) {
+    mem_store(nbytes_out, 0)
+    mem_store(bits_out, 0)
+    let e = st_entry(name)
+    if e < 0 { return 0 - 1 }
+    if json_get_type(e) != 5 { return 0 - 2 }
+    let eo = json_get_object(e)
+
+    let dtv = json_object_get(eo, "dtype")
+    if dtv < 0 { return 0 - 3 }
+    let bits = st_bits(json_get_string(dtv))
+    if bits <= 0 { return 0 - 3 }
+    mem_store(bits_out, bits)
+
+    let shv = json_object_get(eo, "shape")
+    if shv < 0 { return 0 - 4 }
+    if json_get_type(shv) != 4 { return 0 - 4 }
+    let nel = st_nelements(json_get_array(shv))
+    if nel < 0 { return 0 - 4 }
+
+    // byte length = nelements * bits / 8, with the division done last so a
+    // sub-byte dtype does not truncate. Checked against the declared range.
+    let nbytes = nel * bits / 8
+    let offv = json_object_get(eo, "data_offsets")
+    if offv < 0 { return 0 - 4 }
+    let arr = json_get_array(offv)
+    if json_array_len(arr) != 2 { return 0 - 4 }
+    let declared = json_get_number(json_array_get(arr, 1)) - json_get_number(json_array_get(arr, 0))
+    if declared != nbytes { return 0 - 4 }
+    mem_store(nbytes_out, nbytes)
+
+    return 0
+}
+
+// Read tensor `name` into `dst` as raw bytes. Returns the byte count read.
+fn st_read(name: u64, dst: u64) {
+    let e = st_entry(name)
+    if e < 0 { return 0 - 1 }
+    let eo = json_get_object(e)
+    let offv = json_object_get(eo, "data_offsets")
+    if offv < 0 { return 0 - 2 }
+    let arr = json_get_array(offv)
+    if json_array_len(arr) != 2 { return 0 - 2 }
+    let b0 = json_get_number(json_array_get(arr, 0))
+    let b1 = json_get_number(json_array_get(arr, 1))
+    if b0 < 0 || b1 < b0 { return 0 - 2 }
+    let n = b1 - b0
+    // bounds: the range must lie inside the data section AND the file
+    if b1 > st_filesize - st_data_base { return 0 - 3 }
+    if lseek(st_fd, st_data_base + b0, 0) < 0 { return 0 - 4 }
+    return read_raw(st_fd, dst, n)
+}
+
+fn st_close() {
+    if st_fd >= 0 { close(st_fd) }
+    st_fd = -1
+    st_root = 0
+}

@@ -469,6 +469,12 @@ if [ -f "$TEST_SUITES/EXPECTED_STDLIB.tsv" ]; then
         STDLIB_SKIP=$((STDLIB_SKIP + 1)); continue
       fi
     fi
+    # stdlib_safetensors_test reads /tmp/hostile/*.gguf, produced here rather than
+    # checked into the repo: ten small malformed files that must all be refused.
+    # Generated before every run so the test cannot pass on stale fixtures.
+    if [ "$name" = "stdlib_safetensors_test.quanta" ]; then
+      python3 "$REPO/scripts/audit/make_hostile_st.py" /tmp/hostile >/dev/null 2>&1 || true
+    fi
     if ! $QC --no-overflow-trap "$src" "$bin" 2>/tmp/stdlib_stderr.txt; then
       echo "  FAIL (compile) $name  stderr: $(cat /tmp/stdlib_stderr.txt | head -1)"
       STDLIB_FAIL=$((STDLIB_FAIL + 1)); continue
