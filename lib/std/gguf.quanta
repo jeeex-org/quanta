@@ -443,6 +443,91 @@ fn gguf_validate_all_dims() {
     return 0
 }
 
+// ===========================================================================
+// BIT-WIDTH ACCESSORS
+//
+// Needed for the HuggingFace quantization formats (GPTQ, AWQ, NF4, MLX), which
+// pack 2-8 bits per element. Every dtype above is a whole number of BYTES per
+// block, which is why gguf_tensor_nbytes() is already correct for all 35 of them
+// -- verified against ggml's own struct sizes by
+// scripts/audit/check_dtype_sizes.py, which reports 0 mismatches.
+//
+// That verification is what makes this additive rather than a fix: the GGUF path
+// needs nothing changed. These accessors are for formats that pack below a byte.
+//
+// bit_at(p, i): value of bit i (0 = LEAST significant) of the byte at p.
+// MSB/LSB first: GGUF and safetensors pack low bits first within a byte, while
+// GPTQ's qweight packs the LOW nibble first per int32. Read bit 0 = LSB so the
+// caller chooses the convention; getting this backwards transposes every value
+// in a quantized tensor without erroring.
+fn gguf_bit_at(p, i) {
+    if i < 0 || i > 7 { return 0 }
+    let b = mem_load8(p)
+    return (b >> i) & 1
+}
+
+// Extract `nbits` bits starting at bit `start` from the byte at p, as an
+// unsigned integer. Handles a field that straddles two bytes, which 3-, 5- and
+// 6-bit MLX packings require -- a bytes-per-element model cannot express those
+// at all, because 3 bits/element does not land on a byte boundary.
+fn gguf_bits_extract(p, start, nbits) {
+    if nbits <= 0 { return 0 }
+    if nbits > 32 { return 0 }
+    if start < 0 { return 0 }
+    let acc = 0
+    let i = 0
+    while i < nbits {
+        let src = p + (start + i) / 8
+        let bit = (start + i) % 8
+        let avail = 8 - bit
+        let take = nbits - i
+        if take > avail { take = avail }
+        // read `take` bits starting at `bit`, LSB-first
+        let chunk = 0
+        let j = 0
+        while j < take {
+            chunk = chunk | (gguf_bit_at(src, bit + j) << j)
+            j = j + 1
+        }
+        acc = acc | (chunk << i)
+        i = i + take
+    }
+    return acc
+}
+
+// Byte offset and bit offset of element `idx` for a `bits`-per-element packing.
+// Returns the byte address; the caller then uses gguf_bits_extract with the bit
+// offset. Kept as two accessors because the address alone is not enough for a
+// sub-byte type -- the single most common way to read these wrongly is to treat
+// the bit offset as part of the address and then read whole bytes.
+fn gguf_packed_byte(p, idx, bits) {
+    if bits <= 0 { return p }
+    return p + (idx * bits) / 8
+}
+
+fn gguf_packed_bit(p, idx, bits) {
+    if bits <= 0 { return 0 }
+    return (idx * bits) % 8
+}
+
+// Read element `idx` of a `bits`-per-element packing, sign-extended for a signed
+// format (signed_widths != 0). GPTQ and AWQ store signed 4-bit values; NF4 and
+// MLX affine store unsigned. Getting the signedness wrong yields plausible but
+// wrong weights -- the same class of error as dequantizing an AWQ zero-point by
+// ADDING it when the file never stored one.
+fn gguf_packed_read(p, idx, bits, signed_widths) {
+    if bits <= 0 || bits > 32 { return 0 }
+    let byteaddr = gguf_packed_byte(p, idx, bits)
+    let bitoff = gguf_packed_bit(p, idx, bits)
+    let raw = gguf_bits_extract(byteaddr, bitoff, bits)
+    if signed_widths != 0 {
+        // sign-extend from `bits`
+        let sgn = 1 << (bits - 1)
+        if (raw & sgn) != 0 { return raw - (1 << bits) }
+    }
+    return raw
+}
+
 fn gguf_tensor_name(idx) { return mem_load(gguf_tensor_data + idx * TINFO_SIZE) }
 // Materialise a tensor's name as a real Quanta string object.
 //
