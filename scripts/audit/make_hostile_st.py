@@ -145,3 +145,20 @@ with open(os.path.join(out, "not_st.gguf"), "wb") as f:
 
 for n in sorted(os.listdir(out)):
     print("  %-22s %d bytes" % (n, os.path.getsize(os.path.join(out, n))))
+# 8e. VALID file with a header much longer than the garbage length (41)
+# This will be accepted with the store present (returns 0), but with the
+# store removed len(buf) reads garbage (~41) which truncates the JSON,
+# causing a parse failure (-5). This ISOLATES the store.
+h = {}
+off = 0
+for i in range(50):
+    n = "model.layers." + str(i) + ".weight"
+    h[n] = {"dtype": "F32", "shape": [8], "data_offsets": [off, off+32]}
+    off += 32
+import json, struct
+hjson = json.dumps(h).encode()
+with open("/tmp/hostile/long_header_valid.gguf", "wb") as f:
+    f.write(struct.pack("<Q", len(hjson)))
+    f.write(hjson)
+    f.write(bytes(off))
+print("long_header_valid header_len =", len(hjson))

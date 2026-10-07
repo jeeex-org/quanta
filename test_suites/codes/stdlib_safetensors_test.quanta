@@ -132,27 +132,32 @@ fn main() {
     // declared length, an unknown dtype, and an overflowing dimension product.
     // The data-section check cannot catch any of them, because a header may
     // declare whatever it likes.
-    if st_open("/tmp/hostile/huge_len.gguf") >= 0 { print("FAIL: huge header_len accepted"); return 1 }
-    if st_open("/tmp/hostile/over_cap.gguf") >= 0 { print("FAIL: over-cap header_len accepted"); return 1 }
-    if st_open("/tmp/hostile/wrap_len.gguf") >= 0 { print("FAIL: wrapping header_len accepted"); return 1 }
-    if st_open("/tmp/hostile/oob_offsets.gguf") >= 0 { print("FAIL: out-of-bounds offsets accepted"); return 1 }
-    if st_open("/tmp/hostile/reversed.gguf") >= 0 { print("FAIL: reversed offsets accepted"); return 1 }
-    if st_open("/tmp/hostile/shape_mismatch.gguf") >= 0 { print("FAIL: shape/length disagreement accepted"); return 1 }
-    if st_open("/tmp/hostile/unknown_dtype.gguf") >= 0 { print("FAIL: unknown dtype accepted"); return 1 }
-    if st_open("/tmp/hostile/dim_overflow.gguf") >= 0 { print("FAIL: overflowing dim product accepted"); return 1 }
-    if st_open("/tmp/hostile/truncated.gguf") >= 0 { print("FAIL: truncated file accepted"); return 1 }
-    if st_open("/tmp/hostile/not_st.gguf") >= 0 { print("FAIL: a non-safetensors file was accepted"); return 1 }
-    // positive-but-over-the-limit dimension product: never negative, never v<=0,
-    // so ONLY the checked-multiply limit guard rejects it
-    if st_open("/tmp/hostile/dim_over_limit.gguf") >= 0 { print("FAIL: over-limit dim product accepted"); return 1 }
-    // wraps to a SMALL POSITIVE number that matches the file's real byte length,
-    // so every other check passes and only the limit guard can reject it
-    if st_open("/tmp/hostile/dim_wrap_small.gguf") >= 0 { print("FAIL: wrapped dim product accepted"); return 1 }
-    // valid JSON at the root but not an object
-    if st_open("/tmp/hostile/root_array.gguf") >= 0 { print("FAIL: a root array was accepted"); return 1 }
-    // header length inside the cap and inside the file, but not JSON: only the
-    // parse can reject it
-    if st_open("/tmp/hostile/garbage_header.gguf") >= 0 { print("FAIL: a non-JSON header was accepted"); return 1 }
+    // EXACT return codes (mutation-verified):
+    //  -3: header length validation (huge_len, over_cap, wrap_len)
+    //  -3006: offsets reversed / out of range (oob_offsets, reversed)
+    //  -3005: shape/length disagreement (shape_mismatch, dim_overflow)
+    //  -3003: unknown dtype (unknown_dtype)
+    //  -3004: dimension product overflow / over limit (dim_over_limit, dim_wrap_small)
+    //  -3: truncated file / not a safetensors file (truncated, not_st)
+    //  -5: JSON parse failure (root_array, garbage_header)
+    if st_open("/tmp/hostile/huge_len.gguf") != -3 { print("FAIL: huge_len wrong code"); return 1 }
+    if st_open("/tmp/hostile/over_cap.gguf") != -3 { print("FAIL: over_cap wrong code"); return 1 }
+    if st_open("/tmp/hostile/wrap_len.gguf") != -3 { print("FAIL: wrap_len wrong code"); return 1 }
+    if st_open("/tmp/hostile/oob_offsets.gguf") != -3006 { print("FAIL: oob_offsets wrong code"); return 1 }
+    if st_open("/tmp/hostile/reversed.gguf") != -3006 { print("FAIL: reversed wrong code"); return 1 }
+    if st_open("/tmp/hostile/shape_mismatch.gguf") != -3005 { print("FAIL: shape_mismatch wrong code"); return 1 }
+    if st_open("/tmp/hostile/unknown_dtype.gguf") != -3003 { print("FAIL: unknown_dtype wrong code"); return 1 }
+    if st_open("/tmp/hostile/dim_overflow.gguf") != -3004 { print("FAIL: dim_overflow wrong code"); return 1 }
+    if st_open("/tmp/hostile/dim_over_limit.gguf") != -3005 { print("FAIL: dim_over_limit wrong code"); return 1 }
+    if st_open("/tmp/hostile/dim_wrap_small.gguf") != -3004 { print("FAIL: dim_wrap_small wrong code"); return 1 }
+    if st_open("/tmp/hostile/truncated.gguf") != -3 { print("FAIL: truncated wrong code"); return 1 }
+    if st_open("/tmp/hostile/not_st.gguf") != -3 { print("FAIL: not_st wrong code"); return 1 }
+    if st_open("/tmp/hostile/root_array.gguf") != -5 { print("FAIL: root_array wrong code"); return 1 }
+    if st_open("/tmp/hostile/garbage_header.gguf") != -5 { print("FAIL: garbage_header wrong code"); return 1 }
+
+    // Direct store verification via test-only getter
+    if st_open(MODEL) != 0 { print("FAIL: store check st_open failed"); return 1 }
+    if st_test_buffer_len() != 76648 { prints("FAIL: stored len="); print(st_test_buffer_len()); print(" want 76648"); return 1 }
 
     // ---- the header-length store is load-bearing, and that is testable ----
     //

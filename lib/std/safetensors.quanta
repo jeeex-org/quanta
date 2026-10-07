@@ -46,6 +46,7 @@ let st_root = 0                     // parsed JSON object
 let st_data_base = 0                // file offset of the data section (8 + header_len)
 let st_filesize = 0
 let st_ntensors = 0
+let st_test_hlen = 0                // test-only: captured buffer length
 
 // safetensors dtype -> bits per element. Everything here is a WHOLE number of
 // BYTES in the common formats; the sub-byte entries are here because the format
@@ -118,6 +119,7 @@ fn st_open(path) {
     if got != hlen { close(fd); st_fd = -1; return 0 - 4 }
     mem_store8(buf + 8 + hlen, 0)
     mem_store(buf, hlen)
+    st_test_hlen = mem_load(buf)  // test-only capture
 
     let parsed = json_parse(buf)
     if parsed < 0 { close(fd); st_fd = -1; return 0 - 5 }
@@ -288,4 +290,9 @@ fn st_close() {
     if st_fd >= 0 { close(st_fd) }
     st_fd = -1
     st_root = 0
+}
+
+// TEST ONLY: return the length stored in the last opened buffer
+fn st_test_buffer_len() -> i64 {
+    return st_test_hlen
 }

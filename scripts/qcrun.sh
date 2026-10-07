@@ -57,6 +57,50 @@ if [ "${1:-}" = "--qc" ]; then
   exec timeout "${QUANTA_COMPILE_S:-300}" "$QC" "$src" "$out"
 fi
 
+# =====================================================================
+# --ccrun <src> [args...] : COMPILE *AND* RUN, as one atomic step.
+#
+# WHY THIS EXISTS (do not remove -- it closes a real defect, twice hit):
+# invoked separately, `qc src out` COMPILES and exits 0; it does not run the
+# program. Both times the compile step's exit 0 was read as "the test passed",
+# and two genuine defects were reported as "mutation survives / already fixed"
+# off evidence that never executed a byte. This mode makes that unreachable:
+# there is no code path here that reports success without the binary having run.
+#
+# It also enforces the invariants that a hand-rolled invocation drops:
+#   * the compiler gets COMPILER_MEM_MB (below ~6 GB it dies SILENTLY: no
+#     output, no binary, exit 0)
+#   * the compiled binary gets the much lower MEM_LIMIT_MB
+#   * a missing binary, or a compile failure, is a non-zero exit -- never a pass
+# =====================================================================
+if [ "${1:-}" = "--ccrun" ]; then
+  shift
+  [ $# -lt 1 ] && { echo "usage: qcrun.sh --ccrun <src> [args...]" >&2; exit 2; }
+  src="$1"; shift
+  QC="${QC:-$REPO/compiler/$(cat "$REPO/VERSION")/bin/x86/qc}"
+  [ -x "$QC" ] || { echo "no compiler at $QC" >&2; exit 1; }
+  td="$(mktemp -d "${TMPDIR:-/tmp}/ccrun.XXXXXX")" || exit 1
+  bin="$td/prog"
+  ( ulimit -v $((COMPILER_MEM_MB * 1024)) 2>/dev/null
+    timeout "${QUANTA_COMPILE_S:-300}" "$QC" "$src" "$bin" "$@" )
+  crc=$?
+  if [ $crc -ne 0 ]; then
+    echo "[ccrun] COMPILE FAILED rc=$crc (NOT a pass)" >&2; rm -rf "$td"; exit $crc
+  fi
+  if [ ! -x "$bin" ]; then
+    echo "[ccrun] NO BINARY PRODUCED (NOT a pass)" >&2; rm -rf "$td"; exit 1
+  fi
+  ( ulimit -v $((MEM_LIMIT_MB * 1024)) 2>/dev/null
+    timeout -k 5 "$TIME_LIMIT_S" nice -n "$NICE" "$bin" )
+  rrc=$?
+  rm -rf "$td"
+  case $rrc in
+    124) echo "[ccrun] TIMEOUT killed (>${TIME_LIMIT_S}s)" >&2;;
+    137) echo "[ccrun] OOM/address-space limit hit (SIGKILL)" >&2;;
+  esac
+  exit $rrc
+fi
+
 PROG="${1:-}"
 [ -n "$PROG" ] || { echo "usage: qcrun.sh <program> [args...]" >&2; exit 2; }
 shift
