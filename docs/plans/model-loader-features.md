@@ -31,6 +31,9 @@ The last row matters: mmap is missing from the *loader*, not from the language.
 | Sub-byte dtype model | `gguf_type_size` returns a byte count (`gguf.quanta:304`). GGUF quant types are largely fine via `(n/block)*size` block math — the real gap is GPTQ/AWQ/NF4/MLX 2-8 bit packing |
 | ~~7 loader tests, 0 in the gate~~ **FIXED** | all 8 now registered; gating exposed `gguf_general_test`, which could never pass (asserted a relative offset against an absolute accessor) |
 | ~~No offset-chain validation~~ **FIXED** | `gguf_validate_chain()`, wired into `gguf_load`, mutation-tested |
+| ~~Unbounded reads~~ **FIXED** | both read entry points bound against tensor size and EOF |
+| ~~No checked_mul~~ **FIXED** | `gguf_checked_mul` + dim/nelements agreement |
+| ~~No header cap / truncation~~ **FIXED** | metadata caps + `n_kv`/`n_tensors` bounded; truncation segfaults without them |
 | ~~Alignment hardcoded to 32~~ **FIXED** | `gguf_read_alignment()` reads `general.alignment`, rejects non-power-of-2 |
 
 ---
@@ -241,11 +244,28 @@ Ported `Metadata::validate()` semantics; every item below has an upstream preced
 
 **The anchoring subtlety, measured not assumed:** the chain's running total must start at `gguf_data_start`, **not 0**. `gguf_tensor_offset()` already adds `gguf_data_offset()` internally (gguf.quanta:373) and returns an absolute offset. Measured on the real model: tensor 0 sits at absolute 8239136 with relative 0, and every later tensor chains exactly. A validator anchored at 0 reported a spurious 8239136-byte gap at tensor 0 and **rejected the real, valid model** — which is what the first version did.
 
-**Still to do:**
-- `nbytes_remain` bound on every read (not just at validation time)
-- header size cap + truncation check
-- `checked_mul` for every dimension product (Quanta's `nbytes` uses a plain multiply)
-- hostile-file tests at the byte level — currently corruptions are applied in memory, because two attempts at a Python GGUF writer both mis-parsed the KV block and desynced on `general.base_model.0.name`. A correct byte-level corrupt-file generator is still wanted; it needs a real GGUF writer, not a hand-rolled parser
+**Also done:**
+- `gguf_read_tensor_bytes_at()` and `gguf_read_tensor_bytes()` now bound every read against the tensor's own size and against EOF (the `nbytes_remain` guard). **Return contract preserved** — a byte count on success — because `lfm2_mm.quanta:87` depends on it.
+- `gguf_checked_mul()` + `gguf_validate_dims()` + `gguf_validate_all_dims()`, wired into `gguf_load` (rc -7). Covers both an overflowing dim product and dims that disagree with the stored nelements.
+- Metadata caps: `GGUF_MAX_META` (256 MB), `GGUF_MAX_STRING` (64 MB), short-read detection on the key length, and `n_kv`/`n_tensors` bounded against the file size (rc -8).
+
+**What the guards actually prevent — measured:** removing the three metadata guards makes a truncated file **segfault (rc=139)** rather than being rejected. The guards turn a crash into a clean rejection.
+
+**Mutation results (6 mutations):**
+| mutation | result |
+|---|---|
+| M1 delete `t > GGUF_MAX_ELEMENTS` | caught |
+| M2 remove read bounds in `read_tensor_bytes_at` | caught |
+| M3 remove metadata string cap | caught |
+| M4 remove dim/nelements agreement | caught |
+| M5 remove all metadata guards | caught (segfault) |
+| M6 remove `n_kv` bound | **not caught** — defence in depth, covered by the other guards |
+
+Two mutations initially survived and both were fixed by *changing the test*, not the code:
+- **M1**: the obvious case `4e18 * 4e18` wraps *negative*, so the `t <= 0` guard catches it too and the test passed with the limit check deleted. The value that isolates the limit guard is `1e9 * 1e9 = 1e18` (positive, > limit). Added.
+- **M3**: the `read_raw(...) != 8` short-read guard fired first and masked the `klen` bounds, so deleting those still looked detected. Split into a separate file-based test (`stdlib_gguf_truncated_test`) that cuts the real model mid-record and exactly on a record boundary; deleting the bounds then segfaults.
+
+**Remaining:** a byte-level corrupt-file *generator* for non-truncation corruptions (offset and dtype edits in place). Truncation is now covered honestly from Quanta's own parsed offsets; the others still corrupt memory in place.
 
 ### Phase 2 — Bit-width dtype model
 

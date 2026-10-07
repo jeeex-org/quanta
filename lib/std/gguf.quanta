@@ -58,10 +58,28 @@ fn record_data_start(fd) {
 // be fetched later by gguf_kv_find(). Recording the offset costs one lseek(0,1)
 // per record; the alternative -- re-walking the block on every lookup -- turns
 // a vocab search into an O(n_kv * n_tokens) scan of a 20 MB region.
+// Cap on the metadata (KV) block, and on any single string length inside it.
+//
+// ComfyUI caps a safetensors header at 100 MB and rejects anything larger before
+// allocating; safetensors does the same. Without a cap, a file declaring a
+// 4 GB key length causes an allocation and a seek sized by an attacker-chosen
+// number. The real model uses ~1.6 MB of metadata, so this leaves three orders of
+// magnitude of headroom while still bounding the damage.
+const GGUF_MAX_META = 268435456      // 256 MB total metadata block
+const GGUF_MAX_STRING = 67108864     // 64 MB for any one string
+
 fn scan_metadata(fd, n_kv) {
     let klen_buf = mem_alloc(8)
     let vtype_buf = mem_alloc(4)
     let slen_buf = mem_alloc(8)
+
+    // n_kv is attacker-controlled and is multiplied into four allocations below.
+    // A huge value overflows or simply asks for an enormous buffer, so bound it
+    // against the file itself: there cannot be more KV records than there are
+    // bytes, and every record costs at least 12 bytes on disk.
+    if n_kv < 0 { return -1 }
+    if n_kv > 1000000 { return -1 }
+    if gguf_filesize > 0 && n_kv > gguf_filesize / 12 { return -1 }
 
     gguf_kv_index = mem_alloc(n_kv * KVREC_SIZE)
     gguf_kv_arr_off = mem_alloc(n_kv * 8)
@@ -77,8 +95,13 @@ fn scan_metadata(fd, n_kv) {
         mem_store(gguf_kv_arr_len + i * 8, 0)
         mem_store(gguf_kv_etype + i * 8, 0)
 
-        read_raw(fd, klen_buf, 8)
+        // Truncation check: a short read here means the file ended mid-record.
+        if read_raw(fd, klen_buf, 8) != 8 { return -1 }
         let klen = mem_load(klen_buf)
+        if klen < 0 || klen > GGUF_MAX_STRING { return -1 }
+        // The running metadata size must stay inside both the cap and the file.
+        if meta_size > GGUF_MAX_META - 8 - klen { return -1 }
+        if gguf_filesize > 0 && meta_size + 8 + klen > gguf_filesize { return -1 }
         meta_size = meta_size + 8 + klen
         lseek(fd, klen, 1)
         
@@ -152,6 +175,10 @@ fn scan_metadata(fd, n_kv) {
 
 // Read the gguf_n_tensors tensor-info records into gguf_tensor_data.
 fn read_tensor_info(fd) {
+    // n_tensors is attacker-controlled and multiplies an allocation. Each tensor
+    // record costs at least 40 bytes in the file, so the file bounds the count.
+    if gguf_n_tensors < 0 || gguf_n_tensors > 10000000 { return -1 }
+    if gguf_filesize > 0 && gguf_n_tensors * TINFO_SIZE > gguf_filesize { return -1 }
     gguf_tensor_data = mem_alloc(gguf_n_tensors * TINFO_SIZE)
     
     let nlen_buf = mem_alloc(8)
@@ -237,6 +264,7 @@ fn gguf_load(path) {
     gguf_n_kv = n_kv
     
     let meta_size = scan_metadata(fd, n_kv)
+    if meta_size < 0 { close(fd); gguf_fd = -1; return -8 }
     
     // GGUF alignment: pad to the alignment boundary after metadata.
     // Read from general.alignment; upstream llama.cpp reads the same key and
@@ -259,6 +287,10 @@ fn gguf_load(path) {
     if gguf_read_alignment() != 0 { close(fd); gguf_fd = -1; return -5 }
     let vr = gguf_validate_chain()
     if vr != 0 { close(fd); gguf_fd = -1; return -6 }
+    // Checked dimension products: a crafted shape whose product wraps must not
+    // produce a small element count that passes every size check.
+    let dr = gguf_validate_all_dims()
+    if dr != 0 { close(fd); gguf_fd = -1; return -7 }
     return 0
 }
 
@@ -330,6 +362,74 @@ fn gguf_read_alignment() {
     // power of two, as upstream requires
     if (v & (v - 1)) != 0 { return -1 }
     gguf_alignment = v
+    return 0
+}
+
+// Safe multiply: return 0 (and report overflow) if a * b would exceed `limit`.
+//
+// GGUF dims come from an untrusted file, so the element count is a product of up
+// to 4 attacker-chosen dimensions. safetensors makes the same guard mandatory
+// (every dimension product is a checked_mul) precisely because a wrapped product
+// yields a SMALL number that then passes every size check while the real read
+// runs far past the end of the buffer. Quanta's nbytes used a plain multiply,
+// so a crafted shape could make a tensor claim to be tiny while its true extent
+// was enormous.
+//
+// Returns the product, or -1 on overflow. `limit` is the largest product we are
+// willing to accept; GGUF files legitimately reach ~2.6e8 elements
+// (token_embd.weight = 262144000), so the limit is generous but finite.
+const GGUF_MAX_ELEMENTS = 900000000000000000
+
+fn gguf_checked_mul(a, b) {
+    if a <= 0 || b <= 0 { return -1 }
+    if a > GGUF_MAX_ELEMENTS || b > GGUF_MAX_ELEMENTS { return -1 }
+    let t = a * b
+    if t <= 0 { return -1 }
+    if t > GGUF_MAX_ELEMENTS { return -1 }
+    return t
+}
+
+// Recompute a tensor's element count from its dimensions with checked
+// multiplication, and require it to agree with the stored nelements.
+//
+// Two separate attacks are covered:
+//   - dims whose product OVERFLOWS, so the stored nelements is small and every
+//     downstream size check passes while the true extent is huge
+//   - dims that simply DISAGREE with the stored nelements, which means the file
+//     is internally inconsistent
+//
+// Returns 0 if consistent, or a negative code.
+fn gguf_validate_dims(idx) {
+    if idx < 0 || idx >= gguf_n_tensors { return -1000 }
+    let nd = gguf_tensor_ndims(idx)
+    if nd <= 0 || nd > 4 { return -1001 - idx }
+    let prod = 1
+    let d = 0
+    while d < nd {
+        let v = gguf_tensor_dim(idx, d)
+        if v <= 0 { return -1002 - idx }
+        let c = gguf_checked_mul(prod, v)
+        if c < 0 { return -1003 - idx }
+        prod = c
+        d = d + 1
+    }
+    if prod != gguf_tensor_nelements(idx) { return -1004 - idx }
+    // the byte size must also be representable and must fit the file
+    let nb = gguf_tensor_nbytes(idx)
+    if nb <= 0 { return -1005 - idx }
+    if nb > gguf_filesize { return -1006 - idx }
+    return 0
+}
+
+// Validate every tensor's dimensions. Returns 0, or -(3000+idx) for the first
+// tensor that fails, so a caller can name the offender.
+fn gguf_validate_all_dims() {
+    let i = 0
+    while i < gguf_n_tensors {
+        let r = gguf_validate_dims(i)
+        if r != 0 { return r - 3000 }
+        i = i + 1
+    }
     return 0
 }
 
@@ -486,6 +586,14 @@ fn gguf_read_tensor_bytes(idx, buf, nbytes) {
     // the tensor, so every tensor read returned unrelated file data instead of
     // failing.
     let abs_pos = gguf_tensor_offset(idx)
+    // Bound against the tensor's own size and against EOF, same as
+    // gguf_read_tensor_bytes_at(). Returns a byte count, so a short read at EOF
+    // is detectable by the caller.
+    if nbytes < 0 { return -3 }
+    let tsz = gguf_tensor_nbytes(idx)
+    if nbytes > tsz { return -3 }
+    if abs_pos > gguf_filesize { return -5 }
+    if nbytes > gguf_filesize - abs_pos { return -5 }
     if lseek(gguf_fd, abs_pos, 0) < 0 { return -2 }
     return read_raw(gguf_fd, buf, nbytes)
 }
@@ -2146,7 +2254,30 @@ fn gguf_read_tensor(idx) {
 // time on every single token. Callers pass byte_off = row * bytes_per_row.
 fn gguf_read_tensor_bytes_at(idx, byte_off, buf, nbytes) {
     if idx < 0 || idx >= gguf_n_tensors { return -1 }
-    if lseek(gguf_fd, gguf_tensor_offset(idx) + byte_off, 0) < 0 { return -2 }
+    if byte_off < 0 || nbytes < 0 { return -3 }
+
+    // Bound the read against the tensor's OWN size and against end of file.
+    //
+    // This is the gguf.cpp `nbytes_remain` guard: every read is checked against
+    // what is actually available before it is issued, so a bad `byte_off` or an
+    // over-long `nbytes` cannot read past the tensor or past EOF. Before this,
+    // a caller could pass any offset and the kernel would happily read unrelated
+    // bytes -- which for a quantized weight means decoding garbage with no error.
+    //
+    // The RETURN CONTRACT IS UNCHANGED: this returns a BYTE COUNT on success and
+    // a negative value on failure. lfm2_mm.quanta:87 depends on it --
+    // `if gguf_read_tensor_bytes_at(idx, r*rb, buf, rb) != rb` -- so returning a
+    // short count on a partial read is what makes an EOF mid-read detectable.
+    let tsz = gguf_tensor_nbytes(idx)
+    if tsz <= 0 { return -4 }
+    // byte_off and nbytes must both be representable and must not wrap
+    if byte_off > tsz - nbytes { return -3 }
+    let abs = gguf_tensor_offset(idx)
+    if abs > gguf_filesize { return -5 }
+    if nbytes > gguf_filesize - abs { return -5 }
+    if byte_off > gguf_filesize - abs - nbytes { return -5 }
+
+    if lseek(gguf_fd, abs + byte_off, 0) < 0 { return -2 }
     return read_raw(gguf_fd, buf, nbytes)
 }
 
