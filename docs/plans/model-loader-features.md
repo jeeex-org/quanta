@@ -232,7 +232,7 @@ Mutation-verified:
 
 Lesson recorded in the plan: **a test that has never run is not a test.**
 
-### Phase 1 — Validation and safety (correctness before features) — PARTLY DONE
+### Phase 1 — Validation and safety (correctness before features) ✅ COMPLETE
 
 Ported `Metadata::validate()` semantics; every item below has an upstream precedent.
 
@@ -265,7 +265,19 @@ Two mutations initially survived and both were fixed by *changing the test*, not
 - **M1**: the obvious case `4e18 * 4e18` wraps *negative*, so the `t <= 0` guard catches it too and the test passed with the limit check deleted. The value that isolates the limit guard is `1e9 * 1e9 = 1e18` (positive, > limit). Added.
 - **M3**: the `read_raw(...) != 8` short-read guard fired first and masked the `klen` bounds, so deleting those still looked detected. Split into a separate file-based test (`stdlib_gguf_truncated_test`) that cuts the real model mid-record and exactly on a record boundary; deleting the bounds then segfaults.
 
-**Remaining:** a byte-level corrupt-file *generator* for non-truncation corruptions (offset and dtype edits in place). Truncation is now covered honestly from Quanta's own parsed offsets; the others still corrupt memory in place.
+**Byte-level corrupt-file generator — DONE.**
+`scripts/audit/gen_corrupt_gguf.py` produces real corrupt files by patching one 8-byte field at a known offset, and `test_suites/scripts/gguf_corrupt_gate.sh` runs them through the real loader as a permanent gate (summarised in run_tests.sh as `gguf-corrupt`).
+
+Seven corruptions, all rejected at rc=-6, with the real model still loading:
+`gap`, `overlap`, `tail`, `dim_overflow`, `dim_mismatch`, `huge_dtype`, `neg_offset`.
+
+**The design point:** the generator never parses the KV block. It takes the tensor-table offset from Quanta's own verified parser — a new `gguf_tinfo_start` recorded by `read_tensor_info()` — and walks only the fixed tensor-record layout. This exists because two hand-rolled Python GGUF readers failed earlier (both desynced on `general.base_model.0.name`), and a third attempt to fix one failed the same way. Asking the verified parser removed the failure mode instead of debugging it again.
+
+Every derived offset is checked against Quanta's own parsed tensor offsets (t0=0, t5=245506048, t6=245514240, t7=257900544, dtype 14, dim0 2048) **before a byte is written**, and the generator refuses on mismatch — verified to correctly reject a deliberately wrong `tinfo_start`. A bug in the walk cannot silently corrupt an unrelated region of a 1.6 GB file.
+
+Discrimination: with `gguf_validate_chain()` and `gguf_validate_all_dims()` stubbed to `0`, the gate reports **0/7 rejected, FAILED (7)** and rc=1. With them on, 7/7 and rc=0.
+
+**Phase 1 complete.**
 
 ### Phase 2 — Bit-width dtype model
 

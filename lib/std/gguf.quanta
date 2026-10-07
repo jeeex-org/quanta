@@ -8,6 +8,8 @@ let gguf_fd = -1
 let gguf_n_tensors = 0
 let gguf_n_kv = 0
 let gguf_data_start = 0
+// Byte offset of the tensor-info table, set by read_tensor_info().
+let gguf_tinfo_start = 0
 // Total file size, captured at load. The chain validator needs it to prove each
 // tensor stays inside the file; upstream gguf_reader tracks the equivalent as
 // nbytes_remain and bounds every read against it.
@@ -175,6 +177,14 @@ fn scan_metadata(fd, n_kv) {
 
 // Read the gguf_n_tensors tensor-info records into gguf_tensor_data.
 fn read_tensor_info(fd) {
+    // Where the tensor-info table starts, in bytes from the beginning of the file.
+    //
+    // Recorded so that external tooling (the byte-level corrupt-file generator)
+    // can patch a field at a known offset WITHOUT re-walking the KV block. Two
+    // hand-rolled Python GGUF readers desynced on general.base_model.0.name and
+    // produced garbage; asking the verified parser for offsets removes that
+    // whole failure mode.
+    gguf_tinfo_start = lseek(fd, 0, 1)
     // n_tensors is attacker-controlled and multiplies an allocation. Each tensor
     // record costs at least 40 bytes in the file, so the file bounds the count.
     if gguf_n_tensors < 0 || gguf_n_tensors > 10000000 { return -1 }

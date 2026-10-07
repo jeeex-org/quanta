@@ -482,6 +482,17 @@ echo "########## QOBJ (module cache: write, read, cache-only consume) ##########
 # written mode 0111 is treated as absent by every probe, which is how the
 # cache-only build was silently broken for a long time.
 QOBJ_RC=0
+if [ -f "$TEST_SUITES/scripts/gguf_corrupt_gate.sh" ]; then
+  if bash "$TEST_SUITES/scripts/gguf_corrupt_gate.sh"; then
+    GGUF_RC=0
+  else
+    GGUF_RC=1
+  fi
+else
+  echo "  FAIL: gguf_corrupt_gate.sh missing"
+  GGUF_RC=1
+fi
+
 if [ -f "$TEST_SUITES/scripts/qobj_gate.sh" ]; then
   if ! QC="$QC" bash "$TEST_SUITES/scripts/qobj_gate.sh"; then
     QOBJ_RC=1
@@ -528,6 +539,7 @@ echo "  differential  : $([ $DIFF_RC = 0 ] && echo GREEN || echo RED)  (opt -O==
 echo "  generics      : $([ $GENERICS_RC = 0 ] && echo GREEN || echo RED)  (negative type-arg checks fail closed)"
 echo "  stdlib        : $([ $STDLIB_RC = 0 ] && echo GREEN || echo RED)  (lib/std/* via import, EXPECTED_STDLIB.tsv)"
 echo "  multi-tu      : $([ $MTU_RC = 0 ] && echo GREEN || echo RED)  (cross-TU call + global, --emit-obj + gcc link)"
+echo "  gguf-corrupt  : $([ $GGUF_RC = 0 ] && echo GREEN || echo RED)  (byte-level corrupt GGUF files must be rejected)"
 echo "  verify-status : $([ $VERIFY_STATUS_RC = 0 ] && echo GREEN || echo RED)  (docs/status.json consistency)"
 echo "  qobj          : $([ $QOBJ_RC = 0 ] && echo GREEN || echo RED)  (module cache write/read/cache-only, G1+G3+G5+G4, plus G6 cache self-compile)"
 # Block promotion on a real functional/security/perf/valgrind/fuzz/diff/stdlib/mtu/qobj/verify-status
