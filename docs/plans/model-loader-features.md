@@ -29,7 +29,9 @@ The last row matters: mmap is missing from the *loader*, not from the language.
 | **No byte-size overflow guard** | upstream `gguf.cpp:723` checks representability before accumulating. Quanta *does* have per-dtype block-size math (`gguf.quanta:373,376`) — the gap is the overflow check around accumulation, not the sizes |
 | No header-size cap / truncation check | ComfyUI caps safetensors header at 100 MB and checks `data_base_offset > file_size` |
 | Sub-byte dtype model | `gguf_type_size` returns a byte count (`gguf.quanta:304`). GGUF quant types are largely fine via `(n/block)*size` block math — the real gap is GPTQ/AWQ/NF4/MLX 2-8 bit packing |
-| 7 loader tests, **0 in the gate** | all 7 pass when run manually; `EXPECTED_STDLIB.tsv` has one GGUF entry |
+| ~~7 loader tests, 0 in the gate~~ **FIXED** | all 8 now registered; gating exposed `gguf_general_test`, which could never pass (asserted a relative offset against an absolute accessor) |
+| ~~No offset-chain validation~~ **FIXED** | `gguf_validate_chain()`, wired into `gguf_load`, mutation-tested |
+| ~~Alignment hardcoded to 32~~ **FIXED** | `gguf_read_alignment()` reads `general.alignment`, rejects non-power-of-2 |
 
 ---
 
@@ -213,26 +215,37 @@ Benchmarks run on the actual RTX 4070 Laptop (7.70 GiB, **PCIe Gen4 ×8**, CUDA 
 
 Ordered by dependency, not by excitement. Each phase has a verification that can fail.
 
-### Phase 0 — Gate the loader (do this first)
+### Phase 0 — Gate the loader ✅ DONE
 
-Seven tests exercise the loader; **none are in the gate**. A regression in Q6_K dequant currently sails through 813/813.
+Seven tests exercised the loader with **none in the gate**. All seven are now registered in `EXPECTED_STDLIB.tsv`, plus a new eighth for the validator. STDLIB 66 → **75/75**.
 
-- add all 7 to `EXPECTED_STDLIB.tsv`
-- **verify each discriminates**: revert one line per test, confirm it fails
-- baseline: gate 813/813 → expect 820/820
+Gating immediately found a real failure that had been sitting in the tree: `gguf_general_test` asserted `gguf_tensor_offset(0) == 0` while the accessor returns an **absolute** offset (8239136). It could never pass and had been sitting there looking fine. Fixed to assert absolute values.
 
-### Phase 1 — Validation and safety (correctness before features)
+That fix was then found to be *too weak* by mutation: it compared `offset - data_start`, which cancels out a change to how the offset is composed, so it passed even with the accessor returning a relative value. Now asserts the absolute constants directly and fails under that mutation.
 
-Port `Metadata::validate()` semantics; every item below has an upstream precedent:
+Mutation-verified:
+- Q6_K f16 scale read broken → `embedding_test` rc=1
+- `gguf_tensor_offset` absolute→relative → `embedding_test` rc=1, `gguf_general_test` rc=1
 
-1. alignment read from `general.alignment`; reject non-power-of-2
-2. **offset-chain validation** — each tensor offset must equal the running padded total
-3. byte-size representability guard before accumulation
-4. `nbytes_remain` bound on every read
-5. header size cap + truncation check
-6. `checked_mul` for every dimension product
+Lesson recorded in the plan: **a test that has never run is not a test.**
 
-Hostile-file tests: truncated file, overlapping tensors, offset gap, absurd dimensions, non-power-of-2 alignment. **Each must fail cleanly, not crash.**
+### Phase 1 — Validation and safety (correctness before features) — PARTLY DONE
+
+Ported `Metadata::validate()` semantics; every item below has an upstream precedent.
+
+**Done:**
+- `gguf_validate_chain()` — offset-chain validation with a representability/bounds guard, wired into `gguf_load` (rc -6 on failure)
+- `gguf_read_alignment()` — reads `general.alignment`, rejects non-power-of-2, defaults to 32
+- `gguf_filesize` captured at load and used to bound every tensor against EOF
+- `stdlib_gguf_validate_test` — 4 corruptions (gap, overlap, absurd nelements, tail shift) all detected, 0 missed, restoration exact
+
+**The anchoring subtlety, measured not assumed:** the chain's running total must start at `gguf_data_start`, **not 0**. `gguf_tensor_offset()` already adds `gguf_data_offset()` internally (gguf.quanta:373) and returns an absolute offset. Measured on the real model: tensor 0 sits at absolute 8239136 with relative 0, and every later tensor chains exactly. A validator anchored at 0 reported a spurious 8239136-byte gap at tensor 0 and **rejected the real, valid model** — which is what the first version did.
+
+**Still to do:**
+- `nbytes_remain` bound on every read (not just at validation time)
+- header size cap + truncation check
+- `checked_mul` for every dimension product (Quanta's `nbytes` uses a plain multiply)
+- hostile-file tests at the byte level — currently corruptions are applied in memory, because two attempts at a Python GGUF writer both mis-parsed the KV block and desynced on `general.base_model.0.name`. A correct byte-level corrupt-file generator is still wanted; it needs a real GGUF writer, not a hand-rolled parser
 
 ### Phase 2 — Bit-width dtype model
 
