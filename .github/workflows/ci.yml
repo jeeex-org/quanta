@@ -76,14 +76,52 @@ jobs:
           # stage C: self compiles source -> gen3 (fixpoint vs self)
           "$SEED" "$D/qc_self" main.quanta "$D/qc_gen3" -O 2>&1 | tail -3
           test -x "$D/qc_gen3" || { echo "stage C failed"; exit 1; }
-          # fixpoint: self must byte-match gen3
-          A=$(md5sum "$D/qc_self" | cut -d' ' -f1)
-          B=$(md5sum "$D/qc_gen3" | cut -d' ' -f1)
-          echo "fixpoint self=$A gen3=$B"
-          [ "$A" = "$B" ] || { echo "FAIL: self-host fixpoint NOT byte-identical"; exit 1; }
-          # promote the final self-hosted binary into the version bin
+          # fixpoint: the self-hosted binary must compile the source to ITSELF.
+          #
+          # The three stages above deliberately all use "$SEED" as the compiler,
+          # so qc_self and qc_gen3 are just "seed compiles the source" twice --
+          # deterministic and idempotent, which makes `A == B` true trivially and
+          # proves nothing about self-hosting. That was the bug in this step.
+          #
+          # The real test is whether the compiler reproduces ITSELF.
+          # Measured on 0.0.225: a seed-built binary (d02f4e00) recompiles the
+          # source to 1b8941d8, while the committed qc (1b8941d8) recompiles to
+          # exactly itself. So the fixpoint is the SECOND generation, not the
+          # first -- and the old seed-vs-seed comparison passed trivially while
+          # hiding that drift.
+          #
+          # Iterate to a real fixpoint: compile the source with the current
+          # binary until the output stops changing. Each iteration writes a
+          # DISTINCT output file -- an earlier version reused $D/qc_fix every
+          # round, so cmp compared the freshly written file with itself and the
+          # loop exited after one pass without ever comparing anything.
+          #
+          # Measured on 0.0.225: generation 1 (d02f4e00, built by the 0.0.224
+          # seed) recompiles to 1b8941d8, and generation 2 recompiles to itself.
+          # So the fixpoint is the SECOND generation; the old seed-vs-seed check
+          # passed trivially while hiding that drift.
+          PREV_BIN="$D/qc_gen3"
+          CONVERGED=0
+          i=0
+          while [ "$i" -lt 6 ]; do
+            i=$((i + 1))
+            "$PREV_BIN" main.quanta "$D/qc_fix_$i" -O 2>&1 | tail -2
+            test -x "$D/qc_fix_$i" || { echo "fixpoint iteration $i produced no binary"; exit 1; }
+            if cmp -s "$PREV_BIN" "$D/qc_fix_$i"; then
+              CONVERGED=1
+              echo "self-host fixpoint reached after $i iteration(s)"
+              break
+            fi
+            PREV_BIN="$D/qc_fix_$i"
+          done
+          if [ "$CONVERGED" != "1" ]; then
+            echo "FAIL: the self-hosted compiler never reached a fixpoint in 6 iterations"
+            exit 1
+          fi
+          echo "fixpoint qc=$(md5sum "$PREV_BIN" | cut -d' ' -f1)"
+          # promote the binary that IS a fixpoint
           mkdir -p "$GITHUB_WORKSPACE/compiler/$V/bin/x86"
-          cp "$D/qc_gen3" "$GITHUB_WORKSPACE/compiler/$V/bin/x86/qc"
+          cp "$PREV_BIN" "$GITHUB_WORKSPACE/compiler/$V/bin/x86/qc"
           echo "promoted final qc: $(md5sum "$GITHUB_WORKSPACE/compiler/$V/bin/x86/qc" | cut -d' ' -f1)"
 
       - name: Guard — every expected test file must exist in checkout
