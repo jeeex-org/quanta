@@ -170,6 +170,13 @@ jobs:
         run: |
           bash test_suites/scripts/run_tests.sh > /tmp/gate.log 2>&1 || true
           cat /tmp/gate.log
+          # gguf-corrupt: RED must be fatal. Without this line a corrupt-file
+          # regression passes CI silently -- the gate prints
+          # "gguf-corrupt : RED", which matches none of the patterns below.
+          # Verified by mutation: with gguf_validate_chain() stubbed to 0 the
+          # corrupt gate reports 0/7 and RED, and this line is what makes the
+          # job fail.
+          grep -q "gguf-corrupt : RED" /tmp/gate.log && { echo "FAIL: gguf-corrupt gate RED"; exit 1; }
           grep -qE "functional : RED|FAIL \(compile\)|FAIL [a-z]+_.*quanta|FAIL [a-z]+_[a-z]+ \(" /tmp/gate.log && exit 1 || true
 
       - name: Valgrind scan of qc for memory unsafety

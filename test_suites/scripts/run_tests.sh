@@ -13,6 +13,9 @@ TEST_SUITES="./test_suites"
 PASS=0
 FAIL=0
 COMPILE_FAIL=0
+# Tests skipped because a declared prerequisite file was absent (see the
+# SKIP_IF_MISSING column). Excluded from TOTAL so a skip can never read as a pass.
+SKIP=0
 
 mkdir -p "$TEST_SUITES/bin"
 # Scratch cwd for test runs. Symlink every top-level repo entry in, so a test
@@ -26,9 +29,12 @@ done
 
 # Compile all test codes
 echo "=== Compiling test suite ==="
-while IFS=$'\t' read -r name expected; do
+while IFS=$'\t' read -r name expected skip_if_missing; do
   src="$TEST_SUITES/codes/$name"
   out="$TEST_SUITES/bin/${name%.quanta}"
+  # A test needing a real model cannot be compiled-and-run meaningfully without
+  # it; compiling it is still useful (it proves the source builds), so only the
+  # RUN loop skips. See the run loop below.
   if $QC -O "$src" "$out" 2>/tmp/compile_stderr.txt; then
     echo "  OK  $name"
   else
@@ -41,11 +47,18 @@ done < "$TEST_SUITES/EXPECTED.tsv"
 
 echo ""
 echo "=== Running test suite ==="
-while IFS=$'\t' read -r name expected; do
+while IFS=$'\t' read -r name expected skip_if_missing; do
   bin="$TEST_SUITES/bin/${name%.quanta}"
   if [ ! -x "$bin" ]; then
     echo "  SKIP $name (no binary)"
     continue
+  fi
+  # Declared prerequisite absent (SKIP_IF_MISSING column, third field): a test
+  # needing a real model cannot pass on a runner that has none. Printed, never
+  # silent, and excluded from the totals so a skip cannot read as a pass.
+  if [ -n "$skip_if_missing" ] && [ ! -f "$skip_if_missing" ]; then
+    echo "  SKIP $name (missing: $skip_if_missing)"
+    SKIP=$((SKIP + 1)); continue
   fi
   set +e
   # Run from a scratch cwd. A test that writes a file (test_generator does)
@@ -74,7 +87,11 @@ done < "$TEST_SUITES/EXPECTED.tsv"
 
 TOTAL=$((PASS + FAIL + COMPILE_FAIL))
 echo ""
-echo "=== Results: $PASS/$TOTAL pass, $((FAIL + COMPILE_FAIL)) fail (incl. $COMPILE_FAIL compile-fail) ==="
+if [ "$SKIP" -gt 0 ]; then
+  echo "=== Results: $PASS/$TOTAL pass, $((FAIL + COMPILE_FAIL)) fail (incl. $COMPILE_FAIL compile-fail), $SKIP skipped (model absent) ==="
+else
+  echo "=== Results: $PASS/$TOTAL pass, $((FAIL + COMPILE_FAIL)) fail (incl. $COMPILE_FAIL compile-fail) ==="
+fi
 # A compile-fail is a broken feature, not a green row. Exit non-zero if anything
 # failed to compile or produced the wrong result, so CI / promotion gates catch it.
 if [ $((FAIL + COMPILE_FAIL)) -gt 0 ]; then
@@ -430,8 +447,8 @@ fi
 echo "########## STDLIB SUITE (lib/std/* via import) ##########"
 STDLIB_RC=0
 if [ -f "$TEST_SUITES/EXPECTED_STDLIB.tsv" ]; then
-  STDLIB_PASS=0; STDLIB_FAIL=0
-  while IFS=$'\t' read -r name expected; do
+  STDLIB_PASS=0; STDLIB_FAIL=0; STDLIB_SKIP=0
+  while IFS=$'\t' read -r name expected skip_if_missing; do
     src="$TEST_SUITES/codes/$name"
     bin="$TEST_SUITES/bin/${name%.quanta}"
     # --no-overflow-trap is REQUIRED for crypto/unsigned-bitwise stdlibs (secure, quantum).
@@ -439,6 +456,19 @@ if [ -f "$TEST_SUITES/EXPECTED_STDLIB.tsv" ]; then
     # two's-complement wraparound in crypto (rotations, XOR, shifts, byte multiplies).
     # This is NOT a bug workaround — it's the correct semantic flag for such code.
     # The shift-count UB trap (count >= 64) remains active.
+    #
+    # SKIP_IF_MISSING (optional 3rd column): a test that needs a real model file
+    # cannot pass on a runner that has no model. Marking it explicitly here means
+    # it is skipped ONLY when declared, the skip is always printed (never silent),
+    # and the pass/fail totals exclude it. Unmarked model-dependent tests still
+    # FAIL on a runner without the model, which is the point: a new
+    # model-dependent test cannot be added by accident.
+    if [ -n "$skip_if_missing" ]; then
+      if [ ! -f "$skip_if_missing" ]; then
+        echo "  SKIP $name (missing: $skip_if_missing)"
+        STDLIB_SKIP=$((STDLIB_SKIP + 1)); continue
+      fi
+    fi
     if ! $QC --no-overflow-trap "$src" "$bin" 2>/tmp/stdlib_stderr.txt; then
       echo "  FAIL (compile) $name  stderr: $(cat /tmp/stdlib_stderr.txt | head -1)"
       STDLIB_FAIL=$((STDLIB_FAIL + 1)); continue
@@ -455,7 +485,11 @@ if [ -f "$TEST_SUITES/EXPECTED_STDLIB.tsv" ]; then
       STDLIB_FAIL=$((STDLIB_FAIL + 1))
     fi
   done < "$TEST_SUITES/EXPECTED_STDLIB.tsv"
-  echo "  STDLIB: $STDLIB_PASS/$((STDLIB_PASS + STDLIB_FAIL)) GREEN"
+  if [ "$STDLIB_SKIP" -gt 0 ]; then
+    echo "  STDLIB: $STDLIB_PASS/$((STDLIB_PASS + STDLIB_FAIL)) GREEN ($STDLIB_SKIP skipped: model absent)"
+  else
+    echo "  STDLIB: $STDLIB_PASS/$((STDLIB_PASS + STDLIB_FAIL)) GREEN"
+  fi
   if [ $STDLIB_FAIL -gt 0 ]; then STDLIB_RC=1; fi
 else
   echo "  SKIP: EXPECTED_STDLIB.tsv missing"
