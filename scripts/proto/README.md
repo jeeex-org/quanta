@@ -89,3 +89,40 @@ threading in Quanta. Until it exists, `clone` must not be used for parallelism.
    verified 1/2/4/20 against the existing llama.cpp oracle — and run it enough
    times to catch an intermittent fault, because that is exactly what this one
    was.
+
+## Hand-encoding a builtin: four faults, all silent (dot32q4, reverted)
+
+A `dot32q4(q, x, dm_ptr) -> f64` builtin was attempted — the fused dequant+dot
+shape, the one that removes the work instead of rearranging it. It is the right
+*idea* and it did not land. Four faults, each of which compiled, ran, and returned
+a plausible wrong number. Recorded because the next attempt must not repeat them.
+
+Every fault was found by a targeted test, not by reading the code.
+
+1. **`jcc32(12, ...)` is out of range.** `jcc32` only maps cc 0-5; anything else
+   emits opcode byte 0 and control falls through into whatever follows. Symptom:
+   SIGSEGV. cc=2 is the signed JL used elsewhere for the same test.
+2. **`48 66 0F 6E` is a malformed SSE prefix.** x86 wants legacy prefixes (66/F2/F3)
+   FIRST and REX LAST. REX-first decodes as MOVD and ZEROES the upper 32 bits, so a
+   float's bit pattern is silently halved. This file documents the rule above
+   `fld_x` and lists 49 former violations. Symptom: `d` reads as 0, result 0.0.
+3. **ModRM `0xCE` is register-direct, not memory.** For `mulsd xmm1, [rsi+rcx*8]`
+   the ModRM must be `mod=00 reg=001 rm=100(SIB)` = 0x0C with SIB 0x0E. Emitting 0xCE
+   multiplies by the rcx REGISTER and the trailing SIB byte decodes as a separate
+   instruction. Symptom with x[i]=1.0: a result of exactly the loop trip count (32.0).
+4. **The repeat-call corruption is the one still open.** Measured: call 1 correct
+   (960.0), then 9.6e8, then -9.2e12, then inf for the SAME builtin with different
+   d/m. `flush_all()` marks every allocated vreg spilled, and the builtin never
+   restores the allocator's view. Suspect is `vr_init`: `sdef(vr, reg)` sets it,
+   `rbp(reg, spill_home(...))` does not clear it, so state marked defined by one
+   call is re-written by the next. Not confirmed — do not assume, verify with a
+   two-call test before touching the allocator.
+
+**Lesson for the next attempt:** a builtin that loops needs a two-call test from
+the start. A single-call test passes while the second call returns garbage, which
+is exactly the shape of bug that reads as "the kernel is just flaky".
+
+**Also measured while in here:** a builtin call record is IRS=40 bytes holding op,
+res, ira0, ira1, ira2. `ira2(i)+3` reads `ir + i*40 + 40` — the NEXT record's op
+slot — so builtins take at most 3 arguments. That part of the 4-arg attempt was a
+real limit, not a mistake.
