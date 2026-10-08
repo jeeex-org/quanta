@@ -307,6 +307,52 @@ fn aphys(vr) {
     aset(vr,p); return p
 }
 
+// aphys_x(vr, ex): aphys(vr), but never evict `ex` to make room.
+//
+// afree() cannot know what the instruction being emitted still needs. With the
+// register pool full it evicts the LAST map entry unconditionally, so the second
+// operand of a binary op could evict the FIRST one that had just been loaded --
+// and then be handed that same register. Both operands ended up in one register
+// and the op computed x+x. Measured at the single place it fires:
+//
+//     fn seven(n: i64) -> i64 { let a=n+1 ... let g=n+7  return g }
+//     P0 a1=41 a2=41 allocfc=21      <- both operands in the SAME register
+//     seven(1) -> 14                  <- n+n instead of n+7
+//
+// Six bindings never reach it; seven is where the live count first exceeds the
+// free registers. allocfc=21 against 13 physical registers is the same fact.
+fn aphys_x(vr, ex) {
+    let f=afind(vr); if f>=0 { return f }
+    let p=afree_x(ex)
+    if r8(vr_init+vr)!=0 { rbp(p, spill_home(vr)) }
+    aset(vr,p); return p
+}
+
+// afree_x(ex): as afree(), but the eviction never picks the vreg `ex`.
+fn afree_x(ex) {
+    let k=0
+    while k<13 {
+        let pr=r64(REGS+k*8)
+        let used=0; let j=0
+        while j<allocfc { if r64(alloc+j*16+8)==pr { used=1; break }; j=j+1 }
+        if used==0 { return pr }
+        k=k+1
+    }
+    let ei=-1; let ek=0
+    while ek<allocfc {
+        if r64(alloc+ek*16)!=ex { ei=ek }
+        ek=ek+1
+    }
+    if ei<0 { return afree() }
+    let ev_vr=r64(alloc+ei*16); let ev_pr=r64(alloc+ei*16+8)
+    if r8(vr_init+ev_vr)!=0 { wbp(spill_home(ev_vr), ev_pr) }
+    w8(vr_spill+ev_vr, 1)
+    allocfc=allocfc-1
+    w64(alloc+ei*16, r64(alloc+allocfc*16))
+    w64(alloc+ei*16+8, r64(alloc+allocfc*16+8))
+    return ev_pr
+}
+
 // adistinct(res, a1, a2): like aphys(res) but guarantees the returned physical
 // register is NOT a1 and NOT a2 (the operand registers).  This prevents a
 // binary result dst from aliasing an operand, which would let the zeroing /
