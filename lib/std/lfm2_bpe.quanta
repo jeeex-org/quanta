@@ -417,3 +417,92 @@ fn bpe_encode(src, n, ids, max_ids) {
     }
     return out
 }
+
+// ===========================================================================
+// DECODE (id -> text)
+//
+// There was no decode path at all: generation could produce token ids but not
+// turn them back into bytes, so nothing could be printed or checked against a
+// reference.
+//
+// Two inverses are needed, in this order:
+//   1. id -> the token's bytes, via the vocab record at that index. bpe_rec_at
+//      walks the packed array; it is O(id), which is fine for a handful of
+//      decoded tokens per step and would not be for bulk use.
+//   2. GPT-2 byte-level symbol -> original byte. bpe_byte_cp() maps 0..255 onto
+//      33..126, 161..172, 174..255, 256..288 and 162..322; the inverse below is
+//      the exact reverse of each branch.
+// ===========================================================================
+
+// The token's bytes (still in GPT-2 byte-level form) at vocab index `id`.
+fn bpe_token_rec(id) {
+    if bpe_vocab == 0 || id < 0 || id >= bpe_vocab_n { return 0 }
+    return bpe_rec_at(bpe_vocab, id)
+}
+
+fn bpe_token_len(id) {
+    let r = bpe_token_rec(id)
+    if r == 0 { return -1 }
+    return mem_load(r)
+}
+
+// GPT-2 byte-level symbol -> original byte. Exact inverse of bpe_byte_cp().
+fn bpe_cp_byte(u) {
+    if u >= 33 && u <= 126 { return u }
+    if u >= 161 && u <= 172 { return u }
+    if u >= 174 && u <= 255 { return u }
+    if u >= 256 && u <= 288 { return u - 256 }
+    if u >= 162 && u <= 322 { return u - 162 }
+    return -1
+}
+
+// Decode token `id` into `dst` as raw bytes (byte-level form undone).
+// Returns the byte count, or -1 if the id is out of range.
+//
+// UTF-8 continuation bytes are kept as-is: the byte-level alphabet encodes a
+// multi-byte character as several symbols, so decoding symbol-by-symbol and
+// concatenating reproduces the original bytes exactly. Any invalid continuation
+// is dropped rather than guessed at.
+fn bpe_decode_token(id, dst) {
+    let r = bpe_token_rec(id)
+    if r == 0 { return -1 }
+    let n = mem_load(r)
+    let out = 0
+    let i = 0
+    while i < n {
+        let b = mem_load8(r + 8 + i)
+        // Symbols are UTF-8 encoded code points; re-assemble the code point.
+        let u = 0
+        let adv = 1
+        if b < 128 {
+            u = b
+        } else if b < 224 {
+            if i + 1 < n {
+                u = (b - 192) * 64 + (mem_load8(r + 8 + i + 1) - 128)
+                adv = 2
+            }
+        } else {
+            if i + 2 < n {
+                u = (b - 224) * 4096 + (mem_load8(r + 8 + i + 1) - 128) * 64 + (mem_load8(r + 8 + i + 2) - 128)
+                adv = 3
+            }
+        }
+        let ob = bpe_cp_byte(u)
+        if ob >= 0 { mem_store8(dst + out, ob); out = out + 1 }
+        i = i + adv
+    }
+    return out
+}
+
+// Decode a whole id array into `dst`. Returns total bytes written.
+fn bpe_decode(ids, count, dst) {
+    let out = 0
+    let k = 0
+    while k < count {
+        let id = mem_load(ids + k * 8)
+        let n = bpe_decode_token(id, dst + out)
+        if n > 0 { out = out + n }
+        k = k + 1
+    }
+    return out
+}

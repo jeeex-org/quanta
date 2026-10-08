@@ -175,7 +175,46 @@ fn main() {
     print(total_ids)
     print(" fails=")
     print(fails)
-    if fails == 0 && blocks > 0 { print("OK bpe"); return 0 }
+    if fails == 0 && blocks > 0 {
+        // ---- round trip: encode -> decode must reproduce the input bytes ----
+        //
+        // Decode had NO coverage and did not exist before this round, so ids
+        // could be produced but never turned back into text. A round trip is the
+        // only cheap way to pin it: it catches a wrong byte-level inverse, an
+        // off-by-one record read, and a leaked length prefix all at once.
+        //
+        // Note the calling convention: bpe_encode takes a RAW BYTE pointer, so a
+        // string literal must be passed as (s + 8) with len(s). Passing the
+        // string OBJECT encodes its 8-byte length header as text -- measured:
+        // "Hello, world!" then came back as 13,0,0,0,0,0,0,0,"Hello,...".
+        let rt_ids = mem_alloc(512 * 8)
+        let rt_out = mem_alloc(4096)
+        let cases = ["Hello, world!", "The capital of France is", "  spaced  out  ", "1234567890", "a"]
+        let c = 0
+        while c < 5 {
+            let s = cases[c]
+            let want_n = len(s)
+            let got_n = bpe_encode(s + 8, want_n, rt_ids, 512)
+            if got_n <= 0 { print("FAIL rt encode case "); print(c); return 1 }
+            let back = bpe_decode(rt_ids, got_n, rt_out)
+            if back != want_n { print("FAIL rt len case "); print(c); print(" got "); print(back); print(" want "); print(want_n); return 1 }
+            let mm = 0
+            let z = 0
+            while z < want_n {
+                if mem_load8(rt_out + z) != mem_load8(s + 8 + z) { mm = mm + 1 }
+                z = z + 1
+            }
+            if mm != 0 { print("FAIL rt bytes case "); print(c); print(" mismatches "); print(mm); return 1 }
+            c = c + 1
+        }
+
+        // an out-of-range id must be refused, not read out of bounds
+        if bpe_decode_token(bpe_vocab_n + 10, rt_out) >= 0 { print("FAIL: out-of-range id decoded"); return 1 }
+        if bpe_decode_token(0 - 1, rt_out) >= 0 { print("FAIL: negative id decoded"); return 1 }
+
+        print("OK bpe")
+        return 0
+    }
     print("FAIL bpe")
     return 1
 }
