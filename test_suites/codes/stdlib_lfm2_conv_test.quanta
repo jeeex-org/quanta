@@ -71,13 +71,24 @@ fn conv_reference(L, x: u64, state: u64, out: u64) {
     }
 
     // Correlation with all kw taps in INCREASING time order: k0*s0 + k1*s1 + k2*g
+    //
+    // KERNEL INDEXING -- this is the bug the test previously CONTAINED. It read
+    // Wcv[(k*dm + c)] (channel-major, stride 2048), which is what
+    // fc_short_conv() also did, so both sides were wrong in the same way and
+    // agreed. The whole forward pass then produced a flat, wrong logit
+    // distribution (argmax 71 against llama.cpp's 5922) while every conv test
+    // passed.
+    //
+    // conv.weight is [3, 2048] in ggml order: ne[0]=3 is CONTIGUOUS.
+    // ggml_compute_forward_ssm_conv_f32 reads `c[i0 + i1*nc]`, so element
+    // (channel c, tap k) is at flat index k + c*3 = c*kw + k.
     let k_out = mem_alloc(dm * 8)
     let c = 0
     while c < dm {
         let acc: f64 = 0.0
         let k = 0
         while k < kw {
-            acc = acc + f64of(mem_load(Wcv + (k * dm + c) * 8)) * f64of(mem_load(bx + (k * dm + c) * 8))
+            acc = acc + f64of(mem_load(Wcv + (c * kw + k) * 8)) * f64of(mem_load(bx + (k * dm + c) * 8))
             k = k + 1
         }
         mem_store(k_out + c * 8, acc)
@@ -190,6 +201,63 @@ fn main() {
     prints("state entries changed=")
     print(moved)
     if moved == 0 { print("FAIL state did not advance"); return 1 }
+
+    // ---- synthetic kernel-indexing check, independent of any tensor --------
+    //
+    // The real-tensor comparison above CANNOT catch a shared indexing mistake:
+    // the reference and the implementation read the same tensor with the same
+    // formula, so they agree whether that formula is right or wrong. That is
+    // exactly how a wrong stride survived a passing test and only surfaced as a
+    // wrong argmax in the full forward pass.
+    //
+    // This pins the layout directly. conv.weight is [3, n_embd] with ne[0]=3
+    // contiguous, so element (channel c, tap k) lives at c*3 + k. Build a kernel
+    // whose value encodes its own (c,k) and check the correlation picks the
+    // right one: with bx[t][c] = 10^t the correlation for channel c must equal
+    // k0 + 10*k1 + 100*k2, where kk = kernel[c*3 + k].
+    let kw3 = 3
+    let dm3 = 4
+    let ksyn = mem_alloc(kw3 * dm3 * 8)
+    let bxsyn = mem_alloc(kw3 * dm3 * 8)
+    let csyn = 0
+    while csyn < dm3 {
+        // kernel[c*3 + k] = c*1000 + k  -> channel c, tap k
+        let kk = 0
+        while kk < kw3 {
+            mem_store(ksyn + (csyn * kw3 + kk) * 8, i2f(csyn * 1000 + kk))
+            kk = kk + 1
+        }
+        // bx[t][c] = 10^t so the taps are distinguishable by position
+        let tt = 0
+        while tt < kw3 {
+            let pw = 1
+            let e = 0
+            while e < tt { pw = pw * 10; e = e + 1 }
+            mem_store(bxsyn + (tt * dm3 + csyn) * 8, i2f(pw))
+            tt = tt + 1
+        }
+        csyn = csyn + 1
+    }
+    let osyn = mem_alloc(dm3 * 8)
+    csyn = 0
+    while csyn < dm3 {
+        let acc: f64 = 0.0
+        let kk = 0
+        while kk < kw3 {
+            acc = acc + f64of(mem_load(ksyn + (csyn * kw3 + kk) * 8)) * f64of(mem_load(bxsyn + (kk * dm3 + csyn) * 8))
+            kk = kk + 1
+        }
+        mem_store(osyn + csyn * 8, acc)
+        csyn = csyn + 1
+    }
+    // channel c: (c*1000+0)*1 + (c*1000+1)*10 + (c*1000+2)*100 = c*1000*111 + 210
+    csyn = 0
+    while csyn < dm3 {
+        let got = f2i(f64of(mem_load(osyn + csyn * 8)))
+        let want = csyn * 1000 * 111 + 210
+        if got != want { prints("FAIL synthetic conv channel "); print(csyn); prints(" got "); print(got); prints(" want "); print(want); print(""); return 1 }
+        csyn = csyn + 1
+    }
 
     print("OK conv")
     return 0

@@ -255,12 +255,20 @@ fn fc_short_conv(L, x: u64, state: u64, out: u64) {
 
     // One output time step, correlation with taps in increasing time order:
     //   k0*s0 + k1*s1 + k2*g
+    //
+    // KERNEL INDEXING: shortconv.conv is [3, 2048] in ggml order, so ne[0]=3 is
+    // the CONTIGUOUS dimension. ggml_compute_forward_ssm_conv_f32 reads it as
+    //     sumf += s[i0 + i1*ncs] * c[i0 + i1*nc];
+    // i.e. element (channel i1, tap i0) is at flat index i0 + i1*nc = tap + ch*3.
+    // Reading it as (k*dm + c) -- channel-major, stride 2048 -- gives the right
+    // answer only for channel 0 and the wrong tap for every other channel, which
+    // flattens the logits and changes the argmax.
     let c = 0
     while c < dm {
         let acc: f64 = 0.0
         let k = 0
         while k < kw {
-            let w = f64of(mem_load(fc_sc_kw + (k * dm + c) * 8))
+            let w = f64of(mem_load(fc_sc_kw + (c * kw + k) * 8))
             acc = acc + w * f64of(mem_load(fc_sc_bx + (k * dm + c) * 8))
             k = k + 1
         }
