@@ -34,6 +34,7 @@
 
 import std/fs
 import std/json
+import std/map
 import std/math
 import std/str
 
@@ -413,7 +414,10 @@ fn st_dims_at(i: i64, out: u64, cap: i64) -> i64 {
     if json_get_type(shv) != 4 { return 0 - 2 }
     let arr = json_get_array(shv)
     let nd = json_array_len(arr)
-    if nd <= 0 { return 0 - 2 }
+    // A scalar's shape is []: rank 0 is a VALID answer here, not an error. Same
+    // reason as st_validate_one and st_nelements_of. Returning -2 made
+    // qmodel_ndims reject every scalar tensor in a real model.
+    if nd < 0 { return 0 - 2 }
     if nd > cap { return 0 - 2 }
     let d = 0
     while d < nd {
@@ -447,7 +451,14 @@ fn st_nelements_of(i: i64) -> i64 {
     let shv = json_object_get(eo, "shape")
     if shv < 0 { return 0 - 2 }
     if json_get_type(shv) != 4 { return 0 - 2 }
-    return st_nelements(json_get_array(shv))
+    let arr = json_get_array(shv)
+    // A zero-length shape is a SCALAR: one element, not an error. This must
+    // agree with st_validate_one, which was changed for the same reason --
+    // /opt/ai/models/quanta/model.safetensors has 1,166 such tensors. Returning
+    // -1 here made every safetensors parameter count fail, and qmodel_size_class
+    // then reported QSIZE_FULL for a 2.3B model purely because of it.
+    if json_array_len(arr) == 0 { return 1 }
+    return st_nelements(arr)
 }
 
 // Element width in bits, or negative.
