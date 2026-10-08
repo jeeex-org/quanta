@@ -123,10 +123,15 @@ fn str_fmt(dst: u64, dst_cap: i64, fmt: u64, val: i64) -> i64 {
             rev = rev + 1
         }
         num_len = rev
-        // Reverse into final position
+        // Reverse into final position. This must SWAP, not copy: writing
+        // num_buf[j] = num_buf[num_len-1-j] in a loop reads the slot that was
+        // already overwritten on the previous iteration, so "12" came out "11"
+        // (and any 2-digit layer index would name the wrong layer).
         let j = 0
-        while j < num_len {
+        while j < num_len / 2 {
+            let tmp = mem_load8(num_buf + j)
             mem_store8(num_buf + j, mem_load8(num_buf + num_len - 1 - j))
+            mem_store8(num_buf + num_len - 1 - j, tmp)
             j = j + 1
         }
     }
