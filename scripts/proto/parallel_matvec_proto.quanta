@@ -1,0 +1,166 @@
+// Parallel Q4_K matvec over a row range, with a serial reference and a
+// bit-for-bit comparison.
+//
+// WHY THE CHILDREN HAVE CONSTANT IDS:
+// raw clone() makes the child resume executing in the CALLER's stack frame.
+// The parent returns from the spawn function immediately and calls it again for
+// the next worker, which reuses that same frame -- so every value the child
+// reads from it (the worker id, the buffers) is clobbered underneath it.
+// Measured: one wrong row, and the done flags never landed (the parent spun its
+// full 2e9-iteration bound, 125 s).
+//
+// Baking the id in as a literal removes the dependency: child_body(3) passes a
+// constant, so nothing is read from the clobbered frame. The remaining reads in
+// the spawn function (`stack`, `r`) happen before the clone or are only used by
+// the parent path.
+//
+// The fully general fix is a proper thread entry trampoline that reads its
+// arguments off the child's OWN stack, the way pthread_create does. That is the
+// next piece of design work; this proves the mechanism and the scaling first.
+
+import std/fs
+import std/gguf
+import std/lfm2_mm
+
+let TENSOR = 0
+let NROWS = 0
+let NCOLS = 0
+let XBUF = 0
+let YBUF = 0
+let NWORK = 4
+let DONEFLAG = 0
+let SCR = 0
+let ROWCAP = 0
+let RAWCAP = 0
+
+fn worker_scratch(w: i64) -> i64 {
+    return SCR + w * (ROWCAP * 8 + RAWCAP)
+}
+
+fn child_body(w: i64) -> i64 {
+    let rowbuf = worker_scratch(w)
+    let rowraw = rowbuf + ROWCAP * 8
+    let mine = 0
+    let dtype = gguf_tensor_dtype(TENSOR)
+    let rb = mm_row_bytes(dtype, NCOLS)
+    let chunk = (NROWS + NWORK - 1) / NWORK
+
+    // STATIC PARTITION: worker w owns rows [w*chunk, (w+1)*chunk). No shared
+    // work counter, so nothing to race on. A dynamic fetch-and-increment counter
+    // was tried first and is WRONG without a real atomic: read-increment-write
+    // is three separate memory operations, so two workers both read 10, both
+    // write 11, and both believe they won row 10. Measured 931/2048 rows wrong
+    // with a plain counter, still 500 wrong with a re-read check-and-set.
+    // Quanta has no xchg / lock-xadd builtin, so partition instead.
+    let lo = w * chunk
+    let hi = lo + chunk
+    let r = lo
+    while r < hi {
+        if r >= NROWS { break }
+        // pread64 (sc 17), NOT lseek+read: the fd is SHARED between threads, so
+        // lseek+read interleaves (A seeks, B seeks, A reads from B's offset).
+        // pread takes the offset as an argument and is atomic per call.
+        let abso = gguf_tensor_offset(TENSOR) + r * rb
+        let got = syscall(17, gguf_fd, rowraw, rb, abso, 0, 0)
+        if got != rb { return 0 - 1 }
+        if read_block_f64(dtype, rowraw, NCOLS, rowbuf) == 0 { return 0 - 1 }
+        let acc: f64 = 0.0
+        let c = 0
+        while c < NCOLS {
+            acc = acc + f64of(mem_load(rowbuf + c * 8)) * f64of(mem_load(XBUF + c * 8))
+            c = c + 1
+        }
+        mem_store(YBUF + r * 8, acc)
+        mine = mine + 1
+        r = r + 1
+    }
+    return mine
+}
+
+// Each spawner passes a LITERAL id, so the child never reads it from the frame.
+fn spawn1() -> i64 {
+    let stack = mem_alloc(1048576)
+    let r = syscall(56, 0x10f00, stack + 1048576 - 64, 0, 0, 0)
+    if r == 0 { child_body(1); mem_store(DONEFLAG + 1 * 8, 1); syscall(60, 0, 0, 0, 0, 0) }
+    return r
+}
+fn spawn2() -> i64 {
+    let stack = mem_alloc(1048576)
+    let r = syscall(56, 0x10f00, stack + 1048576 - 64, 0, 0, 0)
+    if r == 0 { child_body(2); mem_store(DONEFLAG + 2 * 8, 1); syscall(60, 0, 0, 0, 0, 0) }
+    return r
+}
+fn spawn3() -> i64 {
+    let stack = mem_alloc(1048576)
+    let r = syscall(56, 0x10f00, stack + 1048576 - 64, 0, 0, 0)
+    if r == 0 { child_body(3); mem_store(DONEFLAG + 3 * 8, 1); syscall(60, 0, 0, 0, 0, 0) }
+    return r
+}
+
+fn main() -> i64 {
+    if gguf_load("/opt/ai/models/quanta/QUANTA-LFM2.5-2.6Bv1-Q4_K_M.gguf") != 0 { return 1 }
+    TENSOR = gguf_find_tensor("blk.0.shortconv.out_proj.weight")
+    NROWS = gguf_tensor_dim(TENSOR, 1)
+    NCOLS = gguf_tensor_dim(TENSOR, 0)
+    print("rows="); print(NROWS); print(" cols="); print(NCOLS); print(" nwork="); print(NWORK); print("\n")
+
+    mm_init(NCOLS)
+    ROWCAP = mm_rowcap
+    RAWCAP = mm_rowraw_cap
+    SCR = mem_alloc(NWORK * (ROWCAP * 8 + RAWCAP))
+    XBUF = mem_alloc(NCOLS * 8)
+    YBUF = mem_alloc(NROWS * 8)
+    DONEFLAG = mem_alloc(NWORK * 8)
+    let yserial = mem_alloc(NROWS * 8)
+
+    let c0 = 0
+    while c0 < NCOLS { mem_store(XBUF + c0 * 8, i2f(1)); c0 = c0 + 1 }
+
+    // ---- serial reference over every partition ----
+    let t0 = clock()
+    let ser = 0
+    let sw = 0
+    while sw < NWORK { ser = ser + child_body(sw); sw = sw + 1 }
+    let t1 = clock()
+    let c1 = 0
+    while c1 < NROWS { mem_store(yserial + c1 * 8, f64of(mem_load(YBUF + c1 * 8))); c1 = c1 + 1 }
+    print("SERIAL rows="); print(ser); print(" ns="); print(t1 - t0); print("\n")
+
+    // ---- parallel ----
+    let c2 = 0
+    while c2 < NWORK { mem_store(DONEFLAG + c2 * 8, 0); c2 = c2 + 1 }
+    c2 = 0
+    while c2 < NROWS { mem_store(YBUF + c2 * 8, 0.0); c2 = c2 + 1 }
+
+    let t2 = clock()
+    spawn1()
+    spawn2()
+    spawn3()
+    child_body(0)                      // parent is worker 0
+    // JOIN on the done flags. The parent finishing its own partition says
+    // nothing about the children.
+    let ww = 1
+    while ww < NWORK {
+        let spins = 0
+        while mem_load(DONEFLAG + ww * 8) == 0 && spins < 4000000000 { spins = spins + 1 }
+        ww = ww + 1
+    }
+    let t3 = clock()
+    print("PARALLEL ns="); print(t3 - t2); print("\n")
+
+    // ---- correctness ----
+    let bad = 0
+    let firstbad = 0 - 1
+    let c3 = 0
+    while c3 < NROWS {
+        if f64of(mem_load(YBUF + c3 * 8)) != f64of(mem_load(yserial + c3 * 8)) {
+            bad = bad + 1
+            if firstbad < 0 { firstbad = c3 }
+        }
+        c3 = c3 + 1
+    }
+    print("MISMATCHES="); print(bad)
+    if firstbad >= 0 { print(" first_row="); print(firstbad) }
+    print("\n")
+    return 0
+}
