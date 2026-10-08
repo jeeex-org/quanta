@@ -159,7 +159,11 @@ fn qmodel_name(h: i64, i: i64) -> u64 {
         return gguf_tensor_name_str(i)
     }
     if k == QMODEL_ST {
-        if i < 0 || i >= st_ntensors { return 0 }
+        // st_count(), NOT st_ntensors: st_ntensors is a declared-but-never-
+        // assigned global that is still 0, so testing against it made EVERY
+        // index out of range and qmodel_name returned 0 for every safetensors
+        // tensor.
+        if i < 0 || i >= st_count() { return 0 }
         return st_name_at(i)
     }
     return 0
@@ -242,14 +246,25 @@ fn qmodel_offset(h: i64, i: i64) -> i64 {
     return QMODEL_ERR_RANGE
 }
 
+// Out-parameter scratch for st_layout. These are MODULE GLOBALS, not locals:
+// `let p = mem_alloc(...)` is a compiler-owned binding freed on scope exit, so a
+// local scratch buffer is dead the moment st_layout returns and reading it
+// segfaults. Same reason gguf_tensor_data and mm_dot_acc are module lets.
+let qmodel_nb_buf = 0
+let qmodel_bt_buf = 0
+
 fn qmodel_nbytes(h: i64, i: i64) -> i64 {
     let k = qmodel_kind(h)
     if k == QMODEL_GGUF { return gguf_tensor_nbytes(i) }
     if k == QMODEL_ST {
-        let nb = mem_alloc(8)
-        let bt = mem_alloc(8)
-        if st_layout(qmodel_name(h, i), nb, bt) < 0 { return QMODEL_ERR_TENSOR }
-        return mem_load(nb)
+        if qmodel_nb_buf == 0 {
+            qmodel_nb_buf = mem_alloc(8)
+            qmodel_bt_buf = mem_alloc(8)
+        }
+        let nm = qmodel_name(h, i)
+        if nm == 0 { return QMODEL_ERR_TENSOR }
+        if st_layout(nm, qmodel_nb_buf, qmodel_bt_buf) < 0 { return QMODEL_ERR_TENSOR }
+        return mem_load(qmodel_nb_buf)
     }
     return QMODEL_ERR_RANGE
 }

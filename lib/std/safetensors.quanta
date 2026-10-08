@@ -193,8 +193,24 @@ fn st_validate_one(e) {
     let shv = json_object_get(eo, "shape")
     if shv < 0 { return 0 - 3004 }
     if json_get_type(shv) != 4 { return 0 - 3004 }
-    let nel = st_nelements(json_get_array(shv))
-    if nel < 0 { return 0 - 3004 }
+    // A ZERO-LENGTH shape is a SCALAR, not corruption. st_nelements returns -1
+    // for it, and treating that as invalid rejected the whole file:
+    // /opt/ai/models/quanta/model.safetensors has 1,166 of 2,780 tensors with
+    // "shape": [] -- per-tensor F32 activation scales, 4 bytes each
+    // (e.g. lm_head.input_activation_scale, offsets [0, 4]). st_open returned
+    // -3004 on a perfectly valid model.
+    //
+    // So an empty shape means exactly one element, and the byte-length check
+    // below then does its real job: 1 * 32 bits / 8 = 4 bytes, which is what
+    // the file declares. A hostile file still cannot use this to smuggle a bad
+    // length past, because the length is derived and compared, not trusted.
+    let shape_arr = json_get_array(shv)
+    let ndims = json_array_len(shape_arr)
+    let nel = 1
+    if ndims > 0 {
+        nel = st_nelements(shape_arr)
+        if nel < 0 { return 0 - 3004 }
+    }
 
     let offv = json_object_get(eo, "data_offsets")
     if offv < 0 { return 0 - 3006 }
