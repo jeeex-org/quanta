@@ -2138,12 +2138,26 @@ fn dequant_q4k(raw, nelements, out) {
             //   shift/mask instead of idiv      93 ms  <- the real win, 1.39x
             //   merged into one pass            98 ms  (noise, kept for clarity)
             //   precomputed 16-entry table     101 ms  (SLOWER -- reverted)
+            //   4-wide AVX2 f64                267 ms  (3.5x SLOWER -- reverted)
             // The table lost because a mem_load+mem_store pair costs as much as
-            // the fmul+fsub pair it replaced. Each float builtin expands to
-            // movq xmm0,rdi / movq xmm1,rsi / mulsd / movq rax,xmm0, and with
-            // -O a no-op there is no register allocation, so every "variable"
-            // read is a frame load anyway. Micro-optimising this loop is
-            // exhausted; the remaining lever is parallelism (20 cores vs 1).
+            // the fmul+fsub pair it replaced.
+            //
+            // The 4-wide attempt is the informative one: fmulf_avx2/fsubf_avx2
+            // are real and correct, but they need their operands in MEMORY
+            // (pointer arguments), so the nibbles must be materialised as f64
+            // first. That adds a whole extra pass -- 32 stores to build the
+            // nibble buffer, then 32 more to write the results -- on top of the
+            // 32 the scalar form already does. This loop is bound by memory
+            // operations per element, not by FP arithmetic, which is why
+            // widening the arithmetic made it worse.
+            //
+            // So dequant is NOT vectorisable with the builtins that exist.
+            // Breaking 93 ms needs either a new emitter builtin (a vector
+            // nibble-unpack or int->f64 convert, so the values never round-trip
+            // through memory) or a fused Q4_K matvec (q4k_matvec_avx2, currently
+            // a placeholder), or threads -- and threads are blocked on the clone
+            // trampoline (see scripts/proto/README.md). Recorded so the next
+            // session does not retry the widening.
             let op = out + (bi * 256 + chunk * 64) * 8
             let l = 0
             while l < 32 {
