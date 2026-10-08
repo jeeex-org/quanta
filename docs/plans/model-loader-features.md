@@ -351,6 +351,49 @@ Driven by the measurements, not by folklore.
 6. `cudaMemPoolAttrReleaseThreshold` for constant-VA reload
 7. **do not** implement double buffering (+0.2%), **do not** attempt file-backed `cudaHostRegister` (fails)
 
+#### Phase 7a — Threading the CPU matvec (prerequisite, measured)
+
+The forward pass currently runs at **~90 s/token** (2.6B Q4_K_M, 20-core box). Profiled, not
+guessed — per-phase in-program timestamps:
+
+| phase | time |
+|---|---|
+| embedding lookup | 0.00 s |
+| one conv layer (22 of 30 layers) | 3.47 s |
+| one attn layer (8 of 30) | 3.21 s |
+| output projection (128000x2048) | 12.80 s |
+
+Within a 2048x2048 Q4_K matvec: **dequant 93 ms, dot 69 ms** — dequantization dominates.
+
+**Micro-optimisation of this loop is exhausted.** Measured, all four variants:
+
+| variant | dequant |
+|---|---|
+| direct `fmul`/`fsub` with `idiv` | 129 ms |
+| shift/mask instead of `idiv` | **93 ms (1.39x, kept)** |
+| merged nibble passes | 98 ms (noise) |
+| precomputed 16-entry table | 101 ms (slower, reverted) |
+
+The reason nothing else helps: **`-O` is a verified no-op** (byte-identical binaries with and
+without it — md5 `5fab7144…` both ways). There is no register allocation, so every variable read
+is a frame load no matter how the expression is arranged.
+
+⚠️ **The remaining lever is parallelism: 20 cores, currently 1.** That is ~10x, not 1.4x.
+
+**Constraints on doing it safely** (this is why it is a phase, not an edit):
+- The matvec path uses **module-global scratch** (`mm_rowbuf`, `mm_rowraw`, `fc_sc_*`, `fc_at_*`,
+  `fc_fw_*`). Those are a data race by construction. Each worker needs its own buffers, or the
+  work must be partitioned so no two threads share one.
+- A race here **silently corrupts numbers that currently verify exactly against llama.cpp**. A
+  wrong answer is worse than a slow one.
+- Required invariant, same as Phase 8: **thread count must not change the result.** Enforced by
+  running 1/2/4/20 threads and comparing logits bit-for-bit — the existing
+  `fc_forward_token` vs llama.cpp oracle already provides the reference.
+- Quanta has the primitives: `fnptr(FNAME)` (code pointer), `syscall()` (so `clone`), `clock()`
+  (CLOCK_MONOTONIC ns for timing). Verify each with a small probe before building on it.
+
+Order: partition first (per-thread scratch), then measure scaling, then keep only what scales.
+
 ### Phase 8 — Partial load / block swap
 
 - `load_partial(model, budget)` returning a handle that can grow
@@ -360,6 +403,38 @@ Driven by the measurements, not by folklore.
 - adjacent-matrix layout so one `pread` serves a whole group
 
 **Invariant: partial load and full load must produce identical numbers.** Enforced by a test that runs both and compares bit-for-bit. This is the Colibrì "placement only decides speed" rule, and it is the same discipline already applied to the KV cache and RoPE.
+
+### Phase 8b — MoE expert offload (the mechanism for "larger models" on 8 GB)
+
+This is the concrete answer to "support larger models" on a single 8 GB card. A dense model larger
+than VRAM is hopeless here; an **MoE** is not, because only a few experts are active per token.
+Keep attention and the router dense on GPU, stream experts from host RAM (62 GB on this box).
+
+Source: `exllamav3_ext/cpu/moe_handoff.h` (clone `151539c`). Its design, stated in the header:
+
+- A **persistent worker child process** consumes a job ring. It is not spawned per forward pass.
+- **Pinned shared memory** allocated and `cudaHostRegister`ed by the parent, plain-mapped by the
+  child. All offsets are byte offsets from a region base.
+- Control block: `quit`, `pass_wake` (parent bumps at the start of every forward pass; child spins
+  hard), `abort` (set by the GPU wait kernel on timeout, checked by the parent per pass), `ready`
+  (child → parent: loop entered, layers loaded), `jobs_tail`/`jobs_head` (producer/consumer).
+- Per-slot sequence numbers, **three of them**: `data_ready[]` (GPU publishes job seq), `done[]`
+  (child finished writing), `consumed[]` (the collecting device's stream published after reading
+  the slot back). ⚠️ **Slot reuse waits on `consumed`, not `done`.** The header spells out why:
+  with offloaded layers spread over several GPUs the next tenant's issue runs on a different
+  stream than the previous tenant's readback, so `done` alone lets the child overwrite the output
+  while the readback is still queued on the other device.
+- Per-slot payload: `[x fp16 cap_rows*Hi][sel i32 cap_rows*topk][w fp16 cap_rows*topk]`.
+
+**What this means for Quanta, honestly:** the mechanism is CUDA+shared-memory+process-handoff, so
+none of it ports directly to a single-GPU CPU implementation. What *does* carry over is the
+**design**: pinned staging, a bounded job ring, and a three-state slot protocol. Quanta's own
+version would be single-process (worker threads via `clone`, or a pread pool), with the same
+invariant as Phase 8 — **placement decides speed, never semantics** — enforced by the same
+bit-for-bit test.
+
+⚠️ Do not attempt this before Phase 7/8 exist and the forward pass is fast enough to measure. An
+offloaded MoE at the current ~90 s/token is unusable regardless of how well it fits.
 
 ### Phase 9 — Formats beyond GGUF/safetensors
 
@@ -371,9 +446,35 @@ Prioritized by what actually ships:
 4. **AWQ** — note zero-points are *not stored*; dequant adds
 5. **MXFP4 / NVFP4** — block 32 E8M0 / block 16 E4M3 + global scale
 6. **IQ4_NL / IQ4_XS** — ComfyUI-GGUF already has working reference code on-box
-7. EXL2 — per-group bit counts; **no trellis exists**
+7. **EXL3 (trellis)** — see below. Corrects an earlier note in this plan that said "EXL2: no
+   trellis exists". **EXL3 *is* the trellis format**, and it is what actually ships for large
+   models. EXL2 is the older per-group-bit-count scheme.
 
 Each new format: implement, then validate against the on-box independent implementations (ComfyUI-GGUF, the preserved Python references) before claiming support.
+
+**EXL3 trellis — format notes** (read from `exllamav3` clone `151539c`; note that Kyojin is a
+*fork* of exllamav3 for AMD Strix Halo/gfx1151 and its additions are `USE_ROCM`-guarded, so the
+fork itself is not portable to this box — the upstream engine is the part worth reading):
+
+- **Different in kind from GGUF.** GGUF K-quants are per-256-block affine (`d * q - m`); EXL3
+  applies a **Hadamard rotation** to each 256-wide group and then a **trellis codebook** over the
+  whole group, so error is spread across the group rather than independent per element. That is
+  why it reaches usable quality at 1.5–2.0 bpw where GGUF cannot.
+- Three codebooks: `mul1` (default), `mcg`, `3inst`. `mul1` is required by the int8 GEMV and
+  CPU-expert-offload paths.
+- Bitrate is **fractional**: integer part plus a `half` flag (a 0.5 bpw step). Packed size is
+  `16*K + (HALF ? 8 : 0)` uint16 per tile — see `exllamav3_ext/quant/exl3_kernel_map.cuh`.
+- Weights are stored as `uint16_t` tiles; `reconstruct.cu` is the reference decode and
+  `exl3_gemv.cu` / `exl3_gemm.cu` are the GEMV/GEMM paths.
+- The embedding table can itself be quantized (`-eb`, 1–8 bpw, or 16 = unquantized) and **streamed
+  from disk or held in system RAM**, decoded on GPU at inference (`--embed_disk`).
+- ⚠️ **There is no CPU reference implementation in-tree.** `exllamav3_ext/cpu/` contains only MoE
+  handoff/mul helpers; every EXL3 decode kernel is CUDA (`*.cu`) with RDNA variants under
+  `rocm/`. Porting to Quanta means transcribing the trellis decode from the CUDA kernels, which is
+  a project, not a copy.
+- ⚠️ **Not bit-reproducible by design in one respect:** greedy output under speculative decoding is
+  *not* token-identical to plain decode, because near-tied logits can flip under batched verify
+  (stated in the Kyojin README). Do not write a bit-equality test across those two paths.
 
 **Layout references mined from unsloth source** (clone `660bcba`; it is a *trainer*, not a loader —
 `FastLanguageModel.from_pretrained` delegates to HF, and llama.cpp is used only for GGUF export, so
