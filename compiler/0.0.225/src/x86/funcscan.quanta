@@ -1029,6 +1029,41 @@ fn scan_call_float() {
 // f2i call site would feed an integer to a float operand.
 fn ret_expr_is_float(start, end) {
     let q = start
+    // f2i IS EXCLUDED -- it is an int sink -- but excluding it from the scan
+    // below is NOT enough, because the scan walks EVERY token:
+    //
+    //     fn f(n: i64) -> i64 { return f2i(f64of(n) * 0.5) }
+    //
+    // sees `f64of` and the `f*` arithmetic and concludes "returns float",
+    // marking fn_retflt=1. The caller then tags the result float, and every
+    // downstream integer operation on it is silently wrong -- the value is
+    // correct but print()/arithmetic take the float path and yield bit patterns:
+    //
+    //     let t = 800000
+    //     t - f(20)   ->  4695119159766286336   (= 799980.0 as a double)
+    //
+    // So check the OUTERMOST operation FIRST: if the expression is a call to
+    // f2i, the result is an integer regardless of what it contains. This is
+    // what the comment at the fn_retflt call site already claimed happened.
+    let isf = 0
+    let k = start
+    // Find the first TT_ID that begins a call, i.e. is followed by '('.
+    while k < end && isf == 0 {
+        if tokt(k)==TT_ID {
+            let nm = r8(src+tokv(k))
+            let nm1 = r8(src+tokv(k)+1)
+            let nm2 = r8(src+tokv(k)+2)
+            if nm=='f'&&nm1=='2'&&nm2=='i' { return 0 }   // f2i(...) -> int
+            // Any other call at the head of the expression: its own result type
+            // is decided by its own body, so do not guess from the arguments.
+            let nxt = k+1
+            if nxt<end && tokt(nxt)==TT_PNCT && tokv(nxt)==40 { isf = -1 }
+        }
+        k = k+1
+    }
+    // A head call that is not f2i: we cannot see through it, so fall back to
+    // the token scan (which is what handled fadd(...), i2f(...), etc. before).
+    if isf == -1 { isf = 0 }
     while q < end {
         if tokt(q)==TT_FNUM { return 1 }
         if tokt(q)==TT_ID {
@@ -1199,6 +1234,68 @@ fn ret_id_bound_float_walk(bt, end, r) {
     return 0
 }
 
+// A DECLARED integer return type is authoritative: never tag fn_retflt for it.
+//
+// Both inference paths below (ret_expr_is_float and the transitive
+// ret_id_bound_float walk) answer "does this function RETURN a float" by
+// looking for a float PRODUCER anywhere reachable from the return expression.
+// That is an over-approximation, and it leaks in two measured ways:
+//
+//  1. f2i is an int sink but the scan still saw the float inside it:
+//         fn f(n: i64) -> i64 { return f2i(f64of(n) * 0.5) }
+//     (ret_expr_is_float short-circuits on a head f2i call)
+//
+//  2. Reading a module-level FLOAT CONSTANT poisons the whole body, even when
+//     the value is never returned:
+//         let G_FLOAT = 0.5
+//         fn only_read(n: i64) -> i64 {
+//             let s = G_FLOAT
+//             if s > 0.0 { return n - 1 }
+//             return n - 2
+//         }
+//         t - only_read(20)  ->  4616189618055558400   (should be 799981)
+//
+// Both produce a correct VALUE tagged as a float, so the caller prints and
+// computes on raw IEEE-754 bit patterns -- wrong but plausible, and invisible
+// to any check that only compares values.
+//
+// The declaration is ground truth and costs nothing to consult: a function
+// declared `-> i64` returns an integer whatever its body does. Only an
+// UNDECLARED return type (or `-> f64`) may be inferred.
+//
+// READ FROM THE TOKEN STREAM, not from fn_rettype_name: that array is filled by
+// sfn(), which runs at entry.quanta:745/904, long AFTER scan_retfloat() at :497.
+// Consulting it here always saw "undeclared" and the guard silently did nothing.
+// The signature is walkable from the body token, which scanfns() has already
+// recorded.
+fn declared_int_return(fi) -> i64 {
+    let bt = r64(fns + fi*FNS + 16)          // fn_btok: the body's '{'
+    if bt < 2 { return 0 }
+    // Walk back over the parameter list and name to find `->`. Bounded by the
+    // enclosing statement so a stray '->' in an earlier function cannot match.
+    let k = bt - 1
+    let guard = 0
+    while k >= 0 && guard < 200 {
+        // `->` is ONE TT_OP token, value 45*256+62 (parse.quanta:1133 uses the
+        // same encoding for '>'; the lexer fuses '-' '>'). Looking for two
+        // separate op tokens finds nothing and the guard never fires.
+        if tokt(k)==TT_OP && tokv(k)==45*256+62 {
+            let t = k + 1
+            if t >= tokc { return 0 }
+            let c0 = r8(src+tokv(t))
+            if c0=='f' { return 0 }            // -> f64 : float, keep inferring
+            if c0=='i' || c0=='u' || c0=='b' { return 1 }
+            if c0=='*' { return 0 }            // -> *P : pointer, not a float
+            return 0
+        }
+        // Stop at the `}` or `;` that closes the PREVIOUS top-level item.
+        if tokt(k)==TT_PNCT && (tokv(k)==125 || tokv(k)==59) { return 0 }
+        k = k - 1
+        guard = guard + 1
+    }
+    return 0
+}
+
 fn scan_retfloat() {
     // bind_memo is keyed by token index, and token indices are reused across
     // compiles, so a stale verdict from a previous file would mis-tag. Zero it
@@ -1221,6 +1318,16 @@ fn scan_retfloat() {
     // flag when it was never set, and let the body analysis add to it.
     let already = r64(fn_retflt + fi*8)
     if already != 1 { w64(fn_retflt + fi*8, 0) }
+    // A DECLARED integer return type is authoritative and settles the matter
+    // here, once, instead of at each of the three inference sites below.
+    // Reading a module-level float constant anywhere in the body used to mark
+    // the whole function float and poison every caller:
+    //     let G_FLOAT = 0.5
+    //     fn only_read(n: i64) -> i64 { let s = G_FLOAT ... return n - 1 }
+    //     t - only_read(20)  ->  4616189618055558400   (should be 799981)
+    // `-> i64` returns an integer whatever the body contains, so there is
+    // nothing left for the inference to decide.
+    if already != 1 && declared_int_return(fi) == 1 { fi = fi + 1; continue }
     let bt = fn_btok(fi)
     let depth = 0; let p = bt; let end = tokc; let started = 0
     while p < tokc {
@@ -1245,13 +1352,14 @@ fn scan_retfloat() {
             if tokt(s)==TT_OP && tokv(s)==59 { go = 0 }
             else { s = s+1 }
           }
-          if ret_expr_is_float(r, s)==1 { w64(fn_retflt + fi*8, 1) }
+          if declared_int_return(fi) == 1 { /* declaration wins: never tag */ }
+          else if ret_expr_is_float(r, s)==1 { w64(fn_retflt + fi*8, 1) }
           // `return <ident>`: resolve the local to its bound expression. A float
           //->int conversion in the returned expression has already been judged
           // NOT-float by ret_expr_is_float (f2i is excluded), and that verdict
           // stands; only fall through to the binding when the return is a bare
           // name, so `return f2i(x)` on a float local stays an int return.
-          else if r<s && tokt(r)==TT_ID && ret_id_bound_float(bt, end, r)==1 { w64(fn_retflt + fi*8, 1) }
+          else if declared_int_return(fi) == 0 && r<s && tokt(r)==TT_ID && ret_id_bound_float(bt, end, r)==1 { w64(fn_retflt + fi*8, 1) }
         }
       }
       if tokt(q)==TT_PNCT {
