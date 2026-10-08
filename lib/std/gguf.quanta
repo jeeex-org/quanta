@@ -2134,15 +2134,20 @@ fn dequant_q4k(raw, nelements, out) {
             let l = 0
             while l < 32 {
                 let b = mem_load8(q + l)
+                // Shifts/mask, NOT `b / 16` and `(b/16)*16`. Quanta's -O is a
+                // verified no-op (byte-identical binaries with and without it),
+                // so an integer divide here is a real `idiv` -- ~40-80 cycles
+                // each, twice per element, which is the bulk of the 90
+                // cycles/element measured in the dequant loop.
                 mem_store(out + (bi * 256 + chunk * 64 + l) * 8,
-                          fsub(fmul(d1, i2f(b - (b / 16) * 16)), mm1))
+                          fsub(fmul(d1, i2f(b & 15)), mm1))
                 l = l + 1
             }
             l = 0
             while l < 32 {
                 let b = mem_load8(q + l)
                 mem_store(out + (bi * 256 + chunk * 64 + 32 + l) * 8,
-                          fsub(fmul(d2, i2f(b / 16)), mm2))
+                          fsub(fmul(d2, i2f(b >> 4)), mm2))
                 l = l + 1
             }
             q = q + 32
