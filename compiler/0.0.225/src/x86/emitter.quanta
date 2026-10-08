@@ -1025,11 +1025,43 @@ fn emit_bltn(nmi,nl,ii) {
         return 1
     }
     if nl==3&&r8(nm)=='f'&&r8(nm+1)=='2'&&r8(nm+2)=='i' {  // f2i(x): f64 -> int64 (trunc)
-        // NO flush_all ? uses only xmm0
-        eb(102); eb(72); eb(15); eb(110); eb(199) // movq xmm0, rdi
+        // LOAD THE OPERAND INTO A REGISTER DISTINCT FROM THE RESULT.
+        //
+        // f2i CORRUPTED ITS OWN SOURCE VREG:
+        //
+        //     let p = mem_alloc(8); mem_store(p, 4614256656552045840)  // 10.0
+        //     let f = f64_load(p)
+        //     f64bits(f)  -> 4614256656552045840    correct
+        //     let junk = f2i(f)
+        //     f64bits(f)  -> 3                     CLOBBERED
+        //     mem_load(p) -> 4614256656552045840   the MEMORY is still intact
+        //
+        // aphys() handed back a register that sdef(res) then re-used, so the
+        // integer result landed on top of the float's home slot. Reading that
+        // slot back gave 3 -- the truncation of whatever bit pattern was there --
+        // which is why EVERY computed float failed (direct, f64 param, untyped
+        // param, store/reload round trip) while a literal still worked: a literal
+        // is materialised into a GPR and never shares the alias.
+        //
+        // adistinct() is the helper for exactly this (emitter.quanta:316): the
+        // operand is given its register FIRST via aphys, then adistinct picks a
+        // register that is neither the operand's nor the result's current one.
+        // f2i was not using it. Do NOT guard on rd: register 0 is a real
+        // destination, and a guard emits `mov %rax,%rax`.
+        let res = irres(ii)
+        let av = -1
+        let ab = ira2(ii)
+        if ira1(ii) >= 1 && ab >= 0 { av = irres(ab) }
+        if av >= 0 {
+            let srcv = ira0(ab)
+            let rs = aphys(srcv)
+            let rd = adistinct(res, rs, -1)
+            rr(rd, rs)
+            eb(102); eb(72); eb(15); eb(110); eb(192 + rd)   // movq xmm0, rd
+        }
         eb(242); eb(72); eb(15); eb(44); eb(192)  // cvttsd2si rax, xmm0
-        sdef(irres(ii), 0)
-        w8(vfloat+irres(ii), 0)
+        sdef(res, 0)
+        w8(vfloat+res, 0)
         return 1
     }
     if nl==6&&r8(nm)=='f'&&r8(nm+1)=='c'&&r8(nm+2)=='o'&&r8(nm+3)=='n'&&r8(nm+4)=='s'&&r8(nm+5)=='t' {  // fconst(M, scale, exp10): float literal = (M/scale)*10^exp10
