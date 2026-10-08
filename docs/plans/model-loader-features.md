@@ -570,6 +570,97 @@ references in Phase 9.
 
 ---
 
+## 4c. Phase 11 — Model-size intelligence: fit the harness to the model
+
+**Why this belongs in the loader plan at all.** Every mechanism above assumes one execution
+shape. That is the mistake HashCortX is built to avoid, and the measurements on this box make it
+concrete: LFM2.5-2.6B takes **~68 s/token** here. A 2.6B model *is* the small case, and at that
+speed the correct response is not a faster kernel — it is to stop asking the model to do work a
+2.6B model cannot do. HashCortX (`src/platform/tauri/hashcoder.js:1067`) sizes its whole agent
+harness to the model for exactly this reason. Read from source, not from the README.
+
+### The size decision — from metadata, with a name fallback
+
+`HC.code.sizeOf(billions)` → `'small' | 'mid' | 'full'`, with `null`/unknown → `'full'` so a missing
+figure never *degrades* a model:
+
+| Tier | Boundary | What the model gets |
+|---|---|---|
+| `small` | < 5B | light mode: writes whole files, **the harness does the tool work** and runs the tests |
+| `mid` | 5B–15B | focused tools, steps written out, a plan for longer requests |
+| `full` | ≥ 15B, cloud, or unknown | code map, per-project lessons, a reviewer for larger changes |
+
+`billions` is **read from the model's own metadata** (`local-context.js:90` — Ollama
+`details.parameter_size` via `/api/show`), parsed as `"3.1B"`/`"770M"` → billions
+(`local-context.js:64`), cached per `host|model`, falling back to parsing the *name*
+(`light.js:67` `billionsInName`). Unknown ⇒ `full`, so an older Ollama or a model with no
+`details` loses nothing.
+
+**Quanta can do better than a name regex, because the loader already has the truth.** Phases 2–4
+built a dtype model and a role registry over the tensor table; the parameter count is derivable
+from the same table exactly, and GGUF carries `<arch>.block_count`, embedding width and
+`general.parameter_count` in metadata. So: **read the real count from the loaded tensor graph,
+use the name parse only as the pre-load fallback.** That is a genuine improvement over the
+reference, not a port.
+
+### Four mechanisms worth adopting (all pure functions, all testable without a model)
+
+1. **Context budget by size** (`agent-context.js:39-78`). Tool-output budget scales with tier:
+   `small` 12k chars / 4 results / 3k shell output → `full` 60k / 10 / 20k. The non-obvious part is
+   *how* it gives way: hiding happens in **steps** (cut to `hideTo` × budget, several results at
+   once) rather than one per turn, because a per-turn change forces a full re-read of the prompt
+   on every turn and destroys prefix-cache reuse. **Pure functions of the message list, no state
+   between turns** — the same conversation always yields the same prompt.
+2. **Temperature ceiling by size** (`hashcoder.js:1077`). `{small: 0.1, mid: 0.2, full: 0.35}`,
+   and the user's slider is a *ceiling*, never a wish for more. Rationale: an agent copies text
+   exactly and writes paths/arguments in fixed shapes; a small model samples those wrongly.
+   Default 0.15 when unset.
+3. **Light mode — the harness does the work** (`light.js`). Under 5B the model is offered
+   whole-file writes and no fine-grained tools; the host performs the tool operations and runs the
+   tests. This is the mechanism that makes a 2.6B model *capable* rather than merely fast.
+4. **Proof, not the model's word** (`verify.js`). The best mechanism here, and the one with the
+   clearest lesson for Quanta. An agent that changed code and said "done" was believed on its
+   word. Instead:
+   - the project's own checks are discovered once (test/lint/type/build per package.json,
+     pyproject, Cargo, Makefile) — **the app never runs them itself**;
+   - every command the agent runs is sorted (test/lint/type/build/format) and recorded with
+     pass/fail, scope (whole project or part) and whether it ran **after the last file change**;
+   - the agent is **sent back** when it tries to finish unproven, each check bounded to at most
+     2 send-backs (3 in light mode);
+   - **for a local model < 15B, a reply of words alone is also sent back** — that class of model
+     ends a run by *explaining* the fix or asking a question instead of making the change;
+   - **for < 15B that changed files, one more send-back quotes the original request and checks
+     each item against the files.** Stated failure mode: *"Such a model's usual failure is not a
+     wrong change but a finished half: one of three edits, a page without the stylesheet."*
+   - the end-of-run summary is computed **from the proof record**, never from the agent's own
+     words.
+   
+   The ordering is fixed and each rule is tried in turn (`sendBack`, `verify.js`): unmade change →
+   unchecked test → open plan steps → no proof → per-ask check → small-model self-review.
+
+### What this changes about the performance work already done
+
+This reframes the ~68 s/token result rather than replacing it. The AVX2 dot win (2.95× on the dot,
+~1.8× end-to-end) stands on its own, and threading remains blocked on the `clone` trampoline.
+But at 2.6B and 68 s/token, **kernel work has a ceiling**: it improves a number nobody can use,
+while light mode + proof-send-back converts the same model into one that completes tasks at all.
+Sequencing: build the size tiering and light mode *alongside* further kernel work, not after it.
+
+### Build order
+
+| Step | Deliverable | Done when |
+|---|---|---|
+| 11.1 | `qmodel_size_class()` from the tensor graph + metadata | returns `small/mid/full` for LFM2 2.6B from a real GGUF, `full` on unknown |
+| 11.2 | Context budgeting, pure, stepped | same conversation ⇒ same prompt, 1/2/4 worker-agnostic; sizes verified per tier |
+| 11.3 | Temperature ceiling | slider can lower, never raise, the tier ceiling |
+| 11.4 | Light mode: whole-file writes, host-side tool execution | a task a 2.6B model cannot do directly completes via light mode |
+| 11.5 | Proof record + send-back loop | an agent that "finishes" with no test after its change is sent back, ≤2 times |
+
+**Explicitly not adopted:** the app never runs the project's own test commands (the agent runs
+them and the result is *recorded*); lessons/code-map stay ≥15B-only, as upstream.
+
+---
+
 ## 5. Explicit non-goals
 
 - **No tiered VRAM/RAM/NVMe hierarchy as a core primitive.** Colibrì needs it at 744B/372 GB; Quanta's LFM2 target is 2.6B/~5 GB and never tiers. Build a bounded streaming reader; keep placement a policy layer *above* it.
@@ -592,7 +683,16 @@ references in Phase 9.
 
 Read from source, on-box: llama.cpp (`gguf.cpp`, `llama-arch.h/.cpp`, `llama-vocab.cpp`, `llama-model-loader.cpp`, `llama-mmap.cpp`), ComfyUI (`model_management.py`, `model_patcher.py`, `utils.py`), ComfyUI-GGUF (`dequant.py`), plus the local safetensors model corpus.
 
+HashCortX, cloned and read for Phase 11 (`git clone --depth 1`, v2.6.0-era `main`):
+`src/platform/tauri/hashcoder.js` (`sizeOf`, `SMALL_MODEL_BILLIONS`, `MID_MODEL_BILLIONS`,
+`TEMPERATURE_CEILING`, `SMALL_MODEL_TOOLS`), `src/js/local-context.js` (`billionsOf`, `infoOf`),
+`src/js/agent-context.js` (`TIERS`, `optionsFor`, stepped hiding), `src/js/code/light.js`
+(`billionsInName`, light-mode tool substitution), `src/js/code/verify.js` (`sendBack`, `proofLog`,
+`stopCheck`, `proofLine`), `src/js/code/{plan,review,asks,lessons,codemap,digest}.js`.
+Note: the README's "under 15B checks its own work" summary is much thinner than the code —
+the mechanisms above are what actually ship.
+
 Preserved research (2,923 lines, six inventories):
 `~/.hermes/cache/scratch/research/` — hp-runtimes-loaders, mlx-loader-inventory, quant-formats-layouts, safetensors-onnx-pytorch, vllm-ollama-loaders, gpuload/REPORT.md + 6 CUDA benchmarks, a1111-video-accelerate.
 
-**Correction to earlier claims in this session:** the MLX researcher found `web_extract` returning a *stale cached* `utils.py`, caught by cloning. Any web-fetched claim should be re-verified against a clone before entering a plan — llama.cpp and ComfyUI findings above were read from on-box source and are solid.
+**Correction to earlier claims in this session:** the MLX researcher found `web_extract` returning a *stale cached* `utils.py`, caught by cloning. Any web-fetched claim should be re-verified against a clone before entering a plan — llama.cpp and ComfyUI findings above were read from on-box source and are solid. The same applied to HashCortX: its README describes the tiering in prose, and reading the source was what found the real boundary constants, the metadata-first size lookup, the stepped hiding rule, and the six-rule `sendBack` order.
