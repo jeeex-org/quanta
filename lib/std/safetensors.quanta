@@ -296,3 +296,166 @@ fn st_close() {
 fn st_test_buffer_len() -> i64 {
     return st_test_hlen
 }
+// ===========================================================================
+// Index-based accessors -- added for Phase 6 (loader_traits)
+//
+// Until now this module could only reach a tensor BY NAME (st_entry/st_read/
+// st_layout) and st_ntensors was declared but NEVER ASSIGNED, so there was no
+// enumeration at all: a caller could not list what a file contains, only ask
+// for a name it already knew. The Phase 6 seam needs index -> name, so these
+// fill that gap.
+//
+// The technique is the one st_validate already uses: map_get has no "iterate"
+// entry point, but the bucket array is contiguous and each slot is (key, value)
+// with key==0 meaning empty. So enumeration walks slots and skips empties.
+//
+// ORDER IS THE SLOT ORDER of the parsed map, which is NOT the order tensors
+// appear in the file and NOT alphabetical. A caller must not assume otherwise;
+// qmodel_find below is the only safe way to go from a name to an index. This is
+// recorded in the seam too, because a caller that assumed file order would
+// silently read the wrong tensor.
+
+fn st_bucket_count() -> i64 {
+    if st_root == 0 { return 0 }
+    return mem_load(st_root)
+}
+
+fn st_bucket_esize() -> i64 {
+    if st_root == 0 { return 0 }
+    return mem_load(st_root + 8) * 8
+}
+
+// Name of the Nth non-empty, non-metadata bucket. Returns 0 when i is out of
+// range. Counts only real tensors, so it agrees with st_count().
+fn st_name_at(i: i64) -> u64 {
+    if st_root == 0 { return 0 }
+    if i < 0 { return 0 }
+    let nb = st_bucket_count()
+    let esz = st_bucket_esize()
+    if nb <= 0 || esz <= 0 { return 0 }
+    let seen = 0
+    let s = 0
+    while s < nb {
+        let slot = st_root + 16 + s * esz
+        let k = mem_load(slot)
+        if k != 0 && st_is_metadata(k) == 0 {
+            if seen == i { return k }
+            seen = seen + 1
+        }
+        s = s + 1
+    }
+    return 0
+}
+
+// Number of real tensors (every non-empty bucket that is not __metadata__).
+// This is what st_ntensors SHOULD have been from the start.
+fn st_count() -> i64 {
+    if st_root == 0 { return 0 }
+    let nb = st_bucket_count()
+    let esz = st_bucket_esize()
+    if nb <= 0 || esz <= 0 { return 0 }
+    let n = 0
+    let s = 0
+    while s < nb {
+        let slot = st_root + 16 + s * esz
+        let k = mem_load(slot)
+        if k != 0 && st_is_metadata(k) == 0 { n = n + 1 }
+        s = s + 1
+    }
+    return n
+}
+
+// Index of a tensor by name, or negative. Same slot ordering as st_name_at.
+fn st_index_of(name: u64) -> i64 {
+    if st_root == 0 { return 0 - 1 }
+    let nb = st_bucket_count()
+    let esz = st_bucket_esize()
+    if nb <= 0 || esz <= 0 { return 0 - 1 }
+    let seen = 0
+    let s = 0
+    while s < nb {
+        let slot = st_root + 16 + s * esz
+        let k = mem_load(slot)
+        if k != 0 && st_is_metadata(k) == 0 {
+            if equals(k, name) { return seen }
+            seen = seen + 1
+        }
+        s = s + 1
+    }
+    return 0 - 1
+}
+
+// Shape of tensor i, into a caller buffer. Returns the rank, or negative.
+fn st_dims_at(i: i64, out: u64, cap: i64) -> i64 {
+    let name = st_name_at(i)
+    if name == 0 { return 0 - 1 }
+    let e = st_entry(name)
+    if e < 0 { return 0 - 1 }
+    let eo = json_get_object(e)
+    let shv = json_object_get(eo, "shape")
+    if shv < 0 { return 0 - 2 }
+    if json_get_type(shv) != 4 { return 0 - 2 }
+    let arr = json_get_array(shv)
+    let nd = json_array_len(arr)
+    if nd <= 0 { return 0 - 2 }
+    if nd > cap { return 0 - 2 }
+    let d = 0
+    while d < nd {
+        mem_store(out + d * 8, json_get_number(json_array_get(arr, d)))
+        d = d + 1
+    }
+    return nd
+}
+
+fn st_ndims(i: i64) -> i64 {
+    let tmp = mem_alloc(32)
+    let r = st_dims_at(i, tmp, 4)
+    return r
+}
+
+fn st_dim(i: i64, d: i64) -> i64 {
+    if d < 0 || d > 3 { return 0 }
+    let tmp = mem_alloc(32)
+    let nd = st_dims_at(i, tmp, 4)
+    if nd < 0 { return 0 }
+    if d >= nd { return 0 }
+    return mem_load(tmp + d * 8)
+}
+
+fn st_nelements_of(i: i64) -> i64 {
+    let name = st_name_at(i)
+    if name == 0 { return 0 - 1 }
+    let e = st_entry(name)
+    if e < 0 { return 0 - 1 }
+    let eo = json_get_object(e)
+    let shv = json_object_get(eo, "shape")
+    if shv < 0 { return 0 - 2 }
+    if json_get_type(shv) != 4 { return 0 - 2 }
+    return st_nelements(json_get_array(shv))
+}
+
+// Element width in bits, or negative.
+fn st_bits_of(i: i64) -> i64 {
+    let name = st_name_at(i)
+    if name == 0 { return 0 - 1 }
+    let e = st_entry(name)
+    if e < 0 { return 0 - 1 }
+    let eo = json_get_object(e)
+    let dtv = json_object_get(eo, "dtype")
+    if dtv < 0 { return 0 - 2 }
+    return st_bits(json_get_string(dtv))
+}
+
+// Offset of tensor i's data WITHIN the data section (not the file).
+fn st_tensor_data_off(i: i64) -> i64 {
+    let name = st_name_at(i)
+    if name == 0 { return 0 - 1 }
+    let e = st_entry(name)
+    if e < 0 { return 0 - 1 }
+    let eo = json_get_object(e)
+    let offv = json_object_get(eo, "data_offsets")
+    if offv < 0 { return 0 - 2 }
+    let arr = json_get_array(offv)
+    if json_array_len(arr) != 2 { return 0 - 2 }
+    return json_get_number(json_array_get(arr, 0))
+}

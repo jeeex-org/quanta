@@ -1,0 +1,267 @@
+// ===========================================================================
+// Loader traits -- Phase 6
+//
+// The seam that lets a caller treat a model as "a model" instead of branching
+// on which file format it happens to be. Before this, every caller had to know
+// whether it held a GGUF or a safetensors file, and the two underlying APIs
+// barely resemble each other:
+//
+//   GGUF         gguf_load(path) -> rc, module-global handle
+//                gguf_find_tensor(name) -> idx, then gguf_tensor_* by INDEX
+//   safetensors  st_open(path) -> rc, module-global handle
+//                st_entry(name) -> json node, then st_read(name, buf)
+//
+// One enumerates by index, the other by name; one stores a dtype enum, the
+// other a dtype string. A caller that wants "the tensor named X" had to branch.
+//
+// What this adds, all pure dispatch, no new I/O:
+//
+//   qmodel_open(path)          -> handle, or a negative error
+//   qmodel_kind(h)             -> QMODEL_GGUF / QMODEL_ST
+//   qmodel_num_tensors(h)      -> count
+//   qmodel_name(h, i)          -> name of tensor i
+//   qmodel_find(h, name)       -> index, or negative
+//   qmodel_ndims/ndim/nbytes/nelements/offset
+//   qmodel_read(h, i, buf, n)  -> bytes read, or negative
+//   qmodel_is_quantized(h, i)
+//   qmodel_close(h)
+//
+// DESIGN NOTES, and the reasons behind them:
+//
+// 1. A handle is an INDEX into this module's table, not a pointer. Both
+//    underlying formats keep their state in module globals (gguf_fd, st_fd),
+//    so only ONE of each can be open at a time anyway. Pretending otherwise
+//    would be a lie the caller could detect. Phase 7 (GPU residency, multiple
+//    models resident) is what forces this to grow, and it should grow to real
+//    contexts then, not to a fake handle now.
+//
+// 2. Errors are negative and format-native at the boundary, normalised only
+//    where a caller genuinely cannot tell them apart. qmodel_open collapses
+//    "file not found" from both formats to QMODEL_ERR_OPEN, because every
+//    caller treats those identically. Read errors stay distinct, because
+//    "corrupt header" and "tensor out of bounds" are different bugs and
+//    flattening them would hide real defects -- the discipline the GGUF
+//    reader already follows (gguf_read_tensor_bytes_at returns -1 for a bad
+//    index and -3 for a bad offset, and they are kept apart on purpose).
+//
+// 3. dtype is deliberately NOT unified here. GGUF has numeric dtypes and
+//    safetensors has names ("F32", "BF16"). Phase 2 built a bit-width dtype
+//    model for exactly this; mapping both onto it belongs with the dequant
+//    work, not with the seam, and pretending now would bake in a guess.
+//    qmodel_bits(h,i) returns the WIDTH, which both formats can answer
+//    truthfully, and that is the one question the seam does answer.
+//
+// 4. No caching, no prefetch, no eviction. Those are Phase 7 and 8 and they
+//    belong above this layer, not inside it.
+
+
+// ---- format kinds ---------------------------------------------------------
+let QMODEL_GGUF = 1
+let QMODEL_ST = 2
+
+// ---- normalised errors ----------------------------------------------------
+let QMODEL_ERR_OPEN = -1        // file missing or unreadable
+let QMODEL_ERR_FORMAT = -2      // not a model file we understand
+let QMODEL_ERR_RANGE = -3       // index or name out of range
+let QMODEL_ERR_TENSOR = -4      // no such tensor
+let QMODEL_ERR_UNSUPPORTED = -5 // dtype we cannot handle
+
+// ---- handles --------------------------------------------------------------
+// Index 0 is reserved as "invalid" so a zeroed handle cannot alias a model.
+let QMODEL_MAX = 8
+// No array literals exist in this language: every table in lib/std is a
+// mem_alloc'd buffer written with mem_store (gguf_tensor_data, mm_dot_acc, ...).
+// These are the same shape, allocated once on first open.
+let qmodel_kind_of = 0
+let qmodel_path_of = 0
+let qmodel_tbl_ready = 0
+let qmodel_open_count = 0
+
+fn qmodel_tbl_init() {
+    if qmodel_tbl_ready != 0 { return }
+    qmodel_kind_of = mem_alloc(QMODEL_MAX * 8)
+    qmodel_path_of = mem_alloc(QMODEL_MAX * 8)
+    qmodel_tbl_ready = 1
+}
+
+// The current handle, so the single-slot-per-format reality of the underlying
+// APIs is explicit rather than accidental.
+let qmodel_cur = 0
+
+fn qmodel_kind(h: i64) -> i64 {
+    if qmodel_tbl_ready == 0 { return 0 }
+    if h < 1 || h > QMODEL_MAX { return 0 }
+    return mem_load(qmodel_kind_of + (h - 1) * 8)
+}
+
+// Which format a PATH claims, from its first bytes, without opening it fully.
+// GGUF magic is "GGUF" (0x47 0x47 0x55 0x46); safetensors is an 8-byte LE
+// header length, so the first four bytes are 0..255 and we check the magic
+// first, then fall back to probing st_open on a copy.
+//
+// Magic first is deliberate: a safetensors file whose header length happens to
+// spell "GGUF" is not a thing, but a GGUF file IS unambiguous, so the cheap
+// unambiguous test decides it.
+fn qmodel_probe(path: u64) -> i64 {
+    let fd = open(path, 0, 0)
+    if fd < 0 { return 0 }
+    let b = mem_alloc(8)
+    let got = read_raw(fd, b, 8)
+    close(fd)
+    if got < 4 { return 0 }
+    if mem_load8(b) == 71 && mem_load8(b + 1) == 71 && mem_load8(b + 2) == 85 && mem_load8(b + 3) == 70 {
+        return QMODEL_GGUF
+    }
+    return QMODEL_ST
+}
+
+fn qmodel_open(path: u64) -> i64 {
+    qmodel_tbl_init()
+    let kind = qmodel_probe(path)
+    if kind == 0 { return QMODEL_ERR_OPEN }
+    let rc = 0
+    if kind == QMODEL_GGUF { rc = gguf_load(path) } else { rc = st_open(path) }
+    if rc != 0 { return QMODEL_ERR_FORMAT }
+    if qmodel_open_count >= QMODEL_MAX { return QMODEL_ERR_RANGE }
+    qmodel_open_count = qmodel_open_count + 1
+    let slot = qmodel_open_count
+    mem_store(qmodel_kind_of + (slot - 1) * 8, kind)
+    mem_store(qmodel_path_of + (slot - 1) * 8, path)
+    qmodel_cur = slot
+    return slot
+}
+
+fn qmodel_close(h: i64) -> i64 {
+    qmodel_tbl_init()
+    let k = qmodel_kind(h)
+    if k == 0 { return QMODEL_ERR_RANGE }
+    if k == QMODEL_GGUF { gguf_close() } else { st_close() }
+    mem_store(qmodel_kind_of + (h - 1) * 8, 0)
+    mem_store(qmodel_path_of + (h - 1) * 8, 0)
+    if qmodel_cur == h { qmodel_cur = 0 }
+    return 0
+}
+
+fn qmodel_num_tensors(h: i64) -> i64 {
+    let k = qmodel_kind(h)
+    if k == QMODEL_GGUF { return gguf_num_tensors() }
+    if k == QMODEL_ST { return st_count() }
+    return QMODEL_ERR_RANGE
+}
+
+// Name of tensor i. Returns a NUL-terminated pointer into the format's own
+// storage; the caller must not free it. Returns 0 when out of range, which is
+// why qmodel_name_bytes exists rather than making the caller strlen.
+fn qmodel_name(h: i64, i: i64) -> u64 {
+    let k = qmodel_kind(h)
+    if k == QMODEL_GGUF {
+        if i < 0 || i >= gguf_num_tensors() { return 0 }
+        return gguf_tensor_name_str(i)
+    }
+    if k == QMODEL_ST {
+        if i < 0 || i >= st_ntensors { return 0 }
+        return st_name_at(i)
+    }
+    return 0
+}
+
+fn qmodel_name_bytes(h: i64, i: i64) -> i64 {
+    let p = qmodel_name(h, i)
+    if p == 0 { return 0 - 1 }
+    let n = 0
+    while mem_load8(p + n) != 0 { n = n + 1 }
+    return n
+}
+
+fn qmodel_find(h: i64, name: u64) -> i64 {
+    let k = qmodel_kind(h)
+    if k == QMODEL_GGUF { return gguf_find_tensor(name) }
+    if k == QMODEL_ST {
+        if st_entry(name) < 0 { return QMODEL_ERR_TENSOR }
+        return st_index_of(name)
+    }
+    return QMODEL_ERR_RANGE
+}
+
+fn qmodel_ndims(h: i64, i: i64) -> i64 {
+    let k = qmodel_kind(h)
+    if k == QMODEL_GGUF { return gguf_tensor_ndims(i) }
+    if k == QMODEL_ST { return st_ndims(i) }
+    return QMODEL_ERR_RANGE
+}
+
+fn qmodel_ndim(h: i64, i: i64, d: i64) -> i64 {
+    let k = qmodel_kind(h)
+    if k == QMODEL_GGUF { return gguf_tensor_dim(i, d) }
+    if k == QMODEL_ST { return st_dim(i, d) }
+    return QMODEL_ERR_RANGE
+}
+
+// Element count, both formats.
+fn qmodel_nelements(h: i64, i: i64) -> i64 {
+    let k = qmodel_kind(h)
+    if k == QMODEL_GGUF { return gguf_tensor_nelements(i) }
+    if k == QMODEL_ST { return st_nelements_of(i) }
+    return QMODEL_ERR_RANGE
+}
+
+// Width of one element in BITS, derived as nbytes*8/nelements rather than from a
+// dtype table. Both formats can answer that honestly, so it is the one dtype
+// question the seam answers (see design note 3).
+//
+// Derived, NOT tabulated, on purpose: the only dtype-width table in the tree
+// today is gguf_type_size(), and it returns a type CLASS, not a width, and is
+// itself incomplete (no case for dtypes 14/15). A second hand-written table here
+// would have been wrong in the same way. nbytes and nelements are both already
+// validated per tensor -- st_layout cross-checks them against the declared
+// data_offsets -- so this cannot disagree with the file.
+fn qmodel_bits(h: i64, i: i64) -> i64 {
+    let nel = qmodel_nelements(h, i)
+    if nel <= 0 { return QMODEL_ERR_TENSOR }
+    let nb = qmodel_nbytes(h, i)
+    if nb <= 0 { return QMODEL_ERR_TENSOR }
+    // Bits per element. Sub-byte quantised formats are a whole-block property,
+    // not a per-element one, so anything under 1 bit/element is not a width.
+    let bits = nb * 8 / nel
+    if bits < 1 { return QMODEL_ERR_UNSUPPORTED }
+    return bits
+}
+
+fn qmodel_is_quantized(h: i64, i: i64) -> i64 {
+    let b = qmodel_bits(h, i)
+    if b < 0 { return b }
+    if b < 8 { return 1 }
+    return 0
+}
+
+// Absolute file offset of tensor i's data.
+fn qmodel_offset(h: i64, i: i64) -> i64 {
+    let k = qmodel_kind(h)
+    if k == QMODEL_GGUF { return gguf_tensor_offset(i) }
+    if k == QMODEL_ST { return st_data_base + st_tensor_data_off(i) }
+    return QMODEL_ERR_RANGE
+}
+
+fn qmodel_nbytes(h: i64, i: i64) -> i64 {
+    let k = qmodel_kind(h)
+    if k == QMODEL_GGUF { return gguf_tensor_nbytes(i) }
+    if k == QMODEL_ST {
+        let nb = mem_alloc(8)
+        let bt = mem_alloc(8)
+        if st_layout(qmodel_name(h, i), nb, bt) < 0 { return QMODEL_ERR_TENSOR }
+        return mem_load(nb)
+    }
+    return QMODEL_ERR_RANGE
+}
+
+fn qmodel_read(h: i64, i: i64, buf: u64, nbytes: i64) -> i64 {
+    let k = qmodel_kind(h)
+    if k == QMODEL_GGUF { return gguf_read_tensor_bytes_at(i, 0, buf, nbytes) }
+    if k == QMODEL_ST {
+        // st_read takes a NAME, not an index.
+        let p = qmodel_name(h, i)
+        if p == 0 { return QMODEL_ERR_TENSOR }
+        return st_read(p, buf)
+    }
+    return QMODEL_ERR_RANGE
+}
