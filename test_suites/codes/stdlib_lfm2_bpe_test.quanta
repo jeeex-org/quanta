@@ -212,6 +212,59 @@ fn main() {
         if bpe_decode_token(bpe_vocab_n + 10, rt_out) >= 0 { print("FAIL: out-of-range id decoded"); return 1 }
         if bpe_decode_token(0 - 1, rt_out) >= 0 { print("FAIL: negative id decoded"); return 1 }
 
+        // ---- special tokens ----------------------------------------------
+        //
+        // llama.cpp splits the prompt on SPECIAL tokens before BPE. Without
+        // this, "<|im_start|>" is tokenized as ordinary characters and the id
+        // sequence differs from what llama.cpp feeds the model -- so any
+        // comparison between the two is comparing different prompts.
+        //
+        // token_type is a flat i32 array: gguf_kv_arr_slurp() is for STRING
+        // arrays and returns garbage here (it walks length-prefixed records),
+        // which silently produced ZERO specials. Read elements via
+        // gguf_kv_arr_elem_num.
+        if bpe_special_count() <= 0 { print("FAIL: no special tokens found"); return 1 }
+        let seen_bos = 0
+        let seen_eos = 0
+        let seen_im_start = 0
+        let sp = 0
+        while sp < bpe_special_count() {
+            let id = bpe_special_id_at(sp)
+            if id == 124894 { seen_bos = 1 }
+            if id == 124900 { seen_eos = 1 }
+            if id == 124899 { seen_im_start = 1 }
+            sp = sp + 1
+        }
+        if seen_bos == 0 || seen_eos == 0 || seen_im_start == 0 {
+            print("FAIL: expected special ids missing"); return 1
+        }
+
+        // descending-length order is what makes longest-match win.
+        // Descending means each length must be <= the previous, so a violation
+        // is l > prev. (Checked the other way round first and it reported a
+        // failure on a correctly sorted list.)
+        let prev = 1000000
+        let order_ok = 1
+        sp = 0
+        while sp < bpe_special_count() {
+            let l = bpe_token_len(bpe_special_id_at(sp))
+            if l > prev { order_ok = 0 }
+            prev = l
+            sp = sp + 1
+        }
+        if order_ok == 0 { print("FAIL: specials not sorted by descending length"); return 1 }
+
+        // A real chat prompt must yield the special ids as SINGLE tokens.
+        // The prompt deliberately ENDS with <|im_end|> (no trailing newline):
+        // with a trailing "\n" the final token is 207, not the special, and the
+        // assertion below would be checking the wrong thing.
+        let sp_prompt = "<|im_start|>user\nhi<|im_end|>"
+        let sp_ids = mem_alloc(256 * 8)
+        let sp_n = bpe_encode_special(sp_prompt + 8, len(sp_prompt), sp_ids, 256)
+        if sp_n < 4 { print("FAIL: special prompt token count="); print(sp_n); return 1 }
+        if mem_load(sp_ids + 0 * 8) != 124899 { print("FAIL: first token is not <|im_start|>"); return 1 }
+        if mem_load(sp_ids + (sp_n - 1) * 8) != 124900 { print("FAIL: last token is not <|im_end|>"); return 1 }
+
         print("OK bpe")
         return 0
     }
