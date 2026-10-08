@@ -115,10 +115,24 @@ fn mm_matvec(idx: u64, x: u64, rows: i64, cols: i64, y: u64) {
 }
 
 // One embedding row -> y, as f64 values of length ncols.
+//
+// This MUST copy out of mm_rowbuf. mm_load_row() fills the SHARED scratch
+// buffer mm_rowbuf and returns 0; it does not write the caller's destination.
+// An earlier version returned mm_load_row()'s status directly, so `y` was never
+// populated: every embedding came back as whatever the caller's buffer held
+// (zeros), the whole stack then ran on a zero activation, and the logits came
+// out all 0.000000 -- which looks like "the model produced nothing" rather than
+// like a missing copy.
 fn mm_lookup_row(idx: u64, row: i64, ncols: i64, y: u64) {
     if gguf_dtype_supported(gguf_tensor_dtype(idx)) == 0 { return -1 }
     if mm_rowcap < ncols { return -1 }
-    return mm_load_row(idx, row, ncols)
+    if mm_load_row(idx, row, ncols) != 0 { return -2 }
+    let i = 0
+    while i < ncols {
+        mem_store(y + i * 8, f64of(mem_load(mm_rowbuf + i * 8)))
+        i = i + 1
+    }
+    return 0
 }
 
 // y[v] = dot(embd_row(v0 + v), x) for v in [0, vcount).

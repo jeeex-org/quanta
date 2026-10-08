@@ -100,6 +100,74 @@ fn main() {
     let cols = gguf_tensor_dim(qt, 1)
     if mm_rowraw_cap >= cols * 8 { print("FAIL raw buffer is not row-bounded"); return 1 }
 
+    // ---- mm_lookup_row must actually WRITE its destination --------------
+    //
+    // This had no coverage at all, and the omission cost a full debug round:
+    // mm_lookup_row returned mm_load_row()'s status directly, so the caller's
+    // buffer was never filled. The embedding came back as zeros, the entire
+    // 30-layer stack then ran on a zero activation, and the logits were all
+    // 0.000000 -- which reads as "the model produced nothing" rather than as a
+    // missing copy. Asserting the bytes are non-zero AND equal to the row
+    // dequantized independently is what would have caught it.
+    let emb = gguf_find_tensor("token_embd.weight")
+    if emb < 0 { print("FAIL no token_embd"); return 1 }
+    // GGUF/ggml stores this as [n_embd, n_vocab], so ne[0] is the embedding
+    // width and one token's row is n_embd contiguous values. Taking dim 1
+    // yields n_vocab (128000) and every row assertion is then nonsense.
+    let dm = gguf_tensor_dim(emb, 0)
+    if dm != 2048 { print("FAIL unexpected n_embd="); print(dm); return 1 }
+    if mm_rowcap < dm { print("FAIL rowcap < d_model"); return 1 }
+    let dst = mem_alloc(dm * 8)
+    // prefill with a sentinel so "never written" is distinguishable from "zero"
+    let i = 0
+    while i < dm { mem_store(dst + i * 8, 12345.0); i = i + 1 }
+    if mm_lookup_row(emb, 0, dm, dst) != 0 { print("FAIL mm_lookup_row rc"); return 1 }
+    let nz = 0
+    let sentinel = 0
+    i = 0
+    while i < dm {
+        let v: f64 = f64of(mem_load(dst + i * 8))
+        if v != 0.0 { nz = nz + 1 }
+        if v == 12345.0 { sentinel = sentinel + 1 }
+        i = i + 1
+    }
+    if sentinel != 0 { print("FAIL: mm_lookup_row left the destination untouched"); return 1 }
+    if nz == 0 { print("FAIL: embedding row is all zeros"); return 1 }
+
+    // Row 1 must differ from row 0 -- this proves the row index is actually
+    // used, and it is checkable without materializing the tensor. Comparing
+    // against read_tensor_f64() is NOT an option here: token_embd is
+    // 128000 x 2048 = 262144000 elements, 2 GB as f64, which is precisely the
+    // tensor the row-wise path exists to avoid loading. Attempting it dies on
+    // the memory cap.
+    let dst2 = mem_alloc(dm * 8)
+    let j = 0
+    while j < dm { mem_store(dst2 + j * 8, 0.0); j = j + 1 }
+    if mm_lookup_row(emb, 1, dm, dst2) != 0 { print("FAIL mm_lookup_row row 1"); return 1 }
+    let diff = 0
+    let nz2 = 0
+    j = 0
+    while j < dm {
+        let a: f64 = f64of(mem_load(dst + j * 8))
+        let b: f64 = f64of(mem_load(dst2 + j * 8))
+        if a != b { diff = diff + 1 }
+        if b != 0.0 { nz2 = nz2 + 1 }
+        j = j + 1
+    }
+    if nz2 == 0 { print("FAIL: row 1 is all zeros"); return 1 }
+    if diff == 0 { print("FAIL: row 0 and row 1 are identical"); return 1 }
+
+    // And the same row read twice must be bit-identical (determinism).
+    let dst3 = mem_alloc(dm * 8)
+    if mm_lookup_row(emb, 0, dm, dst3) != 0 { print("FAIL mm_lookup_row reread"); return 1 }
+    let drift = 0
+    j = 0
+    while j < dm {
+        if f64of(mem_load(dst + j * 8)) != f64of(mem_load(dst3 + j * 8)) { drift = drift + 1 }
+        j = j + 1
+    }
+    if drift != 0 { print("FAIL: row 0 not deterministic, drift="); print(drift); return 1 }
+
     print("OK mm")
     return 0
 }
