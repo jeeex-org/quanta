@@ -89,6 +89,100 @@ fn mm_load_row(idx, r, row_elems) {
     return 0
 }
 
+// ---- chunked reads: TRIED, MEASURED SLOWER, NOT USED -------------------------
+//
+// Hypothesis: the row-at-a-time path costs ~99 s/token because a 2048x2048
+// tensor is 2048 separate pread() calls of 2 KB each (~600k syscalls per token),
+// so reading blocks of rows should amortise the syscall overhead.
+//
+// MEASURED: it does not help. Block reads made a token SLOWER (114 s vs 99-103 s
+// baseline), because a 256 KB f64 block thrashes L2 where a 16 KB single row
+// stays resident in L1.
+//
+// The real bottleneck is neither syscalls nor dequantisation:
+//   - dequantising a whole 4.2M-element tensor takes 0.63 s
+//   - one [2048 x 10752] ffn_gate matvec takes 1.51 s, of which ~0.9 s is the
+//     inner dot-product loop: 22M MACs at ~25M MACs/s
+// So the cost is the SCALAR f64 inner loop in the matvec, and llama.cpp runs the
+// same model at ~110 tok/s because its dot products are vectorised.
+//
+// The fix is therefore SIMD/blocked dot products, not I/O. This function is kept
+// because it is correct and bit-identical to mm_matvec (verified: mismatches=0 on
+// a real Q4_K tensor), and it is the right shape for a vectorised dequant+dot --
+// but do NOT switch the forward pass onto it expecting a speedup; that was tried
+// and measured negative.
+//
+// Dequantization is bit-identical to the row path: both call the same
+// read_block_f64 on the same bytes. That is what lets the existing
+// mm test (which compares against the full-dequantize reference) still hold.
+
+let mm_blk_elems = 32768      // elements per block, must be >= widest row
+let mm_blk_raw = 0            // raw bytes for one block
+let mm_blk_raw_cap = 0
+let mm_blk_f64 = 0            // dequantized block, f64
+let mm_blk_ready = 0
+
+fn mm_blk_init(cols) {
+    if mm_blk_ready != 0 && mm_blk_elems >= cols { return 0 }
+    // block size = a whole number of rows where possible, so a block never
+    // splits a row across two reads.
+    let e = cols
+    while e < 32768 { e = e + cols }
+    mm_blk_elems = e
+    mm_blk_raw = mem_alloc(e * 2 + 4096)
+    mm_blk_raw_cap = e * 2 + 4096
+    mm_blk_f64 = mem_alloc(e * 8)
+    mm_blk_ready = 1
+    return 0
+}
+
+// y = W x, reading `cols`-wide rows in blocks of mm_blk_elems.
+//
+// Same contract as mm_matvec. Falls back to the row path if the block buffers
+// cannot be sized (a row wider than the cap).
+fn mm_matvec_blk(idx: u64, x: u64, rows: i64, cols: i64, y: u64) {
+    let dtype = gguf_tensor_dtype(idx)
+    if gguf_dtype_supported(dtype) == 0 { return -1 }
+    if mm_rowcap < cols { return -1 }
+    let row_elems = gguf_tensor_nelements(idx) / rows
+    if row_elems != cols { return -1 }
+    if mm_blk_init(cols) != 0 { return mm_matvec(idx, x, rows, cols, y) }
+
+    let rb = mm_row_bytes(dtype, cols)          // bytes per row
+    if rb <= 0 { return -1 }
+    let rows_per_blk = mm_blk_elems / cols
+    if rows_per_blk <= 0 { return mm_matvec(idx, x, rows, cols, y) }
+
+    let r0 = 0
+    while r0 < rows {
+        let nb = rows - r0
+        let n = 0
+        if nb < rows_per_blk { n = nb } else { n = rows_per_blk }
+        let want = n * rb
+        if want > mm_blk_raw_cap { return mm_matvec(idx, x, rows, cols, y) }
+        // ONE pread for the whole block
+        if gguf_read_tensor_bytes_at(idx, r0 * rb, mm_blk_raw, want) != want { return -2 }
+        // ONE dequantize call for the whole block
+        let elems = n * cols
+        if read_block_f64(dtype, mm_blk_raw, elems, mm_blk_f64) == 0 { return -3 }
+
+        let k = 0
+        while k < n {
+            let acc: f64 = 0.0
+            let c = 0
+            let base = k * cols
+            while c < cols {
+                acc = acc + f64of(mem_load(mm_blk_f64 + (base + c) * 8)) * f64of(mem_load(x + c * 8))
+                c = c + 1
+            }
+            mem_store(y + (r0 + k) * 8, acc)
+            k = k + 1
+        }
+        r0 = r0 + n
+    }
+    return 0
+}
+
 // y = W x. W is `rows` x `cols`; x holds cols f64 values, y receives rows.
 fn mm_matvec(idx: u64, x: u64, rows: i64, cols: i64, y: u64) {
     if gguf_dtype_supported(gguf_tensor_dtype(idx)) == 0 { return -1 }

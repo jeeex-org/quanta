@@ -724,6 +724,7 @@ let fc_fw_ff = 0       // ffn output          [d_model]
 let fc_fw_logits = 0   // logits              [n_vocab]
 let fc_fw_conv = 0     // per-layer conv state [dc * d_model]
 let fc_fw_ready = 0
+let fc_fw_last = 0     // last hidden state produced (for callers skipping logits)
 
 fn fc_fw_init() {
     if fc_fw_ready != 0 { return 0 }
@@ -839,7 +840,16 @@ let fc_ffn_f_up = 0
 
 // One token's embedding row -> fc_fw_x, then the whole stack.
 // Returns 0 on success. Logits land in fc_fw_logits (n_vocab values).
-fn fc_forward_token(tok: i64, pos: i64) -> i64 {
+//
+// `want_logits` = 0 skips the final norm and the tied output projection.
+//
+// WHY THIS EXISTS: the output projection is 128000 rows per call, which is by
+// far the most expensive single step -- and during PREFILL only the LAST
+// position's logits are ever read. Computing them at every prompt position is
+// pure waste: a 46-token prompt was doing 46 full-vocab projections instead of
+// one, which is why a templated prefill could not finish inside a 870 s cap.
+// Decode must pass 1; prefill passes 0 except on the final token.
+fn fc_forward_token_ex(tok: i64, pos: i64, want_logits: i64) -> i64 {
     if fc_fw_init() != 0 { return -1 }
     let dm = fc_d_model
     let emb = lfm2_token_embd()
@@ -861,6 +871,14 @@ fn fc_forward_token(tok: i64, pos: i64) -> i64 {
         L = L + 1
     }
 
+    if want_logits == 0 {
+        // The caller only needs the recurrent/KV state advanced. The final
+        // hidden state stays in `src`, which is fc_fw_x or fc_fw_ff depending on
+        // parity -- callers that skip logits must not read fc_fw_logits.
+        fc_fw_last = src
+        return 0
+    }
+
     // final norm: token_embd_norm (NOT output_norm -- see the note above)
     let on = lfm2_token_embd_norm()
     if on < 0 { return -1 }
@@ -871,7 +889,12 @@ fn fc_forward_token(tok: i64, pos: i64) -> i64 {
     // vocabulary this is 128000 rows per token, which dominates generation, so
     // the caller may instead sample from a window (mm_embed_logits).
     if mm_embed_logits(emb, fc_fw_n, 0, fc_n_vocab, dm, fc_fw_logits) != 0 { return -1 }
+    fc_fw_last = fc_fw_n
     return 0
+}
+
+fn fc_forward_token(tok: i64, pos: i64) -> i64 {
+    return fc_forward_token_ex(tok, pos, 1)
 }
 
 // Argmax over the first `n` logits. Returns the winning index.
