@@ -294,7 +294,7 @@ Discrimination: with `gguf_validate_chain()` and `gguf_validate_all_dims()` stub
 
 **Phase 1 complete.**
 
-### Phase 2 — Bit-width dtype model
+### Phase 2 — Bit-width dtype model ✅ COMPLETE
 
 Prerequisite for the HF quantization formats (GPTQ/AWQ/NF4/MLX), which pack 2-8 bits per element. GGUF quant types are *mostly* already correct via block math — this phase targets the formats needing genuine sub-byte addressing, it is not a fix to GGUF.
 
@@ -303,7 +303,7 @@ Prerequisite for the HF quantization formats (GPTQ/AWQ/NF4/MLX), which pack 2-8 
 - add 3/5/6-bit paths (MLX `extract_bits` boundary-straddling shuffle)
 - gate: existing 14 dtypes bit-identical after the change
 
-### Phase 3 — safetensors reader + shard index
+### Phase 3 — safetensors reader + shard index ✅ COMPLETE
 
 Because **that is where models actually ship**, and GGUF is the legacy path.
 
@@ -312,7 +312,7 @@ Because **that is where models actually ship**, and GGUF is the legacy path.
 - shard index: authoritative missing-file check, ignore unnamed files, **natural numeric sort**
 - 13 local models as fixtures
 
-### Phase 4 — Role vocabulary + arch registry
+### Phase 4 — Role vocabulary + arch registry ✅ COMPLETE
 
 The generalization. Without this, every new model is a new special case.
 
@@ -325,7 +325,7 @@ The generalization. Without this, every new model is a new special case.
 
 The LFM2 port is the proof the abstraction works. If LFM2 needs special cases, the design is wrong — stop and fix it there.
 
-### Phase 5 — Tensor-role → compute mapping
+### Phase 5 — Tensor-role → compute mapping ✅ COMPLETE
 
 Not `role → function pointer` directly. Each role names a **tensor kind**: `[rows, cols]` matrix, `[n]` vector, per-layer state, or router indices.
 
