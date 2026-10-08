@@ -2139,25 +2139,32 @@ fn dequant_q4k(raw, nelements, out) {
             //   merged into one pass            98 ms  (noise, kept for clarity)
             //   precomputed 16-entry table     101 ms  (SLOWER -- reverted)
             //   4-wide AVX2 f64                267 ms  (3.5x SLOWER -- reverted)
-            // The table lost because a mem_load+mem_store pair costs as much as
-            // the fmul+fsub pair it replaced.
+            //   + new nib2f64 emitter builtin  194 ms  (2.7x SLOWER -- reverted)
             //
-            // The 4-wide attempt is the informative one: fmulf_avx2/fsubf_avx2
-            // are real and correct, but they need their operands in MEMORY
-            // (pointer arguments), so the nibbles must be materialised as f64
-            // first. That adds a whole extra pass -- 32 stores to build the
-            // nibble buffer, then 32 more to write the results -- on top of the
-            // 32 the scalar form already does. This loop is bound by memory
-            // operations per element, not by FP arithmetic, which is why
-            // widening the arithmetic made it worse.
+            // TWO hypotheses were tested and BOTH were wrong:
             //
-            // So dequant is NOT vectorisable with the builtins that exist.
-            // Breaking 93 ms needs either a new emitter builtin (a vector
-            // nibble-unpack or int->f64 convert, so the values never round-trip
-            // through memory) or a fused Q4_K matvec (q4k_matvec_avx2, currently
-            // a placeholder), or threads -- and threads are blocked on the clone
-            // trampoline (see scripts/proto/README.md). Recorded so the next
-            // session does not retry the widening.
+            // 1. "Widening the arithmetic should help." It made it 3.5x slower.
+            // 2. "The problem is that Quanta-level temporaries round-trip through
+            //    the frame, so a builtin with register-resident temporaries should
+            //    fix it." A real emitter builtin was written for this (nib2f64:
+            //    9 instructions per byte, 2 stores, no frame traffic, verified
+            //    correct on all outputs) and the result was 194 ms vs 93 ms
+            //    scalar -- still 2.7x slower. Reverted, including the builtin.
+            //
+            // What the two results together actually say: this loop is bound by
+            // WORK PER ELEMENT, not by where the temporaries live. 6 memory ops
+            // per element (the load, and 2 in + 2 out per wide op), and no
+            // amount of instruction-level rearranging removes them. The scalar
+            // form already does 3 per element and is close to the floor.
+            //
+            // The only real wins available are the ones that change the WORK:
+            //   - SIMD that keeps operands in vector registers across a whole
+            //     row (an mm register, not memory) -- needs new builtins that
+            //     operate on vector state, not pointer-in/pointer-out;
+            //   - a fused Q4_K matvec (q4k_matvec_avx2 is a placeholder), which
+            //     never materialises f64 at all;
+            //   - threads (blocked on the clone trampoline).
+            // Do NOT retry widening or builtin-extraction without measuring.
             let op = out + (bi * 256 + chunk * 64) * 8
             let l = 0
             while l < 32 {
