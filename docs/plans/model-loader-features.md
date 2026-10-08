@@ -529,10 +529,17 @@ fn init() -> i64 { return 0; }        // Auto-generated stub
 fn validate() -> i64 { return 0; }
 ```
 
-⚠️ **Those files claim `Status: ✅ done` and contain no implementation.** By the project's own rule
-(`X` means not fixed) they are not done. This is a documentation defect that will mislead any roadmap
-built on it — a generator wrote a completion marker instead of code. The AI-domain files are the
-worst case because they are the ones this section depends on.
+⚠️ **CORRECTION (measured, not assumed).** This section previously claimed that all 8,817 stubs carried `Status: ✅ done`. **That was wrong.** The real distribution, counted across every stub in `lib/std/`:
+
+| Marker | Count | Truthful? |
+|---|---|---|
+| `[?] planned` | 8,641 | ✅ honest — correctly says not implemented |
+| `✅ done` | 58 | ❌ **false** — empty body, claimed done |
+| non-standard vocabulary (`🟠 High`, `🟡 Medium`, `🔴 Critical`, `0`/`1`/`2`/`3`, `**17**`, `\ufffdPlanning`) | 118 | self-consistent, but not the project vocabulary |
+
+So the false-done defect was **58 files, not 8,817** — and all 58 were `programming_language` (54), `mathematics` (3) and `computer_science` (1), **not** the AI domain this section had called the worst case. `lib/std/ai*.quanta` is 171 files of which 160 are stubs and 11 are real (`ai.quanta` 135 lines, `ai_core.quanta` 175).
+
+**Fixed:** those 58 now read `[?] planned` in both the `// Status:` line and `MODULE_STATUS`, and carry an explicit `AUTO-GENERATED PLACEHOLDER -- NOT IMPLEMENTED` note in `init()`. Gate 19/19 GREEN, including `verify-status`.
 
 **What genuinely exists, and what does not:**
 
