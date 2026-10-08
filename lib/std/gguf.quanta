@@ -2131,23 +2131,29 @@ fn dequant_q4k(raw, nelements, out) {
             let d2 = fmul(d, i2f(s1))
             let mm2 = fmul(dmin, i2f(m1))
 
+            // One pass over the 32 bytes, emitting BOTH nibbles.
+            //
+            // MEASURED, do not "optimise" this further without timing it:
+            //   direct fmul/fsub, two passes   129 ms  (before the shift/mask fix)
+            //   shift/mask instead of idiv      93 ms  <- the real win, 1.39x
+            //   merged into one pass            98 ms  (noise, kept for clarity)
+            //   precomputed 16-entry table     101 ms  (SLOWER -- reverted)
+            // The table lost because a mem_load+mem_store pair costs as much as
+            // the fmul+fsub pair it replaced. Each float builtin expands to
+            // movq xmm0,rdi / movq xmm1,rsi / mulsd / movq rax,xmm0, and with
+            // -O a no-op there is no register allocation, so every "variable"
+            // read is a frame load anyway. Micro-optimising this loop is
+            // exhausted; the remaining lever is parallelism (20 cores vs 1).
+            let op = out + (bi * 256 + chunk * 64) * 8
             let l = 0
             while l < 32 {
                 let b = mem_load8(q + l)
                 // Shifts/mask, NOT `b / 16` and `(b/16)*16`. Quanta's -O is a
                 // verified no-op (byte-identical binaries with and without it),
                 // so an integer divide here is a real `idiv` -- ~40-80 cycles
-                // each, twice per element, which is the bulk of the 90
-                // cycles/element measured in the dequant loop.
-                mem_store(out + (bi * 256 + chunk * 64 + l) * 8,
-                          fsub(fmul(d1, i2f(b & 15)), mm1))
-                l = l + 1
-            }
-            l = 0
-            while l < 32 {
-                let b = mem_load8(q + l)
-                mem_store(out + (bi * 256 + chunk * 64 + 32 + l) * 8,
-                          fsub(fmul(d2, i2f(b >> 4)), mm2))
+                // each, twice per element, which was the bulk of the dequant.
+                mem_store(op + l * 8, fsub(fmul(d1, i2f(b & 15)), mm1))
+                mem_store(op + (32 + l) * 8, fsub(fmul(d2, i2f(b >> 4)), mm2))
                 l = l + 1
             }
             q = q + 32
