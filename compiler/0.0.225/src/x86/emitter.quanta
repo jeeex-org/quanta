@@ -1453,16 +1453,18 @@ fn emit_bltn(nmi,nl,ii) {
         return 1
     }
     // q4k_dot(W_q4, x_q8, n_blocks): fused Q4_K dot product
-    // Args: rdi=W_q4, rsi=x_q8, rdx=n_blocks
-    // Returns: sum in rax (i64 Q8)
-    // Q4_K block: 144 bytes = [scale_f16(2)] [sub_scales(16)] [quads(128)]
-    if nl==7&&r8(nm)=='q'&&r8(nm+1)=='4'&&r8(nm+2)=='k'&&r8(nm+3)=='_'&&r8(nm+4)=='d'&&r8(nm+5)=='o'&&r8(nm+6)=='t' {
-        flush_all()
-        // For now, just return 0 (placeholder for full implementation)
-        // Real implementation would be 200+ lines of tight x86-64 assembly
-        rr(0, 0)
-        return 1
-    }
+    //
+    // DEAD HANDLER -- the real (partial) implementation is further down at what
+    // was line 1476. This block used to sit here first and shadow it, so the
+    // builtin always returned 0 no matter what the later code did. A duplicate
+    // `if` with an identical guard is unreachable by construction; it was
+    // removed rather than left in place, because two registrations of the same
+    // builtin make "which one runs" depend on file order.
+    //
+    // NOTE for whoever finishes this: q4k_matvec and q4k_matvec_avx2 are ALSO
+    // placeholders (they emit `return y`), and the surviving q4k_dot body
+    // processes only 2 of 256 elements per block and assumes scale = 1.0. None
+    // of the three compute a correct result, so nothing may call them yet.
     // fdivf: float-preserving div - NO flush_all, uses only xmm
     if nl==5&&r8(nm)=='f'&&r8(nm+1)=='d'&&r8(nm+2)=='i'&&r8(nm+3)=='v'&&r8(nm+4)=='f' {
         eb(102); eb(72); eb(15); eb(110); eb(199) // movq xmm0, rdi
@@ -1472,7 +1474,8 @@ fn emit_bltn(nmi,nl,ii) {
         sdef(irres(ii), 0)
         w8(vfloat+irres(ii), 1)
         return 1
-    }    // q4k_dot(W_q4, x_q8, n_blocks): fused Q4_K dot product
+    }
+    // q4k_dot(W_q4, x_q8, n_blocks): fused Q4_K dot product
     // Args: rdi=W_q4, rsi=x_q8, rdx=n_blocks
     // Returns: sum in rax (i64 Q8)
     // Q4_K block: 144 bytes = [scale_f16(2)] [sub_scales(16)] [quads(128)]
