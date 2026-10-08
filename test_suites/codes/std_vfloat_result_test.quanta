@@ -15,11 +15,14 @@ import std/math
 //
 //     mem_store(p, 4614256656552045840)
 //
-// is the IEEE-754 bit pattern of PI, not of 10.0. The real 10.0 is
+// is the IEEE-754 bit pattern of the double 3.1415926535897896, not of 10.0.
+// (It is NOT math.pi, which is 8 ULP away: bits(pi) = 4614256656552045848. Both
+//  truncate to 3, so the arithmetic was right either way.) The real 10.0 is
 //
 //     4621819117588971520   (0x4024000000000000)
 //
-// so f2i was correctly returning trunc(PI) == 3 the entire time. Ten sessions
+// so f2i was correctly returning trunc(3.1415926535897896) == 3 the whole time.
+// Ten sessions
 // of hunting a compiler bug that was arithmetic I did in my head.
 //
 // The lesson encoded here: NEVER hand-write an IEEE-754 constant. Derive it
@@ -45,7 +48,7 @@ fn main() -> i64 {
     //  3.5 = 0x400c000000000000 = 4615063718147915776
     // 200.0 = 0x4069000000000000 = 4641240890982006784
     // 1e6  = 0x412e848000000000 = 4696837146684686336
-    // PI   = 0x400921fb54442d10 = 4614256656552045840   <-- the impostor
+    // 3.1415926535897896 = 0x400921fb54442d10 = 4614256656552045840  <-- impostor
 
     // 1. f64bits of a literal must be the documented pattern. This is the
     //    ground truth every other check is calibrated against.
@@ -54,7 +57,7 @@ fn main() -> i64 {
         fails = fails + 1
     }
 
-    // 2. And the impostor really is PI, which is what misled me. Asserted so
+    // 2. And the impostor really is that double, which is what misled me.
     //    the trap is documented in executable form.
     if f64bits(f64of(4614256656552045840)) != 4614256656552045840 {
         print("FAIL 2: f64of round trip\n")
@@ -88,7 +91,7 @@ fn main() -> i64 {
     if f2i(f200) != 200 { print("FAIL 6: f2i(200.0)="); print(f2i(f200)); print("\n") fails = fails + 1 }
     if f2i(f1e6) != 1000000 { print("FAIL 7: f2i(1e6)="); print(f2i(f1e6)); print("\n") fails = fails + 1 }
 
-    // 8. f2i of PI is 3 -- CORRECT, and the fact that started all ten
+    // 8. f2i of that double is 3 -- CORRECT, and the fact that started all ten
     //    sessions. Asserting it stops anyone re-deriving the same confusion.
     let ppi = mem_alloc(8)
     mem_store(ppi, 4614256656552045840)
