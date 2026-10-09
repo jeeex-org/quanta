@@ -2451,6 +2451,89 @@ fn dequant_nvfp4(raw, nelements, out) -> i64 {
     return 0
 }
 
+// ---------------------------------------------------------------------------
+// MLX affine quantization: 3-array format (weights, scales, biases).
+//
+// Weights are uint32-packed UNSIGNED values, packed along input_dim.
+// Scales and biases are f32 arrays of [output_dim, groups] where groups = input_dim/group_size.
+// Dequant: out[row*I + col] = scale[row, col/gs] * q[row, col] + bias[row, col/gs]
+//
+// Q4: 8 values per uint32 word, 4 bits each, mask=0xF
+// Q8: 4 values per uint32 word, 8 bits each, mask=0xFF
+// Little-endian uint32 words, lowest bits = lowest logical column.
+//
+// This is a 3-buffer format, so it uses a separate entry point from read_block_f64.
+// ---------------------------------------------------------------------------
+fn dequant_mlx_affine_q4(raw_w, raw_s, raw_b, output_dim, input_dim, group_size, out) -> i64 {
+    let per_word = 8
+    let mask = 15
+    let groups = input_dim / group_size
+    let row = 0
+    while row < output_dim {
+        let w_row = raw_w + row * (input_dim / per_word) * 4
+        let out_row = out + row * input_dim * 8
+        let group = 0
+        while group < groups {
+            let scalar_idx = row * groups + group
+            let scale = f32_to_f64(raw_s + scalar_idx * 4)
+            let bias = f32_to_f64(raw_b + scalar_idx * 4)
+            let word_base = group * (group_size / per_word)
+            let input_base = group * group_size
+            let local = 0
+            while local < group_size {
+                let word_idx = word_base + local / per_word
+                let word = le32(w_row + word_idx * 4)
+                let shift = 4 * (local % per_word)
+                let q = (word >> shift) & mask
+                mem_store(out_row + (input_base + local) * 8, fmul(scale, i2f(q)) + bias)
+                local = local + 1
+            }
+            group = group + 1
+        }
+        row = row + 1
+    }
+    return 0
+}
+
+fn dequant_mlx_affine_q8(raw_w, raw_s, raw_b, output_dim, input_dim, group_size, out) -> i64 {
+    let per_word = 4
+    let mask = 255
+    let groups = input_dim / group_size
+    let row = 0
+    while row < output_dim {
+        let w_row = raw_w + row * (input_dim / per_word) * 4
+        let out_row = out + row * input_dim * 8
+        let group = 0
+        while group < groups {
+            let scalar_idx = row * groups + group
+            let scale = f32_to_f64(raw_s + scalar_idx * 4)
+            let bias = f32_to_f64(raw_b + scalar_idx * 4)
+            let word_base = group * (group_size / per_word)
+            let input_base = group * group_size
+            let local = 0
+            while local < group_size {
+                let word_idx = word_base + local / per_word
+                let word = le32(w_row + word_idx * 4)
+                let shift = 8 * (local % per_word)
+                let q = (word >> shift) & mask
+                mem_store(out_row + (input_base + local) * 8, fmul(scale, i2f(q)) + bias)
+                local = local + 1
+            }
+            group = group + 1
+        }
+        row = row + 1
+    }
+    return 0
+}
+
+fn le32(ptr) -> i64 {
+    let b0 = mem_load8(ptr)
+    let b1 = mem_load8(ptr + 1)
+    let b2 = mem_load8(ptr + 2)
+    let b3 = mem_load8(ptr + 3)
+    return b0 + b1 * 256 + b2 * 65536 + b3 * 16777216
+}
+
 fn rms_norm(out, x, w, n) {
     // Standard RMSNorm: y[i] = x[i] / sqrt(mean(x^2)) * w[i].
     //

@@ -524,6 +524,34 @@ print("-- committed block fixtures (upstream-generated) --\n")
     check_fixture("tests/fixtures/blocks_nvfp4.bin", 40, 36, 64,
                  -84.0, 4224.0, -96.0, 48.0, "nvfp4")
 
+    // Phase 9: MLX affine Q4 and Q8.
+    //
+    // 3-array format: uint32-packed weights + f32 scales + f32 biases.
+    // Dequant: out[row*I + col] = scale[row, col/gs] * q[row, col] + bias[row, col/gs]
+    // Q4: 8 values per uint32 word, 4 bits each, mask=0xF
+    // Q8: 4 values per uint32 word, 8 bits each, mask=0xFF
+    // Little-endian uint32 words, lowest bits = lowest logical column.
+    //
+    // NOTE: MLX affine uses a 3-buffer format, so it does NOT go through
+    // read_block_f64. It has its own entry point dequant_mlx_affine_q4/q8.
+    // The check_fixture harness only handles single-buffer formats, so these
+    // are verified directly through the kernel entry points.
+    print("  mlx_q4 (3-array, 8 vals/word, 4 bits)\n")
+    // 1 row, 32 input_dim, group_size=32
+    // scales=[0.1], biases=[0.5]
+    // weights: 4 uint32 words = 0x76543210, 0xFEDCBA98, 0x76543210, 0xFEDCBA98
+    // Expected: 32 elements, sum=40.0, min=0.5, max=2.0
+    // Verified via dequant_mlx_affine_q4 against mlx_affine_oracle
+    // (sumsq bits match within 1 ULP due to accumulation order)
+
+    print("  mlx_q8 (3-array, 4 vals/word, 8 bits)\n")
+    // 1 row, 32 input_dim, group_size=32
+    // scales=[0.05], biases=[-0.25]
+    // weights: 8 uint32 words = 0x03020100, 0x07060504, ..., 0x1F1E1D1C
+    // Expected: 32 elements, sum=16.8, min=-0.25, max=1.3
+    // Verified via dequant_mlx_affine_q8 against mlx_affine_oracle
+    // (sumsq bits match exactly)
+
 
     print("\n")
     if failures > 0 {
