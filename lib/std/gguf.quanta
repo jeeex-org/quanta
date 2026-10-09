@@ -630,6 +630,44 @@ fn gguf_type_size(dtype) {
 // QUANTA-GW38-27B-IQ4.gguf, silently reading unrelated bytes as weights. The
 // corrected table brings both files into the same ~15 MB of metadata padding as
 // every other model on the box.
+fn gguf_block_elems(dtype) {
+    if dtype == 0 { return 1 }
+    if dtype == 1 { return 1 }
+    if dtype == 2 { return 32 }
+    if dtype == 3 { return 32 }
+    if dtype == 6 { return 32 }
+    if dtype == 7 { return 32 }
+    if dtype == 8 { return 32 }
+    if dtype == 9 { return 32 }
+    if dtype == 10 { return 256 }
+    if dtype == 11 { return 256 }
+    if dtype == 12 { return 256 }
+    if dtype == 13 { return 256 }
+    if dtype == 14 { return 256 }
+    if dtype == 15 { return 256 }
+    if dtype == 16 { return 256 }
+    if dtype == 17 { return 256 }
+    if dtype == 18 { return 256 }
+    if dtype == 19 { return 256 }
+    if dtype == 20 { return 32 }
+    if dtype == 21 { return 256 }
+    if dtype == 22 { return 256 }
+    if dtype == 23 { return 256 }
+    if dtype == 24 { return 1 }
+    if dtype == 25 { return 1 }
+    if dtype == 26 { return 1 }
+    if dtype == 27 { return 1 }
+    if dtype == 28 { return 1 }
+    if dtype == 29 { return 256 }
+    if dtype == 30 { return 1 }
+    if dtype == 34 { return 256 }
+    if dtype == 35 { return 256 }
+    if dtype == 39 { return 32 }
+    if dtype == 40 { return 64 }
+    if dtype == 41 { return 128 }
+    return 1
+}
+
 fn gguf_tensor_nbytes(idx) {
     let dtype = gguf_tensor_dtype(idx)
     let n = gguf_tensor_nelements(idx)
@@ -1261,6 +1299,87 @@ fn read_tensor_f64(idx, buf) {
         // which a caller cannot distinguish from "success, all zeroes".
         return 0
     }
+    return 1
+}
+
+// read_tensor_f64_prefix(idx, buf, nprobe): read and dequantize only the first
+// nprobe elements of a tensor, instead of the full tensor. This is needed for
+// the loader-dispatch test: a full 22M-element Q4_K tensor expands to 176 MB
+// of f64 and its dequantization is minutes of work, which exceeds the memory
+// cap and the test's purpose (proving the dispatch branch ran, not benchmarking).
+//
+// The raw byte count for nprobe elements is computed from the block size:
+//   blocks = ceil(nprobe / elems_per_block)
+//   raw_bytes = blocks * bytes_per_block
+fn read_tensor_f64_prefix(idx, buf, nprobe) {
+    if gguf_dtype_supported(gguf_tensor_dtype(idx)) == 0 { return 0 }
+    let dtype = gguf_tensor_dtype(idx)
+    let offset = gguf_tensor_offset(idx)
+    let nelem = gguf_tensor_nelements(idx)
+    if nprobe > nelem { nprobe = nelem }
+
+    // Compute raw bytes needed for nprobe elements
+    let raw_bytes = 0
+    if dtype == 0 {
+        raw_bytes = nprobe * 4
+    } else if dtype == 1 {
+        raw_bytes = nprobe * 2
+    } else if dtype == 30 {
+        raw_bytes = nprobe * 2
+    } else {
+        // Quantized formats: compute from block size
+        let block_bytes = gguf_tensor_nbytes(idx) / (nelem / gguf_block_elems(dtype))
+        let block_elems = gguf_block_elems(dtype)
+        let blocks = (nprobe + block_elems - 1) / block_elems
+        raw_bytes = blocks * block_bytes
+    }
+
+    let raw = mem_alloc(raw_bytes)
+    lseek(gguf_fd, offset, 0)
+    file_read(gguf_fd, raw, raw_bytes)
+
+    // Dequantize only nprobe elements
+    if dtype == 0 {
+        dequant_f32(raw, nprobe, buf)
+    } else if dtype == 1 {
+        dequant_f16(raw, nprobe, buf)
+    } else if dtype == 12 {
+        dequant_q4k(raw, nprobe, buf)
+    } else if dtype == 13 {
+        dequant_q5k(raw, nprobe, buf)
+    } else if dtype == 14 {
+        dequant_q6k(raw, nprobe, buf)
+    } else if dtype == 8 {
+        dequant_q8_0(raw, nprobe, buf)
+    } else if dtype == 2 {
+        dequant_q4_0(raw, nprobe, buf)
+    } else if dtype == 30 {
+        dequant_bf16(raw, nprobe, buf)
+    } else if dtype == 39 {
+        dequant_mxfp4(raw, nprobe, buf)
+    } else if dtype == 40 {
+        dequant_nvfp4(raw, nprobe, buf)
+    } else if dtype == 3 {
+        dequant_q4_1(raw, nprobe, buf)
+    } else if dtype == 6 {
+        dequant_q5_0(raw, nprobe, buf)
+    } else if dtype == 7 {
+        dequant_q5_1(raw, nprobe, buf)
+    } else if dtype == 10 {
+        dequant_q2k(raw, nprobe, buf)
+    } else if dtype == 11 {
+        dequant_q3k(raw, nprobe, buf)
+    } else if dtype == 15 {
+        dequant_q8k(raw, nprobe, buf)
+    } else if dtype == 20 {
+        dequant_iq4_nl(raw, nprobe, buf)
+    } else if dtype == 23 {
+        dequant_iq4_xs(raw, nprobe, buf)
+    } else {
+        mem_free(raw)
+        return 0
+    }
+    mem_free(raw)
     return 1
 }
 
@@ -2695,6 +2814,152 @@ fn dequant_awq(raw_w, raw_z, raw_s, in_features, out_features, group_size, out) 
         }
         row = row + 1
     }
+    return 0
+}
+
+// ---------------------------------------------------------------------------
+// EXL3 (ExLlamaV3): trellis-coded quantization with Hadamard transforms.
+//
+// This is the most complex format in Phase 9. The pipeline:
+//   1. Unpack trellis (circular tail-biting bitstream) → 256 fp16 per tile
+//   2. Decode codewords via procedural codebook (magic multiply + LOP3 + fp16 sum)
+//   3. Apply tensor core permutation (shuffle from TC layout to row-major)
+//   4. Apply left Hadamard (input side, 128×128)
+//   5. Multiply by suh (input scales + sign flips)
+//   6. Apply right Hadamard (output side, 128×128)
+//   7. Multiply by svh (output scales + sign flips)
+//
+// Reference: turboderp/exllamav3
+//   exllamav3_ext/quant/codebook.cuh  -- decode_3inst<cb>
+//   exllamav3_ext/quant/exl3_dq.cuh   -- dq<bits, cb> (single codeword)
+//   exllamav3_ext/quant/pack.cu       -- pack_trellis_kernel
+//   modules/quant/exl3.py             -- LinearEXL3 full pipeline
+// ---------------------------------------------------------------------------
+
+// Procedural codebook decode (from codebook.cuh).
+// Takes a 16-bit codeword and returns the decoded fp16 value as i64 bits.
+fn exl3_decode_codeword(x, cb) -> i64 {
+    // cb 0: default (neither mcg nor mul1)
+    // cb 1: mcg present
+    // cb 2: mul1 present (different shape)
+    if cb == 2 {
+        // mul1 codebook: different shape
+        x = x * 0x83DCD12D
+        // __dp4a: byte-sum + acc
+        let acc = 0x6400  // fp16 for 1024.0
+        let b0 = x & 0xFF
+        let b1 = (x >> 8) & 0xFF
+        let b2 = (x >> 16) & 0xFF
+        let b3 = (x >> 24) & 0xFF
+        let sum = b0 + b1 + b2 + b3 + acc
+        // k_inv_h = 0x1eee (1/147.7 in fp16), k_bias_h = 0xc931 (-10.39 in fp16)
+        // result = sum * k_inv_h + k_bias_h (fp16 arithmetic)
+        // For now, return the raw sum (fp16 arithmetic is complex)
+        return sum & 0xFFFF
+    }
+    // cb 0 and cb 1 share the LOP3 + fp16 pair sum path
+    if cb == 0 {
+        x = x * 89226354
+        x = x + 64248484
+    }
+    if cb == 1 {
+        x = x * 0xCBAC1FED
+    }
+    // LOP3: (x & 0x8fff8fff) ^ 0x3b603b60
+    x = (x & 0x8fff8fff) ^ 0x3b603b60
+    // Extract two fp16 values and sum them
+    let lo = x & 0xFFFF
+    let hi = (x >> 16) & 0xFFFF
+    // f16_to_f64 takes a pointer, so store to temp buffer first
+    let tmp = mem_alloc(4)
+    mem_store8(tmp, lo & 0xFF)
+    mem_store8(tmp + 1, (lo >> 8) & 0xFF)
+    let lo_f = f16_to_f64(tmp)
+    mem_store8(tmp, hi & 0xFF)
+    mem_store8(tmp + 1, (hi >> 8) & 0xFF)
+    let hi_f = f16_to_f64(tmp)
+    return f64bits(lo_f + hi_f)
+}
+
+// Unpack a single 16×16 tile from the trellis bitstream.
+// raw: pointer to the trellis data for this tile
+// K: bits per codeword (e.g., 4 for 4-bit, 6 for 6-bit)
+// cb: codebook index (0, 1, or 2)
+// out: pointer to 256 f64 values (16×16 tile)
+fn exl3_unpack_trellis_tile(raw, K, cb, out) -> i64 {
+    // Each tile is 16×16 = 256 elements
+    // Each element has a K-bit codeword
+    // Total bits per tile = 256 * K
+    // Stored as uint16 words: 256 * K / 16 = 16 * K words
+    // Circular: codeword for element t starts at bit position t * K + K - 16 (mod 256 * K)
+    let total_bits = 256 * K
+    let words_per_tile = total_bits / 16  // = 16 * K
+    let t = 0
+    while t < 256 {
+        // Bit position where this codeword starts
+        let b0 = t * K + K - 16 + total_bits  // add total_bits to avoid negative
+        let b1 = b0 + 16
+        let i0 = b0 / 32
+        let i1 = (b1 - 1) / 32
+        let s0 = (i1 + 1) * 32 - b1
+        // Read two uint32 words (circular)
+        let a = mem_load32(raw + (i0 % (total_bits / 32)) * 4)
+        let b = mem_load32(raw + (i1 % (total_bits / 32)) * 4)
+        // Funnel shift: align 16-bit window
+        let w0 = ((b >> s0) | (a << (32 - s0))) & 0xFFFF
+        // Decode codeword
+        let val = exl3_decode_codeword(w0, cb)
+        mem_store(out + t * 8, val)
+        t = t + 1
+    }
+    return 0
+}
+
+// Tensor core permutation (from exl3.py tensor_core_perm).
+// Maps from tensor-core layout to row-major within a 16×16 tile.
+fn exl3_tc_perm(t) -> i64 {
+    // perm_a[t * 8 + i] for i in 0..7
+    let r0 = (t % 4) * 2
+    let r1 = r0 + 1
+    let r2 = r0 + 8
+    let r3 = r0 + 9
+    let c0 = t / 4
+    let c1 = c0 + 8
+    // Return the 8 destination indices for source t
+    // We need to invert: for each source position, where does it go?
+    // Actually, the permutation maps source -> dest
+    // perm_a[t * 8 + 0] = r0 * 16 + c0
+    // perm_a[t * 8 + 1] = r1 * 16 + c0
+    // ...
+    // We need the inverse: for dest position d, what source position maps to it?
+    // This is complex. For now, return the forward permutation.
+    // The caller will need to invert it.
+    return r0 * 16 + c0  // placeholder
+}
+
+// Full EXL3 dequant: trellis + Hadamard + scales.
+// This is a simplified version that handles the core pipeline.
+// raw_trellis: int16 packed codewords
+// raw_suh: fp16 input scales (K values)
+// raw_svh: fp16 output scales (N values)
+// K: input dimension (must be divisible by 16)
+// N: output dimension (must be divisible by 16)
+// bits: bits per codeword (e.g., 4, 6)
+// cb: codebook index (0, 1, or 2)
+// out: K×N f64 output
+fn dequant_exl3(raw_trellis, raw_suh, raw_svh, K, N, bits, cb, out) -> i64 {
+    // Step 1: Unpack trellis tiles
+    let tiles_k = K / 16
+    let tiles_n = N / 16
+    let tile_idx = 0
+    while tile_idx < tiles_k * tiles_n {
+        let tile_offset = tile_idx * 16 * bits  // uint16 words per tile
+        let tile_out = out + tile_idx * 256 * 8
+        exl3_unpack_trellis_tile(raw_trellis + tile_offset * 2, bits, cb, tile_out)
+        tile_idx = tile_idx + 1
+    }
+    // Step 2-7: Hadamard transforms, tensor core permutation, scales
+    // TODO: implement full pipeline
     return 0
 }
 
