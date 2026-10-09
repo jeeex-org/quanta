@@ -1081,6 +1081,10 @@ fn gguf_dtype_supported(dtype) {
     if dtype == 10 { return 1 }  // Q2_K
     if dtype == 11 { return 1 }  // Q3_K
     if dtype == 15 { return 1 }  // Q8_K
+    // Phase 9: IQ4_NL (20) is a 32-element block, NOT 256 -- the size table
+    // already recorded that distinction at gguf_type_size. IQ4_XS (23) is 256.
+    if dtype == 20 { return 1 }  // IQ4_NL
+    if dtype == 23 { return 1 }  // IQ4_XS
     if dtype == 30 { return 1 }  // BF16
     // NOTE: Q8_1 (9) is deliberately ABSENT and must stay absent. It is not a
     // row-storage format -- upstream exports no dequantize_row_q8_1 because it
@@ -1119,6 +1123,10 @@ fn read_block_f64(dtype, raw, nelem, out) {
         dequant_q5k(raw, nelem, out)
     } else if dtype == 14 {
         dequant_q6k(raw, nelem, out)
+    } else if dtype == 20 {
+        dequant_iq4_nl(raw, nelem, out)
+    } else if dtype == 23 {
+        dequant_iq4_xs(raw, nelem, out)
     } else if dtype == 8 {
         dequant_q8_0(raw, nelem, out)
     } else if dtype == 2 {
@@ -2180,6 +2188,122 @@ fn dequant_q4k(raw, nelements, out) {
             q = q + 32
             is = is + 2
             chunk = chunk + 1
+        }
+        bi = bi + 1
+    }
+    return 0
+}
+
+// ===========================================================================
+// IQ4_NL and IQ4_XS -- Phase 9
+//
+// Both are 4-bit codebooks with the SAME nibble layout as Q4_0's, and both ship
+// an f16 scale per block. The difference is the block WIDTH and, for IQ4_XS, a
+// second per-sub-block scale.
+//
+// From upstream ggml, read from source:
+//
+//   kvalues_iq4nl                 ggml-common.h:1120-1122
+//   #define QK4_NL 32              ggml-common.h:447
+//   #define QK_K  256              ggml-common.h:89
+//   block_iq4_nl { f16 d; u8 qs[16]; }     ggml-common.h:449-452  -> 18 bytes
+//   block_iq4_xs { f16 d; u16 scales_h;
+//                   u8 scales_l[4]; u8 qs[128]; }  ggml-common.h:454-460 -> 136 bytes
+//   dequantize_row_iq4_nl          ggml-quants.c:2726-2742
+//   dequantize_row_iq4_xs          ggml-quants.c:2744-2765
+//
+// The codebook (ggml-common.h:1121), which is int8_t and NOT the Q4_0 one:
+//
+//     -127, -104, -83, -65, -49, -35, -22, -10, 1, 13, 25, 38, 53, 69, 89, 113
+//
+// NIBBLE ORDER IS THE TRAP. Both kernels emit LOW nibbles for the FIRST half of
+// the block and HIGH nibbles for the second, from the SAME 16 bytes:
+//
+//     IQ4_NL:  y[j]      = d * k[qs[j] & 0xf]     j = 0..15
+//               y[j + 16] = d * k[qs[j] >> 4]      j = 0..15
+//     IQ4_XS:  per 32-element sub-block ib, dl = d * (ls - 32):
+//               y[j]      = dl * k[qs[j] & 0xf]    j = 0..15
+//               y[j + 16] = dl * k[qs[j] >> 4]     j = 0..15
+//
+// so element i is NOT built from byte i/2. Reading it the other way round gives
+// plausible numbers that do not match upstream on any element.
+//
+// IQ4_XS's scale unpack (ggml-quants.c:2754), where `ls` is 6 bits assembled
+// from two places -- 4 bits from scales_l, 2 from scales_h:
+//
+//     ls = ((scales_l[ib/2] >> 4*(ib%2)) & 0xf) | (((scales_h >> 2*ib) & 3) << 4)
+//     dl = d * (ls - 32)
+//
+// The `- 32` is a signed 6-bit value: ls==0 means -32, ls==63 means +31. Reading
+// it unsigned makes every sub-block's scale wrong by up to 2x, and the error
+// compounds across the 8 sub-blocks of a block.
+//
+// ---------------------------------------------------------------------------
+// IQ4_NL: 32 elements per 18-byte block.
+// ---------------------------------------------------------------------------
+fn iq4nl_k(i) -> i64 {
+    let t = [-127, -104, -83, -65, -49, -35, -22, -10, 1, 13, 25, 38, 53, 69, 89, 113]
+    return t[i]
+}
+
+fn dequant_iq4_nl(raw, nelements, out) -> i64 {
+    let n_blocks = nelements / 32
+    let bi = 0
+    while bi < n_blocks {
+        let bo = bi * 18
+        let d = f16_to_f64(raw + bo)
+        let q = raw + bo + 2
+        let op = out + bi * 32 * 8
+        let j = 0
+        while j < 16 {
+            let b = mem_load8(q + j)
+            mem_store(op + j * 8, fmul(d, i2f(iq4nl_k(b & 15))))
+            mem_store(op + (16 + j) * 8, fmul(d, i2f(iq4nl_k(b >> 4))))
+            j = j + 1
+        }
+        bi = bi + 1
+    }
+    return 0
+}
+
+// ---------------------------------------------------------------------------
+// IQ4_XS: 256 elements per 136-byte block, 8 sub-blocks of 32.
+//
+// The 6-bit scale is split ACROSS the block: 2 bits per sub-block live in the
+// leading u16 scales_h, and 4 bits per PAIR of sub-blocks live in scales_l[4].
+// Sub-block ib therefore reads scales_l[ib/2] and scales_h bit 2*ib.
+// ---------------------------------------------------------------------------
+fn iq4xs_scale(sl, ib, sh) -> i64 {
+    let lo = (sl >> (4 * (ib - (ib / 2) * 2))) & 15
+    let hi = (sh >> (2 * ib)) & 3
+    return lo + hi * 16
+}
+
+fn dequant_iq4_xs(raw, nelements, out) -> i64 {
+    let n_blocks = nelements / 256
+    let bi = 0
+    while bi < n_blocks {
+        let bo = bi * 136
+        let d = f16_to_f64(raw + bo)
+        // scales_h is a little-endian u16 at offset 2
+        let sh = mem_load8(raw + bo + 2) + mem_load8(raw + bo + 3) * 256
+        let sl_base = raw + bo + 4
+        let q_base = raw + bo + 8
+        let ib = 0
+        while ib < 8 {
+            let sl = mem_load8(sl_base + ib / 2)
+            let ls = iq4xs_scale(sl, ib, sh)
+            let dl = fmul(d, i2f(ls - 32))
+            let q = q_base + ib * 16
+            let op = out + (bi * 256 + ib * 32) * 8
+            let j = 0
+            while j < 16 {
+                let b = mem_load8(q + j)
+                mem_store(op + j * 8, fmul(dl, i2f(iq4nl_k(b & 15))))
+                mem_store(op + (16 + j) * 8, fmul(dl, i2f(iq4nl_k(b >> 4))))
+                j = j + 1
+            }
+            ib = ib + 1
         }
         bi = bi + 1
     }

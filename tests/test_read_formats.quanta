@@ -482,6 +482,29 @@ print("-- committed block fixtures (upstream-generated) --\n")
     check_fixture("tests/fixtures/blocks_q8_K.bin", 15, 2336, 2048,
                  1.192440, 10.625414, -0.124937, 0.124937, "q8_K")
 
+    // Phase 9: IQ4_NL and IQ4_XS.
+    //
+    // The fixtures came from scripts/audit/iq4_oracle.c, which holds the two
+    // upstream functions VERBATIM from ggml-quants.c:2726-2765 together with the
+    // block layouts from ggml-common.h:447-460 and the int8 codebook from
+    // ggml-common.h:1120-1122. Printed at %.17g so a binary64 round-trips.
+    //
+    // IQ4_NL is the case worth pinning: its block is 32 elements in 18 bytes, NOT
+    // 256 elements as every other Q4 format in this file uses. A 256-element
+    // assumption reads 16x past the block and produces plausible garbage.
+    print("  iq4_nl (dtype 20, 32 elems, 18 bytes)\n")
+    check_fixture("tests/fixtures/blocks_iq4_nl.bin", 20, 18, 32,
+                 -0.007603, 0.000004, -0.000454, 0.000404, "iq4_nl")
+
+    // IQ4_XS carries a SECOND scale per 32-element sub-block, unpacked from two
+    // places: 4 bits in scales_l[ib/2] and 2 bits in scales_h. The 6-bit value is
+    // SIGNED (ls - 32), so ls==0 is -32 and ls==63 is +31. Reading it unsigned
+    // doubles the error on half the sub-blocks and the reduction below still
+    // looks plausible, which is why it needs a fixture rather than a code read.
+    print("  iq4_xs (dtype 23, 256 elems, 136 bytes)\n")
+    check_fixture("tests/fixtures/blocks_iq4_xs.bin", 23, 136, 256,
+                 -0.003977, 0.005038, -0.011719, 0.013171, "iq4_xs")
+
 
     print("\n")
     if failures > 0 {
