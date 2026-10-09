@@ -1,0 +1,109 @@
+import std/gguf
+
+// Phase 8 + 8b test: partial load machinery and MoE offload job ring.
+// Tests the data structures and control flow without requiring a loaded model.
+// The bit-for-bit invariant (partial == full) is verified by the dedicated
+// test run with the real model; here we verify the machinery works.
+
+fn main() -> i64 {
+    let failures = 0
+
+    // ---- Test 1: Partial load init and free ----
+    let rc = load_partial_init(1024 * 1024)  // 1MB budget
+    if rc < 0 {
+        print("FAIL: load_partial_init failed\n")
+        return 1
+    }
+    if pl_handle < 0 {
+        print("FAIL: pl_handle not set\n")
+        failures = failures + 1
+    }
+    if pl_used != 0 {
+        print("FAIL: pl_used not 0\n")
+        failures = failures + 1
+    }
+    load_partial_free()
+    if failures == 0 { print("Partial load T1 (init/free): PASS\n") }
+
+    // ---- Test 2: MoE init and free ----
+    rc = moe_init(4)
+    if rc < 0 {
+        print("FAIL: moe_init failed\n")
+        return 1
+    }
+    moe_free()
+    if failures == 0 { print("MoE T1 (init/free): PASS\n") }
+
+    // ---- Test 3: MoE submit and process jobs ----
+    rc = moe_init(4)
+    if rc < 0 {
+        print("FAIL: moe_init failed\n")
+        return 1
+    }
+
+    // Submit a job (job_type=0, expert_idx=0)
+    let rc2 = moe_submit_job(0, 0)
+    if rc2 < 0 {
+        print("FAIL: moe_submit_job failed\n")
+        failures = failures + 1
+    }
+
+    // Process the job (no model loaded, so pl_get_tensor returns 0)
+    let rc3 = moe_process_job()
+    if rc3 != 0 {
+        print("FAIL: moe_process_job returned ", rc3, " (expected 0)\n")
+        failures = failures + 1
+    }
+
+    // Mark consumed
+    moe_mark_consumed(0)
+
+    // Slot should be free now
+    let slot = moe_alloc_slot()
+    if slot < 0 {
+        print("FAIL: moe_alloc_slot returned -1 after consumed\n")
+        failures = failures + 1
+    }
+
+    moe_free()
+    if failures == 0 { print("MoE T2 (submit/process/consume): PASS\n") }
+
+    // ---- Test 4: MoE slot exhaustion ----
+    rc = moe_init(2)
+    if rc < 0 {
+        print("FAIL: moe_init failed\n")
+        return 1
+    }
+
+    // Submit 2 jobs (fills all slots)
+    moe_submit_job(0, 0)
+    moe_submit_job(0, 1)
+
+    // Third submit should fail (no free slots)
+    let rc4 = moe_submit_job(0, 2)
+    if rc4 >= 0 {
+        print("FAIL: moe_submit_job should have failed (no free slots)\n")
+        failures = failures + 1
+    }
+
+    // Process one job
+    moe_process_job()
+    moe_mark_consumed(0)
+
+    // Now a slot should be free
+    let slot2 = moe_alloc_slot()
+    if slot2 < 0 {
+        print("FAIL: moe_alloc_slot returned -1 after processing\n")
+        failures = failures + 1
+    }
+
+    moe_free()
+    if failures == 0 { print("MoE T3 (slot exhaustion): PASS\n") }
+
+    if failures > 0 {
+        print("std_partial_load_test: ", failures, " FAILURES\n")
+        return 1
+    }
+    print("std_partial_load_test: all pass\n")
+    return 0
+}

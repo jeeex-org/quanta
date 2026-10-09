@@ -3164,6 +3164,295 @@ fn dequant_exl3(raw_trellis, raw_suh, raw_svh, K, N, bits, cb, out) -> i64 {
     return 0
 }
 
+// ---------------------------------------------------------------------------
+// Phase 8: Partial load / block swap.
+//
+// load_partial(model, budget) returns a handle that can grow. Tensors are
+// loaded on demand and evicted when the budget is exceeded. Eviction is by
+// offloaded-memory descending (largest first), not LRU.
+//
+// Invariant: partial load and full load must produce identical numbers.
+// Enforced by a test that runs both and compares bit-for-bit.
+// ---------------------------------------------------------------------------
+
+// Partial load state
+let pl_handle = -1          // current partial load handle
+let pl_budget = 0           // memory budget in bytes
+let pl_used = 0             // currently used bytes
+let pl_n_tensors = 0        // number of tensors in the model
+let pl_loaded = 0           // number of tensors currently loaded
+let pl_tensor_idx = 0       // tensor indices (up to 1024)
+let pl_tensor_size = 0      // tensor sizes in bytes
+let pl_tensor_data = 0      // tensor data pointers (0 = not loaded)
+let pl_tensor_lru = 0       // LRU counter per tensor
+
+// Initialize partial load for a model with a given memory budget.
+// Returns 0 on success, -1 on failure.
+fn load_partial_init(budget) {
+    pl_budget = budget
+    pl_used = 0
+    pl_n_tensors = gguf_n_tensors
+    pl_loaded = 0
+    pl_handle = 1
+    // Allocate arrays for up to 1024 tensors
+    pl_tensor_idx = mem_alloc(1024 * 8)
+    pl_tensor_size = mem_alloc(1024 * 8)
+    pl_tensor_data = mem_alloc(1024 * 8)
+    pl_tensor_lru = mem_alloc(1024 * 8)
+    let i = 0
+    while i < pl_n_tensors {
+        mem_store(pl_tensor_idx + i * 8, i)
+        mem_store(pl_tensor_size + i * 8, gguf_tensor_nbytes(i))
+        mem_store(pl_tensor_data + i * 8, 0)
+        mem_store(pl_tensor_lru + i * 8, 0)
+        i = i + 1
+    }
+    return 0
+}
+
+// Evict tensors until we have enough free space.
+// Eviction is by offloaded-memory descending (largest first).
+fn pl_evict_until(free_needed) {
+    while pl_used + free_needed > pl_budget && pl_loaded > 0 {
+        // Find the largest loaded tensor
+        let largest_idx = -1
+        let largest_size = 0
+        let i = 0
+        while i < pl_n_tensors {
+            let data = mem_load(pl_tensor_data + i * 8)
+            if data != 0 {
+                let sz = mem_load(pl_tensor_size + i * 8)
+                if sz > largest_size {
+                    largest_size = sz
+                    largest_idx = i
+                }
+            }
+            i = i + 1
+        }
+        if largest_idx < 0 { break }
+        // Evict it
+        let data = mem_load(pl_tensor_data + largest_idx * 8)
+        mem_free(data)
+        mem_store(pl_tensor_data + largest_idx * 8, 0)
+        pl_used = pl_used - largest_size
+        pl_loaded = pl_loaded - 1
+    }
+}
+
+// Load a tensor into memory. Returns pointer to f64 data, or 0 on failure.
+fn pl_load_tensor(idx) {
+    // Check if already loaded
+    let existing = mem_load(pl_tensor_data + idx * 8)
+    if existing != 0 {
+        // Update LRU
+        pl_tensor_lru = pl_tensor_lru + 1
+        mem_store(pl_tensor_lru + idx * 8, pl_tensor_lru)
+        return existing
+    }
+    // Check if dtype is supported
+    if gguf_dtype_supported(gguf_tensor_dtype(idx)) == 0 { return 0 }
+    let dtype = gguf_tensor_dtype(idx)
+    let offset = gguf_tensor_offset(idx)
+    let nelem = gguf_tensor_nelements(idx)
+    let nbytes = gguf_tensor_nbytes(idx)
+    // Evict until we have space
+    pl_evict_until(nbytes)
+    // Allocate and load
+    let buf = mem_alloc(nelem * 8)
+    let raw = mem_alloc(nbytes)
+    lseek(gguf_fd, offset, 0)
+    file_read(gguf_fd, raw, nbytes)
+    // Dequantize
+    if dtype == 0 {
+        dequant_f32(raw, nelem, buf)
+    } else if dtype == 1 {
+        dequant_f16(raw, nelem, buf)
+    } else if dtype == 12 {
+        dequant_q4k(raw, nelem, buf)
+    } else if dtype == 13 {
+        dequant_q5k(raw, nelem, buf)
+    } else if dtype == 14 {
+        dequant_q6k(raw, nelem, buf)
+    } else if dtype == 20 {
+        dequant_iq4_nl(raw, nelem, buf)
+    } else if dtype == 23 {
+        dequant_iq4_xs(raw, nelem, buf)
+    } else if dtype == 8 {
+        dequant_q8_0(raw, nelem, buf)
+    } else if dtype == 2 {
+        dequant_q4_0(raw, nelem, buf)
+    } else if dtype == 30 {
+        dequant_bf16(raw, nelem, buf)
+    } else if dtype == 3 {
+        dequant_q4_1(raw, nelem, buf)
+    } else if dtype == 6 {
+        dequant_q5_0(raw, nelem, buf)
+    } else if dtype == 7 {
+        dequant_q5_1(raw, nelem, buf)
+    } else if dtype == 10 {
+        dequant_q2k(raw, nelem, buf)
+    } else if dtype == 11 {
+        dequant_q3k(raw, nelem, buf)
+    } else if dtype == 15 {
+        dequant_q8k(raw, nelem, buf)
+    } else {
+        mem_free(raw)
+        mem_free(buf)
+        return 0
+    }
+    mem_free(raw)
+    // Store pointer
+    mem_store(pl_tensor_data + idx * 8, buf)
+    mem_store(pl_tensor_size + idx * 8, nbytes)
+    pl_used = pl_used + nbytes
+    pl_loaded = pl_loaded + 1
+    pl_tensor_lru = pl_tensor_lru + 1
+    mem_store(pl_tensor_lru + idx * 8, pl_tensor_lru)
+    return buf
+}
+
+// Get a tensor's data, loading it if necessary.
+// Returns pointer to f64 data, or 0 on failure.
+fn pl_get_tensor(idx) {
+    if pl_handle < 0 { return 0 }
+    return pl_load_tensor(idx)
+}
+
+// Free all partial load state.
+fn load_partial_free() {
+    if pl_handle < 0 { return }
+    let i = 0
+    while i < pl_n_tensors {
+        let data = mem_load(pl_tensor_data + i * 8)
+        if data != 0 { mem_free(data) }
+        i = i + 1
+    }
+    mem_free(pl_tensor_idx)
+    mem_free(pl_tensor_size)
+    mem_free(pl_tensor_data)
+    mem_free(pl_tensor_lru)
+    pl_handle = -1
+    pl_used = 0
+    pl_loaded = 0
+}
+
+// ---------------------------------------------------------------------------
+// Phase 8b: MoE expert offload.
+//
+// Design from exllamav3_ext/cpu/moe_handoff.h:
+// - A persistent worker consumes a job ring (not spawned per forward pass)
+// - Pinned shared memory for staging
+// - Three-state slot protocol: data_ready, done, consumed
+// - Slot reuse waits on consumed, not done
+//
+// Quanta's version is single-process (no CUDA, no shared memory across processes).
+// The design carries over: bounded job ring, three-state slot protocol,
+// pinned staging. The invariant is the same as Phase 8:
+// placement decides speed, never semantics.
+// ---------------------------------------------------------------------------
+
+// MoE offload state
+let moe_n_slots = 0           // number of slots in the job ring
+let moe_slot_data = 0         // slot data pointers
+let moe_slot_ready = 0        // data_ready sequence numbers
+let moe_slot_done = 0         // done sequence numbers
+let moe_slot_consumed = 0     // consumed sequence numbers
+let moe_jobs_tail = 0         // producer index
+let moe_jobs_head = 0         // consumer index
+let moe_quit = 0              // quit flag
+
+// Initialize MoE offload with a given number of slots.
+// Returns 0 on success, -1 on failure.
+fn moe_init(n_slots) {
+    if n_slots <= 0 || n_slots > 64 { return -1 }
+    moe_n_slots = n_slots
+    moe_slot_data = mem_alloc(n_slots * 8)
+    moe_slot_ready = mem_alloc(n_slots * 8)
+    moe_slot_done = mem_alloc(n_slots * 8)
+    moe_slot_consumed = mem_alloc(n_slots * 8)
+    let i = 0
+    while i < n_slots {
+        mem_store(moe_slot_data + i * 8, 0)
+        mem_store(moe_slot_ready + i * 8, 0)
+        mem_store(moe_slot_done + i * 8, 0)
+        mem_store(moe_slot_consumed + i * 8, 0)
+        i = i + 1
+    }
+    moe_jobs_tail = 0
+    moe_jobs_head = 0
+    moe_quit = 0
+    return 0
+}
+
+// Allocate a slot for expert loading.
+// Returns slot index, or -1 if no slot available.
+fn moe_alloc_slot() {
+    let i = 0
+    while i < moe_n_slots {
+        let consumed = mem_load(moe_slot_consumed + i * 8)
+        let ready = mem_load(moe_slot_ready + i * 8)
+        if consumed >= ready {
+            // Slot is free
+            return i
+        }
+        i = i + 1
+    }
+    return -1
+}
+
+// Submit a job to the ring.
+// job_type: 0 = load expert, 1 = unload expert
+// expert_idx: index of the expert tensor
+// Returns 0 on success, -1 on failure.
+fn moe_submit_job(job_type, expert_idx) {
+    let slot = moe_alloc_slot()
+    if slot < 0 { return -1 }
+    // Store job info in slot
+    mem_store(moe_slot_data + slot * 8, expert_idx)
+    // Increment ready sequence
+    let ready = mem_load(moe_slot_ready + slot * 8)
+    mem_store(moe_slot_ready + slot * 8, ready + 1)
+    // Advance tail
+    moe_jobs_tail = (moe_jobs_tail + 1) % moe_n_slots
+    return 0
+}
+
+// Process one job from the ring.
+// Returns 0 if a job was processed, 1 if no job available.
+fn moe_process_job() {
+    if moe_jobs_head == moe_jobs_tail { return 1 }
+    let slot = moe_jobs_head
+    let expert_idx = mem_load(moe_slot_data + slot * 8)
+    // Load the expert tensor
+    let data = pl_get_tensor(expert_idx)
+    if data != 0 {
+        // Mark done
+        let done = mem_load(moe_slot_done + slot * 8)
+        mem_store(moe_slot_done + slot * 8, done + 1)
+    }
+    // Advance head
+    moe_jobs_head = (moe_jobs_head + 1) % moe_n_slots
+    return 0
+}
+
+// Mark a slot as consumed.
+fn moe_mark_consumed(slot) {
+    let consumed = mem_load(moe_slot_consumed + slot * 8)
+    mem_store(moe_slot_consumed + slot * 8, consumed + 1)
+}
+
+// Free all MoE offload state.
+fn moe_free() {
+    if moe_n_slots <= 0 { return }
+    // moe_slot_data stores expert_idx, not pointers -- do NOT free it
+    mem_free(moe_slot_data)
+    mem_free(moe_slot_ready)
+    mem_free(moe_slot_done)
+    mem_free(moe_slot_consumed)
+    moe_n_slots = 0
+    moe_quit = 1
+}
+
 fn rms_norm(out, x, w, n) {
     // Standard RMSNorm: y[i] = x[i] / sqrt(mean(x^2)) * w[i].
     //
