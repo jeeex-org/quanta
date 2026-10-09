@@ -1,0 +1,167 @@
+import std/gguf
+
+// MLX affine Q4 dequant test.
+// 3-buffer format: weights (uint32-packed), scales (f32), biases (f32).
+// Reference: MLX affine quantization format.
+
+fn main() -> i64 {
+    let failures = 0
+
+    // ---- Test 1: 1 row, 32 input_dim, group_size=32 ----
+    // scales=[0.1], biases=[0.5]
+    // weights: 4 uint32 words = 0x76543210, 0xFEDCBA98, 0x76543210, 0xFEDCBA98
+    // Expected: 32 elements, sum=40.0, min=0.5, max=2.0
+    {
+        let raw_w = mem_alloc(16)    // 4 int32
+        let raw_s = mem_alloc(4)     // 1 f32
+        let raw_b = mem_alloc(4)     // 1 f32
+        let out = mem_alloc(256)     // 32 f64
+
+        // weights
+        mem_store(raw_w + 0, 0x76543210)
+        mem_store(raw_w + 4, 0xFEDCBA98)
+        mem_store(raw_w + 8, 0x76543210)
+        mem_store(raw_w + 12, 0xFEDCBA98)
+
+        // scales = [0.1] (f32 0x3DCCCCCD)
+        mem_store(raw_s, 0x3DCCCCCD)
+
+        // biases = [0.5] (f32 0x3F000000)
+        mem_store(raw_b, 0x3F000000)
+
+        dequant_mlx_affine_q4(raw_w, raw_s, raw_b, 1, 32, 32, out)
+
+        // Compute expected using the same f32_to_f64 conversion as the kernel.
+        // Using f64of (bit-pattern interpretation) would give wrong results.
+        let scale = f32_to_f64(raw_s)
+        let bias = f32_to_f64(raw_b)
+
+        let ok = 1
+        let k = 0
+        while k < 32 {
+            let word_idx = k / 8
+            let nib_idx = k % 8
+            let w_word = [0x76543210, 0xFEDCBA98, 0x76543210, 0xFEDCBA98][word_idx]
+            let q = (w_word >> (4 * nib_idx)) & 15
+            let expected = fmul(scale, i2f(q)) + bias
+            let v = f64of(mem_load(out + k*8))
+            if v != expected {
+                print("MLX Q4 T1 FAIL at ", k, ": got ", f64bits(v), " expected ", f64bits(expected), "\n")
+                ok = 0
+            }
+            k = k + 1
+        }
+        if ok == 0 { failures = failures + 1 }
+        else { print("MLX Q4 T1 (1 row, 32 cols): PASS\n") }
+    }
+
+    // ---- Test 2: 2 rows, 16 input_dim, group_size=8 (2 groups per row) ----
+    // scales = [[0.1, 0.2], [0.3, 0.4]], biases = [[0.0, 0.5], [1.0, 1.5]]
+    // weights row 0: 0x76543210, 0xFEDCBA98
+    // weights row 1: 0x13579BDF, 0x2468ACE0
+    {
+        let raw_w = mem_alloc(16)    // 2 rows * 2 int32
+        let raw_s = mem_alloc(16)    // 2 rows * 2 groups * 1 f32
+        let raw_b = mem_alloc(16)    // 2 rows * 2 groups * 1 f32
+        let out = mem_alloc(256)     // 2*16 f64
+
+        // weights row 0
+        mem_store(raw_w + 0, 0x76543210)
+        mem_store(raw_w + 4, 0xFEDCBA98)
+        // weights row 1
+        mem_store(raw_w + 8, 0x13579BDF)
+        mem_store(raw_w + 12, 0x2468ACE0)
+
+        // scales: row 0 = [0.1, 0.2], row 1 = [0.3, 0.4]
+        // f32: 0.1 = 0x3DCCCCCD, 0.2 = 0x3E4CCCCD, 0.3 = 0x3E99999A, 0.4 = 0x3ECCCCCD
+        mem_store(raw_s + 0, 0x3DCCCCCD)   // row 0, group 0
+        mem_store(raw_s + 4, 0x3E4CCCCD)   // row 0, group 1
+        mem_store(raw_s + 8, 0x3E99999A)   // row 1, group 0
+        mem_store(raw_s + 12, 0x3ECCCCCD)  // row 1, group 1
+
+        // biases: row 0 = [0.0, 0.5], row 1 = [1.0, 1.5]
+        // f32: 0.0 = 0x00000000, 0.5 = 0x3F000000, 1.0 = 0x3F800000, 1.5 = 0x3FC00000
+        mem_store(raw_b + 0, 0x00000000)   // row 0, group 0
+        mem_store(raw_b + 4, 0x3F000000)   // row 0, group 1
+        mem_store(raw_b + 8, 0x3F800000)   // row 1, group 0
+        mem_store(raw_b + 12, 0x3FC00000)  // row 1, group 1
+
+        dequant_mlx_affine_q4(raw_w, raw_s, raw_b, 2, 16, 8, out)
+
+        // Compute expected using f32_to_f64 (same as kernel).
+        let s00 = f32_to_f64(raw_s + 0)   // row 0, group 0 = 0.1
+        let s01 = f32_to_f64(raw_s + 4)   // row 0, group 1 = 0.2
+        let s10 = f32_to_f64(raw_s + 8)   // row 1, group 0 = 0.3
+        let s11 = f32_to_f64(raw_s + 12)  // row 1, group 1 = 0.4
+        let b00 = f32_to_f64(raw_b + 0)   // row 0, group 0 = 0.0
+        let b01 = f32_to_f64(raw_b + 4)   // row 0, group 1 = 0.5
+        let b10 = f32_to_f64(raw_b + 8)   // row 1, group 0 = 1.0
+        let b11 = f32_to_f64(raw_b + 12)  // row 1, group 1 = 1.5
+
+        let ok = 1
+
+        // Row 0, group 0: word 0x76543210 -> nibbles 0,1,2,3,4,5,6,7
+        let w0 = [0x76543210, 0xFEDCBA98]
+        let k = 0
+        while k < 8 {
+            let q = (w0[0] >> (4*k)) & 15
+            let expected = fmul(s00, i2f(q)) + b00
+            let v = f64of(mem_load(out + k*8))
+            if v != expected {
+                print("MLX Q4 T2 FAIL r0g0 at ", k, ": got ", f64bits(v), " expected ", f64bits(expected), "\n")
+                ok = 0
+            }
+            k = k + 1
+        }
+
+        // Row 0, group 1: word 0xFEDCBA98 -> nibbles 8,9,A,B,C,D,E,F
+        k = 0
+        while k < 8 {
+            let q = (w0[1] >> (4*k)) & 15
+            let expected = fmul(s01, i2f(q)) + b01
+            let v = f64of(mem_load(out + (8+k)*8))
+            if v != expected {
+                print("MLX Q4 T2 FAIL r0g1 at ", k, ": got ", f64bits(v), " expected ", f64bits(expected), "\n")
+                ok = 0
+            }
+            k = k + 1
+        }
+
+        // Row 1, group 0: word 0x13579BDF -> nibbles F,D,B,9,7,5,3,1
+        let w1 = [0x13579BDF, 0x2468ACE0]
+        k = 0
+        while k < 8 {
+            let q = (w1[0] >> (4*k)) & 15
+            let expected = fmul(s10, i2f(q)) + b10
+            let v = f64of(mem_load(out + 128 + k*8))
+            if v != expected {
+                print("MLX Q4 T2 FAIL r1g0 at ", k, ": got ", f64bits(v), " expected ", f64bits(expected), "\n")
+                ok = 0
+            }
+            k = k + 1
+        }
+
+        // Row 1, group 1: word 0x2468ACE0 -> nibbles 0,E,C,A,8,6,4,2
+        k = 0
+        while k < 8 {
+            let q = (w1[1] >> (4*k)) & 15
+            let expected = fmul(s11, i2f(q)) + b11
+            let v = f64of(mem_load(out + 128 + (8+k)*8))
+            if v != expected {
+                print("MLX Q4 T2 FAIL r1g1 at ", k, ": got ", f64bits(v), " expected ", f64bits(expected), "\n")
+                ok = 0
+            }
+            k = k + 1
+        }
+
+        if ok == 0 { failures = failures + 1 }
+        else { print("MLX Q4 T2 (2 rows, 2 groups each): PASS\n") }
+    }
+
+    if failures > 0 {
+        print("std_mlx_q4_test: ", failures, " FAILURES\n")
+        return 1
+    }
+    print("std_mlx_q4_test: all pass\n")
+    return 0
+}
