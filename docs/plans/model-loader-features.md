@@ -663,8 +663,8 @@ Sequencing: build the size tiering and light mode *alongside* further kernel wor
 | 11.1 | `qmodel_size_class()` from the tensor graph + metadata ✅ | returns `small/mid/full` for LFM2 2.6B from a real GGUF, `full` on unknown |
 | 11.2 | Context budgeting, pure, stepped ✅ | same conversation ⇒ same prompt, 1/2/4 worker-agnostic; sizes verified per tier |
 | 11.3 | Temperature ceiling ✅ | slider can lower, never raise, the tier ceiling |
-| 11.4 | Light mode: whole-file writes, host-side tool execution | a task a 2.6B model cannot do directly completes via light mode |
-| 11.5 | Proof record + send-back loop | an agent that "finishes" with no test after its change is sent back, ≤2 times |
+| 11.4 | Light mode: whole-file writes, host-side tool execution ✅ | `lib/std/light_mode.quanta` — 43 checks; prose `FILE:` bodies refused, fabricated `RUN:` results stripped, last write of a path wins |
+| 11.5 | Proof record + send-back loop ✅ | `lib/std/proof_record.quanta` — 121 checks; command sorted to test/lint/type/build/format, scope whole vs part, send-back ≤2 (3 in light mode), summary from the record |
 
 **Explicitly not adopted:** the app never runs the project's own test commands (the agent runs
 them and the result is *recorded*); lessons/code-map stay ≥15B-only, as upstream.
