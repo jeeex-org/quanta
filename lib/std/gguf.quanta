@@ -2593,6 +2593,111 @@ fn dequant_nf4_flat(raw_q, raw_absmax, nelements, blocksize, out) -> i64 {
     return 0
 }
 
+// ---------------------------------------------------------------------------
+// GPTQ: int32-packed weights with per-group scales and zero-points.
+//
+// Dequant (from llama.cpp conversion/base.py:366-395):
+//   pack_factor = 32 // bits
+//   wf[k] = k * bits  (shift for each packed value)
+//   weight[i, k, j] = (qweight[i, j] >> wf[k]) & maxq
+//   zeros[i, k, j]   = (qzeros[i, j] >> wf[k]) & maxq
+//   if gptq format (not v2): zeros += 1
+//   out[i, col] = scales[i, col // group_size] * (weight[i, k, j] - zeros[i, k, j])
+//     where col = j * pack_factor + k
+//
+// This is a 3-array format (qweight, qzeros, scales).
+// ---------------------------------------------------------------------------
+fn dequant_gptq(raw_w, raw_z, raw_s, num_rows, num_cols, bits, group_size, out) -> i64 {
+    let pack_factor = 32 / bits
+    let maxq = (1 << bits) - 1
+    let num_input_dim = num_cols * pack_factor
+    let row = 0
+    while row < num_rows {
+        let w_row = raw_w + row * num_cols * 4
+        let z_row = raw_z + row * num_cols * 4
+        let s_row = raw_s + row * (num_input_dim / group_size) * 4
+        let out_row = out + row * num_input_dim * 8
+        let j = 0
+        while j < num_cols {
+            let w_word = le32(w_row + j * 4)
+            let z_word = le32(z_row + j * 4)
+            let k = 0
+            while k < pack_factor {
+                let shift = k * bits
+                let w_val = (w_word >> shift) & maxq
+                let z_val = ((z_word >> shift) & maxq) + 1
+                let col = j * pack_factor + k
+                let scale = f32_to_f64(s_row + (col / group_size) * 4)
+                let val = fmul(scale, f64of(i2f(w_val - z_val)))
+                mem_store(out_row + col * 8, val)
+                k = k + 1
+            }
+            j = j + 1
+        }
+        row = row + 1
+    }
+    return 0
+}
+
+// ---------------------------------------------------------------------------
+// AWQ (Activation-aware Weight Quantization): 4-bit affine with nibble permutation.
+//
+// 3-buffer format (qweight, qzeros, scales), NOT GGUF.
+//
+// qweight: [in_features, out_features // 8] int32 -- 8x int4 per int32
+// qzeros:  [in_features // group_size, out_features // 8] int32 -- 8x int4 per int32
+// scales:  [in_features // group_size, out_features] f16
+//
+// bits = 4, group_size = 128 (typical)
+//
+// Dequant: out[i,j] = (qweight[i,j] - qzeros[i//gs, j]) * scales[i//gs, j]
+//
+// The AWQ packing interleaves nibbles for coalesced GPU access. The
+// AWQ_REVERSE_ORDER = [0, 4, 1, 5, 2, 6, 3, 7] undoes it during dequant.
+// Without this permutation, values are in the wrong positions but still
+// finite-looking, so it needs a fixture test.
+//
+// Reference: AutoAWQ awq/utils/packing_utils.py
+//   AWQ_REVERSE_ORDER = [0, 4, 1, 5, 2, 6, 3, 7]
+//   dequantize_gemm: unpack -> reverse_order -> mask -> (iw - iz) * scales
+// ---------------------------------------------------------------------------
+fn dequant_awq(raw_w, raw_z, raw_s, in_features, out_features, group_size, out) -> i64 {
+    let per_word = 8
+    let mask = 15
+    let groups = in_features / group_size
+    let words_per_row = out_features / per_word
+    // AWQ nibble permutation (undoes the packing interleave)
+    let rev = [0, 4, 1, 5, 2, 6, 3, 7]
+    let row = 0
+    while row < in_features {
+        let w_row = raw_w + row * words_per_row * 4
+        let group_idx = row / group_size
+        let z_row = raw_z + group_idx * words_per_row * 4
+        let s_row = raw_s + group_idx * out_features * 2
+        let out_row = out + row * out_features * 8
+        let j = 0
+        while j < words_per_row {
+            let w_word = le32(w_row + j * 4)
+            let z_word = le32(z_row + j * 4)
+            let k = 0
+            while k < per_word {
+                let src_k = rev[k]
+                let shift = 4 * src_k
+                let w_val = (w_word >> shift) & mask
+                let z_val = (z_word >> shift) & mask
+                let col = j * per_word + k
+                let scale = f16_to_f64(s_row + col * 2)
+                let val = fmul(scale, f64of(i2f(w_val - z_val)))
+                mem_store(out_row + col * 8, val)
+                k = k + 1
+            }
+            j = j + 1
+        }
+        row = row + 1
+    }
+    return 0
+}
+
 fn rms_norm(out, x, w, n) {
     // Standard RMSNorm: y[i] = x[i] / sqrt(mean(x^2)) * w[i].
     //
