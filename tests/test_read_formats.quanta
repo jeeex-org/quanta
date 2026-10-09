@@ -505,6 +505,25 @@ print("-- committed block fixtures (upstream-generated) --\n")
     check_fixture("tests/fixtures/blocks_iq4_xs.bin", 23, 136, 256,
                  -0.003977, 0.005038, -0.011719, 0.013171, "iq4_xs")
 
+    // Phase 9: MXFP4 and NVFP4.
+    //
+    // MXFP4: 32 elements per 17-byte block. E8M0 scale byte + 16 packed E2M1 nibbles.
+    // E8M0 = 2^(e-127), f64 bit pattern is (e+895)<<52.
+    // Codebook: {0,1,2,3,4,6,8,12,0,-1,-2,-3,-4,-6,-8,-12}
+    // Nibble order: LOW for first 16, HIGH for last 16.
+    print("  mxfp4 (dtype 39, 32 elems, 17 bytes)\n")
+    check_fixture("tests/fixtures/blocks_mxfp4.bin", 39, 17, 32,
+                 0.0, 1616.0, -12.0, 12.0, "mxfp4")
+
+    // NVFP4: 64 elements per 36-byte block. 4 UE4M3 scales + 32 packed E2M1 nibbles.
+    // UE4M3: unsigned, 4 exp bits (bias=7), 3 mantissa bits, result * 0.5.
+    // Special: 0x00 and 0x7F both map to 0.0.
+    // Sub-block s (0..3) uses scale d[s], elements s*16..s*16+15.
+    // Nibble order per sub-block: LOW for first 8, HIGH for last 8.
+    print("  nvfp4 (dtype 40, 64 elems, 36 bytes)\n")
+    check_fixture("tests/fixtures/blocks_nvfp4.bin", 40, 36, 64,
+                 -84.0, 4224.0, -96.0, 48.0, "nvfp4")
+
 
     print("\n")
     if failures > 0 {

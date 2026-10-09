@@ -1086,6 +1086,8 @@ fn gguf_dtype_supported(dtype) {
     if dtype == 20 { return 1 }  // IQ4_NL
     if dtype == 23 { return 1 }  // IQ4_XS
     if dtype == 30 { return 1 }  // BF16
+    if dtype == 39 { return 1 }  // MXFP4
+    if dtype == 40 { return 1 }  // NVFP4
     // NOTE: Q8_1 (9) is deliberately ABSENT and must stay absent. It is not a
     // row-storage format -- upstream exports no dequantize_row_q8_1 because it
     // has no per-element meaning. Its qs[] bytes are only ever consumed as int8
@@ -1127,6 +1129,10 @@ fn read_block_f64(dtype, raw, nelem, out) {
         dequant_iq4_nl(raw, nelem, out)
     } else if dtype == 23 {
         dequant_iq4_xs(raw, nelem, out)
+    } else if dtype == 39 {
+        dequant_mxfp4(raw, nelem, out)
+    } else if dtype == 40 {
+        dequant_nvfp4(raw, nelem, out)
     } else if dtype == 8 {
         dequant_q8_0(raw, nelem, out)
     } else if dtype == 2 {
@@ -1217,6 +1223,20 @@ fn read_tensor_f64(idx, buf) {
         lseek(gguf_fd, offset, 0)
         file_read(gguf_fd, raw, n)
         dequant_bf16(raw, nelem, buf)
+        mem_free(raw)
+    } else if dtype == 39 {
+        let n = gguf_tensor_nbytes(idx)
+        let raw = mem_alloc(n)
+        lseek(gguf_fd, offset, 0)
+        file_read(gguf_fd, raw, n)
+        dequant_mxfp4(raw, nelem, buf)
+        mem_free(raw)
+    } else if dtype == 40 {
+        let n = gguf_tensor_nbytes(idx)
+        let raw = mem_alloc(n)
+        lseek(gguf_fd, offset, 0)
+        file_read(gguf_fd, raw, n)
+        dequant_nvfp4(raw, nelem, buf)
         mem_free(raw)
     } else if dtype == 3 {
         dequant_q4_1(raw, nelem, buf)
@@ -2304,6 +2324,127 @@ fn dequant_iq4_xs(raw, nelements, out) -> i64 {
                 j = j + 1
             }
             ib = ib + 1
+        }
+        bi = bi + 1
+    }
+    return 0
+}
+
+// ---------------------------------------------------------------------------
+// MXFP4 (dtype 39): 32 elements per 17-byte block.
+//
+// Block layout (block_mxfp4):
+//   uint8_t e;         // E8M0 scale byte
+//   uint8_t qs[16];    // packed 4-bit E2M1 values
+//
+// E8M0: 8-bit exponent, 0 mantissa. Value = 2^(e-127) for e >= 2,
+// denormal patterns for e < 2. The f64 bit pattern is (e + 895) << 52.
+//
+// Codebook (kvalues_fp4, 16 entries):
+//   {0, 1, 2, 3, 4, 6, 8, 12, 0, -1, -2, -3, -4, -6, -8, -12}
+//
+// Nibble order: LOW nibbles for first 16 elements, HIGH nibbles for last 16.
+// ---------------------------------------------------------------------------
+fn mxfp4_k(n) -> i64 {
+    if n == 0 { return 0 }
+    if n == 1 { return 1 }
+    if n == 2 { return 2 }
+    if n == 3 { return 3 }
+    if n == 4 { return 4 }
+    if n == 5 { return 6 }
+    if n == 6 { return 8 }
+    if n == 7 { return 12 }
+    if n == 8 { return 0 }
+    if n == 9 { return -1 }
+    if n == 10 { return -2 }
+    if n == 11 { return -3 }
+    if n == 12 { return -4 }
+    if n == 13 { return -6 }
+    if n == 14 { return -8 }
+    return -12
+}
+
+fn e8m0_f64(e) -> i64 {
+    // (e + 895) << 52 gives the f64 bit pattern for 2^(e-127)
+    return (e + 895) << 52
+}
+
+fn dequant_mxfp4(raw, nelements, out) -> i64 {
+    let n_blocks = nelements / 32
+    let bi = 0
+    while bi < n_blocks {
+        let bo = bi * 17
+        let e = mem_load8(raw + bo)
+        let d = f64of(e8m0_f64(e))
+        let q = raw + bo + 1
+        let op = out + bi * 32 * 8
+        let j = 0
+        while j < 16 {
+            let b = mem_load8(q + j)
+            mem_store(op + j * 8, fmul(d, i2f(mxfp4_k(b & 15))))
+            mem_store(op + (16 + j) * 8, fmul(d, i2f(mxfp4_k(b >> 4))))
+            j = j + 1
+        }
+        bi = bi + 1
+    }
+    return 0
+}
+
+// ---------------------------------------------------------------------------
+// NVFP4 (dtype 40): 64 elements per 36-byte block.
+//
+// Block layout (block_nvfp4):
+//   uint8_t d[4];     // UE4M3 scales, one per 16-element sub-block
+//   uint8_t qs[32];   // packed 4-bit E2M1 values
+//
+// UE4M3: unsigned, 4 exp bits (bias=7), 3 mantissa bits.
+// Value = raw * 0.5 to match kvalues_mxfp4 convention.
+// Special: 0x00 and 0x7F both map to 0.0.
+//
+// Sub-block s (0..3) uses scale d[s], elements s*16..s*16+15.
+// Nibble order per sub-block: LOW nibbles for first 8, HIGH for last 8.
+// ---------------------------------------------------------------------------
+fn ue4m3_f64(x) -> i64 {
+    if x == 0 || x == 0x7F { return 0 }
+    let exp = (x >> 3) & 15
+    let man = x & 7
+    // 2^(exp-7): exp is 0..15, so exp-7 is -7..8
+    let p2: f64
+    if exp >= 7 {
+        p2 = i2f(1 << (exp - 7))
+    } else {
+        p2 = 1.0 / i2f(1 << (7 - exp))
+    }
+    let raw: f64
+    if exp == 0 {
+        raw = i2f(man) * 0.001953125  // 2^-9
+    } else {
+        raw = (1.0 + i2f(man) / 8.0) * p2
+    }
+    // multiply by 0.5 to match kvalues_mxfp4
+    return f64bits(raw * 0.5)
+}
+
+fn dequant_nvfp4(raw, nelements, out) -> i64 {
+    let n_blocks = nelements / 64
+    let bi = 0
+    while bi < n_blocks {
+        let bo = bi * 36
+        let q_base = raw + bo + 4
+        let op_base = out + bi * 64 * 8
+        let s = 0
+        while s < 4 {
+            let d = f64of(ue4m3_f64(mem_load8(raw + bo + s)))
+            let q = q_base + s * 8
+            let op = op_base + s * 16 * 8
+            let j = 0
+            while j < 8 {
+                let b = mem_load8(q + j)
+                mem_store(op + j * 8, fmul(d, i2f(mxfp4_k(b & 15))))
+                mem_store(op + (8 + j) * 8, fmul(d, i2f(mxfp4_k(b >> 4))))
+                j = j + 1
+            }
+            s = s + 1
         }
         bi = bi + 1
     }
