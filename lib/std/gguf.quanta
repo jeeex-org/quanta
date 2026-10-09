@@ -2837,8 +2837,12 @@ fn dequant_awq(raw_w, raw_z, raw_s, in_features, out_features, group_size, out) 
 // ---------------------------------------------------------------------------
 
 // Procedural codebook decode (from codebook.cuh).
-// Takes a 16-bit codeword and returns the decoded fp16 value as i64 bits.
+// Takes a 16-bit codeword and returns the decoded value as f64 bits.
+// The codeword is first zero-extended to 32 bits, then the magic multiply
+// and LOP3 produce two fp16 values that are summed.
 fn exl3_decode_codeword(x, cb) -> i64 {
+    // Zero-extend to 32 bits
+    x = x & 0xFFFF
     // cb 0: default (neither mcg nor mul1)
     // cb 1: mcg present
     // cb 2: mul1 present (different shape)
@@ -2915,30 +2919,128 @@ fn exl3_unpack_trellis_tile(raw, K, cb, out) -> i64 {
     return 0
 }
 
-// Tensor core permutation (from exl3.py tensor_core_perm).
-// Maps from tensor-core layout to row-major within a 16×16 tile.
-fn exl3_tc_perm(t) -> i64 {
-    // perm_a[t * 8 + i] for i in 0..7
+// Tensor core permutation: maps from TC layout to row-major within a 16×16 tile.
+// Returns the 256-element permutation array as individual values.
+// perm[i] = destination row-major index for source TC index i.
+fn exl3_tc_perm_element(src_idx) -> i64 {
+    // src_idx = t * 8 + i, where t in 0..31, i in 0..7
+    let t = src_idx / 8
+    let i = src_idx % 8
     let r0 = (t % 4) * 2
-    let r1 = r0 + 1
-    let r2 = r0 + 8
-    let r3 = r0 + 9
     let c0 = t / 4
-    let c1 = c0 + 8
-    // Return the 8 destination indices for source t
-    // We need to invert: for each source position, where does it go?
-    // Actually, the permutation maps source -> dest
-    // perm_a[t * 8 + 0] = r0 * 16 + c0
-    // perm_a[t * 8 + 1] = r1 * 16 + c0
-    // ...
-    // We need the inverse: for dest position d, what source position maps to it?
-    // This is complex. For now, return the forward permutation.
-    // The caller will need to invert it.
-    return r0 * 16 + c0  // placeholder
+    let rr = 0
+    let cc = 0
+    if i == 0 { rr = r0; cc = c0 }
+    else if i == 1 { rr = r0 + 1; cc = c0 }
+    else if i == 2 { rr = r0 + 8; cc = c0 }
+    else if i == 3 { rr = r0 + 9; cc = c0 }
+    else if i == 4 { rr = r0; cc = c0 + 8 }
+    else if i == 5 { rr = r0 + 1; cc = c0 + 8 }
+    else if i == 6 { rr = r0 + 8; cc = c0 + 8 }
+    else { rr = r0 + 9; cc = c0 + 8 }
+    return rr * 16 + cc
+}
+
+// Apply tensor core permutation to a 16×16 tile.
+// in: 256 f64 values in TC layout
+// out: 256 f64 values in row-major layout
+fn exl3_apply_tc_perm(in_ptr, out_ptr) -> i64 {
+    let i = 0
+    while i < 256 {
+        let dest = exl3_tc_perm_element(i)
+        mem_store(out_ptr + dest * 8, mem_load(in_ptr + i * 8))
+        i = i + 1
+    }
+    return 0
+}
+
+// Hadamard matrix element: H[i][j] = (-1)^popcount(i & j) / sqrt(n)
+fn exl3_hadamard_element(i, j, n) -> i64 {
+    let x = i & j
+    let count = 0
+    let tmp = x
+    // Count bits in x
+    let c = 0
+    let t = x
+    let c2 = 0
+    let t2 = t
+    // Unrolled bit count for 8 bits (n <= 128)
+    let b0 = t2 & 1; t2 = t2 >> 1
+    let b1 = t2 & 1; t2 = t2 >> 1
+    let b2 = t2 & 1; t2 = t2 >> 1
+    let b3 = t2 & 1; t2 = t2 >> 1
+    let b4 = t2 & 1; t2 = t2 >> 1
+    let b5 = t2 & 1; t2 = t2 >> 1
+    let b6 = t2 & 1; t2 = t2 >> 1
+    let b7 = t2 & 1
+    let count2 = b0 + b1 + b2 + b3 + b4 + b5 + b6 + b7
+    let sign = if count2 % 2 == 0 { 1.0 } else { -1.0 }
+    // Compute 1/sqrt(n) using Newton's method
+    let n_f = f64of(i2f(n))
+    let guess = n_f
+    let g = guess
+    // g = (g + n/g) / 2, 20 iterations
+    let g1 = (g + n_f / g) / 2.0
+    let g2 = (g1 + n_f / g1) / 2.0
+    let g3 = (g2 + n_f / g2) / 2.0
+    let g4 = (g3 + n_f / g3) / 2.0
+    let g5 = (g4 + n_f / g4) / 2.0
+    let g6 = (g5 + n_f / g5) / 2.0
+    let g7 = (g6 + n_f / g6) / 2.0
+    let g8 = (g7 + n_f / g7) / 2.0
+    let g9 = (g8 + n_f / g8) / 2.0
+    let g10 = (g9 + n_f / g9) / 2.0
+    let g11 = (g10 + n_f / g10) / 2.0
+    let g12 = (g11 + n_f / g11) / 2.0
+    let g13 = (g12 + n_f / g12) / 2.0
+    let g14 = (g13 + n_f / g13) / 2.0
+    let g15 = (g14 + n_f / g14) / 2.0
+    let g16 = (g15 + n_f / g15) / 2.0
+    let g17 = (g16 + n_f / g16) / 2.0
+    let g18 = (g17 + n_f / g17) / 2.0
+    let g19 = (g18 + n_f / g18) / 2.0
+    let g20 = (g19 + n_f / g19) / 2.0
+    let sqrt_n = g20
+    let result = sign / sqrt_n
+    return f64bits(result)
+}
+
+// Apply Hadamard transform to a block of data.
+// data: n×n f64 values
+// n: block size (must be power of 2, typically 128)
+// dir: 0 for forward (H @ data), 1 for inverse (data @ H^T)
+fn exl3_hadamard_transform(data, n, dir) -> i64 {
+    // For forward: out[i][j] = sum_k H[i][k] * data[k][j]
+    // For inverse: out[i][j] = sum_k data[i][k] * H[k][j]
+    // Since H is symmetric, both are the same operation
+    let tmp = mem_alloc(n * n * 8)
+    let i = 0
+    while i < n {
+        let j = 0
+        while j < n {
+            let sum = f64of(0.0)
+            let k = 0
+            while k < n {
+                let h_ik = f64of(exl3_hadamard_element(i, k, n))
+                let d_kj = f64of(mem_load(data + (k * n + j) * 8))
+                sum = sum + h_ik * d_kj
+                k = k + 1
+            }
+            mem_store(tmp + (i * n + j) * 8, sum)
+            j = j + 1
+        }
+        i = i + 1
+    }
+    // Copy back
+    let idx = 0
+    while idx < n * n {
+        mem_store(data + idx * 8, mem_load(tmp + idx * 8))
+        idx = idx + 1
+    }
+    return 0
 }
 
 // Full EXL3 dequant: trellis + Hadamard + scales.
-// This is a simplified version that handles the core pipeline.
 // raw_trellis: int16 packed codewords
 // raw_suh: fp16 input scales (K values)
 // raw_svh: fp16 output scales (N values)
@@ -2948,18 +3050,117 @@ fn exl3_tc_perm(t) -> i64 {
 // cb: codebook index (0, 1, or 2)
 // out: K×N f64 output
 fn dequant_exl3(raw_trellis, raw_suh, raw_svh, K, N, bits, cb, out) -> i64 {
-    // Step 1: Unpack trellis tiles
     let tiles_k = K / 16
     let tiles_n = N / 16
+    let had_dim = 128  // Hadamard block size
+
+    // Step 1: Unpack trellis tiles and apply tensor core permutation
     let tile_idx = 0
     while tile_idx < tiles_k * tiles_n {
         let tile_offset = tile_idx * 16 * bits  // uint16 words per tile
+        let tile_tmp = mem_alloc(256 * 8)
+        exl3_unpack_trellis_tile(raw_trellis + tile_offset * 2, bits, cb, tile_tmp)
+        // Apply tensor core permutation
         let tile_out = out + tile_idx * 256 * 8
-        exl3_unpack_trellis_tile(raw_trellis + tile_offset * 2, bits, cb, tile_out)
+        exl3_apply_tc_perm(tile_tmp, tile_out)
         tile_idx = tile_idx + 1
     }
-    // Step 2-7: Hadamard transforms, tensor core permutation, scales
-    // TODO: implement full pipeline
+
+    // Step 2: Apply left Hadamard (input side) in blocks of had_dim
+    let row = 0
+    while row < K {
+        let col_block = 0
+        while col_block < N {
+            let block_size = had_dim
+            if col_block + block_size > N { block_size = N - col_block }
+            // Extract block, apply Hadamard, write back
+            let block = mem_alloc(block_size * block_size * 8)
+            let i = 0
+            while i < block_size {
+                let j = 0
+                while j < block_size {
+                    mem_store(block + (i * block_size + j) * 8,
+                               mem_load(out + ((row + i) * N + col_block + j) * 8))
+                    j = j + 1
+                }
+                i = i + 1
+            }
+            exl3_hadamard_transform(block, block_size, 0)
+            i = 0
+            while i < block_size {
+                let j = 0
+                while j < block_size {
+                    mem_store(out + ((row + i) * N + col_block + j) * 8,
+                               mem_load(block + (i * block_size + j) * 8))
+                    j = j + 1
+                }
+                i = i + 1
+            }
+            col_block = col_block + block_size
+        }
+        row = row + had_dim
+    }
+
+    // Step 3: Multiply by suh (input scales)
+    let i = 0
+    while i < K {
+        let suh_val = f16_to_f64(raw_suh + i * 2)
+        let j = 0
+        while j < N {
+            let idx = (i * N + j) * 8
+            mem_store(out + idx, fmul(f64of(mem_load(out + idx)), suh_val))
+            j = j + 1
+        }
+        i = i + 1
+    }
+
+    // Step 4: Apply right Hadamard (output side) in blocks of had_dim
+    let col = 0
+    while col < N {
+        let row_block = 0
+        while row_block < K {
+            let block_size = had_dim
+            if row_block + block_size > K { block_size = K - row_block }
+            let block = mem_alloc(block_size * block_size * 8)
+            let i = 0
+            while i < block_size {
+                let j = 0
+                while j < block_size {
+                    mem_store(block + (i * block_size + j) * 8,
+                               mem_load(out + ((row_block + i) * N + col + j) * 8))
+                    j = j + 1
+                }
+                i = i + 1
+            }
+            exl3_hadamard_transform(block, block_size, 1)
+            i = 0
+            while i < block_size {
+                let j = 0
+                while j < block_size {
+                    mem_store(out + ((row_block + i) * N + col + j) * 8,
+                               mem_load(block + (i * block_size + j) * 8))
+                    j = j + 1
+                }
+                i = i + 1
+            }
+            row_block = row_block + block_size
+        }
+        col = col + had_dim
+    }
+
+    // Step 5: Multiply by svh (output scales)
+    let j = 0
+    while j < N {
+        let svh_val = f16_to_f64(raw_svh + j * 2)
+        let i = 0
+        while i < K {
+            let idx = (i * N + j) * 8
+            mem_store(out + idx, fmul(f64of(mem_load(out + idx)), svh_val))
+            i = i + 1
+        }
+        j = j + 1
+    }
+
     return 0
 }
 
