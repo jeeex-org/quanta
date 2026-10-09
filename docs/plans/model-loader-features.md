@@ -2,7 +2,7 @@
 
 Scope decided with the maintainer: **full architecture** — loader + tokenizer + multi-model support — with the GPU load/unload path as a first-class requirement.
 
-**Status: plan for review. Nothing here is implemented yet.**
+**Status: 17 of 18 phases complete. Phase 7 (GPU residency) is blocked on CUDA.**
 
 ---
 
@@ -342,9 +342,20 @@ safetensors so callers never branch on format name. Verified across a real
 
 - `load_header`, `list_tensors`, `find_tensor`, `tensor_nbytes`, `read_tensor_bytes`, `dequantize_tensor`, `is_quantized`, `has`
 
-### Phase 7 — GPU residency, load/unload at speed
+### Phase 7 — GPU residency, load/unload at speed — **BLOCKED**
 
-Driven by the measurements, not by folklore.
+**Blocked on CUDA.** Quanta has no CUDA bindings. The doc requires:
+- `cudaMemcpyAsync` on a dedicated stream
+- Pinned anonymous staging in 64 MiB chunks
+- Fused dequant-on-load in the copy kernel
+- `cudaMemPoolAttrReleaseThreshold` for constant-VA reload
+
+None of these can be implemented without GPU access. The doc explicitly says
+"driven by the measurements, not by folklore" — those measurements need a GPU.
+
+**What exists instead:** Phase 8 (partial load) and Phase 8b (MoE offload) provide
+the CPU-side memory management that Phase 7 would build on. The invariant is
+the same: placement decides speed, never semantics.
 
 1. mmap the model file; `MADV_POPULATE_READ` in windows (0.057 s per 4 GiB)
 2. pinned anonymous staging in 64 MiB chunks (file-backed pinning **fails** on this driver)
