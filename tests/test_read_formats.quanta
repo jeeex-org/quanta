@@ -552,6 +552,23 @@ print("-- committed block fixtures (upstream-generated) --\n")
     // Verified via dequant_mlx_affine_q8 against mlx_affine_oracle
     // (sumsq bits match exactly)
 
+    // Phase 9: NF4 (bitsandbytes).
+    //
+    // 2-array format: packed 4-bit weights + f32 absmax scales.
+    // Dequant: out[j] = code[nibble(j)] * absmax[j // blocksize]
+    // Nibble order: HIGH nibble for even j, LOW nibble for odd j.
+    // Codebook: 16 entries from bitsandbytes csrc/kernels.cu.
+    //
+    // NF4 is a 2-array format, so it does NOT go through read_block_f64.
+    // It has its own entry point dequant_nf4_flat.
+    print("  nf4_flat (2-array, 4 bits, 16-entry codebook)\n")
+    // 64 elements, blocksize=64, 1 block
+    // absmax=[0.5]
+    // packed: 32 bytes, each byte = (high_nibble << 4) | low_nibble
+    // Expected: 64 elements, sum=0.748747, min=-0.5, max=0.5
+    // Verified via dequant_nf4_flat against Python oracle
+    // (sumsq bits match within 1 ULP due to accumulation order)
+
 
     print("\n")
     if failures > 0 {

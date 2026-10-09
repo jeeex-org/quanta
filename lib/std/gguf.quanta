@@ -2534,6 +2534,65 @@ fn le32(ptr) -> i64 {
     return b0 + b1 * 256 + b2 * 65536 + b3 * 16777216
 }
 
+// ---------------------------------------------------------------------------
+// NF4 (bitsandbytes): 4-bit Normal Float 4.
+//
+// Codebook (16 entries, from bitsandbytes csrc/kernels.cu):
+//   {-1.0, -0.696, -0.525, -0.395, -0.284, -0.185, -0.091, 0.0,
+//    0.0796, 0.161, 0.246, 0.338, 0.441, 0.563, 0.723, 1.0}
+//
+// Flat dequant: out[j] = code[nibble(j)] * absmax[j // blocksize]
+//   - Nibble order: HIGH nibble for even j, LOW nibble for odd j
+//   - absmax is f32, one per blocksize elements
+//   - Packed bytes: high nibble is the even element, low nibble is the odd
+//
+// This is a 2-array format (packed weights + absmax scales).
+// ---------------------------------------------------------------------------
+fn nf4_k(n) -> i64 {
+    if n == 0 { return 0xBFF0000000000000 }
+    if n == 1 { return 0xBFE6473620000000 }
+    if n == 2 { return 0xBFE0CD6600000000 }
+    if n == 3 { return 0xBFD9465400000000 }
+    if n == 4 { return 0xBFD23449A0000000 }
+    if n == 5 { return 0xBFC7A6A7E0000000 }
+    if n == 6 { return 0xBFB74F0E20000000 }
+    if n == 7 { return 0 }
+    if n == 8 { return 0x3FB45F5FE0000000 }
+    if n == 9 { return 0x3FC4995C60000000 }
+    if n == 10 { return 0x3FCF809BA0000000 }
+    if n == 11 { return 0x3FD5A06740000000 }
+    if n == 12 { return 0x3FDC349700000000 }
+    if n == 13 { return 0x3FE200F560000000 }
+    if n == 14 { return 0x3FE7227660000000 }
+    return 0x3FF0000000000000
+}
+
+fn dequant_nf4_flat(raw_q, raw_absmax, nelements, blocksize, out) -> i64 {
+    let n_blocks = nelements / blocksize
+    let bi = 0
+    while bi < n_blocks {
+        let scale = f32_to_f64(raw_absmax + bi * 4)
+        let q_base = raw_q + bi * (blocksize / 2)
+        let op_base = out + bi * blocksize * 8
+        let j = 0
+        while j < blocksize {
+            let byte_idx = j / 2
+            let b = mem_load8(q_base + byte_idx)
+            let nib: i64
+            if j % 2 == 0 {
+                nib = b >> 4
+            } else {
+                nib = b & 15
+            }
+            let val = fmul(scale, f64of(nf4_k(nib)))
+            mem_store(op_base + j * 8, val)
+            j = j + 1
+        }
+        bi = bi + 1
+    }
+    return 0
+}
+
 fn rms_norm(out, x, w, n) {
     // Standard RMSNorm: y[i] = x[i] / sqrt(mean(x^2)) * w[i].
     //
