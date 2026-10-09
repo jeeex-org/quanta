@@ -495,13 +495,45 @@ there is no loader code to port here — but two kernels document byte layouts p
   checkpoints carry `weight_g_idx` `[K]` (column → group). Decode `(q - zp) * scale` is exact in fp32,
   then rounded like compressed-tensors (scale dtype, then output).
 
-### Phase 10 — Tokenizers as a family
+### Phase 10 — Tokenizers as a family ✅ FAMILY LAYER DONE
 
 Currently BPE + SPM, both arch-specific. Target the 5 llama.cpp families behind one trait:
 
 - shared: `tokenize`, `detokenize`, `vocab_size`, `token_to_id`, `id_to_token`
 - per-family: pre-tokenizer + merge/vocab table construction
 - `trust_remote_code` equivalent — default **off**
+
+`lib/std/tokenizer_trait.quanta` is the family layer, and it reads the family from the
+model's own GGUF rather than from its name or architecture. Verified on the real
+`QUANTA-LFM2.5-2.6Bv1-Q4_K_M.gguf`:
+
+| metadata | value |
+|---|---|
+| `tokenizer.ggml.model` | `gpt2` → **BPE** |
+| `tokenizer.ggml.pre` | `lfm2` → **LLAMA3** (not GPT2) |
+| `tokenizer.ggml.tokens` | 128000 |
+| `tokenizer.ggml.merges` | 293320 |
+
+The pre-tokenizer **name is not the variant**: `llama-vocab.cpp:2286-2296` maps ten
+model-authored names (`llama3`, `llama-v3`, `llama-bpe`, `falcon3`, `falcon-h1`,
+`pixtral`, `midm-2.0`, `lfm2`, `jina-v5-nano`) onto one LLAMA3 behaviour, and sets
+`ignore_merges = true` and `add_bos = true` alongside it. `lfm2` and `gpt2` are both
+BPE with *different* pre-tokenizers, which is precisely why the trait reads the
+metadata.
+
+Queries **dispatch** to the family rather than reimplementing it. BPE is
+`lib/std/lfm2_bpe.quanta`, already verified byte-exact against llama.cpp's own
+test-tokenizer-0 on 26 blocks; a second copy inside the trait could drift from the
+code the gate actually proves. `std_tokenizer_trait_test.quanta` asserts the two
+agree, and checks six fixture blocks token-for-token (67 checks).
+
+`trust_remote_code` is **off** by default. Only 0 and 1 are accepted; a sentinel is
+refused rather than stored.
+
+**Not done:** SPM, WPM, UGM and RWKV are named because llama.cpp names them, and
+`vt_implemented()` reports them as **not implemented**. `lib/std/sp_tokenizer.quanta`
+is a stub that fakes a 256-entry vocab and encodes one byte per token — it is
+worse than absent, because it returns plausible ids.
 
 ---
 
