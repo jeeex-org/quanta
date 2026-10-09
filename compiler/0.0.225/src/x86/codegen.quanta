@@ -1204,6 +1204,51 @@ fn ci_func(fi, is_main) {
         }
     }
     // Prologue
+    // Discard the fixpoint's float tags and re-derive only the two cases that
+    // come from a type TABLE rather than from a record scan: a parameter declared
+    // `: f64` (fn_parflt) and a call to a function declared `-> f64` (fn_retflt).
+    //
+    // Why discard the rest. The fixpoint above walks records and follows IR_MOV
+    // chains, but on the source path ci_func scans 0..irc -- every function's
+    // records live in one buffer and vreg numbering RESTARTS per function, so a
+    // record in another function naming vreg 0 is indistinguishable from this
+    // function's own vreg 0. A module-level float initialiser is compiled as its
+    // own pseudo-function (entry.quanta, ci_func(0,0)) and lowers to IR_CALL
+    // fconst writing vreg 0, which is also the first parameter's vreg:
+    //
+    //     let G = 2.0
+    //     fn t(n: i64) -> i64 { let s = G  return n + 1 }
+    //     t(20) -> 1.0's bit pattern   (want 21)
+    //
+    // fopld_rr then bit-moved n instead of converting it -- measured in the
+    // emitted code as `movq %rbx,%xmm0` where `cvtsi2sd %rbx,%xmm0` was required.
+    // 20 became 1e-322 and 1e-322 + 1.0 rounds to exactly 1.0.
+    //
+    // Nothing is lost: every float PRODUCER re-tables its own result as it is
+    // EMITTED (IR_LOADG from gfloat, IR_FCONST, IR_NEG, and the arithmetic
+    // branches all write w8(vfloat+res, 1)), so an f64 literal's vreg is re-tagged
+    // from its own record during emit.
+    {
+        let z=0
+        let zhi=vreg_n
+        if vreg_high>zhi { zhi=vreg_high }
+        while z<zhi+8 { w8(vfloat+z,0); z=z+1 }
+        let tb=ir_beg
+        while tb<ir_end {
+            let top=irop(tb); let tres=irres(tb); let ta0=ira0(tb)
+            if tres>=0 {
+                if top==IR_PARAM && ta0>=0 && r64(fn_parflt + (fi*200 + ta0)*8)==1 { w8(vfloat+tres,1) }
+                if top==IR_CALL {
+                    let tl=0
+                    while tl<200 && r8(src+ta0+tl)!=0 && r8(src+ta0+tl)!=40 && r8(src+ta0+tl)!=41 && r8(src+ta0+tl)!=44 { tl=tl+1 }
+                    let tcf=-1
+                    if tl>0 { tcf=findfn(ta0,tl) }
+                    if tcf>=0 && tcf<fnc && r64(fn_retflt + tcf*8)==1 { w8(vfloat+tres,1) }
+                }
+            }
+            tb=tb+1
+        }
+    }
     xpush(5); rr(5,4)
     // FIX-0.0.7: mark frame context. Every ci_func body has the push-rbp
     // prologue above, so [rbp+8] is a valid caller return address for any
