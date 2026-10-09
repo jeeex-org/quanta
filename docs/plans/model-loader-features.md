@@ -333,9 +333,12 @@ Not `role → function pointer` directly. Each role names a **tensor kind**: `[r
 - transposition must be explicit and cheap; roles declare which form they store
 - llama.cpp's `get_tp_alignment` equivalent: declare alignment (group_size) per tensor kind
 
-### Phase 6 — Loader traits
+### Phase 6 — Loader traits ✅ DONE
 
-So callers write `if loader.has(load_weight_only)` and never branch on format name.
+Format-neutral seam: `lib/std/loader_traits.quanta` exposes `qmodel_*` over GGUF and
+safetensors so callers never branch on format name. Verified across a real
+266-tensor GGUF and two real safetensors files (2,780 and 1,152 tensors), with all
+14 hostile-file fixtures still rejected.
 
 - `load_header`, `list_tensors`, `find_tensor`, `tensor_nbytes`, `read_tensor_bytes`, `dequantize_tensor`, `is_quantized`, `has`
 
@@ -657,9 +660,9 @@ Sequencing: build the size tiering and light mode *alongside* further kernel wor
 
 | Step | Deliverable | Done when |
 |---|---|---|
-| 11.1 | `qmodel_size_class()` from the tensor graph + metadata | returns `small/mid/full` for LFM2 2.6B from a real GGUF, `full` on unknown |
-| 11.2 | Context budgeting, pure, stepped | same conversation ⇒ same prompt, 1/2/4 worker-agnostic; sizes verified per tier |
-| 11.3 | Temperature ceiling | slider can lower, never raise, the tier ceiling |
+| 11.1 | `qmodel_size_class()` from the tensor graph + metadata ✅ | returns `small/mid/full` for LFM2 2.6B from a real GGUF, `full` on unknown |
+| 11.2 | Context budgeting, pure, stepped ✅ | same conversation ⇒ same prompt, 1/2/4 worker-agnostic; sizes verified per tier |
+| 11.3 | Temperature ceiling ✅ | slider can lower, never raise, the tier ceiling |
 | 11.4 | Light mode: whole-file writes, host-side tool execution | a task a 2.6B model cannot do directly completes via light mode |
 | 11.5 | Proof record + send-back loop | an agent that "finishes" with no test after its change is sent back, ≤2 times |
 
