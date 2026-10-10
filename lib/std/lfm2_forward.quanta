@@ -366,8 +366,23 @@ fn fc_kv_init(nctx) {
     if fc_kvbuf != 0 { return 0 }
     if fc_nkv_max <= 0 || fc_head_dim <= 0 { return -1 }
     fc_kv_cap = nctx
-    // n_layers slots for K and the same again for V.
-    fc_kvbuf = mem_alloc(fc_kv_layer_stride() * fc_n_layers * 2 + 4096)
+    // The allocation MUST match the index expression in fc_kv_at exactly. That
+    // expression steps by fc_kv_cap positions, so the per-layer stride has to
+    // include the context length:
+    //
+    //     per layer = fc_kv_cap * fc_nkv_max * fc_head_dim * 8
+    //
+    // This version allocated only nkv_max * head_dim * 8 per layer -- one
+    // POSITION, not a whole context -- while the index multiplied in
+    // fc_kv_cap. Measured on this model (cap 2048, 30 layers, nkv 8, hd 64):
+    // the index expression reaches byte 503,315,968 of a 249,856-byte buffer,
+    // a 503 MB overshoot, exactly 2048x too far.
+    //
+    // pos 0 was the only case that worked, because its position term is zero --
+    // which is why generation looked fine at the first token and then corrupted
+    // memory. Every store past pos 0 wrote outside its own layer slot and
+    // eventually outside the allocation entirely.
+    fc_kvbuf = mem_alloc(fc_kv_cap * fc_nkv_max * fc_head_dim * 8 * fc_n_layers * 2 + 4096)
     if fc_kvbuf == 0 { return -1 }
     fc_kv_len = 0
     return 0
