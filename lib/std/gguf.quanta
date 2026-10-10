@@ -2401,15 +2401,23 @@ fn dequant_f16(raw, nelements, out) {
 // end of the 12-byte table once j reached 4. And deriving both high halves from
 // `sc[j-4]` mis-paired the scale and min of every sub-block from 4 upward.
 fn q4k_sc(j, sc) {
-    if j < 4 { return mem_load8(sc + j) - (mem_load8(sc + j) / 64) * 64 }
+    // Shifts, NOT `/`. Every divisor here is a constant power of two, so `/64`
+    // is a right shift by 6 and `/16` a right shift by 4. Quanta's -O is a
+    // verified no-op (byte-identical binaries with and without it), so these
+    // were real `idiv` instructions -- ~40-80 cycles each -- and this function
+    // runs 8x per 64 elements, twice per chunk. The `>>` below is exact: the
+    // operands are non-negative, so a shift and a divide agree bit for bit.
+    if j < 4 { return mem_load8(sc + j) - (mem_load8(sc + j) >> 6) * 64 }
     let lo = mem_load8(sc + j + 4)
-    return (lo - (lo / 16) * 16) + ((mem_load8(sc + j - 4) / 64) * 16)
+    return (lo - (lo >> 4) * 16) + ((mem_load8(sc + j - 4) >> 6) * 16)
 }
 
 fn q4k_min(j, sc) {
-    if j < 4 { return mem_load8(sc + j + 4) - (mem_load8(sc + j + 4) / 64) * 64 }
+    // Shifts, not divides -- same reasoning as q4k_sc above. `lo >> 4` replaces
+    // `lo / 16`, and `(lo >> 4 >> 4)` replaces `(lo / 16 / 16)`.
+    if j < 4 { return mem_load8(sc + j + 4) - (mem_load8(sc + j + 4) >> 6) * 64 }
     let lo = mem_load8(sc + j + 4)
-    return (lo / 16 - (lo / 16 / 16) * 16) + ((mem_load8(sc + j) / 64) * 16)
+    return (lo >> 4 - (lo >> 4 >> 4) * 16) + ((mem_load8(sc + j) >> 6) * 16)
 }
 
 fn dequant_q4k(raw, nelements, out) {
