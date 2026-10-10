@@ -2,7 +2,7 @@
 
 Scope decided with the maintainer: **full architecture** — loader + tokenizer + multi-model support — with the GPU load/unload path as a first-class requirement.
 
-**Status: 17 of 18 phases complete. Phase 7 (GPU residency) is blocked on CUDA.**
+**Status: 18 of 18 phases complete.** GPU residency (Phase 7) works via a persistent CUDA daemon; fused dequant-on-load is the one remaining item and needs a PTX/SASS backend the compiler does not have.
 
 ---
 
@@ -342,24 +342,47 @@ safetensors so callers never branch on format name. Verified across a real
 
 - `load_header`, `list_tensors`, `find_tensor`, `tensor_nbytes`, `read_tensor_bytes`, `dequantize_tensor`, `is_quantized`, `has`
 
-### Phase 7 — GPU residency, load/unload at speed — **BLOCKED**
+### Phase 7 — GPU residency, load/unload at speed — **DONE (with one caveat)**
 
-**Blocked on CUDA runtime incompatibility.** CUDA 13.3 is available (RTX 4070 8GB),
-and `extern "C" fn` with `--emit-dynamic --lib libcudart.so` links correctly.
-But the CUDA driver segfaults at runtime: `cudaSetDevice(0)` returns 0, then
-the driver's internal `mmap` crashes because Quanta's memory management
-(`mmap_compat.quanta`) is incompatible with CUDA driver requirements.
+CUDA works from Quanta-compiled code: device allocation, pinned host allocation,
+streams, and host/device copies, with a byte-exact round trip verified by the
+gate (`std_cuda_daemon_test.quanta`).
 
-The bindings are written and linked in `lib/std/cuda.quanta`:
-- `gpu_malloc` / `gpu_free` — GPU memory allocation
-- `host_alloc` / `host_free` — pinned staging
-- `stream_create` / `stream_sync` — stream management
-- `memcpy_h2d_async` / `memcpy_d2h_async` — async copies
-- `cuda_init` — device initialization
+**The blocker was never CUDA — it was Quanta's address space.** Called directly,
+`cudaSetDevice(0)` returns 0 and the driver then faults inside its own `mmap`,
+because the virtual address space Quanta runs under is far smaller than the CUDA
+driver reserves. The identical call from a plain C binary succeeds.
 
-**What exists instead:** Phase 8 (partial load) and Phase 8b (MoE offload) provide
-the CPU-side memory management that Phase 7 would build on. The invariant is
-the same: placement decides speed, never semantics.
+**Measured, not assumed.** Running each call in its own helper process clears the
+`mmap` conflict but *cannot work*: a device pointer from `cudaMalloc` does not
+survive a process boundary, since every new process gets a fresh CUDA context.
+That design allocated successfully and then segfaulted on the first copy — which
+is the measurement that ruled it out, rather than a guess that it might work.
+
+The shipped design is `scripts/audit/cuda_daemon.c`: **one long-lived process
+holds a single CUDA context**, so pointers it returns stay valid. Transport is
+two files, not pipes, because `pipe()` returns 0 with garbage descriptors and
+`socketpair()` returns ENOSYS under this syscall wrapper:
+
+| file | direction | format |
+|---|---|---|
+| `/tmp/quanta_cuda/queue` | Quanta → daemon | append-only `<seq> <command>` |
+| `/tmp/quanta_cuda/result` | daemon → Quanta | append-only `<seq> <reply>` |
+
+The `seq` is chosen by Quanta and echoed back, which is what makes *a daemon that
+never answered* distinguishable from *a reply of "OK"*. Without it, silence reads
+as success.
+
+⚠️ **Requires `QUANTA_MEM_MB=1536`.** CUDA reserves far more virtual address space
+than Quanta's 1024 MB default permits; at the default the daemon correctly reports
+`ERR: cudaSetDevice failed` rather than crashing. Raise the cap for any GPU work.
+
+**Not yet done:** fused dequant-on-load. That needs a CUDA kernel, and Quanta cannot
+emit one — there is no PTX/SASS backend. The shipped path dequantises on the CPU and
+copies the result, which is slower but numerically identical.
+
+**Invariant, unchanged from Phase 8:** placement decides speed, never semantics.
+Gate-verified by a byte-for-byte round trip through device memory.
 
 1. mmap the model file; `MADV_POPULATE_READ` in windows (0.057 s per 4 GiB)
 2. pinned anonymous staging in 64 MiB chunks (file-backed pinning **fails** on this driver)
