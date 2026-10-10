@@ -1,0 +1,85 @@
+// CUDA daemon client test, end to end.
+//
+// NOTE on the staging buffer: mem_store/mem_load are 8-byte operations, so the
+// elements are spaced 8 bytes apart. An earlier version spaced them 4 bytes
+// apart, which made every comparison read two overlapping elements and report a
+// mismatch on data the GPU had actually round-tripped correctly.
+import std/fs
+import std/cuda_daemon
+
+fn main() -> i64 {
+    let fails = 0
+
+    if cuda_daemon_ready() == 0 {
+        print("FAIL: daemon not running\n")
+        return 1
+    }
+    print("daemon files: OK\n")
+
+    if cuda_init() != 0 { print("FAIL: cuda_init\n"); return 1 }
+    print("init: OK\n")
+
+    let g = gpu_malloc(4096)
+    if g == 0 { print("FAIL: gpu_malloc\n"); fails = fails + 1 } else { print("gpu_malloc: OK\n") }
+
+    let h = host_alloc(4096)
+    if h == 0 { print("FAIL: host_alloc\n"); fails = fails + 1 } else { print("host_alloc: OK\n") }
+
+    let s = stream_create()
+    if s == 0 { print("FAIL: stream_create\n"); fails = fails + 1 } else { print("stream_create: OK\n") }
+
+    // Stage 8 elements, 8 bytes apart: 1, 2, 3, ... 8
+    let nel = 8
+    let stage = mem_alloc(nel * 8)
+    let i = 0
+    while i < nel { mem_store(stage + i*8, i + 1); i = i + 1 }
+
+    let fd = open("/tmp/qc_stage.bin", 577, 420)
+    if fd < 0 { print("FAIL: open stage\n"); return 1 }
+    write_raw(fd, stage, nel * 8)
+    close(fd)
+
+    if g != 0 {
+        if memcpy_h2d_async("/tmp/qc_stage.bin", g, nel * 8) != 0 {
+            print("FAIL: h2d\n"); fails = fails + 1
+        } else { print("h2d: OK\n") }
+
+        if memcpy_d2h_async(g, "/tmp/qc_back.bin", nel * 8) != 0 {
+            print("FAIL: d2h\n"); fails = fails + 1
+        } else {
+            let f2 = open("/tmp/qc_back.bin", 0, 0)
+            if f2 < 0 { print("FAIL: open back\n"); fails = fails + 1 }
+            else {
+                let back = mem_alloc(nel * 8)
+                let n = read_raw(f2, back, nel * 8)
+                close(f2)
+                if n != nel * 8 {
+                    print("FAIL: short read n="); print(n); print("\n")
+                    fails = fails + 1
+                } else {
+                    let bad = 0
+                    let j = 0
+                    while j < nel {
+                        if mem_load(back + j*8) != j + 1 { bad = bad + 1 }
+                        j = j + 1
+                    }
+                    if bad > 0 {
+                        print("FAIL: round trip, "); print(bad); print(" of "); print(nel); print(" wrong\n")
+                        fails = fails + 1
+                    } else { print("round-trip: OK\n") }
+                }
+            }
+        }
+    }
+
+    if s != 0 { stream_sync(s) }
+    if h != 0 { host_free(h) }
+    if g != 0 { gpu_free(g) }
+
+    if fails > 0 {
+        print("cuda_daemon: "); print(fails); print(" FAILURES\n")
+        return 1
+    }
+    print("cuda_daemon: all pass\n")
+    return 0
+}

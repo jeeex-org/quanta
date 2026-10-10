@@ -1,0 +1,412 @@
+// cuda_daemon.quanta — persistent CUDA context, driven from Quanta.
+//
+// WHY A DAEMON
+// ------------
+// Quanta cannot call CUDA directly: cudaSetDevice returns 0 and the driver then
+// faults inside its own mmap, because the address-space ceiling Quanta runs
+// under is far below what the CUDA driver reserves. Running each call in its own
+// helper process dodges that, but a device pointer from cudaMalloc does not
+// survive a process boundary -- every new process gets a fresh CUDA context, so
+// a fork-per-call design can allocate and can never copy.
+//
+// scripts/audit/cuda_daemon.c solves both: one long-lived process owns a single
+// CUDA context, so the pointers it hands out stay valid. Pipes would be the
+// natural transport but are unusable here -- pipe() returns 0 with garbage
+// descriptors and socketpair() returns ENOSYS under this syscall wrapper -- so
+// the transport is two files:
+//
+//   /tmp/quanta_cuda/queue   append-only: "<seq> <command>"
+//   /tmp/quanta_cuda/result  append-only: "<seq> <reply>"
+//
+// The seq number is ours and is echoed back, which is what makes a timeout
+// distinguishable from a reply: without it, a command that the daemon never
+// answered would read as an empty result and look like success.
+
+import std/fs
+
+const CUDA_QUEUE  = "/tmp/quanta_cuda/queue"
+const CUDA_RESULT = "/tmp/quanta_cuda/result"
+
+// Sequence number for the next command. Monotonic, so a reply can always be
+// matched to the command that asked for it.
+let cuda_seq = 0
+// How many result lines we have already consumed, so we never re-read a reply.
+let cuda_result_pos = 0
+
+// Copy a Quanta string literal into a NUL-terminated raw byte buffer.
+//
+// A Quanta string is not a C string: length sits at [ptr] and the bytes live at
+// [ptr+8]. Indexing one as s[i] reads the length header as a character, and
+// comparing that to 0 ends the copy immediately -- which is how an earlier
+// version of this file sent the helper an empty command and made CUDA look
+// broken. len() and +8 are the only correct accessors.
+//
+// Returns the byte count written, excluding the NUL.
+fn cuda_cstr(dst, s) -> i64 {
+    let n = len(s)
+    let i = 0
+    while i < n {
+        mem_store8(dst + i, mem_load8(s + 8 + i))
+        i = i + 1
+    }
+    mem_store8(dst + n, 0)
+    return n
+}
+
+// Append a Quanta string to a raw buffer at pos. Returns the new pos.
+fn cuda_cat(dst, pos, s) -> i64 {
+    let n = len(s)
+    let i = 0
+    while i < n {
+        mem_store8(dst + pos + i, mem_load8(s + 8 + i))
+        // `i = i + 1`, NOT `i = pos + i + 1`. Advancing i by pos as well ran the
+        // index past the end of the source string, so every character read came
+        // back as zero and the filename arrived as blank spaces.
+        i = i + 1
+    }
+    return pos + n
+}
+
+// Append a non-negative integer in decimal. Returns the new pos.
+fn cuda_cat_u64(dst, pos, v) -> i64 {
+    let tmp = mem_alloc(32)
+    let tpos = 0
+    if v == 0 {
+        mem_store8(tmp, 48)
+        tpos = 1
+    }
+    let x = v
+    while x > 0 {
+        mem_store8(tmp + tpos, 48 + (x % 10))
+        x = x / 10
+        tpos = tpos + 1
+    }
+    let out = pos
+    while tpos > 0 {
+        tpos = tpos - 1
+        mem_store8(dst + out, mem_load8(tmp + tpos))
+        out = out + 1
+    }
+    mem_free(tmp)
+    return out
+}
+
+// Append a pointer in lowercase hex, as the daemon expects. Returns new pos.
+fn cuda_cat_hex(dst, pos, v) -> i64 {
+    let tmp = mem_alloc(32)
+    let tpos = 0
+    if v == 0 {
+        mem_store8(tmp, 48)
+        tpos = 1
+    }
+    let x = v
+    while x > 0 {
+        let d = x % 16
+        if d < 10 { mem_store8(tmp + tpos, 48 + d) }
+        else { mem_store8(tmp + tpos, 97 + d - 10) }
+        x = x / 16
+        tpos = tpos + 1
+    }
+    let out = pos
+    while tpos > 0 {
+        tpos = tpos - 1
+        mem_store8(dst + out, mem_load8(tmp + tpos))
+        out = out + 1
+    }
+    mem_free(tmp)
+    return out
+}
+
+// Append a space.
+fn cuda_cat_sp(dst, pos) -> i64 {
+    mem_store8(dst + pos, 32)
+    return pos + 1
+}
+
+// TRUE when the daemon's queue and result files exist.
+fn cuda_daemon_ready() -> i64 {
+    let f = open(CUDA_QUEUE, 0, 0)
+    if f < 0 { return 0 }
+    close(f)
+    let g = open(CUDA_RESULT, 0, 0)
+    if g < 0 { return 0 }
+    close(g)
+    return 1
+}
+
+// Move the result cursor past lines we have already handled.
+fn cuda_drain_result() -> i64 {
+    let fd = open(CUDA_RESULT, 0, 0)
+    if fd < 0 { return 0 }
+    let size = file_size(fd)
+    close(fd)
+    if size > cuda_result_pos {
+        cuda_result_pos = size
+    }
+    return 0
+}
+
+// Read one result line and confirm it carries our seq. Returns 1 on match.
+// The reply body (after "<seq> ") is left at the returned buffer.
+//
+// Returns 0 when no reply for this seq has arrived yet.
+fn cuda_take_reply(seq, out_len_ptr) -> i64 {
+    let fd = open(CUDA_RESULT, 0, 0)
+    if fd < 0 { return 0 }
+    let size = file_size(fd)
+    if size <= cuda_result_pos {
+        close(fd)
+        return 0
+    }
+    // Read everything from the cursor onwards, then advance the cursor to the
+    // end of the LAST complete line. A reply still being appended would be a
+    // partial line; leaving it for the next call is what keeps us from acting on
+    // half a reply.
+    lseek(fd, cuda_result_pos, 0)
+    let buf = mem_alloc(4096)
+    let n = read_raw(fd, buf, 4000)
+    close(fd)
+    if n <= 0 { mem_free(buf); return 0 }
+
+    // Find the last newline.
+    let last_nl = -1
+    let i = 0
+    while i < n {
+        if mem_load8(buf + i) == 10 { last_nl = i }
+        i = i + 1
+    }
+    if last_nl < 0 { mem_free(buf); return 0 }
+
+    cuda_result_pos = cuda_result_pos + last_nl + 1
+
+    // Walk complete lines looking for our seq.
+    let start = 0
+    let found = 0
+    while start <= last_nl {
+        let end = start
+        while end < n && mem_load8(buf + end) != 10 { end = end + 1 }
+        // Parse "<seq> <body>"
+        let got = 0
+        let want = seq
+        let p = start
+        let ok = 1
+        while p < end {
+            let c = mem_load8(buf + p)
+            if c < 48 || c > 57 { break }
+            got = got * 10 + (c - 48)
+            p = p + 1
+        }
+        if p == start { ok = 0 }
+        if ok == 1 && got != want { ok = 0 }
+        if ok == 1 {
+            // body starts after the seq and one space
+            let b = p
+            if b < end && mem_load8(buf + b) == 32 { b = b + 1 }
+            let blen = end - b
+            let i2 = 0
+            while i2 < blen {
+                mem_store8(out_len_ptr + i2, mem_load8(buf + b + i2))
+                i2 = i2 + 1
+            }
+            mem_store8(out_len_ptr + blen, 0)
+            found = 1
+            break
+        }
+        start = end + 1
+    }
+    mem_free(buf)
+    return found
+}
+
+// Send one command line to the daemon and wait for its reply.
+// `cmd` is a raw NUL-terminated byte buffer, `n` its length.
+// Returns a raw buffer holding the reply body, or 0 on failure.
+fn cuda_call(cmd, n) -> i64 {
+    cuda_seq = cuda_seq + 1
+    let seq = cuda_seq
+
+    // "<seq> <cmd>\n"
+    let line = mem_alloc(n + 32)
+    let p = cuda_cat_u64(line, 0, seq)
+    p = cuda_cat_sp(line, p)
+    let i = 0
+    while i < n {
+        mem_store8(line + p + i, mem_load8(cmd + i))
+        i = i + 1
+    }
+    let ln = p + n
+    mem_store8(line + ln, 10)
+
+    // Append to the queue. O_APPEND keeps concurrent writers from clobbering.
+    let fd = open(CUDA_QUEUE, 1089, 420)   // O_WRONLY|O_APPEND|O_CREAT
+    if fd < 0 { mem_free(line); return 0 }
+    write_raw(fd, line, ln + 1)
+    close(fd)
+    mem_free(line)
+
+    // Poll for the reply. Bounded so a dead daemon cannot hang the caller.
+    //
+    // NOTE: cuda_take_reply fills `reply_buf`, not the buffer passed to it for
+    // allocation. Returning `buf` here handed callers a block of zeros, so
+    // cuda_reply_ok() never saw "OK" and every call looked like a failure even
+    // when the daemon had answered correctly.
+    let reply_buf = mem_alloc(4096)
+    let tries = 0
+    let got = 0
+    while tries < 20000 {
+        if cuda_take_reply(seq, reply_buf) == 1 { got = 1; break }
+        // Busy-wait: there is no sleep builtin, and the round trip is a file
+        // append, so spinning briefly is cheaper than a round of syscalls.
+        tries = tries + 1
+    }
+    if got == 0 { mem_free(reply_buf); return 0 }
+    return reply_buf
+}
+
+// TRUE when a reply body reports success.
+fn cuda_reply_ok(body) -> i64 {
+    if body == 0 { return 0 }
+    if mem_load8(body) == 79 && mem_load8(body + 1) == 75 { return 1 }
+    return 0
+}
+
+// Parse a "0x..." pointer out of a reply body. Returns 0 if there is none.
+fn cuda_parse_ptr(body) -> i64 {
+    if body == 0 { return 0 }
+    let ptr = 0
+    let k = 0
+    while mem_load8(body + k) != 0 {
+        let c = mem_load8(body + k)
+        if c == 48 && mem_load8(body + k + 1) == 120 { k = k + 2; continue }
+        if !((c >= 48 && c <= 57) || (c >= 97 && c <= 102)) { break }
+        ptr = ptr * 16
+        if c >= 48 && c <= 57 { ptr = ptr + (c - 48) }
+        else { ptr = ptr + (c - 97 + 10) }
+        k = k + 1
+    }
+    return ptr
+}
+
+// Prepare the client side. Fails loudly if the daemon is not running, because
+// every other call would otherwise fail in a much less obvious way.
+fn cuda_init() -> i64 {
+    if cuda_daemon_ready() == 0 { return -1 }
+    cuda_drain_result()
+    cuda_seq = 0
+    cuda_result_pos = 0
+    let cmd = mem_alloc(16)
+    let n = cuda_cstr(cmd, "init")
+    let body = cuda_call(cmd, n)
+    mem_free(cmd)
+    if body == 0 { return -1 }
+    let ok = cuda_reply_ok(body)
+    mem_free(body)
+    if ok == 0 { return -1 }
+    return 0
+}
+
+// Allocate device memory. Returns the pointer, or 0 on failure.
+fn gpu_malloc(size) -> i64 {
+    let cmd = mem_alloc(64)
+    let n = cuda_cat(cmd, 0, "malloc ")
+    n = cuda_cat_u64(cmd, n, size)
+    let body = cuda_call(cmd, n)
+    mem_free(cmd)
+    if body == 0 { return 0 }
+    let ptr = cuda_parse_ptr(body)
+    mem_free(body)
+    return ptr
+}
+
+// Free device memory.
+fn gpu_free(ptr) {
+    if ptr == 0 { return }
+    let cmd = mem_alloc(64)
+    let n = cuda_cat(cmd, 0, "free ")
+    n = cuda_cat_hex(cmd, n, ptr)
+    let body = cuda_call(cmd, n)
+    mem_free(cmd)
+    if body != 0 { mem_free(body) }
+}
+
+// Allocate pinned host memory. Returns the pointer, or 0 on failure.
+fn host_alloc(size) -> i64 {
+    let cmd = mem_alloc(64)
+    let n = cuda_cat(cmd, 0, "host_alloc ")
+    n = cuda_cat_u64(cmd, n, size)
+    let body = cuda_call(cmd, n)
+    mem_free(cmd)
+    if body == 0 { return 0 }
+    let ptr = cuda_parse_ptr(body)
+    mem_free(body)
+    return ptr
+}
+
+// Free pinned host memory.
+fn host_free(ptr) {
+    if ptr == 0 { return }
+    let cmd = mem_alloc(64)
+    let n = cuda_cat(cmd, 0, "host_free ")
+    n = cuda_cat_hex(cmd, n, ptr)
+    let body = cuda_call(cmd, n)
+    mem_free(cmd)
+    if body != 0 { mem_free(body) }
+}
+
+// Create a stream. Returns the handle, or 0 on failure.
+fn stream_create() -> i64 {
+    let cmd = mem_alloc(32)
+    let n = cuda_cstr(cmd, "stream_create")
+    let body = cuda_call(cmd, n)
+    mem_free(cmd)
+    if body == 0 { return 0 }
+    let h = cuda_parse_ptr(body)
+    mem_free(body)
+    return h
+}
+
+// Synchronize a stream.
+fn stream_sync(stream) {
+    let cmd = mem_alloc(64)
+    let n = cuda_cat(cmd, 0, "stream_sync ")
+    n = cuda_cat_hex(cmd, n, stream)
+    let body = cuda_call(cmd, n)
+    mem_free(cmd)
+    if body != 0 { mem_free(body) }
+}
+
+// Copy a host file to a device pointer. src_file is a Quanta string.
+fn memcpy_h2d_async(src_file, dst_ptr, size) -> i64 {
+    let cmd = mem_alloc(1024)
+    let n = cuda_cat(cmd, 0, "h2d ")
+    n = cuda_cat_hex(cmd, n, dst_ptr)
+    n = cuda_cat_sp(cmd, n)
+    n = cuda_cat(cmd, n, src_file)
+    n = cuda_cat_sp(cmd, n)
+    n = cuda_cat_u64(cmd, n, size)
+    let body = cuda_call(cmd, n)
+    mem_free(cmd)
+    if body == 0 { return -1 }
+    let ok = cuda_reply_ok(body)
+    mem_free(body)
+    if ok == 0 { return -1 }
+    return 0
+}
+
+// Copy a device pointer into a host file. dst_file is a Quanta string.
+fn memcpy_d2h_async(src_ptr, dst_file, size) -> i64 {
+    let cmd = mem_alloc(1024)
+    let n = cuda_cat(cmd, 0, "d2h ")
+    n = cuda_cat_hex(cmd, n, src_ptr)
+    n = cuda_cat_sp(cmd, n)
+    n = cuda_cat(cmd, n, dst_file)
+    n = cuda_cat_sp(cmd, n)
+    n = cuda_cat_u64(cmd, n, size)
+    let body = cuda_call(cmd, n)
+    mem_free(cmd)
+    if body == 0 { return -1 }
+    let ok = cuda_reply_ok(body)
+    mem_free(body)
+    if ok == 0 { return -1 }
+    return 0
+}
