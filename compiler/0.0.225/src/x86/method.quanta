@@ -1212,7 +1212,13 @@ fn parse_primary() {
             let bcnt=0
             if !(peek()==TT_PNCT && pval()==125) {   // non-empty literal
                 let be0=parse_expr(); w64(belems+bcnt*8, be0); bcnt=bcnt+1
-                while peek()==TT_PNCT&&pval()==44 { adv(); let be=parse_expr(); w64(belems+bcnt*8, be); bcnt=bcnt+1 }
+                while peek()==TT_PNCT&&pval()==44 {
+                    adv()
+                    // Same trailing-comma guard as the bracket literal below:
+                    // `}` ends the list, so `,}` must not add a phantom element.
+                    if peek()==TT_PNCT && pval()==125 { break }
+                    let be=parse_expr(); w64(belems+bcnt*8, be); bcnt=bcnt+1
+                }
             }
             if peek()==TT_PNCT && pval()==125 { adv() }   // '}'
             let btr=nv(); iremit(IR_TALLOC,btr,bcnt,0,0)
@@ -1235,7 +1241,17 @@ fn parse_primary() {
         let cnt=0
         if peek()!=TT_PNCT || pval()!=93 {  // non-empty literal
             let e0=parse_expr(); w64(elems+cnt*8, e0); cnt=cnt+1
-            while peek()==TT_PNCT&&pval()==44 { adv(); let e=parse_expr(); w64(elems+cnt*8, e); cnt=cnt+1 }
+            // A trailing comma must NOT add a phantom element. `["a","b",]` has 2
+            // elements, but the loop used to call parse_expr() unconditionally
+            // after the comma, which parsed the `]` itself and counted it -- so
+            // len() reported one too many and indexing the phantom slot read past
+            // the allocation and segfaulted. Guard on the closer, the same shape
+            // parse_index_on already uses for an empty slice bound.
+            while peek()==TT_PNCT&&pval()==44 {
+                adv()
+                if peek()==TT_PNCT && pval()==93 { break }
+                let e=parse_expr(); w64(elems+cnt*8, e); cnt=cnt+1
+            }
         }
         mpnct(93)  // ']'
         let tr=nv(); iremit(IR_TALLOC,tr,cnt,0,0)
@@ -1262,7 +1278,13 @@ fn parse_primary() {
         if peek()==TT_PNCT&&pval()==44 {
             let elems=mmap(8000); let cnt=0
             w64(elems+cnt*8, e); cnt=cnt+1
-            while peek()==TT_PNCT&&pval()==44 { adv(); let ev=parse_expr(); w64(elems+cnt*8, ev); cnt=cnt+1 }
+            while peek()==TT_PNCT&&pval()==44 {
+                adv()
+                // `)` ends the tuple, so a trailing comma must not add a
+                // phantom element. Same guard as the bracket and brace literals.
+                if peek()==TT_PNCT && pval()==41 { break }
+                let ev=parse_expr(); w64(elems+cnt*8, ev); cnt=cnt+1
+            }
             if mpnct(41)==0 { let mn="error: expected ')' in tuple literal\n"; file_write(2,mn+8,len(mn)); exit(1) }
             let tr=nv(); iremit(IR_TALLOC, tr, cnt, 0, 0)
             let ci=0
