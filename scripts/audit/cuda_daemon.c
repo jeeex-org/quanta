@@ -121,8 +121,99 @@ static char *cmd_stream_create(unsigned long long seq)
     return out;
 }
 
-// h2d <0xptr> <hostfile> <n>
-static char *cmd_h2d(unsigned long long seq, uintptr_t dp, const char *file, size_t n)
+// Pinned host staging (Phase 7 item 2).
+//
+// The plan's measurement is that FILE-BACKED pinning fails on this driver, so
+// this is anonymous pinned memory and the file is read into it. One buffer is
+// reused across calls rather than allocated per call: cudaHostAlloc is
+// expensive (it pins pages) and the whole point of the pool is to pay it once.
+//
+// CHUNKED at 64 MiB rather than sized to the request, because a request can be
+// the whole 1.7 GB tensor set and pinning that much would double the host
+// footprint for no benefit -- the copy is issued in 64 MiB pieces instead, which
+// also bounds how long a single transfer blocks the stream.
+#define STAGE_CHUNK (64u * 1024u * 1024u)
+#define STAGE_SLOTS 8
+
+// ONE buffer per in-flight copy, NOT one shared buffer.
+//
+// This was a real correctness bug, found by measuring rather than reasoning. With
+// a single buffer and an ASYNCHRONOUS copy, the buffer is overwritten by the next
+// call while the previous transfer is still reading it. Measured: four copies
+// issued back to back into one buffer, then synchronised once, all landed with
+// the LAST payload written -- 10 10 10 10 where 10 11 12 13 was expected. Worse,
+// this segfaulted the daemon, which is how it was found.
+//
+// A ring of STAGE_SLOTS bounds how many copies can be in flight; when a slot is
+// reused, the stream that last used it is synchronised first. That is the
+// backpressure a real pipeline needs, and it is why a single shared buffer could
+// not simply be kept.
+static void *stage_buf[STAGE_SLOTS];
+static cudaStream_t stage_stream[STAGE_SLOTS];
+static size_t stage_cap = 0;
+static unsigned stage_next = 0;
+
+static void stage_release(void);   // defined below; used by stage_reserve
+
+// Allocate one pinned buffer. Returns 0 on failure.
+static int stage_alloc_one(void **out, size_t want)
+{
+    void *p = NULL;
+    if (cudaHostAlloc(&p, want, cudaHostAllocDefault) != cudaSuccess) { *out = NULL; return 0; }
+    *out = p;
+    return 1;
+}
+
+// Reserve a slot for this copy, waiting on the slot's previous stream if it is
+// still in use. Returns the slot index, or -1 if no pinned memory is available.
+static int stage_reserve(cudaStream_t stream, size_t n)
+{
+    size_t want = STAGE_CHUNK;
+    if (n > want) want = n;
+
+    if (stage_cap < want) {
+        // Grow: release every slot first so two generations are never held.
+        stage_release();
+        if (!stage_alloc_one(&stage_buf[0], want)) return -1;
+        stage_cap = want;
+    }
+
+    unsigned slot = stage_next;
+    stage_next = (stage_next + 1) % STAGE_SLOTS;
+
+    // This slot may still back an in-flight copy on another stream.
+    if (stage_buf[slot] && stage_stream[slot] != (cudaStream_t)0) {
+        cudaStreamSynchronize(stage_stream[slot]);
+    }
+    if (!stage_buf[slot]) {
+        // Ring slot never allocated (only slot 0 is, up front).
+        if (!stage_alloc_one(&stage_buf[slot], want)) return -1;
+    }
+    stage_stream[slot] = stream;
+    return (int)slot;
+}
+
+// Release every staging slot. Called on quit so the pinned pages are returned
+// before the process exits, and when the pool needs to grow.
+static void stage_release(void)
+{
+    for (int i = 0; i < STAGE_SLOTS; i++) {
+        if (stage_buf[i]) { cudaFreeHost(stage_buf[i]); stage_buf[i] = NULL; }
+        stage_stream[i] = (cudaStream_t)0;
+    }
+    stage_cap = 0;
+    stage_next = 0;
+}
+
+// h2d <0xptr> <hostfile> <n> [stream]
+//
+// Phase 7 item 3/4: the copy is issued on the caller's stream and NOT
+// synchronised here. The original version passed stream 0 (the legacy default
+// stream) and called cudaDeviceSynchronize() before replying, which serialised
+// every transfer and made "async" a misnomer. With a real stream the caller
+// pipelines several copies and synchronises once, at the point it needs the
+// data -- that is the whole point of a stream pool.
+static char *cmd_h2d(unsigned long long seq, uintptr_t dp, const char *file, size_t n, cudaStream_t stream)
 {
     FILE *f = fopen(file, "rb");
     if (!f) { reply(seq, "ERR: cannot open %s", file); return NULL; }
@@ -134,26 +225,53 @@ static char *cmd_h2d(unsigned long long seq, uintptr_t dp, const char *file, siz
         return NULL;
     }
     rewind(f);
-    void *buf = malloc(n ? n : 1);
-    if (fread(buf, 1, n, f) != n) { fclose(f); free(buf); reply(seq, "ERR: short read"); return NULL; }
-    fclose(f);
 
-    cudaError_t rc = cudaMemcpyAsync((void *)dp, buf, n, cudaMemcpyHostToDevice, 0);
-    if (rc != cudaSuccess) { free(buf); reply_cuda_error(seq, "cudaMemcpyAsync H2D", rc); return NULL; }
-    rc = cudaDeviceSynchronize();
-    free(buf);
-    if (rc != cudaSuccess) { reply_cuda_error(seq, "cudaDeviceSynchronize", rc); return NULL; }
+    // Reserve a staging slot for THIS copy, so a later call cannot overwrite a
+    // buffer this transfer is still reading.
+    int slot = stage_reserve(stream, n);
+    if (slot < 0) {
+        fclose(f);
+        reply(seq, "ERR: pinned staging allocation failed");
+        return NULL;
+    }
+    void *sbuf = stage_buf[slot];
+
+    // Chunked so a large tensor is copied in 64 MiB pieces on one stream.
+    size_t off = 0;
+    while (off < n) {
+        size_t piece = n - off;
+        if (piece > STAGE_CHUNK) piece = STAGE_CHUNK;
+        if (fread(sbuf, 1, piece, f) != piece) {
+            fclose(f);
+            reply(seq, "ERR: short read at %zu", off);
+            return NULL;
+        }
+        cudaError_t rc = cudaMemcpyAsync((void *)(dp + off), sbuf, piece,
+                                         cudaMemcpyHostToDevice, stream);
+        if (rc != cudaSuccess) {
+            fclose(f);
+            reply_cuda_error(seq, "cudaMemcpyAsync H2D", rc);
+            return NULL;
+        }
+        off += piece;
+    }
+    fclose(f);
     return strdup("OK");
 }
 
-// d2h <0xptr> <hostfile> <n>
-static char *cmd_d2h(unsigned long long seq, uintptr_t dp, const char *file, size_t n)
+// d2h <0xptr> <hostfile> <n> [stream]
+//
+// d2h cannot be left genuinely async: the reply is written as soon as the copy
+// is ISSUED, but the bytes are not on disk yet. So this one synchronises the
+// stream before writing the file, and says so -- an async d2h would return OK
+// while the file was still short.
+static char *cmd_d2h(unsigned long long seq, uintptr_t dp, const char *file, size_t n, cudaStream_t stream)
 {
     void *buf = malloc(n ? n : 1);
-    cudaError_t rc = cudaMemcpyAsync(buf, (void *)dp, n, cudaMemcpyDeviceToHost, 0);
+    cudaError_t rc = cudaMemcpyAsync(buf, (void *)dp, n, cudaMemcpyDeviceToHost, stream);
     if (rc != cudaSuccess) { free(buf); reply_cuda_error(seq, "cudaMemcpyAsync D2H", rc); return NULL; }
-    rc = cudaDeviceSynchronize();
-    if (rc != cudaSuccess) { free(buf); reply_cuda_error(seq, "cudaDeviceSynchronize", rc); return NULL; }
+    rc = cudaStreamSynchronize(stream);
+    if (rc != cudaSuccess) { free(buf); reply_cuda_error(seq, "cudaStreamSynchronize", rc); return NULL; }
 
     FILE *f = fopen(file, "wb");
     if (!f) { free(buf); reply(seq, "ERR: cannot write %s", file); return NULL; }
@@ -232,6 +350,7 @@ int main(void)
             else if (strcmp(rest, "quit") == 0) {
                 reply(seq, "OK");
                 fclose(q);
+                stage_release();   // return the pinned pages before exiting
                 return 0;
             }
             else if (strncmp(rest, "malloc ", 7) == 0) {
@@ -266,7 +385,7 @@ int main(void)
                 else body = strdup("OK");
             }
             else if (strncmp(rest, "h2d ", 4) == 0) {
-                // h2d <0xdp> <file> <n>
+                // h2d <0xdp> <file> <n> [stream]
                 char *end = NULL;
                 uintptr_t dp = (uintptr_t)strtoull(rest + 4, &end, 16);
                 while (end && *end == ' ') end++;
@@ -275,10 +394,25 @@ int main(void)
                 while (end && *end && *end != ' ' && fi < (int)sizeof(file) - 1) file[fi++] = *end++;
                 file[fi] = 0;
                 while (end && *end == ' ') end++;
-                size_t n = (size_t)strtoull(end ? end : "0", NULL, 10);
-                body = cmd_h2d(seq, dp, file, n);
+                // NOTE: the endptr MUST be captured here. Passing NULL left
+                // `end` pointing at the start of the size field, so the stream
+                // parse below re-read "64" and passed 0x64 to cudaMemcpyAsync as
+                // a cudaStream_t. The driver then faulted inside
+                // cuMemcpyHtoDAsync_v2 -- which read as a CUDA bug and was not
+                // one. Caught by printing the parsed stream, not by reasoning.
+                char *nend = NULL;
+                size_t n = (size_t)strtoull(end ? end : "0", &nend, 10);
+                end = nend;
+                // optional 4th field: the stream to issue on. Absent means the
+                // default stream, which is what the pre-pool behaviour used.
+                while (end && *end == ' ') end++;
+                cudaStream_t st = (end && *end)
+                    ? (cudaStream_t)strtoull(end, NULL, 16)
+                    : (cudaStream_t)0;
+                body = cmd_h2d(seq, dp, file, n, st);
             }
             else if (strncmp(rest, "d2h ", 4) == 0) {
+                // d2h <0xdp> <file> <n> [stream]
                 char *end = NULL;
                 uintptr_t dp = (uintptr_t)strtoull(rest + 4, &end, 16);
                 while (end && *end == ' ') end++;
@@ -287,8 +421,15 @@ int main(void)
                 while (end && *end && *end != ' ' && fi < (int)sizeof(file) - 1) file[fi++] = *end++;
                 file[fi] = 0;
                 while (end && *end == ' ') end++;
-                size_t n = (size_t)strtoull(end ? end : "0", NULL, 10);
-                body = cmd_d2h(seq, dp, file, n);
+                // endptr required -- see the h2d branch above for why.
+                char *nend = NULL;
+                size_t n = (size_t)strtoull(end ? end : "0", &nend, 10);
+                end = nend;
+                while (end && *end == ' ') end++;
+                cudaStream_t st = (end && *end)
+                    ? (cudaStream_t)strtoull(end, NULL, 16)
+                    : (cudaStream_t)0;
+                body = cmd_d2h(seq, dp, file, n, st);
             }
             else {
                 reply(seq, "ERR: unknown command");

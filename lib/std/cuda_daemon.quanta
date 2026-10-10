@@ -365,6 +365,17 @@ fn stream_create() -> i64 {
     return h
 }
 
+// Destroy a stream.
+fn stream_destroy(stream) {
+    if stream == 0 { return }
+    let cmd = mem_alloc(64)
+    let n = cuda_cat(cmd, 0, "stream_destroy ")
+    n = cuda_cat_hex(cmd, n, stream)
+    let body = cuda_call(cmd, n)
+    mem_free(cmd)
+    if body != 0 { mem_free(body) }
+}
+
 // Synchronize a stream.
 fn stream_sync(stream) {
     let cmd = mem_alloc(64)
@@ -376,7 +387,19 @@ fn stream_sync(stream) {
 }
 
 // Copy a host file to a device pointer. src_file is a Quanta string.
+// Copies on the DEFAULT stream (0).
 fn memcpy_h2d_async(src_file, dst_ptr, size) -> i64 {
+    return memcpy_h2d_on(src_file, dst_ptr, size, 0)
+}
+
+// Copy a host file to a device pointer on a NAMED stream. src_file is a Quanta
+// string.
+//
+// Phase 7 item 3/4. The reply means the copy has been ISSUED on that stream,
+// not that it has finished: the daemon no longer synchronises before replying,
+// which is precisely what lets several copies be in flight at once. Call
+// stream_sync() on the stream when the data is actually needed.
+fn memcpy_h2d_on(src_file, dst_ptr, size, stream) -> i64 {
     let cmd = mem_alloc(1024)
     let n = cuda_cat(cmd, 0, "h2d ")
     n = cuda_cat_hex(cmd, n, dst_ptr)
@@ -384,6 +407,10 @@ fn memcpy_h2d_async(src_file, dst_ptr, size) -> i64 {
     n = cuda_cat(cmd, n, src_file)
     n = cuda_cat_sp(cmd, n)
     n = cuda_cat_u64(cmd, n, size)
+    if stream != 0 {
+        n = cuda_cat_sp(cmd, n)
+        n = cuda_cat_hex(cmd, n, stream)
+    }
     let body = cuda_call(cmd, n)
     mem_free(cmd)
     if body == 0 { return -1 }
@@ -394,7 +421,18 @@ fn memcpy_h2d_async(src_file, dst_ptr, size) -> i64 {
 }
 
 // Copy a device pointer into a host file. dst_file is a Quanta string.
+// Copies on the DEFAULT stream (0).
 fn memcpy_d2h_async(src_ptr, dst_file, size) -> i64 {
+    return memcpy_d2h_on(src_ptr, dst_file, size, 0)
+}
+
+// Copy a device pointer into a host file on a NAMED stream.
+//
+// NOTE: d2h is NOT left asynchronous even though the copy is issued on the
+// stream. The reply has to mean the bytes are on disk, and the file write
+// cannot start until the transfer lands, so the daemon synchronises this stream
+// before replying. H2D is the direction that can be pipelined.
+fn memcpy_d2h_on(src_ptr, dst_file, size, stream) -> i64 {
     let cmd = mem_alloc(1024)
     let n = cuda_cat(cmd, 0, "d2h ")
     n = cuda_cat_hex(cmd, n, src_ptr)
@@ -402,6 +440,10 @@ fn memcpy_d2h_async(src_ptr, dst_file, size) -> i64 {
     n = cuda_cat(cmd, n, dst_file)
     n = cuda_cat_sp(cmd, n)
     n = cuda_cat_u64(cmd, n, size)
+    if stream != 0 {
+        n = cuda_cat_sp(cmd, n)
+        n = cuda_cat_hex(cmd, n, stream)
+    }
     let body = cuda_call(cmd, n)
     mem_free(cmd)
     if body == 0 { return -1 }
@@ -409,4 +451,74 @@ fn memcpy_d2h_async(src_ptr, dst_file, size) -> i64 {
     mem_free(body)
     if ok == 0 { return -1 }
     return 0
+}
+
+// ---------------------------------------------------------------------------
+// Stream pool (Phase 7 item 3).
+//
+// A fixed set of streams handed out round-robin, so consecutive H2D copies land
+// on different streams and overlap instead of serialising behind each other. The
+// size is a compile-time constant rather than a pool sized to the workload: the
+// point is to have more streams than any single copy pipeline needs, and a large
+// enough pool would just queue work the caller never waits on.
+const CUDA_POOL_N = 4
+let cuda_pool = 0          // array of CUDA_POOL_N handles
+let cuda_pool_next = 0     // round-robin cursor
+
+// Create the pool. Returns the number of streams created, or -1 on failure.
+fn cuda_pool_init() -> i64 {
+    if cuda_pool != 0 { return CUDA_POOL_N }
+    if cuda_init() != 0 { return -1 }
+    cuda_pool = mem_alloc(CUDA_POOL_N * 8)
+    let made = 0
+    let i = 0
+    while i < CUDA_POOL_N {
+        let h = stream_create()
+        if h == 0 {
+            // A pool is only useful if more than one stream exists; tear down
+            // rather than hand back a "pool" that cannot overlap anything.
+            cuda_pool_free()
+            return -1
+        }
+        mem_store(cuda_pool + i * 8, h)
+        made = made + 1
+        i = i + 1
+    }
+    cuda_pool_next = 0
+    return made
+}
+
+// Borrow the next stream, round-robin. Returns 0 if the pool is not up.
+fn cuda_pool_lease() -> i64 {
+    if cuda_pool == 0 { return 0 }
+    let h = mem_load(cuda_pool + cuda_pool_next * 8)
+    cuda_pool_next = cuda_pool_next + 1
+    if cuda_pool_next >= CUDA_POOL_N { cuda_pool_next = 0 }
+    return h
+}
+
+// Wait for every stream in the pool. This is the one barrier that matters: after
+// it, every copy issued through the pool has landed.
+fn cuda_pool_sync() -> i64 {
+    if cuda_pool == 0 { return -1 }
+    let i = 0
+    while i < CUDA_POOL_N {
+        stream_sync(mem_load(cuda_pool + i * 8))
+        i = i + 1
+    }
+    return 0
+}
+
+// Destroy every stream in the pool and release the handle array.
+fn cuda_pool_free() {
+    if cuda_pool == 0 { return }
+    let i = 0
+    while i < CUDA_POOL_N {
+        let h = mem_load(cuda_pool + i * 8)
+        if h != 0 { stream_destroy(h) }
+        i = i + 1
+    }
+    mem_free(cuda_pool)
+    cuda_pool = 0
+    cuda_pool_next = 0
 }
