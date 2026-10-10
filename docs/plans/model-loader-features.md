@@ -344,14 +344,18 @@ safetensors so callers never branch on format name. Verified across a real
 
 ### Phase 7 — GPU residency, load/unload at speed — **BLOCKED**
 
-**Blocked on CUDA.** Quanta has no CUDA bindings. The doc requires:
-- `cudaMemcpyAsync` on a dedicated stream
-- Pinned anonymous staging in 64 MiB chunks
-- Fused dequant-on-load in the copy kernel
-- `cudaMemPoolAttrReleaseThreshold` for constant-VA reload
+**Blocked on CUDA runtime incompatibility.** CUDA 13.3 is available (RTX 4070 8GB),
+and `extern "C" fn` with `--emit-dynamic --lib libcudart.so` links correctly.
+But the CUDA driver segfaults at runtime: `cudaSetDevice(0)` returns 0, then
+the driver's internal `mmap` crashes because Quanta's memory management
+(`mmap_compat.quanta`) is incompatible with CUDA driver requirements.
 
-None of these can be implemented without GPU access. The doc explicitly says
-"driven by the measurements, not by folklore" — those measurements need a GPU.
+The bindings are written and linked in `lib/std/cuda.quanta`:
+- `gpu_malloc` / `gpu_free` — GPU memory allocation
+- `host_alloc` / `host_free` — pinned staging
+- `stream_create` / `stream_sync` — stream management
+- `memcpy_h2d_async` / `memcpy_d2h_async` — async copies
+- `cuda_init` — device initialization
 
 **What exists instead:** Phase 8 (partial load) and Phase 8b (MoE offload) provide
 the CPU-side memory management that Phase 7 would build on. The invariant is
