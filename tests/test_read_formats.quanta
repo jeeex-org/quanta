@@ -515,8 +515,14 @@ print("-- committed block fixtures (upstream-generated) --\n")
     // Codebook: {0,1,2,3,4,6,8,12,0,-1,-2,-3,-4,-6,-8,-12}
     // Nibble order: LOW for first 16, HIGH for last 16.
     print("  mxfp4 (dtype 39, 32 elems, 17 bytes)\n")
+    // sumsq is 548.0, not the 1616.0 that was committed here. The other three
+    // values (sum 0.0, min -12.0, max 12.0) were already correct, which is the
+    // signature of a sumsq taken over the wrong element set rather than a
+    // dequantiser defect. scripts/audit/mx_oracle.c holds the upstream
+    // functions transcribed from ggml-quants.c; it gives 548.0, and Quanta
+    // matches it element-for-element (not just in this reduction).
     check_fixture("tests/fixtures/blocks_mxfp4.bin", 39, 17, 32,
-                 0.0, 1616.0, -12.0, 12.0, "mxfp4")
+                 0.0, 548.0, -12.0, 12.0, "mxfp4")
 
     // NVFP4: 64 elements per 36-byte block. 4 UE4M3 scales + 32 packed E2M1 nibbles.
     // UE4M3: unsigned, 4 exp bits (bias=7), 3 mantissa bits, result * 0.5.
@@ -524,8 +530,9 @@ print("-- committed block fixtures (upstream-generated) --\n")
     // Sub-block s (0..3) uses scale d[s], elements s*16..s*16+15.
     // Nibble order per sub-block: LOW for first 8, HIGH for last 8.
     print("  nvfp4 (dtype 40, 64 elems, 36 bytes)\n")
+    // Same story: 23930.0 is the upstream sumsq, the committed 4224.0 was not.
     check_fixture("tests/fixtures/blocks_nvfp4.bin", 40, 36, 64,
-                 -84.0, 4224.0, -96.0, 48.0, "nvfp4")
+                 -84.0, 23930.0, -96.0, 48.0, "nvfp4")
 
     // Phase 9: MLX affine Q4 and Q8.
     //
