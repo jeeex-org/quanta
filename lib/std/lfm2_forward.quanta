@@ -578,7 +578,7 @@ fn fc_attention(L, pos, x: u64, out: u64) {
         // from pos 1 on: cos against a reference fell to ~0.46-0.57 instead of
         // 1.0. fc_kv_cap is set by fc_kv_init and is the right bound -- the score
         // vector can never be longer than the number of cached positions.
-        fc_at_sc = mem_alloc((fc_kv_cap + 2) * 8)
+        fc_at_sc = mem_alloc(nh * (fc_kv_cap + 2) * 8)
         fc_at_out = mem_alloc(nh * hd * 8)
     }
 
@@ -717,6 +717,266 @@ fn fc_attention(L, pos, x: u64, out: u64) {
 }
 
 // ===========================================================================
+// PARALLEL ATTENTION BODY (scores/softmax/accumulate per query head)
+//
+// The 24 query heads are independent. Split across workers.
+// Each worker processes a slice of heads: computes scores, softmax, and
+// weighted sum for its assigned heads. Requires the Q/K/V projections
+// and q_norm/k_norm/RoPE/KV append to already be done.
+//
+// Worker function: processes heads [lo, hi)
+fn patt_worker(t: i64) -> i64 {
+    let lo = patt_lo + t * patt_per
+    let hi = lo + patt_per
+    if t == patt_nworkers - 1 { hi = patt_nh }
+    if hi > patt_nh { hi = patt_nh }
+
+    let dm = patt_dm
+    let nh = patt_nh
+    let nkv = patt_nkv
+    let hd = patt_hd
+    let pos = patt_pos
+    
+    let L = patt_L
+
+    let scale: f64 = 1.0 / sqrt(i2f(hd))
+    let h = lo
+    while h < hi {
+        let kvh = h / (nh / nkv)
+        let qb = fc_at_q + h * hd * 8
+        let ob = fc_at_out + h * hd * 8
+        // Per-head score buffer: fc_at_sc is shared but we use head's slice
+        let sc_base = fc_at_sc + h * (patt_kv_cap + 2) * 8
+
+        // max for stable softmax
+        let t_idx = 0
+        let mx: f64 = 0.0 - 1e300
+        while t_idx <= pos {
+            let acc: f64 = 0.0
+            let c = 0
+            while c < hd {
+                acc = acc + f64of(mem_load(qb + c * 8)) * fc_kv_get(L, 0, t_idx, kvh, c)
+                c = c + 1
+            }
+            let sc = acc * scale
+            mem_store(sc_base + t_idx * 8, sc)
+            if sc > mx { mx = sc }
+            t_idx = t_idx + 1
+        }
+
+        // exp and sum
+        let sum: f64 = 0.0
+        t_idx = 0
+        while t_idx <= pos {
+            let e = expf(f64of(mem_load(sc_base + t_idx * 8)) - mx)
+            mem_store(sc_base + t_idx * 8, e)
+            sum = sum + e
+            t_idx = t_idx + 1
+        }
+        if sum == 0.0 { return -1 }
+
+        // weighted sum of v
+        t_idx = 0
+        while t_idx <= pos {
+            let w = f64of(mem_load(sc_base + t_idx * 8)) / sum
+            let c = 0
+            while c < hd {
+                let cur = f64of(mem_load(ob + c * 8))
+                mem_store(ob + c * 8, cur + w * fc_kv_get(L, 1, t_idx, kvh, c))
+                c = c + 1
+            }
+            t_idx = t_idx + 1
+        }
+        h = h + 1
+    }
+    return 0
+}
+
+// Parallel attention body: q_norm, k_norm, RoPE, KV append, scores/softmax/accumulate
+fn fc_attention_par(L, pos, x: u64, out: u64) {
+    let dm = fc_d_model
+    let nh = fc_n_heads
+    let nkv = fc_nkv_of(L)
+    let hd = fc_head_dim
+    if nkv <= 0 || hd <= 0 { return -1 }
+    let qt = lfm2_attn_q(L)
+    let kt = lfm2_attn_k(L)
+    let vt = lfm2_attn_v(L)
+    let qn = lfm2_attn_q_norm(L)
+    let kn = lfm2_attn_k_norm(L)
+    let wo = lfm2_attn_output(L)
+    if qt < 0 || kt < 0 || vt < 0 || qn < 0 || kn < 0 || wo < 0 { return -1 }
+
+    if fc_at_q == 0 {
+        fc_at_qn = mem_alloc(hd * 8)
+        fc_at_kn = mem_alloc(hd * 8)
+        read_tensor_f64(qn, fc_at_qn)
+        read_tensor_f64(kn, fc_at_kn)
+        fc_at_q = mem_alloc(nh * hd * 8)
+        fc_at_k = mem_alloc(nkv * hd * 8)
+        fc_at_v = mem_alloc(nkv * hd * 8)
+        fc_at_h = mem_alloc(hd * 8)
+        fc_at_sc = mem_alloc(nh * (fc_kv_cap + 2) * 8)
+        fc_at_out = mem_alloc(nh * hd * 8)
+    }
+
+    // ---- projections (already parallel via mm_matvec) -----------------------
+    if mm_matvec(qt, x, nh * hd, dm, fc_at_q) != 0 { return -1 }
+    if mm_matvec(kt, x, nkv * hd, dm, fc_at_k) != 0 { return -1 }
+    if mm_matvec(vt, x, nkv * hd, dm, fc_at_v) != 0 { return -1 }
+
+    // ---- q_norm / k_norm, per head, BEFORE RoPE -----------------------------
+    let h = 0
+    while h < nh {
+        if fc_rms_norm_head(fc_at_h, fc_at_q + h * hd * 8, fc_at_qn, hd) != 0 { return -1 }
+        let c = 0
+        while c < hd {
+            mem_store(fc_at_q + (h * hd + c) * 8, f64of(mem_load(fc_at_h + c * 8)))
+            c = c + 1
+        }
+        h = h + 1
+    }
+    h = 0
+    while h < nkv {
+        if fc_rms_norm_head(fc_at_h, fc_at_k + h * hd * 8, fc_at_kn, hd) != 0 { return -1 }
+        let c = 0
+        while c < hd {
+            mem_store(fc_at_k + (h * hd + c) * 8, f64of(mem_load(fc_at_h + c * 8)))
+            c = c + 1
+        }
+        h = h + 1
+    }
+
+    // ---- RoPE ---------------------------------------------------------------
+    fc_rope_cache(pos)
+    h = 0
+    while h < nh {
+        fc_rope_apply(fc_at_q + h * hd * 8)
+        h = h + 1
+    }
+    h = 0
+    while h < nkv {
+        fc_rope_apply(fc_at_k + h * hd * 8)
+        h = h + 1
+    }
+
+    // ---- append k, v to the cache -------------------------------------------
+    h = 0
+    while h < nkv {
+        let c = 0
+        while c < hd {
+            fc_kv_put(L, 0, pos, h, c, f64of(mem_load(fc_at_k + (h * hd + c) * 8)))
+            fc_kv_put(L, 1, pos, h, c, f64of(mem_load(fc_at_v + (h * hd + c) * 8)))
+            c = c + 1
+        }
+        h = h + 1
+    }
+
+    // ---- scores, softmax, accumulate (PARALLEL) -----------------------------
+    let scale: f64 = 1.0 / sqrt(i2f(hd))
+
+    // Zero the per-head output accumulator before use.
+    h = 0
+    while h < nh {
+        let c = 0
+        while c < hd {
+            mem_store(fc_at_out + (h * hd + c) * 8, 0.0)
+            c = c + 1
+        }
+        h = h + 1
+    }
+
+    if fc_attn_workers > 1 && nh / fc_attn_workers >= 1 {
+        // Static partitioning across workers
+        patt_lo = 0
+        patt_per = nh / fc_attn_workers
+        patt_nh = nh
+        patt_nworkers = fc_attn_workers
+        patt_dm = dm
+        patt_nkv = nkv
+        patt_hd = hd
+        patt_pos = pos
+        
+        patt_L = L
+        patt_kv_cap = fc_kv_cap
+
+        let slots = mem_alloc(fc_attn_workers * 8)
+        let t = 0
+        while t < fc_attn_workers {
+            mem_store(slots + t * 8, thread_create(patt_worker, t))
+            t = t + 1
+        }
+        t = 0
+        while t < fc_attn_workers {
+            if thread_join(mem_load(slots + t * 8)) < 0 { return -1 }
+            t = t + 1
+        }
+    } else {
+        // Serial fallback (the original loop)
+        let scale: f64 = 1.0 / sqrt(i2f(hd))
+        h = 0
+        while h < nh {
+            let kvh = h / (nh / nkv)
+            let qb = fc_at_q + h * hd * 8
+
+            let t_idx = 0
+            let mx: f64 = 0.0 - 1e300
+            while t_idx <= pos {
+                let acc: f64 = 0.0
+                let c = 0
+                while c < hd {
+                    acc = acc + f64of(mem_load(qb + c * 8)) * fc_kv_get(L, 0, t_idx, kvh, c)
+                    c = c + 1
+                }
+                let sc = acc * scale
+                mem_store(fc_at_sc + t_idx * 8, sc)
+                if sc > mx { mx = sc }
+                t_idx = t_idx + 1
+            }
+
+            let sum: f64 = 0.0
+            t_idx = 0
+            while t_idx <= pos {
+                let e = expf(f64of(mem_load(fc_at_sc + t_idx * 8)) - mx)
+                mem_store(fc_at_sc + t_idx * 8, e)
+                sum = sum + e
+                t_idx = t_idx + 1
+            }
+            if sum == 0.0 { return -1 }
+
+            t_idx = 0
+            while t_idx <= pos {
+                let w = f64of(mem_load(fc_at_sc + t_idx * 8)) / sum
+                let c = 0
+                while c < hd {
+                    let cur = f64of(mem_load(fc_at_out + (h * hd + c) * 8))
+                    mem_store(fc_at_out + (h * hd + c) * 8, cur + w * fc_kv_get(L, 1, t_idx, kvh, c))
+                    c = c + 1
+                }
+                t_idx = t_idx + 1
+            }
+            h = h + 1
+        }
+    }
+
+    // ---- out projection -----------------------------------------------------
+    return mm_matvec(wo, fc_at_out, dm, nh * hd, out)
+}
+
+// Globals for patt_worker
+let patt_lo = 0
+let patt_per = 0
+let patt_nh = 0
+let patt_nworkers = 0
+let patt_dm = 0
+let patt_nkv = 0
+let patt_hd = 0
+let patt_pos = 0
+
+let patt_L = 0
+let patt_kv_cap = 0
+
+// ===========================================================================
 // LAYER FORWARD + TOKEN GENERATION
 //
 // Composed from llama.cpp src/models/lfm2.cpp (the graph loop). The block is:
@@ -748,6 +1008,7 @@ let fc_fw_logits = 0   // logits              [n_vocab]
 let fc_fw_conv = 0     // per-layer conv state [dc * d_model]
 let fc_fw_ready = 0
 let fc_fw_last = 0     // last hidden state produced (for callers skipping logits)
+let fc_attn_workers = 0  // worker count for parallel attention body
 
 fn fc_fw_init() {
     if fc_fw_ready != 0 { return 0 }
@@ -804,7 +1065,11 @@ fn fc_layer(L, pos, inp: u64, out: u64) -> i64 {
 
     // ---- branch: short conv or attention ----
     if lfm2_layer_is_attn(L) != 0 {
-        if fc_attention(L, pos, fc_fw_n, fc_fw_a) != 0 { return -1 }
+        if fc_attn_workers > 1 {
+            if fc_attention_par(L, pos, fc_fw_n, fc_fw_a) != 0 { return -1 }
+        } else {
+            if fc_attention(L, pos, fc_fw_n, fc_fw_a) != 0 { return -1 }
+        }
     } else {
         if fc_short_conv(L, fc_fw_n, fc_fw_conv_state(L), fc_fw_a) != 0 { return -1 }
     }
