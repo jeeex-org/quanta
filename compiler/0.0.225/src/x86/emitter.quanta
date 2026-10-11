@@ -2570,74 +2570,46 @@ fn emit_bltn2(nmi,nl,ii) {
         return 1
     }
     // 0.0.119: thread_join(slot) -> worker result. slot: [0]=tid(futex), [8]=result.
-    //   Polls slot[0] until the kernel's CLONE_CLEARTID zeroes it, then returns
-    //   the result at [8].
+    //   Uses futex_wait on slot[0] (the CLONE_CLEARTID location) with proper
+    //   handling for already-exited threads.
     //
-    //   WHY NOT futex_wait. The obvious implementation is
-    //       futex(slot, FUTEX_WAIT, *slot)   -- and it deadlocks.
-    //   FUTEX_WAIT sleeps when *uaddr == val, and returns EAGAIN when they
-    //   differ. The original code passed the CURRENT *slot as val, so:
-    //     - joining immediately (one thread): *slot == tid != 0, val == tid,
-    //       equal -> sleep -> the thread exits -> kernel zeroes *slot and wakes
-    //       the futex. Works.
-    //     - joining a thread that has ALREADY exited (two or more alive at once):
-    //       the kernel already zeroed *slot, so *slot == 0 and val == 0. They are
-    //       EQUAL, so the futex sleeps forever on a condition that is never going
-    //       to change. Nothing will ever wake it: the CLONE_CLEARTID wake already
-    //       happened, before we started waiting.
-    //   Measured: 1 thread create+join works; create+join one at a time works for
-    //   every N; 2 threads alive simultaneously hangs forever, even when the test
-    //   polls until BOTH slots are already clear before joining.
+    //   Algorithm:
+    //     1. Load slot[0] (TID) into r11
+    //     2. If r11 == 0: thread already exited -> return slot[8] immediately
+    //     3. Else: futex_wait(slot[0], FUTEX_WAIT, r11) - sleeps until kernel clears it
+    //     4. On wake: return slot[8]
     //
-    //   The kernel-side clear itself is fine -- polling confirms slot[0] really
-    //   does reach 0 for every thread -- and slot[8] holds the right result. Only
-    //   the wait was wrong. Polling is therefore the correct wait, not merely a
-    //   workaround: it cannot miss a wake-up because it never sleeps.
+    //   This avoids the race because:
+    //   - If thread already exited: slot[0] is 0 (kernel cleared it), we don't wait
+    //   - If thread running: we wait on the exact value the kernel will clear
+    //   - The kernel wakes the futex when it clears slot[0] (CLONE_CLEARTID)
     //
-    //   yield (syscall 24) is issued between polls so the joiner does not starve
-    //   the very threads it is waiting for.
+    //   syscall 202 = futex(uaddr, op, val, timeout, uaddr2, val3)
+    //   FUTEX_WAIT = 0
     if nl==11&&r8(nm)=='t'&&r8(nm+1)=='h'&&r8(nm+2)=='r'&&r8(nm+3)=='e'&&r8(nm+4)=='a'&&r8(nm+5)=='d'&&r8(nm+6)=='_'&&r8(nm+7)=='j'&&r8(nm+8)=='o'&&r8(nm+9)=='i'&&r8(nm+10)=='n' {
         flush_all()
         rbp(7, spill_home(irres(ira2(ii)+0)))  // rdi = slot
-        // LBB: poll slot[16], the done flag the CHILD writes before exiting.
-        let lbb = nl()
+        // Check if thread already exited: load slot[0]
+        ldx(11, 7, 0)                          // r11 = slot[0] (TID / 0 if exited)
+        rtest(11, 11)                          // test r11, r11
         let l_done = nl()
-        lbladd(lbb, codelen)
-        ldx(11, 7, 16)                         // r11 = slot[16] (done flag)
-        rtest(11, 11)                          // test r11, r11
-        // NOTE the branch polarity: the flag being NON-zero means the child has
-        // FINISHED, so JNE must leave the loop. The first version pointed it at
-        // the loop top instead, which spun forever precisely when the join should
-        // have succeeded -- the joiner waited on success for a condition it had
-        // already met.
-        //
-        // emit_patch takes the OFFSET OF THE BRANCH INSTRUCTION, not of its
-        // rel32 operand -- the same shape printsp() uses (`let p=codelen;
-        // jcc32(0,0); emit_patch(p, lbl, 1)`). Passing the operand offset patches
-        // two bytes late and lands mid-instruction.
         let p = codelen
-        jcc32(1, 0)                             // 0F 85 jne DONE -- child finished
+        jcc32(0, 0)                            // 0F 84 jz DONE -- already exited
         emit_patch(p, l_done, 1)
-        ri(0, 24); sysc()                      // sched_yield: do not starve the child
-        let p2 = codelen
-        jmp32(0)
-        emit_patch(p2, lbb, 0)
+        // Thread still running: futex_wait on slot[0] with val = TID
+        // rdi = slot (uaddr), rsi = 0 (FUTEX_WAIT), rdx = r11 (val = TID)
+        // r10 = 0 (timeout), r8 = 0, r9 = 0
+        rr(0, 11)              // rax = 202 (futex syscall)
+        eb(0x48); eb(0xc7); eb(0xc0); ei(202)  // mov rax, 202
+        rxor(6,6)              // rsi = 0 (FUTEX_WAIT)
+        rr(2, 11)              // rdx = val = TID
+        rxor(10,10)            // r10 = 0 (no timeout)
+        rxor(8,8)              // r8 = 0
+        rxor(9,9)              // r9 = 0
+        sysc()                 // futex_wait
+        // Futex returned (woken by kernel clearing slot[0])
         lbladd(l_done, codelen)
-        // LOAD BARRIER + RELOAD FLAG: x86 TSO orders stores, so child's
-        // "result store -> mfence -> flag store" is visible in that order.
-        // But the joiner's flag load might hit a stale cache line. The mfence
-        // ensures no later load executes before earlier loads retire, but the
-        // flag load that exited the loop might have already cached a stale 0.
-        // Reload the flag after mfence to get the globally visible value.
-        eb(0x0f); eb(0xae); eb(0xf0)           // mfence
-        ldx(11, 7, 16)                         // reload slot[16] (done flag)
-        rtest(11, 11)                          // test r11, r11
-        // If flag is now 0, we raced and need to retry (extremely rare).
-        // JZ back to spin loop.
-        let p = codelen
-        jcc32(0, 0)                            // 0F 84 jz SPIN
-        emit_patch(p, lbb, 1)
-        ldx(0, 7, 8)                           // rax = slot[8] = result
+        ldx(0, 7, 8)           // rax = slot[8] = result
         return 1
     }
 
