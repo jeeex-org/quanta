@@ -2526,27 +2526,7 @@ fn emit_bltn2(nmi,nl,ii) {
         eb(232); ei(0)       // call worker_fn (rel32 placeholder)
         w64(patches+patchc*PCS, call_ofs); w64(patches+patchc*PCS+8, g_thread_ffi); w64(patches+patchc*PCS+16, 5); patchc = patchc + 1
         lsp(14, 8)           // r14 = js, reloaded from child stack ([rsp+8]=[child_sp+8]; ret restored rsp)
-        // Result first, then the done flag. The flag is what the joiner spins
-        // on, so it must not become visible before the value it vouches for.
-        //
-        // A LOCKed store would order them, but `mov qword [mem], imm32` has NO
-        // LOCK form -- trying it raises #UD and every run died with SIGILL. The
-        // ordering that is actually available here is x86's own store ordering:
-        // two stores to the same address from one thread are observed in program
-        // order by another core. The flag sits ABOVE the result in the same cache
-        // line region, so a joiner that sees the flag sees the result.
-        //
-        // The 1-in-20 failure seen before this was a different thing: it was the
-        // gate running thread_test while the machine was loaded, and it went away
-        // once the flag was published explicitly at all (commit 2a8f849d).
         eb(0x49); eb(0x89); eb(0x46); eb(8)   // mov [r14+8], rax  (store result in js+8)
-        // Publish-side barrier. The joiner reads the flag first and the result
-        // second, so the result must be globally visible before the flag is. x86
-        // orders stores to the same address but a store buffer can still hold the
-        // earlier one back; the fence drains it. Costs one instruction per thread
-        // exit, which is nothing next to the work done.
-        eb(0x0f); eb(0xae); eb(0xf0)           // mfence
-        eb(0x49); eb(0xc7); eb(0x46); eb(16); ei(1)       // mov qword [r14+16], 1
         // Mark the slot DONE explicitly, BEFORE exiting.
         //
         // The old comment here claimed "exit(0) -> kernel clears *js (futex
@@ -2566,6 +2546,7 @@ fn emit_bltn2(nmi,nl,ii) {
         // Write the whole 64-bit word, not a dword: the reader loads 64 bits
         // (ldx), so writing only the low 32 would leave the high half undefined
         // and `test r11,r11` would never observe zero on a reused slot.
+        eb(0x49); eb(0xc7); eb(0x46); eb(16); ei(1)       // mov qword [r14+16], 1
         rxor(7,7)            // rdi = 0  (exit code)
         ri(0, 60); sysc()    // exit(0)
         // ERR (clone failed, rax < 0): fail closed. Unmap both mappings then exit(1).
@@ -2638,19 +2619,6 @@ fn emit_bltn2(nmi,nl,ii) {
         jmp32(0)
         emit_patch(p2, lbb, 0)
         lbladd(l_done, codelen)
-        // LOAD BARRIER before reading the result.
-        //
-        // x86 orders STORES (TSO), so the child's "result then flag" is fine.
-        // It does NOT order LOADS: the joiner may speculatively execute the
-        // slot[8] load before the flag load retires, buffer the stale value, and
-        // only then observe flag=1. The result returned is then the value from
-        // BEFORE the worker finished.
-        //
-        // Measured 7/40 wrong results with the machine loaded (6 spinners), 0/30
-        // idle -- rare and load-dependent, which is the signature of exactly this.
-        // MFENCE drains the load buffer and costs nothing on the exit path, which
-        // runs once per join.
-        eb(0x0f); eb(0xae); eb(0xf0)           // mfence
         ldx(0, 7, 8)                           // rax = slot[8] = result
         return 1
     }
