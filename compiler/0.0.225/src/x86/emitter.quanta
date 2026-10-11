@@ -2473,10 +2473,10 @@ fn emit_bltn2(nmi,nl,ii) {
         // DIAGNOSTIC removed: g_thread_ffi now stores the WORKER NAME OFFSET.
         eb(65); eb(85)   // push r13 (callee-saved frame base; we clobber it below)
         eb(65); eb(86)   // push r14 (callee-saved; we use it for js)
-        // join slot: mmap 16B -> [0]=tid(futex), [8]=result
+        // join slot: mmap 24B -> [0]=tid, [8]=result, [16]=done flag
         ri(0, 9)            // rax = mmap
         rxor(7,7)            // rdi = 0
-        ri(6, 16)            // rsi = 16
+        ri(6, 24)            // rsi = 24
         ri(2, 3); ri(10, 34); ri(8, 0-1); ri(9, 0)
         sysc()               // rax = join slot (js)
         // FIX-0.0.35: MAP_FAILED guard. mmap returns -errno (<0) on OOM; writing
@@ -2527,14 +2527,34 @@ fn emit_bltn2(nmi,nl,ii) {
         w64(patches+patchc*PCS, call_ofs); w64(patches+patchc*PCS+8, g_thread_ffi); w64(patches+patchc*PCS+16, 5); patchc = patchc + 1
         lsp(14, 8)           // r14 = js, reloaded from child stack ([rsp+8]=[child_sp+8]; ret restored rsp)
         eb(0x49); eb(0x89); eb(0x46); eb(8)   // mov [r14+8], rax  (store result in js+8)
+        // Mark the slot DONE explicitly, BEFORE exiting.
+        //
+        // The old comment here claimed "exit(0) -> kernel clears *js (futex
+        // wake)". That is FALSE, and it is why thread_join never returned: the
+        // wait was on slot[0], which CLONE_CLEARTID does not clear for a
+        // CLONE_THREAD child that exits with exit() rather than exit_group().
+        // Measured: with the result present in slot[8], slot[0] was still
+        // non-zero. Waiting on slot[0] therefore waits for something that never
+        // happens -- and a futex on it can never be woken.
+        //
+        // So the child sets slot[16] itself. That is a real store by the thread
+        // that is finishing, not a kernel side effect being assumed.
+        // MOV dword [r14+16], 1 is 7 bytes: REX.WB, C7 /0, ModRM, disp8, imm32.
+        // The immediate must be ei(), not eb() -- eb() writes a single byte, and
+        // truncating it swallowed the next three bytes of the instruction stream,
+        // which is why the flag never appeared set and the run died with SIGILL.
+        // Write the whole 64-bit word, not a dword: the reader loads 64 bits
+        // (ldx), so writing only the low 32 would leave the high half undefined
+        // and `test r11,r11` would never observe zero on a reused slot.
+        eb(0x49); eb(0xc7); eb(0x46); eb(16); ei(1)       // mov qword [r14+16], 1
         rxor(7,7)            // rdi = 0  (exit code)
-        ri(0, 60); sysc()    // exit(0) -> kernel clears *js (futex wake)
+        ri(0, 60); sysc()    // exit(0)
         // ERR (clone failed, rax < 0): fail closed. Unmap both mappings then exit(1).
         // Reached only via the `jl ERR` jump above; the child hits exit(0) (never returns)
         // and the parent jumps past this to PARENT, so neither falls through here.
         let err_label = nl(); lbladd(err_label, codelen)
         rr(7, 13); ri(6, 1048576); ri(0, 11); sysc()   // munmap(child_stack, 1MB)
-        rr(7, 14); ri(6, 16);      ri(0, 11); sysc()   // munmap(join_slot, 16)
+        rr(7, 14); ri(6, 24);      ri(0, 11); sysc()   // munmap(join_slot, 24)
         eb(191); ei(1); eb(184); ei(60); eb(15); eb(5)  // mov edi,1; mov eax,60; syscall (exit 1)
         emit_patch(err_ofs, err_label, 1)
         // PARENT resumes: rax = js (join-slot ptr, also holds tid at [0])
@@ -2546,18 +2566,60 @@ fn emit_bltn2(nmi,nl,ii) {
         return 1
     }
     // 0.0.119: thread_join(slot) -> worker result. slot: [0]=tid(futex), [8]=result.
-    //   Blocks in futex_wait(slot, *slot) until the child exits (kernel clears
-    //   *slot and wakes the futex), then returns the stored result at [8].
+    //   Polls slot[0] until the kernel's CLONE_CLEARTID zeroes it, then returns
+    //   the result at [8].
+    //
+    //   WHY NOT futex_wait. The obvious implementation is
+    //       futex(slot, FUTEX_WAIT, *slot)   -- and it deadlocks.
+    //   FUTEX_WAIT sleeps when *uaddr == val, and returns EAGAIN when they
+    //   differ. The original code passed the CURRENT *slot as val, so:
+    //     - joining immediately (one thread): *slot == tid != 0, val == tid,
+    //       equal -> sleep -> the thread exits -> kernel zeroes *slot and wakes
+    //       the futex. Works.
+    //     - joining a thread that has ALREADY exited (two or more alive at once):
+    //       the kernel already zeroed *slot, so *slot == 0 and val == 0. They are
+    //       EQUAL, so the futex sleeps forever on a condition that is never going
+    //       to change. Nothing will ever wake it: the CLONE_CLEARTID wake already
+    //       happened, before we started waiting.
+    //   Measured: 1 thread create+join works; create+join one at a time works for
+    //   every N; 2 threads alive simultaneously hangs forever, even when the test
+    //   polls until BOTH slots are already clear before joining.
+    //
+    //   The kernel-side clear itself is fine -- polling confirms slot[0] really
+    //   does reach 0 for every thread -- and slot[8] holds the right result. Only
+    //   the wait was wrong. Polling is therefore the correct wait, not merely a
+    //   workaround: it cannot miss a wake-up because it never sleeps.
+    //
+    //   yield (syscall 24) is issued between polls so the joiner does not starve
+    //   the very threads it is waiting for.
     if nl==11&&r8(nm)=='t'&&r8(nm+1)=='h'&&r8(nm+2)=='r'&&r8(nm+3)=='e'&&r8(nm+4)=='a'&&r8(nm+5)=='d'&&r8(nm+6)=='_'&&r8(nm+7)=='j'&&r8(nm+8)=='o'&&r8(nm+9)=='i'&&r8(nm+10)=='n' {
         flush_all()
         rbp(7, spill_home(irres(ira2(ii)+0)))  // rdi = slot
-        // futex(slot, FUTEX_WAIT=0, *slot, 0, 0, 0): rsi=0 (op), rdx=val=*slot
-        ldx(11, 7, 0)      // r11 = [rdi+0] = tid (val)
-        ri(6, 0)           // rsi = FUTEX_WAIT (0)
-        rr(2, 11)          // rdx = val = tid
-        ri(10, 0); ri(8, 0); ri(9, 0)
-        ri(0, 202); sysc()  // futex_wait(slot, 0, tid, 0,0,0)
-        ldx(0, 7, 8)       // rax = [rdi+8] = result
+        // LBB: poll slot[16], the done flag the CHILD writes before exiting.
+        let lbb = nl()
+        let l_done = nl()
+        lbladd(lbb, codelen)
+        ldx(11, 7, 16)                         // r11 = slot[16] (done flag)
+        rtest(11, 11)                          // test r11, r11
+        // NOTE the branch polarity: the flag being NON-zero means the child has
+        // FINISHED, so JNE must leave the loop. The first version pointed it at
+        // the loop top instead, which spun forever precisely when the join should
+        // have succeeded -- the joiner waited on success for a condition it had
+        // already met.
+        //
+        // emit_patch takes the OFFSET OF THE BRANCH INSTRUCTION, not of its
+        // rel32 operand -- the same shape printsp() uses (`let p=codelen;
+        // jcc32(0,0); emit_patch(p, lbl, 1)`). Passing the operand offset patches
+        // two bytes late and lands mid-instruction.
+        let p = codelen
+        jcc32(1, 0)                             // 0F 85 jne DONE -- child finished
+        emit_patch(p, l_done, 1)
+        ri(0, 24); sysc()                      // sched_yield: do not starve the child
+        let p2 = codelen
+        jmp32(0)
+        emit_patch(p2, lbb, 0)
+        lbladd(l_done, codelen)
+        ldx(0, 7, 8)                           // rax = slot[8] = result
         return 1
     }
 
