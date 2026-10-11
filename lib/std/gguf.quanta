@@ -3836,8 +3836,21 @@ fn gguf_read_tensor_bytes_at(idx, byte_off, buf, nbytes) {
     if nbytes > gguf_filesize - abs { return -5 }
     if byte_off > gguf_filesize - abs - nbytes { return -5 }
 
-    if lseek(gguf_fd, abs + byte_off, 0) < 0 { return -2 }
-    return read_raw(gguf_fd, buf, nbytes)
+    // pread, NOT lseek+read.
+    //
+    // The fd is SHARED, so lseek(fd, off) + read(fd, ...) is a race the moment
+    // two threads read different offsets: worker A seeks, worker B seeks, A
+    // reads B's bytes. That is exactly what broke the parallel matvec -- element
+    // mismatches grew with worker count (2 -> 83 rows, 4 -> 499, 16 -> 926).
+    //
+    // pread64 takes the offset as an argument, so the seek and the read are one
+    // atomic operation from the caller's point of view and the fd position is
+    // never used. syscall 17 is pread64, and the generic syscall() builtin maps
+    // its FOURTH argument to r10, which is precisely where pread64 wants the
+    // offset.
+    let n = syscall(17, gguf_fd, buf, nbytes, abs + byte_off, 0, 0)
+    if n < 0 { return -2 }
+    return n
 }
 
 // ------------------------------------------------------------- linear algebra
