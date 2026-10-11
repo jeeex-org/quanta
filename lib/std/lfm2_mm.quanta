@@ -260,10 +260,17 @@ fn mm_matvec_par(idx: u64, x: u64, rows: i64, cols: i64, y: u64, nworkers: i64) 
 // all funnel through here. Leaving it 0 keeps the serial path byte-identical to
 // before, which is what makes this safe to land first and tune later.
 let mm_workers = 0
+let mm_embed_workers = 0
 
 fn mm_set_workers(n) {
     if n < 0 { n = 0 }
     mm_workers = n
+    return 0
+}
+
+fn mm_set_embed_workers(n) {
+    if n < 0 { n = 0 }
+    mm_embed_workers = n
     return 0
 }
 
@@ -324,9 +331,15 @@ fn mm_lookup_row(idx: u64, row: i64, ncols: i64, y: u64) {
 // Reading all 128000 rows per token would dominate generation cost, so the caller
 // chooses the window: a sampled shortlist while sampling, or the full vocabulary
 // once a token is settled.
+//
+// When mm_embed_workers > 1, this routes to the parallel implementation
+// (mm_embed_logits_par). The default is 0 (serial, byte-identical to before).
 fn mm_embed_logits(idx: u64, x: u64, v0: i64, vcount: i64, ncols: i64, y: u64) {
     if gguf_dtype_supported(gguf_tensor_dtype(idx)) == 0 { return -1 }
     if mm_rowcap < ncols { return -1 }
+    if mm_embed_workers > 1 && vcount / mm_embed_workers >= 1 {
+        return mm_embed_logits_par(idx, x, v0, vcount, ncols, y, mm_embed_workers)
+    }
 
     let v = 0
     while v < vcount {
@@ -342,6 +355,82 @@ fn mm_embed_logits(idx: u64, x: u64, v0: i64, vcount: i64, ncols: i64, y: u64) {
     }
     return 0
 }
+
+// y[v] = dot(embd_row(v0 + v), x) for v in [0, vcount). PARALLEL version.
+// Static row partitioning, same as mm_matvec_par. Each worker owns [lo, hi)
+// and uses its own scratch so there is no shared state.
+// The caller sets the global mm_embed_workers (default 0 = serial).
+fn mm_embed_logits_par(idx: u64, x: u64, v0: i64, vcount: i64, ncols: i64, y: u64, nworkers: i64) {
+    if gguf_dtype_supported(gguf_tensor_dtype(idx)) == 0 { return -1 }
+    if mm_rowcap < ncols { return -1 }
+    if nworkers <= 1 || vcount <= 0 {
+        return mm_embed_logits(idx, x, v0, vcount, ncols, y)
+    }
+    let per = vcount / nworkers
+    if per < 1 {
+        return mm_embed_logits(idx, x, v0, vcount, ncols, y)
+    }
+
+    // zero y so a worker failure leaves a detectable value
+    let v = 0
+    while v < vcount { mem_store(y + v * 8, 0.0); v = v + 1 }
+
+    // global params for the worker function (module-level, filled before thread_create)
+    pem_idx = idx
+    pem_x = x
+    pem_v0 = v0
+    pem_vcount = vcount
+    pem_ncols = ncols
+    pem_y = y
+    pem_nworkers = nworkers
+
+    let slots = mem_alloc(nworkers * 8)
+    let t = 0
+    while t < nworkers {
+        mem_store(slots + t * 8, thread_create(pem_worker, t))
+        t = t + 1
+    }
+    t = 0
+    while t < nworkers {
+        thread_join(mem_load(slots + t * 8))
+        t = t + 1
+    }
+    return 0
+}
+
+// Worker for mm_embed_logits_par: computes a slice of [v0, v0+vcount).
+fn pem_worker(t: i64) -> i64 {
+    let cell = mm_scratch_new(pem_ncols)
+    let per = pem_vcount / pem_nworkers
+    let lo = t * per
+    let hi = lo + per
+    if t == pem_nworkers - 1 { hi = pem_vcount }
+    if hi > pem_vcount { hi = pem_vcount }
+
+    let v = lo
+    while v < hi {
+        if mm_load_row_s(pem_idx, pem_v0 + v, pem_ncols, cell) != 0 { return -1 }
+        let acc: f64 = 0.0
+        let c = 0
+        while c < pem_ncols {
+            acc = acc + f64of(mem_load(mem_load(cell + 8) + c * 8)) * f64of(mem_load(pem_x + c * 8))
+            c = c + 1
+        }
+        mem_store(pem_y + (pem_v0 + v) * 8, acc)
+        v = v + 1
+    }
+    return hi - lo
+}
+
+// module globals for pem_worker
+let pem_idx = 0
+let pem_x = 0
+let pem_v0 = 0
+let pem_vcount = 0
+let pem_ncols = 0
+let pem_y = 0
+let pem_nworkers = 0
+
 // Load a WHOLE small tensor into `dst` as f64, using read_tensor_f64.
 //
 // For a tensor small enough to hold (the short-conv kernel is [3, 2048] = 6144
