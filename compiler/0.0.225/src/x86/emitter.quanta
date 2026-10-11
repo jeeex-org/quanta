@@ -2527,8 +2527,13 @@ fn emit_bltn2(nmi,nl,ii) {
         w64(patches+patchc*PCS, call_ofs); w64(patches+patchc*PCS+8, g_thread_ffi); w64(patches+patchc*PCS+16, 5); patchc = patchc + 1
         lsp(14, 8)           // r14 = js, reloaded from child stack ([rsp+8]=[child_sp+8]; ret restored rsp)
         eb(0x49); eb(0x89); eb(0x46); eb(8)   // mov [r14+8], rax  (store result in js+8)
+        // STORE BARRIER: ensure the result store is globally visible before
+        // the flag store. x86 orders stores to the SAME address, but stores to
+        // DIFFERENT addresses can be observed out of order by other cores.
+        // Without this, the joiner might see flag=1 but the result store still
+        // in the store buffer. MFENCE drains the store buffer.
+        eb(0x0f); eb(0xae); eb(0xf0)           // mfence
         // Mark the slot DONE explicitly, BEFORE exiting.
-        //
         // The old comment here claimed "exit(0) -> kernel clears *js (futex
         // wake)". That is FALSE, and it is why thread_join never returned: the
         // wait was on slot[0], which CLONE_CLEARTID does not clear for a
@@ -2536,7 +2541,6 @@ fn emit_bltn2(nmi,nl,ii) {
         // Measured: with the result present in slot[8], slot[0] was still
         // non-zero. Waiting on slot[0] therefore waits for something that never
         // happens -- and a futex on it can never be woken.
-        //
         // So the child sets slot[16] itself. That is a real store by the thread
         // that is finishing, not a kernel side effect being assumed.
         // MOV dword [r14+16], 1 is 7 bytes: REX.WB, C7 /0, ModRM, disp8, imm32.
@@ -2619,6 +2623,20 @@ fn emit_bltn2(nmi,nl,ii) {
         jmp32(0)
         emit_patch(p2, lbb, 0)
         lbladd(l_done, codelen)
+        // LOAD BARRIER + RELOAD FLAG: x86 TSO orders stores, so child's
+        // "result store -> mfence -> flag store" is visible in that order.
+        // But the joiner's flag load might hit a stale cache line. The mfence
+        // ensures no later load executes before earlier loads retire, but the
+        // flag load that exited the loop might have already cached a stale 0.
+        // Reload the flag after mfence to get the globally visible value.
+        eb(0x0f); eb(0xae); eb(0xf0)           // mfence
+        ldx(11, 7, 16)                         // reload slot[16] (done flag)
+        rtest(11, 11)                          // test r11, r11
+        // If flag is now 0, we raced and need to retry (extremely rare).
+        // JZ back to spin loop.
+        let p = codelen
+        jcc32(0, 0)                            // 0F 84 jz SPIN
+        emit_patch(p, lbb, 1)
         ldx(0, 7, 8)                           // rax = slot[8] = result
         return 1
     }
