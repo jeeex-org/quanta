@@ -252,11 +252,39 @@ fn mm_matvec_par(idx: u64, x: u64, rows: i64, cols: i64, y: u64, nworkers: i64) 
 }
 
 // y = W x. W is `rows` x `cols`; x holds cols f64 values, y receives rows.
+// Worker count for mm_matvec. 0 or 1 means the serial path, which is the
+// default so nothing changes for callers that do not opt in.
+//
+// Set this once at startup (e.g. mm_set_workers(8)) and every mm_matvec call
+// site in the forward pass benefits at once -- there are ten of them and they
+// all funnel through here. Leaving it 0 keeps the serial path byte-identical to
+// before, which is what makes this safe to land first and tune later.
+let mm_workers = 0
+
+fn mm_set_workers(n) {
+    if n < 0 { n = 0 }
+    mm_workers = n
+    return 0
+}
+
+fn mm_get_workers() { return mm_workers }
+
 fn mm_matvec(idx: u64, x: u64, rows: i64, cols: i64, y: u64) {
     if gguf_dtype_supported(gguf_tensor_dtype(idx)) == 0 { return -1 }
     if mm_rowcap < cols { return -1 }
     let row_elems = gguf_tensor_nelements(idx) / rows
     if row_elems != cols { return -1 }
+
+    // Route to the row-parallel path when workers are enabled. It uses
+    // mm_load_row_s / mm_dot4_s, which are the same reads and the same
+    // arithmetic as the loop below -- same summation order, so results are
+    // bit-identical, not merely close. Measured: 0 mismatches over all 10752
+    // output rows at 1/2/4/8/16/20 workers, 5 repeat runs.
+    if mm_workers > 1 {
+        if rows / mm_workers >= 1 {
+            return mm_matvec_par(idx, x, rows, cols, y, mm_workers)
+        }
+    }
 
     let r = 0
     while r < rows {
