@@ -2,10 +2,10 @@
 
 **Status:** Phases A and A2 complete — B onward open
 **Date:** 2026-10-11 (updated 2026-10-12)
-**Target:** Quanta 0.0.226+
+**Target:** Quanta 0.0.230+ (after loader 0.0.226–0.0.229)
 **Stable at time of writing:** 0.0.225
 
-**Progress:** A ✅ · A2 ✅ · B ⬜ · B2 ⬜ · C1 ⬜ · C2 ⬜ · D ⬜
+**Progress:** A ✅ · A2 ✅ · Loader 6.1–7.2 ⬜ · B ⬜ · B2 ⬜ · C1 ⬜ · C2 ⬜ · D ⬜
 
 ---
 
@@ -101,17 +101,20 @@ Four independent workstreams, ordered by dependency and risk.
 
 **Versioning** (one per phase, per convention — new feature → next sequential number):
 
+**Loader phases occupy 0.0.226–0.0.229 first; kernel phases follow.**
+
 | Phase | Version | Status |
 |---|---|---|
 | A | 0.0.225 (folded in) | ✅ done |
 | A2 | 0.0.225 (folded in) | ✅ done |
-| B | 0.0.226 | ⬜ |
-| B2 | 0.0.227 | ⬜ |
-| C1 (assembler) | 0.0.228 | ⬜ |
-| C2 (operands) | 0.0.229 | ⬜ |
-| D | 0.0.230 | ⬜ |
+| — Loader 6.1–7.2 — | 0.0.226–0.0.229 | ⬜ |
+| B | 0.0.230 | ⬜ |
+| B2 | 0.0.231 | ⬜ |
+| C1 (assembler) | 0.0.232 | ⬜ |
+| C2 (operands) | 0.0.233 | ⬜ |
+| D | 0.0.234 | ⬜ |
 
-A and A2 landed inside 0.0.225 rather than as separate versions — both were defect fixes, not features, so they did not take a version number. Subsequent phases start at 0.0.226.
+A and A2 landed inside 0.0.225 rather than as separate versions — both were defect fixes, not features, so they did not take a version number. Loader phases (4 versions) start at 0.0.226; kernel Phase B starts at 0.0.230.
 
 Phase C is deliberately split: the assembler and the operand/constraint machinery are separable and the assembler is independently testable.
 
@@ -572,10 +575,11 @@ Both were correctness bugs with silent failure modes. They became Phases A and A
 
 | Phase | Work | Version | Blocks | Effort |
 |---|---|---|---|---|
-| B | `naked fn` + `section` + `no_mangle` | 0.0.226 | D | Small — additive syntax, 3 keywords |
-| B2 | `packed` structs / explicit field offsets | 0.0.227 | D | Medium — layout change, touches struct codegen |
-| C1 | Minimal x86 assembler | 0.0.228 | C2, D | **Large** — new module `asm_x86.quanta` |
-| C2 | Operands + constraints | 0.0.229 | D | **Large** — touches register allocator |
-| D | Ring-0 entry (IDT/GDT) | 0.0.230 | — | Medium — consumes B, B2, C |
+| — Loader 6.1–7.2 — | (see loader-phase67.md) | 0.0.226–0.0.229 | — | — |
+| B | `naked fn` + `section` + `no_mangle` | 0.0.230 | D | Small — additive syntax, 3 keywords |
+| B2 | `packed` structs / explicit field offsets | 0.0.231 | D | Medium — layout change, touches struct codegen |
+| C1 | Minimal x86 assembler | 0.0.232 | C2, D | **Large** — new module `asm_x86.quanta` |
+| C2 | Operands + constraints | 0.0.233 | D | **Large** — touches register allocator |
+| D | Ring-0 entry (IDT/GDT) | 0.0.234 | — | Medium — consumes B, B2, C |
 
 **The critical path is C1 → C2.** Everything else is either small (B, B2) or consumes what C produces (D). The assembler is the piece with no existing foundation in the compiler — `asm!` today is a hex-byte emitter with no mnemonic table.

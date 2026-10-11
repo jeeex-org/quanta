@@ -158,14 +158,16 @@ GGUF has numeric dtype IDs; safetensors has string names. `qmodel_bits` derives 
 
 ## 7. Versioning
 
-**Note:** Kernel-capability plan (Phases B–D) occupies 0.0.226–0.0.230. Loader phases follow sequentially.
+**Loader phases occupy 0.0.226–0.0.229 first; kernel phases follow.**
 
 | Phase | Work | Version |
 |---|---|---|
-| 6.1 | Multiple models | 0.0.231 |
-| 6.2 | GPU residency / offload | 0.0.232 |
-| 7.1 | Tensor caching / prefetch / eviction | 0.0.233 |
-| 7.2 | dtype unification | 0.0.234 |
+| 6.1 | Multiple models | 0.0.226 |
+| 6.2 | GPU residency / offload | 0.0.227 |
+| 7.1 | Tensor caching / prefetch / eviction | 0.0.228 |
+| 7.2 | dtype unification | 0.0.229 |
+
+Kernel phases (B, B2, C1, C2, D) then occupy 0.0.230–0.0.234.
 
 ---
 
@@ -176,7 +178,7 @@ Per phase:
 cd /opt/tali/quanta
 QC=compiler/<VER>/bin/x86/qc bash test_suites/scripts/run_tests.sh
 ```
-Versions: 0.0.231, 0.0.232, 0.0.233, 0.0.234
+Versions: 0.0.226, 0.0.227, 0.0.228, 0.0.229
 
 Additional:
 - Self-host check (new compiler builds itself byte-identically)
