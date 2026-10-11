@@ -2200,14 +2200,31 @@ fn emit_bltn(nmi,nl,ii) {
         eb(89); eb(94); eb(95)             // pop rdx, pop rsi, pop rdi (balance 3 pushes)
         return 1
     }
-    // mem_load / mem_load8 / mem_store / mem_store8
+    // mem_load / mem_load8 / mem_load16 / mem_load32
+    // mem_store / mem_store8 / mem_store16 / mem_store32
     if nl>=8&&r8(nm)=='m'&&r8(nm+1)=='e'&&r8(nm+2)=='m'&&r8(nm+3)=='_' {
         flush_all()   // memory builtins clobber rdi/rsi/rax; spill live vregs first
         if r8(nm+4)=='l' {
+            if nl==10 {                           // mem_load16 / mem_load32
+                if r8(nm+8)=='1' {                // mem_load16
+                    eb(72); eb(15); eb(183); eb(7); return 1   // movzx rax,word[rdi]
+                }
+                if r8(nm+8)=='3' {                // mem_load32
+                    eb(139); eb(7); return 1                   // mov eax,[rdi]  (zero-extends)
+                }
+            }
             if nl==9 { eb(72); eb(15); eb(182); eb(7); return 1 }  // mem_load8: movzx rax,byte[rdi]
             eb(72); eb(139); eb(7); return 1                       // mem_load:  mov rax,[rdi]
         }
         if r8(nm+4)=='s' {
+            if nl==11 {                           // mem_store16 / mem_store32
+                if r8(nm+9)=='1' {                // mem_store16
+                    eb(102); eb(137); eb(55); return 1         // mov [rdi],si
+                }
+                if r8(nm+9)=='3' {                // mem_store32
+                    eb(137); eb(55); return 1                  // mov [rdi],esi
+                }
+            }
             if nl==10 { 
                 eb(72); eb(133); eb(255)       // test rdi, rdi
                 eb(116); eb(3)                 // jz +3 (skip the store when rdi==0)
