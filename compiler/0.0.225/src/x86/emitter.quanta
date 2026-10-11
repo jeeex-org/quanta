@@ -2271,7 +2271,25 @@ fn emit_bltn2(nmi,nl,ii) {
                 if r64(vreg_is_str + _src2*8) == 1 { _isstr = 1 }
             }
             flush_all()   // syscalls clobber rdi/rsi/rdx/rax; spill live vregs first
-            if _isstr==1 { argp8(7, ira2(ii), 0) }   // rdi = path + 8 (skip length header)
+            //
+            // open(2) on x86-64 reads its FOURTH argument -- the mode -- from R10,
+            // not rdx. The generic arg loader in codegen maps args 0..5 to
+            // rdi/rsi/rdx/rcx/r8/r9, so a 3-arg open() puts the mode in rdx and
+            // leaves r10 holding whatever the previous syscall happened to leave.
+            // R10 is only consulted when O_CREAT or O_TMPFILE is set, which is
+            // exactly why this hid for so long: read-only opens never use it.
+            //
+            // Effect measured: open(p, 577, 420) returned a valid fd and the write
+            // succeeded, but the file was created mode 000 -- `cat` could not read
+            // it and reopening it returned EACCES (-13), while /etc/hostname opened
+            // fine on the same call site.
+            //
+            // ira2(ii) is the BASE index into the arg-vreg list, so argument N is
+            // irres(ira2(ii)+N) -- the same shape execve() uses above. Loading r10
+            // BEFORE the path keeps argp8() as the last register write, so the
+            // Quanta-string +8 adjustment is not clobbered.
+            rbp(10, spill_home(irres(ira2(ii) + 1)))   // r10 = mode (arg 2)
+            if _isstr==1 { argp8(7, ira2(ii), 0) }    // rdi = path + 8 (skip length header)
             // else rdi already holds the raw pointer from IR_CALL arg load
             eb(184); ei(2); sysc(); return 1
         }
