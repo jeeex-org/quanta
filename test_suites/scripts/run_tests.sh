@@ -452,6 +452,23 @@ if [ -f "$TEST_SUITES/EXPECTED_STDLIB.tsv" ]; then
   # CUDA path would look identical to a passing one. Start the daemon here and
   # treat a CUDA test that reports SKIP as a FAILURE, so the coverage is real.
   CUDA_DAEMON_STARTED=0
+  # A daemon already running is only usable if it IS the committed binary.
+  # Otherwise the gate measures a stale build -- the same failure mode as
+  # compiling with a stale VERSION. Verified by md5 of /proc/<pid>/exe against
+  # the committed file; a mismatch means restart with the right binary.
+  CUDA_WANT_MD5="$(md5sum "$REPO/scripts/audit/cuda_daemon" 2>/dev/null | cut -d' ' -f1)"
+  CUDA_STALE=0
+  for _p in $(pgrep -x cuda_daemon 2>/dev/null); do
+    _have="$(md5sum "/proc/$_p/exe" 2>/dev/null | cut -d' ' -f1)"
+    if [ -n "$_have" ] && [ "$_have" != "$CUDA_WANT_MD5" ]; then
+      CUDA_STALE=1
+      echo "  NOTE: killing stale cuda_daemon pid=$_p (md5 $_have != committed $CUDA_WANT_MD5)"
+      kill "$_p" 2>/dev/null || true
+    fi
+  done
+  if [ "$CUDA_STALE" = "1" ]; then
+    sleep 0.5
+  fi
   if ! pgrep -x cuda_daemon >/dev/null 2>&1; then
     rm -f /tmp/quanta_cuda/queue /tmp/quanta_cuda/result /tmp/quanta_cuda/lock
     "$REPO/scripts/audit/cuda_daemon" >/tmp/cuda_daemon_gate.log 2>&1 &
