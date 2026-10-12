@@ -3,9 +3,9 @@
 **Status:** Phases A and A2 complete — B onward open
 **Date:** 2026-10-11 (updated 2026-10-12)
 **Target:** Quanta 0.0.229+ (after loader 0.0.226–0.0.228)
-**Stable at time of writing:** 0.0.226
+**Stable at time of writing:** 0.0.228
 
-**Progress:** A ✅ · A2 ✅ · Loader 6.1 ✅ · 6.2 ✅ · 7.1 ✅ · 7.2 ⬜ · B ⬜ · B2 ⬜ · C1 ⬜ · C2 ⬜ · D ⬜
+**Progress:** A ✅ · A2 ✅ · Loader 6.1 ✅ · 6.2 ✅ · 7.1 ✅ · 7.2 ✅ · B ⬜ · B2 ⬜ · C1 ⬜ · C2 ⬜ · D ⬜
 
 ---
 
@@ -113,7 +113,7 @@ version freezes in place as the fallback and its `src` is never touched again.
 |---|---|---|
 | A | 0.0.225 (folded in) | ✅ done |
 | A2 | 0.0.225 (folded in) | ✅ done |
-| — Loader 6.1–7.2 — | 0.0.226–0.0.228 | 6.1 ✅ · 6.2 ✅ · 7.1 ✅ · 7.2 ⬜ |
+| — Loader 6.1–7.2 — | 0.0.226–0.0.228 | 6.1 ✅ · 6.2 ✅ · 7.1 ✅ · 7.2 ✅ |
 | B | 0.0.229 | ⬜ |
 | B2 | 0.0.230 | ⬜ |
 | C1 (assembler) | 0.0.231 | ⬜ |
@@ -602,7 +602,7 @@ Both were correctness bugs with silent failure modes. They became Phases A and A
 
 | Phase | Work | Version | Blocks | Effort |
 |---|---|---|---|---|
-| — Loader 6.1–7.2 — | (see loader-phase67.md) | 0.0.226–0.0.228 | 6.1 ✅ · 6.2 ✅ · 7.1 ✅ · 7.2 ⬜ |
+| — Loader 6.1–7.2 — | (see loader-phase67.md) | 0.0.226–0.0.228 | 6.1 ✅ · 6.2 ✅ · 7.1 ✅ · 7.2 ✅ |
 | B | `naked fn` + `section` + `no_mangle` | 0.0.229 | D | Small — additive syntax, 3 keywords |
 | B2 | `packed` structs / explicit field offsets | 0.0.230 | D | Medium — layout change, touches struct codegen |
 | C1 | Minimal x86 assembler | 0.0.231 | C2, D | **Large** — new module `asm_x86.quanta` |

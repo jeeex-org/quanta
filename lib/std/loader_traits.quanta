@@ -5,6 +5,13 @@
 
 import std/gguf
 import std/safetensors
+import std/json
+import std/qmodel_dtype
+
+// QMD_UNKNOWN (from qmodel_dtype) is not re-exported through the import, so
+// tests that import only loader_traits still see it. `let` + `0 - 1` because a
+// const initializer must be a single non-negative literal (see qmodel_dtype).
+let QMD_UNKNOWN = 0 - 1
 
 // ---- format kinds ---------------------------------------------------------
 let QMODEL_GGUF = 1
@@ -359,4 +366,43 @@ fn qmodel_read(h: i64, i: i64, buf: u64, nbytes: i64) -> i64 {
         return st_read_ctx(sctx, p, buf)
     }
     return QMODEL_ERR_RANGE
+}
+
+// ===========================================================================
+// Phase 7.2: Unified dtype access
+// ===========================================================================
+
+// Return the QmodelDtype enum value for tensor i, regardless of whether the
+// model was loaded from GGUF or safetensors. This is the single call the rest
+// of the loader should make when it needs to know what format a tensor is in.
+//
+// Returns -1 (QMD_UNKNOWN) when the dtype is not recognized.
+fn qmodel_dtype(h: i64, i: i64) -> i64 {
+    let ctx = qmodel_ctx_by_handle(h)
+    if ctx == 0 { return -1 }
+    let k = qmodel_ctx_kind(ctx)
+    if k == QMODEL_GGUF {
+        let gctx = qmodel_ctx_gguf(ctx)
+        let dt = gguf_ctx_tensor_dtype(gctx, i)
+        return gguf_dtype_to_qmodel(dt)
+    }
+    if k == QMODEL_ST {
+        let sctx = qmodel_ctx_st(ctx)
+        let name = st_name_at_ctx(sctx, i)
+        if name == 0 { return -1 }
+        let e = st_entry_ctx(sctx, name)
+        if e < 0 { return -1 }
+        let eo = json_get_object(e)
+        let dtv = json_object_get(eo, "dtype")
+        if dtv < 0 { return -1 }
+        return st_dtype_to_qmodel(json_get_string(dtv))
+    }
+    return -1
+}
+
+// Return the human-readable name of a QmodelDtype value.
+// Note: this calls qmodel_dtype_name() from std/qmodel_dtype, not itself.
+fn qmodel_dtype_str(h: i64, i: i64) -> str {
+    let dt = qmodel_dtype(h, i)
+    return qmodel_dtype_name(dt)
 }

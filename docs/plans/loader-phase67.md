@@ -1,8 +1,8 @@
 # Loader Phase 6/7 Plan: GPU Residency, Multi-Model, Tensor Caching, dtype Unification
 
-**Status:** Phase 6.1 ✅ · 6.2 ✅ · 7.1 ✅ · 7.2 ⬜ (dtype unification)  
+**Status:** Loader Phases 6.1 ✅ · 6.2 ✅ · 7.1 ✅ · 7.2 ✅ — loader plan COMPLETE  
 **Target:** Quanta 0.0.226+  
-**Stable at time of writing:** 0.0.226
+**Stable at time of writing:** 0.0.228
 
 ---
 
@@ -198,7 +198,30 @@ Models exceed GPU memory. Need LRU cache with prefetch.
 
 ---
 
-## 6. Phase 7.2: dtype Unification (0.0.229)
+## 6. Phase 7.2: dtype Unification ✅ DONE (0.0.228)
+
+**Status: COMPLETE.** Verified: mapping tables unit-checked (GGUF numeric IDs and
+safetensors strings land on the same enum for the same format), all 266 GGUF
+tensors and all 632 safetensors tensors resolve to known dtypes, enum bit width
+agrees with the derived width for every whole-byte tensor, and names round-trip
+through the enum. Gate 108/108, self-host 7/7.
+Test: `test_suites/codes/std_qmodel_dtype_test.quanta`.
+
+What landed:
+- `lib/std/qmodel_dtype.quanta` — QmodelDtype enum (float/int/quantized/k-quant/
+  IQ/sub-byte/ternary), `gguf_dtype_to_qmodel`, `st_dtype_to_qmodel`,
+  `qmodel_bits_of`, `qmodel_dtype_name`.
+- `lib/std/loader_traits.quanta` — `qmodel_dtype(h, i)` and `qmodel_dtype_str(h, i)`
+  dispatching on format kind, returning the same enum for either format.
+
+Two compiler conventions hit while writing this (both verified by bisection):
+- A `const` initializer must be a single non-negative literal. `const X = -1`
+  and `const X = 0 - 1` both parse but the name is never registered — every use
+  dies with "undeclared variable". Negative module-level values use `let`.
+- A function returning a string literal must declare `-> str`. With `-> u64` the
+  literal decays to a raw C pointer and prints as an integer.
+
+### Original design notes
 
 ### Problem
 GGUF has numeric dtype IDs; safetensors has string names. `qmodel_bits` derives width from `nbytes*8/nelements` but doesn't unify semantics.
@@ -240,7 +263,7 @@ GGUF has numeric dtype IDs; safetensors has string names. `qmodel_bits` derives 
 | 6.1 | Multiple models | 0.0.226 | ✅ done |
 | 6.2 | GPU residency / offload | 0.0.226 | ✅ done |
 | 7.1 | Tensor caching / prefetch / eviction | 0.0.227 | ✅ done |
-| 7.2 | dtype unification | 0.0.228 | ⬜ |
+| 7.2 | dtype unification | 0.0.228 | ✅ done |
 
 Kernel phases (B, B2, C1, C2, D) then occupy 0.0.229–0.0.233.
 
