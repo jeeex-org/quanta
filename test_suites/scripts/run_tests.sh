@@ -448,6 +448,24 @@ echo "########## STDLIB SUITE (lib/std/* via import) ##########"
 STDLIB_RC=0
 if [ -f "$TEST_SUITES/EXPECTED_STDLIB.tsv" ]; then
   STDLIB_PASS=0; STDLIB_FAIL=0; STDLIB_SKIP=0
+  # CUDA tests skip themselves (and return 0) when no daemon is up, so a broken
+  # CUDA path would look identical to a passing one. Start the daemon here and
+  # treat a CUDA test that reports SKIP as a FAILURE, so the coverage is real.
+  CUDA_DAEMON_STARTED=0
+  if ! pgrep -x cuda_daemon >/dev/null 2>&1; then
+    rm -f /tmp/quanta_cuda/queue /tmp/quanta_cuda/result /tmp/quanta_cuda/lock
+    "$REPO/scripts/audit/cuda_daemon" >/tmp/cuda_daemon_gate.log 2>&1 &
+    CUDA_DAEMON_PID=$!
+    for _ in $(seq 1 40); do
+      grep -q READY /tmp/cuda_daemon_gate.log 2>/dev/null && break
+      sleep 0.1
+    done
+    if pgrep -x cuda_daemon >/dev/null 2>&1; then
+      CUDA_DAEMON_STARTED=1
+    else
+      echo "  WARN: cuda_daemon failed to start (CUDA tests will be reported as FAIL)"
+    fi
+  fi
   while IFS=$'\t' read -r name expected skip_if_missing; do
     src="$TEST_SUITES/codes/$name"
     bin="$TEST_SUITES/bin/${name%.quanta}"
@@ -480,9 +498,20 @@ if [ -f "$TEST_SUITES/EXPECTED_STDLIB.tsv" ]; then
       STDLIB_FAIL=$((STDLIB_FAIL + 1)); continue
     fi
     set +e
-    ./scripts/quanta_run.sh "$bin" < /dev/null > /dev/null 2>&1
+    # Capture output so a self-reported SKIP can be detected. A CUDA test that
+    # skips has not tested anything, so counting it as a pass is how the CUDA
+    # path stayed "green" while the daemon was actually broken.
+    STDLIB_OUT="$(./scripts/quanta_run.sh "$bin" < /dev/null 2>&1)"
     actual=$?
     set -e
+    case "$name" in
+      std_cuda_*)
+        if printf '%s' "$STDLIB_OUT" | grep -q "^SKIP:"; then
+          echo "  FAIL $name (reported SKIP: CUDA daemon not reachable)"
+          STDLIB_FAIL=$((STDLIB_FAIL + 1)); continue
+        fi
+        ;;
+    esac
     if [ "$actual" = "$expected" ]; then
       echo "  PASS $name (rc=$actual)"
       STDLIB_PASS=$((STDLIB_PASS + 1))
@@ -491,6 +520,10 @@ if [ -f "$TEST_SUITES/EXPECTED_STDLIB.tsv" ]; then
       STDLIB_FAIL=$((STDLIB_FAIL + 1))
     fi
   done < "$TEST_SUITES/EXPECTED_STDLIB.tsv"
+  if [ "$CUDA_DAEMON_STARTED" = "1" ]; then
+    kill "$CUDA_DAEMON_PID" 2>/dev/null || true
+    wait "$CUDA_DAEMON_PID" 2>/dev/null || true
+  fi
   if [ "$STDLIB_SKIP" -gt 0 ]; then
     echo "  STDLIB: $STDLIB_PASS/$((STDLIB_PASS + STDLIB_FAIL)) GREEN ($STDLIB_SKIP skipped: model absent)"
   else

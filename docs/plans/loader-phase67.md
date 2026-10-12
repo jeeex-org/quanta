@@ -91,9 +91,15 @@ The work was not "add contexts" — the contexts existed but had never run:
 All tensor data lives in host RAM. Need device residency for GPU matvec.
 
 ### Dependencies
-- CUDA daemon stability (currently dies under test load)
-- Multi-model contexts (Phase 6.1)
-- Device memory management (alloc/free/copy)
+- ~~CUDA daemon stability~~ — **NOT A BLOCKER (verified).** The daemon works:
+  `init`/`malloc`/`host_alloc`/`stream_create`/`h2d`/`d2h` all correct, a 1 MiB
+  H2D->D2H round-trip is byte-exact (md5 match), 200 malloc/free cycles and a
+  2 GiB allocation survive, and both `std_cuda_daemon_test` and
+  `std_cuda_pool_test` pass end-to-end from Quanta. The "dies under test load"
+  note was stale, and it read as a daemon bug when the real defect was a
+  **missing single-instance lock** (see §9).
+- Multi-model contexts (Phase 6.1) ✅
+- Device memory management (alloc/free/copy) ✅ — already in cuda_daemon.quanta
 
 ### Design
 - `qmodel_gpu_upload(h, i)` — upload tensor `i` to device, return device ptr
@@ -219,7 +225,8 @@ Additional:
 
 | Risk | Severity | Mitigation |
 |---|---|---|
-| CUDA daemon instability | High | Fix daemon before Phase 6.2; add watchdog |
+| CUDA daemon had no single-instance lock | High | **FIXED** — `flock` on `QUEUE_DIR/lock`. Without it a second daemon shared the queue and both answered every command, so two CUDA contexts each returned their own pointer for one `malloc` and a caller could free memory another still owned. Measured: five daemons produced five replies per seq. |
+| CUDA tests skipped silently | High | **FIXED** — the gate starts the daemon itself and treats a self-reported `SKIP` as a FAIL. A broken CUDA path used to look identical to a passing one. |
 | Context refactor breaks GGUF/ST | Medium | Run all 24 GGUF/ST tests after each step |
 | GPU numerics diverge from CPU | High | ULP tolerance test per dtype; assert 0 differing logits |
 | Cache eviction correctness | Medium | Deterministic LRU test with known access pattern |

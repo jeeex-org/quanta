@@ -52,6 +52,8 @@
 #include <errno.h>
 #include <sys/stat.h>
 #include <sys/types.h>
+#include <fcntl.h>
+#include <sys/file.h>
 #include <cuda_runtime.h>
 
 #ifndef QUEUE_DIR
@@ -59,6 +61,7 @@
 #endif
 #define QUEUE_PATH QUEUE_DIR "/queue"
 #define RESULT_PATH QUEUE_DIR "/result"
+#define LOCK_PATH QUEUE_DIR "/lock"
 #define POLL_USLEEP 2000
 #define IDLE_SLEEP_USLEEP 50000
 
@@ -286,8 +289,30 @@ int main(void)
 {
     mkdir(QUEUE_DIR, 0755);
 
+    // SINGLE INSTANCE, enforced before anything else touches the queue.
+    //
+    // Without this, a second daemon shares QUEUE_PATH and RESULT_PATH with the
+    // first and BOTH answer every command: the result file ends up with two
+    // replies per seq, and two independent CUDA contexts each hand out their own
+    // pointer for the same "malloc", so one caller frees memory the other still
+    // owns. Measured with five daemons live: every reply appeared five times.
+    //
+    // flock, not a pid file: the kernel drops an flock when the holder dies for
+    // any reason, so a crashed daemon cannot wedge the next start. LOCK_NB so a
+    // second instance exits immediately rather than blocking.
+    int lockfd = open(LOCK_PATH, O_CREAT | O_RDWR, 0644);
+    if (lockfd < 0) {
+        fprintf(stderr, "cuda_daemon: cannot open lock %s: %s\n", LOCK_PATH, strerror(errno));
+        return 1;
+    }
+    if (flock(lockfd, LOCK_EX | LOCK_NB) != 0) {
+        fprintf(stderr, "cuda_daemon: another daemon already holds %s\n", LOCK_PATH);
+        return 1;
+    }
+    // Keep lockfd open for the life of the process; closing it releases the lock.
+
     // Start from empty queues so a restarted daemon cannot answer for a command
-    // issued to the previous instance.
+    // issued to the previous instance. Safe now that we know we are the only one.
     FILE *q = fopen(QUEUE_PATH, "w"); if (q) fclose(q);
     FILE *r = fopen(RESULT_PATH, "w"); if (r) fclose(r);
 
