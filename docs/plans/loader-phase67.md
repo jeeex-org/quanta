@@ -32,7 +32,8 @@
 
 ## 3. Phase 6.1: Multiple Models Open Simultaneously (0.0.226) ✅ DONE
 
-**Status: COMPLETE.** Commit `b2ac13fd`. Verified: two handles on one file
+**Status: COMPLETE** in `compiler/0.0.226`. Commits `b2ac13fd` (loader) and
+`d6783ef5` (compiler guard); version corrected by the promotion commit. Verified: two handles on one file
 interleave correctly and `close(h1)` leaves h2 intact; GGUF + safetensors open
 together with correct kind dispatch. Gate 20/20, stdlib 103/103, self-host 7/7.
 Test: `test_suites/codes/stdlib_loader_multi_test.quanta`.

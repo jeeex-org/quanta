@@ -99,6 +99,12 @@ Four independent workstreams, ordered by dependency and risk.
 
 **Order rationale:** A and A2 were bug fixes with a small blast radius — done first to get a clean baseline. B and B2 are additive syntax with no interaction with the register allocator — do them second. C1/C2 are the hard ones and want a stable base. D is last because it consumes B, B2 and C.
 
+**Versioning rule (from the promotion history).** Each release commit CREATES
+`compiler/<ver>` and BUMPS `VERSION` to it in the same commit; the previous
+version freezes in place as the fallback and its `src` is never touched again.
+`VERSION` therefore always names the newest tree, and the gate compiles with
+`compiler/$(cat VERSION)/bin/x86/qc`.
+
 **Versioning** (one per phase, per convention — new feature → next sequential number):
 
 **Loader phases occupy 0.0.226–0.0.229 first; kernel phases follow.**

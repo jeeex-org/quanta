@@ -330,51 +330,6 @@ fn main(argc, argv) {
         exit(0)
     }
     
-    // 0.0.226: refuse an output path that is the source path.
-    //
-    // `qc SRC SRC` read SRC and then opened SRC for writing as the output,
-    // replacing the source with a compiled binary. That is not hypothetical:
-    // lib/std/gguf.quanta (155 KB of source) was destroyed this way and had to
-    // be rebuilt from git.
-    //
-    // Two things make this need care:
-    //
-    // 1. srcp/out_p are RAW C strings from argv (no 8-byte Quanta length
-    //    header). The `stat` builtin is not usable here: it emits argp8(),
-    //    which adds 8 to the path, so it would stat the path with its first 8
-    //    characters cut off -- "/tmp/x.quanta" becomes "x.quanta", usually
-    //    ENOENT, and the check would silently never fire. newfstatat is issued
-    //    through syscall() instead, which passes arguments raw.
-    //
-    // 2. Compared by (st_dev, st_ino), not by the path bytes. "./x.quanta" and
-    //    "x.quanta" are different strings naming one file, and a symlink adds a
-    //    third name; a text compare would miss exactly the cases that matter.
-    //    stat follows symlinks, which is what is wanted -- writing through a
-    //    symlink to the source destroys the source.
-    //
-    // Checked before the source is opened and before any output mode runs
-    // (ELF, --emit-obj, --emit-qobj, --link), because all of them write out_p.
-    // AT_FDCWD = -100; syscall 262 = newfstatat.
-    if srcp != 0 && out_p != 0 {
-        let rs = syscall(262, -100, srcp, stat_buf, 0, 0, 0)
-        // If the output does not exist yet there is nothing to clobber, so a
-        // failed stat on out_p skips the check rather than failing the compile.
-        if rs == 0 {
-            let ro = syscall(262, -100, out_p, stat_buf_out, 0, 0, 0)
-            if ro == 0 {
-                let sdev = mem_load(stat_buf + 0)
-                let sino = mem_load(stat_buf + 8)
-                let odev = mem_load(stat_buf_out + 0)
-                let oino = mem_load(stat_buf_out + 8)
-                if sdev == odev && sino == oino {
-                    let msg = "error: output path is the source path (refusing to overwrite the input)\n"
-                    file_write(2, msg+8, len(msg))
-                    exit(1)
-                }
-            }
-        }
-    }
-
     let fd=file_open(srcp,0)
     if fd<0 { exit(14) }
     // FIX-0.0.9 (LOW): a source file larger than the 16MB read buffer was
