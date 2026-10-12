@@ -1,0 +1,40 @@
+// x25519_inv_step.quanta — test fe_sq in isolation
+
+import std/x25519
+
+fn print_hex(label, ptr, n) {
+  let s = ""
+  let i = 0
+  while i < n {
+    let b = mem_load8(ptr + i)
+    let hi = b >> 4; let lo = b & 0xf
+    if hi < 10 { s = str(s, hi + 48) } else { s = str(s, hi + 87) }
+    if lo < 10 { s = str(s, lo + 48) } else { s = str(s, lo + 87) }
+    i = i + 1
+  }
+  println(s)
+}
+
+fn main() {
+  println("Debug fe_sq loop...")
+  
+  let a = mem_alloc(5*8)
+  fe_zero(a)
+  mem_store(a, 2)
+  println("a = 2:")
+  print_hex("a", a, 40)
+  
+  let result = mem_alloc(5*8)
+  fe_one(result)
+  
+  // Just test one iteration: square
+  let tmp = mem_alloc(5*8)
+  fe_sq(result, tmp)
+  fe_copy(tmp, result)
+  
+  println("After 1 square:")
+  print_hex("result", result, 40)
+  
+  println(0)
+  exit(0)
+}

@@ -1,0 +1,566 @@
+// === LEXER ===
+fn isoc(c) {
+    if c==33||c==37||c==38||c==42||c==43||c==45||c==47 { return 1 }
+    if c==60||c==61||c==62||c==94||c==124||c==126 { return 1 }
+    return 0
+}
+
+fn ispnct(c) {
+    if c==40||c==41||c==44||c==46||c==58||c==59 { return 1 }
+    if c==91||c==93||c==123||c==125 { return 1 }
+    if c==63 { return 1 }
+    // '<' and '>' are operators (isoc), not punctuation for generics
+    return 0
+}
+
+fn isws(c) {
+    if c==32||c==9||c==10||c==13 { return 1 }
+    return 0
+}
+
+fn ialpha(c) {
+    if c>=65 && c<=90 { return 1 }; if c>=97 && c<=122 { return 1 }
+    if c==95 { return 1 }; return 0
+}
+
+fn idigit(c) { if c>=48 && c<=57 { return 1 }; return 0 }
+
+fn ismop(p) {
+    if p+1>=srclen { return 0 }
+    let b1=r8(src+p); let b2=r8(src+p+1)
+    if b1==61&&b2==61||b1==33&&b2==61 { return 1 }
+    if b1==60&&b2==61||b1==62&&b2==61 { return 1 }
+    if b1==61&&b2==62 { return 1 }  // => for match arms
+    if b1==38&&b2==38 { return 1 }
+    // RESTORED: || as single multichar token (value 31868); closure literal
+    // uses single | (TT_OP value 124), which is distinct and not matched here.
+    if b1==124&&b2==124 { return 1 }
+    if b1==60&&b2==60||b1==62&&b2==62 { return 1 }
+    if b1==43&&b2==43||b1==45&&b2==45 { return 1 }
+    if b1==43&&b2==61||b1==45&&b2==61 { return 1 }
+    if b1==42&&b2==61||b1==47&&b2==61||b1==37&&b2==61 { return 1 }
+    if b1==45&&b2==62 { return 1 }
+    if b1==58&&b2==58 { return 1 }  // ::
+    if b1==46&&b2==46 { return 1 }  // .. (string concatenation operator)
+    return 0
+}
+
+fn mopv(p) { return r8(src+p)*256+r8(src+p+1) }
+
+fn tokenize() {
+    tokc=0; let p=0; let l=1; let c=1
+    while p<srclen {
+        let ch=r8(src+p)
+        if isws(ch) {
+            p=p+1; if ch==10 { l=l+1; c=1 } else { c=c+1 }
+        } else if ch==47&&p+1<srclen&&r8(src+p+1)==42 {   // /* block comment */
+            p=p+2
+            while p+1<srclen {
+                if r8(src+p)==42 && r8(src+p+1)==47 { p=p+2; break }
+                if r8(src+p)==10 { l=l+1; c=1 } else { c=c+1 }
+                p=p+1
+            }
+        } else if ch==47&&p+1<srclen&&r8(src+p+1)==47 {
+            p=p+2; while p<srclen&&r8(src+p)!=10 { p=p+1 }
+            if p<srclen { p=p+1 }; l=l+1; c=1
+        } else if ch==35 {   // '#' line comment (bash/python-style): skip to EOL
+            p=p+1; while p<srclen&&r8(src+p)!=10 { p=p+1 }
+            if p<srclen { p=p+1 }; l=l+1; c=1
+        } else if ch==34 {
+            let sl=l; let sc=c; let sp=p; p=p+1; c=c+1
+            // String literal: kept as a single literal token (including any
+            // ${...}/$[...] text). Interpolation is split later in parse_primary
+            // at parse time (where extending srclen is safe), not during lexing.
+            while p<srclen&&r8(src+p)!=34 {
+                if r8(src+p)==92&&p+1<srclen { p=p+2; c=c+2 } else { p=p+1; c=c+1 }
+            }
+            if p>=srclen { let mh = "error: unterminated string literal (missing closing quote)\n"; file_write(2, mh+8, len(mh)); exit(1) }; p=p+1; c=c+1
+            if p>sp { stok(tokc,TT_STR,sp,sl,sc,p-sp); tokc=tokc+1 }
+        } else if ch==39 {
+            let sc=c; let cval=0
+            if r8(src+p+1)==92 {
+                let ec=r8(src+p+2)
+                if ec==110 { cval=10 } else if ec==116 { cval=9 } else if ec==114 { cval=13 } else if ec==48 { cval=0 } else if ec==92 { cval=92 } else if ec==39 { cval=39 } else { cval=ec }
+                p=p+4; c=c+4
+            } else {
+                cval=r8(src+p+1); p=p+3; c=c+3
+            }
+            stok(tokc,TT_NUM,cval,l,sc,1); tokc=tokc+1
+        } else if idigit(ch) {
+            let sp=p; let sc=c
+            if ch==48 && p+1<srclen && (r8(src+p+1)==120 || r8(src+p+1)==88) {
+                // hex literal 0x... / 0X...
+                // NOTE: do NOT mask with 0xFFFFFFFFFFFFFFFF here ? that literal
+                // is itself truncated by the (pre-fix) hex lexer, so the mask
+                // would silently clobber the high 32 bits. `val` is a 64-bit
+                // slot and val*16+digit stays within 64 bits for any valid hex
+                // literal, so no mask is required.
+                p=p+2; c=c+2
+                let hi=0
+                let lo=0
+                let hdig=0
+                // FIX-0.0.32: hex literals span the FULL 64-bit two's-complement
+                // range (like C): up to 16 hex digits accepted; values above
+                // I64MAX wrap to negative i64 bit patterns. Keccak round
+                // constants (0x800000000000808a etc.) need this. >16 digits
+                // genuinely overflows 64 bits -> reject.
+                // G2 overflow-trap gate means val*16 / val+val both SIGILL once
+                // val nears 2^63, so we fold into two 32-bit halves (hi:lo) and
+                // combine with (hi << 32) + lo ? shifts are not trap-checked and
+                // that add cannot overflow signed i64.
+                while p<srclen {
+                    let d=r8(src+p)
+                    let dv = -1
+                    if d>=48&&d<=57 { dv=d-48 }
+                    else if d>=97&&d<=102 { dv=d-87 }
+                    else if d>=65&&d<=70 { dv=d-55 }
+                    if dv < 0 { break }
+                    if hdig >= 16 { let mh="error: integer literal overflows i64 range\n"; file_write(2, mh+8, len(mh)); exit(1) }
+                    if hdig < 8 {
+                        hi = hi << 4
+                        hi = hi + dv
+                    } else {
+                        lo = lo << 4
+                        lo = lo + dv
+                    }
+                    p=p+1; c=c+1; hdig=hdig+1
+                }
+                let val = 0
+                if hdig <= 8 { val = hi } else { val = (hi << 32) + lo }
+                // NEW-5: a bare `0x` / `0X` with no hex digits must not silently
+                // compile to 0 ? reject it as a malformed numeric literal.
+                if hdig==0 {
+                    let mh = "error: malformed hex literal (no digits after 0x)\n"
+                    file_write(2, mh+8, len(mh)); exit(1)
+                }
+                stok(tokc,TT_NUM,val,l,sc,p-sp); tokc=tokc+1
+            } else {
+                let val=0
+                // Overflow guard: I64MAX = 9223372036854775807. A positive
+                // decimal literal overflows if val > I64MAX/10 (=922337203685477580)
+                // or (val == I64MAX/10 and next digit > 7). Reject cleanly
+                // instead of emitting a wrapped value that crashes codegen.
+                let IMAXD = 922337203685477580
+                // 0.0.114 FIX: when the literal overflows i64 we emit ONE
+                // TT_BIGNUM token and must NOT also fall through to the TT_NUM
+                // emission below. The old code used `continue` inside the inner
+                // digit loop, which only re-entered that loop (it then broke on
+                // the non-digit) and fell through to emit a SECOND, truncated
+                // TT_NUM token. That stray token desynced the parser into an
+                // infinite IR_CONST loop ("source too many tokens/IR limit").
+                // big_done flags the overflow so we skip the TT_NUM path.
+                let big_done=0
+                while p<srclen {
+                    let dch=r8(src+p)
+                    if idigit(dch)==0 { break }
+                    let d = dch-48
+                    if val > IMAXD || (val == IMAXD && d > 7) {
+                        // Over-sized decimal literal: don't reject ? emit a
+                        // TT_BIGNUM token carrying the SOURCE OFFSET (sp) and the
+                        // digit count (nlen) so the parser can build a big via
+                        // big_from_dec. Keep scanning the remaining digits so the
+                        // whole literal is consumed as one token.
+                        while p<srclen && idigit(r8(src+p))==1 { p=p+1; c=c+1 }
+                        // FIX-0.0.26: cap digit count to prevent unbounded TT_BIGNUM token
+                        if c > 100000 { exit(1) }
+                        stok(tokc, TT_BIGNUM, sp, l, sc, p-sp); tokc = tokc + 1
+                        big_done=1
+                        break
+                    }
+                    val = val*10 + d
+                    p=p+1; c=c+1
+                }
+                if big_done==1 { continue }
+                let nlen=p-sp
+                // Disambiguate float vs field-access '.':
+                // A trailing '.' is a decimal point (float) ONLY when the
+                // integer is a genuine literal (previous token is NOT '.')
+                // AND the '.' is followed by a digit OR is at end-of-input
+                // ('3.14' or dangling '1.'). Otherwise it is a field-access/
+                // range dot ('.N', '.field', '..') and must be left for the
+                // parser - never rejected here.
+                // A number is a FLOAT when a '.' follows, OR when an exponent
+                // does. The '.' test alone missed `1e-6` entirely: with no dot,
+                // control fell to the TT_NUM branch and `e` lexed as a separate
+                // identifier -- the parse then failed with "undeclared variable:
+                // e", which is exactly what lib/std/native_inference.quanta hit
+                // on its `1e-6` epsilon. `f`-suffixed literals (`2.5f`) reach the
+                // same branch via their dot; a bare `2f32` has no dot and is
+                // covered by the exponent-style lookahead below.
+                // Is this number a FLOAT? It is if a '.' follows, or if an
+                // exponent does.
+                //
+                // The '.' test alone missed `1e-6` entirely. With no dot, control
+                // fell through to the TT_NUM branch and the `e` lexed as a
+                // separate identifier, so the parse failed with "undeclared
+                // variable: e" -- exactly what lib/std/native_inference.quanta hit
+                // on its `1e-6` epsilon. `1.0` worked only because the fraction
+                // alone made a TT_FNUM token.
+                let isfloat = 0
+                if p<srclen && r8(src+p)==46 {
+                    // A trailing '.' is a decimal point only when the integer is a
+                    // genuine literal (previous token is not '.') and the '.' is
+                    // followed by a digit or ends the input ('3.14', dangling
+                    // '1.'). Otherwise it is field access / a range dot.
+                    let prevdot = (tokc>0 && tokt(tokc-1)==TT_PNCT && tokv(tokc-1)==46)
+                    if prevdot==0 && ((p+1<srclen && idigit(r8(src+p+1))==1) || p+1>=srclen) { isfloat = 1 }
+                }
+                if isfloat==0 && p<srclen && (r8(src+p)==101 || r8(src+p)==69) {
+                    // 'e'/'E', optional sign, then at least one digit
+                    let ep = p + 1
+                    if ep<srclen && (r8(src+ep)==43 || r8(src+ep)==45) { ep = ep + 1 }
+                    if ep<srclen && idigit(r8(src+ep))==1 { isfloat = 1 }
+                }
+                if isfloat==1 {
+                    if p<srclen && r8(src+p)==46 { p = p + 1 }   // consume '.' if present
+                    let fval = 0
+                    let fdigits = 0
+                    // Signed decimal exponent, carried beside (not folded into) the
+                    // mantissa. Zero for every literal without an 'e'. See the
+                    // positive-exponent branch below for why it must NOT be folded
+                    // into the mantissa with integer multiplies.
+                    let fexp = 0
+                    while p<srclen && idigit(r8(src+p))==1 {
+                        let d = r8(src+p) - 48
+                        // The float token packs the mantissa as (val << 8) | fdigits
+                        // so that parse_primary can recover both with `v >> 8` and
+                        // `v & 255` (see method.quanta, the TT_FNUM branch). That
+                        // packing is the CONSTRAINT, and it is much tighter than
+                        // i64: `val << 8` must stay inside a SIGNED 64-bit field,
+                        // so val must not exceed 2^55 - 1 = 36028797018963967.
+                        //
+                        // The old guard compared val against 922337203685477580
+                        // (i64/10), which let val keep growing to ~19 digits and
+                        // only then stop. By that point `val << 8` was already
+                        // past 2^63, so the packed token came back NEGATIVE:
+                        // 6931471805599.0 packed to 1774456782233521445646, and
+                        // parse_primary's `v >> 8` recovered a sign-extended
+                        // mantissa instead of 6931471805599. The scale loop in
+                        // parse_primary then divided by a 10^fdigits that no
+                        // longer matched, and the emitted fconst divided by a
+                        // huge/garbage xmm1 -- the literal came out as 0.000751
+                        // instead of 0.6931471805599453, and a 13-digit integer
+                        // part sent the compiler into a hang.
+                        //
+                        // Saturating at 2^55-1 is exact for every literal that
+                        // i64 could have carried anyway: a mantissa needing more
+                        // than 17 significant digits cannot be represented in the
+                        // packed token at all, so the extra digits were always
+                        // going to be lost. Saturation (rather than wrap) keeps the
+                        // packed value positive and keeps the compiler alive.
+                        // `val` accumulates every digit of the literal and is the
+                        // only value packed into the token as (val << 8) | fdigits.
+                        // `val << 8` must stay inside a signed i64, so
+                        // val < 2^55 = 36028797018963968 -- that is at most 16
+                        // significant digits, because 17-digit values start at
+                        // 1e16 and 8.42894206204953964 << 8 = 2.1e19 overflows
+                        // 2^63 = 9.2e18. (17 digits only fits when the leading
+                        // digit is 1 or 2, which is why 1.3333333333333333 packed
+                        // fine while 8.42894206204953964 did not.)
+                        //
+                        // val, fval and fdigits must all STOP together. Counting
+                        // fdigits on after val has stopped inflates the divisor by a
+                        // power of ten per extra digit, so every literal with more
+                        // than 17 significant digits came out silently wrong:
+                        //     1.33333333333333333e+00 -> 0.612757392954054
+                        //     8.42894206204953964e+00  -> 1.223182658256746
+                        //
+                        // Found via fdlibm's pi/2 high word 1.57079632673412561417e+00
+                        // (21 digits), which materialised as 3.86e+03 and made
+                        // sinf(0.5) return 0.999999 because x/hi came out as 3856.7
+                        // instead of 0.3183.
+                        //
+                        // Stopping at 17 significant digits is CORRECT, not lossy: an
+                        // f64 carries 17 significant digits, so nothing past the 17th
+                        // can change the correctly rounded result except at an exact
+                        // tie, and fconst rounds to nearest-even on the exact value
+                        // handed to it.
+                        //
+                        // The guard is on val's LENGTH, not a magnitude constant,
+                        // because the integer part consumes the same budget: 17
+                        // fraction digits are exact after a leading 1, but only 16
+                        // after a leading 8 (18 digits of val in total either way).
+                        // Test the MAGNITUDE, not the digit count: whether a 17-digit
+                        // mantissa fits depends on its leading digit, so a digit-count
+                        // test is off by one for some literals and wrong for others.
+                        if val < 3602879701896397 {
+                            val = val*10 + d
+                            if fval < 36028797018963967 { fval = fval*10 + d }
+                            fdigits = fdigits + 1
+                        }
+                        p = p + 1; c = c + 1
+                    }
+                    let nlen = p - sp
+                    // Scientific notation: fold the exponent into the existing
+                    // (mantissa, frac_digits) encoding that fconst(M, scale)
+                    // already consumes, so no new token kind is needed.
+                    if p<srclen && (r8(src+p)==101 || r8(src+p)==69) {
+                        let es = p
+                        p = p + 1
+                        let eneg = 0
+                        if p<srclen && (r8(src+p)==43 || r8(src+p)==45) {
+                            if r8(src+p)==45 { eneg = 1 }
+                            p = p + 1
+                        }
+                        if p<srclen && idigit(r8(src+p))==1 {
+                            // READ THE EXPONENT VALUE. The loop counted DIGITS, so
+                            // `en` was 1 for every single-digit exponent and `1.0e2`
+                            // came out as 100 instead of 1000, `1e-6` as 10/10^7
+                            // instead of 1e-6, and `1.0e0` as 100 instead of 10.
+                            // Only one-digit exponents looked right, and only because
+                            // the two wrongs cancelled.
+                            let en = 0
+                            while p<srclen && idigit(r8(src+p))==1 {
+                                en = en*10 + (r8(src+p) - 48)
+                                p = p + 1
+                            }
+                            // A float literal is carried as (mantissa, fdigits),
+                            // read by parse_primary as mantissa / 10^fdigits, and
+                            // fconst evaluates that with real fp division
+                            // (cvtsi2sd + divsd in emitter.quanta). So the pair only
+                            // has to be moved together, never rescaled on its own.
+                            //
+                            //   1e-6   1e-6 == mantissa 1, six more fraction digits
+                            //   1.0e0  1.0  == unchanged; a zero exponent is a no-op
+                            //   1.0e2  100  == mantissa 10 * 10^2
+                            if eneg==1 {
+                                // A NEGATIVE exponent. It is carried in `fexp`
+                                // as a signed value, exactly like the positive
+                                // case, so BOTH branches share one representation:
+                                //
+                                //     literal == mantissa / 10^fdigits * 10^fexp
+                                //
+                                // 1e-6  -> mantissa 1, fdigits 0, fexp -6
+                                // 1.0e-6-> mantissa 10, fdigits 1, fexp -6
+                                //
+                                // The earlier code added `en` to `fdigits` instead.
+                                // `fdigits` is an 8-BIT field inside the token word,
+                                // so 1.0e-308 wanted fdigits = 308, truncated to 52,
+                                // and the value was wrong by 256 orders of magnitude.
+                                fexp = 0 - en
+                            } else {
+                                // Positive (or zero) exponent. With en==0 this is a
+                                // no-op, so `1.0e0` stays 10/10 == 1.0.
+                                //
+                                // FIX 0.0.221: DO NOT DO THIS IN INTEGER ARITHMETIC.
+                                // `val = val*10` once per exponent digit overflows i64
+                                // as soon as the literal exceeds ~1e17 (1.0e18 turned
+                                // 10 into 10^19 = 0x8AC7230489E80000), and the
+                                // wrapped mantissa then also broke the `<< 8` token
+                                // packing below. The compiler did not report an
+                                // error -- it died with SIGILL (exit -4) partway
+                                // through codegen, so `import std/gguf` produced NO
+                                // binary and NO message.
+                                //
+                                // Carrying the exponent in the side word and letting
+                                // the PARSER materialise 10^fexp in floating point
+                                // (see the fconst path in method.quanta) removes the
+                                // integer power-of-ten entirely. Integer literals are
+                                // untouched: only the float branch reads `fexp`.
+                                fexp = en
+                            }
+                        } else {
+                            p = es   // 'e' with no digits: not an exponent
+                        }
+                    }
+                    // Rust-style float type suffix: 0.0f32, 1.0f64, 2.5f. A no-op
+                    // for the value -- one float representation -- but it MUST be
+                    // consumed or it lexes as an identifier and the expression
+                    // parse fails with "undeclared variable: f32".
+                    if p<srclen && (r8(src+p)==102 || r8(src+p)==70) {
+                        let fs = p
+                        p = p + 1
+                        while p<srclen && idigit(r8(src+p))==1 { p = p + 1 }
+                        // f16/f32/f64 only; otherwise it was an identifier
+                        // starting with 'f', so put it back.
+                        if p-fs != 2 && p-fs != 3 { p = fs }
+                    }
+                    // 0.0.221: (M << 8) | frac_digits keeps its shape, but frac_digits
+                    // is now CLAMPED to 255 and the excess is moved into the side
+                    // word, because the field is only 8 bits wide. A literal such as
+                    // 0.0001234...<300 zeros>1 has more fraction digits than 255 can
+                    // name; the extra digits are all zero, so folding them into the
+                    // exponent is exact, not an approximation.
+                    if fdigits > 255 {
+                        fexp = fexp - (fdigits - 255)
+                        fdigits = 255
+                    }
+                    let fval_enc = (val << 8) | fdigits
+                    stok(tokc, TT_FNUM, fval_enc, l, sc, nlen); tokc = tokc + 1
+                    // Signed decimal exponent, in the side word stoke/toke read.
+                    stoke(tokc-1, fexp)
+                    continue
+                }
+stok(tokc, TT_NUM, val, l, sc, nlen); tokc = tokc + 1
+            }
+        } else if ialpha(ch) {
+            let sp=p; let sc=c
+            while p<srclen {
+                let c2=r8(src+p)
+                if ialpha(c2)||idigit(c2)||c2==95 { p=p+1; c=c+1 } else { break }
+            }
+            let nl=p-sp
+            let ty=TT_ID
+            let kt = ktext(sp,nl)
+            if kt!=0 { ty=TT_KEY }
+            // P6.1b: check for unsigned/bool/char/byte type keywords
+            if kt==8 || kt==9 || kt==10 || kt==11 || kt==12 { ty=TT_KEY }
+            if kt==13 || kt==14 || kt==15 { ty=TT_KEY }
+            // P6.1b: check for enum/match/type/interface/impl/trait/where/Option/Result keywords
+            if kt==21 { 
+              ty=TT_ENUM 
+            }
+            else if kt==22 { ty=TT_MATCH }
+            else if kt==23 { ty=TT_TYPE }
+            else if kt==24 { ty=TT_INTERFACE }
+            else if kt==25 { ty=TT_IMPL }
+            else if kt==26 { ty=TT_TRAIT }
+            else if kt==27 { ty=TT_WHERE }
+            else if kt==28 { ty=TT_ID }   // Option: plain ID; parse paths use ktext()
+            else if kt==29 { ty=TT_ID }   // Some
+            else if kt==30 { ty=TT_ID }   // None
+            else if kt==31 { ty=TT_ID }   // Result
+            else if kt==32 { ty=TT_ID }   // Ok
+            else if kt==33 { ty=TT_ID }   // Err
+            else if kt==62 { ty=TT_ID }   // 0.0.114: big ? plain ID; type-annotation position checks ktext (parse_let), so `let big = 70000` stays legal
+            else if kt==34 { ty=TT_REF }
+            else if kt==35 { ty=TT_MUT }
+            else if kt==36 { ty=TT_MOVE }
+            else if kt==37 { ty=TT_STRING }
+            // P9: "for" keyword (ktext=7)
+            else if kt==7 { ty=TT_KEY }
+            // P6: Low-level keywords
+            else if kt==38 { ty=TT_RAW }      // raw
+            else if kt==39 { ty=TT_VOLATILE } // volatile
+            else if kt==40 { ty=TT_ASM }      // asm
+            else if kt==41 { ty=TT_AS }       // as
+            else if kt==42 { ty=TT_USIZE }    // usize
+            // P7: panic keyword
+            else if kt==H_PANIC { ty=TT_PANIC }
+            // P8: struct keyword
+            else if kt==H_STRUCT { ty=TT_STRUCT }
+            // P10: 'in' keyword for for-in loops
+            else if kt==H_IN { ty=TT_IN }
+            // F6: 'defer' keyword
+            else if kt==H_DEFER { ty=TT_KEY }
+            // F7: 'const' keyword
+            else if kt==H_CONST { ty=TT_KEY }
+            // 0.0.229 Phase B: naked / section / no_mangle are CONTEXT keywords
+            // (same precedent as `big`=62 and `try`=59): they lex as TT_ID so
+            // existing identifiers keep working — lib/std/config.quanta has
+            // `fn config_get(doc, section, key)`, and reserving `section` broke
+            // it (config_test compile rc=132). Attribute position is detected
+            // by scanfns/parse_block from the token context instead.`
+            else if kt==H_NAKED { ty=TT_ID }
+            else if kt==H_SECTION { ty=TT_ID }
+            else if kt==H_NOMANGLE { ty=TT_ID }
+            // 0.0.230 Phase B2: `packed` is a CONTEXT keyword TOO — and it MUST
+            // be remapped here. ktext() returning non-zero makes the default
+            // TT_KEY (the `if kt!=0 { ty=TT_KEY }` above fires for every match),
+            // and method.quanta has `let packed = cv0 - bvmark()` (line ~1588) —
+            // without this remap the self-host dies with "reserved type keyword
+            // used as a variable name" at that line. Found by the self-host
+            // fixed-point check, exactly as designed.
+            else if kt==H_PACKED { ty=TT_ID }
+        stok(tokc,ty,sp,l,sc,nl); tokc=tokc+1
+        } else if ismop(p) {
+            stok(tokc,TT_OP,mopv(p),l,c,2); tokc=tokc+1; p=p+2; c=c+2
+        } else if isoc(ch) {
+                    // Always emit < and > as TT_OP - parser handles context
+                    stok(tokc, TT_OP, ch, l, c, 1); tokc = tokc + 1; p = p + 1; c = c + 1
+        } else if ispnct(ch) {
+            // dz: when >0 we are inside a $(name(...)) sigil; skip the ')' that
+            // closes the $( (the one AFTER the args' own ')'), so $(f(1,b)) does
+            // not leave a stray ')'.
+            if dz > 0 {
+                if ch==40 { dz = dz + 1 }
+                else if ch==41 {
+                    dz = dz - 1
+                    if dz == 0 { p=p+1; c=c+1; continue }  // skip the $( closer
+                }
+            }
+            stok(tokc,TT_PNCT,ch,l,c,1); tokc=tokc+1; p=p+1; c=c+1
+        } else if ch==36&&p+1<srclen&&r8(src+p+1)==91 {
+            // $[name] : a read-only LOCAL handle (current function's local, via
+            // vfind). Used for explicit local reference and string interpolation
+            // of a local. The inner name is tokenized as TT_LOCAL.
+            p=p+2; c=c+2   // skip $[
+            let sp2=p; let sc2=c
+            while p<srclen&&r8(src+p)!=93 { p=p+1; c=c+1 }   // until ]
+            if p>=srclen { let mh="error: unterminated local reference (missing ']')\\n"; file_write(2, mh+8, len(mh)); exit(1) }
+            let nl2=p-sp2
+            stok(tokc,TT_LOCAL,sp2,l,sc2,nl2); tokc=tokc+1
+            p=p+1; c=c+1   // skip ]
+        } else if ch==36&&p+1<srclen&&r8(src+p+1)==36&&p+2<srclen&&r8(src+p+2)==40 {
+            // $$(cmd) external command substitution. If the next char is NOT a
+            // quote or bracket, capture everything until ')' as a raw command
+            // string. This handles $$(ls -l ~/) by treating "ls -l ~/" as the
+            // command. If it IS a quote/bracket, emit TT_SHCMD so the parser's
+            // existing string/array handling works.
+            let next_ch = r8(src+p+3)
+            if next_ch==34 || next_ch==91 {
+                // String literal or array form: let parser handle it
+                p=p+3; c=c+3   // skip $$(
+                stok(tokc,TT_SHCMD,0,l,c,0); tokc=tokc+1
+            } else {
+                // Raw command form: scan to matching ')' and capture as string
+                p=p+3; c=c+3   // skip $$(
+                let cmd_start = p
+                let depth = 1
+                while p<srclen && depth>0 {
+                    let ch2 = r8(src+p)
+                    if ch2==40 { depth = depth+1 }
+                    else if ch2==41 { depth = depth-1 }
+                    if depth>0 { p=p+1; c=c+1 }
+                }
+                let cmd_len = p - cmd_start
+                // Write the raw command as a quoted string at srclen
+                let str_at = srclen
+                w8(src+str_at, 34)  // opening quote
+                let i = 0
+                while i < cmd_len { w8(src+str_at+1+i, r8(src+cmd_start+i)); i = i+1 }
+                w8(src+str_at+1+cmd_len, 34)  // closing quote
+                srclen = str_at + cmd_len + 2
+                // Emit TT_SHCMD_RAW with the string location
+                stok(tokc,TT_SHCMD_RAW,str_at,l,sc,cmd_len+2); tokc=tokc+1
+                p=p+1; c=c+1  // skip the closing ')'
+            }
+        } else if ch==36&&p+1<srclen&&r8(src+p+1)==40&&p+2<srclen&&ialpha(r8(src+p+2)) {
+            // $(name) or $(name(args)): explicit EXTERNAL / GLOBAL function call.
+            // Tokenized as TT_CALL (distinct from TT_ID, so a bare `name)` in
+            // normal code is never mistaken for a call). Resolves via the global
+            // function table only (findfn_global) ? reaching the top-level
+            // definition even when a local same-named function shadows it.
+            p=p+2; c=c+2   // skip $(
+            let sp2=p; let sc2=c
+            while p<srclen && (ialpha(r8(src+p)) || (r8(src+p)>=48&&r8(src+p)<=57) || r8(src+p)==95) { p=p+1; c=c+1 }
+            let nl2 = p - sp2
+            if nl2==0 { let mh="error: empty external call name in $()\\n"; file_write(2, mh+8, len(mh)); exit(1) }
+            stok(tokc,TT_CALL,sp2,l,sc2,nl2); tokc=tokc+1
+            // If args follow ($(name(args))), the closing ')' of $( is the one
+            // AFTER the args' own ')'. Track depth so the generic PNCT handler
+            // skips exactly that trailing ')'.
+            if p<srclen && r8(src+p)==40 {
+                dz = 1   // we are now inside the $( 's paren pair
+            } else {
+                // 0-arg form $(name): no source '(' exists. Emit a single
+                // synthetic '(' so the stream is TT_CALL(name) '(' and the real
+                // ')' that follows closes the call ? identical to a real name()
+                // call. (Do NOT emit a synthetic ')'; the source ')' is the close.)
+                stok(tokc,TT_PNCT,40,l,c,1); tokc=tokc+1
+            }
+        } else if ch==36&&p+1<srclen&&r8(src+p+1)==123&&p+2<srclen&&ialpha(r8(src+p+2)) {
+            // ${name} : a GLOBAL reference (read-only cross-scope handle). The
+            // inner name is tokenized as TT_DOLLAR so it resolves to a `global`
+            // declaration via gfind() ? distinct from any local `name`.
+            p=p+2; c=c+2   // skip ${
+            let sp2=p; let sc2=c
+            while p<srclen&&r8(src+p)!=125 { p=p+1; c=c+1 }
+            if p>=srclen { let mh="error: unterminated variable reference (missing '}')\n"; file_write(2, mh+8, len(mh)); exit(1) }
+            let nl2=p-sp2
+            stok(tokc,TT_DOLLAR,sp2,l,sc2,nl2); tokc=tokc+1
+            p=p+1; c=c+1   // skip }
+        } else { let mh = "error: invalid character in source (byte not a token)\n"; file_write(2, mh+8, len(mh)); exit(1) }
+    }
+}
+

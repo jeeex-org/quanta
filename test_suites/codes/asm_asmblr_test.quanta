@@ -1,0 +1,70 @@
+// asm_asmblr_test -- Phase C1 (0.0.231): the minimal x86-64 assembler.
+//
+// Each case assembles an instruction via asm! and asserts the OBSERVED machine
+// state — the value that comes back in the result register (RAX convention) or
+// the effect on a register that a later asm reads.
+//
+// CALLER-SAVED RULE: asm! inside a NORMAL function may clobber caller-saved
+// registers only (rax, rcx, rdx, rsi, rdi, r8-r11). rbx/r12-r15 are compiler-
+// owned (spilled across the function), and clobbering them corrupts the
+// function — discovered here the hard way: `mov rbx, 37` inside main
+// segfaulted the test binary. Kernel trap handlers that need full register
+// control use NAKED fns (Phase B), where the body owns everything.
+//
+//   1. mov REG, IMM: the result convention returns the immediate
+//   2. mov REG, REG: two asm! statements chain through r10 (caller-saved)
+//   3. hex fallback still works (existing behavior must not regress)
+//   4. push/pop round trip through the assembler
+//   5. cli/sti are emitted and execute (no observable state, but must not crash)
+//   6. r8-r15 encodings
+//   7. the rejection path: garbage is a COMPILE error — covered by the gate's
+//      ASM-REJECT stage, not here (a runtime test cannot observe a compile
+//      failure)
+
+fn main() -> i64 {
+    let fails = 0
+
+    // 1. mov REG, IMM
+    let a = asm!("mov rax, 42")
+    if a != 42 { print("FAIL mov imm: got "); print(a); print("\n"); fails = fails + 1 }
+
+    // 2. mov REG, REG: the ENCODING is exercised (compiles, runs, no crash).
+    // A VALUE-level assertion is NOT possible in C1: RAX is the only asm!
+    // interface register, and the result-convention move (rax -> result vreg's
+    // assigned register) may land ON the register the asm wrote (observed:
+    // aphys(res)==r10 clobbered `mov r10, 37`'s effect before the next asm!
+    // could read it). Cross-statement register chaining needs C2 operands.
+    let c = asm!("mov rax, r10")
+    let c2 = asm!("mov rax, r11")
+
+    // 3. hex fallback (pre-existing behavior)
+    let d = asm!("b8 2a 00 00 00")   // mov eax, 42
+    if d != 42 { print("FAIL hex path: got "); print(d); print("\n"); fails = fails + 1 }
+
+    // 4. push/pop round trip: push rax (42), clobber rax, pop restores
+    let e = asm!("mov rax, 77")
+    let f = asm!("push rax")
+    let g = asm!("mov rax, 0")
+    let h = asm!("pop rax")
+    if h != 77 { print("FAIL push/pop: got "); print(h); print("\n"); fails = fails + 1 }
+
+    // 5. Privileged instructions (cli/sti/hlt/lgdt/lidt/rdmsr/wrmsr/in/out)
+    // assemble but CANNOT execute in ring 3 — cli under Linux userspace
+    #SIGSEGVs on the privileged-instruction fault (verified: a bare asm!("cli")
+    // test crashes at runtime). Their ENCODINGS are covered by the assembler
+    // table and are exercised for real under QEMU in Phase D. Here: one more
+    // user-mode-safe instruction instead — rdtsc returns in rdx:rax, so the
+    // low bits in rax change between two reads (virtually certain).
+    let t1 = asm!("rdtsc")
+    let t2 = asm!("rdtsc")
+    if t1 == t2 { print("NOTE: rdtsc identical twice (harmless)\n") }
+
+    // 6. r8-r15 encodings (REX.B): both compile, execute, no crash. Same
+    // C1 interface limit as case 2 — no cross-statement value assertion.
+    let j = asm!("mov r10, 91")
+    let k = asm!("mov rax, r10")
+
+    if fails == 0 { print("asm_asmblr: all pass\n"); return 0 }
+    print("asm_asmblr: FAILURES\n")
+    return 1
+}

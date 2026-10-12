@@ -93,7 +93,7 @@ Four independent workstreams, ordered by dependency and risk.
 | **A2** | `asm!` rejects non-hex input | Low | ✅ **DONE** — commit `452e5285` |
 | **B** | `naked fn` + `section` + `no_mangle` | Low | ✅ **DONE** — 0.0.229 |
 | **B2** | `packed` structs / explicit field offsets | Medium | ✅ **DONE** — 0.0.230 |
-| **C1** | Minimal x86 assembler | High | ⬜ open |
+| **C1** | Minimal x86 assembler | High | ✅ **DONE** — 0.0.231 |
 | **C2** | Operands + constraints | **High** | ⬜ open |
 | **D** | Ring-0 entry (IDT/GDT) | Medium | ⬜ open |
 
@@ -468,6 +468,37 @@ Assert that `asm!("not an instruction")` now fails to compile with a clear messa
 
 ---
 
+### 6.0.1 Phase C1 — Completion notes ✅ (0.0.231)
+
+**Status: COMPLETE.** `asm!("mov rax, 42")` returns 42; `asm!("garbage")` is a
+compile error ("unrecognized asm template"); the hex-byte path still works.
+Gate 816/816, STDLIB 108/108, new gate Stage 15 "ASM ASSEMBLER" (positive run +
+garbage-rejection with the plan's message) — promotion-blocking. Self-host 7/7.
+
+What landed:
+- `src/x86/asm_x86.quanta` — mnemonic table + template scanner. Register names
+  accepted in all widths (rax/eax/ax/al, r8/r8d/r8w/r8b) mapping to Quanta's
+  internal numbering (rax=0..r15=15, identical to x86 encoding).
+- Instruction classes implemented: mov reg,reg/imm; mov crN/reg (REX.W +
+  0F 22/20); mov seg/reg (8E/8C); lgdt/lidt/invlpg [reg] (0F 01 /2,/3,/7 via
+  r11 staging); rdmsr/wrmsr/rdtsc; iretq; cli/sti/hlt; cpuid; in/out (al/eax x
+  imm/dx); push/pop reg. The hex-byte escape hatch stays supported.
+- C1-T2 rejection: non-hex + non-mnemonic = `error: unrecognized asm template`
+  (the old "invalid hex char" message fired first — replaced per the plan).
+
+Two semantics discovered by the runtime test (both recorded, both binding):
+- **RAX is the only asm! interface register.** The result-convention move
+  (rax -> result vreg's assigned register) may land ON a register the asm wrote
+  (observed: aphys(res)==r10 clobbered `mov r10, 37` between statements).
+  Cross-statement register chaining is NOT guaranteed — that is precisely what
+  C2's operand machinery adds.
+- **Privileged instructions cannot be runtime-tested in ring 3:** a bare
+  `asm!("cli")` SIGSEGVs on the privileged-instruction fault (verified). Their
+  encodings are covered by the table; real execution is Phase D under QEMU.
+  User-mode-safe instructions (mov/push/pop/rdtsc) carry the runtime tests.
+
+---
+
 ### 6.1 Phase C2 — Operands and constraints (0.0.232)
 
 Target syntax (Rust-like, adapted to Quanta):
@@ -668,7 +699,7 @@ Both were correctness bugs with silent failure modes. They became Phases A and A
 | — Loader 6.1–7.2 — | (see loader-phase67.md) | 0.0.226–0.0.228 | 6.1 ✅ · 6.2 ✅ · 7.1 ✅ · 7.2 ✅ |
 | B | `naked fn` + `section` + `no_mangle` | 0.0.229 | D | Small — additive syntax, 3 keywords |
 | B2 | `packed` structs / explicit field offsets | 0.0.230 | D | Medium — layout change, touches struct codegen |
-| C1 | Minimal x86 assembler | 0.0.231 | C2, D | **Large** — new module `asm_x86.quanta` |
+| C1 | Minimal x86 assembler | 0.0.231 | C2, D | ✅ done — new module `asm_x86.quanta` |
 | C2 | Operands + constraints | 0.0.232 | D | **Large** — touches register allocator |
 | D | Ring-0 entry (IDT/GDT) | 0.0.233 | — | Medium — consumes B, B2, C |
 

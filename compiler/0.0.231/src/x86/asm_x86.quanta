@@ -1,0 +1,402 @@
+// asm_x86.quanta — 0.0.231 Phase C1: minimal x86-64 assembler for asm!.
+//
+// SCOPE (kernel-capability.md Phase C1): the instruction classes the kernel
+// phases need, keyed by MNEMONIC with operand-form dispatch. Anything outside
+// this table falls through to the existing HEX-BYTE path (which stays
+// supported); a template that is neither a known mnemonic nor valid hex is a
+// COMPILE ERROR (fail closed — Gap 5).
+//
+// Register encoding: Quanta's internal numbering (rax=0, rcx=1, rdx=2, rbx=3,
+// rsp=4, rbp=5, rsi=6, rdi=7, r8..r15=8..15) matches x86 encoding exactly.
+//
+// The API: asm_emit(template_src_off) parses the template text in `src`
+// starting at the given offset (after the opening quote) and emits bytes via
+// the emitter primitives. Returns 1 if a known mnemonic consumed the template,
+// 0 if the text is NOT a mnemonic (caller falls back to hex parsing).
+//
+// Supported forms (operand separator: one or more spaces or a comma):
+//   mov REG, REG          mov rax, rdi
+//   mov REG, IMM          mov rax, 42            (imm32 sign-extended)
+//   mov REG, crN          mov cr3, rax           (0F 22 /r)
+//   mov crN, REG          mov rax, cr3           (0F 20 /r)
+//   mov SEG, REG          mov ds, ax             (8E /r)
+//   mov REG, SEG          mov ax, ds             (8C /r)
+//   lgdt [REG]            0F 01 /2               (m: 0F 01 50 d8 style via r11)
+//   lidt [REG]            0F 01 /3
+//   rdmsr / wrmsr         0F 32 / 0F 30
+//   invlpg [REG]          0F 01 /7
+//   iretq                 48 CF
+//   cli / sti / hlt       FA / FB / F4
+//   cpuid                 0F A2
+//   in al, IMM            E4 ib     |  in eax, IMM   E5 ib
+//   in al, dx             EC        |  in eax, dx    ED
+//   out IMM, al           E6 ib     |  out IMM, eax  E7 ib
+//   out dx, al            EE        |  out dx, eax   EF
+//   push REG / pop REG    50+r / 58+r
+//   rdtsc                 0F 31
+//
+// Memory operands in this phase: only the [REG] form (no displacement), which
+// is what lgdt/lidt/invlpg need. General displacement forms still use the hex
+// path.
+
+// Register name -> Quanta/x86 register number. Returns -1 if not a register.
+// Accepts 64-bit names (rax..r15), 32-bit (eax..r15d), 16-bit (ax..di, r8w..),
+// and 8-bit (al..dil, r8b..). All map to the same encoding number.
+fn asm_regno(p, l) -> i64 {
+    // 64-bit names of length 3: rax rbx rcx rdx rsi rdi rbp rsp
+    if l==3 {
+      if r8(src+p)=='r' {
+        if r8(src+p+1)=='a' && r8(src+p+2)=='x' { return 0 }
+        if r8(src+p+1)=='c' && r8(src+p+2)=='x' { return 1 }
+        if r8(src+p+1)=='d' && r8(src+p+2)=='x' { return 2 }
+        if r8(src+p+1)=='b' && r8(src+p+2)=='x' { return 3 }
+        if r8(src+p+1)=='s' && r8(src+p+2)=='p' { return 4 }
+        if r8(src+p+1)=='b' && r8(src+p+2)=='p' { return 5 }
+        if r8(src+p+1)=='s' && r8(src+p+2)=='i' { return 6 }
+        if r8(src+p+1)=='d' && r8(src+p+2)=='i' { return 7 }
+      }
+    }
+    // 32-bit e-names (eax etc.) and 16-bit (ax bx cx dx si di bp sp)
+    if l==3 {
+      if r8(src+p)=='e' {
+        if r8(src+p+1)=='a' && r8(src+p+2)=='x' { return 0 }
+        if r8(src+p+1)=='c' && r8(src+p+2)=='x' { return 1 }
+        if r8(src+p+1)=='d' && r8(src+p+2)=='x' { return 2 }
+        if r8(src+p+1)=='b' && r8(src+p+2)=='x' { return 3 }
+        if r8(src+p+1)=='s' && r8(src+p+2)=='p' { return 4 }
+        if r8(src+p+1)=='b' && r8(src+p+2)=='p' { return 5 }
+        if r8(src+p+1)=='s' && r8(src+p+2)=='i' { return 6 }
+        if r8(src+p+1)=='d' && r8(src+p+2)=='i' { return 7 }
+      }
+      if r8(src+p+1)=='x' {
+        if r8(src+p)=='a' { return 0 }
+        if r8(src+p)=='c' { return 1 }
+        if r8(src+p)=='d' { return 2 }
+        if r8(src+p)=='b' { return 3 }
+      }
+      if r8(src+p+1)=='p' && r8(src+p)!='r' {
+        if r8(src+p)=='s' { return 6 }
+        if r8(src+p)=='b' { return 7 }
+      }
+      // sp/bp handled above; si/di:
+      if r8(src+p+1)=='i' {
+        if r8(src+p)=='s' { return 6 }
+        if r8(src+p)=='d' { return 7 }
+      }
+    }
+    if l==2 {
+      // 8-bit legacy: al cl dl bl ah ch dh bh — map to the same regs
+      if r8(src+p+1)=='l' {
+        if r8(src+p)=='a' { return 0 }
+        if r8(src+p)=='c' { return 1 }
+        if r8(src+p)=='d' { return 2 }
+        if r8(src+p)=='b' { return 3 }
+      }
+      // Segment regs are NOT registers here; handled by the segment forms.
+    }
+    // r8..r15 (and r8d/r8w/r8b share the number): rN with N in 8..15
+    if l>=2 && l<=4 && r8(src+p)=='r' {
+      let d=0; let k=p+1; let got=0
+      while k < p+l {
+        let c = r8(src+k)
+        if c>=48 && c<=57 { d = d*10 + (c-48); got=1 } else { break }
+        k = k+1
+      }
+      if got==1 && d>=8 && d<=15 {
+        // the rest of the token (if any) must be a suffix letter d/w/b or end
+        if k==p+l { return d }
+        if k==p+l-1 {
+          let sfx = r8(src+k)
+          if sfx=='d' || sfx=='w' || sfx=='b' { return d }
+        }
+      }
+    }
+    return 0-1
+}
+
+// Control register number: cr0..cr15 -> 0..15. Returns -1 if not a cr.
+fn asm_crno(p, l) -> i64 {
+    if l==3 && r8(src+p)=='c' && r8(src+p+1)=='r' {
+      let c = r8(src+p+2)
+      if c>=48 && c<=57 { return c-48 }
+    }
+    return 0-1
+}
+
+// Segment register number for mov seg/reg forms: es=0 cs=1 ss=2 ds=3 fs=4 gs=5.
+fn asm_segno(p, l) -> i64 {
+    if l==2 {
+      if r8(src+p)=='e' && r8(src+p+1)=='s' { return 0 }
+      if r8(src+p)=='c' && r8(src+p+1)=='s' { return 1 }
+      if r8(src+p)=='s' && r8(src+p+1)=='s' { return 2 }
+      if r8(src+p)=='d' && r8(src+p+1)=='s' { return 3 }
+      if r8(src+p)=='f' && r8(src+p+1)=='s' { return 4 }
+      if r8(src+p)=='g' && r8(src+p+1)=='s' { return 5 }
+    }
+    return 0-1
+}
+
+// ---- template scanner -------------------------------------------------------
+// The template lives in `src` starting at tpos (after the opening quote) up to
+// the closing quote. Scan into: mnemonic (op word), then operands.
+let asm_tpl = 0       // template start (just after the opening quote)
+let asm_tp = 0        // scan position
+let asm_end = 0       // template end (closing quote offset)
+let asm_o1 = 0        // operand 1 start
+let asm_o1l = 0
+let asm_o2 = 0
+let asm_o2l = 0
+let asm_ok = 0        // parse succeeded
+
+fn asm_skip_ws() {
+    while asm_tp < asm_end {
+        let c = r8(src+asm_tp)
+        if c==32 || c==9 { asm_tp = asm_tp + 1 } else { break }
+    }
+}
+
+fn asm_read_tok() -> i64 {
+    asm_skip_ws()
+    let st = asm_tp
+    while asm_tp < asm_end {
+        let c = r8(src+asm_tp)
+        if c==32 || c==9 || c==44 { break }
+        asm_tp = asm_tp + 1
+    }
+    return asm_tp - st
+}
+
+fn asm_expect_comma() -> i64 {
+    asm_skip_ws()
+    if asm_tp < asm_end && r8(src+asm_tp)==44 { asm_tp = asm_tp + 1; return 1 }
+    return 0
+}
+
+fn asm_at_lbrack() -> i64 {
+    asm_skip_ws()
+    if asm_tp < asm_end && r8(src+asm_tp)==91 { asm_tp = asm_tp + 1; return 1 }
+    return 0
+}
+
+fn asm_expect_rbrack() -> i64 {
+    asm_skip_ws()
+    if asm_tp < asm_end && r8(src+asm_tp)==93 { asm_tp = asm_tp + 1; return 1 }
+    return 0
+}
+
+fn asm_decimal() -> i64 {
+    asm_skip_ws()
+    let v = 0; let got = 0
+    while asm_tp < asm_end {
+        let c = r8(src+asm_tp)
+        if c>=48 && c<=57 { v = v*10 + (c-48); got = 1; asm_tp = asm_tp + 1 } else { break }
+    }
+    if got==0 { return 0-1 }
+    return v
+}
+
+fn asm_fail() {
+    let mn = "error: unrecognized asm template: "
+    file_write(2, mn+8, len(mn))
+    // print the template text
+    let k = asm_tpl
+    while k < asm_end { file_write(2, src+k, 1); k = k+1 }
+    let dnl = "\n"
+    file_write(2, dnl+8, 1)
+    exit(1)
+}
+
+// ---- instruction dispatch ---------------------------------------------------
+// Parse the template header: mnemonic word. On success emits the encoding and
+// returns 1. Returns 0 when the first word is not a known mnemonic (caller
+// falls back to the hex path). Calls asm_fail() (exit 1) when a KNOWN mnemonic
+// has malformed operands — fail closed.
+fn asm_try_emit() -> i64 {
+    asm_tp = asm_tpl
+    let ml = asm_read_tok()
+    if ml == 0 { return 0 }
+    let m0 = asm_tp - ml
+
+    // ---- mov ----
+    if ml==3 && r8(src+m0)=='m' && r8(src+m0+1)=='o' && r8(src+m0+2)=='v' {
+        let o1l = asm_read_tok()
+        if o1l == 0 { asm_fail(); return 1 }
+        let o1 = asm_tp - o1l
+        if asm_expect_comma() == 0 { asm_fail(); return 1 }
+        // mem operand form: mov crN, ... handled below via cr check first
+        let cr1 = asm_crno(o1, o1l)
+        let sg1 = asm_segno(o1, o1l)
+        let r1 = asm_regno(o1, o1l)
+        if cr1 >= 0 {
+            // mov crN, REG  (0F 22 /r, REX.W). crN is the DEST: reg field = crN,
+            // rm field = source register. REX.W (48) precedes 0F; REX.B for r8+.
+            let o2l = asm_read_tok()
+            if o2l == 0 { asm_fail(); return 1 }
+            let o2 = asm_tp - o2l
+            let r2 = asm_regno(o2, o2l)
+            if r2 < 0 { asm_fail(); return 1 }
+            if r2 >= 8 { eb(73) } else { eb(72) }
+            eb(15); eb(34); mr(3, cr1, r2 % 8)
+            return 1
+        }
+        if sg1 >= 0 {
+            // mov SEG, REG16 (8E /r) — segment is the dest
+            let o2l = asm_read_tok()
+            if o2l == 0 { asm_fail(); return 1 }
+            let o2 = asm_tp - o2l
+            let r2 = asm_regno(o2, o2l)
+            if r2 < 0 || r2 > 7 { asm_fail(); return 1 }
+            eb(142); mr(3, sg1, r2)
+            return 1
+        }
+        if r1 < 0 { asm_fail(); return 1 }
+        // mov REG, ...
+        let o2l = asm_read_tok()
+        if o2l == 0 { asm_fail(); return 1 }
+        let o2 = asm_tp - o2l
+        let cr2 = asm_crno(o2, o2l)
+        let sg2 = asm_segno(o2, o2l)
+        let r2 = asm_regno(o2, o2l)
+        if cr2 >= 0 {
+            // mov REG, crN (0F 20 /r, REX.W). reg field = crN (src), rm = dst.
+            if r1 >= 8 { eb(73) } else { eb(72) }
+            eb(15); eb(32); mr(3, cr2, r1 % 8)
+            return 1
+        }
+        if sg2 >= 0 {
+            // mov REG16, SEG (8C /r)
+            if r1 > 7 { asm_fail(); return 1 }
+            eb(140); mr(3, sg2, r1)
+            return 1
+        }
+        if r2 >= 0 {
+            // mov REG, REG
+            rr(r1, r2)
+            return 1
+        }
+        // mov REG, IMM
+        asm_tp = o2
+        let iv = asm_decimal()
+        if iv < 0 { asm_fail(); return 1 }
+        ri(r1, iv)
+        return 1
+    }
+    // ---- lgdt/lidt/invlpg [REG] ----
+    if ml==4 && r8(src+m0)=='l' && r8(src+m0+1)=='g' && r8(src+m0+2)=='d' && r8(src+m0+3)=='t' {
+        if asm_at_lbrack()==0 { asm_fail(); return 1 }
+        let o1l = asm_read_tok()
+        let o1 = asm_tp - o1l
+        let r1 = asm_regno(o1, o1l)
+        if r1 < 0 { asm_fail(); return 1 }
+        if asm_expect_rbrack()==0 { asm_fail(); return 1 }
+        // lgdt [r] = 0F 01 /2 with mem operand: use r11 staging
+        rr(11, r1)
+        eb(15); eb(1); mr(2, 2, 3)   // 0F 01 /2 with rm=r11(3)
+        return 1
+    }
+    if ml==4 && r8(src+m0)=='l' && r8(src+m0+1)=='i' && r8(src+m0+2)=='d' && r8(src+m0+3)=='t' {
+        if asm_at_lbrack()==0 { asm_fail(); return 1 }
+        let o1l = asm_read_tok()
+        let o1 = asm_tp - o1l
+        let r1 = asm_regno(o1, o1l)
+        if r1 < 0 { asm_fail(); return 1 }
+        if asm_expect_rbrack()==0 { asm_fail(); return 1 }
+        rr(11, r1)
+        eb(15); eb(1); mr(2, 3, 3)   // 0F 01 /3, rm=r11
+        return 1
+    }
+    if ml==6 && r8(src+m0)=='i' && r8(src+m0+1)=='n' && r8(src+m0+2)=='v' && r8(src+m0+3)=='l' && r8(src+m0+4)=='p' && r8(src+m0+5)=='g' {
+        if asm_at_lbrack()==0 { asm_fail(); return 1 }
+        let o1l = asm_read_tok()
+        let o1 = asm_tp - o1l
+        let r1 = asm_regno(o1, o1l)
+        if r1 < 0 { asm_fail(); return 1 }
+        if asm_expect_rbrack()==0 { asm_fail(); return 1 }
+        rr(11, r1)
+        eb(15); eb(1); mr(2, 7, 3)   // 0F 01 /7, rm=r11
+        return 1
+    }
+    // ---- no-operand instructions ----
+    if ml==5 && r8(src+m0)=='r' && r8(src+m0+1)=='d' && r8(src+m0+2)=='m' && r8(src+m0+3)=='s' && r8(src+m0+4)=='r' { eb(15); eb(50); return 1 }
+    if ml==5 && r8(src+m0)=='w' && r8(src+m0+1)=='r' && r8(src+m0+2)=='m' && r8(src+m0+3)=='s' && r8(src+m0+4)=='r' { eb(15); eb(48); return 1 }
+    if ml==5 && r8(src+m0)=='i' && r8(src+m0+1)=='r' && r8(src+m0+2)=='e' && r8(src+m0+3)=='t' && r8(src+m0+4)=='q' { eb(72); eb(207); return 1 }
+    if ml==3 && r8(src+m0)=='c' && r8(src+m0+1)=='l' && r8(src+m0+2)=='i' { eb(250); return 1 }
+    if ml==3 && r8(src+m0)=='s' && r8(src+m0+1)=='t' && r8(src+m0+2)=='i' { eb(251); return 1 }
+    if ml==3 && r8(src+m0)=='h' && r8(src+m0+1)=='l' && r8(src+m0+2)=='t' { eb(244); return 1 }
+    if ml==5 && r8(src+m0)=='c' && r8(src+m0+1)=='p' && r8(src+m0+2)=='u' && r8(src+m0+3)=='i' && r8(src+m0+4)=='d' { eb(15); eb(162); return 1 }
+    if ml==5 && r8(src+m0)=='r' && r8(src+m0+1)=='d' && r8(src+m0+2)=='t' && r8(src+m0+3)=='s' && r8(src+m0+4)=='c' { eb(15); eb(49); return 1 }
+    // ---- push/pop REG ----
+    if ml==4 && r8(src+m0)=='p' && r8(src+m0+1)=='u' && r8(src+m0+2)=='s' && r8(src+m0+3)=='h' {
+        let o1l = asm_read_tok()
+        if o1l == 0 { asm_fail(); return 1 }
+        let o1 = asm_tp - o1l
+        let r1 = asm_regno(o1, o1l)
+        if r1 < 0 { asm_fail(); return 1 }
+        if r1 < 8 { eb(80 + r1) } else { eb(65); eb(128 + (r1-8)) }
+        return 1
+    }
+    if ml==3 && r8(src+m0)=='p' && r8(src+m0+1)=='o' && r8(src+m0+2)=='p' {
+        let o1l = asm_read_tok()
+        if o1l == 0 { asm_fail(); return 1 }
+        let o1 = asm_tp - o1l
+        let r1 = asm_regno(o1, o1l)
+        if r1 < 0 { asm_fail(); return 1 }
+        if r1 < 8 { eb(88 + r1) } else { eb(65); eb(136 + (r1-8)) }
+        return 1
+    }
+    // ---- in / out (al/eax forms) ----
+    if ml==2 && r8(src+m0)=='i' && r8(src+m0+1)=='n' {
+        let o1l = asm_read_tok()
+        if o1l == 0 { asm_fail(); return 1 }
+        let o1 = asm_tp - o1l
+        if asm_expect_comma()==0 { asm_fail(); return 1 }
+        let o2l = asm_read_tok()
+        if o2l == 0 { asm_fail(); return 1 }
+        let o2 = asm_tp - o2l
+        // in al, imm | in al, dx | in eax, imm | in eax, dx
+        let is_al = (o1l==2 && r8(src+o1)=='a' && r8(src+o1+1)=='l')
+        let is_eax = (asm_regno(o1,o1l)==0)
+        if is_al {
+            if o2l==2 && r8(src+o2)=='d' && r8(src+o2+1)=='x' { eb(236); return 1 }
+            asm_tp = o2
+            let pv = asm_decimal()
+            if pv < 0 || pv > 255 { asm_fail(); return 1 }
+            eb(228); eb(pv); return 1
+        }
+        if is_eax {
+            if o2l==2 && r8(src+o2)=='d' && r8(src+o2+1)=='x' { eb(237); return 1 }
+            asm_tp = o2
+            let pv = asm_decimal()
+            if pv < 0 || pv > 255 { asm_fail(); return 1 }
+            eb(229); eb(pv); return 1
+        }
+        asm_fail(); return 1
+    }
+    if ml==3 && r8(src+m0)=='o' && r8(src+m0+1)=='u' && r8(src+m0+2)=='t' {
+        let o1l = asm_read_tok()
+        if o1l == 0 { asm_fail(); return 1 }
+        let o1 = asm_tp - o1l
+        if asm_expect_comma()==0 { asm_fail(); return 1 }
+        let o2l = asm_read_tok()
+        if o2l == 0 { asm_fail(); return 1 }
+        let o2 = asm_tp - o2l
+        let is_al = (o2l==2 && r8(src+o2)=='a' && r8(src+o2+1)=='l')
+        let is_eax = (asm_regno(o2,o2l)==0)
+        if is_al {
+            if o1l==2 && r8(src+o1)=='d' && r8(src+o1+1)=='x' { eb(238); return 1 }
+            asm_tp = o1
+            let pv = asm_decimal()
+            if pv < 0 || pv > 255 { asm_fail(); return 1 }
+            eb(230); eb(pv); return 1
+        }
+        if is_eax {
+            if o1l==2 && r8(src+o1)=='d' && r8(src+o1+1)=='x' { eb(239); return 1 }
+            asm_tp = o1
+            let pv = asm_decimal()
+            if pv < 0 || pv > 255 { asm_fail(); return 1 }
+            eb(231); eb(pv); return 1
+        }
+        asm_fail(); return 1
+    }
+    return 0
+}

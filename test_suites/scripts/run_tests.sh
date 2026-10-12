@@ -662,6 +662,36 @@ else
   NAKED_RC=1
 fi
 
+# --- Stage 15: ASM assembler (0.0.231 Phase C1) -----------------------------
+echo ""
+echo "########## ASM ASSEMBLER ##########"
+ASM_RC=0
+if $QC --no-overflow-trap "$TEST_SUITES/codes/asm_asmblr_test.quanta" "$TEST_SUITES/run/asm_gate" 2>/tmp/asm_gate_c.txt; then
+  ASM_OUT="$(./scripts/quanta_run.sh "$TEST_SUITES/run/asm_gate" < /dev/null 2>&1)"
+  if printf '%s' "$ASM_OUT" | grep -q "^asm_asmblr: all pass$"; then
+    echo "  PASS: mnemonic asm executes (mov imm/reg/reg-reg, hex fallback, push/pop, rdtsc)"
+  else
+    echo "  FAIL: asm_asmblr runtime: $ASM_OUT"
+    ASM_RC=1
+  fi
+  # T2/T4: garbage template must FAIL to compile with the plan's message.
+  printf 'fn main() -> i64 {\n  let v = asm!("garbage nonsense")\n  return 0\n}\n' > /tmp/asm_reject.quanta
+  if $QC --no-overflow-trap /tmp/asm_reject.quanta /tmp/asm_reject 2>/tmp/asm_reject_err.txt; then
+    echo "  FAIL: garbage asm! template compiled (must be a compile error)"
+    ASM_RC=1
+  else
+    if grep -q "unrecognized asm template" /tmp/asm_reject_err.txt; then
+      echo "  PASS: garbage asm! template rejected (unrecognized asm template)"
+    else
+      echo "  FAIL: rejection message wrong: $(cat /tmp/asm_reject_err.txt | head -1)"
+      ASM_RC=1
+    fi
+  fi
+else
+  echo "  FAIL: asm_asmblr_test failed to compile: $(cat /tmp/asm_gate_c.txt | head -1)"
+  ASM_RC=1
+fi
+
 echo "=== GATE SUMMARY ==="
 echo "  functional     : $([ $FUNCTIONAL_RC = 0 ] && echo GREEN || echo RED)"
 echo "  native        : $([ $NATIVE_RC = 0 ] && echo GREEN || echo RED)  (no extern, no libc -- the default path)"
@@ -684,6 +714,7 @@ echo "  verify-status : $([ $VERIFY_STATUS_RC = 0 ] && echo GREEN || echo RED)  
 echo "  qobj          : $([ $QOBJ_RC = 0 ] && echo GREEN || echo RED)  (module cache write/read/cache-only, G1+G3+G5+G4, plus G6 cache self-compile)"
 echo "  output-path   : $([ $OUTGUARD_RC = 0 ] && echo GREEN || echo RED)  (qc must refuse to overwrite its own input)"
 echo "  naked         : $([ $NAKED_RC = 0 ] && echo GREEN || echo RED)  (naked fn + section + no_mangle, 0.0.229 Phase B)"
+echo "  asm-assembler : $([ $ASM_RC = 0 ] && echo GREEN || echo RED)  (mnemonic asm! + rejection, 0.0.231 Phase C1)"
 # Block promotion on a real functional/security/perf/valgrind/fuzz/diff/stdlib/mtu/qobj/verify-status
 # regression. Security KNOWN issues are surfaced by the script but do not turn
 # the gate red.
@@ -698,7 +729,7 @@ echo "  naked         : $([ $NAKED_RC = 0 ] && echo GREEN || echo RED)  (naked f
 if [ $FUNCTIONAL_RC -ne 0 ] || [ $NATIVE_RC -ne 0 ] || [ $SECURITY_RC -ne 0 ] || [ $PERF_RC -ne 0 ] \
    || [ $VALGRIND_RC -ne 0 ] || [ $FUZZ_RC -ne 0 ] || [ $DIFF_RC -ne 0 ] \
    || [ $GENERICS_RC -ne 0 ] || [ $STDLIB_RC -ne 0 ] || [ $MTU_RC -ne 0 ] \
-   || [ $QOBJ_RC -ne 0 ] || [ $VERIFY_STATUS_RC -ne 0 ] || [ $OUTGUARD_RC -ne 0 ] || [ $NAKED_RC -ne 0 ]; then
+   || [ $QOBJ_RC -ne 0 ] || [ $VERIFY_STATUS_RC -ne 0 ] || [ $OUTGUARD_RC -ne 0 ] || [ $NAKED_RC -ne 0 ] || [ $ASM_RC -ne 0 ]; then
   exit 1
 fi
 exit 0
