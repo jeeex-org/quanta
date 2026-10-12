@@ -1,0 +1,116 @@
+// Chained assignment: a = b = c = expr
+//
+// 0.0.220. This crashed the COMPILER with SIGILL on every release from 0.0.217
+// through 0.0.220. `import std/rag` had therefore never compiled, because
+// lib/std/rag.quanta builds its sqlite command with `cmd = cmd = cmd + "..."`.
+//
+// Cause: parse_expr did not stop at the inner `=`, and parse_primary's fallback
+// emitted `CONST 0` WITHOUT advancing the token cursor, so the statement loop
+// re-entered on the same token and the desync cascaded into a corrupt
+// instruction stream.
+//
+// Semantics are C's: every name in the chain receives the value.
+//
+// Integer only. String `+` is a SEPARATE pre-existing bug -- `"a" + "b"` does
+// not equal "ab" on any release including 0.0.220 -- so string chains are not
+// asserted here. See the note in WIP.md.
+
+fn f1() -> i64 {
+    let a = 0
+    let b = 0
+    a = b = 5
+    if a != 5 { return 1 }
+    if b != 5 { return 2 }
+    return 0
+}
+
+fn f2() -> i64 {
+    let a = 0
+    let b = 0
+    let c = 0
+    a = b = c = 7
+    if a != 7 { return 11 }
+    if b != 7 { return 12 }
+    if c != 7 { return 13 }
+    return 0
+}
+
+fn f3() -> i64 {
+    // the outermost name still updates, and the chain is reusable
+    let a = 0
+    let b = 0
+    a = b = 2
+    a = b = 3
+    if a != 3 { return 21 }
+    if b != 3 { return 22 }
+    return 0
+}
+
+fn f4() -> i64 {
+    // a chain value is an ordinary expression
+    let a = 0
+    let b = 0
+    a = b = 6 * 7
+    if a != 42 { return 31 }
+    if b != 42 { return 32 }
+    return 0
+}
+
+fn f5() -> i64 {
+    // left-to-right evaluation of the value: the value is computed from the
+    // ORIGINAL x, then stored into both
+    let x = 0
+    x = x = x + 1
+    if x != 1 { return 41 }
+    return 0
+}
+
+fn f6() -> i64 {
+    // a chain inside another function, and used after
+    let y = 0
+    y = y = 4
+    let z = y * 10
+    if z != 40 { return 51 }
+    return 0
+}
+
+fn f7() -> i64 {
+    // four links
+    let a = 0
+    let b = 0
+    let c = 0
+    let d = 0
+    a = b = c = d = 3
+    if a * 1000 + b * 100 + c * 10 + d != 3333 { return 61 }
+    return 0
+}
+
+fn f8() -> i64 {
+    // PLAIN assignment must be untouched: no chain, one '='
+    let x = 0
+    x = x + 5
+    if x != 5 { return 71 }
+    x = 9
+    if x != 9 { return 72 }
+    return 0
+}
+
+fn main() -> i64 {
+    let r = f1()
+    if r != 0 { return r }
+    r = f2()
+    if r != 0 { return r }
+    r = f3()
+    if r != 0 { return r }
+    r = f4()
+    if r != 0 { return r }
+    r = f5()
+    if r != 0 { return r }
+    r = f6()
+    if r != 0 { return r }
+    r = f7()
+    if r != 0 { return r }
+    r = f8()
+    if r != 0 { return r }
+    return 42
+}

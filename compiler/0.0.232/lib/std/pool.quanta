@@ -1,0 +1,29 @@
+// Memory pool: pre-allocate all buffers once, reuse across layers
+// Eliminates per-layer malloc overhead
+
+let pool_ptr = 0
+let pool_size = 0
+let pool_used = 0
+
+fn pool_init(size) {
+    pool_ptr = mmap(size)
+    pool_size = size
+    pool_used = 0
+}
+
+fn pool_alloc(size) {
+    let ptr = pool_ptr + pool_used
+    pool_used = pool_used + size
+    if pool_used > pool_size { return 0 }
+    return ptr
+}
+
+fn pool_reset() {
+    pool_used = 0
+}
+
+fn pool_free() {
+    pool_ptr = 0
+    pool_size = 0
+    pool_used = 0
+}

@@ -1,0 +1,75 @@
+// quantum_test.quanta — 0.0.116 gate: lib/std/quantum (Keccak/SHA3/SHAKE).
+// Verifies FULL digests against official NIST vectors (not just first bytes).
+// Quanta string literals carry an 8-byte header; raw bytes live at strptr+8.
+//
+// Vectors:
+//   SHA3-256("")    = a7ffc6f8bf1ed76651c14756a061d662f580ff4de43b49fa82d80a4b80f8434a
+//   SHA3-256("abc") = 3a985da74fe225b2045c172d6bd390bd855f086e3e9d525b46bfe24511431532
+//   SHA3-512("abc") = b751850b1a57168a5693cd924b6b096e08f621827444f70d884f5d0240d2712e
+//                     10e116e9192af3c91a7ec57647e3934057340b4cf408d5a56592f8274eec53f0
+//   SHAKE128("",16) = 7f9c2ba4e88f827d616045507605853e
+//   SHAKE256("",16) = 46b9dd2b0ba88d13233b3feb743eeb24
+//
+// Prints 0 on full success; distinct exit codes identify the first failure.
+import std/quantum
+
+fn hexval(c) {
+  if c >= 48 && c <= 57 { return c - 48 }
+  if c >= 97 && c <= 102 { return c - 87 }
+  if c >= 65 && c <= 70 { return c - 55 }
+  return 0
+}
+
+fn hex_to_bytes(dst, hexstr, n) {
+  let i = 0
+  while i < n {
+    let hi = hexval(mem_load8(hexstr + 8 + i * 2))
+    let lo = hexval(mem_load8(hexstr + 8 + i * 2 + 1))
+    mem_store8(dst + i, hi * 16 + lo)
+    i = i + 1
+  }
+}
+
+fn mem_eq(a, b, n) {
+  let i = 0
+  while i < n {
+    if mem_load8(a + i) != mem_load8(b + i) { return 0 }
+    i = i + 1
+  }
+  return 1
+}
+
+fn main() {
+  // --- SHA3-256("") ---
+  let e = sha3_256("", 0)
+  let ve = mem_alloc(32)
+  hex_to_bytes(ve, "a7ffc6f8bf1ed76651c14756a061d662f580ff4de43b49fa82d80a4b80f8434a", 32)
+  if mem_eq(e, ve, 32) == 0 { exit(1) }
+
+  // --- SHA3-256("abc") ---
+  let a = sha3_256("abc" + 8, 3)
+  let va = mem_alloc(32)
+  hex_to_bytes(va, "3a985da74fe225b2045c172d6bd390bd855f086e3e9d525b46bfe24511431532", 32)
+  if mem_eq(a, va, 32) == 0 { exit(2) }
+
+  // --- SHA3-512("abc") ---
+  let b = sha3_512("abc" + 8, 3)
+  let vb = mem_alloc(64)
+  hex_to_bytes(vb, "b751850b1a57168a5693cd924b6b096e08f621827444f70d884f5d0240d2712e10e116e9192af3c91a7ec57647e3934057340b4cf408d5a56592f8274eec53f0", 64)
+  if mem_eq(b, vb, 64) == 0 { exit(3) }
+
+  // --- SHAKE128("", 16) ---
+  let s1 = shake128("", 0, 16)
+  let vs1 = mem_alloc(16)
+  hex_to_bytes(vs1, "7f9c2ba4e88f827d616045507605853e", 16)
+  if mem_eq(s1, vs1, 16) == 0 { exit(4) }
+
+  // --- SHAKE256("", 16) ---
+  let s2 = shake256("", 0, 16)
+  let vs2 = mem_alloc(16)
+  hex_to_bytes(vs2, "46b9dd2b0ba88d13233b3feb743eeb24", 16)
+  if mem_eq(s2, vs2, 16) == 0 { exit(5) }
+
+  println(0)
+  exit(0)
+}

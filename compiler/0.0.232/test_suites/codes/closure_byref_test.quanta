@@ -1,0 +1,32 @@
+// 0.0.121: closures capture BY REFERENCE. The closure reads/writes through a
+// pointer to the enclosing frame's variable, so mutations are visible both ways.
+fn increment_counter() {
+    let count = 0
+    let inc = |x| { count = count + x; return count }
+    let a = inc(1)   // 1
+    let b = inc(1)   // 2
+    return a * 100 + b
+}
+
+fn capture_mutate_shared() {
+    let total = 10
+    let add = |x| { total = total + x; return total }
+    add(5)   // total 15
+    add(7)   // total 22
+    return total
+}
+
+fn closure_sees_live_mutation() {
+    let y = 10
+    let f = |x| { x + y }
+    y = 99
+    return f(1)   // by-ref: closure sees 99 -> 100
+}
+
+fn main() {
+    let r1 = increment_counter()
+    let r2 = capture_mutate_shared()
+    let r3 = closure_sees_live_mutation()
+    if r1 == 102 && r2 == 22 && r3 == 100 { return 0 }
+    return 1
+}

@@ -674,6 +674,19 @@ if $QC --no-overflow-trap "$TEST_SUITES/codes/asm_asmblr_test.quanta" "$TEST_SUI
     echo "  FAIL: asm_asmblr runtime: $ASM_OUT"
     ASM_RC=1
   fi
+  # C2 (0.0.232): operand test — r/=r/+r/i through the substitution machinery.
+  if $QC --no-overflow-trap "$TEST_SUITES/codes/asm_operand_test.quanta" "$TEST_SUITES/run/asm_op_gate" 2>/tmp/asm_op_c.txt; then
+    ASM_OP_OUT="$(./scripts/quanta_run.sh "$TEST_SUITES/run/asm_op_gate" < /dev/null 2>&1)"
+    if printf '%s' "$ASM_OP_OUT" | grep -q "^asm_operand: all pass$"; then
+      echo "  PASS: asm! operands (r, =r, +r, i) through %N substitution"
+    else
+      echo "  FAIL: asm_operand runtime: $ASM_OP_OUT"
+      ASM_RC=1
+    fi
+  else
+    echo "  FAIL: asm_operand_test failed to compile: $(cat /tmp/asm_op_c.txt | head -1)"
+    ASM_RC=1
+  fi
   # T2/T4: garbage template must FAIL to compile with the plan's message.
   printf 'fn main() -> i64 {\n  let v = asm!("garbage nonsense")\n  return 0\n}\n' > /tmp/asm_reject.quanta
   if $QC --no-overflow-trap /tmp/asm_reject.quanta /tmp/asm_reject 2>/tmp/asm_reject_err.txt; then

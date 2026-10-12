@@ -94,7 +94,7 @@ Four independent workstreams, ordered by dependency and risk.
 | **B** | `naked fn` + `section` + `no_mangle` | Low | ✅ **DONE** — 0.0.229 |
 | **B2** | `packed` structs / explicit field offsets | Medium | ✅ **DONE** — 0.0.230 |
 | **C1** | Minimal x86 assembler | High | ✅ **DONE** — 0.0.231 |
-| **C2** | Operands + constraints | **High** | ⬜ open |
+| **C2** | Operands + constraints | **High** | ✅ **DONE** — 0.0.232 |
 | **D** | Ring-0 entry (IDT/GDT) | Medium | ⬜ open |
 
 **Order rationale:** A and A2 were bug fixes with a small blast radius — done first to get a clean baseline. B and B2 are additive syntax with no interaction with the register allocator — do them second. C1/C2 are the hard ones and want a stable base. D is last because it consumes B, B2 and C.
@@ -523,6 +523,40 @@ Clobbers: `"memory"` (barrier — already emitted for volatile), `"cc"` (flags).
 
 **Explicitly out of scope for the first cut:** specific-register constraints (`"a"`, `"d"`), multi-alternative constraints (`"rm"`), and `%k`-style size modifiers. Add them only if a real target needs them (YAGNI).
 
+### 6.2 Completion notes ✅ (0.0.232)
+
+**Status: COMPLETE.** `asm!("mov rax, %0" : "r"(local))` returns the local's
+runtime value; `=r`/`+r` outputs read back through their bound registers; `"i"`
+immediates substitute at parse time; hex path and C1 behavior unchanged.
+Gate 817/817, STDLIB 108/108, Stage 15 extended (operands + rejection),
+self-host 7/7. Test: `asm_operand_test.quanta`.
+
+What landed:
+- Parser (method.quanta): `asm!("tpl" : "c"(e), ... : "c"(e) : "memory", "cc")` —
+  operand block keyed by the RESULT VREG (vreg_asmop; stable across opt unlike
+  IR record indices). Constraints r/=r/+r/m/i, clobbers memory/cc.
+- Substitution (asm_template.quanta): %N -> register NAME (r/=r/+r), [regname]
+  (m), decimal (i). Substituted text injected into src past srclen (the
+  established pattern), so the C1 assembler and hex paths run unchanged.
+- Codegen: flush_all FIRST, then aphys each operand (materializes inputs into
+  registers), "=r" outputs marked uninitialized (no stale spill-home load),
+  sdef binds each output. "memory" clobber = flush_all itself; "cc" needs no
+  code (flags dead across the text).
+
+Two bugs the verification caught (both recorded):
+1. **String token text is RAW SOURCE:** the constraint token's value is the
+   offset of the OPENING quote; the text runs to the closing quote in the raw
+   source. A NUL-scan read far past the token — every constraint rejected
+   until the scan was bounded by the quote.
+2. **"i" immediates must be captured at PARSE time:** the emit-time const scan
+   failed twice over (def_is_constval returned -1 despite the CONST existing —
+   it resolves the LAST def of the vreg and parse-adjacent records shadow it;
+   the B2 lesson generalized). The value is captured into the operand block at
+   parse time; opt cannot touch it.
+
+Out-of-scope items from the plan remain out: specific-register constraints,
+multi-alternatives, %k modifiers (YAGNI until a target needs them).
+
 ### 6.2 Tasks
 
 **Task C1: Parser**
@@ -700,7 +734,7 @@ Both were correctness bugs with silent failure modes. They became Phases A and A
 | B | `naked fn` + `section` + `no_mangle` | 0.0.229 | D | Small — additive syntax, 3 keywords |
 | B2 | `packed` structs / explicit field offsets | 0.0.230 | D | Medium — layout change, touches struct codegen |
 | C1 | Minimal x86 assembler | 0.0.231 | C2, D | ✅ done — new module `asm_x86.quanta` |
-| C2 | Operands + constraints | 0.0.232 | D | **Large** — touches register allocator |
+| C2 | Operands + constraints | 0.0.232 | D | ✅ done — operand blocks keyed by result vreg |
 | D | Ring-0 entry (IDT/GDT) | 0.0.233 | — | Medium — consumes B, B2, C |
 
 **The critical path is C1 → C2.** Everything else is either small (B, B2) or consumes what C produces (D). The assembler is the piece with no existing foundation in the compiler — `asm!` today is a hex-byte emitter with no mnemonic table.
