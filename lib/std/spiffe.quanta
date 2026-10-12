@@ -284,14 +284,14 @@ fn spiffe_verify_x509_svid(cert, bundle, now) {
     let bundle_td = r64(bundle + BUNDLE_OFF_TRUST_DOMAIN)
     let bundle_td_len = r64(bundle + BUNDLE_OFF_TRUST_DOMAIN_LEN)
     
-    let match = 1
+    let eq = 1
     if td_len != bundle_td_len {
-        match = 0
+        eq = 0
     } else {
         let i = 0
         while i < td_len {
             if mem_load8(td + i) != mem_load8(bundle_td + i) {
-                match = 0
+                eq = 0
                 break
             }
             i = i + 1
@@ -302,7 +302,7 @@ fn spiffe_verify_x509_svid(cert, bundle, now) {
     mem_free(path)
     mem_free(spiffe_id)
     
-    if match == 0 {
+    if eq == 0 {
         x509_free(parsed)
         return -1
     }
@@ -329,16 +329,16 @@ fn spiffe_parse_jwt_svid(jwt, jwt_len, spiffe_id_out, spiffe_id_len_out, expiry_
     
     let i = 0
     while i + marker_len < jwt_len {
-        let match = 1
+        let eq = 1
         let j = 0
         while j < marker_len {
             if mem_load8(jwt + i + j) != mem_load8(sub_marker + j) {
-                match = 0
+                eq = 0
                 break
             }
             j = j + 1
         }
-        if match == 1 {
+        if eq == 1 {
             // Found sub claim with SPIFFE ID
             let start = i + marker_len - 1 // include the first quote
             // Find closing quote
@@ -425,14 +425,14 @@ fn spiffe_verify_jwt_svid(jwt, jwt_len, bundle, now) {
     let bundle_td = r64(bundle + BUNDLE_OFF_TRUST_DOMAIN)
     let bundle_td_len = r64(bundle + BUNDLE_OFF_TRUST_DOMAIN_LEN)
     
-    let match = 1
+    let eq = 1
     if td_len != bundle_td_len {
-        match = 0
+        eq = 0
     } else {
         let i = 0
         while i < td_len {
             if mem_load8(td + i) != mem_load8(bundle_td + i) {
-                match = 0
+                eq = 0
                 break
             }
             i = i + 1
@@ -443,7 +443,7 @@ fn spiffe_verify_jwt_svid(jwt, jwt_len, bundle, now) {
     mem_free(path)
     if spiffe_id != 0 { mem_free(spiffe_id) }
     
-    if match == 0 { return -1 }
+    if eq == 0 { return -1 }
     
     // Would verify JWS signature against JWT authorities in bundle
     return 0

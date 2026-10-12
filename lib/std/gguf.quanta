@@ -3931,3 +3931,768 @@ fn gguf_softmax(out: u64, inp: u64, n: i64) {
     }
     return 0
 }
+// ===========================================================================
+// Phase 6.1: Per-context GGUF API (appended to gguf.quanta)
+// ===========================================================================
+
+// ---- GgufCtx layout (mem_alloc'd buffer) ----
+// All offsets in bytes from context base
+const GCTX_FD            = 0
+const GCTX_MAP_BASE      = 8
+const GCTX_MAP_OFF       = 16
+const GCTX_MAP_LEN       = 24
+const GCTX_MAP_FAULTED   = 32
+const GCTX_N_TENSORS     = 40
+const GCTX_N_KV          = 48
+const GCTX_DATA_START    = 56
+const GCTX_TINFO_START   = 64
+const GCTX_FILESIZE      = 72
+const GCTX_TENSOR_DIMS   = 80
+const GCTX_TENSOR_DATA   = 88
+const GCTX_KV_INDEX      = 96
+const GCTX_KV_ARR_OFF    = 104
+const GCTX_KV_ARR_LEN    = 112
+const GCTX_KV_ETYPE      = 120
+const GCTX_ALIGNMENT     = 128
+const GCTX_SIZE          = 136
+
+fn gguf_ctx_alloc() -> u64 {
+    let ctx = mem_alloc(GCTX_SIZE)
+    let i = 0
+    while i < GCTX_SIZE { mem_store(ctx + i, 0); i = i + 8 }
+    return ctx
+}
+
+fn gguf_ctx_free(ctx: u64) {
+    if ctx == 0 { return }
+    // Close fd if open
+    let fd = mem_load(ctx + GCTX_FD)
+    if fd > 0 { close(fd) }
+    // Unmap if mapped
+    let base = mem_load(ctx + GCTX_MAP_BASE)
+    let len = mem_load(ctx + GCTX_MAP_LEN)
+    if base != 0 && len != 0 { munmap_file(base, len) }
+    // Free all allocated buffers
+    let dims = mem_load(ctx + GCTX_TENSOR_DIMS)
+    if dims != 0 { /* gguf_tensor_dims is not separately freed in original */ }
+    let tdata = mem_load(ctx + GCTX_TENSOR_DATA)
+    if tdata != 0 { /* original doesn't free this either */ }
+    let kvidx = mem_load(ctx + GCTX_KV_INDEX)
+    if kvidx != 0 { /* original doesn't free this either */ }
+    let kvaoff = mem_load(ctx + GCTX_KV_ARR_OFF)
+    if kvaoff != 0 { /* original doesn't free this either */ }
+    let kvalen = mem_load(ctx + GCTX_KV_ARR_LEN)
+    if kvalen != 0 { /* original doesn't free this either */ }
+    let kvetype = mem_load(ctx + GCTX_KV_ETYPE)
+    if kvetype != 0 { /* original doesn't free this either */ }
+    // Note: we don't free the context buffer itself here
+}
+
+fn gguf_ctx_fd(ctx: u64) -> i64 {
+    return mem_load(ctx + GCTX_FD)
+}
+
+fn gguf_ctx_set_fd(ctx: u64, fd: i64) {
+    mem_store(ctx + GCTX_FD, fd)
+}
+
+fn gguf_ctx_map_base(ctx: u64) -> u64 {
+    return mem_load(ctx + GCTX_MAP_BASE)
+}
+
+fn gguf_ctx_set_map_base(ctx: u64, base: u64) {
+    mem_store(ctx + GCTX_MAP_BASE, base)
+}
+
+fn gguf_ctx_map_off(ctx: u64) -> i64 {
+    return mem_load(ctx + GCTX_MAP_OFF)
+}
+
+fn gguf_ctx_set_map_off(ctx: u64, off: i64) {
+    mem_store(ctx + GCTX_MAP_OFF, off)
+}
+
+fn gguf_ctx_map_len(ctx: u64) -> i64 {
+    return mem_load(ctx + GCTX_MAP_LEN)
+}
+
+fn gguf_ctx_set_map_len(ctx: u64, len: i64) {
+    mem_store(ctx + GCTX_MAP_LEN, len)
+}
+
+fn gguf_ctx_map_faulted(ctx: u64) -> i64 {
+    return mem_load(ctx + GCTX_MAP_FAULTED)
+}
+
+fn gguf_ctx_set_map_faulted(ctx: u64, v: i64) {
+    mem_store(ctx + GCTX_MAP_FAULTED, v)
+}
+
+fn gguf_ctx_n_tensors(ctx: u64) -> i64 {
+    return mem_load(ctx + GCTX_N_TENSORS)
+}
+
+fn gguf_ctx_set_n_tensors(ctx: u64, n: i64) {
+    mem_store(ctx + GCTX_N_TENSORS, n)
+}
+
+fn gguf_ctx_n_kv(ctx: u64) -> i64 {
+    return mem_load(ctx + GCTX_N_KV)
+}
+
+fn gguf_ctx_set_n_kv(ctx: u64, n: i64) {
+    mem_store(ctx + GCTX_N_KV, n)
+}
+
+fn gguf_ctx_data_start(ctx: u64) -> i64 {
+    return mem_load(ctx + GCTX_DATA_START)
+}
+
+fn gguf_ctx_set_data_start(ctx: u64, off: i64) {
+    mem_store(ctx + GCTX_DATA_START, off)
+}
+
+fn gguf_ctx_tinfo_start(ctx: u64) -> i64 {
+    return mem_load(ctx + GCTX_TINFO_START)
+}
+
+fn gguf_ctx_set_tinfo_start(ctx: u64, off: i64) {
+    mem_store(ctx + GCTX_TINFO_START, off)
+}
+
+fn gguf_ctx_filesize(ctx: u64) -> i64 {
+    return mem_load(ctx + GCTX_FILESIZE)
+}
+
+fn gguf_ctx_set_filesize(ctx: u64, sz: i64) {
+    mem_store(ctx + GCTX_FILESIZE, sz)
+}
+
+fn gguf_ctx_tensor_dims(ctx: u64) -> u64 {
+    return mem_load(ctx + GCTX_TENSOR_DIMS)
+}
+
+fn gguf_ctx_set_tensor_dims(ctx: u64, ptr: u64) {
+    mem_store(ctx + GCTX_TENSOR_DIMS, ptr)
+}
+
+fn gguf_ctx_tensor_data(ctx: u64) -> u64 {
+    return mem_load(ctx + GCTX_TENSOR_DATA)
+}
+
+fn gguf_ctx_set_tensor_data(ctx: u64, ptr: u64) {
+    mem_store(ctx + GCTX_TENSOR_DATA, ptr)
+}
+
+fn gguf_ctx_kv_index(ctx: u64) -> u64 {
+    return mem_load(ctx + GCTX_KV_INDEX)
+}
+
+fn gguf_ctx_set_kv_index(ctx: u64, ptr: u64) {
+    mem_store(ctx + GCTX_KV_INDEX, ptr)
+}
+
+fn gguf_ctx_kv_arr_off(ctx: u64) -> u64 {
+    return mem_load(ctx + GCTX_KV_ARR_OFF)
+}
+
+fn gguf_ctx_set_kv_arr_off(ctx: u64, ptr: u64) {
+    mem_store(ctx + GCTX_KV_ARR_OFF, ptr)
+}
+
+fn gguf_ctx_kv_arr_len(ctx: u64) -> u64 {
+    return mem_load(ctx + GCTX_KV_ARR_LEN)
+}
+
+fn gguf_ctx_set_kv_arr_len(ctx: u64, ptr: u64) {
+    mem_store(ctx + GCTX_KV_ARR_LEN, ptr)
+}
+
+fn gguf_ctx_kv_etype(ctx: u64) -> u64 {
+    return mem_load(ctx + GCTX_KV_ETYPE)
+}
+
+fn gguf_ctx_set_kv_etype(ctx: u64, ptr: u64) {
+    mem_store(ctx + GCTX_KV_ETYPE, ptr)
+}
+
+fn gguf_ctx_alignment(ctx: u64) -> i64 {
+    return mem_load(ctx + GCTX_ALIGNMENT)
+}
+
+fn gguf_ctx_set_alignment(ctx: u64, a: i64) {
+    mem_store(ctx + GCTX_ALIGNMENT, a)
+}
+
+// ---- Context-aware versions of core functions ----
+
+fn gguf_page_align_down_ctx(ctx: u64, v: i64) -> i64 {
+    return v - (v % GGUF_PAGE)
+}
+
+fn gguf_map_populate_ctx(ctx: u64, base: u64, len: i64) {
+    if len <= 0 { return }
+    syscall(28, base, len, 22, 0, 0, 0)
+}
+
+fn gguf_map_range_ctx(ctx: u64, offset: i64, len: i64) -> u64 {
+    let fd = gguf_ctx_fd(ctx)
+    if fd < 0 { return 0 }
+    if len <= 0 { return 0 }
+    let base = mmap_file(0, len, 1, 2, fd, offset)
+    if base < 0 { return 0 }
+    return base
+}
+
+fn gguf_unmap_range_ctx(ctx: u64, base: u64, len: i64) {
+    if base <= 0 { return }
+    munmap_file(base, len)
+}
+
+fn gguf_map_data_window_ctx(ctx: u64) -> u64 {
+    let fd = gguf_ctx_fd(ctx)
+    if fd < 0 { return 0 }
+    if gguf_ctx_map_base(ctx) != 0 { return gguf_ctx_map_base(ctx) }
+
+    let data_off = gguf_data_offset_ctx(ctx)
+    if data_off <= 0 { return 0 }
+    let sz = gguf_ctx_filesize(ctx)
+
+    let map_off = gguf_page_align_down_ctx(ctx, data_off)
+    if map_off < 0 { return 0 }
+
+    let remaining = sz - map_off
+    if remaining <= 0 { return 0 }
+
+    let len = remaining
+    if len > GGUF_MAP_WINDOW { len = GGUF_MAP_WINDOW }
+
+    let base = gguf_map_range_ctx(ctx, map_off, len)
+    if base == 0 { return 0 }
+
+    gguf_map_populate_ctx(ctx, base, len)
+
+    gguf_ctx_set_map_base(ctx, base)
+    gguf_ctx_set_map_off(ctx, map_off)
+    gguf_ctx_set_map_len(ctx, len)
+    gguf_ctx_set_map_faulted(ctx, 1)
+    return base
+}
+
+fn gguf_read_bytes_ctx(ctx: u64, off: i64, dst: u64, len: i64) -> i64 {
+    if len <= 0 { return 0 }
+
+    let map_base = gguf_ctx_map_base(ctx)
+    if map_base != 0 {
+        let map_off = gguf_ctx_map_off(ctx)
+        let map_len = gguf_ctx_map_len(ctx)
+        let rel = off - map_off
+        if rel >= 0 && rel + len <= map_len {
+            let src = map_base + rel
+            let words = len / 8
+            let i = 0
+            while i < words {
+                mem_store(dst + i * 8, mem_load(src + i * 8))
+                i = i + 1
+            }
+            let done = words * 8
+            while done < len {
+                mem_store8(dst + done, mem_load8(src + done))
+                done = done + 1
+            }
+            return len
+        }
+    }
+
+    let fd = gguf_ctx_fd(ctx)
+    lseek(fd, off, 0)
+    return file_read(fd, dst, len)
+}
+
+fn gguf_load_ctx(path: u64, ctx: u64) -> i64 {
+    let fd = open(path, 0, 0)
+    if fd < 0 { return -1 }
+    gguf_ctx_set_fd(ctx, fd)
+    gguf_ctx_set_filesize(ctx, file_size(fd))
+
+    let hdr = mem_alloc(24)
+    file_read(fd, hdr, 24)
+    if mem_load8(hdr) != 71 { close(fd); gguf_ctx_set_fd(ctx, -1); return -2 }
+
+    let n_kv = mem_load(hdr + 16)
+    gguf_ctx_set_n_tensors(ctx, mem_load(hdr + 8))
+    gguf_ctx_set_n_kv(ctx, n_kv)
+
+    let meta_size = scan_metadata_ctx(ctx, n_kv)
+    if meta_size < 0 { close(fd); gguf_ctx_set_fd(ctx, -1); return -8 }
+
+    let total_meta = 24 + meta_size
+
+    read_tensor_info_ctx(ctx, fd)
+
+    record_data_start_ctx(ctx, fd)
+
+    if gguf_read_alignment_ctx(ctx) != 0 { close(fd); gguf_ctx_set_fd(ctx, -1); return -5 }
+    let vr = gguf_validate_chain_ctx(ctx)
+    if vr != 0 { close(fd); gguf_ctx_set_fd(ctx, -1); return -6 }
+    let dr = gguf_validate_all_dims_ctx(ctx)
+    if dr != 0 { close(fd); gguf_ctx_set_fd(ctx, -1); return -7 }
+
+    gguf_map_data_window_ctx(ctx)
+    return 0
+}
+
+fn gguf_read_alignment_ctx(ctx: u64) -> i64 {
+    let k = gguf_kv_find_ctx(ctx, "general.alignment")
+    if k < 0 {
+        gguf_ctx_set_alignment(ctx, 32)
+        return 0
+    }
+    let val_off = gguf_kv_value_offset_ctx(ctx, k)
+    if val_off < 0 { return -1 }
+    let buf = mem_alloc(4)
+    let fd = gguf_ctx_fd(ctx)
+    lseek(fd, val_off, 0)
+    if read_raw(fd, buf, 4) != 4 { return -1 }
+    let align = mem_load(buf)
+    if align <= 0 || (align & (align - 1)) != 0 { return -1 }
+    gguf_ctx_set_alignment(ctx, align)
+    return 0
+}
+
+fn gguf_kv_find_ctx(ctx: u64, name: u64) -> i64 {
+    let want = len(name)
+    let n_kv = gguf_ctx_n_kv(ctx)
+    let idx = gguf_ctx_kv_index(ctx)
+    let fd = gguf_ctx_fd(ctx)
+    let i = 0
+    while i < n_kv {
+        lseek(fd, mem_load(idx + i * 8), 0)
+        let lb = mem_alloc(8)
+        if read_raw(fd, lb, 8) != 8 { return -1 }
+        let klen = mem_load(lb)
+        if klen < 0 || klen > GGUF_MAX_STRING { return -1 }
+        let kb = mem_alloc(klen + 1)
+        read_raw(fd, kb, klen)
+        let ok = 1
+        if klen != want {
+            ok = 0
+        } else {
+            let j = 0
+            while j < want {
+                if mem_load8(kb + j) != mem_load8(name + 8 + j) { ok = 0; j = want }
+                j = j + 1
+            }
+        }
+        if ok == 1 { return i }
+        i = i + 1
+    }
+    return -1
+}
+
+fn gguf_kv_value_offset_ctx(ctx: u64, k: i64) -> i64 {
+    let off = mem_load(gguf_ctx_kv_index(ctx) + k * 8)
+    let fd = gguf_ctx_fd(ctx)
+    lseek(fd, off, 0)
+    let lb = mem_alloc(8)
+    if read_raw(fd, lb, 8) != 8 { return -1 }
+    let klen = mem_load(lb)
+    return off + 8 + klen + 4
+}
+
+fn scan_metadata_ctx(ctx: u64, n_kv: i64) -> i64 {
+    let fd = gguf_ctx_fd(ctx)
+    let fsz = gguf_ctx_filesize(ctx)
+    let klen_buf = mem_alloc(8)
+    let vtype_buf = mem_alloc(4)
+    let slen_buf = mem_alloc(8)
+
+    // n_kv is attacker-controlled and multiplies four allocations below.
+    if n_kv < 0 { return -1 }
+    if n_kv > 1000000 { return -1 }
+    if fsz > 0 && n_kv > fsz / 12 { return -1 }
+
+    let kv_index = mem_alloc(n_kv * KVREC_SIZE)
+    let kv_arr_off = mem_alloc(n_kv * 8)
+    let kv_arr_len = mem_alloc(n_kv * 8)
+    let kv_etype = mem_alloc(n_kv * 8)
+    gguf_ctx_set_kv_index(ctx, kv_index)
+    gguf_ctx_set_kv_arr_off(ctx, kv_arr_off)
+    gguf_ctx_set_kv_arr_len(ctx, kv_arr_len)
+    gguf_ctx_set_kv_etype(ctx, kv_etype)
+
+    let meta_size = 0
+    let i = 0
+    while i < n_kv {
+        mem_store(kv_index + i * 8, lseek(fd, 0, 1))
+        mem_store(kv_arr_off + i * 8, -1)
+        mem_store(kv_arr_len + i * 8, 0)
+        mem_store(kv_etype + i * 8, 0)
+
+        if read_raw(fd, klen_buf, 8) != 8 { return -1 }
+        let klen = mem_load(klen_buf)
+        if klen < 0 || klen > GGUF_MAX_STRING { return -1 }
+        if meta_size > GGUF_MAX_META - 8 - klen { return -1 }
+        if fsz > 0 && meta_size + 8 + klen > fsz { return -1 }
+        meta_size = meta_size + 8 + klen
+        lseek(fd, klen, 1)
+
+        read_raw(fd, vtype_buf, 4)
+        meta_size = meta_size + 4
+        let vtype = mem_load(vtype_buf)
+
+        if vtype == 0 { lseek(fd, 1, 1); meta_size = meta_size + 1 }
+        else if vtype == 1 { lseek(fd, 1, 1); meta_size = meta_size + 1 }
+        else if vtype == 2 { lseek(fd, 2, 1); meta_size = meta_size + 2 }
+        else if vtype == 3 { lseek(fd, 2, 1); meta_size = meta_size + 2 }
+        else if vtype == 4 { lseek(fd, 4, 1); meta_size = meta_size + 4 }
+        else if vtype == 5 { lseek(fd, 4, 1); meta_size = meta_size + 4 }
+        else if vtype == 6 { lseek(fd, 4, 1); meta_size = meta_size + 4 }
+        else if vtype == 7 { lseek(fd, 1, 1); meta_size = meta_size + 1 }
+        else if vtype == 10 { lseek(fd, 8, 1); meta_size = meta_size + 8 }
+        else if vtype == 11 { lseek(fd, 8, 1); meta_size = meta_size + 8 }
+        else if vtype == 12 { lseek(fd, 8, 1); meta_size = meta_size + 8 }
+        else if vtype == 8 {
+            read_raw(fd, slen_buf, 8)
+            let slen = mem_load(slen_buf)
+            lseek(fd, slen, 1)
+            meta_size = meta_size + 8 + slen
+        } else if vtype == 9 {
+            read_raw(fd, vtype_buf, 4)
+            meta_size = meta_size + 4
+            read_raw(fd, slen_buf, 8)
+            meta_size = meta_size + 8
+            let alen = mem_load(slen_buf)
+            let etype = mem_load(vtype_buf)
+            mem_store(kv_etype + i * 8, etype)
+            mem_store(kv_arr_off + i * 8, lseek(fd, 0, 1))
+            mem_store(kv_arr_len + i * 8, alen)
+            if etype == 8 {
+                let ai = 0
+                while ai < alen {
+                    read_raw(fd, slen_buf, 8)
+                    let slen = mem_load(slen_buf)
+                    lseek(fd, slen, 1)
+                    meta_size = meta_size + 8 + slen
+                    ai = ai + 1
+                }
+            } else {
+                let esize = 1
+                if etype == 2 || etype == 3 { esize = 2 }
+                if etype == 4 || etype == 5 || etype == 6 { esize = 4 }
+                if etype == 10 || etype == 11 || etype == 12 { esize = 8 }
+                lseek(fd, alen * esize, 1)
+                meta_size = meta_size + alen * esize
+            }
+        }
+
+        i = i + 1
+    }
+
+    return meta_size
+}
+
+fn read_tensor_info_ctx(ctx: u64, fd: i64) -> i64 {
+    gguf_ctx_set_tinfo_start(ctx, lseek(fd, 0, 1))
+    let n = gguf_ctx_n_tensors(ctx)
+    if n < 0 || n > 10000000 { return -1 }
+    let fsz = gguf_ctx_filesize(ctx)
+    if fsz > 0 && n * TINFO_SIZE > fsz { return -1 }
+
+    let tdata = mem_alloc(n * TINFO_SIZE)
+    gguf_ctx_set_tensor_data(ctx, tdata)
+    // Shape storage, parallel to the tensor-info table: 4 dims per tensor.
+    let tdims = mem_alloc(n * 32)
+    gguf_ctx_set_tensor_dims(ctx, tdims)
+
+    let nlen_buf = mem_alloc(8)
+    let ndims_buf = mem_alloc(4)
+    let dim_buf = mem_alloc(8)
+    let dtype_buf = mem_alloc(4)
+    let off_buf = mem_alloc(8)
+    let name_buf = mem_alloc(256)
+
+    let i = 0
+    while i < n {
+        if read_raw(fd, nlen_buf, 8) != 8 { return -1 }
+        let nlen = mem_load(nlen_buf)
+        if nlen < 0 || nlen > GGUF_MAX_STRING { return -1 }
+        file_read(fd, name_buf, nlen)
+        mem_store8(name_buf + nlen, 0)
+
+        if read_raw(fd, ndims_buf, 4) != 4 { return -1 }
+        let ndims = mem_load(ndims_buf)
+        if ndims < 0 || ndims > 4 { return -1 }
+
+        let nelem = 1
+        let d = 0
+        while d < ndims {
+            if read_raw(fd, dim_buf, 8) != 8 { return -1 }
+            let dim = mem_load(dim_buf)
+            if dim < 0 { return -1 }
+            nelem = nelem * dim
+            mem_store(tdims + i * 32 + d * 8, dim)
+            d = d + 1
+        }
+        // clear stale dims from a wider previous record
+        while d < 4 {
+            mem_store(tdims + i * 32 + d * 8, 0)
+            d = d + 1
+        }
+
+        if read_raw(fd, dtype_buf, 4) != 4 { return -1 }
+        let dtype = mem_load(dtype_buf)
+
+        if read_raw(fd, off_buf, 8) != 8 { return -1 }
+        let offset = mem_load(off_buf)
+        if offset < 0 { return -1 }
+
+        let name_copy = mem_alloc(nlen + 1)
+        d = 0
+        while d < nlen {
+            mem_store8(name_copy + d, mem_load8(name_buf + d))
+            d = d + 1
+        }
+        mem_store8(name_copy + nlen, 0)
+
+        mem_store(tdata + i * TINFO_SIZE, name_copy)
+        mem_store(tdata + i * TINFO_SIZE + 8, ndims)
+        mem_store(tdata + i * TINFO_SIZE + 16, dtype)
+        mem_store(tdata + i * TINFO_SIZE + 24, offset)
+        mem_store(tdata + i * TINFO_SIZE + 32, nelem)
+
+        i = i + 1
+    }
+
+    return 0
+}
+
+fn record_data_start_ctx(ctx: u64, fd: i64) -> i64 {
+    let info_end = lseek(fd, 0, 1)
+    let rem = info_end - (info_end / 32) * 32
+    if rem != 0 { lseek(fd, 32 - rem, 1) }
+    gguf_ctx_set_data_start(ctx, lseek(fd, 0, 1))
+    return 0
+}
+
+fn gguf_validate_chain_ctx(ctx: u64) -> i64 {
+    let n = gguf_ctx_n_tensors(ctx)
+    if n <= 0 { return 0 }
+    let running = gguf_ctx_data_start(ctx)
+    let fsz = gguf_ctx_filesize(ctx)
+    let i = 0
+    while i < n {
+        let off = gguf_ctx_tensor_offset(ctx, i)
+        let nb = gguf_ctx_tensor_nbytes(ctx, i)
+        if nb < 0 { return -1000 - i }
+        if off < 0 { return -2000 - i }
+        if off != running { return -3000 - i }
+        if fsz > 0 && off > fsz { return -4000 - i }
+        if fsz > 0 && nb > fsz - off { return -4000 - i }
+        running = running + nb
+        i = i + 1
+    }
+    return 0
+}
+
+fn gguf_validate_all_dims_ctx(ctx: u64) -> i64 {
+    let n = gguf_ctx_n_tensors(ctx)
+    let i = 0
+    while i < n {
+        let nd = gguf_ctx_tensor_ndims(ctx, i)
+        if nd <= 0 || nd > 4 { return -1001 - i }
+        let prod = 1
+        let d = 0
+        while d < nd {
+            let v = gguf_ctx_tensor_dim(ctx, i, d)
+            if v <= 0 { return -1002 - i }
+            prod = prod * v
+            if prod <= 0 || prod > 900000000000000000 { return -1003 - i }
+            d = d + 1
+        }
+        if prod != gguf_ctx_tensor_nelements(ctx, i) { return -1004 - i }
+        let nb = gguf_ctx_tensor_nbytes(ctx, i)
+        if nb <= 0 { return -1005 - i }
+        let fsz = gguf_ctx_filesize(ctx)
+        if fsz > 0 && nb > fsz { return -1006 - i }
+        i = i + 1
+    }
+    return 0
+}
+
+fn gguf_data_offset_ctx(ctx: u64) -> i64 {
+    // Original gguf_data_offset
+    return gguf_ctx_data_start(ctx)
+}
+
+fn gguf_close_ctx(ctx: u64) -> i64 {
+    let fd = gguf_ctx_fd(ctx)
+    if fd > 0 { close(fd) }
+    gguf_ctx_set_fd(ctx, -1)
+    let base = gguf_ctx_map_base(ctx)
+    let len = gguf_ctx_map_len(ctx)
+    if base != 0 && len != 0 { munmap_file(base, len) }
+    gguf_ctx_set_map_base(ctx, 0)
+    return 0
+}
+
+// ---- Getter functions for loader_traits ----
+
+fn gguf_ctx_num_tensors(ctx: u64) -> i64 {
+    return gguf_ctx_n_tensors(ctx)
+}
+
+fn gguf_ctx_tensor_name_str(ctx: u64, i: i64) -> u64 {
+    let tdata = gguf_ctx_tensor_data(ctx)
+    let p = mem_load(tdata + i * TINFO_SIZE)
+    if p == 0 { return 0 }
+    let n = 0
+    while mem_load8(p + n) != 0 { n = n + 1 }
+    if n == 0 { return 0 }
+    let buf = mem_alloc((n + 9 + 7) / 8 * 8)
+    mem_store(buf, n)
+    let k = 0
+    while k < n {
+        mem_store8(buf + 8 + k, mem_load8(p + k))
+        k = k + 1
+    }
+    return buf
+}
+
+fn gguf_ctx_tensor_dtype(ctx: u64, i: i64) -> i64 {
+    let tdata = gguf_ctx_tensor_data(ctx)
+    return mem_load(tdata + i * TINFO_SIZE + 16)
+}
+
+fn gguf_ctx_tensor_offset(ctx: u64, i: i64) -> i64 {
+    let tdata = gguf_ctx_tensor_data(ctx)
+    let rel = mem_load(tdata + i * TINFO_SIZE + 24)
+    return gguf_data_offset_ctx(ctx) + rel
+}
+
+fn gguf_ctx_tensor_nelements(ctx: u64, i: i64) -> i64 {
+    let tdata = gguf_ctx_tensor_data(ctx)
+    return mem_load(tdata + i * TINFO_SIZE + 32)
+}
+
+fn gguf_ctx_tensor_ndims(ctx: u64, i: i64) -> i64 {
+    let tdata = gguf_ctx_tensor_data(ctx)
+    return mem_load(tdata + i * TINFO_SIZE + 8)
+}
+
+fn gguf_ctx_tensor_dim(ctx: u64, i: i64, d: i64) -> i64 {
+    let ndims = gguf_ctx_tensor_ndims(ctx, i)
+    if d < 0 || d >= ndims { return -1 }
+    let tdims = gguf_ctx_tensor_dims(ctx)
+    return mem_load(tdims + i * 32 + d * 8)
+}
+
+fn gguf_ctx_tensor_nbytes(ctx: u64, i: i64) -> i64 {
+    let dtype = gguf_ctx_tensor_dtype(ctx, i)
+    let n = gguf_ctx_tensor_nelements(ctx, i)
+    if n <= 0 { return 0 }
+    if dtype == 0 { return n * 4 }
+    if dtype == 1 { return n * 2 }
+    if dtype == 2 { return (n / 32) * 18 }
+    if dtype == 3 { return (n / 32) * 20 }
+    if dtype == 6 { return (n / 32) * 22 }
+    if dtype == 7 { return (n / 32) * 24 }
+    if dtype == 8 { return (n / 32) * 34 }
+    if dtype == 9 { return (n / 32) * 36 }
+    if dtype == 10 { return (n / 256) * 84 }
+    if dtype == 11 { return (n / 256) * 110 }
+    if dtype == 12 { return (n / 256) * 144 }
+    if dtype == 13 { return (n / 256) * 176 }
+    if dtype == 14 { return (n / 256) * 210 }
+    if dtype == 15 { return (n / 256) * 292 }
+    if dtype == 16 { return (n / 256) * 66 }
+    if dtype == 17 { return (n / 256) * 74 }
+    if dtype == 18 { return (n / 256) * 98 }
+    if dtype == 19 { return (n / 256) * 50 }
+    if dtype == 20 { return (n / 32) * 18 }
+    if dtype == 21 { return (n / 256) * 110 }
+    if dtype == 22 { return (n / 256) * 82 }
+    if dtype == 23 { return (n / 256) * 136 }
+    if dtype == 24 { return n }
+    if dtype == 25 { return n * 2 }
+    if dtype == 26 { return n * 4 }
+    if dtype == 27 { return n * 8 }
+    if dtype == 28 { return n * 8 }
+    if dtype == 29 { return (n / 256) * 56 }
+    if dtype == 30 { return n * 2 }
+    if dtype == 34 { return (n / 256) * 54 }
+    if dtype == 35 { return (n / 256) * 66 }
+    if dtype == 39 { return (n / 32) * 17 }
+    if dtype == 40 { return (n / 64) * 36 }
+    if dtype == 41 { return (n / 128) * 18 }
+    if dtype == 42 { return (n / 64) * 18 }
+    return n
+}
+
+fn gguf_type_size_ctx(ctx: u64, dtype: i64) -> i64 {
+    // Original gguf_type_size - copy here
+    if dtype == 0 { return 1 }
+    if dtype == 1 { return 1 }
+    if dtype == 2 { return 2 }
+    if dtype == 3 { return 2 }
+    if dtype == 4 { return 4 }
+    if dtype == 5 { return 4 }
+    if dtype == 6 { return 4 }
+    if dtype == 7 { return 1 }
+    if dtype == 8 { return 1 }
+    if dtype == 9 {
+        let etype = mem_load(gguf_ctx_kv_etype(ctx))
+        return gguf_type_size_ctx(ctx, etype)
+    }
+    if dtype == 10 { return 8 }
+    if dtype == 11 { return 8 }
+    if dtype == 12 { return 8 }
+    if dtype == 13 { return 8 }
+    if dtype == 14 { return 8 }
+    if dtype == 15 { return 8 }
+    return 8
+}
+
+fn gguf_block_elems_ctx(ctx: u64, dtype: i64) -> i64 {
+    // Original gguf_block_elems
+    if dtype == 10 { return 256 } // Q4_K
+    if dtype == 11 { return 32 }  // Q5_K
+    if dtype == 12 { return 256 } // Q6_K
+    if dtype == 13 { return 256 } // Q8_K
+    if dtype == 14 { return 256 } // IQ4_NL
+    if dtype == 15 { return 256 } // IQ4_XS
+    if dtype == 16 { return 256 } // MXFP4
+    if dtype == 17 { return 256 } // NVFP4
+    return 1
+}
+
+fn gguf_ctx_find_tensor(ctx: u64, name: u64) -> i64 {
+    let want = len(name)
+    let n = gguf_ctx_num_tensors(ctx)
+    let i = 0
+    while i < n {
+        let tname = gguf_ctx_tensor_name_str(ctx, i)
+        if tname != 0 {
+            let ok = 1
+            if mem_load(tname) != want {
+                ok = 0
+            } else {
+                let j = 0
+                while j < want {
+                    if mem_load8(tname + 8 + j) != mem_load8(name + 8 + j) { ok = 0; j = want }
+                    j = j + 1
+                }
+            }
+            if ok == 1 { return i }
+        }
+        i = i + 1
+    }
+    return -1
+}
+
+fn gguf_ctx_read_tensor_bytes_at(ctx: u64, i: i64, off: i64, buf: u64, nbytes: i64) -> i64 {
+    let base_off = gguf_ctx_tensor_offset(ctx, i)
+    if base_off < 0 { return -1 }
+    let abs_off = base_off + off
+    return gguf_read_bytes_ctx(ctx, abs_off, buf, nbytes)
+}

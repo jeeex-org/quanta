@@ -117,16 +117,16 @@ fn tls_ticket_key_get_by_name(key_name, key_out) {
     while i < ticket_key_count {
         let base = i * (TICKET_KEY_SIZE + TICKET_KEY_NAME_SIZE + 8)
         let name = r64(ticket_keys + base + 8)
-        let match = 1
+        let eq = 1
         let j = 0
         while j < TICKET_KEY_NAME_SIZE {
             if mem_load8(name + j) != mem_load8(key_name + j) {
-                match = 0
+                eq = 0
                 break
             }
             j = j + 1
         }
-        if match == 1 {
+        if eq == 1 {
             w64(key_out, r64(ticket_keys + base))
             return 0
         }
@@ -524,11 +524,11 @@ fn tls_client_hello_psk(identities, identity_count, binders, binder_count, trans
         }
         
         // Compare binders
-        let match = 1
+        let eq = 1
         j = 0
         while j < binder_len && j < 32 {
             if mem_load8(binder + j) != mem_load8(expected_binder + j) {
-                match = 0
+                eq = 0
                 break
             }
             j = j + 1
@@ -537,7 +537,7 @@ fn tls_client_hello_psk(identities, identity_count, binders, binder_count, trans
         mem_free(expected_binder)
         mem_free(psk)
         
-        if match == 1 {
+        if eq == 1 {
             // Valid PSK found
             w64(psk_out, identity)
             w64(psk_mode_out, TLS_PSK_DHE_KE) // Use PSK with DHE
@@ -607,17 +607,17 @@ fn tls_replay_check(client_hello_hash, now) {
         let timestamp = r64(replay_cache + i * 40 + 32)
         
         // Check if hash matches
-        let match = 1
+        let eq = 1
         let j = 0
         while j < 32 {
             if mem_load8(hash + j) != mem_load8(client_hello_hash + j) {
-                match = 0
+                eq = 0
                 break
             }
             j = j + 1
         }
         
-        if match == 1 {
+        if eq == 1 {
             // Check if within replay window
             if now - timestamp < REPLAY_WINDOW_MS {
                 return -1 // Replay detected
