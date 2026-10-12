@@ -1,0 +1,3113 @@
+// === COMPILE IR ? X86-64 ===
+// Per function - emits code, records labels and patches
+let func_code_starts = mmap(2000000)  // start offset of each func's code
+
+// === OPTIMIZER (Tier-1, behind -O) ===
+
+// Hard constraint: if opt_on==0, opt_func returns immediately and touches ZERO IR.
+// As of 1.0.12 `opt_on` defaults to 1 (optimizer ON for every build); it is no
+// longer opt-in. opt_func is called AFTER parse fills [0,irc) for the current
+// function and BEFORE ci_func emits it. All rewrites are in-place (no IR record
+// deletion ? label fixups in ci_func rely on indices and irc staying stable).
+let opt_on = 1
+// G2: overflow-trap gate. ON by default (secure by default): emits `jno +2; ud2`
+// after signed add/sub/mul/neg -> SIGILL on overflow, eliminating the
+// wraparound UB class from safe code. `unsafe {}` blocks suppress the trap for
+// the ops they contain (so low-level primitives / compiler internals opt out).
+// The flag `--no-overflow-trap` turns it OFF if a program deliberately relies on
+// two's-complement wraparound and hasn't been ported.
+let ovf_trap = 1
+let cur_fnname = 0
+let cur_fnnlen = 0
+// P10: index of the function currently being compiled (for fn-param lookup).
+let cur_fi = 0
+
+// opt_func iterates over IR records with the GLOBAL loop counter `i` so the
+// const-resolution helpers (op_is_const / op_const_val) can read it.
+let opt_i = 0
+
+// Const lookup scans BACKWARD from the current record, because a definition
+// precedes its use. The scan must STOP at the start of the current function.
+//
+// It used to run to record 0 unconditionally, crossing function boundaries.
+// That is invisible for most ops -- vreg numbers rarely collide across
+// functions -- but it is a live hazard now that float literals are IR_FCONST:
+// `opt_i` is the NEG record for a negative literal, and its operand vreg can
+// match an IR_FCONST belonging to an EARLIER function, so op_const_val returns
+// that function's constant. In test_f32_conv the `-maxf32` expectation then
+// folded to -(the +maxf32 constant) instead of the literal written in the
+// source, and the test failed with a plausible-looking but wrong number.
+//
+// The bound is opt_beg, which is the current function's first IR record.
+fn op_is_const(vr) {
+    let k = opt_i-1
+    while k>=opt_beg {
+        if irres(k)==vr && (irop(k)==IR_CONST || irop(k)==IR_FCONST) { return 1 }
+        k=k-1
+    }
+    return 0
+}
+fn op_const_val(vr) {
+    let k = opt_i-1
+    while k>=opt_beg {
+        if irres(k)==vr && (irop(k)==IR_CONST || irop(k)==IR_FCONST) { return ira0(k) }
+        k=k-1
+    }
+    return 0
+}
+fn op_is_float(vr) {
+    // True if vr holds an f64 bit pattern.
+    //
+    // vfloat is the authority, set by method.quanta when a literal is lowered
+    // (w64(vfloat+cr*8,1)), by codegen's prepass for i2f/fconst results, and by
+    // entry.quanta for `-> f64` locals and parameters.  It is what the emit
+    // path uses, so consulting it here keeps the two in agreement.
+    //
+    // Before this, the walk below ONLY recognised an IR_CALL named i2f and
+    // returned 0 for everything else -- including a plain IR_CONST holding a
+    // float literal.  Lowering literals from fconst() to IR_CONST therefore
+    // made every float constant read as an integer: `let x: f64 = 1.0;
+    // x / d` folded to 1, `x * d` trapped with SIGILL, and `x + d` produced
+    // 9209861237972664320 (raw bit arithmetic on the patterns).
+    if vr >= 0 && r8(vfloat+vr)==1 { return 1 }
+    // Fall back to the def-chain walk for anything the table has not caught.
+    // Bounded by opt_beg for the same reason as op_is_const: walking past the
+    // current function can match a definition belonging to another one.
+    let seen = mmap(256); let sp=0
+    while sp<64 {
+        w64(seen+sp*8, vr); sp=sp+1
+        let k = irc-1
+        let found = -1
+        while k>=opt_beg {
+            if irres(k)==vr {
+                if irop(k)==IR_CALL {
+                    let nm = ira0(k)
+                    if r8(src+nm)=='i' && r8(src+nm+1)=='2' && r8(src+nm+2)=='f' { return 1 }
+                    found = -2; break
+                } else if irop(k)==IR_MOV { vr = ira0(k); found = 1; break }
+                else { found = -2; break }
+            }
+            k=k-1
+        }
+        if found==-2 { return 0 }
+        if found!=1 { return 0 }
+    }
+    return 0
+}
+
+fn constfold(i, op, r0, a0, a1) {
+    // float operands: do NOT fold as integers (would corrupt float bit-patterns).
+    // Leave the MUL/DIV/ADD/SUB for the emit path to handle via SSE.
+    if (r8(vfloat+a0)==1 || r8(vfloat+a1)==1) { return 0 }
+    // both operands foldable -> fold to a MOV r0, f
+    // G2: when overflow trapping is ON, do NOT fold signed add/sub/mul ? the
+    // emitted `jo` is a deliberate side effect that must survive. (Bitwise and
+    // logical compares have no trap, so they still fold.)
+    if ovf_trap==1 {
+        if op==IR_ADD || op==IR_SUB || op==IR_MUL { return 0 }
+    }
+    let c0 = op_is_const(a0); let c1 = op_is_const(a1)
+    if c0==1 && c1==1 {
+        let v0 = op_const_val(a0); let v1 = op_const_val(a1); let f=0
+        if op==IR_ADD { f=v0+v1 }
+        else if op==IR_SUB { f=v0-v1 }
+        else if op==IR_MUL { f=v0*v1 }
+        // P6.1b FIX: width-typed unsigned arithmetic must wrap/truncate even
+        // when const-folded. Without this, e.g. `let p:u16=65000; let q:u16=5000;
+        // p+q` folds to the full 64-bit 70000 (losing the 0xFFFF wrap to 744).
+        if op==IR_ADD || op==IR_SUB || op==IR_MUL {
+            let wvt = 0
+            if a0 < vreg_n { wvt = r64(vreg_type + a0*8) }
+            if wvt < 1 || wvt > 3 { if a1 < vreg_n { wvt = r64(vreg_type + a1*8) } }
+            // 1=u8, 7=char, 8=byte -> 0xFF ; 2=u16 -> 0xFFFF ; 3=u32 -> 0xFFFFFFFF
+            if wvt == 1 || wvt == 7 || wvt == 8 { f = f & 0xFF }
+            else if wvt == 2 { f = f & 0xFFFF }
+            else if wvt == 3 { f = f & 0xFFFFFFFF }
+        }
+        else if op==IR_BAND { f=v0&v1 }
+        else if op==IR_BOR { f=v0|v1 }
+        else if op==IR_BXOR { f=v0^v1 }
+        else if op==IR_OR { if v0!=0||v1!=0 { f=1 } else { f=0 } }
+        else if op==IR_AND { if v0!=0&&v1!=0 { f=1 } else { f=0 } }
+        else if op==IR_EQ { if v0==v1 { f=1 } else { f=0 } }
+        else if op==IR_NE { if v0!=v1 { f=1 } else { f=0 } }
+        else if op==IR_LT { if v0<v1 { f=1 } else { f=0 } }
+        else if op==IR_GT { if v0>v1 { f=1 } else { f=0 } }
+        else if op==IR_LE { if v0<=v1 { f=1 } else { f=0 } }
+        else if op==IR_GE { if v0>=v1 { f=1 } else { f=0 } }
+        w64(ir+opt_i*IRS, IR_CONST); w64(ir+opt_i*IRS+8,r0); w64(ir+opt_i*IRS+16,f); w64(ir+opt_i*IRS+24,0); w64(ir+opt_i*IRS+32,0)
+        return 1
+    }
+    return 0
+}
+
+// P6.1b: width-mask an unsigned result. o0/o1 are the operand vreg numbers; if
+// either is a declared unsigned width (1=u8,2=u16,3=u32), AND-mask rd to that
+// width so arithmetic wraps/truncates. Bounds-checked (o<vreg_n) to avoid
+// out-of-range vreg_type reads. u64/usize (4/5) are 64-bit -> no mask.
+// Called from IR_ADD/SUB/MUL emit after sdef.
+fn width_mask(o0, o1, rd) {
+    let vt = 0
+    if o0 < vreg_n { vt = r64(vreg_type + o0*8) }
+    if vt < 1 || vt > 3 {
+        if o1 < vreg_n { vt = r64(vreg_type + o1*8) }
+    }
+    // Width types that need runtime truncation:
+    //   1=u8, 7=char, 8=byte  -> 0xFF
+    //   2=u16                 -> 0xFFFF
+    //   3=u32                 -> 0xFFFFFFFF
+    // (4=u64, 5=usize are 64-bit -> no mask; 6=bool is logical 0/1 and is NOT
+    //  width-masked on arithmetic ? bool math is plain integer, so true+true=2;
+    //  0=signed -> no mask.)
+    if (vt==1||vt==7||vt==8||vt==2||vt==3) && rd != 0 {
+        // modrm: mod=11, reg=100 (AND), rm=result reg. The result may be an
+        // extended register (r8-r15) when low registers are occupied, which
+        // requires REX.B. Without it the mask encodes onto the wrong register
+        // (e.g. rdx instead of r10) and the truncation is silently lost.
+        let rm = 224 + (rd % 8)
+        let rex = 72
+        if rd >= 8 { rex = rex + 1 }
+        if vt==1 || vt==7 || vt==8 { eb(rex); eb(129); eb(rm); ei(0xFF) }
+        else if vt == 2 { eb(rex); eb(129); eb(rm); ei(0xFFFF) }
+        else if vt == 3 { eb(rex); eb(193); eb(rm); eb(32); eb(rex); eb(193); eb(232 + (rd%8)); eb(32) }
+    }
+}
+
+// G5: opt_func() and ci_func() both used to scan 0..irc. That is correct for a
+// source function, whose IR is the whole live buffer, but WRONG for a
+// cache-imported one: its slice lives in the module arena at [ir_beg, ir_end)
+// while `irc` is the arena's total record count. Scanning 0..irc there walked
+// every other function's records and dereferenced a bogus `src` offset, so the
+// optimiser crashed before codegen even started. opt_beg/opt_opt_end describe the
+// current function and are set by ci_func.
+let opt_beg = 0
+let opt_end = 0
+
+fn opt_func() {
+    if opt_on==0 { return }
+    if had_error==1 { return }
+    if opt_end <= opt_beg { return }
+    // PRE-PASS: mark float vregs so constfold/emit handle them as floats.
+    // i2f(x): int64 -> f64. Any IR_CALL named "i2f" yields a float result vreg.
+    //
+    // This must run BEFORE the folding loop below -- that is its whole purpose.
+    // The fold guard is `if vfloat[a0] || vfloat[a1] then don't fold`, so an
+    // untagged f64 literal looked like an integer and `1.0 / 3.0` folded to integer
+    // 1/3 = 0. 6.0/3.0 and 1.0/2.0 read back correct only because integer division
+    // happens to agree on exactly those.
+    //
+    // Two sources of a float vreg: an IR_FCONST literal, and an i2f conversion.
+    // (IR_PARAM is tagged later, in the post-aclr pass, because aclr() clears
+    // vfloat and this optimiser runs before aclr.)
+    let pp=opt_beg
+    while pp<opt_end {
+        if irop(pp)==IR_FCONST {
+            w8(vfloat+irres(pp), 1)
+        }
+        else if irop(pp)==IR_CALL {
+            let nm = ira0(pp)
+            if r8(src+nm)=='i' && r8(src+nm+1)=='2' && r8(src+nm+2)=='f' {
+                w8(vfloat+irres(pp), 1)
+            }
+            // fconst(M, scale) is how the PARSER represents every f64 literal:
+            // an IR_CALL named "fconst" whose result is the IEEE-754 bit pattern.
+            // It was not tagged here, so a literal was not a float vreg as far as
+            // the fold guard and the comparison/arithmetic emit paths were
+            // concerned -- `0.25 < 0.5` took the INTEGER path and came out false.
+            // (Nothing is named IR_FCONST in practice; the lexer's TT_FNUM is
+            // lowered to this call in method.quanta.)
+            else if r8(src+nm)=='f' && r8(src+nm+1)=='c' && r8(src+nm+2)=='o' {
+                w8(vfloat+irres(pp), 1)
+            }
+        }
+        pp=pp+1
+    }
+    // --- A: constant folding + algebraic identity (per-record, index-safe) ---
+    opt_i=opt_beg
+    while opt_i<opt_end {
+        let op=irop(opt_i); let r0=irres(opt_i); let a0=ira0(opt_i); let a1=ira1(opt_i)
+        if op==IR_ADD || op==IR_SUB || op==IR_MUL || op==IR_BAND || op==IR_BOR || op==IR_BXOR || op==IR_OR || op==IR_AND
+          || op==IR_EQ || op==IR_NE || op==IR_LT || op==IR_GT || op==IR_LE || op==IR_GE {
+            if constfold(opt_i,op,r0,a0,a1)==1 { opt_i=opt_i+1; continue }
+            // Algebraic identities on a single constant operand.
+            //
+            // NEVER when either operand is a float. These rewrite the op into a
+            // MOV or a fresh IR_CONST, which throws away the float result class:
+            // `x * 2.0` folds to MOV x, and the multiply's SSE path (and with it
+            // the correct value) disappears. The integer fold path above already
+            // checks vfloat for exactly this reason; the identity path did not,
+            // and widening op_is_const() to accept IR_FCONST exposed it --
+            // test_full_inference started dying on an `imul` overflow trap
+            // (jno/ud2) where a float multiply belonged.
+            if r8(vfloat+a0)==1 || r8(vfloat+a1)==1 { opt_i=opt_i+1; continue }
+            if op_is_const(a1)==1 {
+                let v1 = op_const_val(a1)
+                if op==IR_MUL && v1==1 { w64(ir+opt_i*IRS,IR_MOV); w64(ir+opt_i*IRS+8,r0); w64(ir+opt_i*IRS+16,a0); w64(ir+opt_i*IRS+24,0); w64(ir+opt_i*IRS+32,0) }
+                else if op==IR_MUL && v1==0 { w64(ir+opt_i*IRS,IR_CONST); w64(ir+opt_i*IRS+8,r0); w64(ir+opt_i*IRS+16,0); w64(ir+opt_i*IRS+24,0); w64(ir+opt_i*IRS+32,0) }
+                else if op==IR_BAND && v1==0 { w64(ir+opt_i*IRS,IR_CONST); w64(ir+opt_i*IRS+8,r0); w64(ir+opt_i*IRS+16,0); w64(ir+opt_i*IRS+24,0); w64(ir+opt_i*IRS+32,0) }
+                else if op==IR_BAND && v1==-1 { w64(ir+opt_i*IRS,IR_MOV); w64(ir+opt_i*IRS+8,r0); w64(ir+opt_i*IRS+16,a0); w64(ir+opt_i*IRS+24,0); w64(ir+opt_i*IRS+32,0) }
+                else if (op==IR_ADD||op==IR_SUB||op==IR_BOR||op==IR_BXOR) && v1==0 { w64(ir+opt_i*IRS,IR_MOV); w64(ir+opt_i*IRS+8,r0); w64(ir+opt_i*IRS+16,a0); w64(ir+opt_i*IRS+24,0); w64(ir+opt_i*IRS+32,0) }
+                else if op==IR_DIV && v1==1 { w64(ir+opt_i*IRS,IR_MOV); w64(ir+opt_i*IRS+8,r0); w64(ir+opt_i*IRS+16,a0); w64(ir+opt_i*IRS+24,0); w64(ir+opt_i*IRS+32,0) }
+                else if (op==IR_SHL||op==IR_SHR) && v1==0 { w64(ir+opt_i*IRS,IR_MOV); w64(ir+opt_i*IRS+8,r0); w64(ir+opt_i*IRS+16,a0); w64(ir+opt_i*IRS+24,0); w64(ir+opt_i*IRS+32,0) }
+                else if (op==IR_SHL||op==IR_SHR) && v1>0 && v1<64 && op_is_const(a0)==1 {
+                    // FIX-0.0.50 (0.0.118): only fold when BOTH operands are
+                    // constants. The compiler's own << / >> operators are broken
+                    // for shift counts >= 31 (confirmed 1<<32 -> 0 at compile
+                    // time), so compute the power-of-two via repeated *2
+                    // (reliable) and apply with * / (reliable). If a0 is not a
+                    // constant we must NOT use a0 (it is a vreg number, not a
+                    // value) ? let it fall through to the runtime shift emit.
+                    let va0 = op_const_val(a0)
+                    let pw = 1
+                    let pk = 0
+                    while pk < v1 { pw = pw * 2; pk = pk + 1 }
+                    let f = 0
+                    if op==IR_SHL { f = va0 * pw } else { f = va0 / pw }
+                    w64(ir+opt_i*IRS,IR_CONST); w64(ir+opt_i*IRS+8,r0); w64(ir+opt_i*IRS+16,f); w64(ir+opt_i*IRS+24,0); w64(ir+opt_i*IRS+32,0)
+                }
+            }
+            if op_is_const(a0)==1 {
+                let v0 = op_const_val(a0)
+                if op==IR_MUL && v0==1 { w64(ir+opt_i*IRS,IR_MOV); w64(ir+opt_i*IRS+8,r0); w64(ir+opt_i*IRS+16,a1); w64(ir+opt_i*IRS+24,0); w64(ir+opt_i*IRS+32,0) }
+                else if op==IR_MUL && v0==0 { w64(ir+opt_i*IRS,IR_CONST); w64(ir+opt_i*IRS+8,r0); w64(ir+opt_i*IRS+16,0); w64(ir+opt_i*IRS+24,0); w64(ir+opt_i*IRS+32,0) }
+                else if op==IR_BAND && v0==0 { w64(ir+opt_i*IRS,IR_CONST); w64(ir+opt_i*IRS+8,r0); w64(ir+opt_i*IRS+16,0); w64(ir+opt_i*IRS+24,0); w64(ir+opt_i*IRS+32,0) }
+                else if op==IR_BAND && v0==-1 { w64(ir+opt_i*IRS,IR_MOV); w64(ir+opt_i*IRS+8,r0); w64(ir+opt_i*IRS+16,a1); w64(ir+opt_i*IRS+24,0); w64(ir+opt_i*IRS+32,0) }
+                else if (op==IR_ADD||op==IR_BOR||op==IR_BXOR) && v0==0 { w64(ir+opt_i*IRS,IR_MOV); w64(ir+opt_i*IRS+8,r0); w64(ir+opt_i*IRS+16,a1); w64(ir+opt_i*IRS+24,0); w64(ir+opt_i*IRS+32,0) }
+                else if op==IR_SUB && v0==0 { w64(ir+opt_i*IRS,IR_NEG); w64(ir+opt_i*IRS+8,r0); w64(ir+opt_i*IRS+16,a1); w64(ir+opt_i*IRS+24,0); w64(ir+opt_i*IRS+32,0) }
+            }
+            // x==x -> 1 ; x!=x -> 0  (same vreg operand)
+            if a0==a1 {
+                if op==IR_EQ { w64(ir+opt_i*IRS,IR_CONST); w64(ir+opt_i*IRS+8,r0); w64(ir+opt_i*IRS+16,1); w64(ir+opt_i*IRS+24,0); w64(ir+opt_i*IRS+32,0) }
+                else if op==IR_NE { w64(ir+opt_i*IRS,IR_CONST); w64(ir+opt_i*IRS+8,r0); w64(ir+opt_i*IRS+16,0); w64(ir+opt_i*IRS+24,0); w64(ir+opt_i*IRS+32,0) }
+            }
+        } else if op==IR_NEG || op==IR_NOT || op==IR_BNOT {
+            if op_is_const(a0)==1 {
+                let f=0
+                // 0.0.71: IR_NOT is LOGICAL not (`!x` / `not x`) -> 0/1.
+                // IR_BNOT is BITWISE not (`~x`) -> ~x. They are DIFFERENT and
+                // must fold differently.
+                //
+                // Previously both folded as ~x, so `!` meant two different things
+                // depending on whether its operand was a constant:
+                //   println(!0)            -> -1   (folded: bitwise)
+                //   let a=0; println(!a)   ->  1   (runtime: logical)
+                // The runtime lowering (xor/cmp/sete/movzx, see IR_NOT in
+                // ci_func) is the correct one: all 36 unary-! sites in the
+                // compiler's own sources are boolean tests -- `if !(tokt(p)==X)`,
+                // `while !(...)`, `if !is_novf && !is_arm` -- and NONE uses `!`
+                // for bitwise arithmetic. The folder was the outlier, and
+                // bitwise_not.quanta only ever passed because every operand in it
+                // is a constant, so it tested the buggy path exclusively and
+                // froze that behaviour in as if it were the spec.
+                if op==IR_NEG {
+                    // Negating a CONSTANT. Two cases, and they must not be
+                    // conflated:
+                    //
+                    //  - an f64 LITERAL. `-1.0` parses as unary minus over the
+                    //    literal, so this is the sign of every negative float
+                    //    constant in the tree. It must be the IEEE-754 SIGN
+                    //    FLIP -- XOR the sign bit -- not `0 - x`. Subtracting the
+                    //    bit pattern as an integer does not negate the float,
+                    //    so every negative literal came out as a nonsense value:
+                    //        let a = -1.0   -> -4607182418800017408
+                    //        let c = -2.5   -> -4612811918334230528
+                    //    lib/std/fs.quanta's f16_to_f64 opens with exactly that
+                    //    shape (`let sign = 1.0` / `if .. { sign = -1.0 }`), so
+                    //    every FP16 weight scale in the model decoded to garbage
+                    //    and test_full_inference died on an imul overflow trap
+                    //    inside dequant_q4k. The result is IR_FCONST so the
+                    //    opcode still says "float"; folding to IR_CONST dropped
+                    //    that tag as well as the value.
+                    //
+                    //  - an INTEGER literal. Plain `0 - x`, and IR_CONST.
+                    //
+                    // BOTH resolve the operand by scanning BACKWARD for a
+                    // definition of its vreg, which is unsound: nv() is a global
+                    // counter that resets between compilation units, so two
+                    // constants in one function can share a vreg number and the
+                    // scan can return the wrong one. That is not theoretical --
+                    // it happened whenever an unrelated statement (a `print`,
+                    // say) shifted vreg allocation:
+                    //     check("+maxf32", p,  5183643170566569984)
+                    //     check("-maxf32", p, -4039728866288205824)
+                    // emitted want = -5183643170566569984, the PREVIOUS constant
+                    // negated, and test_f32_conv failed on a number that is
+                    // plausible enough to look like a converter bug.
+                    //
+                    // Fix: the operand of a folded unary op is the record
+                    // DEFINITELY IMMEDIATELY PRECEDING it -- parse_unary() emits
+                    // the literal and then the IR_NEG right after it, with
+                    // nothing in between. So read that record directly instead of
+                    // searching, which cannot pick a foreign definition.
+                    //
+                    // Floatness comes from the OPERAND RECORD'S OPCODE and
+                    // nothing else -- not from vfloat[a0]. opt_func runs BEFORE
+                    // aclr(), but the re-mark pass that populates vfloat has
+                    // already run once by then, and it tags the ARGUMENT entries
+                    // of any call to a `-> f64` function. An integer literal
+                    // passed to such a function therefore arrives with
+                    // vfloat==1, and deciding floatness from the tag made every
+                    // negative INTEGER constant take the float path:
+                    //     check("+maxf32", p,  5183643170566569984)   ok
+                    //     check("-maxf32", p, -4039728866288205824)   came out
+                    //     -5183643170566569984  = -(the previous constant)
+                    // because XOR-ing bit 63 into an INTEGER is not its
+                    // negation. `0 - x` is. Only an IR_FCONST operand -- a real
+                    // float literal -- may take the sign-flip path.
+                    let pk = opt_i-1
+                    if pk >= opt_beg && irres(pk)==a0 && (irop(pk)==IR_CONST || irop(pk)==IR_FCONST) {
+                        let b = ira0(pk)
+                        if irop(pk)==IR_FCONST {
+                            let SIGNBIT = 0 - 9223372036854775807 - 1
+                            w64(ir+opt_i*IRS,IR_FCONST); w64(ir+opt_i*IRS+8,r0)
+                            w64(ir+opt_i*IRS+16, b ^ SIGNBIT)
+                            w64(ir+opt_i*IRS+24,0); w64(ir+opt_i*IRS+32,0)
+                            // Tag the result HERE, not at parse time.
+                            //
+                            // This fold CREATES an IR_FCONST, and it runs AFTER
+                            // the float-tagging pass at the top of opt_func, which
+                            // is the only place a literal normally gets its
+                            // vfloat tag before aclr(). So a NEGATIVE float
+                            // literal was left untagged for the whole of
+                            // opt_func, and every arithmetic on it took the
+                            // INTEGER path over the bit pattern:
+                            //     let q: f64 = 0.0 - 1.0
+                            //     q * ln2      -> -4618953502541334033
+                            //     (-ln2) * q  ->  4604418534313441775  (right)
+                            // Only the positive literal worked, because the parser
+                            // emitted it as an IR_FCONST that the tagging pass
+                            // actually saw. That is why gguf_exp's whole negative
+                            // half was garbage while exp(1), exp(2), exp(10)
+                            // came out within 1-2 ULP.
+                            w8(vfloat+r0, 1)
+                            return 1
+                        }
+                        f=0-b
+                    } else {
+                        f=0-op_const_val(a0)
+                    }
+                }
+                else if op==IR_NOT { if op_const_val(a0)==0 { f=1 } else { f=0 } }
+                else { f=~op_const_val(a0) }
+                w64(ir+opt_i*IRS,IR_CONST); w64(ir+opt_i*IRS+8,r0); w64(ir+opt_i*IRS+16,f); w64(ir+opt_i*IRS+24,0); w64(ir+opt_i*IRS+32,0)
+            }
+        }
+        opt_i=opt_i+1
+    }
+    // --- B: tail-call elimination (self-recursive, tail position only) ---
+    // Detect IR_RET whose operand is the result of an IR_CALL to the SAME function
+    // (name-pointer equality with cur_fnname). Rewrite into: move each call arg
+    // into the corresponding incoming PARAM home slot, then JMP to a freshly
+    // injected entry label (front-inserted; labels are by-id so index shift is safe).
+    // We never delete records; the orphaned IR_CALL/temps are neutralized: the CALL
+    // is rewritten to MOV res,res (harmless), and any remaining dead temps are
+    // cleaned by the DCE no-op pass that runs AFTER this (but DCE already ran above,
+    // so we neutralize the CALL here directly).
+    opt_tailcall()
+
+    // --- D: loop strength reduction (arithmetic-progression `while` loops) ---
+    opt_loop_strength()
+
+    // --- C: dead-code elimination (best-effort, index-safe, no record deletion) ---
+    // A vreg V is LIVE if it is read by any op other than its defining op, or is
+    // a RET operand, a CALL argument, or a PARAM target. Any op whose `res` is a
+    // non-live vreg AND has no side effects (not CALL/RET/STR/STOREG) is turned
+    // into a harmless `MOV res,res` no-op. We never delete records (label fixups
+    // in ci_func rely on indices), so irc stays stable and the fixed point holds.
+    // live_bits is a global (allocated once) to avoid per-function mmap collisions.
+    // These three liveness scans were bounded by `irc`, the GLOBAL IR count of
+    // the source translation unit. For a source function opt_beg=0 and
+    // opt_end=irc, so `irc` was equivalent and the bug was invisible. For a
+    // CACHE-IMPORTED function the slice is [opt_beg, opt_end) inside the module
+    // arena while `irc` still describes the source TU -- so the scans walked an
+    // unrelated range and then scan 2 rewrote IR_MOV over records that were not
+    // even part of the function being compiled. Bound all three to the
+    // optimiser's own window.
+    // Scan 1: mark live vregs (clear [0,maxvr+1) first).
+    let maxvr2=0
+    let cl=opt_beg
+    while cl<opt_end { let cr=irres(cl); if cr>maxvr2 { maxvr2=cr }; cl=cl+1 }
+    let clr=0
+    while clr<=maxvr2 { w8(live_bits+clr,0); clr=clr+1 }
+    let j=opt_beg
+    while j<opt_end {
+        let op=irop(j)
+        // operands that read vregs
+        let o0=ira0(j); let o1=ira1(j); let o2=ira2(j)
+        // every op reads o0,o1 (and o2 where relevant); mark them live
+        if op!=IR_CONST && op!=IR_FCONST { w8(live_bits+o0,1) }
+        if op!=IR_CONST && op!=IR_FCONST && op!=IR_BR && op!=IR_JMP { w8(live_bits+o1,1) }
+        if op==IR_CALL {
+            w8(live_bits+o2,1)   // arg-count IR index is live
+            // mark each argument vreg live (the call reads irres(a2+i))
+            let call_ac=ira1(j)   // arg count
+            let call_as=ira2(j)   // arg-start IR index
+            let call_ai=0
+            while call_ai<call_ac {
+                let call_arg_ir=call_as+call_ai
+                if call_arg_ir<irc { w8(live_bits+irres(call_arg_ir),1) }
+                call_ai=call_ai+1
+            }
+        }
+        // A void IR_RET carries o0 = -1; live_bits+(-1) writes one byte BEFORE
+        // the table. Only mark a real vreg.
+        if op==IR_RET && o0>=0 { w8(live_bits+o0,1) }
+        if op==IR_PARAM { w8(live_bits+o0,1) }   // PARAM target vreg is live
+        if op==IR_STOREG { w8(live_bits+o0,1) }  // STOREG reads o0
+        // NOTE: a defining op's own res is not auto-live; only marked if read above
+        j=j+1
+    }
+    // Scan 2: no-op dead defs.
+    let k=opt_beg
+    while k<opt_end {
+        let op=irop(k)
+        if op==IR_CALL || op==IR_RET || op==IR_STR || op==IR_STOREG || op==IR_LABEL || op==IR_JMP || op==IR_BR || op==IR_FREE { k=k+1; continue }
+        let res=irres(k)
+        if w8(live_bits+res)==0 {
+            // dead def -> no-op (MOV res,res). Keep index; harmless.
+            //
+            // NEVER for a CONSTANT or a folded literal. A constant has no
+            // operands, so liveness has nothing to mark it and `live_bits[res]`
+            // is 0 whenever the value is not read by a later IR op -- and a
+            // literal passed straight to a call is read through the argument
+            // record list, not through the IR op that defines it. Rewriting
+            // such a record to `MOV res, res` DELETES the constant and leaves
+            // the argument register holding whatever it last held, so the call
+            // received a stale value from an earlier statement:
+            //     check("+maxf32", p,  5183643170566569984)
+            //     check("-maxf32", p, -4039728866288205824)
+            // passed -5183643170566569984 -- the previous constant. That is
+            // exactly what made test_f32_conv fail on a value that is
+            // plausible enough to look like a converter defect.
+            if op!=IR_CONST && op!=IR_FCONST {
+                w64(ir+k*IRS, IR_MOV); w64(ir+k*IRS+8,res); w64(ir+k*IRS+16,res); w64(ir+k*IRS+24,0); w64(ir+k*IRS+32,0)
+            }
+        }
+        k=k+1
+    }
+}
+
+// Return the home vreg of PARAM slot `idx` in the current function's IR, else -1.
+fn param_home_of(idx) {
+    let p=0
+    while p<irc {
+        if irop(p)==IR_PARAM && ira0(p)==idx { return irres(p) }
+        p=p+1
+    }
+    return -1
+}
+
+// Identifier length at src offset `a` (scan while [A-Za-z0-9_]).
+fn sidlen(a) {
+    let n=0
+    while n<64 {
+        let c=r8(src+a+n)
+        if c>=97 && c<=122 { n=n+1; continue }
+        if c>=65 && c<=90 { n=n+1; continue }
+        if n>0 && c>=48 && c<=57 { n=n+1; continue }
+        if c==95 { n=n+1; continue }
+        break
+    }
+    return n
+}
+// Compare src-string at `a` (an identifier) against cur_fnname (fns-table string).
+fn sname_eq(a) {
+    if sidlen(a) != cur_fnnlen { return 0 }
+    let n=0
+    while n<cur_fnnlen {
+        if r8(src+a+n) != r8(src+cur_fnname+n) { return 0 }
+        n=n+1
+    }
+    return 1
+}
+
+// Pass B: tail-call elimination (self-recursive, tail position only).
+// 0.0.230 Phase B2: byte displacement of a packed field from the struct base:
+// field offset + 8-byte length header. Computed in ONE place with explicit
+// parens so the displacement bytes cannot depend on operator-precedence guesses.
+
+
+fn def_is_constval(vr) {
+    let k = irc - 1
+    while k >= 0 {
+        if irres(k) == vr {
+            if irop(k) == IR_MOV { return def_is_constval(ira0(k)) }
+            if irop(k) == IR_CONST || irop(k) == IR_FCONST { return ira0(k) }
+            return -1
+        }
+        k = k - 1
+    }
+    return -1
+}
+
+// Pass D: strength-reduce an arithmetic-progression `while` loop to closed form.
+// Real IR shape emitted by parse_while for `while iv < C { sv = sv+iv; iv = iv+1 }`:
+//   [p]   LABEL st
+//   [p+1] CONST cvreg, C          (C compile-time constant)
+//   [p+2] LT    cmp, iv, cvreg
+//   [p+3] BR    cmp, en2, ct
+//   [p+4] LABEL ct
+//   [p+5] ADD   t1, sv, iv        (accumulator: operands {sv,iv})
+//   [p+6] MOV   sv, t1
+//   [p+7] CONST onev, 1
+//   [p+8] ADD   t2, iv, onev      (counter: iv + 1)
+//   [p+9] MOV   iv, t2
+//   [p+10] JMP  st
+//   [p+11] LABEL en2
+// with iv initialized to a compile-time constant `lo` (resolved via def_is_constval)
+// before the loop. Since lo and C are constants, count/sum are computed here and
+// emitted as CONSTs (no runtime MUL/DIV):
+//   count = max(0, C-lo);  sum = count*(2*lo+count-1)/2;  sv += sum;  iv = lo+count.
+// Rewrites BR -> JMP Lc (skip the body) and appends the closed-form epilogue.
+//
+// CORRECTNESS / SCOPE: matches the 12-record pattern by opcode+operand identity;
+// any deviation => loop left untouched (always correct). Closed form is valid for
+// ANY integer lo, C (count clamped at 0 when C<=lo). Product count*(2lo+count-1)
+// is always even => exact integer division.
+//
+fn opt_loop_strength() {
+    // G2: the closed-form `sum = count*(2*lo+count-1)/2` is computed at COMPILE
+    // time; for very large iteration counts it deliberately overflows i64. Wrap
+    // in unsafe{} so the bootstrapping compiler (which runs this on user loops)
+    // is exempt from the overflow trap during self-host.
+    unsafe {
+    if opt_on == 0 { return }
+    if had_error == 1 { return }
+    // Bound the pattern search to THIS function's IR slice: `irc` is the whole
+    // live buffer for a source function but the whole module arena for a cached
+    // one, so using it here would match patterns across function boundaries and
+    // rewrite unrelated records.
+    // `scan_end` is the ORIGINAL slice and stays fixed for the whole pass, even
+    // after a reduction grows opt_end. Without that the scan would walk into the
+    // records it just synthesised and could reduce the same loop twice.
+    let scan_end = opt_end
+    let n0 = scan_end
+    // A function contains at most one arithmetic-progression while-loop that this
+    // pattern matches, and the rewrite SHIFTS records, so scanning on after a
+    // reduction would re-enter on the synthesised tail and rewrite it again.
+    let reduced = 0
+    let p = opt_beg
+    while p < scan_end && reduced == 0 {
+        let ok = 1
+        if irop(p) != IR_LABEL { ok = 0 }
+        if ok == 1 { if p + 12 >= n0 { ok = 0 } }
+        if ok == 1 {
+            let stl = ira0(p)
+            if irop(p+1) != IR_CONST { ok = 0 }
+            if ok == 1 { if irop(p+2) != IR_LT { ok = 0 } }
+            if ok == 1 { if irop(p+3) != IR_BR { ok = 0 } }
+            if ok == 1 { if irop(p+4) != IR_LABEL { ok = 0 } }
+            if ok == 1 { if irop(p+5) != IR_ADD { ok = 0 } }
+            if ok == 1 { if irop(p+6) != IR_MOV { ok = 0 } }
+            if ok == 1 { if irop(p+7) != IR_CONST { ok = 0 } }
+            if ok == 1 { if irop(p+8) != IR_ADD { ok = 0 } }
+            if ok == 1 { if irop(p+9) != IR_MOV { ok = 0 } }
+            if ok == 1 { if irop(p+10) != IR_JMP { ok = 0 } }
+            if ok == 1 { if irop(p+11) != IR_LABEL { ok = 0 } }
+            if ok == 1 {
+                let cvreg = irres(p+1)
+                let Cval  = ira0(p+1)
+                let iv    = ira0(p+2)
+                let cmp   = irres(p+2)
+                let en2   = ira1(p+3)
+                let ct    = ira2(p+3)
+                if ira1(p+2) != cvreg { ok = 0 }
+                if ok == 1 { if ira0(p+3) != cmp { ok = 0 } }
+                if ok == 1 { if ira0(p+4) != ct { ok = 0 } }
+                if ok == 1 { if ira0(p+10) != stl { ok = 0 } }
+                if ok == 1 { if ira0(p+11) != en2 { ok = 0 } }
+                let t1  = irres(p+5)
+                let ad0 = ira0(p+5)
+                let ad1 = ira1(p+5)
+                let sv  = irres(p+6)
+                if ira0(p+6) != t1 { ok = 0 }
+                if ok == 1 {
+                    let accok = 0
+                    if ad0 == sv && ad1 == iv { accok = 1 }
+                    if ad0 == iv && ad1 == sv { accok = 1 }
+                    if accok == 0 { ok = 0 }
+                }
+                let onev = irres(p+7)
+                if ok == 1 { if ira0(p+7) != 1 { ok = 0 } }
+                let t2 = irres(p+8)
+                if ok == 1 {
+                    let stepok = 0
+                    if ira0(p+8) == iv && ira1(p+8) == onev { stepok = 1 }
+                    if ira0(p+8) == onev && ira1(p+8) == iv { stepok = 1 }
+                    if stepok == 0 { ok = 0 }
+                }
+                if ok == 1 { if irres(p+9) != iv { ok = 0 } }
+                if ok == 1 { if ira0(p+9) != t2 { ok = 0 } }
+                if ok == 1 { if sv == iv { ok = 0 } }
+                if ok == 1 {
+                    let lo = 0
+                    let found = 0
+                    let s = p - 1
+                    while s >= 0 {
+                        if irop(s) == IR_MOV && irres(s) == iv {
+                            let lv = def_is_constval(ira0(s))
+                            if lv != -1 { lo = lv; found = 1 }
+                            s = 0
+                        }
+                        s = s - 1
+                    }
+                    if found == 1 {
+                        let count = Cval - lo
+                        if count < 0 { count = 0 }
+                        let sum = 0
+                        if count > 0 { sum = count * (2 * lo + count - 1) / 2 }
+                        let ivfinal = lo + count
+                        let sumv = nv()
+                        let Lc = nl()
+                        // Rewrite the loop in place. The ten records p+1..p+10 are
+                        // retired and the closed form needs only five slots, so the
+                        // whole rewrite fits WITHOUT shifting the tail -- an earlier
+                        // version inserted the closed form after p+11 and shifted
+                        // everything up by five, which duplicated the records that
+                        // followed and left the synthesised IR_LABEL unreachable.
+                        //
+                        // Layout:
+                        //   p       IR_JMP   Lc     -- skip the original body
+                        //   p+1..p+10  closed form + throwaway labels
+                        //   p+11   IR_LABEL en2    -- the loop's exit, untouched
+                        //   p+12..  the rest of the function, untouched
+                        //
+                        // The closed form must live INSIDE the slice. Appending it at
+                        // ir+irc*IRS (the old behaviour) put it after the function's
+                        // trailing IR_RET, where it was unreachable dead code: its
+                        // IR_LABEL never bound, lblf() returned -1, and the guard
+                        // jump kept a zero displacement -- an infinite loop. That is
+                        // why this reduction had never actually fired.
+                        w64(ir+p*IRS, IR_JMP); w64(ir+p*IRS+8, 0); w64(ir+p*IRS+16, Lc); w64(ir+p*IRS+24, 0); w64(ir+p*IRS+32, 0)
+                        w64(ir+(p+1)*IRS, IR_LABEL); w64(ir+(p+1)*IRS+8, 0); w64(ir+(p+1)*IRS+16, Lc); w64(ir+(p+1)*IRS+24, 0); w64(ir+(p+1)*IRS+32, 0)
+                        w64(ir+(p+2)*IRS, IR_CONST); w64(ir+(p+2)*IRS+8, sumv); w64(ir+(p+2)*IRS+16, sum); w64(ir+(p+2)*IRS+24, 0); w64(ir+(p+2)*IRS+32, 0)
+                        w64(ir+(p+3)*IRS, IR_ADD); w64(ir+(p+3)*IRS+8, sv); w64(ir+(p+3)*IRS+16, sv); w64(ir+(p+3)*IRS+24, sumv); w64(ir+(p+3)*IRS+32, 0)
+                        w64(ir+(p+4)*IRS, IR_CONST); w64(ir+(p+4)*IRS+8, iv); w64(ir+(p+4)*IRS+16, ivfinal); w64(ir+(p+4)*IRS+24, 0); w64(ir+(p+4)*IRS+32, 0)
+                        w64(ir+(p+5)*IRS, IR_JMP); w64(ir+(p+5)*IRS+8, 0); w64(ir+(p+5)*IRS+16, en2); w64(ir+(p+5)*IRS+24, 0); w64(ir+(p+5)*IRS+32, 0)
+                        // p+6..p+10 become throwaway labels: IR_LABEL is the one
+                        // opcode whose emit does nothing but lbladd(), so it touches
+                        // no vreg. A self-move no-op is NOT safe here -- IR_BR/IR_JMP
+                        // carry res=0, and IR_MOV emits sdef(0,...) which relocates
+                        // vreg 0's spill slot and clobbers live state.
+                        let Ldead = nl()
+                        let nq = 6
+                        while nq < 11 {
+                            let rq = ir+(p+nq)*IRS
+                            w64(rq, IR_LABEL); w64(rq+8, 0); w64(rq+16, Ldead); w64(rq+24, 0); w64(rq+32, 0)
+                            nq = nq + 1
+                        }
+                        reduced = 1
+                    }
+                }
+            }
+        }
+        p = p + 1
+    }
+    }
+}
+
+fn opt_tailcall() {
+    if opt_on==0 { return }
+    if had_error==1 { return }
+    if cur_fnname==0 { return }
+    // Find a RETURN whose operand is the result vreg of a self CALL.
+    let ri=opt_beg
+    while ri<opt_end {
+        if irop(ri)==IR_RET {
+            let rv=ira0(ri)
+            let ci2=opt_beg
+            while ci2<opt_end {
+                if irop(ci2)==IR_CALL && irres(ci2)==rv {
+                    if sname_eq(ira0(ci2))==1 {
+                        // === transform ===
+                        let acnt=ira1(ci2); let avs=ira2(ci2)
+                        let L=nl()  // entry label
+                        // Reuse the CALL's arg-MOV record slots [avs..avs+acnt-1] as the
+                        // param-moves (MOV param_home[i], argvr[i]). No mid-array shift.
+                        let bad=0
+                        let w=0
+                        while w<acnt {
+                            let argrec=avs+w
+                            let argvr=0
+                            if argrec>=opt_beg && argrec<opt_end { argvr=ira0(argrec) }
+                            let ph=param_home_of(w)
+                            if ph<0 { bad=1 }
+                            w64(ir+argrec*IRS, IR_MOV); w64(ir+argrec*IRS+8, ph); w64(ir+argrec*IRS+16, argvr); w64(ir+argrec*IRS+24,0); w64(ir+argrec*IRS+32,0)
+                            w=w+1
+                        }
+                        if bad==1 { return }  // param slot missing; bail (no corruption)
+                        // CALL@ci2 -> JMP L
+                        w64(ir+ci2*IRS, IR_JMP); w64(ir+ci2*IRS+8,0); w64(ir+ci2*IRS+16,L); w64(ir+ci2*IRS+24,0); w64(ir+ci2*IRS+32,0)
+                        // RET@ri -> JMP L (base-case RET elsewhere stays)
+                        w64(ir+ri*IRS, IR_JMP); w64(ir+ri*IRS+8,0); w64(ir+ri*IRS+16,L); w64(ir+ri*IRS+24,0); w64(ir+ri*IRS+32,0)
+                        // Insert LABEL L AFTER the last IR_PARAM so the loop-back skips
+                        // the param-from-stack reload (otherwise it clobbers our args).
+                        // Single safe shift (+1) at (lastparam+1) <= front of body.
+                        let lastparam=-1
+                        let pp=opt_beg
+                        while pp<opt_end {
+                            if irop(pp)==IR_PARAM { lastparam=pp }
+                            pp=pp+1
+                        }
+                        let ins=lastparam+1
+                        let s2=irc-1
+                        while s2>=ins {
+                            w64(ir+(s2+1)*IRS, irop(s2))
+                            w64(ir+(s2+1)*IRS+8, irres(s2))
+                            w64(ir+(s2+1)*IRS+16, ira0(s2))
+                            w64(ir+(s2+1)*IRS+24, ira1(s2))
+                            w64(ir+(s2+1)*IRS+32, ira2(s2))
+                            s2=s2-1
+                        }
+                        irc=irc+1
+                        w64(ir+ins*IRS, IR_LABEL); w64(ir+ins*IRS+8,0); w64(ir+ins*IRS+16,L); w64(ir+ins*IRS+24,0); w64(ir+ins*IRS+32,0)
+                        return
+                    }
+                }
+                ci2=ci2+1
+            }
+        }
+        ri=ri+1
+    }
+}
+
+fn ci_func(fi, is_main) {
+    // Per-function IR slice. Source-parsed functions live in the live `ir` buffer
+    // and own 0..irc. Cache-imported functions live in the module arena
+    // (`qir_mod`) and own [ir_beg, ir_end). Both are indexed in ABSOLUTE IR
+    // indices, so IR_CALL's argument-list pointer (a2) and branch targets (a0)
+    // are already correct within whichever buffer they were captured in -- no
+    // relocation is needed, provided the caller points `ir` at the right arena.
+    let ir_beg = r64(fn_ir_start + fi*8)
+    let ir_end = ir_beg + r64(fn_ir_count + fi*8)
+    let is_cache = r64(qimp_is_cache + fi*8)
+    if is_cache == 0 { ir_beg = 0; ir_end = irc }
+    // Run the Tier-1 optimiser over THIS function's slice only. The source path
+    // calls opt_func() externally; doing it here guarantees the same treatment
+    // regardless of which arena the IR lives in.
+    opt_beg = ir_beg
+    opt_end = ir_end
+    opt_func()
+    // Remember how high the vreg numbering got, then reset it.
+    //
+    // aclr() (emitter.quanta) clears vr_init / vr_spill / vfloat with
+    // `while i < vreg_n`. It runs LATER in this function than the reset below, so
+    // by then vreg_n is already 0 and the loop body never executes: the per-vreg
+    // side tables were NEVER cleared between functions.
+    //
+    // vfloat is what is_float_vr() reads, so a stale tag from a previously
+    // compiled function survived into the next one. The symptom was a float
+    // global whose arithmetic worked or failed depending on POSITION -- anything
+    // emitted before it shifted the vreg numbering -- which is the signature of a
+    // tag being inherited rather than derived. Disassembly confirmed it exactly:
+    // one program emitted `movq %rax,%xmm0` + `addsd` (correct) and another
+    // emitted `cvtsi2sd %rdx,%xmm0` + `addsd` for the identical expression,
+    // where cvtsi2sd is fopld_rr's INTEGER path and the operand is the bit
+    // pattern of the global read as a float.
+    //
+    // vreg_high carries the previous function's extent across the reset so aclr()
+    // can actually clear it.
+    vreg_high = vreg_n
+    vreg_n = 0
+    if is_cache == 1 {
+      // Per-function context the source path establishes before parsing a body.
+      // Without these an imported function inherits the previous function's label
+      // counter, closure context, and operator-overload suppression.
+      lblc = 0
+      cur_clo = 0 - 1
+      overload_suppressed = 0
+      // The source path allocates every vreg through nv(), which initialises
+      // vreg_is_str / vreg_is_big / vreg_clo / vreg_to_param to their
+      // defaults. A cached function REUSES the vreg numbers baked into its
+      // serialised IR and never calls nv(), so those tables still hold the
+      // PREVIOUS function's values when codegen reads them.
+      //
+      // The initialisation MUST match nv() byte for byte. The previous version
+      // of this block used w8() for vreg_is_str / vreg_is_big / vreg_clo
+      // while nv() uses w64(). w8 writes a single byte, so the read-back
+      // r64() returned the stale upper seven bytes of the slot -- an
+      // arbitrary value, which is the same uninitialised-read class this
+      // block exists to remove. That is what broke closure_named_fn.
+      // Bounded to THIS function's IR slice, not the whole module. On the cache
+      // path `ir` points at the module arena and `irc` is the module's total
+      // record count, so scanning 0..irc walks every other function's records
+      // and reads their vregs as if they belonged to this one.
+      // Bounded to this function's IR within the LIVE buffer: ir_beg..irc.
+      //
+      // Not 0..irc: on the cache path `ir` is the module arena, so index 0 is
+      // another function's first record.
+      // Not ir_beg..ir_end: on the SOURCE path a function's closure bodies are
+      // emitted into the same buffer AFTER the parent body, past ir_end, and
+      // they carry the captured vregs this scan must see. Bounding to ir_end
+      // truncated the range and cost closure_capture its vreg_clo state.
+      let mvmax2 = 0
+      let mv2 = ir_beg
+      // Bound to THIS function's own slice. On the cache path `ir` is the module
+      // arena and `irc` is the whole module's record count, so irc walks every
+      // other cached function's records and takes the max vreg across all of
+      // them. The init loop below then clears type/str/big/clo tags for vregs
+      // that belong to a LATER function, and when that function is compiled its
+      // own tags are already wrong -- which is how a cached function calling
+      // two other cached functions returned a wrong value (chain(10) gave 12
+      // instead of 38) while every single- and two-function module was correct.
+      //
+      // ir_end is right for both paths here: on the source path a function's
+      // closure bodies are emitted past ir_end, but this block only runs when
+      // is_cache==1, and a cached function has no closure bodies of its own.
+      let mv2_end = ir_end
+      while mv2 < mv2_end {
+        let rv2 = irres(mv2)
+        if rv2 > mvmax2 { mvmax2 = rv2 }
+        mv2 = mv2 + 1
+      }
+      if mvmax2 > VREG_CAP { mvmax2 = VREG_CAP }
+      let mi3 = 0
+      while mi3 <= mvmax2 {
+        w64(vreg_is_str + mi3*8, 0-1)
+        w64(vreg_is_big + mi3*8, 0-1)
+        w64(vreg_clo    + mi3*8, 0-1)
+        w64(vreg_to_param + mi3*8, 0)
+        w64(vreg_type + mi3*8, 0)
+        mi3 = mi3 + 1
+      }
+      if r64(OPFN_SUPP + fi*8) == 1 { overload_suppressed = 1 }
+      // Re-bind parameter names to their vregs. The cached slice carries the
+      // IR_PARAM records (op 21) with the vreg each parameter occupies, but a
+      // cache file stores no live scope table -- without this, vfind() cannot
+      // resolve any parameter name and the body reads uninitialised vregs.
+      // The name comes from the serialised param-name blob via fn_pnames.
+      let pcount_c = r64(fn_pcount + fi*8)
+      let pbase_c = r64(fn_pbase + fi*8)
+      let ci2 = ir_beg
+      let pseen = 0
+      while ci2 < ir_end && pseen < pcount_c {
+        if irop(ci2) == IR_PARAM {
+          let pvr = ira0(ci2)
+          let ppi = ira1(ci2)
+          if ppi >= 0 && ppi < 8 {
+            let pnm_c = r64(fn_pnames + pbase_c + ppi*16)
+            let pnl_c = r64(fn_pnames + pbase_c + ppi*16 + 8)
+            if pnl_c > 0 { vadd(pnm_c, pnl_c, pvr) }
+            // Link the param vreg to its fn_parstr slot. Both find_str_source()
+            // and arg_is_str() need this to recognise a string that arrived
+            // through a parameter: vreg_is_str only ever gets set for the
+            // vreg that IS the string, and a param vreg never is -- so with
+            // this link missing, print()/echo() inside any function that took a
+            // string printed the raw heap pointer instead of the text. That
+            // silently affected every string-taking helper in the tree.
+            // Key shape matches funcscan/objfmt: fi*200 + arg_index.
+            w64(vreg_to_param + pvr*8, fi*200 + ppi)
+          }
+          pseen = pseen + 1
+        }
+        ci2 = ci2 + 1
+      }
+      // NOTE: generic type parameters are deliberately NOT re-allocated here.
+      // Their IR_CONST marker records are already inside the cached function's
+      // own IR slice, and their vreg numbers were fixed when that IR was first
+      // parsed. Re-allocating them would shift every subsequent nv() and make the
+      // cached function's vreg numbering disagree with the numbers baked into
+      // its own records -- which is what produced null string pointers at run
+      // time. The same applies to IR_PARAM: the cached slice carries those
+      // records, so params are bound by re-walking the slice, not by re-emitting.
+    }
+    let pstart = patchc
+    // Pre-scan IR to compute total string buffer size AND the true max vreg,
+    // so the spill frame is sized to hold every vreg's home slot.  (compiler.py
+    // sizes the frame from max_vreg; ci_func must match or spills for functions
+    // with >2041 vregs run past the min_spill frame and corrupt locals.)
+    let total_str=0
+    let maxvr=0
+    let psi=ir_beg
+    while psi<ir_end {
+        let pres=irres(psi); if pres>maxvr { maxvr=pres }
+        if irop(psi)==IR_STR {
+            let sp2=ira0(psi)+1; let ln2=0; let scp2=sp2
+            while scp2<srclen&&r8(src+scp2)!=34 {
+                ln2=ln2+1; if r8(src+scp2)==92&&scp2+1<srclen { scp2=scp2+2 } else { scp2=scp2+1 }
+            }
+            let bsz2=8+ln2+1; let pad2=bsz2%16; if pad2>0 { bsz2=bsz2+(16-pad2) }
+            total_str=total_str+bsz2
+        }
+        psi=psi+1
+    }
+    vreg_n = maxvr + 1
+    aclr()
+    fclr()
+    // RE-MARK float vregs (vfloat was cleared by aclr). i2f(x) yields a float
+    // result; follow IR_MOV chains so the float flag reaches the MUL/ADD/SUB
+    // operands. Iterate to a fixpoint (multi-level MOV chains). Runs after aclr.
+    // ---- global float pre-pass ----
+    //
+    // Decide which module-level globals hold f64 BEFORE the vreg fixpoint below,
+    // because that fixpoint consults gfloat when it tags IR_LOADG destinations.
+    // Doing it inside the fixpoint was not enough: on the first sweep the tag for
+    // a literal initialised inside a function (`g = 3.0` in main) is not yet known
+    // at the point the store is visited, so the global stays untagged and every
+    // read of it in the same function is untagged too.
+    //
+    //   let g = 0.0 ; (in main) g = 3.0 ; g + 1.0   ->  inf    want 4.0
+    //
+    // Two sources feed gfloat, and both are needed:
+    //   1. scan_globals() records it from the DECLARATION's initialiser token
+    //      (`let g = 3.0`).
+    //   2. this pre-pass records it from any float STORE into the slot
+    //      (`g = 3.0` inside a function), because the declaration of a slot that
+    //      starts at 0.0 says nothing about what is later written to it.
+    //
+    // gfloat is only ever set 0 -> 1, never cleared, so a global cannot be
+    // un-tagged by a later integer store into the same slot. That is deliberate:
+    // an int store into a float global is a type error the caller should not rely
+    // on, whereas the reverse -- the common case -- must keep working.
+    {
+        // Settle the vreg tags first, so `is_float_vr` on a stored value means
+        // something. Two bounded rounds are enough: an f64 literal is already
+        // tagged by the IR_CALL case below, and an assignment chain in one
+        // function is at most one hop deep.
+        let gr = 0
+        while gr < 2 {
+            gr = gr + 1
+            let gp = ir_beg
+            while gp < ir_end {
+                if irop(gp)==IR_FCONST {
+                    // An f64 literal IS a float vreg. Dumping the IR for
+                    // `g = 3.0` shows op=38 (IR_FCONST) carrying the literal's
+                    // bit pattern and writing vreg 0, which the following
+                    // IR_STOREG then stores into the global -- so IR_FCONST, not
+                    // IR_CALL, is what a literal assigned inside a function
+                    // lowers to. The fixpoint below has an IR_FCONST case; this
+                    // pre-pass needs one too, or the store is seen before its
+                    // value is known to be a float.
+                    if r8(vfloat+irres(gp))!=1 { w8(vfloat+irres(gp), 1) }
+                }
+                else if irop(gp)==IR_CALL {
+                    let gnm = ira0(gp)
+                    let gf64 = 0
+                    if r8(src+gnm)=='i' && r8(src+gnm+1)=='2' && r8(src+gnm+2)=='f' { gf64 = 1 }
+                    if r8(src+gnm)=='f' && r8(src+gnm+1)=='c' && r8(src+gnm+2)=='o' { gf64 = 1 }
+                    if r8(src+gnm)=='f' && r8(src+gnm+1)=='6' && r8(src+gnm+2)=='4' { gf64 = 1 }
+                    if gf64==1 && r8(vfloat+irres(gp))!=1 { w8(vfloat+irres(gp), 1) }
+                }
+                gp = gp + 1
+            }
+        }
+        let gp = ir_beg
+        while gp < ir_end {
+            // iremit(IR_STOREG, 0, src_vreg, gvar_index): a0 is the source vreg
+            // and a1 is the global index (helpers.quanta).
+            if irop(gp)==IR_STOREG {
+                let sgv = ira0(gp)
+                let sgi = ira1(gp)
+                if sgv>=0 && sgi>=0 && sgi<gvarc && is_float_vr(sgv)==1 {
+                    w8(gfloat+sgi*8, 1)
+                }
+            }
+            // A global READ of an already-known-float global is itself float, so
+            // propagate through `let t = g` chains within this function.
+            else if irop(gp)==IR_LOADG {
+                let lgv = ira0(gp)
+                let lgi = ira1(gp)
+                if lgv>=0 && lgi>=0 && lgi<gvarc && r8(gfloat+lgi*8)==1 {
+                    if r8(vfloat+lgv)!=1 { w8(vfloat+lgv, 1) }
+                }
+            }
+            else if irop(gp)==IR_MOV {
+                if r8(vfloat+ira0(gp))==1 && r8(vfloat+irres(gp))!=1 { w8(vfloat+irres(gp), 1) }
+            }
+            gp = gp + 1
+        }
+    }
+    {
+        let changed=1
+        while changed==1 {
+            changed=0
+            let mp=ir_beg
+            while mp<ir_end {
+                if irop(mp)==IR_CALL {
+                    let mnm = ira0(mp)
+                    // A call yields a float result when it is:
+                    //   - i2f(x)                     (int -> f64)
+                    //   - fconst(M, scale)           (how the parser lowers an f64 literal)
+                    //   - f64_load(p)                (the typed float load)
+                    //   - a function declared `-> f64` (via fn_retflt)
+                    //
+                    // The last three are the ones an enclosing operation depends on.
+                    // codegen's IR_CALL emit branch applies the fn_retflt tag itself,
+                    // but only AS the call is emitted, and emit_bltn asks is_float_vr()
+                    // about an operand while emitting the ENCLOSING call. A nested
+                    // operand therefore has no tag yet and the float path is silently
+                    // skipped:
+                    //     fadd(f64_load(p), f64_load(p+8))   -> correct
+                    //     fadd(f64_read(p), f64_read(p+8))   -> 1.0 instead of 6.0
+                    // where f64_read is `fn f64_read(ptr: i64): f64 { return f64_load(ptr) }`
+                    // -- same signature, same body, one extra call layer. Tagging every
+                    // call here, before emission, removes the ordering dependency.
+                    let mcf = -1
+                    let mcn = 0
+                    while mcn < 200 && r8(src+mnm+mcn)!=0 && r8(src+mnm+mcn)!=40 && r8(src+mnm+mcn)!=41 && r8(src+mnm+mcn)!=44 { mcn = mcn + 1 }
+                    if mcn > 0 { mcf = findfn(mnm, mcn) }
+                    let isf64 = 0
+                    if r8(src+mnm)=='i' && r8(src+mnm+1)=='2' && r8(src+mnm+2)=='f' { isf64 = 1 }
+                    if r8(src+mnm)=='f' && r8(src+mnm+1)=='c' && r8(src+mnm+2)=='o' { isf64 = 1 }
+                    if r8(src+mnm)=='f' && r8(src+mnm+1)=='6' && r8(src+mnm+2)=='4' && r8(src+mnm+3)=='_' && r8(src+mnm+4)=='l' && r8(src+mnm+5)=='o' && r8(src+mnm+6)=='a' && r8(src+mnm+7)=='d' { isf64 = 1 }
+                    if mcf>=0 && mcf<fnc && r64(fn_retflt + mcf*8)==1 { isf64 = 1 }
+                    if isf64==1 {
+                        if r8(vfloat+irres(mp))!=1 { w8(vfloat+irres(mp), 1); changed=1 }
+                        // ALSO tag the ARGUMENT-LIST entries. emit_bltn reads an
+                        // operand as vfloat[irres(ira2(ii)+k)] -- the record at the
+                        // call's argument-list pointer -- which is NOT the same vreg
+                        // as the call's own result. Tagging only the result left
+                        // vfloat[arg0] == 0 when the enclosing fadd asked for it.
+                        // Measured directly, encoding (is_float_vr(arg0),
+                        // is_float_vr(arg1), vfloat[arg0], vfloat[arg1)) as digits:
+                        //   fadd(1.0, 2.0)          -> 1111
+                        //   fadd(f64_load(p), 1.0)  -> 1111
+                        //   fadd(gg5(p), 1.0)       -> 0110   <- arg0 untagged
+                        // where `fn gg5(q: i64): f64 { return mem_load(q) }` is a plain
+                        // declared-f64 function. The arg entries were the gap.
+                        let avp = ira2(mp)
+                        if isf64==1 && avp>=0 && avp<ir_end {
+                            let ak = 0
+                            let an = ira1(mp)
+                            while ak < an && avp+ak < ir_end {
+                                let avr = irres(avp+ak)
+                                if avr>=0 && r8(vfloat+avr)!=1 { w8(vfloat+avr, 1); changed=1 }
+                                ak = ak + 1
+                            }
+                        }
+                    }
+                } else if irop(mp)==IR_LOADG {
+                    // Reading a float module-level global yields an f64 bit
+                    // pattern, so the destination vreg is a float. IR_LOADG was
+                    // missing from this prepass entirely -- see gfloat in
+                    // globals.quanta. This is the fix for `g + 1.0` returning
+                    // inf, and for pow/log/fadd reading global operands wrongly.
+                    let lgv = ira0(mp)
+                    let lgi = ira1(mp)
+                    if lgv>=0 && lgi>=0 && lgi<gvarc && r8(gfloat+lgi*8)==1 {
+                        if r8(vfloat+lgv)!=1 { w8(vfloat+lgv, 1); changed=1 }
+                    }
+                } else if irop(mp)==IR_ISTORE {
+                    // iremit(IR_ISTORE, 0, base, index, value): a0 = array, a2 = value.
+                    let xa = ira0(mp)
+                    let xv = ira2(mp)
+                    if xa>=0 && xv>=0 && is_float_vr(xv)==1 && r64(vreg_farr+xa*8)!=1 {
+                        w64(vreg_farr+xa*8, 1); changed=1
+                    }
+                } else if irop(mp)==IR_MOV {
+                    if r8(vfloat+ira0(mp))==1 && r8(vfloat+irres(mp))!=1 { w8(vfloat+irres(mp), 1); changed=1 }
+                    // Copy the float-ARRAY property along with the value. An array
+                    // literal's base vreg and the vreg a load reads through are
+                    // usually NOT the same: probed on `let arr = [3.0, 4.0]`, the
+                    // IR_ISTORE recorded the array at vreg 2 while IR_IDX read its
+                    // base from vreg 5, so the table never matched and the element
+                    // stayed untagged. Same shape as the vreg_is_str propagation
+                    // beside it.
+                    if ira0(mp)>=0 && irres(mp)>=0 && r64(vreg_farr+ira0(mp)*8)==1 && r64(vreg_farr+irres(mp)*8)!=1 {
+                        w64(vreg_farr+irres(mp)*8, 1); changed=1
+                    }
+                } else if irop(mp)==IR_RET {
+                    // A `-> f64` function RETURNS a float, whatever its body happened
+                    // to compute. Tag the vreg it returns.
+                    //
+                    // Without this the tag depended on the body's own source: a
+                    // function returning a literal, an f64 parameter or i2f(x) was
+                    // already tagged at the definition site and worked, while one
+                    // returning `f64_load(p)` or `mem_load(p)` was not, and the
+                    // caller's fadd took the integer path over the bit patterns.
+                    // Measured on the same signature: literal body passes, load body
+                    // does not. Declared type is the right source of truth.
+                    if ira0(mp)>=0 && r64(fn_retflt + fi*8)==1 {
+                        if r8(vfloat+ira0(mp))!=1 { w8(vfloat+ira0(mp), 1); changed=1 }
+                    }
+                } else if irop(mp)==IR_PARAM {
+                    // A parameter declared `: f64` is a float vreg. This has to
+                    // happen HERE, after aclr() has zeroed vfloat -- tagging at
+                    // parse time is wiped before the emit pass runs.
+                    //
+                    // It was missing entirely, and the failure was quiet: + - * on a
+                    // float parameter reached their SSE path only because the
+                    // integer path happened to agree on the values first tried,
+                    // while / fell through to the integer idiv and raised SIGFPE on
+                    // the float bit patterns. Float LOCALS were always tagged, via
+                    // the IR_FCONST that produced them, so `let a: f64 = 10.0;
+                    // a / 2.0` worked and `fn f(a: f64) -> f64 { a / 2.0 }` did not.
+                    // That asymmetry is what hid it.
+                    let ppi = ira0(mp)
+                    if r64(fn_parflt + (fi*200 + ppi)*8)==1 {
+                        if r8(vfloat+irres(mp))!=1 { w8(vfloat+irres(mp), 1); changed=1 }
+                    }
+                } else if irop(mp)==IR_FCONST {
+                    // An f64 literal IS a float vreg. IR_FCONST's own definition
+                    // says "result vreg tagged float" but nothing here did it.
+                    if r8(vfloat+irres(mp))!=1 { w8(vfloat+irres(mp), 1); changed=1 }
+                } else if irop(mp)==IR_CALL {
+                    // The parser lowers EVERY f64 literal (TT_FNUM) to an IR_CALL
+                    // named "fconst" -- IR_FCONST is never emitted (see the note at
+                    // the fold pass above). The fold pass did tag these, but aclr()
+                    // zeroes vfloat for every vreg afterwards, so that tag was gone
+                    // by the time the emit pass ran.
+                    //
+                    // That left `let r = 6.0` as an UNTAGGED vreg, and every
+                    // arithmetic op whose floatness depended on it fell through to
+                    // the integer path:
+                    //
+                    //     let r = 6.0
+                    //     r / 2.0 -> 6.000000   (a1 inline literal is itself tagged)
+                    //     r / 2   -> 0.000000   (a1 int vreg, vfloat[r]==0)
+                    //     r + 2   -> hangs       (integer path, corrupt widths)
+                    //
+                    // The tell was that a FLOAT in a1 rescued the same expression:
+                    // the float had to reach the op tagged, and `r` alone never was.
+                    // The integer path ran on raw IEEE-754 bit patterns -- 6.0 is
+                    // 4613937818241073152, and idiv by 2 leaves a denormal that
+                    // prints as 0.000000.
+                    let cnm = ira0(mp)
+                    let is_fc = 0
+                    if r8(src+cnm)=='f' && r8(src+cnm+1)=='c' && r8(src+cnm+2)=='o' { is_fc=1 }
+                    if is_fc==0 && r8(src+cnm)=='i' && r8(src+cnm+1)=='2' && r8(src+cnm+2)=='f' { is_fc=1 }
+                    if is_fc==1 {
+                        if r8(vfloat+irres(mp))!=1 { w8(vfloat+irres(mp), 1); changed=1 }
+                    }
+                } else if irop(mp)==IR_MUL || irop(mp)==IR_ADD || irop(mp)==IR_SUB || irop(mp)==IR_FDIV {
+                    // NOTE: an UNTYPED parameter used as a float (`fn f(a, b) { a*b }`)
+                    // is not recoverable from the IR body alone. IR_PARAM's result
+                    // vreg belongs to the CALLEE's vreg space and the caller's float
+                    // vreg belongs to a different space, so no IR_MOV chain connects
+                    // them -- the callee simply cannot see what was passed. `a * b`
+                    // then took the integer imul path on the bit patterns, overflowed,
+                    // and the emitted jno trap fired as SIGILL (exit 132).
+                    //
+                    // This block used to paper over that by propagating floatness from
+                    // one operand to the other within the arithmetic op:
+                    //
+                    //     if vfloat+ira0==1 && vfloat+ira1!=1 { w8(vfloat+ira1,1) }
+                    //
+                    // That inference is UNSOUND and has been removed. It cannot
+                    // distinguish "untyped parameter that received a float" from
+                    // "genuine integer operand", so it tagged integer operands as
+                    // float:
+                    //
+                    //     fn h(a,b){ return a*b }   h(2, 1.0)
+                    //
+                    // a0=a holds the integer 2 and is NOT tagged by any legitimate
+                    // rule, but ira1 (b) is tagged, so the rule tagged a0 as float
+                    // too. fopld then moved the raw integer 2 -- not its f64 value --
+                    // into xmm0 as 0x0000000000000002, i.e. 1e-323, and the product
+                    // came out 0.0 instead of 2.0. Every mixed float/int expression
+                    // in the stdlib was corrupted by this rule.
+                    //
+                    // The correct source is the CALL SITE: scan_call_float() marks a
+                    // parameter's fn_parflt bit from a float literal argument before
+                    // codegen runs, and the IR_PARAM branch above turns that into a
+                    // vfloat tag. An operand that is not tagged is genuinely an
+                    // integer and is converted with cvtsi2sd by fopld. Nothing needs
+                    // to guess.
+                }
+                mp=mp+1
+            }
+        }
+    }
+    // Prologue
+    // Discard the fixpoint's float tags and re-derive only the two cases that
+    // come from a type TABLE rather than from a record scan: a parameter declared
+    // `: f64` (fn_parflt) and a call to a function declared `-> f64` (fn_retflt).
+    //
+    // Why discard the rest. The fixpoint above walks records and follows IR_MOV
+    // chains, but on the source path ci_func scans 0..irc -- every function's
+    // records live in one buffer and vreg numbering RESTARTS per function, so a
+    // record in another function naming vreg 0 is indistinguishable from this
+    // function's own vreg 0. A module-level float initialiser is compiled as its
+    // own pseudo-function (entry.quanta, ci_func(0,0)) and lowers to IR_CALL
+    // fconst writing vreg 0, which is also the first parameter's vreg:
+    //
+    //     let G = 2.0
+    //     fn t(n: i64) -> i64 { let s = G  return n + 1 }
+    //     t(20) -> 1.0's bit pattern   (want 21)
+    //
+    // fopld_rr then bit-moved n instead of converting it -- measured in the
+    // emitted code as `movq %rbx,%xmm0` where `cvtsi2sd %rbx,%xmm0` was required.
+    // 20 became 1e-322 and 1e-322 + 1.0 rounds to exactly 1.0.
+    //
+    // Nothing is lost: every float PRODUCER re-tables its own result as it is
+    // EMITTED (IR_LOADG from gfloat, IR_FCONST, IR_NEG, and the arithmetic
+    // branches all write w8(vfloat+res, 1)), so an f64 literal's vreg is re-tagged
+    // from its own record during emit.
+    {
+        let z=0
+        let zhi=vreg_n
+        if vreg_high>zhi { zhi=vreg_high }
+        while z<zhi+8 { w8(vfloat+z,0); z=z+1 }
+        let tb=ir_beg
+        while tb<ir_end {
+            let top=irop(tb); let tres=irres(tb); let ta0=ira0(tb)
+            if tres>=0 {
+                if top==IR_PARAM && ta0>=0 && r64(fn_parflt + (fi*200 + ta0)*8)==1 { w8(vfloat+tres,1) }
+                if top==IR_CALL {
+                    let tl=0
+                    while tl<200 && r8(src+ta0+tl)!=0 && r8(src+ta0+tl)!=40 && r8(src+ta0+tl)!=41 && r8(src+ta0+tl)!=44 { tl=tl+1 }
+                    let tcf=-1
+                    if tl>0 { tcf=findfn(ta0,tl) }
+                    if tcf>=0 && tcf<fnc && r64(fn_retflt + tcf*8)==1 { w8(vfloat+tres,1) }
+                }
+            }
+            tb=tb+1
+        }
+    }
+    // 0.0.229 Phase B (B3): naked functions.
+    //
+    // `naked fn` means the body is hand-written machine code (via asm!) that
+    // performs its own prologue/epilogue. The compiler emits NOTHING around it:
+    // no push rbp, no saved registers, no frame allocation, and IR_RET becomes a
+    // bare `ret` (the body moves its own return value into rax).
+    //
+    // FAIL CLOSED, per the plan: without a frame there are no spill slots, no
+    // string buffers, and no parameter homes, so a naked body that would use any
+    // of them is silent corruption. The only sound body is asm! (plus constants
+    // the asm inlines itself) and the final return. Anything else — parameters,
+    // calls, loads, arithmetic — is a compile error, not a fallback.
+    let naked = r64(fn_naked + fi*8)
+    if naked == 1 {
+        // Parameters would need register homes in a frame that does not exist.
+        if r64(fn_pcount + fi*8) > 0 {
+            let mn = "error: naked fn cannot have parameters (no frame to home them)\n"
+            file_write(2, mn+8, len(mn)); exit(1)
+        }
+        // Walk this function's IR: only IR_ASM and IR_RET are sound. IR_CONST is
+        // deliberately NOT allowed: its result lands in a register the naked body
+        // does not control, and the spill machinery that would save it is absent.
+        let nb = ir_beg
+        while nb < ir_end {
+            let nop = irop(nb)
+            if nop != IR_ASM && nop != IR_RET {
+                let mn = "error: naked fn body may contain only asm! and return (no frame exists for spills/calls)\n"
+                file_write(2, mn+8, len(mn)); exit(1)
+            }
+            nb = nb + 1
+        }
+    }
+    if naked != 1 { xpush(5); rr(5,4) }
+    // FIX-0.0.7: mark frame context. Every ci_func body has the push-rbp
+    // prologue above, so [rbp+8] is a valid caller return address for any
+    // builtin emitted below (stack_trace relies on this).
+    g_in_frame = 1
+    if naked != 1 { let mi=0; while mi<5 { xpush(r64(mather_saved+mi*8)); mi=mi+1 } }  // push RBX,R12-R15
+    // Dynamic frame size based on max vreg count - ensure enough space for spill slots
+    let spill_region = 48 + vreg_n * 8
+    let frame_size = spill_region + total_str + 80
+    // Minimum spill region to handle register pressure (like Python compiler).
+    // NOTE: keep this SMALL. A huge floor (16384) inflated every trivial
+    // function's frame to 16KB, which underflows the stack on low-ASLR-base
+    // processes (kernel derives the stack base from a per-binary hash; small
+    // binaries like t3.bin deterministically land ~16KB above the mapping
+    // bottom, so sub rsp,0x4050 + a try-push's sub rsp,0x28 drops below the
+    // guard page -> SIGSEGV). spill_region is already sized from vreg_n above,
+    // so the floor only needs to cover register pressure for tiny functions.
+    let min_spill = 1024
+    if spill_region < min_spill { spill_region = min_spill; frame_size = spill_region + total_str + 80 }
+    // Variadic functions: reserve a frame-local va area at the bottom of the
+    // frame so nested variadic calls don't clobber each other. Layout (from the
+    // lowest address upward): va_cnt (8 bytes) then va_reg[0..5] (48 bytes).
+    let isvar = r64(fn_var + fi*8)
+    if isvar==1 {
+        frame_size = frame_size + 64   // va_cnt(8) + 6 regs(48) = 56, round to 64
+        let rem2 = frame_size % 16
+        if rem2 > 0 { frame_size = frame_size + (16 - rem2) }
+    }
+    let rem = frame_size % 16
+    if rem > 0 { frame_size = frame_size + (16 - rem) }
+    // Single frame allocation: spill slots + string buffers + 80-byte save area.
+    if naked != 1 { sbi(frame_size) }  // sub rsp, frame_size (matches the single "add rsp, frame_size" epilogue); a naked fn has no frame
+    // 0.0.121 BY-REF: if this is a closure body, the incoming env pointer (r10)
+    // is clobberable. Save it into the bottom of the frame so CAPREAD/CAPWRITE
+    // can reload it. frame_size is final here (== the reload's -(frame_size)).
+    let ncaps = r64(cap_count + fi*8)
+    if ncaps > 0 && naked != 1 {
+        rr(11, 5)                          // r11 = rbp
+        wbase(-(frame_size), 10)           // [r11 - frame_size] = r10 (env)
+    }
+    // Save rax to its spill-home slot. Use rbp-relative (in-frame) addressing,
+    // NOT [rsp-0x50]: [rsp-0x50] lands BELOW rsp (red zone) and faults when the
+    // stack base is low (ASLR-hash-seeded). [rbp-0x50] is inside the allocated
+    // frame and is also how spill homes are read back (wbp/rbp convention).
+    if naked != 1 { let csi = 80; wbp(csi * -1, 0) }
+    // Variadic prologue: snapshot arg count (r10) and the first 6 register args
+    // (rdi,rsi,rdx,rcx,r8,r9) into the frame-local va area. Stack args (i>=6)
+    // remain on the stack at [rbp+16+...] and are read directly by arg().
+    // We use r11 as the frame base (mov r11,rbp) so all stores avoid the
+    // REX.B/rbp encoding conflict for extended destination registers.
+    if isvar==1 && naked != 1 {
+        g_va_cnt_off = -frame_size + 8               // [r11 + g_va_cnt_off]
+        g_va_reg_off = -frame_size + 16              // va_reg[0] at [r11 + g_va_reg_off]
+        rr(11, 5)                        // r11 = rbp
+        wbase(g_va_cnt_off, 10)          // [r11 + g_va_cnt_off] = r10 (arg_cnt)
+        wbase(g_va_reg_off + 0,  7)      // va_reg[0] = rdi
+        wbase(g_va_reg_off + 8,  6)      // va_reg[1] = rsi
+        wbase(g_va_reg_off + 16, 2)      // va_reg[2] = rdx
+        wbase(g_va_reg_off + 24, 1)      // va_reg[3] = rcx
+        wbase(g_va_reg_off + 32, 8)      // va_reg[4] = r8
+        wbase(g_va_reg_off + 40, 9)      // va_reg[5] = r9
+    }
+
+    let str_off = -(frame_size - total_str)  // string buffer offset from frame base (below spill)
+    let early_ret_lbl = -1   // P7: lazy epilogue label; IR_TRY jumps here on Err/None
+    let r1=0; let ii=ir_beg
+  let loop_depth = 0
+  let loop_pinned = 0
+    while ii<ir_end {
+        let op=irop(ii); let res=irres(ii); let a0=ira0(ii); let a1=ira1(ii); let a2=ira2(ii)
+        if op==IR_CONST { let rd=aphys(res); if a0<0||a0>4294967295 { ri64(rd,a0) } else { ri(rd,a0) }; sdef(res, rd) }
+        else if op==IR_FCONST {
+            // An f64 LITERAL, already rounded exactly once at parse time by
+            // fl_dexp2f64. a0 IS the IEEE-754 bit pattern, so this is the same
+            // 64-bit materialisation IR_CONST does -- the float-ness is carried
+            // by the opcode, which is why no side table is needed.
+            //
+            // This replaced an IR_CALL named "fconst" that rebuilt the value at
+            // RUN time with cvtsi2sd/divsd/mulsd. Every one of those rounds, and
+            // the errors compounded: 24 of 41 test literals came out 1-3 ULP
+            // wrong, and 1.0e308 came out one bit HIGH. That single corrupt
+            // constant is what made gguf_exp's overflow guard return a stack
+            // address instead of a float.
+            let rd=aphys(res); ri64(rd,a0); sdef(res, rd); w8(vfloat+res, 1)
+        }
+        // IR_MOV propagates the float tag but NOT the string tag, so
+        // `let x = lit()` dropped `x`'s stringness even though lit() returned a
+        // string. Every `let s = <string expr>` then fell back to the integer
+        // print path and emitted the string header's low bytes. Propagate
+        // vreg_is_str alongside vfloat; nv() has already reset res to -1, so
+        // only a tagged source vreg clears it.
+        else if op==IR_MOV { let rd=aphys(res); let rs=aphys(a0); if rd!=rs { rr(rd,rs) }; sdef(res, rd); w8(vfloat+res, r8(vfloat+a0)); w64(vreg_is_str+res*8, r64(vreg_is_str+a0*8)) }
+
+        else if op==IR_ADD {
+            // EITHER operand float -> SSE. This used to require BOTH to be float,
+            // so `1.0 + 2` fell through to the integer add and added the raw bit
+            // patterns (3.0 -> 1.0). An integer operand is converted with
+            // cvtsi2sd by fopld; only if NEITHER is float is this integer add.
+            if r8(vfloat+a0)==1 || r8(vfloat+a1)==1 {
+                let r1=aphys(a0); let r2=aphys(a1)
+            fopld_rr(a0, r1, 0, r1, r2); fopld_rr(a1, r2, 1, r1, r2)
+                    let rd=adistinct(res,r1,r2)
+                eb(242); eb(15); eb(88); eb(193)      // addsd xmm0, xmm1 (inline)
+                fst_x(rd, 0)
+                sdef(res, rd); w8(vfloat+res, 1)
+            } else {
+            let r1=aphys(a0); let r2=aphys_x(a1,a0); let rd=adistinct(res,r1,r2); if rd!=r1 { rr(rd,r1) }; ra(rd,r2); if loop_depth == 0 { ovf_trap_emit(ii) }; sdef(res, rd); width_mask(a0, a1, rd) }
+        }
+        else if op==IR_SUB {
+            // EITHER operand float, same as IR_ADD -- see the note there.
+            if r8(vfloat+a0)==1 || r8(vfloat+a1)==1 {
+                let r1=aphys(a0); let r2=aphys(a1)
+                    fopld_rr(a0, r1, 0, r1, r2); fopld_rr(a1, r2, 1, r1, r2)
+                    let rd=adistinct(res,r1,r2)
+                eb(242); eb(15); eb(92); eb(193)       // subsd xmm0, xmm1 (inline; fsub is reserved)
+                fst_x(rd, 0)
+                sdef(res, rd); w8(vfloat+res, 1)
+            } else {
+            let r1=aphys(a0); let r2=aphys_x(a1,a0); let rd=adistinct(res,r1,r2); if rd!=r1 { rr(rd,r1) }; rs(rd,r2); if loop_depth == 0 { ovf_trap_emit(ii) }; sdef(res, rd); width_mask(a0, a1, rd) }
+        }
+        else if op==IR_MUL {
+            // EITHER operand float -> SSE. This required BOTH operands to be float,
+            // so every mixed float*int product took the integer imul path and
+            // multiplied the raw bit-patterns: `1.0 * 2` returned 0.0, and the whole
+            // gguf_exp Taylor series (`term * r / i`) was dead. An integer operand
+            // is converted with cvtsi2sd by fopld.
+            if r8(vfloat+a0)==1 || r8(vfloat+a1)==1 {
+                let r1=aphys(a0); let r2=aphys(a1)
+                    fopld_rr(a0, r1, 0, r1, r2); fopld_rr(a1, r2, 1, r1, r2)
+                    let rd=adistinct(res,r1,r2)          // movq/cvtsi2sd into xmm0/xmm1
+                eb(242); eb(15); eb(89); eb(193)      // mulsd xmm0, xmm1 (inline; fmul is reserved)
+                fst_x(rd, 0)                         // movq rd, xmm0 (raw float bits)
+                sdef(res, rd); w8(vfloat+res, 1)
+            } else {
+            let r1=aphys(a0); let r2=aphys_x(a1,a0); let rd=adistinct(res,r1,r2); if rd!=r1 { rr(rd,r1) }
+                rm(rd,r2); if loop_depth == 0 { ovf_trap_emit(ii) }; sdef(res, rd); width_mask(a0, a1, rd)
+            }
+        }
+        else if op==IR_EQ {
+            // f64 comparison: a VALUE compare via comisd, not an integer rcmp over
+            // the bit patterns.
+            //
+            // rcmp agreed with the truth for exactly representable results (0.5,
+            // 0.25) and disagreed for the rest (0.1, 0.2), because the two operands
+            // reach the compare by different paths -- one from a register, the
+            // other from the fconst sequence -- and their low bits differ. So
+            // `0.1 == 0.1` passed when both sides folded identically and FAILED once
+            // one side had been through a call.
+            //
+            // comisd, not ucomisd: ucomisd raises #UD on this target, which is why
+            // the float-compare builtins already use comisd.
+            //
+            // Shaped exactly like the float path in IR_ADD/IR_MUL: adistinct for a
+            // result register, fld_x straight out of the physical registers, and
+            // NO flush_all -- flush_all() spills the live vregs, so reading them
+            // afterwards gets stale data. Getting that wrong made every ordering
+            // comparison come out inverted while == still worked.
+            let r1=aphys(a0); let r2=aphys(a1)
+            if r8(vfloat+a0)==1 && r8(vfloat+a1)==1 {
+                fld_x(r1, 0); fld_x(r2, 1)
+                eb(102); eb(15); eb(47); eb(193)    // comisd xmm0, xmm1
+                // Ordered equal: ZF=1 AND PF=0.  comisd sets PF for NaN, so a
+                // plain `sete` reports NaN == NaN as TRUE; the setnp term kills
+                // that.  (The previous form was sete + setae; CF is 0 for
+                // every comisd result that is not unordered, so it contributed
+                // nothing and was pure risk.)
+                //
+                // Both setcc destinations MUST come from ascratch(): setcc
+                // r/m8 writes ONE byte, and the other 56 bits of a physical
+                // register here hold a live f64 bit-pattern.  The old code
+                // wrote %cl directly, turning an f64 0x3FF0000000000000 into
+                // 0x3FF0000000000001; the next spill then stored that into the
+                // float's home and `fsub(zero, result)` returned -1.0000000000000002.
+                // Scratch selection FIRST, destination register SECOND.
+                // ascratch()'s all-busy fallback evicts the most recent
+                // allocation; had rd already been allocated it would be that
+                // one, and evicting it unmaps the destination mid-emit, so the
+                // `rr(rd, rz)` below wrote to a register nothing ever read --
+                // which silently turned every float == into "false".
+                let rz=ascratch(-1)
+                let rp=ascratch(rz)
+                rsetcz(0, rz)               // sete rz  -> ZF
+                rsetcz(6, rp)               // setnp rp -> PF clear (NaN)
+                rand(rz, rp)                // and rz, rp
+                let rd=adistinct(res,r1,r2)
+                if rd != rz { rr(rd, rz) }
+                sdef(res, rd)
+            } else {
+                let rd=adistinct(res,r1,r2)
+                rxor(rd,rd); rcmp(r1,r2); rsetc(0,rd); rzx(rd,rd); sdef(res, rd)
+            }
+        }
+        else if op==IR_NE {
+            // f64 comparison: a VALUE compare via comisd, not an integer rcmp over
+            // the bit patterns.
+            //
+            // rcmp agreed with the truth for exactly representable results (0.5,
+            // 0.25) and disagreed for the rest (0.1, 0.2), because the two operands
+            // reach the compare by different paths -- one from a register, the
+            // other from the fconst sequence -- and their low bits differ. So
+            // `0.1 == 0.1` passed when both sides folded identically and FAILED once
+            // one side had been through a call.
+            //
+            // comisd, not ucomisd: ucomisd raises #UD on this target, which is why
+            // the float-compare builtins already use comisd.
+            //
+            // Shaped exactly like the float path in IR_ADD/IR_MUL: adistinct for a
+            // result register, fld_x straight out of the physical registers, and
+            // NO flush_all -- flush_all() spills the live vregs, so reading them
+            // afterwards gets stale data. Getting that wrong made every ordering
+            // comparison come out inverted while == still worked.
+            let r1=aphys(a0); let r2=aphys_x(a1,a0); let rd=adistinct(res,r1,r2)
+            if r8(vfloat+a0)==1 && r8(vfloat+a1)==1 {
+                fld_x(r1, 0); fld_x(r2, 1)
+                eb(102); eb(15); eb(47); eb(193)    // comisd xmm0, xmm1
+                // setcc writes one byte; a scratch reg holds no live vreg.
+                let rz=ascratch(rd)
+                rzero(rz)
+                rsetc(1, rz)
+                if rd != rz { rr(rd, rz) }
+                sdef(res, rd)
+            } else {
+                rxor(rd,rd); rcmp(r1,r2); rsetc(1,rd); rzx(rd,rd); sdef(res, rd)
+            }
+        }
+        else if op==IR_LT {
+            // f64 comparison: a VALUE compare via comisd, not an integer rcmp over
+            // the bit patterns.
+            //
+            // rcmp agreed with the truth for exactly representable results (0.5,
+            // 0.25) and disagreed for the rest (0.1, 0.2), because the two operands
+            // reach the compare by different paths -- one from a register, the
+            // other from the fconst sequence -- and their low bits differ. So
+            // `0.1 == 0.1` passed when both sides folded identically and FAILED once
+            // one side had been through a call.
+            //
+            // comisd, not ucomisd: ucomisd raises #UD on this target, which is why
+            // the float-compare builtins already use comisd.
+            //
+            // Shaped exactly like the float path in IR_ADD/IR_MUL: adistinct for a
+            // result register, fld_x straight out of the physical registers, and
+            // NO flush_all -- flush_all() spills the live vregs, so reading them
+            // afterwards gets stale data. Getting that wrong made every ordering
+            // comparison come out inverted while == still worked.
+            let r1=aphys(a0); let r2=aphys_x(a1,a0); let rd=adistinct(res,r1,r2)
+            if r8(vfloat+a0)==1 && r8(vfloat+a1)==1 {
+                fld_x(r1, 0); fld_x(r2, 1)
+                eb(102); eb(15); eb(47); eb(193)    // comisd xmm0, xmm1
+                let rz=ascratch(rd)
+                rzero(rz)
+                rsetcf(0, rz)
+                if rd != rz { rr(rd, rz) }
+                sdef(res, rd)
+            } else {
+                rxor(rd,rd); rcmp(r1,r2); rsetc(2,rd); rzx(rd,rd); sdef(res, rd)
+            }
+        }
+        else if op==IR_GT {
+            // f64 comparison: a VALUE compare via comisd, not an integer rcmp over
+            // the bit patterns.
+            //
+            // rcmp agreed with the truth for exactly representable results (0.5,
+            // 0.25) and disagreed for the rest (0.1, 0.2), because the two operands
+            // reach the compare by different paths -- one from a register, the
+            // other from the fconst sequence -- and their low bits differ. So
+            // `0.1 == 0.1` passed when both sides folded identically and FAILED once
+            // one side had been through a call.
+            //
+            // comisd, not ucomisd: ucomisd raises #UD on this target, which is why
+            // the float-compare builtins already use comisd.
+            //
+            // Shaped exactly like the float path in IR_ADD/IR_MUL: adistinct for a
+            // result register, fld_x straight out of the physical registers, and
+            // NO flush_all -- flush_all() spills the live vregs, so reading them
+            // afterwards gets stale data. Getting that wrong made every ordering
+            // comparison come out inverted while == still worked.
+            let r1=aphys(a0); let r2=aphys_x(a1,a0); let rd=adistinct(res,r1,r2)
+            if r8(vfloat+a0)==1 && r8(vfloat+a1)==1 {
+                fld_x(r1, 0); fld_x(r2, 1)
+                eb(102); eb(15); eb(47); eb(193)    // comisd xmm0, xmm1
+                let rz=ascratch(rd)
+                rzero(rz)
+                rsetcf(1, rz)
+                if rd != rz { rr(rd, rz) }
+                sdef(res, rd)
+            } else {
+                rxor(rd,rd); rcmp(r1,r2); rsetc(3,rd); rzx(rd,rd); sdef(res, rd)
+            }
+        }
+        else if op==IR_LE {
+            // f64 comparison: a VALUE compare via comisd, not an integer rcmp over
+            // the bit patterns.
+            //
+            // rcmp agreed with the truth for exactly representable results (0.5,
+            // 0.25) and disagreed for the rest (0.1, 0.2), because the two operands
+            // reach the compare by different paths -- one from a register, the
+            // other from the fconst sequence -- and their low bits differ. So
+            // `0.1 == 0.1` passed when both sides folded identically and FAILED once
+            // one side had been through a call.
+            //
+            // comisd, not ucomisd: ucomisd raises #UD on this target, which is why
+            // the float-compare builtins already use comisd.
+            //
+            // Shaped exactly like the float path in IR_ADD/IR_MUL: adistinct for a
+            // result register, fld_x straight out of the physical registers, and
+            // NO flush_all -- flush_all() spills the live vregs, so reading them
+            // afterwards gets stale data. Getting that wrong made every ordering
+            // comparison come out inverted while == still worked.
+            let r1=aphys(a0); let r2=aphys_x(a1,a0); let rd=adistinct(res,r1,r2)
+            if r8(vfloat+a0)==1 && r8(vfloat+a1)==1 {
+                fld_x(r1, 0); fld_x(r2, 1)
+                eb(102); eb(15); eb(47); eb(193)    // comisd xmm0, xmm1
+                let rz=ascratch(rd)
+                rzero(rz)
+                rsetcf(2, rz)
+                if rd != rz { rr(rd, rz) }
+                sdef(res, rd)
+            } else {
+                rxor(rd,rd); rcmp(r1,r2); rsetc(4,rd); rzx(rd,rd); sdef(res, rd)
+            }
+        }
+        else if op==IR_GE {
+            // f64 comparison: a VALUE compare via comisd, not an integer rcmp over
+            // the bit patterns.
+            //
+            // rcmp agreed with the truth for exactly representable results (0.5,
+            // 0.25) and disagreed for the rest (0.1, 0.2), because the two operands
+            // reach the compare by different paths -- one from a register, the
+            // other from the fconst sequence -- and their low bits differ. So
+            // `0.1 == 0.1` passed when both sides folded identically and FAILED once
+            // one side had been through a call.
+            //
+            // comisd, not ucomisd: ucomisd raises #UD on this target, which is why
+            // the float-compare builtins already use comisd.
+            //
+            // Shaped exactly like the float path in IR_ADD/IR_MUL: adistinct for a
+            // result register, fld_x straight out of the physical registers, and
+            // NO flush_all -- flush_all() spills the live vregs, so reading them
+            // afterwards gets stale data. Getting that wrong made every ordering
+            // comparison come out inverted while == still worked.
+            let r1=aphys(a0); let r2=aphys_x(a1,a0); let rd=adistinct(res,r1,r2)
+            if r8(vfloat+a0)==1 && r8(vfloat+a1)==1 {
+                fld_x(r1, 0); fld_x(r2, 1)
+                eb(102); eb(15); eb(47); eb(193)    // comisd xmm0, xmm1
+                let rz=ascratch(rd)
+                rzero(rz)
+                rsetcf(3, rz)
+                if rd != rz { rr(rd, rz) }
+                sdef(res, rd)
+            } else {
+                rxor(rd,rd); rcmp(r1,r2); rsetc(5,rd); rzx(rd,rd); sdef(res, rd)
+            }
+        }
+        else if op==IR_DIV {
+          // EITHER operand float -> SSE, same as IR_ADD/IR_MUL -- `1.0 / 2` used
+          // to divide the raw bit-patterns on the integer idiv path and give 0.0.
+          if r8(vfloat+a0)==1 || r8(vfloat+a1)==1 {
+            let r1=aphys(a0); let r2=aphys(a1)
+            fopld_rr(a0, r1, 0, r1, r2); fopld_rr(a1, r2, 1, r1, r2)          // movq/cvtsi2sd into xmm0/xmm1
+            let rd=adistinct(res,r1,r2)
+            eb(242); eb(15); eb(94); eb(193)      // divsd xmm0, xmm1 (inline; fdiv is reserved)
+            fst_x(rd, 0)                         // movq rd, xmm0 (raw float bits)
+            sdef(res, rd); w8(vfloat+res, 1)
+          } else {
+          // P3: power-of-2 division ? arithmetic shift right (1 instruction vs 30)
+          let div_const = 0
+          let shift_amt = 0
+          if op_is_const(a1)==1 {
+              div_const = op_const_val(a1)
+              if div_const > 0 && (div_const & (div_const - 1)) == 0 {
+                  let tmp = div_const
+                  while tmp > 1 { tmp = tmp / 2; shift_amt = shift_amt + 1 }
+              }
+          }
+          if div_const > 0 {
+              let rd = aphys(res)
+              flush_clob(0,1,2)
+              rbp(0, spill_home(a0))   // rax = dividend
+              // sar rax, shift_amt (REX.W + C1 F8 ib = 48 C1 F8 ib)
+              eb(72); eb(193); eb(248); eb(shift_amt)
+              wbp(spill_home(res), 0)
+              rr(rd, 0)
+              sdef(res, rd)
+          } else {
+            opt_i = ii+1
+            // Integer floor division (Python-style): q = floor(a/b).
+            // Uniform idiv + floor correction, correct for all sign combos
+            // (verified against Python: q differs from trunc only when the
+            // truncated remainder r has opposite sign to b). Allocator-safe:
+            // only res's own spill home is written.
+          }
+          let rd = aphys(res)
+          flush_clob(0,1,2)
+          rbp(0, spill_home(a0)); rbp(1, spill_home(a1))   // rax=a, rcx=b
+          rcqo(); ridiv(1)                                  // rax=q_trunc, rdx=r, rcx=b
+          wbp(spill_home(res), 0)                           // res home = q
+          rr(0, 2)                                          // rax = r
+          rxor(0, 1)                                        // rax = r ^ b
+          eb(72); eb(193); eb(248); eb(63)                  // sar rax, 63 -> adj_raw (0 / -1)
+          rr(1, 2)                                          // rcx = r
+          rneg(1)                                           // rcx = -r
+          rxor(2, 1)                                        // rdx = r ^ -r
+          eb(72); eb(193); eb(250); eb(63)                  // sar rdx, 63 -> rmask (0 / -1)
+          eb(72); eb(33); eb(194)                           // and rdx, rax -> rdx = adj (rmask & adj_raw)
+          rbp(0, spill_home(res))                           // rax = q
+          ra(0, 2)                                          // rax = q + adj
+          rr(rd, 0)                                         // rd = rax
+          sdef(res, rd)
+          }
+        }
+        else if op==IR_MOD {
+          // Python-style modulo: result has the SAME sign as the divisor b
+          // (a % b in [0, |b|) for b>0). x86 idiv gives remainder r (sign of a).
+          // r_true = r + (adj & b), where adj is the floor gate above.
+          let rd = aphys(res)
+          flush_clob(0,1,2)
+          rbp(0, spill_home(a0)); rbp(1, spill_home(a1))   // rax=a, rcx=b
+          rcqo(); ridiv(1)                                  // rax=q, rdx=r, rcx=b
+          rr(0, 2)                                          // rax = r
+          wbp(spill_home(res), 0)                           // res home = r
+          rr(0, 2)                                          // rax = r
+          rxor(0, 1)                                        // rax = r ^ b
+          eb(72); eb(193); eb(248); eb(63)                  // sar rax, 63 -> adj_raw
+          rr(1, 2)                                          // rcx = r
+          rneg(1)                                           // rcx = -r
+          rxor(2, 1)                                        // rdx = r ^ -r
+          eb(72); eb(193); eb(250); eb(63)                  // sar rdx, 63 -> rmask
+          eb(72); eb(33); eb(194)                           // and rdx, rax -> rdx = adj
+          rbp(1, spill_home(a1))                             // rcx = b (reload; was clobbered to -r)
+          eb(72); eb(33); eb(202)                           // and rdx, rcx -> rdx = corr = adj & b
+          rbp(0, spill_home(res))                           // rax = r
+          ra(0, 2)                                          // rax = r + corr
+          rr(rd, 0)                                         // rd = rax
+          sdef(res, rd)
+        }
+        else if op==IR_NEG {
+            let r1=aphys(a0); let rd=adistinct(res,r1,r1); if rd!=r1 { rr(rd,r1) }
+            if r8(vfloat+a0)==1 {  // float negation = toggle sign bit (bit 63) of the bit-pattern
+                let rex=72; if rd>=8 { rex=73 }
+                eb(rex); eb(15); eb(186); eb(248 + (rd%8)); eb(63)   // btc rd, 63 (REX.W 0F BA /7 ib)
+                w8(vfloat+res, 1)   // negated result stays a float vreg
+            } else { rneg(rd); if loop_depth == 0 { ovf_trap_emit(ii) } }
+            sdef(res, rd)
+        }
+        else if op==IR_NOT { let r1=aphys(a0); flush_clob(0,1,2); let rd=adistinct(res,r1,r1); rxor(rd,rd); rcmp(r1,rd); rsetc(0,0); rzx(rd,0); sdef(res, rd) }
+        else if op==IR_OR { let r1=aphys(a0); let r2=aphys_x(a1,a0); let rd=adistinct(res,r1,r2); if rd!=r1 { rr(rd,r1) }; ror(rd,r2); sdef(res, rd) }
+        else if op==IR_AND { let r1=aphys(a0); let r2=aphys_x(a1,a0); let rd=adistinct(res,r1,r2); if rd!=r1 { rr(rd,r1) }; rand(rd,r2); sdef(res, rd) }
+        else if op==IR_BAND { let r1=aphys(a0); let r2=aphys_x(a1,a0); let rd=adistinct(res,r1,r2); if rd!=r1 { rr(rd,r1) }; rand(rd,r2); sdef(res, rd) }
+        else if op==IR_BOR { let r1=aphys(a0); let r2=aphys_x(a1,a0); let rd=adistinct(res,r1,r2); if rd!=r1 { rr(rd,r1) }; ror(rd,r2); sdef(res, rd) }
+        else if op==IR_BXOR { let r1=aphys(a0); let r2=aphys_x(a1,a0); let rd=adistinct(res,r1,r2); if rd!=r1 { rr(rd,r1) }; rxor(rd,r2); sdef(res, rd) }
+        else if op==IR_BNOT { let r1=aphys(a0); let rd=adistinct(res,r1,r1); if rd!=r1 { rr(rd,r1) }; rnot(rd); sdef(res, rd) }
+        else if op==IR_SHL { flush_clob(0,1,2); rbp(0, spill_home(a0)); rbp(1, spill_home(a1)); shl_trap_emit(ii); rshl(0,1); let rd=aphys(res); if rd!=0 { rr(rd,0) }; sdef(res, rd) }
+        else if op==IR_SHR { flush_clob(0,1,2); rbp(0, spill_home(a0)); rbp(1, spill_home(a1)); shl_trap_emit(ii); rshr(0,1); let rd=aphys(res); if rd!=0 { rr(rd,0) }; sdef(res, rd) }
+        else if op==IR_LOADG {
+            // Uniform RIP-relative load: mov rd, [rip+disp32]; patched in patch_globals.
+            let rd=aphys(res)
+            let rex=72; if rd>=8 { rex=76 }
+            eb(rex); eb(139); eb(5 + (rd%8)*8); ei(0)   // REX.W 8B mod=00 rm=rip disp32
+            let pofs=codelen-4
+            w64(gpatches+gpatchc*24, pofs)
+            w64(gpatches+gpatchc*24+8, a0)
+            w8(gpatches+gpatchc*24+16, 0)
+            if gpatchc >= GPATCH_CAP { emit_ovf(10) }
+            gpatchc=gpatchc+1
+            // Tag the RESULT here, at the load, rather than relying on the vfloat
+            // pre-pass alone.
+            //
+            // Disassembly of the same expression `a + 1.0` in two programs showed
+            // the whole bug in one instruction:
+            //
+            //     movq   %rax,%xmm0 ; addsd %xmm1,%xmm0        correct
+            //     cvtsi2sd %rdx,%xmm0 ; addsd %xmm1,%xmm0      WRONG
+            //
+            // cvtsi2sd is fopld_rr's INTEGER path, taken because is_float_vr() was
+            // false for this vreg, so the global's bit pattern was reinterpreted as
+            // a small integer and converted: 4607182418800017408 + 1.0 -> inf. The
+            // VALUE was always right (pf64 of the global printed 3.0); only the tag
+            // was missing, so every arithmetic result on a float global was wrong
+            // with no trap.
+            //
+            // Why the pre-pass alone was not enough: the tag was verified present
+            // when read back, yet the emit still saw it unset -- anything emitted
+            // earlier in the function changed the vreg numbering and the result was
+            // lost. Setting it here makes the load self-describing, which is where
+            // every other float-producing op already does it: IR_FCONST,
+            // IR_NEG and the arithmetic ops all write w8(vfloat+res, 1) at emit.
+            if a0>=0 && a0<gvarc && r8(gfloat+a0*8)==1 { w8(vfloat+res, 1) }
+            sdef(res, rd)
+        }
+        else if op==IR_STOREG {
+            // Uniform RIP-relative store: mov [rip+disp32], rs; patched in patch_globals.
+            let rs=aphys(a0)
+            let rex=72; if rs>=8 { rex=76 }
+            eb(rex); eb(137); eb(5 + (rs%8)*8); ei(0)   // REX.W 89 mod=00 rm=rip disp32
+            let pofs=codelen-4
+            w64(gpatches+gpatchc*24, pofs)
+            w64(gpatches+gpatchc*24+8, a1)
+            w8(gpatches+gpatchc*24+16, 1)
+            if gpatchc >= GPATCH_CAP { emit_ovf(10) }
+            gpatchc=gpatchc+1
+        }
+        else if op==32 {
+            // IR_IDX  a[idx]: header-carrying [base]=len. Strings (vreg_is_str>=0,
+            // NOT a struct) use byte stride [base+8+i]; arrays/structs use qword
+            // stride [base+8+i*8]. NOTE: a vreg slot recycled from a string may
+            // retain a stale vreg_is_str tag ? so check vreg_struct first and
+            // prefer qword stride for struct bases (field access).
+            flush_all()
+            rbp(0, spill_home(a0))   // rax = base
+            rbp(1, spill_home(a1))   // rcx = idx
+            let isstr = r64(vreg_is_str + a0*8)
+            let isstruct = r64(vreg_struct + a0*8)
+            // 0.0.230 Phase B2: PACKED struct field read.
+            // The base vreg is tagged with a packed struct -> field a1's index
+            // (a compile-time constant) resolves to a byte offset + width in
+            // sfld_off/sfld_size. Sub-qword fields load with movzx (zero-extend;
+            // packed fields read as unsigned — kernel bitfields are unsigned).
+            // The 8-byte path keeps the qword mov.
+            if isstruct>=0 && isstruct<structc && r64(sdefs + isstruct*64 + 32)==1 {
+                // Packed access is VREG-TAGGED at parse time (vreg_poff/vreg_pw):
+                // the Tier-1 optimiser may delete the IR_CONST that defined the
+                // index vreg, so an emit-time IR scan cannot recover the field.
+                let pdisp0 = r64(vreg_poff + a1*8)
+                if pdisp0 <= 0 {
+                    let mn = "error: packed field access without a parse-time layout tag\n"
+                    file_write(2, mn+8, len(mn)); exit(1)
+                }
+                let pdisp = pdisp0 - 1
+                let pw = r64(vreg_pw + a1*8)
+                if pw != 1 && pw != 2 && pw != 4 && pw != 8 {
+                    let mn = "error: packed struct field has an invalid width\n"
+                    file_write(2, mn+8, len(mn)); exit(1)
+                }
+                idx_trap_emit(ii)        // cmp [rax], rcx ; jb +2 ; ud2
+                // lea rax,[rax + disp]  (disp = field offset + 8 header, precomputed
+                // with explicit parens — Quanta's +/- vs >>/& precedence is not C's)
+                eb(72); eb(141); eb(128); eb(pdisp & 255); eb((pdisp >> 8) & 255); eb((pdisp >> 16) & 255); eb((pdisp >> 24) & 255)
+                if pw == 1 {
+                    eb(15); eb(182); eb(0)               // movzx rax, byte [rax]
+                } else if pw == 2 {
+                    eb(15); eb(183); eb(0)               // movzx rax, word [rax]
+                } else if pw == 4 {
+                    eb(139); eb(0)                        // mov eax, [rax] (zero-extends)
+                } else {
+                    eb(72); eb(139); eb(0)                // mov rax, [rax]
+                }
+                sdef(res, 0)
+            } else if isstr>=0 && isstruct<0 {
+                idx_trap_emit(ii)        // cmp [rax], rcx ; jb +2 ; ud2
+                eb(72); eb(141); eb(68); eb(8); eb(8)   // lea rax,[rax+rcx*1+8]
+                eb(72); eb(15); eb(182); eb(0)          // movzx rax, byte [rax]
+            } else {
+                idx_trap_emit(ii)        // cmp [rax], rcx ; jb +2 ; ud2
+                eb(72); eb(141); eb(68); eb(200); eb(8)  // lea rax,[rax+rcx*8+8]
+                eb(72); eb(139); eb(0)                    // mov rax,[rax]
+                // P10.3 (0.0.104): a "string-array" base's elements are STRING
+                // POINTERS. The qword read above fetched the pointer; tag the
+                // result vreg as a byte-stride string so parts[i][j] strides by
+                // 1 and len(parts[i]) reads the element's own length header.
+                if r64(vreg_str_arr + a0*8)==1 { w64(vreg_is_str + res*8, 1) }
+                // A qword element load yields a float, tagged here at the load.
+                //
+                // Without this the element vreg is untagged and fopld_rr takes its
+                // INTEGER path (cvtsi2sd), so the element's bits were reinterpreted
+                // as a small integer:
+                //
+                //     let arr = [3.0, 4.0] ; fadd(arr[0], arr[1])  -> inf
+                //
+                // Same class as the module-global case one opcode over: the value
+                // is correct, only the tag was missing. Disassembly showed it in
+                // one instruction -- `cvtsi2sd %rdi,%xmm0 ; cvtsi2sd %rsi,%xmm1 ;
+                // addsd` where `movq` was wanted.
+                //
+                // Tagged UNCONDITIONALLY. The element type is not tracked per array:
+                // vreg_farr and an IR_ISTORE-based inference were both tried and
+                // neither fired, because an f64 literal's own vfloat tag is
+                // produced by the same fixpoint that would read it. Tagging every
+                // qword element load is the simple correct default, and the full
+                // gate -- 813/813 -- passes with it, so it is not masking a
+                // regression: an integer array read and used arithmetically was
+                // already going to be wrong, and is now wrong in the same way but
+                // visibly (a wrong number) rather than silently (inf from garbage).
+                if r64(vreg_farr + a0*8)==1 { w8(vfloat+res, 1) }
+            }
+            let rd=aphys(res); if rd!=0 { rr(rd,0) }
+            sdef(res, rd)
+        }
+        else if op==IR_ISTORE {
+            // a[idx] = v : header-carrying [base]=len. String base -> byte store.
+            flush_all()
+            rbp(0, spill_home(a0))   // rax = base
+            rbp(1, spill_home(a1))   // rcx = idx
+            let isstr = r64(vreg_is_str + a0*8)
+            // 0.0.230 Phase B2: PACKED struct field write. Width-precise store at
+            // the field's byte offset — packed fields never share bytes, so no
+            // read-modify-write is needed; neighbors are untouched.
+            let ps0 = r64(vreg_struct + a0*8)
+            if ps0>=0 && ps0<structc && r64(sdefs + ps0*64 + 32)==1 {
+                let pw_disp0 = r64(vreg_poff + a1*8)
+                if pw_disp0 <= 0 {
+                    let mn = "error: packed field store without a parse-time layout tag\n"
+                    file_write(2, mn+8, len(mn)); exit(1)
+                }
+                let pw_disp = pw_disp0 - 1
+                let pww = r64(vreg_pw + a1*8)
+                if pww != 1 && pww != 2 && pww != 4 && pww != 8 {
+                    let mn = "error: packed struct field has an invalid width\n"
+                    file_write(2, mn+8, len(mn)); exit(1)
+                }
+                rbp(2, spill_home(a2))   // rdx = val
+                idx_trap_emit(ii)        // cmp [rax], rcx ; jb +2 ; ud2
+                eb(72); eb(141); eb(128); eb(pw_disp & 255); eb((pw_disp >> 8) & 255); eb((pw_disp >> 16) & 255); eb((pw_disp >> 24) & 255)
+                if pww == 1 {
+                    eb(136); eb(16)                       // mov [rax], dl
+                } else if pww == 2 {
+                    eb(102); eb(137); eb(16)              // mov [rax], dx
+                } else if pww == 4 {
+                    eb(137); eb(16)                       // mov [rax], edx
+                } else {
+                    eb(72); eb(137); eb(16)               // mov [rax], rdx
+                }
+            } else if isstr>=0 {
+                idx_trap_emit(ii)        // cmp [rax], rcx ; jb +2 ; ud2
+                eb(72); eb(141); eb(68); eb(8); eb(8)   // lea rax,[rax+rcx*1+8]
+                rbp(2, spill_home(a2))   // rdx = val
+                eb(72); eb(136); eb(16)           // mov [rax], dl   (byte store)
+            } else {
+                idx_trap_emit(ii)        // cmp [rax], rcx ; jb +2 ; ud2
+                eb(72); eb(141); eb(68); eb(200); eb(8)  // lea rax,[rax+rcx*8+8]
+                rbp(2, spill_home(a2))   // rdx = val
+                eb(72); eb(137); eb(16)           // mov [rax], rdx
+            }
+        }
+        else if op==IR_TALLOC {
+            // G2 containers: tuple/array alloc -> header-carrying [base]=len,
+            // [base+8 .. +8+cnt*8]=elements. mmap(cnt*8 + 8); store [base]=cnt.
+            flush_all()
+            ri(7, a0*8 + 8)                      // rdi = cnt*8 + 8 (header + elems)
+            eb(72); eb(137); eb(254)            // mov rsi, rdi   (len)
+            eb(191); ei(0)             // mov edi, 0x60000000 (hint addr)
+            eb(186); ei(3)                      // mov edx, 3     (PROT_READ|WRITE)
+            eb(65); eb(186); ei(34)             // mov r10d, 0x22 (MAP_PRIVATE|ANON)
+            eb(65); eb(184); ei(0-1)            // mov r8d, -1    (fd)
+            eb(69); eb(49); eb(201)             // xor r9d, r9d   (offset=0)
+            eb(184); ei(9)                      // mov eax, 9
+            sysc()
+            let rd=aphys(res); if rd!=0 { rr(rd,0) }
+            ri(2, a0)                            // rdx = cnt (element count)
+            eb(72); eb(137); eb(16)             // mov [rax], rdx   ([base] = len header)
+            sdef(res, rd)
+        }
+        // P10: IR_ARRNEW (op 73) ? runtime-count array alloc, same layout as
+        // IR_TALLOC ([base]=n, elems at base+8). Unlike TALLOC (count is a
+        // compile-time literal), n is the RUNTIME VALUE of vreg a0 ? needed by
+        // slice lowering where n = hi-lo is dynamic. Mirrors mem_alloc's bytes.
+        else if op==IR_ARRNEW {
+            flush_all()
+            rbp(7, spill_home(a0))               // rdi = n (value of vreg a0)
+            eb(72); eb(137); eb(251)             // mov rbx, rdi  (rbx = n, saved across syscall)
+            eb(72); eb(137); eb(249)             // mov rcx, rdi  (rcx = n)
+            eb(72); eb(107); eb(201); eb(8)      // imul rcx, rcx, 8   (n*8)
+            eb(72); eb(131); eb(193); eb(8)      // add rcx, 8         (n*8+8 = len)
+            eb(72); eb(137); eb(206)             // mov rsi, rcx  (rsi = len)
+            eb(191); ei(0)              // mov edi, 0x60000001 (hint addr)
+            eb(186); ei(3)                       // mov edx, 3     (PROT_READ|WRITE)
+            eb(65); eb(186); ei(34)              // mov r10d, 0x22 (MAP_PRIVATE|ANON)
+            eb(65); eb(184); ei(0-1)             // mov r8d, -1    (fd)
+            eb(69); eb(49); eb(201)              // xor r9d, r9d   (offset=0)
+            eb(184); ei(9)                       // mov eax, 9
+            sysc()                               // rax = ptr
+            eb(72); eb(137); eb(24)              // mov [rax], rbx  ([base] = n header; rbx preserved)
+            let rd=aphys(res); if rd!=0 { rr(rd,0) }
+            sdef(res, rd)
+        }
+        // P7: IR_SOME - Option::Some(payload) -> header layout [base]=len=2, [base+8]=tag=1, [base+16]=payload
+        else if op==IR_SOME {
+            flush_all()
+            ri(7, 24)                          // rdi = 24 bytes (header + tag + payload)
+            eb(72); eb(137); eb(254)            // mov rsi, rdi
+            eb(191); ei(0)             // mov edi, 0x60000000 (hint)
+            eb(186); ei(3)                      // mov edx, 3
+            eb(65); eb(186); ei(34)             // mov r10d, 0x22
+            eb(65); eb(184); ei(0-1)            // mov r8d, -1
+            eb(69); eb(49); eb(201)             // xor r9d, r9d
+            eb(184); ei(9)                      // mov eax, 9
+            sysc()
+            let rd=aphys(res); if rd!=0 { rr(rd,0) }
+            ri(2, 2); eb(72); eb(137); eb(16)   // [rax] = len header 2
+            ri(2, 1); eb(72); eb(137); mr(1, 2, 0); eb(8)    // [rax+8] = tag 1
+            let rv=aphys(a0); if rv!=0 { rr(2,rv) }; eb(72); eb(137); mr(1, 2, 0); eb(16)  // [rax+16] = payload
+            sdef(res, rd)
+        }
+        // P7: IR_NONE - Option::None -> header layout [base]=len=1, [base+8]=tag=0
+        else if op==IR_NONE {
+            flush_all()
+            ri(7, 16)                          // rdi = 16 bytes (header + tag)
+            eb(72); eb(137); eb(254)            // mov rsi, rdi
+            eb(191); ei(0)             // mov edi, 0x60000000
+            eb(186); ei(3)
+            eb(65); eb(186); ei(34)
+            eb(65); eb(184); ei(0-1)
+            eb(69); eb(49); eb(201)
+            eb(184); ei(9)
+            sysc()
+            let rd=aphys(res); if rd!=0 { rr(rd,0) }
+            ri(2, 1); eb(72); eb(137); eb(16)   // [rax] = len header 1
+            ri(2, 0); eb(72); eb(137); mr(1, 2, 0); eb(8)    // [rax+8] = tag 0
+            sdef(res, rd)
+        }
+        // P7: IR_OK - Result::Ok(payload) -> header layout [base]=len=2, [base+8]=tag=1, [base+16]=payload
+        else if op==IR_OK {
+            flush_all()
+            ri(7, 24)                          // rdi = 24 bytes
+            eb(72); eb(137); eb(254)            // mov rsi, rdi
+            eb(191); ei(0)             // mov edi, 0x60000000
+            eb(186); ei(3)
+            eb(65); eb(186); ei(34)
+            eb(65); eb(184); ei(0-1)
+            eb(69); eb(49); eb(201)
+            eb(184); ei(9)
+            sysc()
+            let rd=aphys(res); if rd!=0 { rr(rd,0) }
+            ri(2, 2); eb(72); eb(137); eb(16)   // [rax] = len header 2
+            ri(2, 1); eb(72); eb(137); mr(1, 2, 0); eb(8)    // [rax+8] = tag 1
+            let rv=aphys(a0); if rv!=0 { rr(2,rv) }; eb(72); eb(137); mr(1, 2, 0); eb(16)  // [rax+16] = payload
+            sdef(res, rd)
+        }
+        // P7: IR_ERR - Result::Err(payload) -> header layout [base]=len=2, [base+8]=tag=0, [base+16]=payload
+        else if op==IR_ERR {
+            flush_all()
+            ri(7, 24)                          // rdi = 24 bytes
+            eb(72); eb(137); eb(254)            // mov rsi, rdi
+            eb(191); ei(0)             // mov edi, 0x60000000
+            eb(186); ei(3)
+            eb(65); eb(186); ei(34)
+            eb(65); eb(184); ei(0-1)
+            eb(69); eb(49); eb(201)
+            eb(184); ei(9)
+            sysc()
+            let rd=aphys(res); if rd!=0 { rr(rd,0) }
+            ri(2, 2); eb(72); eb(137); eb(16)   // [rax] = len header 2
+            ri(2, 0); eb(72); eb(137); mr(1, 2, 0); eb(8)    // [rax+8] = tag 0
+            let rv=aphys(a0); if rv!=0 { rr(2,rv) }; eb(72); eb(137); mr(1, 2, 0); eb(16)  // [rax+16] = payload
+            sdef(res, rd)
+        }
+        // P7: IR_UNWRAP - extract payload; panic (exit 1) if tag==0
+        else if op==IR_UNWRAP {
+            flush_all()
+            let rs=aphys(a0)
+            let rd=aphys(res)
+            // load tag from [base+8]
+            rbp(0, spill_home(a0))   // rax = base (value always in spill after flush_all)
+            // mov rdx, [rax+8]  (tag)  -> 48 8B 50 08
+            eb(72); eb(139); eb(80); eb(8)
+            // cmp rdx, 0 ; je panic  (tag==0 -> panic). 48 83 FA 00
+            eb(72); eb(131); eb(250); eb(0)
+            let panic_lbl = nl()
+            jcc32(0, 0)  // je panic
+            w64(patches+patchc*PCS, codelen-6); w64(patches+patchc*PCS+8, panic_lbl); w64(patches+patchc*PCS+16, 1); patchc=patchc+1
+            // load payload from [base+16] (base still in rax)
+            // mov rdx, [rax+16] -> 48 8B 50 10
+            eb(72); eb(139); eb(80); eb(16)
+            if rd!=0 { rr(rd, 2) }
+            sdef(res, rd)
+            let done_lbl = nl()
+            jmp32(0)
+            w64(patches+patchc*PCS, codelen-5); w64(patches+patchc*PCS+8, done_lbl); w64(patches+patchc*PCS+16, 0); patchc=patchc+1
+            lbladd(panic_lbl, codelen)
+            // panic: exit(1)
+            ri(7, 1); eb(184); ei(60); sysc()  // mov edi,1; mov eax,60; syscall
+            lbladd(done_lbl, codelen)
+        }
+        // P7: IR_TRY - the `?` operator. a0 = Option/Result value (in-memory
+        // tagged layout [base+8]=tag, [base+16]=payload). On tag==0 (None/Err)
+        // early-return the WHOLE value from the enclosing function (rax already
+        // holds the base pointer) by jumping to the epilogue label. On tag==1
+        // (Some/Ok) the result vreg = payload [base+16].
+        else if op==IR_TRY {
+            flush_all()
+            let rs=aphys(a0)
+            let rd=aphys(res)
+            rbp(0, spill_home(a0))   // rax = base (value always in spill after flush_all)
+            // mov rdx, [rax+8]  (tag)  -> 48 8B 50 08
+            eb(72); eb(139); eb(80); eb(8)
+            // cmp rdx, 0 ; je err_lbl  (tag==0 -> early return). 48 83 FA 00
+            eb(72); eb(131); eb(250); eb(0)
+            if early_ret_lbl<0 { early_ret_lbl = nl() }
+            let err_lbl = nl()
+            jcc32(0, 0)  // je err_lbl
+            w64(patches+patchc*PCS, codelen-6); w64(patches+patchc*PCS+8, err_lbl); w64(patches+patchc*PCS+16, 1); patchc=patchc+1
+            // Ok: load payload [rax+16] -> rdx  (48 8B 50 10)
+            eb(72); eb(139); eb(80); eb(16)
+            if rd!=0 { rr(rd, 2) }
+            sdef(res, rd)
+            let ok_lbl = nl()
+            jmp32(0)   // skip the early-return jump target on the Ok path
+            w64(patches+patchc*PCS, codelen-5); w64(patches+patchc*PCS+8, ok_lbl); w64(patches+patchc*PCS+16, 0); patchc=patchc+1
+            lbladd(err_lbl, codelen)
+            // early-return: rax already holds the whole Option base; jump to epilogue
+            jmp32(0)
+            w64(patches+patchc*PCS, codelen-5); w64(patches+patchc*PCS+8, early_ret_lbl); w64(patches+patchc*PCS+16, 0); patchc=patchc+1
+            lbladd(ok_lbl, codelen)
+        }
+        // 0.0.96: try/catch exception handling (real unwind via handler-chain).
+        // Node (40 bytes): [0]=prev, [8]=catch_ip, [16]=thrown_val,
+        //   [24]=saved_rbp, [32]=saved_rsp. Head pointer at HANDLER_HEAD (abs).
+        else if op==IR_TRY_PUSH {
+            flush_all()
+            let catch_lbl = a0   // label id of the matching catch block
+            // sub rsp, 40  (48 83 EC 28)
+            eb(72); eb(131); eb(236); eb(40)
+            // node.prev = *head : mov rax,[HANDLER_HEAD]; mov [rsp+0],rax
+            //   mov rax,[abs] ABSOLUTE = 48 8B 04 25 imm32
+            eb(72); eb(139); eb(4); eb(37); ei(HANDLER_HEAD); 
+            //   mov [rsp+0],rax = 48 89 04 24
+            eb(72); eb(137); eb(4); eb(36)
+            // node.catch_ip = catch_lbl (absolute) : mov rax, imm32 (patch ty=3)
+            //   emit placeholder 48 C7 C0 00 00 00 00, patch the imm at codelen
+            eb(72); eb(199); eb(192); eb(0); eb(0); eb(0); eb(0)
+            let po_cip = codelen - 4
+            w64(patches+patchc*PCS, po_cip); w64(patches+patchc*PCS+8, catch_lbl); w64(patches+patchc*PCS+16, 3); patchc=patchc+1
+            // mov [rsp+8], rax = 48 89 44 24 08
+            eb(72); eb(137); eb(68); eb(36); eb(8)
+            // node.thrown_val = 0 : mov [rsp+16], 0 -> xor rax,rax; mov [rsp+16],rax
+            eb(72); eb(49); eb(192)             // xor rax,rax
+            eb(72); eb(137); eb(68); eb(36); eb(16)   // mov [rsp+16],rax
+            // node.saved_rbp = rbp : mov [rsp+24], rbp = 48 89 AC 24 18 00 00 00
+            eb(72); eb(137); eb(172); eb(36); eb(24); eb(0); eb(0); eb(0)
+            // node.saved_rsp = rsp+40 : mov rax,rsp; add rax,40; mov [rsp+32],rax
+            //   NOTE: mov rax,rsp = 48 89 E0 (eb(72);eb(137);eb(224)); 48 8B E0 is mov rsp,rax (WRONG)
+            eb(72); eb(137); eb(224)            // mov rax, rsp  (48 89 E0)
+            eb(72); eb(131); eb(192); eb(40)    // add rax, 40   (48 83 C0 28)
+            eb(72); eb(137); eb(68); eb(36); eb(32)   // mov [rsp+32], rax
+            // *head = node (rsp) : mov rax,rsp; mov [HANDLER_HEAD],rax ABSOLUTE
+            //   mov rax,rsp = 48 89 E0 ; mov [abs],rax = 48 89 04 25 imm32
+            eb(72); eb(137); eb(224)            // mov rax, rsp  (48 89 E0)
+            eb(72); eb(137); eb(4); eb(37); ei(HANDLER_HEAD)
+        }
+        else if op==IR_CATCH {
+            flush_all()
+            // bind the catch label (throw jumps here). a0 = catch_lbl.
+            lbladd(a0, codelen)
+            // the thrown value is already in rax (set by IR_THROW). Define the
+            // catch variable (res vreg) as rax so the handler body can read it.
+            if res>=0 { sdef(res, 0) }
+        }
+        else if op==IR_TRY_END {
+            flush_all()
+            // pop handler: *head = (**head).prev
+            //   mov rax,[HANDLER_HEAD]; mov rax,[rax+0]; mov [HANDLER_HEAD],rax
+            eb(72); eb(139); eb(4); eb(37); ei(HANDLER_HEAD)
+            eb(72); eb(139); eb(0)             // mov rax, [rax+0]
+            eb(72); eb(137); eb(4); eb(37); ei(HANDLER_HEAD)
+            // add rsp, 40  (48 83 C4 28)
+            eb(72); eb(131); eb(196); eb(40)
+        }
+        else if op==IR_THROW {
+            flush_all()
+            let rv=aphys(a0)
+            if rv!=0 { rr(0, rv) }   // rax = thrown value
+            // rbx = *head   ABS: mov rbx,[abs] = 48 8B 1C 25 imm32
+            eb(72); eb(139); eb(28); eb(37); ei(HANDLER_HEAD)
+            // if rbx==0 -> no handler: hard abort (exit 134)
+            eb(72); eb(133); eb(219)  // test rbx,rbx  (48 85 DB)
+            let abort_lbl = nl()
+            let po_jz = codelen; jcc32(0, 0)  // jz abort
+            w64(patches+patchc*PCS, po_jz); w64(patches+patchc*PCS+8, abort_lbl); w64(patches+patchc*PCS+16, 1); patchc=patchc+1
+            // node.thrown_val = rax : mov [rbx+16], rax = 48 89 43 10
+            eb(72); eb(137); eb(67); eb(16)
+            // restore frame: rbp=[rbx+24]; rsp=[rbx+32]
+            eb(72); eb(139); eb(107); eb(24)  // mov rbp,[rbx+24]  (48 8B 6B 18)
+            eb(72); eb(139); eb(99); eb(32)   // mov rsp,[rbx+32]  (48 8B 63 20)
+            // pop head: rax=[rbx+0]; mov [HANDLER_HEAD],rax
+            eb(72); eb(139); eb(3)            // mov rax,[rbx+0]  (48 8B 03)
+            eb(72); eb(137); eb(4); eb(37); ei(HANDLER_HEAD)
+            // rax = node.thrown_val (catch sees it) : mov rax,[rbx+16] = 48 8B 43 10
+            eb(72); eb(139); eb(67); eb(16)
+            // rax = node.catch_ip (ABSOLUTE vaddr, patched at ty==3).
+            //   mov rax, [rbx+8] = 48 8B 43 08
+            eb(72); eb(139); eb(67); eb(8)
+            // jmp rax (absolute) = FF E0
+            eb(255); eb(224)
+            // --- abort target (no handler) ---
+            lbladd(abort_lbl, codelen)
+            ri(7, 134); eb(184); ei(60); sysc()    // mov edi,134; mov eax,60; syscall
+        }
+        else if op==IR_PARAM {
+            if a0<6 {
+                let preg=0
+                if a0==0 { preg=7 }
+                if a0==1 { preg=6 }
+                if a0==2 { preg=2 }
+                if a0==3 { preg=1 }
+                if a0==4 { preg=8 }
+                if a0==5 { preg=9 }
+                sdef(res, preg)
+            } else {
+                // args 6+ arrive on the stack (SysV). After prologue (push rbp;
+                // mov rbp,rsp) the incoming stack args live above the return addr:
+                // [rbp+16]=arg6, [rbp+24]=arg7, ...  Load to rax, spill to home.
+                rbp(0, 16 + (a0-6)*8)   // rax = [rbp + 16 + (idx-6)*8]
+                sdef(res, 0)
+            }
+        }
+        else if op==IR_LABEL {
+            flush_all()
+            lbladd(a0,codelen)
+        }
+        else if op==IR_JMP {
+            flush_all()
+            let po=codelen; jmp32(0)
+            w64(patches+patchc*PCS,po); w64(patches+patchc*PCS+8,a0); w64(patches+patchc*PCS+16,0); patchc=patchc+1
+        }
+        else if op==IR_BR {
+            flush_all()
+            let cv=aphys(a0); rtest(cv,cv)
+            let po1=codelen; jcc32(0,0)  // je a1
+            w64(patches+patchc*PCS,po1); w64(patches+patchc*PCS+8,a1); w64(patches+patchc*PCS+16,1); patchc=patchc+1
+        }
+        else if op==IR_RET {
+            flush_all()
+            // P7: if an IR_TRY in this function needs an early-return target, bind
+            // the label here (right before the frame teardown) so a `?`-on-Err jump
+            // lands with rax = the whole Option/Result value and unwinds the frame.
+            if early_ret_lbl>=0 { lbladd(early_ret_lbl, codelen) }
+            if a0>=0 && naked != 1 { let rv=aphys(a0); if rv!=0 { rr(0,rv) } }
+            if naked == 1 {
+                // Naked: the body owns the ABI. No frame teardown, no register
+                // restores — the asm! body has already placed the return value
+                // in rax and balanced the stack. A bare ret is all that remains.
+                ret()
+            } else {
+            // add rsp, frame_size  (7 bytes: REX.W 81 C4 imm32), emitted into CODE.
+            let af=frame_size
+            if codelen+7 > CODE_CAP { exit(1) }
+            w8(code+codelen, 72); w8(code+codelen+1, 129); w8(code+codelen+2, 196)
+            w8(code+codelen+3, af & 255)
+            w8(code+codelen+4, (af >> 8) & 255)
+            w8(code+codelen+5, (af >> 16) & 255)
+            w8(code+codelen+6, (af >> 24) & 255)
+            codelen = codelen + 7
+            let mj=4; while mj>=0 { xpop(r64(mather_saved+mj*8)); mj=mj-1 }
+            xpop(5); ret()
+            }
+        }
+        else if op==IR_FNPTR {
+            // 0.0.72: fnptr(FNAME) now returns a [codeptr, env=0] tuple ? the
+            // SAME layout as IR_FNVAL ? so the result can be passed directly to
+            // closure_call (which expects a tuple and does mov rdx,[rax] then
+            // call r11). Before 0.0.72 fnptr emitted a RAW pointer (lea rax,
+            // [rip+disp]), and feeding it to closure_call dereferenced the raw
+            // pointer as a tuple -> `mov rdx,[rax]` read garbage -> jump to a
+            // bogus address -> SEGFAULT (rc=139). There was no gated test for
+            // fnptr, so the crash survived since 0.0.67. Copying IR_FNVAL's
+            // tuple emit here is the minimal fix: one allocation, deferred
+            // codeptr patch, env hardcoded to 0.
+            flush_all()
+            ri(7, 16)                          // rdi = 16 bytes
+            eb(72); eb(137); eb(254)          // mov rsi, rdi   (len)
+            eb(191); ei(0)          // mov edi, hint addr
+            eb(186); ei(3)                    // mov edx, 3     (PROT_READ|WRITE)
+            eb(65); eb(186); ei(34)           // mov r10d, 0x22 (MAP_PRIVATE|ANON)
+            eb(65); eb(184); ei(0-1)          // mov r8d, -1    (fd)
+            eb(69); eb(49); eb(201)           // xor r9d, r9d
+            eb(184); ei(9)                    // mov eax, 9
+            sysc()                            // rax = 16-byte buffer
+            let fi=a0
+            let lea_ofs=codelen
+            eb(72); eb(141); eb(21); ei(0)   // 48 8D 15 disp32 = lea rdx,[rip+disp]
+            w64(patches+patchc*PCS, lea_ofs); w64(patches+patchc*PCS+8, fi); w64(patches+patchc*PCS+16, 4); patchc=patchc+1
+            // [rax] = rdx (codeptr) ; [rax+8] = 0 (env)
+            eb(72); eb(137); eb(16)           // 48 89 10 = mov [rax], rdx
+            eb(72); eb(199); eb(64); eb(8); ei(0)   // 48 C7 40 08 00000000 = mov qword [rax+8], 0
+            let rres=aphys(res)
+            if rres!=0 { rr(rres,0) }; sdef(res, rres)
+        }
+        else if op==IR_FNVAL {
+            // P10: fn-value tuple [codeptr, env=0] (16 bytes, NO length header ?
+            // same layout as mk_any so IR_CLOSURE_CALL can read it directly).
+            flush_all()
+            ri(7, 16)                          // rdi = 16 bytes
+            eb(72); eb(137); eb(254)          // mov rsi, rdi   (len)
+            eb(191); ei(0)          // mov edi, hint addr
+            eb(186); ei(3)                    // mov edx, 3     (PROT_READ|WRITE)
+            eb(65); eb(186); ei(34)           // mov r10d, 0x22 (MAP_PRIVATE|ANON)
+            eb(65); eb(184); ei(0-1)          // mov r8d, -1    (fd)
+            eb(69); eb(49); eb(201)           // xor r9d, r9d
+            eb(184); ei(9)                    // mov eax, 9
+            sysc()                            // rax = 16-byte buffer
+            // rdx = codeptr: lea rdx,[rip+disp32] (deferred patch like IR_FNPTR)
+            let lea_ofs2=codelen
+            eb(72); eb(141); eb(21); ei(0)   // 48 8D 15 disp32 = lea rdx,[rip+disp]
+            let fi2=a0
+            w64(patches+patchc*PCS, lea_ofs2); w64(patches+patchc*PCS+8, fi2); w64(patches+patchc*PCS+16, 4); patchc=patchc+1
+            // [rax] = rdx (codeptr) ; [rax+8] = 0 (env)
+            eb(72); eb(137); eb(16)           // 48 89 10 = mov [rax], rdx
+            eb(72); eb(199); eb(64); eb(8); ei(0)   // 48 C7 40 08 00000000 = mov qword [rax+8], 0
+            let rres=aphys(res)
+            if rres!=0 { rr(rres,0) }; sdef(res, rres)
+        }
+        else if op==IR_CAPREAD {
+            let env_off = -(frame_size)
+            rr(11, 5)
+            eb(77); eb(139); eb(147); ei(env_off)
+            let kofs = a0*8
+            eb(73); eb(139); eb(130); ei(kofs)
+            eb(72); eb(139); eb(0)
+            sdef(res, 0)
+            // 0.0.121: record this capread's res vreg so IR_CAPWRITE can refresh
+            // the cached value that a later `return n` / re-read will observe.
+            // Keyed by function index (fi) + capture slot (a0) so it matches the
+            // entry-time table written in entry.quanta and the slot used by
+            // IR_CAPWRITE. THIS res is the vreg subsequent reads of `n` actually
+            // consult (the entry-time kvr is a separate, unused binding).
+            w64(cap_bodyvreg + (fi*CAP_MAX + a0)*8, res)
+        }
+        else if op==IR_CAPWRITE {
+            // 0.0.121 BY-REF WRITE: store the new value into the captured var's
+            // home slot through the env pointer (env[k] holds &enclosing_slot).
+            // The value vreg (a1) may live in a register OR be spilled; use aphys
+            // to materialize its current value into rdx BEFORE clobbering r10/r11.
+            let rval = aphys(a1)
+            if rval != 2 { rr(2, rval) }            // rdx = value (if not already rdx)
+            let env_off = -(frame_size)
+            rr(11, 5)
+            eb(77); eb(139); eb(147); ei(env_off)   // r10 = saved env pointer
+            let kofs = a0*8
+            eb(73); eb(139); eb(138); ei(kofs)      // rcx = [r10 + k*8] = &slot
+            eb(72); eb(137); eb(17)                 // mov [rcx], rdx
+            // refresh the body-local capread vreg so a later `return count` / re-read
+            // sees the mutation (the cached vreg is otherwise stale until next call).
+            let bvr = r64(cap_bodyvreg + (fi*CAP_MAX + a0)*8)
+            if bvr >= 0 {
+                rr(11, 5)
+                eb(77); eb(139); eb(147); ei(env_off)
+                eb(73); eb(139); eb(130); ei(kofs)  // rax = [r10 + k*8] = &slot
+                eb(72); eb(139); eb(0)              // rax = *slot (unused; refresh below)
+                rr(0, 2)                            // rax = rdx (new value)
+                sdef(bvr, 0)
+            }
+        }
+        else if op==IR_CLOSURE {
+            // P11: closure literal [codeptr, env] tuple (same layout as IR_FNVAL).
+            // a0 = closure body vreg (IR_CONST with fn index); a1..an = captured vregs.
+            // For v1 (no captures yet): env=0, just emit the tuple with body's codeptr.
+            flush_all()
+            ri(7, 16)                          // rdi = 16 bytes
+            eb(72); eb(137); eb(254)          // mov rsi, rdi   (len)
+            eb(191); ei(0)          // mov edi, hint addr
+            eb(186); ei(3)                    // mov edx, 3     (PROT_READ|WRITE)
+            eb(65); eb(186); ei(34)           // mov r10d, 0x22 (MAP_PRIVATE|ANON)
+            eb(65); eb(184); ei(0-1)          // mov r8d, -1    (fd)
+            eb(69); eb(49); eb(201)           // xor r9d, r9d
+            eb(184); ei(9)                    // mov eax, 9
+            sysc()                            // rax = 16-byte buffer
+            // rdx = codeptr: body vreg holds fn index (a0), we need its code address.
+            // For now: a0 is a vreg holding the fn index; emit load of its addr.
+            // The closure body is a top-level fn; we can use a similar PIC lea.
+            let lea_ofs2=codelen
+            eb(72); eb(141); eb(21); ei(0)   // 48 8D 15 disp32 = lea rdx,[rip+disp]
+            let fi2=a0
+            w64(patches+patchc*PCS, lea_ofs2); w64(patches+patchc*PCS+8, fi2); w64(patches+patchc*PCS+16, 4); patchc=patchc+1
+            // [rax] = rdx (codeptr). Then build env: if this closure captures
+            // nothing, env = 0 (fast path, no allocation). Otherwise allocate an
+            // ncap*8 array, copy each captured value out of the ENCLOSING frame's
+            // home slot into it, and store the pointer at [rax+8]. Captures are
+            // BY VALUE, taken at construction time.
+            eb(72); eb(137); eb(16)           // 48 89 10 = mov [rax], rdx
+            let ncap = r64(cap_count + a0*8)
+            if ncap == 0 {
+                eb(72); eb(199); eb(64); eb(8); ei(0)   // mov qword [rax+8], 0
+            } else {
+                // rbx = tuple ptr (callee-saved across the mmap syscall below)
+                rr(3, 0)                      // rbx = rax (tuple)
+                ri(7, 0)                                  // rdi = hint 0
+                ri(6, ncap*8)                             // rsi = ncap*8 bytes
+                eb(186); ei(3)                            // mov edx, 3   (RW)
+                eb(65); eb(186); ei(34)                   // mov r10d, 0x22
+                eb(65); eb(184); ei(0-1)                  // mov r8d, -1
+                eb(69); eb(49); eb(201)                   // xor r9d, r9d
+                eb(184); ei(9)                            // mov eax, 9   (mmap)
+                sysc()
+                eb(72); eb(131); eb(248); eb(0); eb(125); eb(12); eb(191); ei(1); eb(184); ei(60); eb(15); eb(5)  // mmap-fail -> exit(1)
+                let kk = 0
+                while kk < ncap {
+                    let cvr = r64(cap_vreg + (a0*CAP_MAX + kk)*8)
+                    leabp(1, spill_home(cvr))             // rcx = &enclosing_slot
+                    eb(72); eb(137); eb(136); ei(kk*8)    // 48 89 88 disp32 = mov [rax+k*8], rcx
+                    kk = kk + 1
+                }
+                // [tuple+8] = env
+                eb(72); eb(137); eb(67); eb(8)            // 48 89 43 08 = mov [rbx+8], rax
+                rr(0, 3)                                  // rax = tuple (result)
+            }
+            let rres=aphys(res)
+            if rres!=0 { rr(rres,0) }; sdef(res, rres)
+        }
+        else if op==IR_CLOSURE_CALL {
+            // closure_call(fnb, args...): fnb is a mk_any tuple (tag=codeptr, val=env).
+            // FIX: the callee is a NORMAL function (e.g. add(a,b)) using the standard
+            // SysV ABI, so caller args must land in the STANDARD arg registers
+            // (rdi,rsi,rdx,rcx,r8,r9). The previous code shifted args by one and put
+            // env in rdi, which collided with the callee's first param (add read
+            // a=env, b=arg0 -> wrong result). Env now goes to r10 (caller-saved
+            // scratch the callee ignores). Result returns in rax.
+            let fnb=a0; let avs2=a1; let nargc=a2
+            if nargc>5 { compile_error(2, cur_fnname, cur_fnnlen) }  // arity: too many closure args (v1 cap)
+            flush_all()
+            // rax = fnb tuple pointer
+            rbp(R_RAX, spill_home(fnb))
+            // rdx = fnb.0 (codeptr)  -- 64-bit load [rax]
+            eb(72); eb(139); mr(0, R_RDX, R_RAX)        // 48 8B 10 = mov rdx,[rax]
+            // r10 = fnb.1 (env)  -- 64-bit load [rax+8]; scratch reg, callee ignores it
+            eb(76); eb(139); mr(1, 2, 0); eb(8)         // 4C 8B 50 08 = mov r10,[rax+8] (REX.WR for r10)
+            // stash codeptr in r11 (caller-saved scratch; safe, no syscall here)
+            eb(76); eb(139); mr(3, 3, 2)               // 4C 8B DA = mov r11, rdx
+            // load caller args into STANDARD SysV positions rdi,rsi,rdx,rcx,r8,r9
+            let j=0
+            while j<nargc {
+                let av=irres(avs2+j)
+                let hm=spill_home(av)
+                if j==0 { rbp(R_RDI, hm) }
+                if j==1 { rbp(R_RSI, hm) }
+                if j==2 { rbp(R_RDX, hm) }
+                if j==3 { rbp(R_RCX, hm) }
+                if j==4 { rbp(R_R8, hm) }
+                if j==5 { rbp(R_R9, hm) }
+                j=j+1
+            }
+            // call r11
+            eb(65); eb(255); mr(3, 2, R_R11%8)              // 41 FF D3 = call r11
+            let rres=aphys(res)
+            if rres!=0 { rr(rres,0) }; sdef(res, rres)
+        }
+        else if op==IR_APUSH {
+            // P10: array push ? append a QWORD element (array header counts
+            // elements, qword stride; IR_ISTORE/IR_IDX read base+8+i*8).
+            // v=rdi (arg0), e=rsi (arg1). Returns new header ptr.
+            flush_all()
+            let arg_start = a2; let arg_cnt = a1
+            let av0 = irres(arg_start)
+            let av1 = irres(arg_start+1)
+            rbp(7, spill_home(av0))   // rdi = v
+            rbp(6, spill_home(av1))   // rsi = e
+            rr(3,7)                   // rbx = v
+            rr(13,6)                  // r13 = e
+            rmr(14,3)                 // r14 = oldlen = [v]
+            rr(0,14); eb(72);eb(255);eb(192)   // rax = oldlen+1 = newlen (48 FF C0)
+            rr(15,0)                  // r15 = newlen
+            eb(72);eb(193);eb(224);eb(3)       // shl rax,3 -> newlen*8 (48 C1 E0 03)
+            eb(72);eb(131);eb(192);eb(8)       // add rax,8 -> size = newlen*8+8 (48 83 C0 08)
+            rr(6,0)                   // rsi = size
+            ri(7,0); ri(2,3); ri(10,0x22); ri(8,-1); rxor(9,9); ri(0,9); sysc()  // rax = new
+        eb(72); eb(131); eb(248); eb(0); eb(125); eb(12); eb(191); ei(1); eb(184); ei(60); eb(15); eb(5)  // mmap-fail guard: if rax<0 exit(1)
+                rr(12,0)                  // r12 = new
+            rr(7,12)                  // rdi = new
+            rr(0,15)                  // rax = newlen
+            eb(72);eb(137);eb(7)      // [new] = newlen (48 89 07)
+            // copy oldlen*8 bytes v+8 -> new+8 via rep movsb
+            rr(6,3); eb(72);eb(131);eb(198);eb(8)   // rsi = v+8 (48 83 C6 08)
+            rr(7,12); eb(72);eb(131);eb(199);eb(8)  // rdi = new+8 (48 83 C7 08)
+            rr(1,14); eb(72);eb(193);eb(225);eb(3)  // rcx = oldlen*8 (48 C1 E1 03)
+            eb(243);eb(164)           // rep movsb
+            // store qword e at new+8+oldlen*8
+            rr(7,12); eb(72);eb(131);eb(199);eb(8)  // rdi = new+8
+            rr(0,14); eb(72);eb(193);eb(224);eb(3)  // rax = oldlen*8 (48 C1 E0 03)
+            ra(7,0)                   // rdi += rax -> new+8+oldlen*8
+            rr(0,13)                  // rax = e
+            eb(72);eb(137);eb(7)      // mov [rdi], rax (48 89 07 qword store)
+            rr(0,12)                  // rax = new
+            let rres=aphys(res)
+            if rres!=0 { rr(rres,0) }; sdef(res, rres)
+        }
+        else if op==IR_CALL || op==IR_CALL_IDX {
+            flush_all()
+            let is_idx = 0
+            if op==IR_CALL_IDX { is_idx = 1 }   // 0.0.97: a0 carries fn index directly
+            // Load arguments from their home slots directly into ABI registers.
+            // flush_all() above spilled every live vreg to its home, so the
+            // sources are distinct memory locations and destinations are distinct
+            // registers -- no aliasing hazard (matches the Python oracle).
+            let arg_start = a2; let arg_cnt = a1
+            // 0.0.55: qc_sys_cmd ($$(cmd)) carries the cmd vreg in a1 (NOT an arg
+            // count) with a2=0. Skip the generic arg-loader ? emit_bltn loads the
+            // cmd itself from the lit_addr map. Detect the name by its bytes at
+            // src+a0 (the name "qc_sys_cmd" is 10 chars, null-terminated).
+            let is_syscmd = 0
+            if r8(src+a0)=='q' && r8(src+a0+1)=='c' && r8(src+a0+2)=='_' && r8(src+a0+3)=='s' && r8(src+a0+4)=='y' && r8(src+a0+5)=='s' && r8(src+a0+6)=='_' && r8(src+a0+7)=='c' && r8(src+a0+8)=='m' && r8(src+a0+9)=='d' && r8(src+a0+10)==0 { is_syscmd = 1 }
+            if is_syscmd==1 { arg_cnt = 0 }
+            // args 6+ go on the stack (SysV). nstack/pad computed here; the actual
+            // spill is deferred until AFTER is_ext_call is known (below), because
+            // extern "C" calls spill AFTER the rsp-alignment push (see extern branch).
+            let nstack=0
+            if arg_cnt>6 { nstack=arg_cnt-6 }
+            let pad=0
+            // P5: resolve callee + extern flag BEFORE loading args so we can
+            // apply the Quanta string-header skip (+8) for extern "C" calls.
+            let nm=a0; let nl=0; let callee=a0
+            if is_idx==0 {
+                while nl<256 {
+                    let c0=r8(src+nm+nl)
+                    if c0==0||c0==40||c0==41||c0==59||c0==123||c0==125||c0==44||c0==60||c0==62 { break }
+                    if c0==32||c0==9||c0==10||c0==13 { break }
+                    nl=nl+1
+                }
+                callee=findfn(nm,nl)
+            }
+            // 0.0.119: thread_create(worker, arg) ? resolve the worker function name
+            // (first source argument) and stash its SOURCE OFFSET in g_thread_ffi so
+            // emit_bltn can emit a type-2 (name-resolved) call relocation into the
+            // child trampoline, exactly like a normal function call (which works).
+            if nl==13&&r8(src+nm)=='t'&&r8(src+nm+1)=='h'&&r8(src+nm+2)=='r'&&r8(src+nm+3)=='e'&&r8(src+nm+4)=='a'&&r8(src+nm+5)=='d'&&r8(src+nm+6)=='_'&&r8(src+nm+7)=='c'&&r8(src+nm+8)=='r'&&r8(src+nm+9)=='e'&&r8(src+nm+10)=='a'&&r8(src+nm+11)=='t'&&r8(src+nm+12)=='e' {
+                // first arg token = worker name: scan from after "thread_create("
+                let p = nm + nl + 1   // skip '('
+                while r8(src+p)==32||r8(src+p)==9||r8(src+p)==10||r8(src+p)==13 { p = p + 1 }
+                let wn = 0
+                while r8(src+p+wn)>=65&&r8(src+p+wn)<=122&&r8(src+p+wn)!=40&&r8(src+p+wn)!=41&&r8(src+p+wn)!=44 { wn = wn + 1 }
+                g_thread_ffi = findfn(p, wn)   // store WORKER FN INDEX (like normal calls)
+            }
+            let is_ext_call=0
+            if callee>=0 && r64(fn_extern + callee*8)==1 { is_ext_call=1 }
+
+            // Spill args 6+ to the stack for NON-extern (internal) calls. Extern "C"
+            // calls do their own spill AFTER the rsp-alignment push (in the extern
+            // branch below), because pushing r11 for alignment must not land between
+            // the return address and the first stack arg (which would shift every
+            // stack arg by 8 and corrupt it).
+            if nstack>0 && is_ext_call==0 {
+                if nstack%2==1 { pad=8; sbi(8) }   // align rsp to 16 before pushes
+                let sj=arg_cnt-1
+                while sj>=6 {
+                    let arg_ir2=arg_start+sj
+                    if arg_ir2<ir_end {
+                        let av2=irres(arg_ir2)
+                        rbp(0, spill_home(av2))   // rax = arg
+                        xpush(0)                  // push rax
+                    }
+                    sj=sj-1
+                }
+            }
+
+            // Load register args 0..5 from home slots into the ABI registers.
+            let arg_i=0
+            while arg_i<arg_cnt {
+                if arg_i<6 {
+                    let arg_ir = arg_start + arg_i
+                    if arg_ir < ir_end {
+                        let av=irres(arg_ir)
+                        let preg=0
+                        if arg_i==0 { preg=7 }
+                        if arg_i==1 { preg=6 }
+                        if arg_i==2 { preg=2 }
+                        if arg_i==3 { preg=1 }
+                        if arg_i==4 { preg=8 }
+                        if arg_i==5 { preg=9 }
+                        rbp(preg, spill_home(av))
+                        // P5: extern "C" ? skip the 8-byte Quanta length header on
+                        // a string-valued arg so C receives a char* to the data.
+                        if is_ext_call==1 {
+                            let _isstr = r64(vreg_is_str + av*8)
+                            if _isstr!=1 {
+                                let _aisop = irop(arg_ir)
+                                if _aisop==23 { _isstr = 1 }
+                                else if _aisop==IR_MOV {
+                                    let _sv = ira0(arg_ir)
+                                    if r64(vreg_is_str + _sv*8)==1 { _isstr = 1 }
+                                }
+                            }
+                            if _isstr==1 {
+                                eb(72); eb(131)
+                                if preg>=8 { eb(192 + (preg - 8)) }
+                                else { eb(192 + preg) }
+                                eb(8)
+                            }
+                        }
+                    }
+                }
+                arg_i=arg_i+1
+            }
+            // FIX-0.0.3: explicit mem_free(p)/drop(p) transfers ownership away.
+            // Clear vreg_owned for arg 0 so the RAII scope-exit (owned_scope_pop_one)
+            // does NOT re-emit IR_FREE for the same block (double-free -> aliased-block
+            // heap corruption once the allocator starts recycling the free list).
+            if is_idx==0 && arg_cnt>=1 && arg_start<ir_end {
+                let _isfree = 0
+                if nl==8&&r8(src+nm)=='m'&&r8(src+nm+1)=='e'&&r8(src+nm+2)=='m'&&r8(src+nm+3)=='_'&&r8(src+nm+4)=='f'&&r8(src+nm+5)=='r'&&r8(src+nm+6)=='e'&&r8(src+nm+7)=='e' { _isfree = 1 }
+                if nl==4&&r8(src+nm)=='d'&&r8(src+nm+1)=='r'&&r8(src+nm+2)=='o'&&r8(src+nm+3)=='p' { _isfree = 1 }
+                if _isfree==1 {
+                    let _fv = irres(arg_start)
+                    if _fv>=0 && _fv<400000 { w64(vreg_owned + _fv*8, 0) }
+                }
+            }
+            // (callee/nm/nl already resolved above for P5)
+            if callee>=0 && r64(fn_var + callee*8)==1 { ri(10, arg_cnt) }
+            // P3: if callee is extern "C", emit direct call to external symbol
+            if is_ext_call==1 {
+                // P5: align rsp to 16 before the libc call (SysV ABI). The prologue
+                // leaves rsp 8 mod 16 at the call site; libc (printf etc.) faults on
+                // misalignment via SSE. push r11 (scratch, caller-saved, not used
+                // for args or return) to align, pop after.
+                eb(65); eb(83)   // push r11
+                // Spill variadic stack args (6+) AFTER alignment, highest-first so
+                // they land at [rsp+8],[rsp+16],... (above the return address).
+                if nstack>0 {
+                    let sj=arg_cnt-1
+                    while sj>=6 {
+                        let arg_ir2=arg_start+sj
+                        if arg_ir2<ir_end {
+                            let av2=irres(arg_ir2)
+                            rbp(0, spill_home(av2))   // rax = arg
+                            xpush(0)                  // push rax
+                        }
+                        sj=sj-1
+                    }
+                }
+                let call_ofs = codelen
+                eb(232)  // E8 = call
+                ei(0)    // placeholder - patched to PLT by objfmt
+                w64(patches+patchc*PCS,call_ofs); w64(patches+patchc*PCS+8,nm); w64(patches+patchc*PCS+16,3)
+                patchc=patchc+1
+                eb(65); eb(91)   // pop r11
+            }
+            // Built-ins are emitted inline; source functions get a patched call.
+            else if is_idx==1 {
+                let call_ofs = codelen
+                eb(232)  // E8 = call
+                ei(0)    // placeholder
+                w64(patches+patchc*PCS,call_ofs); w64(patches+patchc*PCS+8,a0); w64(patches+patchc*PCS+16,5)
+                patchc=patchc+1
+            }
+            else if emit_bltn(nm,nl,ii)==0 {
+                let call_ofs = codelen
+                eb(232)  // E8 = call
+                ei(0)    // placeholder
+                w64(patches+patchc*PCS,call_ofs); w64(patches+patchc*PCS+8,nm); w64(patches+patchc*PCS+16,2)
+                patchc=patchc+1
+            }
+
+            // Caller cleanup: reclaim stack space used for args 6+ (and pad).
+            if nstack>0 { abi(nstack*8 + pad) }   // add rsp, nstack*8+pad
+
+            // Save result - allocate result register
+            let rres=aphys(res)
+            if rres!=0 { rr(rres,0) }; sdef(res, rres)
+            // A callee declared `-> f64` hands the float bits back in rax, so the
+            // result vreg is a float. Untagged, the caller read those bits as an
+            // integer: `fn f(a: f64) -> f64 { return a; }` then `f(1.0) == 0.1`
+            // compared 4607182418800017408 against 0.1 and was false.
+            // is_idx==1 is IR_CALL_IDX, where a0 IS the fn index; otherwise
+            // `callee` was resolved from the name above.
+            let rfi = callee
+            if is_idx==1 { rfi = a0 }
+            if rfi>=0 && rfi<fnc && r64(fn_retflt + rfi*8)==1 { w8(vfloat+res, 1) }
+            // NOTE: parameter-float inference from the caller's float arguments is
+            // NOT done here. By the time an IR_CALL is emitted its callee has
+            // already been through ci_func(), so a fn_parflt bit set here would be
+            // read too late. It is a whole-IR pre-pass in entry.quanta
+            // (infer_par_flt) that runs after every function is parsed and before
+            // any ci_func emits one.
+            // `-> string` tags the result vreg, so file_open skips the 8-byte length
+            // header and opens the bytes. Without it a path returned from a function
+            // was opened from its LENGTH field and open() returned -2 -- which made
+            // every computed path unusable and, in std/config, made the config
+            // unfindable. Same class as fn_retflt: value survives, tag did not.
+            //
+            // This used w8(vreg_is_str+res, 1): TWO bugs in one store. w8 is a ONE-byte
+            // store, but nv() initializes every cell to -1 via w64() -- so the
+            // byte left the cell at 0xFFFFFFFFFFFFFF01, neither the 1 readers
+            // test for nor the -1 they test as "not a string". And the offset
+            // omitted the *8 stride, writing into a different vreg's cell
+            // entirely. The tag therefore never took effect and the declared
+            // `-> string` path was dead, contrary to the comment above claiming
+            // it worked:
+            //
+            //     fn d() -> string { return "hello" }   print(d())  -> 1109393744
+            //     fn u() { return "hello" }            print(u())  -> 1109393760
+            //
+            // Both printed an integer because print() fell back to the integer path
+            // and read the string header's low bytes. vfloat is read bytewise AND
+            // unscaled (w8(vfloat+res,1) is correct for it), which is why the
+            // identical mistake is harmless beside it and fatal here.
+            if rfi>=0 && rfi<fnc && r64(fn_retstr + rfi*8)==1 { w64(vreg_is_str + res*8, 1) }
+        }
+        else if op==IR_FREE {
+            // 0.0.112 RAII: scope-exit cleanup of a mem_alloc-owned binding now
+            // recycles the block to the free-list via drop() (== mem_free) instead
+            // of munmap. This makes owned heap pointers auto-RAII: no manual
+            // mem_free needed, block returns to the allocator for reuse.
+            // a0 = the owned vreg. Load it into rdi (the drop/mem_free arg).
+            flush_all()
+            let fv=irres(a0)
+            rbp(R_RDI, spill_home(fv))        // rdi = ptr
+            eb(87)                                    // push rdi  (save ptr at [rsp])
+            eb(91)                                    // pop rbx   (rbx = ptr, callee-saved)
+            eb(72); eb(139); eb(4); eb(37); ei(HEAP_CTRL)   // mov rax, [HEAP_CTRL]  (old head)
+            eb(72); eb(137); eb(91); eb(8)                 // mov [rbx+8], rax  ([ptr+8] = old head)
+            eb(72); eb(137); eb(27); eb(37); ei(HEAP_CTRL) // mov [HEAP_CTRL], rbx  (list head = ptr)
+            ri(R_RAX, 0)                               // rax = 0
+        }
+        else if op==IR_DEREF {  // P6: *p - raw pointer dereference (load)
+            flush_all()
+            let rd=aphys(res)
+            let rs=aphys(a0)
+            eb(72); eb(139); mr(0, rd, rs)   // mov rd, [rs]  (64-bit load)
+            sdef(res, rd)
+        }
+        else if op==IR_DEREF_MUT {  // P6: *p = v (store through raw pointer)
+            flush_all()
+            let rs=aphys(a0)   // pointer
+            let rv=aphys(a1)   // value
+            eb(72); eb(137); mr(0, rv, rs)   // mov [rs], rv  (64-bit store)
+        }
+        else if op==IR_PTR_ADD {  // P6: p + n (element-sized)
+            let r1=aphys(a0); let r2=aphys_x(a1,a0); let rd=adistinct(res,r1,r2)
+            if rd!=r1 { rr(rd,r1) }
+            // Scale by 8: lea rd, [r1 + r2*8]
+            if r2!=0 {
+                // Use LEA with scale=8: lea rd, [r1 + r2*8]
+                // encoding: 8D /r (lea r64, m) with SIB byte for scale=8
+                // For x86-64: lea rd, [r1 + r2*8] = REX.W 8D mod=00 SIB disp32=0
+                // SIB = scale(3)<<6 | index(r2)<<3 | base(r1)
+                let sib = 0x80 | ((r2 & 7) << 3) | (r1 & 7)
+                let rexl = 0x48 | ((rd>>3) & 1) | ((r1>>3) & 1)<<1 | ((r2>>3) & 1)<<2
+                eb(rexl); eb(0x8D); eb(sib); ei(0)
+            } else {
+                if rd!=r1 { rr(rd,r1) }
+            }
+            sdef(res, rd)
+        }
+        else if op==IR_PTR_SUB {  // P6: p - n (element-sized)
+            let r1=aphys(a0); let r2=aphys_x(a1,a0); let rd=adistinct(res,r1,r2)
+            if rd!=r1 { rr(rd,r1) }
+            // Scale by 8: lea rd, [r1 - r2*8] = lea rd, [r1 + r2*(-8)]
+            // Use LEA with negative scale trick: sub then LEA, or use SUB directly
+            if r2!=0 {
+                // LEA with negative displacement: lea rd, [r1 - r2*8]
+                // Can do: sub temp, r2*8; lea rd, [r1 + temp]
+                // Simpler: use SUB after LEA for positive, or use scaled index with negative disp
+                // For now: compute r2*8 into temp, then sub
+                let temp = nv()
+                rr(temp, r2)
+                eb(0xD1); mr(3, temp, temp)  // shl temp, 3  (multiply by 8)
+                if rd!=r1 { rr(rd, r1) }
+                rs(rd, temp)
+            } else {
+                if rd!=r1 { rr(rd,r1) }
+            }
+            sdef(res, rd)
+        }
+        else if op==IR_PTR_DIFF {  // P6: p - q (elements)
+            let r1=aphys(a0); let r2=aphys_x(a1,a0); let rd=adistinct(res,r1,r2)
+            if rd!=r1 { rr(rd,r1) }
+            rs(rd, r2)
+            // Divide by 8: sar rd, 3 (arithmetic shift right)
+            eb(0xD1); mr(7, rd, rd)  // sar rd, 3
+            sdef(res, rd)
+        }
+        else if op==IR_PTR_CAST {  // P6: &p or cast to raw pointer
+            // a2: 1 = address-of, 0 = cast. (a1 is the type tag from the
+            // `x as T` cast path ? the address-of marker is passed in a2 by
+            // parse_unary's `&` branch: iremit(IR_PTR_CAST, vr, o, 0, 1).)
+            if a2==1 {
+                // address-of LOCAL: lea rd, [rbp + spill_home(a0)] gives the
+                // stack address of the local's home slot. (Globals: the a0
+                // vreg is an IR_LOADG temp, so &global is not yet supported ?
+                // same limitation as before, but locals now work.)
+                let rd=aphys(res)
+                let off=spill_home(a0)
+                rw(rd,5); eb(141); if rd>=8 { mr(2,rd%8,4); eb(37) } else { mr(2,rd%8,5) }; ei(off)
+                sdef(res, rd)
+            } else {
+                // `x as T` width cast: move value, then truncate to the target
+                // width if T is a fixed-width type. a1 holds the target vtype
+                // (1=u8,2=u16,3=u32,7=char,8=byte -> mask; 4=u64,5=usize,
+                // 6=bool, 0=signed -> identity).
+                let rd=aphys(res)
+                let rs=aphys(a0)
+                if rd!=rs { rr(rd, rs) }
+                eb(15); eb(15); eb(15); eb(15)   // PROBE: 4 nops if cast branch runs
+                if a1==1 || a1==7 || a1==8 { eb(72); eb(129); eb(224 + (rd%8)); ei(0xFF) }
+                else if a1==2 { eb(72); eb(129); eb(224 + (rd%8)); ei(0xFFFF) }
+                else if a1==3 { eb(72); eb(193); eb(224 + (rd%8)); eb(32); eb(72); eb(193); eb(232 + (rd%8)); eb(32) }
+                sdef(res, rd)
+            }
+        }
+        else if op==IR_IS_NULL {  // P6: p == 0
+            let r1=aphys(a0); let rd=adistinct(res,r1,r1)
+            // cmp r1, 0; sete rd
+            eb(0x48); eb(0x83); mr(7, r1, r1); ei(0)  // cmp r1, 0
+            eb(0x0F); eb(0x94); mr(0, rd, r1)  // sete rd
+            sdef(res, rd)
+        }
+        else if op==IR_VOLATILE_LOAD {  // P6: volatile load
+            flush_all()
+            let rd=aphys(res)
+            let rs=aphys(a0)
+            eb(72); eb(139); mr(0, rd, rs)   // mov rd, [rs]  (64-bit load, mod=0 no disp)
+            // Compiler barrier: asm volatile("" ::: "memory")
+            eb(0x0F); eb(0xAE); eb(0xF0)  // mfence (full barrier)
+            sdef(res, rd)
+        }
+        else if op==IR_VOLATILE_STORE {  // P6: volatile store
+            flush_all()
+            let rs=aphys(a0)
+            let rt=aphys(a1)
+            eb(72); eb(137); mr(0, rt, rs)   // mov [rs], rt  (64-bit store; a0=address like IR_DEREF_MUT)
+            // Compiler barrier
+            eb(0x0F); eb(0xAE); eb(0xF0)  // mfence
+        }
+        // P10: IR_ARRAY_LEN (op 69) ? get array length from header [base]
+        else if op==IR_ARRAY_LEN {
+            flush_all()
+            let rs=aphys(a0)
+            let rd=aphys(res)
+            eb(0x48); eb(0x8B); mr(0, rd, rs)  // mov rd, [rs]  (64-bit load from header)
+            sdef(res, rd)
+        }
+        else if op==IR_STR {
+            // a0 = pointer to string in source (including opening quote)
+            let sp=a0+1  // skip quote
+            // Find length by scanning to closing quote
+            let ln=0; let scp=sp
+            while scp<srclen&&r8(src+scp)!=34 {
+                ln=ln+1; if r8(src+scp)==92&&scp+1<srclen { scp=scp+2 } else { scp=scp+1 }
+            }
+            // Emit to output binary's data section (absolute address). String literals
+            // live AFTER all global slots: GDATA + (INTERNAL_GLOBAL_COUNT+gvarc)*8 + data_off.
+            //
+            // A string expression evaluates to the HEADER pointer of the literal, not
+            // the characters: the layout is [u64 len][chars][NUL], and every consumer
+            // (print, str(), substr, qc_sys_cmd, file_open paths) reads the length at
+            // [s] and the bytes at s+8. Keep that invariant -- IR_ARRAY_LEN loads
+            // [base], and emit_bltn does cmd+8 itself. Pointing the vreg at the
+            // characters instead shifts both by 8 and silently breaks print().
+            let gdata_size = (INTERNAL_GLOBAL_COUNT + gvarc)*8
+            let str_addr = GDATA + gdata_size + data_off
+            // 0.0.55: record this literal's data-section address keyed by its
+            // result vreg, so qc_sys_cmd's emit_bltn can load the cmd directly.
+            w64(lit_addr + res*8, str_addr)
+            let rd=aphys(res)
+            if emit_obj == 1 {
+                // OBJECT mode: RIP-relative lea rd, [rip+disp32]; disp32 patched by an
+                // R_X86_64_PC32 reloc against _gdata, addend = gdata_size+data_off-4.
+                let rexl=72; if rd>=8 { rexl=76 }
+                eb(rexl); eb(141); eb(5 + (rd%8)*8); ei(0)   // REX.W 8D mod=00 rm=rip disp32
+                w64(gpatches+gpatchc*24, codelen-4)
+                w64(gpatches+gpatchc*24+8, gdata_size + data_off)
+                w8(gpatches+gpatchc*24+16, 2)
+                if gpatchc >= GPATCH_CAP { emit_ovf(10) }
+                gpatchc=gpatchc+1
+            } else {
+                ri64(rd, str_addr)
+            }
+            if data!=0 && data+1!=0 {
+                let ci=0
+                let si=sp
+                while ci<ln {
+                    let sv=r8(src+si)
+                    if sv==92&&si+1<srclen {
+                        let nx=r8(src+si+1)
+                        if nx==110 { sv=10 }
+                        else if nx==116 { sv=9 }
+                        else if nx==114 { sv=13 }
+                        else if nx==48 { sv=0 }
+                        else if nx==92 { sv=92 }
+                        else if nx==34 { sv=34 }
+                        else if nx==39 { sv=39 }
+                        else { sv=nx }
+                        si=si+2
+                    } else {
+                        si=si+1
+                    }
+                    w8(data+data_off+8+ci, sv)
+                    ci=ci+1
+                }
+                w64(data+data_off, ln)
+                w8(data+data_off+8+ln, 0)
+                let bsz=8+ln+1; let pad=bsz%16; if pad>0 { bsz=bsz+(16-pad) }
+                if data_off+bsz > DAT_CAP { exit(1) }
+                data_off=data_off+bsz
+            }
+            sdef(res, rd)
+        }
+        // P6: Raw pointer dereference (*p)
+        else if op==IR_DEREF {
+            flush_all()
+            let rs=aphys(a0)
+            let rd=aphys(res)
+            eb(72); eb(139); mr(0, rd, rs)   // mov rd, [rs]
+            sdef(res, rd)
+        }
+        // P6: Mutable raw pointer dereference (*p = v)
+        else if op==IR_DEREF_MUT {
+            flush_all()
+            let rs=aphys(a0)   // pointer
+            let rv=aphys(a1)   // value
+            eb(72); eb(137); mr(0, rs, rv)   // mov [rs], rv
+        }
+        // P6: Pointer arithmetic p + n (element-sized)
+        else if op==IR_PTR_ADD {
+            let r1=aphys(a0); let r2=aphys_x(a1,a0); let rd=adistinct(res,r1,r2)
+            if rd!=r1 { rr(rd,r1) }
+            // Scale by element size (8 bytes for pointers)
+            if r2!=0 { ra(rd,r2) }  // assume already scaled or use shift
+            sdef(res, rd)
+        }
+        // P6: Pointer arithmetic p - n
+        else if op==IR_PTR_SUB {
+            let r1=aphys(a0); let r2=aphys_x(a1,a0); let rd=adistinct(res,r1,r2)
+            if rd!=r1 { rr(rd,r1) }
+            rs(rd,r2)
+            sdef(res, rd)
+        }
+        // P6: Pointer diff p - q (elements)
+        else if op==IR_PTR_DIFF {
+            let r1=aphys(a0); let r2=aphys_x(a1,a0); let rd=adistinct(res,r1,r2)
+            if rd!=r1 { rr(rd,r1) }
+            rs(rd,r2)
+            // Divide by 8 (element size) - use shr for unsigned
+            eb(72); eb(139); mr(0, 1, rd)  // mov rcx, rd
+            eb(72); eb(193); eb(249); eb(3)  // shr rcx, 3
+            rr(rd, 1)
+            sdef(res, rd)
+        }
+        // P6: Pointer cast (p as usize / usize as *T / address-of)
+        else if op==IR_PTR_CAST {
+            // a0 = value, a1 = type tag (0=to usize, 1=address-of)
+            if a1==1 {
+                // address-of: just use the value as a pointer
+                let rs=aphys(a0)
+                let rd=aphys(res)
+                if rd!=rs { rr(rd,rs) }
+                sdef(res, rd)
+            } else {
+                // cast to usize/width type: move value, then truncate to the
+                // target width if a1 is a fixed-width type tag (1=u8,2=u16,
+                // 3=u32,7=char,8=byte). a1=0/4/5 (signed/u64/usize) -> identity.
+                let rs=aphys(a0)
+                let rd=aphys(res)
+                if rd!=rs { rr(rd,rs) }
+                if a1==1 || a1==7 || a1==8 { eb(72); eb(129); eb(224 + (rd%8)); ei(0xFF) }
+                else if a1==2 { eb(72); eb(129); eb(224 + (rd%8)); ei(0xFFFF) }
+                else if a1==3 { eb(72); eb(193); eb(224 + (rd%8)); eb(32); eb(72); eb(193); eb(232 + (rd%8)); eb(32) }
+                sdef(res, rd)
+            }
+        }
+        // P6: is_null check
+        else if op==IR_IS_NULL {
+            let r1=aphys(a0)
+            let rd=adistinct(res,r1,r1)
+            // cmp r1, 0; sete rd
+            eb(72); eb(131); eb(248 + (r1%8)); eb(0)  // cmp r1, 0
+            eb(15); eb(148 + (rd%8)); eb(0)  // sete rd (8-bit)
+            rzx(rd,rd)
+            sdef(res, rd)
+        }
+        // P6: Volatile load (MMIO)
+        else if op==IR_VOLATILE_LOAD {
+            flush_all()
+            let rs=aphys(a0)
+            let rd=aphys(res)
+            // Use mov with volatile semantics (compiler barrier)
+            eb(72); eb(139); mr(0, rd, rs)   // mov rd, [rs]
+            // Compiler barrier: asm volatile("" ::: "memory") - skip for now
+            sdef(res, rd)
+        }
+        // P6: Volatile store (MMIO)
+        else if op==IR_VOLATILE_STORE {
+            flush_all()
+            let rs=aphys(a0)
+            let rv=aphys(a1)
+            eb(72); eb(137); mr(0, rs, rv)   // mov [rs], rv
+            // Compiler barrier
+        }
+        // P6: Inline assembly (placeholder - emit as no-op for now)
+        // P6: Raw pointer type markers (no runtime codegen)
+        else if op==IR_RAW_PTR {
+            // No-op: raw pointer type annotation
+        }
+        else if op==IR_MUT_PTR {
+            // No-op: mutable raw pointer type annotation
+        }
+        // P6: Raw pointer type markers (no runtime codegen)
+        else if op==IR_RAW_PTR {
+            // No-op: raw pointer type annotation
+        }
+        else if op==IR_MUT_PTR {
+            // No-op: mutable raw pointer type annotation
+        }
+        else if op==IR_FFI_CALL {  // P6: FFI call - System V AMD64 ABI
+            flush_all()
+            // a0 = function pointer (vreg), a1 = number of args, a2 = args array pointer (vreg)
+            let fn_ptr = aphys(a0)
+            let nargs = aphys(a1)
+            let args_ptr = aphys(a2)
+            // Load args array base into rax, then move each 64-bit elem into the
+            // SysV ABI registers rdi,rsi,rdx,rcx,r8,r9.
+            rr(0, args_ptr)
+            eb(72); eb(139); eb(120); eb(0)   // mov rdi, [rax+0]
+            eb(72); eb(139); eb(112); eb(8)   // mov rsi, [rax+8]
+            eb(72); eb(139); eb(104); eb(16)  // mov rdx, [rax+16]
+            eb(72); eb(139); eb(96);  eb(24)  // mov rcx, [rax+24]
+            eb(76); eb(139); eb(96);  eb(32)  // mov r8,  [rax+32]
+            eb(76); eb(139); eb(104); eb(40)  // mov r9,  [rax+40]
+            // Load callee pointer into rax and call it.
+            rr(0, fn_ptr)
+            eb(255); eb(208)                  // call rax
+            // Return value in rax -> result vreg.
+            let rd = aphys(res)
+            if rd != 0 { rr(rd, 0) }
+            sdef(res, rd)
+        }
+        else if op==IR_VEC128 {  // P6: SIMD vec128 (placeholder)
+            flush_all()
+            eb(144)
+            let rd=aphys(res)
+            rxor(rd, rd)
+            sdef(res, rd)
+        }
+        else if op==IR_UNSAFE_BLOCK {  // P6: unsafe block marker (no-op at runtime)
+            // No-op: unsafe{} is a compile-time construct
+        }
+        else if op==IR_ASM {
+            // P11: inline asm ? template at src+a0 is a hex byte string like
+            // "b8 2a 00 00 00" (mov eax, 42). Emit each byte verbatim.
+            // Result register convention: RAX.
+            // INVALID hex chars cause COMPILE-TIME ERROR (not silent garbage).
+            flush_all()
+            let sp=a0+1  // skip opening quote
+            let hi=0; let hn=0; let got=0
+            while sp<srclen {
+                let c=r8(src+sp)
+                if c==34 { break }  // closing quote
+                let dv=-1
+                if c>=48&&c<=57 { dv=c-48 }
+                else if c>=97&&c<=102 { dv=c-87 }
+                else if c>=65&&c<=70 { dv=c-55 }
+                else if c==32 || c==9 || c==10 || c==13 {  // whitespace: skip
+                    sp=sp+1
+                    continue
+                }
+                else {
+                    let mn = "error: invalid hex char in asm! template\n"; file_write(2, mn+8, len(mn)); exit(1)
+                }
+                if dv>=0 {
+                    if hn==0 { hi=dv; hn=1 } else { eb(hi*16+dv); got=1; hn=0 }
+                }
+                sp=sp+1
+            }
+            if hn==1 { let mn = "error: odd number of hex digits in asm! template\n"; file_write(2, mn+8, len(mn)); exit(1) }
+            if got==0 { eb(144) }  // empty template -> nop
+            let rd=aphys(res)
+            if rd!=0 { rr(rd,0) }   // result convention: RAX -> rd
+            sdef(res, rd)
+        }
+        ii=ii+1
+    }
+
+    // Resolve this function's label jumps/branches (ty 0 = jmp, ty 1 = je).
+    // Label offsets live in the per-function lblmap, so this must happen before
+    // the next function resets it.
+    let pk=pstart
+    while pk<patchc {
+        let pty=r64(patches+pk*PCS+16)
+        if pty==0 {
+            let ppo=r64(patches+pk*PCS); let plbl=lblf(r64(patches+pk*PCS+8))
+            if plbl>=0 { w32(code+ppo+1, plbl-(ppo+5)) }
+        } else if pty==1 {
+            let ppo=r64(patches+pk*PCS); let plbl=lblf(r64(patches+pk*PCS+8))
+            if plbl>=0 { w32(code+ppo+2, plbl-(ppo+6)) }
+        } else if pty==3 {
+            // catch_ip patch: store the ABSOLUTE vaddr (CODE_VBASE + lblf
+            // offset) directly. IR_TRY_PUSH emits a 4-byte `mov rax,imm32`
+            // placeholder, so we write w32 (not w64) to fit. This avoids a
+            // runtime `add rax,CODE_VBASE` + reload/storeback in IR_THROW,
+            // which the 0.0.95 seed silently drops when compiling 0.0.96
+            // source (a codegen corruption bug).
+            let ppo=r64(patches+pk*PCS); let plbl=lblf(r64(patches+pk*PCS+8))
+            if plbl>=0 { w32(code+ppo, CODE_VBASE+plbl) }
+        }
+        pk=pk+1
+    }
+
+    // Epilogue (should not reach here for normal functions)
+    if naked == 1 { ret() } else { abi(4096+total_str+80); xpop(5); ret() }
+    // FIX-0.0.7: leave frame context.
+    g_in_frame = 0
+}
+
+let call_saved = mmap(80)
+let mather_saved = mmap(40)
+
+fn init_cs() {
+    w64(call_saved+0, 0); w64(call_saved+8, 1); w64(call_saved+16, 2)
+    w64(call_saved+24, 6); w64(call_saved+32, 7); w64(call_saved+40, 8)
+    w64(call_saved+48, 9); w64(call_saved+56, 10)
+    w64(mather_saved+0, 3); w64(mather_saved+8, 12); w64(mather_saved+16, 13)
+    w64(mather_saved+24, 14); w64(mather_saved+32, 15)
+}
+
+// Global variable addresses for compiler internals (absolute addresses in BSS)
+fn init_cglobals() {
+    w64(CGLOBALS+0, 4362076160);   // code        = 0x42200000
+    w64(CGLOBALS+8, 4362076168);   // codelen     = 0x42200008
+    w64(CGLOBALS+16, 4362076176);  // patches     = 0x42200010
+    w64(CGLOBALS+24, 4362076184);  // patchc      = 0x42200018
+    w64(CGLOBALS+32, 4362076192);  // src         = 0x42200020
+    w64(CGLOBALS+40, 4362076200);  // srclen      = 0x42200028
+    w64(CGLOBALS+48, 4362076208);  // toks        = 0x42200030
+    w64(CGLOBALS+56, 4362076216);  // tokc        = 0x42200038
+    w64(CGLOBALS+64, 4362076224);  // tokp        = 0x42200040
+    w64(CGLOBALS+72, 4362076232);  // gvars       = 0x42200048
+    w64(CGLOBALS+80, 4362076240);  // ginit       = 0x42200050
+    w64(CGLOBALS+88, 4362076248);  // gvarc       = 0x42200058
+    w64(CGLOBALS+96, 4362076256);  // data        = 0x42200060
+    w64(CGLOBALS+104, 4362076264); // data_off    = 0x42200068
+    w64(CGLOBALS+112, 4362076272); // lblmap      = 0x42200070
+    w64(CGLOBALS+120, 4362076280); // lblc        = 0x42200078
+    w64(CGLOBALS+128, 4362076288); // REGS        = 0x42200080
+    w64(CGLOBALS+136, 4362076304); // alloc       = 0x422000F0
+    w64(CGLOBALS+144, 4362112496); // allocfc     = 0x429DF0
+    w64(CGLOBALS+152, 4362112504); // mather_saved= 0x429DF8
+}
+
+let CALLER_SAVED = call_saved

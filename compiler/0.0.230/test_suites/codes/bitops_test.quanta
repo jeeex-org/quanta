@@ -1,0 +1,36 @@
+// bitops_test.quanta — 0.0.107 bit/byte extras (parity/bitfield/bswap16/32/64)
+// Early-exit per-check (each check is a standalone comparison, matching
+// bits_test.quanta's safe pattern). Keeping results live across a user-fn
+// call would expose a PRE-EXISTING allocator bug (live vreg clobbered across
+// call boundaries) — unrelated to these builtins; see ROADMAP "live-var across
+// call" note. Returns 0 on success; exits with the check number on failure.
+// Edge cases (wid==64 for bitfield) are documented in FEATURES.
+// NOTE: 64-bit literals with the top bit set are avoided (pre-existing
+// constant-emission bug); all literals below keep bit63 clear.
+
+fn main() {
+    // parity(x) = 1 if odd number of set bits, else 0
+    if !(parity(11) == 1) { exit(1) }     // 0b1011 -> 3 bits (odd) -> 1
+    if !(parity(15) == 0) { exit(2) }     // 0b1111 -> 4 bits (even) -> 0
+    if !(parity(0)  == 0) { exit(3) }     // 0 -> even -> 0
+    if !(parity(255)== 0) { exit(4) }     // 0xFF -> 8 bits (even) -> 0
+
+    // bitfield(x, off, wid) = (x >> off) & ((1<<wid)-1)
+    let x = 0x12345678
+    if !(bitfield(x, 0, 8)  == 0x78)   { exit(5) }   // low byte
+    if !(bitfield(x, 8, 8)  == 0x56)   { exit(6) }
+    if !(bitfield(x, 16, 16)== 0x1234) { exit(7) }
+    if !(bitfield(x, 4, 4)  == 0x7)    { exit(8) }
+    if !(bitfield(x, 28, 4) == 0x1)    { exit(9) }
+
+    // bswap16(x): swap low 2 bytes
+    if !(bswap16(0x1234) == 0x3412) { exit(10) }
+
+    // bswap32(x): reverse 4 bytes
+    if !(bswap32(0x12345678) == 0x78563412) { exit(11) }
+
+    // bswap64(x): reverse 8 bytes (bit63 clear on both sides)
+    if !(bswap64(0x0102030405060708) == 0x0807060504030201) { exit(12) }
+
+    exit(0)   // all passed
+}

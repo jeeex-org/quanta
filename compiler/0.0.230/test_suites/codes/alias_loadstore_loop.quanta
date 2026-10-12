@@ -1,0 +1,21 @@
+// Regression test: load-modify-store to the SAME memory address, inside a loop.
+// Each iteration must re-read the current value (not cache a stale vreg).
+// Repro for the aliasing class of bugs. Expect deterministic per-iter output.
+fn add_one(p) {
+  let v = mem_load(p)      // load current value
+  mem_store(p, v + 1)      // store value+1 back to SAME addr
+  return 0
+}
+fn main() {
+  let buf = mem_alloc(16)
+  mem_store(buf, 0)
+  let i = 0
+  while i < 5 {
+    add_one(buf)
+    i = i + 1
+  }
+  // final value should be 5
+  printi(mem_load(buf))
+  println(0)
+  return 0
+}

@@ -1,0 +1,81 @@
+import std/crypto
+// Integration test for lib/std/crypto: verifies FULL digests against published
+// NIST / RFC / FIPS vectors (NOT just first bytes). Any byte mismatch fails.
+//
+// Vectors checked:
+//   SHA-256("")                = e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855
+//   SHA-256("abc")             = ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad
+//   HMAC-SHA256 RFC4231 TC1    = b0344c61d8db38535ca8afceaf0bf12b881dc200c9833da726e9376c2e32cff7
+//   AES-128 FIPS197 ECB(pt=i)  = 69c4e0d86a7b0430d8cdb78070b4c55a
+//   getrandom(16)              = 16 bytes returned (CSPRNG via syscall3)
+//
+// Quanta string literals carry an 8-byte header; raw bytes live at strptr+8.
+
+fn hexval(c) {
+  if c >= 48 && c <= 57 { return c - 48 }
+  if c >= 97 && c <= 102 { return c - 87 }
+  if c >= 65 && c <= 70 { return c - 55 }
+  return 0
+}
+
+fn hex_to_bytes(dst, hexstr, n) {
+  let i = 0
+  while i < n {
+    let hi = hexval(mem_load8(hexstr + 8 + i * 2))
+    let lo = hexval(mem_load8(hexstr + 8 + i * 2 + 1))
+    mem_store8(dst + i, hi * 16 + lo)
+    i = i + 1
+  }
+}
+
+fn mem_eq(a, b, n) {
+  let i = 0
+  while i < n {
+    if mem_load8(a + i) != mem_load8(b + i) { return 0 }
+    i = i + 1
+  }
+  return 1
+}
+
+fn main() {
+  let allok = 1
+
+  // --- SHA-256("") ---
+  let e = sha256_str("", 0)
+  let ve = mem_alloc(32)
+  hex_to_bytes(ve, "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855", 32)
+  if mem_eq(e, ve, 32) == 0 { allok = 0 }
+
+  // --- SHA-256("abc") ---
+  let a = sha256_str("abc", 3)
+  let va = mem_alloc(32)
+  hex_to_bytes(va, "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad", 32)
+  if mem_eq(a, va, 32) == 0 { allok = 0 }
+
+  // --- HMAC-SHA256 RFC4231 TC1 (key=20x0b, msg="Hi There") ---
+  let k = mem_alloc(20)
+  let ki = 0
+  while ki < 20 { mem_store8(k + ki, 0x0b); ki = ki + 1 }
+  let m = "Hi There"
+  let hm = hmac_sha256(k, 20, m + 8, 8)
+  let vh = mem_alloc(32)
+  hex_to_bytes(vh, "b0344c61d8db38535ca8afceaf0bf12b881dc200c9833da726e9376c2e32cff7", 32)
+  if mem_eq(hm, vh, 32) == 0 { allok = 0 }
+
+  // --- AES-128 ECB (key=i, pt=i*17) first 16 bytes must equal FIPS197 ---
+  let ek = mem_alloc(16)
+  let ept = mem_alloc(16)
+  let ii = 0
+  while ii < 16 { mem_store8(ek + ii, ii); mem_store8(ept + ii, ii * 17); ii = ii + 1 }
+  let ect = aes128_enc(ek, ept)
+  let vect = mem_alloc(16)
+  hex_to_bytes(vect, "69c4e0d86a7b0430d8cdb78070b4c55a", 16)
+  if mem_eq(ect, vect, 16) == 0 { allok = 0 }
+
+  // --- CSPRNG: getrandom(16) returns 16 ---
+  let rbuf = mem_alloc(16)
+  let rn = syscall3(318, rbuf, 16, 0)
+  if rn != 16 { allok = 0 }
+
+  if allok == 1 { exit(3) } else { exit(7) }
+}

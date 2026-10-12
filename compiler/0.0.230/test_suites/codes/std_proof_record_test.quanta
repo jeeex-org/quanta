@@ -1,0 +1,358 @@
+// ===========================================================================
+// std_proof_record_test.quanta
+//
+// Phase 11.5. From HashCortX src/js/code/verify.js.
+//
+// An agent that changed code and then said "done" was believed on its word.
+// Nothing tied finishing to having checked anything. This pins the two
+// decisions that replace that: whether to SEND THE AGENT BACK, and the one line
+// the person is shown at the end -- both worked out from the record, never from
+// the agent's words.
+//
+// Expectations are derived from verify.js, not from what the code happens to do.
+//
+// Two compiler facts this test relies on, both measured while building it:
+//   - `kind` and `last` are reserved type keywords and cannot be binding names.
+//   - `x != ""` is not a reliable emptiness test; equals(x,"")==0 is used.
+
+import std/proof_record
+import std/str
+
+let FAIL = 0
+
+fn check(id, ok) -> i64 {
+    if ok != 1 {
+        print("  FAIL check "); print(id); print("\n")
+        FAIL = FAIL + 1
+    }
+    return 0
+}
+
+fn has(s, w) -> i64 {
+    let n = len(s)
+    let m = len(w)
+    if m == 0 || m > n { return 0 }
+    let i = 0
+    while i + m <= n {
+        let j = 0
+        let same = 1
+        while j < m {
+            if byte_at(s, i + j) != byte_at(w, j) { same = 0; break }
+            j = j + 1
+        }
+        if same == 1 { return 1 }
+        i = i + 1
+    }
+    return 0
+}
+
+// ---------------------------------------------------------------------------
+// 1. Sorting a command into a kind of check. verify.js commandKind:86-136.
+// ---------------------------------------------------------------------------
+fn t_command_kind() -> i64 {
+    check(1, pv_command_kind("npm test") == PK_TEST)
+    check(2, pv_command_kind("npm run t") == PK_TEST)          // the short script
+    check(3, pv_command_kind("npm run lint") == PK_LINT)
+    check(4, pv_command_kind("npm run build") == PK_BUILD)
+    check(5, pv_command_kind("yarn test") == PK_TEST)
+    check(6, pv_command_kind("pnpm test") == PK_TEST)
+    check(7, pv_command_kind("npx jest") == PK_TEST)           // delegates
+    check(8, pv_command_kind("cargo test") == PK_TEST)
+    check(9, pv_command_kind("cargo clippy") == PK_LINT)
+    check(10, pv_command_kind("cargo build") == PK_BUILD)
+    check(11, pv_command_kind("cargo check") == PK_TYPECHECK)
+    check(12, pv_command_kind("cargo fmt") == PK_FORMAT)
+    check(13, pv_command_kind("go test ./...") == PK_TEST)
+    check(14, pv_command_kind("go vet ./...") == PK_LINT)
+    check(15, pv_command_kind("python3 -m pytest") == PK_TEST)
+    check(16, pv_command_kind("python -m unittest") == PK_TEST)
+    check(17, pv_command_kind("python3 -m py_compile x.py") == PK_LINT)
+    check(18, pv_command_kind("python3.11 -m pytest") == PK_TEST)
+    check(19, pv_command_kind("node --test") == PK_TEST)
+    check(20, pv_command_kind("node --check a.js") == PK_LINT)
+    check(21, pv_command_kind("node test/a.test.js") == PK_TEST)  // name reads as test
+    check(22, pv_command_kind("pytest") == PK_TEST)
+    check(23, pv_command_kind("tsc") == PK_TYPECHECK)
+    check(24, pv_command_kind("ruff check .") == PK_LINT)
+    check(25, pv_command_kind("make") == PK_BUILD)             // a bare make builds
+    check(26, pv_command_kind("make check") == PK_TEST)
+    check(27, pv_command_kind("ls") == PK_NONE)                // not a check
+    check(28, pv_command_kind("git status") == PK_NONE)
+    check(29, pv_command_kind("") == PK_NONE)
+    return 0
+}
+
+// ---------------------------------------------------------------------------
+// 2. Whole or part. verify.js commandScope:137-158. A part can pass while the
+//    rest is broken, so the distinction has to survive into the summary line.
+// ---------------------------------------------------------------------------
+fn t_command_scope() -> i64 {
+    check(30, pv_command_scope("npm test") == PS_WHOLE)
+    check(31, pv_command_scope("cargo test") == PS_WHOLE)
+    check(32, pv_command_scope("python3 -m pytest") == PS_WHOLE)
+    check(33, pv_command_scope("npm test -- -t name") == PS_PART)
+    check(34, pv_command_scope("python3 -m pytest -k name") == PS_PART)
+    check(35, pv_command_scope("node --test test/one.test.js") == PS_PART)
+    return 0
+}
+
+// ---------------------------------------------------------------------------
+// 3. What counts as code. verify.js CODE_FILE:223. A docs-only change needs no
+//    proof, and upstream does not send the agent back for one.
+// ---------------------------------------------------------------------------
+fn t_is_code() -> i64 {
+    check(40, pv_is_code("a.js") == 1)
+    check(41, pv_is_code("src/a.ts") == 1)
+    check(42, pv_is_code("src/deep/a.py") == 1)
+    check(43, pv_is_code("lib/a.rs") == 1)
+    check(44, pv_is_code("x.quanta") == 1)
+    check(45, pv_is_code("README.md") == 0)
+    check(46, pv_is_code("index.html") == 0)
+    check(47, pv_is_code("style.css") == 0)
+    check(48, pv_is_code("") == 0)
+    check(49, pv_is_code("noext") == 0)
+    return 0
+}
+
+// ---------------------------------------------------------------------------
+// 4. A command that proved nothing is NOT recorded. verify.js:233-238.
+//
+// Reading "the program is not there" as a failed test sent the agent back to fix
+// a failure its change never caused.
+// ---------------------------------------------------------------------------
+fn t_never_ran() -> i64 {
+    pv_reset()
+    check(50, pv_never_ran(127, "") == 1)                      // sh: not found
+    check(51, pv_never_ran(9009, "") == 1)                     // Windows
+    check(52, pv_never_ran(0, "sh: 1: vitest: command not found") == 1)
+    check(53, pv_never_ran(0, "Missing script: \"foo\"") == 1)
+    check(54, pv_never_ran(1, "1 test failed") == 0)           // a real failure
+    check(55, pv_never_ran(0, "") == 0)
+
+    pv_reset()
+    check(56, pv_ran("npm test", 127, "") == 0)                // not recorded
+    check(57, pv_ran("npm test", 0, "command not found") == 0)
+    check(58, pv_ran("ls", 0, "") == 0)                        // not a check
+    check(59, pv_ran("npm test", 0, "") == 1)                  // recorded
+    return 0
+}
+
+// ---------------------------------------------------------------------------
+// 5. The send-back decision. verify.js stopCheck:349-381.
+// ---------------------------------------------------------------------------
+fn t_stop_check() -> i64 {
+    // code changed, no test ran -> send back
+    pv_reset()
+    pv_edited("a.js")
+    check(60, pv_stop_check("done", 1, 0, 0) == 1)
+    check(61, PV_REASON == 2)
+
+    // code changed, test passed since -> finish
+    pv_reset()
+    pv_edited("a.js")
+    pv_ran("npm test", 0, "")
+    check(62, pv_stop_check("done", 1, 0, 0) == 0)
+    check(63, PV_REASON == 0)
+
+    // code changed, test FAILED since -> send back, and say which
+    pv_reset()
+    pv_edited("a.js")
+    pv_ran("npm test", 1, "")
+    check(64, pv_stop_check("done", 1, 0, 0) == 1)
+    check(65, PV_REASON == 1)
+
+    // no code changed at all -> nothing to prove
+    pv_reset()
+    pv_edited("README.md")
+    check(66, pv_stop_check("done", 1, 0, 0) == 0)
+    pv_reset()
+    check(67, pv_stop_check("done", 1, 0, 0) == 0)
+
+    // the limit holds: twice normally
+    pv_reset()
+    pv_edited("a.js")
+    check(68, pv_stop_check("done", 1, 1, 0) == 1)
+    pv_reset()
+    pv_edited("a.js")
+    check(69, pv_stop_check("done", 1, 2, 0) == 0)
+
+    // light mode gets one more round: three
+    pv_reset()
+    pv_edited("a.js")
+    check(70, pv_stop_check("done", 1, 2, 1) == 1)
+    pv_reset()
+    pv_edited("a.js")
+    check(71, pv_stop_check("done", 1, 3, 1) == 0)
+
+    // a reply that ends by asking the person is not a finished run
+    pv_reset()
+    pv_edited("a.js")
+    check(72, pv_stop_check("which one do you mean?", 1, 0, 0) == 0)
+
+    // a project with no test command cannot prove anything, so it must not send
+    // the agent in circles
+    pv_reset()
+    pv_edited("a.js")
+    check(73, pv_stop_check("done", 0, 0, 0) == 0)
+
+    // a test that ran BEFORE the last change proves nothing about it
+    pv_reset()
+    pv_ran("npm test", 0, "")
+    pv_edited("a.js")
+    check(74, pv_stop_check("done", 1, 0, 0) == 1)
+    check(75, PV_REASON == 2)
+
+    // ...and the change AFTER the test makes it count again
+    pv_reset()
+    pv_edited("a.js")
+    pv_ran("npm test", 1, "")
+    pv_edited("b.js")
+    pv_ran("npm test", 0, "")
+    check(76, pv_stop_check("done", 1, 0, 0) == 0)
+    return 0
+}
+
+// ---------------------------------------------------------------------------
+// 6. The message is never mistaken for the person. verify.js APP_NOTE.
+//    It also names the files changed, so the agent knows what it must prove.
+// ---------------------------------------------------------------------------
+fn t_messages() -> i64 {
+    pv_reset()
+    pv_edited("src/deep/thing.js")
+    pv_stop_check("done", 1, 0, 0)
+    check(80, has(PV_MESSAGE, "not from the person") == 1)
+    check(81, has(PV_MESSAGE, "thing.js") == 1)
+    check(82, has(PV_MESSAGE, "no test has run since") == 1)
+
+    pv_reset()
+    pv_edited("a.js")
+    pv_ran("npm test", 1, "")
+    pv_stop_check("done", 1, 0, 0)
+    check(83, has(PV_MESSAGE, "not from the person") == 1)
+    check(84, has(PV_MESSAGE, "failed after your last change") == 1)
+    check(85, has(PV_MESSAGE, "which checks passed") == 1)
+
+    // at most four file names, so the message stays readable
+    pv_reset()
+    pv_edited("a1.js")
+    pv_edited("a2.js")
+    pv_edited("a3.js")
+    pv_edited("a4.js")
+    pv_edited("a5.js")
+    pv_stop_check("done", 1, 0, 0)
+    check(86, has(PV_MESSAGE, "a5.js") == 0)
+    check(87, has(PV_MESSAGE, "a4.js") == 1)
+    return 0
+}
+
+// ---------------------------------------------------------------------------
+// 7. The end-of-run summary, computed from the record. verify.js proofLine.
+// ---------------------------------------------------------------------------
+fn t_proof_line() -> i64 {
+    pv_reset()
+    pv_edited("a.js")
+    pv_ran("npm test", 0, "")
+    let line = pv_proof_line()
+    check(90, has(line, "Checked after the last change") == 1)
+    check(91, has(line, "passed") == 1)
+    check(92, has(line, "part of the project") == 0)
+
+    // a PART run says so
+    pv_reset()
+    pv_edited("a.js")
+    pv_ran("node --test test/one.test.js", 0, "")
+    line = pv_proof_line()
+    check(93, has(line, "part of the project") == 1)
+
+    // a failure is stated as unproven, never as a pass
+    pv_reset()
+    pv_edited("a.js")
+    pv_ran("npm test", 1, "")
+    line = pv_proof_line()
+    check(94, has(line, "Not proven") == 1)
+    check(95, has(line, "failed after the last change") == 1)
+    check(96, has(line, "passed") == 0)
+
+    // a passing lint with no test is "not tested", not "checked"
+    pv_reset()
+    pv_edited("a.js")
+    pv_ran("npm run lint", 0, "")
+    line = pv_proof_line()
+    check(97, has(line, "Not tested") == 1)
+    check(98, has(line, "no test ran") == 1)
+
+    // nothing ran at all
+    pv_reset()
+    pv_edited("a.js")
+    line = pv_proof_line()
+    check(99, has(line, "Not checked") == 1)
+
+    // no code changed
+    pv_reset()
+    line = pv_proof_line()
+    check(100, has(line, "no code was changed") == 1)
+
+    // a stale test does not become proof after a later change
+    pv_reset()
+    pv_ran("npm test", 0, "")
+    pv_edited("a.js")
+    line = pv_proof_line()
+    check(101, has(line, "Not checked") == 1)
+    return 0
+}
+
+// ---------------------------------------------------------------------------
+// 8. The log is a record, not a summary: a path changed twice is listed once,
+//    and the checks keep their order.
+// ---------------------------------------------------------------------------
+fn t_log_shape() -> i64 {
+    pv_reset()
+    pv_edited("a.js")
+    pv_edited("a.js")
+    check(110, vec_len(PV_CHANGED) == 1)
+    check(111, pv_code_changed() == 1)
+
+    pv_reset()
+    pv_edited("README.md")
+    check(112, pv_code_changed() == 0)
+
+    pv_reset()
+    pv_edited("a.js")
+    pv_ran("npm test", 0, "")
+    check(113, PV_NCHK == 1)
+    check(114, pv_checks_since_code() == 1)
+    check(115, pv_passed_test_since() == 1)
+    check(116, pv_failed_test_since() == -1)
+
+    pv_reset()
+    pv_edited("a.js")
+    pv_ran("npm test", 1, "")
+    pv_ran("npm test", 1, "")
+    check(117, PV_NCHK == 2)
+    check(118, pv_failed_test_since() == 1)          // the LAST failure
+    check(119, pv_passed_test_since() == 0)
+
+    pv_reset()
+    check(120, PV_NCHK == 0)
+    check(121, pv_code_changed() == 0)
+    return 0
+}
+
+fn main() -> i64 {
+    t_command_kind()
+    t_command_scope()
+    t_is_code()
+    t_never_ran()
+    t_stop_check()
+    t_messages()
+    t_proof_line()
+    t_log_shape()
+
+    print("std_proof_record: ")
+    if FAIL == 0 {
+        print("PASS (121 checks)\n")
+        return 0
+    }
+    print("FAIL "); print(FAIL); print(" check(s)\n")
+    return 1
+}

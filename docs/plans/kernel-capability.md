@@ -5,7 +5,7 @@
 **Target:** Quanta 0.0.229+ (after loader 0.0.226–0.0.228)
 **Stable at time of writing:** 0.0.229
 
-**Progress:** A ✅ · A2 ✅ · Loader 6.1 ✅ · 6.2 ✅ · 7.1 ✅ · 7.2 ✅ · B ✅ · B2 ⬜ · C1 ⬜ · C2 ⬜ · D ⬜
+**Progress:** A ✅ · A2 ✅ · Loader 6.1 ✅ · 6.2 ✅ · 7.1 ✅ · 7.2 ✅ · B ✅ · B2 ✅ · C1 ⬜ · C2 ⬜ · D ⬜
 
 ---
 
@@ -91,8 +91,8 @@ Four independent workstreams, ordered by dependency and risk.
 |---|---|---|---|
 | **A** | 16/32-bit memory widths | Low | ✅ **DONE** — commit `452e5285` |
 | **A2** | `asm!` rejects non-hex input | Low | ✅ **DONE** — commit `452e5285` |
-| **B** | `naked fn` + `section` + `no_mangle` | Low | ⬜ open |
-| **B2** | `packed` structs / explicit field offsets | Medium | ⬜ open |
+| **B** | `naked fn` + `section` + `no_mangle` | Low | ✅ **DONE** — 0.0.229 |
+| **B2** | `packed` structs / explicit field offsets | Medium | ✅ **DONE** — 0.0.230 |
 | **C1** | Minimal x86 assembler | High | ⬜ open |
 | **C2** | Operands + constraints | **High** | ⬜ open |
 | **D** | Ring-0 entry (IDT/GDT) | Medium | ⬜ open |
@@ -115,7 +115,7 @@ version freezes in place as the fallback and its `src` is never touched again.
 | A2 | 0.0.225 (folded in) | ✅ done |
 | — Loader 6.1–7.2 — | 0.0.226–0.0.228 | 6.1 ✅ · 6.2 ✅ · 7.1 ✅ · 7.2 ✅ |
 | B | 0.0.229 | ✅ done |
-| B2 | 0.0.230 | ⬜ |
+| B2 | 0.0.230 | ✅ done |
 | C1 (assembler) | 0.0.231 | ⬜ |
 | C2 (operands) | 0.0.232 | ⬜ |
 | D | 0.0.233 | ⬜ |
@@ -360,6 +360,48 @@ Test that a naked function is reachable and that `readelf` shows the symbol unma
 readelf -sW /tmp/naked | grep my_handler
 readelf -SW /tmp/naked | grep .text.startup
 ```
+
+---
+
+## 5.5 Phase B2 — `packed` structs ✅ DONE (0.0.230)
+
+**Status: COMPLETE.** Verified through real memory: `packed struct IdtGate` with
+the exact x86-64 IDT gate layout (u16@0, u16@2, u8@4, u8@5, u16@6, u32@8, u32@12)
+writes and reads back all 7 fields correctly; byte-precise stores leave neighbors
+untouched (writing `ist` does not disturb `sel`/`type_attr`; writing `off_hi` does
+not disturb `off_mid`); a mixed-width struct (u8, u32, u16, u8, u64) round-trips;
+sub-qword fields zero-extend (unsigned semantics — kernel bitfields are unsigned).
+Gate 815/815, STDLIB 108/108, self-host 7/7.
+Test: `test_suites/codes/packed_test.quanta` (in EXPECTED.tsv).
+
+What landed:
+- `packed struct Name { ... }` — `packed` is a CONTEXT keyword (lexes as TT_ID;
+  it is a live identifier in lib/std — big.quanta, ml_kem_ntt.quanta, gguf.quanta).
+- Layout tables: `sfld_off`/`sfld_size` per field, packed flag + total size in
+  sdefs slots 32/40. Unpacked structs are bit-identical to before (codegen
+  branches on the flag; their tables stay zero).
+- Field width from the `: type` annotation (i8/u8/bool/char/byte=1, i16/u16=2,
+  i32/u32=4, i64/u64/usize=8, default i64). Nested structs and Strings in a
+  packed struct are compile errors (fail closed).
+- Codegen: sub-qword loads via movzx (zero-extend), width-precise stores
+  (packed fields never share bytes, so no read-modify-write is needed).
+
+**The load-bearing bug this phase caught (via the self-host fixed point):**
+`packed` was added to ktext() WITHOUT a lexer remap, and ktext() returning
+non-zero makes the lexer default the token to TT_KEY — so `let packed =
+cv0 - bvmark()` in method.quanta (an unrelated pre-existing local) became
+"reserved type keyword used as a variable name" and the self-host failed while
+the seed-built binary looked fine. The fixed-point check caught exactly the
+class of bug it exists for.
+
+**Second lesson (vreg-tagged layout metadata):** the first codegen approach
+recovered the field index at emit time by scanning the IR for the defining
+IR_CONST. The Tier-1 optimiser DELETES those records (constant folding), so the
+scan returned wild indices (compiler SIGSEGV on closure tests — vreg numbering
+restarts per fn in the shared buffer). Fix: the field's byte displacement and
+width are recorded PER VREG at parse time (`vreg_poff`/`vreg_pw`, displacement+1
+so 0 means "not a packed access") — keyed by vreg number, which opt never
+renumbers.
 
 ---
 
