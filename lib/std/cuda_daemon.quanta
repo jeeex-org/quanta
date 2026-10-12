@@ -522,3 +522,105 @@ fn cuda_pool_free() {
     cuda_pool = 0
     cuda_pool_next = 0
 }
+
+
+// ---------------------------------------------------------------------------
+// Phase 6.2: GPU dequant + matvec.
+//
+// These drive the kernels in scripts/audit/quanta_gpu_kernels.cu through the
+// daemon. All pointers are DEVICE addresses, so a tensor that is already
+// resident can be dequantized or multiplied without a host round trip.
+//
+// dtype numbering follows GGUF: 0 = F32, 12 = Q4_K. Only those two are
+// implemented in the kernel; anything else returns a negative code from the
+// daemon, which surfaces here as a failure rather than as silent zeros.
+// ---------------------------------------------------------------------------
+
+const CUDA_DTYPE_F32  = 0
+const CUDA_DTYPE_Q4_K = 12
+
+// Dequantize a device-resident quantized tensor into a device f32 buffer.
+// `src` and `dst` are device pointers; `nelem` is the element count.
+fn gpu_dequant(dtype, src, dst, nelem) -> i64 {
+    let cmd = mem_alloc(128)
+    let n = cuda_cat(cmd, 0, "dequant ")
+    n = cuda_cat_u64(cmd, n, dtype)
+    n = cuda_cat_sp(cmd, n)
+    n = cuda_cat_hex(cmd, n, src)
+    n = cuda_cat_sp(cmd, n)
+    n = cuda_cat_hex(cmd, n, dst)
+    n = cuda_cat_sp(cmd, n)
+    n = cuda_cat_u64(cmd, n, nelem)
+    let body = cuda_call(cmd, n)
+    mem_free(cmd)
+    if body == 0 { return -1 }
+    let ok = cuda_reply_ok(body)
+    mem_free(body)
+    if ok == 0 { return -1 }
+    return 0
+}
+
+// y = W @ x on the device. W is a device tensor of `rows` x `cols`, x and y are
+// device f32 vectors. For a quantized W the kernel dequantizes on the fly, so
+// no f32 copy of the weights is ever materialised.
+fn gpu_matvec(dtype, w, x, y, rows, cols) -> i64 {
+    let cmd = mem_alloc(192)
+    let n = cuda_cat(cmd, 0, "matvec ")
+    n = cuda_cat_u64(cmd, n, dtype)
+    n = cuda_cat_sp(cmd, n)
+    n = cuda_cat_hex(cmd, n, w)
+    n = cuda_cat_sp(cmd, n)
+    n = cuda_cat_hex(cmd, n, x)
+    n = cuda_cat_sp(cmd, n)
+    n = cuda_cat_hex(cmd, n, y)
+    n = cuda_cat_sp(cmd, n)
+    n = cuda_cat_u64(cmd, n, rows)
+    n = cuda_cat_sp(cmd, n)
+    n = cuda_cat_u64(cmd, n, cols)
+    let body = cuda_call(cmd, n)
+    mem_free(cmd)
+    if body == 0 { return -1 }
+    let ok = cuda_reply_ok(body)
+    mem_free(body)
+    if ok == 0 { return -1 }
+    return 0
+}
+
+
+// Convert a device f32 buffer to device f64 (exact) -- the loader's buffers are
+// f64, the kernels want f32, so this is the bridge in both directions.
+fn gpu_f32_to_f64(src, dst, n) -> i64 {
+    let cmd = mem_alloc(96)
+    let n2 = cuda_cat(cmd, 0, "f32_to_f64 ")
+    n2 = cuda_cat_hex(cmd, n2, src)
+    n2 = cuda_cat_sp(cmd, n2)
+    n2 = cuda_cat_hex(cmd, n2, dst)
+    n2 = cuda_cat_sp(cmd, n2)
+    n2 = cuda_cat_u64(cmd, n2, n)
+    let body = cuda_call(cmd, n2)
+    mem_free(cmd)
+    if body == 0 { return -1 }
+    let ok = cuda_reply_ok(body)
+    mem_free(body)
+    if ok == 0 { return -1 }
+    return 0
+}
+
+// Narrow a device f64 buffer to f32 (a real narrowing -- this is the one that
+// loses precision, and it is the step that makes the weights device-shaped).
+fn gpu_f64_to_f32(src, dst, n) -> i64 {
+    let cmd = mem_alloc(96)
+    let n2 = cuda_cat(cmd, 0, "f64_to_f32 ")
+    n2 = cuda_cat_hex(cmd, n2, src)
+    n2 = cuda_cat_sp(cmd, n2)
+    n2 = cuda_cat_hex(cmd, n2, dst)
+    n2 = cuda_cat_sp(cmd, n2)
+    n2 = cuda_cat_u64(cmd, n2, n)
+    let body = cuda_call(cmd, n2)
+    mem_free(cmd)
+    if body == 0 { return -1 }
+    let ok = cuda_reply_ok(body)
+    mem_free(body)
+    if ok == 0 { return -1 }
+    return 0
+}

@@ -85,7 +85,37 @@ The work was not "add contexts" — the contexts existed but had never run:
 
 ---
 
-## 4. Phase 6.2: GPU Residency / Offload (0.0.227)
+## 4. Phase 6.2: GPU Residency / Offload ✅ DONE (kernels + device API)
+
+**Status: COMPLETE for dequant + matvec on the device.** Verified: Q4_K dequant
+on the GPU is EXACT (0/2048 differing against the CPU path on a full-range scale
+table), fused Q4_K matvec agrees to 1.0e-06 relative, F32 matvec to 1.0e-07.
+Test: `test_suites/codes/std_cuda_kernels_test.quanta`, in the gate (106/106).
+
+What landed:
+
+- `scripts/audit/quanta_gpu_kernels.cu` (nvcc, sm_89) — `dequant_q4k`,
+  `matvec_q4k` (FUSED: dequantizes in registers, so no f32 copy of the weights
+  is ever materialised; for 2.6B params that copy would be ~10 GB), `matvec_f32`,
+  and exact `f32<->f64` converters.
+- `scripts/audit/build_cuda_daemon.sh` — nvcc + gcc link, arch taken from
+  `nvidia-smi`. nvcc is NOT on PATH on this box (`/usr/local/cuda-13.3/bin`), so
+  the script locates the toolkit rather than assuming.
+- `cuda_daemon.c` — `dequant`, `matvec`, `f32_to_f64`, `f64_to_f32` commands.
+  All device-to-device: a resident tensor is dequantized or multiplied with no
+  host round trip.
+- `lib/std/cuda_daemon.quanta` — `gpu_dequant`, `gpu_matvec`, `gpu_f32_to_f64`,
+  `gpu_f64_to_f32`.
+
+A defect in the TEST, found by negative control (worth recording): the first
+version generated the Q4_K scale table with `% 64`, so bits 6-7 of every scale
+byte were always zero. Those bits are the HIGH BITS of the paired min field, so
+a decode reading the wrong byte for them produced an identical result — a
+deliberately broken kernel (scale high bits from `sc[j]` instead of `sc[j-4]`)
+still PASSED. With the full byte range the same broken kernel fails loudly
+(964/2048 differing). A test that cannot fail is not a test.
+
+### Original design notes
 
 ### Problem
 All tensor data lives in host RAM. Need device residency for GPU matvec.

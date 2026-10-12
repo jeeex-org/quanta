@@ -36,6 +36,10 @@
 //   stream_sync <0xstream>     -> OK | ERR: <reason>
 //   h2d <0xptr> <hostfile> <n> -> OK | ERR: <reason>
 //   d2h <0xptr> <hostfile> <n> -> OK | ERR: <reason>
+//   dequant <dtype> <0xsrc> <0xdst> <nelem>          -> OK | ERR: <reason>
+//   matvec <dtype> <0xw> <0xx> <0xy> <rows> <cols>   -> OK | ERR: <reason>
+//   f32_to_f64 <0xsrc> <0xdst> <n>                   -> OK | ERR: <reason>
+//   f64_to_f32 <0xsrc> <0xdst> <n>                   -> OK | ERR: <reason>
 //   quit                       -> daemon exits after replying OK
 //
 // A failed operation is reported as ERR, never as a stale OK: the daemon writes
@@ -59,6 +63,15 @@
 #ifndef QUEUE_DIR
 #define QUEUE_DIR "/tmp/quanta_cuda"
 #endif
+// Phase 6.2: dequant + matvec kernels live in quanta_gpu_kernels.cu (nvcc).
+// Plain C entry points so the daemon stays a one-line gcc build and only the
+// kernels need the CUDA compiler.
+extern int qg_dequant(int dtype, const void *raw, float *out, long nelem);
+extern int qg_matvec(int dtype, const void *w, const float *x, float *y,
+                     long rows, long cols);
+extern int qg_f32_to_f64(const float *src, double *dst, long n);
+extern int qg_f64_to_f32(const double *src, float *dst, long n);
+
 #define QUEUE_PATH QUEUE_DIR "/queue"
 #define RESULT_PATH QUEUE_DIR "/result"
 #define LOCK_PATH QUEUE_DIR "/lock"
@@ -455,6 +468,57 @@ int main(void)
                     ? (cudaStream_t)strtoull(end, NULL, 16)
                     : (cudaStream_t)0;
                 body = cmd_d2h(seq, dp, file, n, st);
+            }
+            else if (strncmp(rest, "dequant ", 8) == 0) {
+                // dequant <dtype> <0xsrc> <0x dst> <nelem>
+                // Device-to-device: both pointers are device addresses, so a
+                // caller can dequantize a resident tensor without a round trip
+                // through the host.
+                char *end = NULL;
+                int dtype = (int)strtol(rest + 8, &end, 10);
+                while (end && *end == ' ') end++;
+                uintptr_t src = (uintptr_t)strtoull(end ? end : "0", &end, 16);
+                while (end && *end == ' ') end++;
+                uintptr_t dst = (uintptr_t)strtoull(end ? end : "0", &end, 16);
+                while (end && *end == ' ') end++;
+                long nelem = (long)strtoll(end ? end : "0", NULL, 10);
+                int rc = qg_dequant(dtype, (const void *)src, (float *)dst, nelem);
+                if (rc != 0) reply(seq, "ERR: qg_dequant rc=%d", rc);
+                else { body = malloc(16); if (body) snprintf(body, 16, "OK"); }
+            }
+            else if (strncmp(rest, "matvec ", 7) == 0) {
+                // matvec <dtype> <0xw> <0xx> <0xy> <rows> <cols>
+                char *end = NULL;
+                int dtype = (int)strtol(rest + 7, &end, 10);
+                while (end && *end == ' ') end++;
+                uintptr_t wp = (uintptr_t)strtoull(end ? end : "0", &end, 16);
+                while (end && *end == ' ') end++;
+                uintptr_t xp = (uintptr_t)strtoull(end ? end : "0", &end, 16);
+                while (end && *end == ' ') end++;
+                uintptr_t yp = (uintptr_t)strtoull(end ? end : "0", &end, 16);
+                while (end && *end == ' ') end++;
+                long rows = (long)strtoll(end ? end : "0", &end, 10);
+                while (end && *end == ' ') end++;
+                long cols = (long)strtoll(end ? end : "0", NULL, 10);
+                int rc = qg_matvec(dtype, (const void *)wp, (const float *)xp,
+                                   (float *)yp, rows, cols);
+                if (rc != 0) reply(seq, "ERR: qg_matvec rc=%d", rc);
+                else { body = malloc(16); if (body) snprintf(body, 16, "OK"); }
+            }
+            else if (strncmp(rest, "f32_to_f64 ", 11) == 0 ||
+                     strncmp(rest, "f64_to_f32 ", 11) == 0) {
+                // f32_to_f64 <0xsrc> <0xdst> <n>   (device pointers)
+                int up = (rest[1] == '3');
+                char *end = NULL;
+                uintptr_t src = (uintptr_t)strtoull(rest + 11, &end, 16);
+                while (end && *end == ' ') end++;
+                uintptr_t dst = (uintptr_t)strtoull(end ? end : "0", &end, 16);
+                while (end && *end == ' ') end++;
+                long n = (long)strtoll(end ? end : "0", NULL, 10);
+                int rc = up ? qg_f32_to_f64((const float *)src, (double *)dst, n)
+                            : qg_f64_to_f32((const double *)src, (float *)dst, n);
+                if (rc != 0) reply(seq, "ERR: convert rc=%d", rc);
+                else { body = malloc(16); if (body) snprintf(body, 16, "OK"); }
             }
             else {
                 reply(seq, "ERR: unknown command");
