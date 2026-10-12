@@ -127,14 +127,121 @@ static char *cmd_host_alloc(unsigned long long seq, size_t n)
     return out;
 }
 
+// Live stream registry.
+//
+// cudaStreamDestroy on a pointer that is not a live stream SEGFAULTS INSIDE
+// libcuda -- it is not a returned error. Observed backtrace:
+//     #0 libcuda.so.1
+//     #4 cuStreamDestroy_v2
+//     #6 cudaStreamDestroy
+//     #7 main (cuda_daemon.c:415)
+// That killed the daemon mid-run and read as "the daemon is unstable".
+//
+// The trigger is a second destroy of the same handle (a pool free followed by a
+// teardown that frees again), which is easy for a caller to do and impossible
+// for the driver to survive. Every stream the daemon creates is recorded here;
+// destroy looks the pointer up and refuses anything not in the table.
+#define MAX_STREAMS 256
+static cudaStream_t live_streams[MAX_STREAMS];
+static int live_stream_count = 0;
+
+static int stream_is_live(cudaStream_t s)
+{
+    for (int i = 0; i < live_stream_count; i++)
+        if (live_streams[i] == s) return 1;
+    return 0;
+}
+
+#define STAGE_CHUNK (64u * 1024u * 1024u)
+#define STAGE_SLOTS 8
+static void *stage_buf[STAGE_SLOTS];
+static cudaStream_t stage_stream[STAGE_SLOTS];
+
+// Validate a stream that came off the wire.
+//
+// A stream handle is just a number in the command text, so a stale or mistyped
+// one reaches the driver unchecked. The default stream (0) is always valid; any
+// other value must be a stream this daemon created and has not destroyed.
+// Without this, cudaMemcpyAsync / cudaStreamSynchronize with a dead handle
+// SEGFAULTS INSIDE libcuda instead of returning an error -- observed at
+// cuStreamSynchronize via cmd_d2h, and at cuStreamDestroy_v2 via a double
+// destroy. Both killed the daemon and both read as "the daemon is unstable".
+static int stream_is_usable(cudaStream_t s)
+{
+    return s == (cudaStream_t)0 || stream_is_live(s);
+}
+
+static int stream_forget(cudaStream_t s)
+{
+    for (int i = 0; i < live_stream_count; i++) {
+        if (live_streams[i] == s) {
+            live_streams[i] = live_streams[live_stream_count - 1];
+            live_stream_count--;
+            return 1;
+        }
+    }
+    return 0;
+}
+
 static char *cmd_stream_create(unsigned long long seq)
 {
+    fprintf(stderr, "[stream] create\n");
+    if (live_stream_count >= MAX_STREAMS) {
+        reply(seq, "ERR: too many live streams (%d)", MAX_STREAMS);
+        return NULL;
+    }
     cudaStream_t s;
     cudaError_t rc = cudaStreamCreate(&s);
     if (rc != cudaSuccess) { reply_cuda_error(seq, "cudaStreamCreate", rc); return NULL; }
+    live_streams[live_stream_count++] = s;
+    fprintf(stderr, "[stream] create -> 0x%llx (live=%d)\n",
+            (unsigned long long)(uintptr_t)s, live_stream_count);
     char *out = malloc(64);
     snprintf(out, 64, "0x%llx", (unsigned long long)(uintptr_t)s);
     return out;
+}
+
+// Destroy a stream, refusing anything not live. Returns NULL on refusal (the
+// reply has already been written).
+static char *cmd_stream_destroy(unsigned long long seq, cudaStream_t s)
+{
+    fprintf(stderr, "[stream] destroy 0x%llx (live=%d)\n",
+            (unsigned long long)(uintptr_t)s, live_stream_count);
+    if (s == (cudaStream_t)0) {
+        reply(seq, "ERR: refusing to destroy the default stream (0)");
+        return NULL;
+    }
+    if (!stream_is_live(s)) {
+        reply(seq, "ERR: stream 0x%llx is not live (already destroyed?)",
+              (unsigned long long)(uintptr_t)s);
+        return NULL;
+    }
+    // Sync BEFORE destroying.
+    //
+    // cudaStreamDestroy on a stream with work still in flight is documented as
+    // legal (the work completes and the stream is freed later), but on this
+    // driver it leaves the context in a state where the NEXT kernel launch fails
+    // with "invalid device context". That is how the pool test poisoned the
+    // daemon for every later command: it destroys its four streams without a
+    // final sync, and the following test's first kernel launch fails.
+    // Measured: dequant immediately after the pool test -> invalid device
+    // context; with this sync -> the whole sequence passes.
+    cudaError_t src_rc = cudaStreamSynchronize(s);
+    if (src_rc != cudaSuccess) {
+        // Report but still destroy: a sync failure must not leak the stream.
+        reply_cuda_error(seq, "cudaStreamSynchronize before destroy", src_rc);
+        cudaStreamDestroy(s);
+        stream_forget(s);
+        return NULL;
+    }
+    cudaError_t rc = cudaStreamDestroy(s);
+    if (rc != cudaSuccess) { reply_cuda_error(seq, "cudaStreamDestroy", rc); return NULL; }
+    stream_forget(s);
+    // Also drop it from the staging ring. stage_stream[] outlives the stream, and
+    // a later h2d would otherwise sync this dead handle -- see stage_reserve.
+    for (int i = 0; i < STAGE_SLOTS; i++)
+        if (stage_stream[i] == s) stage_stream[i] = (cudaStream_t)0;
+    return strdup("OK");
 }
 
 // Pinned host staging (Phase 7 item 2).
@@ -164,8 +271,6 @@ static char *cmd_stream_create(unsigned long long seq)
 // reused, the stream that last used it is synchronised first. That is the
 // backpressure a real pipeline needs, and it is why a single shared buffer could
 // not simply be kept.
-static void *stage_buf[STAGE_SLOTS];
-static cudaStream_t stage_stream[STAGE_SLOTS];
 static size_t stage_cap = 0;
 static unsigned stage_next = 0;
 
@@ -198,7 +303,14 @@ static int stage_reserve(cudaStream_t stream, size_t n)
     stage_next = (stage_next + 1) % STAGE_SLOTS;
 
     // This slot may still back an in-flight copy on another stream.
-    if (stage_buf[slot] && stage_stream[slot] != (cudaStream_t)0) {
+    //
+    // The recorded stream can be one that has since been DESTROYED: stage_stream[]
+    // is not cleared when a stream dies, and the pool test destroys all four of
+    // its streams. cudaStreamSynchronize on a dead handle SEGFAULTS INSIDE
+    // libcuda (cuStreamSynchronize), which is what killed the daemon on the first
+    // h2d after the pool test -- the crash site was this line, reached from
+    // cmd_h2d, not from any stream command.
+    if (stage_buf[slot] && stream_is_usable(stage_stream[slot])) {
         cudaStreamSynchronize(stage_stream[slot]);
     }
     if (!stage_buf[slot]) {
@@ -231,6 +343,11 @@ static void stage_release(void)
 // data -- that is the whole point of a stream pool.
 static char *cmd_h2d(unsigned long long seq, uintptr_t dp, const char *file, size_t n, cudaStream_t stream)
 {
+    if (!stream_is_usable(stream)) {
+        reply(seq, "ERR: h2d given stream 0x%llx which is not live",
+              (unsigned long long)(uintptr_t)stream);
+        return NULL;
+    }
     FILE *f = fopen(file, "rb");
     if (!f) { reply(seq, "ERR: cannot open %s", file); return NULL; }
     if (fseek(f, 0, SEEK_END) != 0) { fclose(f); reply(seq, "ERR: fseek"); return NULL; }
@@ -283,6 +400,11 @@ static char *cmd_h2d(unsigned long long seq, uintptr_t dp, const char *file, siz
 // while the file was still short.
 static char *cmd_d2h(unsigned long long seq, uintptr_t dp, const char *file, size_t n, cudaStream_t stream)
 {
+    if (!stream_is_usable(stream)) {
+        reply(seq, "ERR: d2h given stream 0x%llx which is not live",
+              (unsigned long long)(uintptr_t)stream);
+        return NULL;
+    }
     void *buf = malloc(n ? n : 1);
     cudaError_t rc = cudaMemcpyAsync(buf, (void *)dp, n, cudaMemcpyDeviceToHost, stream);
     if (rc != cudaSuccess) { free(buf); reply_cuda_error(seq, "cudaMemcpyAsync D2H", rc); return NULL; }
@@ -357,7 +479,25 @@ int main(void)
         q = fopen(QUEUE_PATH, "r");
         if (!q) { usleep(IDLE_SLEEP_USLEEP); continue; }
 
-        if (fseek(q, offset, SEEK_SET) != 0) { fclose(q); offset = 0; continue; }
+        // NEVER reset to 0 on a failed seek. Resetting REPLAYS THE WHOLE QUEUE,
+        // re-executing every command ever issued -- including `stream_sync` and
+        // `stream_destroy` for streams that were destroyed long ago. Those fault
+        // INSIDE libcuda (cuStreamSynchronize / cuStreamDestroy_v2), which kills
+        // the daemon with SIGSEGV and reads as "the daemon is unstable".
+        //
+        // The offset goes stale when the queue file is truncated by a new start
+        // (the gate does this) while this process still holds the old length.
+        // The safe recovery is to jump to the CURRENT end: everything before it
+        // has already been answered, and nothing new can have been written
+        // before the truncate that we would want to run.
+        if (fseek(q, offset, SEEK_SET) != 0) {
+            fclose(q);
+            long end = 0;
+            FILE *e = fopen(QUEUE_PATH, "r");
+            if (e) { fseek(e, 0, SEEK_END); end = ftell(e); fclose(e); }
+            offset = end;
+            continue;
+        }
 
         int progressed = 0;
         while (fgets(line, sizeof(line), q)) {
@@ -412,15 +552,22 @@ int main(void)
             }
             else if (strncmp(rest, "stream_destroy ", 15) == 0) {
                 cudaStream_t s = (cudaStream_t)strtoull(rest + 15, NULL, 16);
-                cudaError_t frc = cudaStreamDestroy(s);
-                if (frc != cudaSuccess) reply_cuda_error(seq, "cudaStreamDestroy", frc);
-                else body = strdup("OK");
+                body = cmd_stream_destroy(seq, s);
             }
             else if (strncmp(rest, "stream_sync ", 12) == 0) {
                 cudaStream_t s = (cudaStream_t)strtoull(rest + 12, NULL, 16);
-                cudaError_t frc = cudaStreamSynchronize(s);
-                if (frc != cudaSuccess) reply_cuda_error(seq, "cudaStreamSynchronize", frc);
-                else body = strdup("OK");
+                // A stale handle here is the same class of fault as a double
+                // destroy: refuse rather than hand it to the driver.
+                fprintf(stderr, "[stream] sync 0x%llx (live=%d)\n",
+                        (unsigned long long)(uintptr_t)s, live_stream_count);
+                if (!stream_is_usable(s)) {
+                    reply(seq, "ERR: stream 0x%llx is not live",
+                          (unsigned long long)(uintptr_t)s);
+                } else {
+                    cudaError_t frc = cudaStreamSynchronize(s);
+                    if (frc != cudaSuccess) reply_cuda_error(seq, "cudaStreamSynchronize", frc);
+                    else body = strdup("OK");
+                }
             }
             else if (strncmp(rest, "h2d ", 4) == 0) {
                 // h2d <0xdp> <file> <n> [stream]
