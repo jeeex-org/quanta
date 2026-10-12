@@ -30,9 +30,33 @@
 
 ---
 
-## 3. Phase 6.1: Multiple Models Open Simultaneously (0.0.226)
+## 3. Phase 6.1: Multiple Models Open Simultaneously (0.0.226) ✅ DONE
 
-### Problem
+**Status: COMPLETE.** Commit `b2ac13fd`. Verified: two handles on one file
+interleave correctly and `close(h1)` leaves h2 intact; GGUF + safetensors open
+together with correct kind dispatch. Gate 20/20, stdlib 103/103, self-host 7/7.
+Test: `test_suites/codes/stdlib_loader_multi_test.quanta`.
+
+The work was not "add contexts" — the contexts existed but had never run:
+
+- `lib/std/gguf.quanta` had been **overwritten by a compiler output** (an ELF
+  binary where the source belonged). Rebuilt as legacy + `gguf_ctx`, the shape
+  `safetensors.quanta`/`st_ctx.quanta` already used.
+- The `gguf_ctx` half was a **stub**: `scan_metadata_ctx` returned 0 without
+  allocating the KV index (so `gguf_kv_find_ctx` dereferenced garbage),
+  `read_tensor_info_ctx` never stored tensor names and wrote each record's
+  dimensions over its dtype/offset/nelements slots, both validators returned 0
+  unconditionally, and `gguf_ctx_tensor_dim` read the dtype field.
+- `qmodel_open` passed the 48-byte handle slot where a 136-byte GGUF context was
+  expected, aliasing the two layouts; `qmodel_close` then closed fd 0 (stdin).
+- `gguf_ctx_alloc`/`st_ctx_alloc` returned uninitialised memory — `mem_alloc`
+  does not zero.
+- `gguf_ctx_tensor_name_str` returned a raw C pointer where `loader_traits`
+  expects a length-prefixed string, so every name read as `len=1`.
+- `let match = 1` is a compile error (`match` is reserved), silently binding 0.
+  Hit 15 sites in 8 files; `gguf.quanta` and `aes_gcm.quanta` did not compile.
+
+### Problem (original)
 `loader_traits` has single-slot per format (`gguf_fd`, `st_fd` module globals). Opening a second model closes the first.
 
 ### Design

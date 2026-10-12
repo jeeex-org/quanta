@@ -562,6 +562,27 @@ This plan is x86-64 only. Same four gaps exist for ARM64, addressed by `docs/pla
 
 The honest framing: **atomics, fences, and volatile already work. Five items remain open (B, B2, C1, C2, D), and the assembler-plus-operands work (C1+C2) is substantially larger than everything else combined.**
 
+### Compiler defect found while repairing the loader — ✅ FIXED (0.0.226)
+
+**`qc SRC SRC` destroyed the source.** `lib/std/gguf.quanta` (155 KB) was lost
+this way: the compiler read the source, then opened the same path for writing as
+its output, replacing it with a compiled binary. Nothing warned.
+
+Fixed in `compiler/0.0.225/src/x86/entry.quanta`: the compiler now refuses when
+the output path and the source path are the same file, compared by
+`(st_dev, st_ino)` so `./x` vs `x` and symlinks are all caught. Applies to every
+output mode (ELF, `--emit-obj`, `--emit-qobj`, `--link`), before the source is
+opened.
+
+Note the guard stats through `syscall(262)` rather than the `stat` builtin:
+`srcp`/`out_p` are raw argv C strings, while `stat` emits `argp8()` (+8, skipping
+a Quanta string header). With the builtin the path loses its first 8 characters,
+the stat returns ENOENT, and the check silently never fires — which is exactly
+how the first version of this guard shipped without working.
+
+Gate stage 13 (`output-path`) is blocking. Test:
+`test_suites/scripts/output_path_guard_test.sh`, 9 cases.
+
 ### Defects found during plan review — ✅ BOTH FIXED
 
 1. ~~**`mem_store16`/`mem_store32` silently emit 64-bit stores** — clobbers adjacent memory.~~ ✅ **Fixed** in commit `452e5285`. Re-verified: neighbour intact, 7/7 width checks pass.

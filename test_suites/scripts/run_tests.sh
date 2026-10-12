@@ -562,6 +562,16 @@ else
   VERIFY_STATUS_RC=1
 fi
 
+# --- Stage 13: OUTPUT-PATH GUARD (compiler must not overwrite its input) -----
+echo ""
+echo "########## OUTPUT-PATH GUARD ##########"
+OUTGUARD_RC=0
+if bash "$TEST_SUITES/scripts/output_path_guard_test.sh" "$QC" 2>&1 | sed 's/^/  /'; then
+  OUTGUARD_RC=0
+else
+  OUTGUARD_RC=1
+fi
+
 echo "=== GATE SUMMARY ==="
 echo "  functional     : $([ $FUNCTIONAL_RC = 0 ] && echo GREEN || echo RED)"
 echo "  native        : $([ $NATIVE_RC = 0 ] && echo GREEN || echo RED)  (no extern, no libc -- the default path)"
@@ -582,6 +592,7 @@ echo "  multi-tu      : $([ $MTU_RC = 0 ] && echo GREEN || echo RED)  (cross-TU 
 echo "  gguf-corrupt  : $([ $GGUF_RC = 0 ] && echo GREEN || echo RED)  (byte-level corrupt GGUF files must be rejected)"
 echo "  verify-status : $([ $VERIFY_STATUS_RC = 0 ] && echo GREEN || echo RED)  (docs/status.json consistency)"
 echo "  qobj          : $([ $QOBJ_RC = 0 ] && echo GREEN || echo RED)  (module cache write/read/cache-only, G1+G3+G5+G4, plus G6 cache self-compile)"
+echo "  output-path   : $([ $OUTGUARD_RC = 0 ] && echo GREEN || echo RED)  (qc must refuse to overwrite its own input)"
 # Block promotion on a real functional/security/perf/valgrind/fuzz/diff/stdlib/mtu/qobj/verify-status
 # regression. Security KNOWN issues are surfaced by the script but do not turn
 # the gate red.
@@ -596,7 +607,7 @@ echo "  qobj          : $([ $QOBJ_RC = 0 ] && echo GREEN || echo RED)  (module c
 if [ $FUNCTIONAL_RC -ne 0 ] || [ $NATIVE_RC -ne 0 ] || [ $SECURITY_RC -ne 0 ] || [ $PERF_RC -ne 0 ] \
    || [ $VALGRIND_RC -ne 0 ] || [ $FUZZ_RC -ne 0 ] || [ $DIFF_RC -ne 0 ] \
    || [ $GENERICS_RC -ne 0 ] || [ $STDLIB_RC -ne 0 ] || [ $MTU_RC -ne 0 ] \
-   || [ $QOBJ_RC -ne 0 ] || [ $VERIFY_STATUS_RC -ne 0 ]; then
+   || [ $QOBJ_RC -ne 0 ] || [ $VERIFY_STATUS_RC -ne 0 ] || [ $OUTGUARD_RC -ne 0 ]; then
   exit 1
 fi
 exit 0
