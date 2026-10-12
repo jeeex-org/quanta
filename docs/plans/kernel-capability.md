@@ -2,10 +2,10 @@
 
 **Status:** Phases A and A2 complete — B onward open
 **Date:** 2026-10-11 (updated 2026-10-12)
-**Target:** Quanta 0.0.230+ (after loader 0.0.226–0.0.229)
-**Stable at time of writing:** 0.0.225
+**Target:** Quanta 0.0.229+ (after loader 0.0.226–0.0.228)
+**Stable at time of writing:** 0.0.226
 
-**Progress:** A ✅ · A2 ✅ · Loader 6.1–7.2 ⬜ · B ⬜ · B2 ⬜ · C1 ⬜ · C2 ⬜ · D ⬜
+**Progress:** A ✅ · A2 ✅ · Loader 6.1 ✅ · 6.2 ✅ · 7.1 ✅ · 7.2 ⬜ · B ⬜ · B2 ⬜ · C1 ⬜ · C2 ⬜ · D ⬜
 
 ---
 
@@ -107,20 +107,20 @@ version freezes in place as the fallback and its `src` is never touched again.
 
 **Versioning** (one per phase, per convention — new feature → next sequential number):
 
-**Loader phases occupy 0.0.226–0.0.229 first; kernel phases follow.**
+**Loader phases occupy 0.0.226–0.0.228 first; kernel phases follow.**
 
 | Phase | Version | Status |
 |---|---|---|
 | A | 0.0.225 (folded in) | ✅ done |
 | A2 | 0.0.225 (folded in) | ✅ done |
-| — Loader 6.1–7.2 — | 0.0.226–0.0.229 | ⬜ |
-| B | 0.0.230 | ⬜ |
-| B2 | 0.0.231 | ⬜ |
-| C1 (assembler) | 0.0.232 | ⬜ |
-| C2 (operands) | 0.0.233 | ⬜ |
-| D | 0.0.234 | ⬜ |
+| — Loader 6.1–7.2 — | 0.0.226–0.0.228 | 6.1 ✅ · 6.2 ✅ · 7.1 ✅ · 7.2 ⬜ |
+| B | 0.0.229 | ⬜ |
+| B2 | 0.0.230 | ⬜ |
+| C1 (assembler) | 0.0.231 | ⬜ |
+| C2 (operands) | 0.0.232 | ⬜ |
+| D | 0.0.233 | ⬜ |
 
-A and A2 landed inside 0.0.225 rather than as separate versions — both were defect fixes, not features, so they did not take a version number. Loader phases (4 versions) start at 0.0.226; kernel Phase B starts at 0.0.230.
+A and A2 landed inside 0.0.225 rather than as separate versions — both were defect fixes, not features, so they did not take a version number. Loader 6.1 and 6.2 both landed in 0.0.226; 7.1 in 0.0.227; 7.2 is next (0.0.228). Kernel Phase B starts at 0.0.229.
 
 Phase C is deliberately split: the assembler and the operand/constraint machinery are separable and the assembler is independently testable.
 
@@ -305,19 +305,19 @@ git commit -m "fix: mem_load16/32 + mem_store16/32 emit true-width accesses"
 
 ### Task B1: Lexer keywords
 
-**Files:** Modify `compiler/0.0.227/src/x86/lexer.quanta:430-440`, `compiler/0.0.227/src/x86/helpers.quanta:255-280`
+**Files:** Modify `compiler/0.0.229/src/x86/lexer.quanta:430-440`, `compiler/0.0.229/src/x86/helpers.quanta:255-280`
 
 Add three keywords following the existing char-code pattern (e.g. `naked` = n-a-k-e-d). Register `TT_NAKED`, `TT_SECTION`, `TT_NOMANGLE`. Follow the existing convention exactly — `helpers.quanta:261` shows the pattern, and `:273` warns about duplicate keyword codes (a past bug: `asm` was assigned 53 then corrected to 40). **Check for collisions before assigning.**
 
 ### Task B2: Parser — `naked fn`
 
-**Files:** Modify `compiler/0.0.227/src/x86/method.quanta` (fn parsing), `compiler/0.0.227/src/x86/parse.quanta`
+**Files:** Modify `compiler/0.0.229/src/x86/method.quanta` (fn parsing), `compiler/0.0.229/src/x86/parse.quanta`
 
 Accept `naked fn name(...) { ... }` before the existing `fn` handling. Set a per-function flag.
 
 ### Task B3: Codegen — suppress prologue/epilogue
 
-**Files:** Modify `compiler/0.0.227/src/x86/codegen.quanta` (the `ci_func` frame setup, around `:1079-1150`)
+**Files:** Modify `compiler/0.0.229/src/x86/codegen.quanta` (the `ci_func` frame setup, around `:1079-1150`)
 
 When the naked flag is set, skip the frame allocation, the register saves, and the `ret`. The body is emitted verbatim.
 
@@ -325,7 +325,7 @@ When the naked flag is set, skip the frame allocation, the register saves, and t
 
 ### Task B4: `section` and `no_mangle`
 
-**Files:** Modify `compiler/0.0.227/src/x86/objfmt.quanta`, `compiler/0.0.227/src/x86/elf.quanta`
+**Files:** Modify `compiler/0.0.229/src/x86/objfmt.quanta`, `compiler/0.0.229/src/x86/elf.quanta`
 
 `section("...")` on a function or global routes it to a named ELF section. `no_mangle` suppresses name mangling so the symbol is exactly as written.
 
@@ -346,9 +346,9 @@ readelf -SW /tmp/naked | grep .text.startup
 
 **This is the hard phase. It touches the register allocator.**
 
-**Split into two versions:** C1 (0.0.230) adds a minimal x86 assembler; C2 (0.0.231) adds operand/constraint machinery on top. C1 is independently testable and has no regalloc interaction.
+**Split into two versions:** C1 (0.0.231) adds a minimal x86 assembler; C2 (0.0.232) adds operand/constraint machinery on top. C1 is independently testable and has no regalloc interaction.
 
-### 6.0 Phase C1 — Minimal x86 assembler (0.0.230)
+### 6.0 Phase C1 — Minimal x86 assembler (0.0.231)
 
 **Why required:** `asm!` currently takes a hex byte string (`"b8 2a 00 00 00"`) and the handler at `codegen.quanta:2904-2930` collects hex pairs, silently skipping everything else. Operands cannot be substituted into this form because the ModR/M byte depends on the register chosen.
 
@@ -389,12 +389,12 @@ fn main() {
 ```
 
 **C1-T2: Reject non-hex, non-mnemonic input**
-**Files:** Modify `compiler/0.0.230/src/x86/codegen.quanta:2904-2930`
+**Files:** Modify `compiler/0.0.231/src/x86/codegen.quanta:2904-2930`
 
 Before Phase C1's assembler accepts a template, the *existing* hex path must fail closed. Add: if a character is neither a hex digit nor whitespace, and the template does not parse as a known mnemonic, emit `error: unrecognized asm template` and exit non-zero. **This alone closes Gap 5.**
 
 **C1-T3: Encoding table**
-**Files:** Create `compiler/0.0.230/src/x86/asm_x86.quanta`
+**Files:** Create `compiler/0.0.231/src/x86/asm_x86.quanta`
 
 Opcode table keyed by mnemonic, with operand-form dispatch (reg/reg, reg/imm, reg/mem). Reuse the existing emitter primitives (`rr`, `ri`, `mr`, `eb` — see `emitter.quanta:18-52`) rather than hand-rolling bytes.
 
@@ -405,7 +405,7 @@ Assert that `asm!("not an instruction")` now fails to compile with a clear messa
 
 ---
 
-### 6.1 Phase C2 — Operands and constraints (0.0.231)
+### 6.1 Phase C2 — Operands and constraints (0.0.232)
 
 Target syntax (Rust-like, adapted to Quanta):
 
@@ -432,17 +432,17 @@ Clobbers: `"memory"` (barrier — already emitted for volatile), `"cc"` (flags).
 ### 6.2 Tasks
 
 **Task C1: Parser**
-**Files:** Modify `compiler/0.0.228/src/x86/method.quanta:629-650`
+**Files:** Modify `compiler/0.0.232/src/x86/method.quanta:629-650`
 
 After the string template, accept an optional `: outputs : inputs : clobbers` sequence. Each operand is `"<constraint>" ( <expr> )`. Produce an operand descriptor array; do not resolve registers here.
 
 **Task C2: IR representation**
-**Files:** Modify `compiler/0.0.228/src/x86/globals.quanta`
+**Files:** Modify `compiler/0.0.232/src/x86/globals.quanta`
 
 Extend `IR_ASM` (op 65). Today: `iremit(IR_ASM, vr, sv, 0, 0)` — `sv` is the source offset of the template. Add parallel arrays for operand vregs and constraint codes, indexed by an operand count. Keep the existing no-operand path working unchanged (it is used by current tests).
 
 **Task C3: Codegen — constraint → register binding**
-**Files:** Modify `compiler/0.0.228/src/x86/codegen.quanta:2679-2700`
+**Files:** Modify `compiler/0.0.232/src/x86/codegen.quanta:2679-2700`
 
 This is the real work. For each operand:
 1. Call `aphys(vreg)` to get a physical register (`emitter.quanta:303`).
@@ -454,7 +454,7 @@ This is the real work. For each operand:
 **Interaction with regalloc — the hazard:** `flush_all()` (`emitter.quanta:574`) currently spills everything before a builtin. For asm with operands this is wrong — it would clobber the registers just bound. The operand bindings must be established *after* the flush, and the flush must not spill the operand registers. This is the single most likely place for a subtle bug.
 
 **Task C4: Template substitution**
-**Files:** Create `compiler/0.0.228/src/x86/asm_template.quanta`
+**Files:** Create `compiler/0.0.232/src/x86/asm_template.quanta`
 
 Walk the template string; on `%` followed by a digit, emit the operand's register name (or address form). Everything else is passed through to the existing hex-byte path.
 
@@ -473,7 +473,7 @@ Must exercise: register input, register output, read-write operand, memory opera
 
 ### Tasks
 
-**D1: `packed` structs** — **CONFIRMED REQUIRED.** Verified: Quanta structs use 8-byte stride with no sub-word packing. An x86-64 IDT gate is 16 bytes with fields at offsets 0, 2, 4, 5, 6, 8, 12 — not expressible with 8-byte stride. Add `packed` (or explicit field offsets). This is its own version (0.0.229) and blocks D.
+**D1: `packed` structs** — **CONFIRMED REQUIRED.** Verified: Quanta structs use 8-byte stride with no sub-word packing. An x86-64 IDT gate is 16 bytes with fields at offsets 0, 2, 4, 5, 6, 8, 12 — not expressible with 8-byte stride. Add `packed` (or explicit field offsets). This is its own version (0.0.230) and blocks D.
 
 **D2: `lgdt`/`lidt`** — expressible via operand asm once C lands, or as dedicated builtins. Prefer asm; it is the point of C.
 
@@ -602,11 +602,11 @@ Both were correctness bugs with silent failure modes. They became Phases A and A
 
 | Phase | Work | Version | Blocks | Effort |
 |---|---|---|---|---|
-| — Loader 6.1–7.2 — | (see loader-phase67.md) | 0.0.226–0.0.229 | — | — |
-| B | `naked fn` + `section` + `no_mangle` | 0.0.230 | D | Small — additive syntax, 3 keywords |
-| B2 | `packed` structs / explicit field offsets | 0.0.231 | D | Medium — layout change, touches struct codegen |
-| C1 | Minimal x86 assembler | 0.0.232 | C2, D | **Large** — new module `asm_x86.quanta` |
-| C2 | Operands + constraints | 0.0.233 | D | **Large** — touches register allocator |
-| D | Ring-0 entry (IDT/GDT) | 0.0.234 | — | Medium — consumes B, B2, C |
+| — Loader 6.1–7.2 — | (see loader-phase67.md) | 0.0.226–0.0.228 | 6.1 ✅ · 6.2 ✅ · 7.1 ✅ · 7.2 ⬜ |
+| B | `naked fn` + `section` + `no_mangle` | 0.0.229 | D | Small — additive syntax, 3 keywords |
+| B2 | `packed` structs / explicit field offsets | 0.0.230 | D | Medium — layout change, touches struct codegen |
+| C1 | Minimal x86 assembler | 0.0.231 | C2, D | **Large** — new module `asm_x86.quanta` |
+| C2 | Operands + constraints | 0.0.232 | D | **Large** — touches register allocator |
+| D | Ring-0 entry (IDT/GDT) | 0.0.233 | — | Medium — consumes B, B2, C |
 
 **The critical path is C1 → C2.** Everything else is either small (B, B2) or consumes what C produces (D). The assembler is the piece with no existing foundation in the compiler — `asm!` today is a hex-byte emitter with no mnemonic table.

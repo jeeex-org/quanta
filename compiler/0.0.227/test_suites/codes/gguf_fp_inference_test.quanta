@@ -1,0 +1,47 @@
+import std/fs
+import std/gguf
+
+// Test floating point math operations: Q6_K dequant, RMSNorm using fadd/fmul/fdiv
+fn main() {
+    let rc = gguf_load("/opt/ai/models/quanta/QUANTA-LFM2.5-2.6Bv1-Q4_K_M.gguf")
+    if rc != 0 { return 1 }
+    
+    // Load just first block (256 elements) of token_embd.weight
+    let token_embd = gguf_find_tensor("token_embd.weight")
+    let offset = gguf_tensor_offset(token_embd)
+    
+    let raw = mem_alloc(210)
+    lseek(gguf_fd, offset, 0)
+    file_read(gguf_fd, raw, 210)
+    
+    let hidden = mem_alloc(256 * 8)
+    dequant_q6k(raw, 256, hidden)
+    
+    // Verify Q6_K dequant produced non-zero values
+    if mem_load(hidden) == i2f(0) { return 1 }
+    
+    // Load first 256 elements of ffn_norm.weight (f32)
+    let norm_idx = gguf_find_tensor("token_embd_norm.weight")
+    let norm_off = gguf_tensor_offset(norm_idx)
+    
+    let norm_raw = mem_alloc(256 * 4)
+    lseek(gguf_fd, norm_off, 0)
+    file_read(gguf_fd, norm_raw, 256 * 4)
+    
+    let norm_w = mem_alloc(256 * 8)
+    let i = 0
+    while i < 256 {
+        mem_store(norm_w + i * 8, f32_to_f64(norm_raw + i * 4))
+        i = i + 1
+    }
+    
+    // Apply RMSNorm
+    let normed = mem_alloc(256 * 8)
+    rms_norm(normed, hidden, norm_w, 256)
+    
+    // Verify output is non-zero
+    if mem_load(normed) == i2f(0) { return 1 }
+    
+    gguf_close()
+    return 0
+}

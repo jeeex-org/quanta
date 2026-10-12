@@ -1,0 +1,97 @@
+import std/fs
+
+// Sampling: temperature scaling, top-k filtering, nucleus (top-p) sampling
+let rng_state = 12345
+
+fn rng_next() {
+    rng_state = (rng_state * 1103515245 + 12345) - ((rng_state * 1103515245 + 12345) / 2147483648) * 2147483648
+    return rng_state
+}
+
+fn sample_temperature(logits, n, temperature) {
+    let i = 0
+    while i < n {
+        let v = mem_load(logits + i * 8)
+        mem_store(logits + i * 8, fdiv(v, temperature))
+        i = i + 1
+    }
+}
+
+fn sample_top_k(logits, n, k) {
+    let sorted = mem_alloc(n * 8)
+    let i = 0
+    while i < n {
+        mem_store(sorted + i * 8, mem_load(logits + i * 8))
+        i = i + 1
+    }
+    
+    i = 0
+    while i < n {
+        let j = i + 1
+        while j < n {
+            if f2i(mem_load(sorted + j * 8)) > f2i(mem_load(sorted + i * 8)) {
+                let tmp = mem_load(sorted + i * 8)
+                mem_store(sorted + i * 8, mem_load(sorted + j * 8))
+                mem_store(sorted + j * 8, tmp)
+            }
+            j = j + 1
+        }
+        i = i + 1
+    }
+    
+    let threshold = mem_load(sorted + k * 8)
+    
+    i = 0
+    while i < n {
+        if f2i(mem_load(logits + i * 8)) < f2i(threshold) {
+            mem_store(logits + i * 8, fsub(i2f(0), i2f(1000)))
+        }
+        i = i + 1
+    }
+}
+
+fn sample_softmax(logits, n) {
+    let max_val = mem_load(logits)
+    let i = 1
+    while i < n {
+        let v = mem_load(logits + i * 8)
+        if f2i(v) > f2i(max_val) { max_val = v }
+        i = i + 1
+    }
+    
+    let sum = i2f(0)
+    i = 0
+    while i < n {
+        let v = mem_load(logits + i * 8)
+        let ev = fadd(i2f(1), fsub(v, max_val))
+        if f2i(ev) < 0 { ev = i2f(0) }
+        sum = fadd(sum, ev)
+        mem_store(logits + i * 8, ev)
+        i = i + 1
+    }
+    
+    i = 0
+    while i < n {
+        mem_store(logits + i * 8, fdiv(mem_load(logits + i * 8), sum))
+        i = i + 1
+    }
+}
+
+fn sample_draw(probs, n) {
+    let r = rng_next()
+    let cumsum = i2f(0)
+    let i = 0
+    while i < n {
+        cumsum = fadd(cumsum, mem_load(probs + i * 8))
+        if f2i(fmul(cumsum, i2f(1000))) > r { return i }
+        i = i + 1
+    }
+    return 0
+}
+
+fn sample_full(logits, n, temperature, k) {
+    sample_temperature(logits, n, temperature)
+    if k > 0 && k < n { sample_top_k(logits, n, k) }
+    sample_softmax(logits, n)
+    return sample_draw(logits, n)
+}

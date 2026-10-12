@@ -1,8 +1,8 @@
 # Loader Phase 6/7 Plan: GPU Residency, Multi-Model, Tensor Caching, dtype Unification
 
-**Status:** Planned — Phase 6 (loader_traits seam) complete, Phase 7 (GPU/offload) and Phase 8 (multi-model/caching) open  
+**Status:** Phase 6.1 ✅ · 6.2 ✅ · 7.1 ✅ · 7.2 ⬜ (dtype unification)  
 **Target:** Quanta 0.0.226+  
-**Stable at time of writing:** 0.0.225
+**Stable at time of writing:** 0.0.226
 
 ---
 
@@ -157,7 +157,21 @@ All tensor data lives in host RAM. Need device residency for GPU matvec.
 
 ---
 
-## 5. Phase 7.1: Tensor Caching / Prefetch / Eviction (0.0.228)
+## 5. Phase 7.1: Tensor Caching / Prefetch / Eviction ✅ DONE (0.0.227)
+
+**Status: COMPLETE.** Verified: LRU eviction under a 25 MiB budget on a 1589 MiB
+model. Fetch/hit returns the same device pointer (no re-upload). Eviction picks
+the LRU entry (smallest tick). In-use tensors are never evicted. Resident tensor
+content matches CPU dequant (0/256 differing). Gate 107/107, self-host 7/7.
+Test: `test_suites/codes/std_qmodel_cache_test.quanta`.
+
+What landed:
+- `lib/std/qmodel_cache.quanta` — per-handle LRU cache with device budget,
+  acquire/release pinning, stats (hits/misses/evictions/uploads/bytes).
+- No dirty-bit write-back: device copies are derived from read-only host mmap,
+  so eviction is always a free() and never a D2H copy.
+
+### Original design notes
 
 ### Problem
 Models exceed GPU memory. Need LRU cache with prefetch.
@@ -219,16 +233,16 @@ GGUF has numeric dtype IDs; safetensors has string names. `qmodel_bits` derives 
 
 ## 7. Versioning
 
-**Loader phases occupy 0.0.226–0.0.229 first; kernel phases follow.**
+**Loader phases occupy 0.0.226–0.0.228 first; kernel phases follow.**
 
 | Phase | Work | Version | Status |
 |---|---|---|---|
 | 6.1 | Multiple models | 0.0.226 | ✅ done |
-| 6.2 | GPU residency / offload | 0.0.227 | ⬜ |
-| 7.1 | Tensor caching / prefetch / eviction | 0.0.228 | ⬜ |
-| 7.2 | dtype unification | 0.0.229 | ⬜ |
+| 6.2 | GPU residency / offload | 0.0.226 | ✅ done |
+| 7.1 | Tensor caching / prefetch / eviction | 0.0.227 | ✅ done |
+| 7.2 | dtype unification | 0.0.228 | ⬜ |
 
-Kernel phases (B, B2, C1, C2, D) then occupy 0.0.230–0.0.234.
+Kernel phases (B, B2, C1, C2, D) then occupy 0.0.229–0.0.233.
 
 **0.0.226 is now a real tree** holding Phase 6.1, so it is no longer free.
 

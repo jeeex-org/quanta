@@ -1,0 +1,125 @@
+import std/model_temp
+import std/model_size
+import std/math
+
+// Phase 11.3 -- temperature ceiling and logit scaling.
+//
+// The rule: the tier figure is a CEILING. A user who chose lower is obeyed; a
+// higher request is clamped down. A missing value defaults to 0.15, itself
+// clamped, so a small model gets 0.1 either way.
+//
+// Checks carry NUMERIC ids rather than string labels: print() on a string
+// pointer emits an ADDRESS, so a label-based failure cannot identify itself. That
+// is not hypothetical -- the first version of this test printed "FAIL:
+// 1109395936" and I had to re-derive which check it was by hand.
+
+fn close_to(a: f64, b: f64) -> i64 {
+    let d = a - b
+    if d < 0.0 { d = 0.0 - d }
+    if d < 0.0000001 { return 1 }
+    return 0
+}
+
+fn chk_temp(id: i64, got: f64, want: f64) -> i64 {
+    if close_to(got, want) == 1 { return 0 }
+    print("FAIL temp check #")
+    print(id)
+    print(" got ")
+    print(got)
+    print(" want ")
+    print(want)
+    print("\n")
+    return 1
+}
+
+fn chk_i(id: i64, got: i64, want: i64) -> i64 {
+    if got == want { return 0 }
+    print("FAIL check #")
+    print(id)
+    print(" got ")
+    print(got)
+    print(" want ")
+    print(want)
+    print("\n")
+    return 1
+}
+
+fn main() -> i64 {
+    let bad = 0
+
+    // ---- ceilings (1..3) ----
+    bad = bad + chk_temp(1, qtemp_ceiling_for(1), 0.1)
+    bad = bad + chk_temp(2, qtemp_ceiling_for(2), 0.2)
+    bad = bad + chk_temp(3, qtemp_ceiling_for(3), 0.35)
+    // an unknown class falls back to full, never to the most restrictive
+    bad = bad + chk_temp(4, qtemp_ceiling_for(99), 0.35)
+
+    // ---- the ceiling clamps down, never up (5..10) ----
+    bad = bad + chk_temp(5, qtemp_for(1, 1.0), 0.1)
+    bad = bad + chk_temp(6, qtemp_for(2, 0.9), 0.2)
+    bad = bad + chk_temp(7, qtemp_for(3, 5.0), 0.35)
+    // exactly the ceiling is allowed
+    bad = bad + chk_temp(8, qtemp_for(1, 0.1), 0.1)
+    bad = bad + chk_temp(9, qtemp_for(2, 0.2), 0.2)
+    bad = bad + chk_temp(10, qtemp_for(3, 0.35), 0.35)
+    // lower is obeyed (11..12)
+    bad = bad + chk_temp(11, qtemp_for(3, 0.05), 0.05)
+    bad = bad + chk_temp(12, qtemp_for(3, 0.0), 0.0)
+
+    // ---- unset defaults to 0.15, clamped by the tier (13..15) ----
+    bad = bad + chk_temp(13, qtemp_for(1, 0.0 - 1.0), 0.1)
+    bad = bad + chk_temp(14, qtemp_for(2, 0.0 - 1.0), 0.15)
+    bad = bad + chk_temp(15, qtemp_for(3, 0.0 - 1.0), 0.15)
+
+    // ---- scaling ----
+    let a = mem_alloc(5 * 8)
+    mem_store(a, 1.0)
+    mem_store(a + 8, 2.0)
+    mem_store(a + 16, 3.0)
+    mem_store(a + 24, 4.0)
+    mem_store(a + 32, 5.0)
+    bad = bad + chk_i(16, qtemp_scale(a, 5, 1.0), 0)
+    bad = bad + chk_i(17, f2i(f64of(mem_load(a + 16))), 3)
+
+    // T <= 0 means greedy, not a divide by zero (18..20)
+    bad = bad + chk_i(18, qtemp_scale(a, 5, 0.0), 1)
+    bad = bad + chk_i(19, qtemp_scale(a, 5, 0.0 - 1.0), 1)
+    bad = bad + chk_i(20, f2i(f64of(mem_load(a + 16))), 3)
+
+    // T == 2 halves every logit after the max shift (21..23)
+    mem_store(a, 1.0)
+    mem_store(a + 8, 2.0)
+    mem_store(a + 16, 3.0)
+    mem_store(a + 24, 4.0)
+    mem_store(a + 32, 5.0)
+    qtemp_scale(a, 5, 2.0)
+    // max is 5, so scaled = (x-5)/2 -> 1->-2, 3->-1, 5->0
+    bad = bad + chk_i(21, f2i(f64of(mem_load(a))), 0 - 2)
+    bad = bad + chk_i(22, f2i(f64of(mem_load(a + 16))), 0 - 1)
+    bad = bad + chk_i(23, f2i(f64of(mem_load(a + 32))), 0)
+
+    // ---- shift invariance, checked rather than asserted (24..25) ----
+    // scaled = (x - mx)/T. For [1000, 1002, 1000] with T=0.5 and mx=1002:
+    //   peak becomes 0, and both 1000s become (1000-1002)/0.5 = -4.
+    // The DIFFERENCE between peak and base is what the distribution depends on,
+    // and it survives the shift -- which is why shifting is safe.
+    let big = mem_alloc(3 * 8)
+    mem_store(big, 1000.0)
+    mem_store(big + 8, 1002.0)
+    mem_store(big + 16, 1000.0)
+    qtemp_scale(big, 3, 0.5)
+    bad = bad + chk_i(24, f2i(f64of(mem_load(big + 8))), 0)
+    bad = bad + chk_i(25, f2i(f64of(mem_load(big))), 0 - 4)
+
+    // ---- overflow guard (26) ----
+    // A large positive logit over a tiny T would reach +inf without the shift,
+    // and inf - inf in a softmax is NaN.
+    let huge = mem_alloc(2 * 8)
+    mem_store(huge, 0.0 - 100000.0)
+    mem_store(huge + 8, 100000.0)
+    qtemp_scale(huge, 2, 0.0001)
+    bad = bad + chk_i(26, f2i(f64of(mem_load(huge + 8))), 0)
+
+    if bad == 0 { print("OK model_temp\n") }
+    return bad
+}

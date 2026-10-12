@@ -1,0 +1,23 @@
+import std/fs
+
+// Test: read a small portion of the file
+fn main() {
+    let fd = open("/opt/ai/models/quanta/QUANTA-LFM2.5-2.6Bv1-Q4_K_M.gguf", 0, 0)
+    if fd < 0 { return 1 }
+    
+    // Read just the header
+    let buf = mem_alloc(24)
+    file_read(fd, buf, 24)
+    
+    let magic = mem_load8(buf)
+    if magic != 71 { return 1 }
+    
+    let n_kv = mem_load(buf + 8)
+    let n_tensors = mem_load(buf + 16)
+    
+    if n_kv != 266 { return 1 }
+    if n_tensors != 37 { return 1 }
+    
+    close(fd)
+    return 0
+}

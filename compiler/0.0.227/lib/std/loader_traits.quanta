@@ -1,0 +1,362 @@
+// ===========================================================================
+// Phase 6.1: Multiple models open simultaneously
+// Refactor loader_traits, gguf, safetensors to use per-context state
+// ===========================================================================
+
+import std/gguf
+import std/safetensors
+
+// ---- format kinds ---------------------------------------------------------
+let QMODEL_GGUF = 1
+let QMODEL_ST = 2
+
+// ---- normalised errors ----------------------------------------------------
+let QMODEL_ERR_OPEN = -1        // file missing or unreadable
+let QMODEL_ERR_FORMAT = -2      // not a model file we understand
+let QMODEL_ERR_RANGE = -3       // index or name out of range
+let QMODEL_ERR_TENSOR = -4      // no such tensor
+let QMODEL_ERR_UNSUPPORTED = -5 // dtype we cannot handle
+
+
+// ---- QmodelCtx layout (mem_alloc'd buffer) ----
+// All offsets in bytes from context base
+const QCTX_KIND      = 0    // i64: QMODEL_GGUF / QMODEL_ST
+const QCTX_PATH      = 8    // u64: path pointer (NUL-terminated)
+const QCTX_GGUF_CTX  = 16   // u64: pointer to GgufCtx (or 0)
+const QCTX_ST_CTX    = 24   // u64: pointer to StCtx (or 0)
+const QCTX_NBYTES_BUF = 32  // u64: scratch for st_layout nbytes
+const QCTX_BTYPE_BUF  = 40  // u64: scratch for st_layout btype
+const QCTX_SIZE       = 48  // total size per context
+
+// ---- Global context table ----
+let qmodel_ctx_table = 0
+let qmodel_ctx_max = 8
+let qmodel_ctx_count = 0
+let qmodel_tbl_ready = 0
+
+fn qmodel_tbl_init() {
+    if qmodel_tbl_ready != 0 { return }
+    qmodel_ctx_table = mem_alloc(qmodel_ctx_max * QCTX_SIZE)
+    qmodel_tbl_ready = 1
+}
+
+fn qmodel_ctx_alloc() -> u64 {
+    qmodel_tbl_init()
+    if qmodel_ctx_count >= qmodel_ctx_max { return 0 }
+    qmodel_ctx_count = qmodel_ctx_count + 1
+    let slot = qmodel_ctx_count - 1
+    return qmodel_ctx_table + slot * QCTX_SIZE
+}
+
+fn qmodel_ctx_free(ctx: u64) {
+    if ctx == 0 { return }
+    // Note: we don't shrink the table, just mark kind=0
+    mem_store(ctx + QCTX_KIND, 0)
+    mem_store(ctx + QCTX_PATH, 0)
+    mem_store(ctx + QCTX_GGUF_CTX, 0)
+    mem_store(ctx + QCTX_ST_CTX, 0)
+    mem_store(ctx + QCTX_NBYTES_BUF, 0)
+    mem_store(ctx + QCTX_BTYPE_BUF, 0)
+}
+
+fn qmodel_ctx_by_handle(h: i64) -> u64 {
+    if h < 1 || h > qmodel_ctx_count { return 0 }
+    return qmodel_ctx_table + (h - 1) * QCTX_SIZE
+}
+
+fn qmodel_ctx_kind(ctx: u64) -> i64 {
+    if ctx == 0 { return 0 }
+    return mem_load(ctx + QCTX_KIND)
+}
+
+fn qmodel_ctx_set_kind(ctx: u64, kind: i64) {
+    mem_store(ctx + QCTX_KIND, kind)
+}
+
+fn qmodel_ctx_path(ctx: u64) -> u64 {
+    if ctx == 0 { return 0 }
+    return mem_load(ctx + QCTX_PATH)
+}
+
+fn qmodel_ctx_set_path(ctx: u64, path: u64) {
+    mem_store(ctx + QCTX_PATH, path)
+}
+
+fn qmodel_ctx_gguf(ctx: u64) -> u64 {
+    if ctx == 0 { return 0 }
+    return mem_load(ctx + QCTX_GGUF_CTX)
+}
+
+fn qmodel_ctx_set_gguf(ctx: u64, gctx: u64) {
+    mem_store(ctx + QCTX_GGUF_CTX, gctx)
+}
+
+fn qmodel_ctx_st(ctx: u64) -> u64 {
+    if ctx == 0 { return 0 }
+    return mem_load(ctx + QCTX_ST_CTX)
+}
+
+fn qmodel_ctx_set_st(ctx: u64, sctx: u64) {
+    mem_store(ctx + QCTX_ST_CTX, sctx)
+}
+
+fn qmodel_ctx_nbytes_buf(ctx: u64) -> u64 {
+    if ctx == 0 { return 0 }
+    let buf = mem_load(ctx + QCTX_NBYTES_BUF)
+    if buf == 0 {
+        buf = mem_alloc(8)
+        mem_store(ctx + QCTX_NBYTES_BUF, buf)
+    }
+    return buf
+}
+
+fn qmodel_ctx_btype_buf(ctx: u64) -> u64 {
+    if ctx == 0 { return 0 }
+    let buf = mem_load(ctx + QCTX_BTYPE_BUF)
+    if buf == 0 {
+        buf = mem_alloc(8)
+        mem_store(ctx + QCTX_BTYPE_BUF, buf)
+    }
+    return buf
+}
+
+// ---- Updated API ----
+
+// Sniff the first 4 bytes for the GGUF magic ("GGUF"). Anything else is
+// treated as safetensors; st_open validates the real header, so a wrong guess
+// fails there rather than here.
+fn qmodel_probe(path: u64) -> i64 {
+    let fd = open(path, 0, 0)
+    if fd < 0 { return 0 }
+    let b = mem_alloc(8)
+    let got = read_raw(fd, b, 8)
+    close(fd)
+    if got < 4 { return 0 }
+    if mem_load8(b) == 71 && mem_load8(b + 1) == 71 && mem_load8(b + 2) == 85 && mem_load8(b + 3) == 70 {
+        return QMODEL_GGUF
+    }
+    return QMODEL_ST
+}
+
+
+fn qmodel_kind(h: i64) -> i64 {
+    let ctx = qmodel_ctx_by_handle(h)
+    return qmodel_ctx_kind(ctx)
+}
+
+fn qmodel_open(path: u64) -> i64 {
+    let kind = qmodel_probe(path)
+    if kind == 0 { return QMODEL_ERR_OPEN }
+
+    let ctx = qmodel_ctx_alloc()
+    if ctx == 0 { return QMODEL_ERR_RANGE }
+
+    let rc = 0
+    if kind == QMODEL_GGUF {
+        // The GGUF context is its own 136-byte allocation; the QmodelCtx slot
+        // holds only a pointer to it. Passing the slot itself would make the
+        // two layouts alias and every gguf_ctx_* read the wrong field.
+        let gctx = gguf_ctx_alloc()
+        if gctx == 0 { qmodel_ctx_free(ctx); return QMODEL_ERR_RANGE }
+        qmodel_ctx_set_gguf(ctx, gctx)
+        rc = gguf_load_ctx(path, gctx)
+    } else {
+        let sctx = st_ctx_alloc()
+        if sctx == 0 { qmodel_ctx_free(ctx); return QMODEL_ERR_RANGE }
+        qmodel_ctx_set_st(ctx, sctx)
+        rc = st_open_ctx(path, sctx)
+    }
+    if rc != 0 {
+        qmodel_ctx_free(ctx)
+        return QMODEL_ERR_FORMAT
+    }
+
+    qmodel_ctx_set_kind(ctx, kind)
+    qmodel_ctx_set_path(ctx, path)
+    return qmodel_ctx_count  // handle = slot + 1
+}
+
+fn qmodel_close(h: i64) -> i64 {
+    let ctx = qmodel_ctx_by_handle(h)
+    if ctx == 0 { return QMODEL_ERR_RANGE }
+    let k = qmodel_ctx_kind(ctx)
+    if k == QMODEL_GGUF {
+        let gctx = qmodel_ctx_gguf(ctx)
+        if gctx != 0 { gguf_close_ctx(gctx) }
+    } else if k == QMODEL_ST {
+        let sctx = qmodel_ctx_st(ctx)
+        if sctx != 0 { st_close_ctx(sctx) }
+    }
+    qmodel_ctx_free(ctx)
+    return 0
+}
+
+fn qmodel_num_tensors(h: i64) -> i64 {
+    let ctx = qmodel_ctx_by_handle(h)
+    if ctx == 0 { return QMODEL_ERR_RANGE }
+    let k = qmodel_ctx_kind(ctx)
+    if k == QMODEL_GGUF {
+        let gctx = qmodel_ctx_gguf(ctx)
+        return gguf_ctx_num_tensors(gctx)
+    }
+    if k == QMODEL_ST {
+        let sctx = qmodel_ctx_st(ctx)
+        return st_count_ctx(sctx)
+    }
+    return QMODEL_ERR_RANGE
+}
+
+fn qmodel_name(h: i64, i: i64) -> u64 {
+    let ctx = qmodel_ctx_by_handle(h)
+    if ctx == 0 { return 0 }
+    let k = qmodel_ctx_kind(ctx)
+    if k == QMODEL_GGUF {
+        let gctx = qmodel_ctx_gguf(ctx)
+        if i < 0 || i >= gguf_ctx_num_tensors(gctx) { return 0 }
+        return gguf_ctx_tensor_name_str(gctx, i)
+    }
+    if k == QMODEL_ST {
+        let sctx = qmodel_ctx_st(ctx)
+        if i < 0 || i >= st_count_ctx(sctx) { return 0 }
+        return st_name_at_ctx(sctx, i)
+    }
+    return 0
+}
+
+fn qmodel_name_bytes(h: i64, i: i64) -> i64 {
+    let p = qmodel_name(h, i)
+    if p == 0 { return -1 }
+    let n = 0
+    while mem_load8(p + n) != 0 { n = n + 1 }
+    return n
+}
+
+fn qmodel_find(h: i64, name: u64) -> i64 {
+    let ctx = qmodel_ctx_by_handle(h)
+    if ctx == 0 { return QMODEL_ERR_RANGE }
+    let k = qmodel_ctx_kind(ctx)
+    if k == QMODEL_GGUF {
+        let gctx = qmodel_ctx_gguf(ctx)
+        return gguf_ctx_find_tensor(gctx, name)
+    }
+    if k == QMODEL_ST {
+        let sctx = qmodel_ctx_st(ctx)
+        if st_entry_ctx(sctx, name) < 0 { return QMODEL_ERR_TENSOR }
+        return st_index_of_ctx(sctx, name)
+    }
+    return QMODEL_ERR_RANGE
+}
+
+fn qmodel_ndims(h: i64, i: i64) -> i64 {
+    let ctx = qmodel_ctx_by_handle(h)
+    if ctx == 0 { return QMODEL_ERR_RANGE }
+    let k = qmodel_ctx_kind(ctx)
+    if k == QMODEL_GGUF {
+        let gctx = qmodel_ctx_gguf(ctx)
+        return gguf_ctx_tensor_ndims(gctx, i)
+    }
+    if k == QMODEL_ST {
+        let sctx = qmodel_ctx_st(ctx)
+        return st_ndims_ctx(sctx, i)
+    }
+    return QMODEL_ERR_RANGE
+}
+
+fn qmodel_ndim(h: i64, i: i64, d: i64) -> i64 {
+    let ctx = qmodel_ctx_by_handle(h)
+    if ctx == 0 { return QMODEL_ERR_RANGE }
+    let k = qmodel_ctx_kind(ctx)
+    if k == QMODEL_GGUF {
+        let gctx = qmodel_ctx_gguf(ctx)
+        return gguf_ctx_tensor_dim(gctx, i, d)
+    }
+    if k == QMODEL_ST {
+        let sctx = qmodel_ctx_st(ctx)
+        return st_dim_ctx(sctx, i, d)
+    }
+    return QMODEL_ERR_RANGE
+}
+
+fn qmodel_nelements(h: i64, i: i64) -> i64 {
+    let ctx = qmodel_ctx_by_handle(h)
+    if ctx == 0 { return QMODEL_ERR_RANGE }
+    let k = qmodel_ctx_kind(ctx)
+    if k == QMODEL_GGUF {
+        let gctx = qmodel_ctx_gguf(ctx)
+        return gguf_ctx_tensor_nelements(gctx, i)
+    }
+    if k == QMODEL_ST {
+        let sctx = qmodel_ctx_st(ctx)
+        return st_nelements_of_ctx(sctx, i)
+    }
+    return QMODEL_ERR_RANGE
+}
+
+fn qmodel_bits(h: i64, i: i64) -> i64 {
+    let nel = qmodel_nelements(h, i)
+    if nel <= 0 { return QMODEL_ERR_TENSOR }
+    let nb = qmodel_nbytes(h, i)
+    if nb <= 0 { return QMODEL_ERR_TENSOR }
+    let bits = nb * 8 / nel
+    if bits < 1 { return QMODEL_ERR_UNSUPPORTED }
+    return bits
+}
+
+fn qmodel_is_quantized(h: i64, i: i64) -> i64 {
+    let b = qmodel_bits(h, i)
+    if b < 0 { return b }
+    if b < 8 { return 1 }
+    return 0
+}
+
+fn qmodel_offset(h: i64, i: i64) -> i64 {
+    let ctx = qmodel_ctx_by_handle(h)
+    if ctx == 0 { return QMODEL_ERR_RANGE }
+    let k = qmodel_ctx_kind(ctx)
+    if k == QMODEL_GGUF {
+        let gctx = qmodel_ctx_gguf(ctx)
+        return gguf_ctx_tensor_offset(gctx, i)
+    }
+    if k == QMODEL_ST {
+        let sctx = qmodel_ctx_st(ctx)
+        return st_ctx_data_base(sctx) + st_tensor_data_off_ctx(sctx, i)
+    }
+    return QMODEL_ERR_RANGE
+}
+
+fn qmodel_nbytes(h: i64, i: i64) -> i64 {
+    let ctx = qmodel_ctx_by_handle(h)
+    if ctx == 0 { return QMODEL_ERR_RANGE }
+    let k = qmodel_ctx_kind(ctx)
+    if k == QMODEL_GGUF {
+        let gctx = qmodel_ctx_gguf(ctx)
+        return gguf_ctx_tensor_nbytes(gctx, i)
+    }
+    if k == QMODEL_ST {
+        let sctx = qmodel_ctx_st(ctx)
+        let nb_buf = qmodel_ctx_nbytes_buf(ctx)
+        let bt_buf = qmodel_ctx_btype_buf(ctx)
+        let nm = qmodel_name(h, i)
+        if nm == 0 { return QMODEL_ERR_TENSOR }
+        if st_layout_ctx(sctx, nm, nb_buf, bt_buf) < 0 { return QMODEL_ERR_TENSOR }
+        return mem_load(nb_buf)
+    }
+    return QMODEL_ERR_RANGE
+}
+
+fn qmodel_read(h: i64, i: i64, buf: u64, nbytes: i64) -> i64 {
+    let ctx = qmodel_ctx_by_handle(h)
+    if ctx == 0 { return QMODEL_ERR_RANGE }
+    let k = qmodel_ctx_kind(ctx)
+    if k == QMODEL_GGUF {
+        let gctx = qmodel_ctx_gguf(ctx)
+        return gguf_ctx_read_tensor_bytes_at(gctx, i, 0, buf, nbytes)
+    }
+    if k == QMODEL_ST {
+        let sctx = qmodel_ctx_st(ctx)
+        let p = qmodel_name(h, i)
+        if p == 0 { return QMODEL_ERR_TENSOR }
+        return st_read_ctx(sctx, p, buf)
+    }
+    return QMODEL_ERR_RANGE
+}
