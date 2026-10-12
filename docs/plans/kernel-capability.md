@@ -116,9 +116,9 @@ version freezes in place as the fallback and its `src` is never touched again.
 | — Loader 6.1–7.2 — | 0.0.226–0.0.228 | 6.1 ✅ · 6.2 ✅ · 7.1 ✅ · 7.2 ✅ |
 | B | 0.0.229 | ✅ done |
 | B2 | 0.0.230 | ✅ done |
-| C1 (assembler) | 0.0.231 | ⬜ |
-| C2 (operands) | 0.0.232 | ⬜ |
-| D | 0.0.233 | ⬜ |
+| C1 (assembler) | 0.0.231 | ✅ done |
+| C2 (operands) | 0.0.232 | ✅ done |
+| D | 0.0.233 | ✅ milestone met (D4 ring-3 remains) |
 
 A and A2 landed inside 0.0.225 rather than as separate versions — both were defect fixes, not features, so they did not take a version number. Loader 6.1 and 6.2 both landed in 0.0.226; 7.1 in 0.0.227; 7.2 is next (0.0.228). Kernel Phase B starts at 0.0.229.
 
@@ -599,6 +599,157 @@ Must exercise: register input, register output, read-write operand, memory opera
 
 **Depends on B (naked, section, no_mangle), B2 (packed), and C (asm + operands).**
 
+### 7.0 Completion notes ✅ — milestone MET (0.0.233)
+
+**The milestone: QEMU boots a Quanta binary that prints `Hello from Quanta` via
+UART from an interrupt handler.** Measured serial output of
+`test_suites/codes/baremetal_idt_test.quanta` under
+`qemu-system-x86_64 -kernel … -serial file:… -no-reboot -m 1100 -cpu max
+-device isa-debug-exit,iobase=0x501,iosize=0x4`:
+
+```
+Quanta ring0: IDT demo
+triggering int3
+Hello from Quanta            <- printed from INSIDE the #BP handler
+returned from int3           <- iretq restored the interrupted context
+```
+
+The program runs in ring 0 with no OS: it zeroes a 256-gate IDT, fills gate 3
+with a 16/16/32-bit split handler address and type_attr 0x8E, `lidt`s it, saves
+a Quanta handler address in a fixed slot, executes `int3`; a `naked` trampoline
+saves the caller-saved registers, loads the handler address, `call`s it, and
+`iretq`s. Gate is GREEN with the stage below; `asm_operand_test`,
+`argconv_test` and `strlayout_test` cover the pieces.
+
+#### The boot path: multiboot is impossible, PVH is the way
+
+**Measured, not assumed:** `qemu-system-x86_64 -kernel <elf64 with a valid
+multiboot header>` prints
+
+```
+qemu-system-x86_64: Cannot load x86-64 image, give a 32bit one.
+```
+
+An earlier prototype (a Quanta program that emitted a 512-byte boot sector
+doing INT 13h + real→protected→long mode by hand) was abandoned once PVH proved
+out: it needed a hand-written disk loader AND a broken verbatim-ELF copy step,
+where PVH has QEMU place the segments itself. That file is deleted.
+
+QEMU's multiboot loader accepts ELF32/i386 only (multiboot also enters in 32-bit
+protected mode). The earlier `--multiboot` flag (12-byte 0x1BADB002 header) was
+therefore dead on arrival and has been **replaced by `--bare`**, which uses the
+PVH entry path QEMU does support for a 64-bit kernel:
+
+* the ELF carries a `PT_NOTE` with the Xen note `XEN_ELFNOTE_PHYS32_ENTRY`
+  (type 18) whose descriptor is a 32-bit physical entry;
+* QEMU loads the ELF64 normally (segments at their real paddr) and enters that
+  address in 32-bit protected mode with paging off;
+* the stub builds page tables, enables PAE + long mode, and jumps to the 64-bit
+  entry the compiler emits directly after it. `e_entry` shifts past the prefix.
+
+#### The 32-bit stub: provenance and verification
+
+The stub is **the only non-Quanta code in the image** (~208 bytes) and exists
+because Quanta's backend is 64-bit only. Its source of truth is
+`scripts/boot/boot32.S` (gas), and `scripts/boot/gen_boot32.py` emits the
+compiler's byte table `src/x86/boot32_bytes.quanta` — one line per instruction
+with the assembler's own disassembly as the comment, so the emitted prefix can
+be audited against the source. Regenerate with:
+
+```bash
+python3 scripts/boot/gen_boot32.py compiler/<ver>
+```
+
+and re-verify what actually shipped in a built ELF with:
+
+```bash
+python3 scripts/boot/verify_boot32.py <bare-elf> compiler/<ver>
+```
+
+which re-derives the prefix from the image, checks that the PT_NOTE really is
+the Xen PHYS32_ENTRY note pointing at the stub inside the code LOAD, and
+compares the stub bytes **and** the instruction stream against a fresh assembly
+of `boot32.S`. Measured output on the shipped image:
+
+```
+  PT_NOTE at file 344 / vaddr 0x400158, filesz 20, align 4
+  note: Xen/18 -> 0x400170 (the stub, inside the code LOAD)
+  stub bytes: identical to a fresh assembly of boot32.S (208 bytes)
+  stub disassembly: matches the reference instruction-for-instruction (49 instructions)
+```
+
+Rules the generator enforces (each one caught a real failure):
+
+1. **Bytes come from the linked section, never from parsed objdump text.** The
+   first implementation re-parsed objdump output and silently dropped 9 of 176
+   bytes — a byte table that is merely *mostly* right. The generator now
+   extracts bytes with `objcopy -O binary --only-section=` and uses the listing
+   only for comments, then **fails closed** unless the annotated instructions
+   tile the byte stream exactly.
+2. **`.boot32` must land 16-byte aligned.** gas gives the section 16-byte
+   alignment; when its VMA was not aligned the linker inserted 4 pad bytes
+   *inside* the section, which shifted every absolute address (the GDT
+   descriptor came out 4 bytes late and the far jump #GP'd). The generator
+   asserts `nm boot32 == STUB_BASE`, and the prefix layout is
+   `[note 20][pad 4][stub]` so `STUB_BASE = ht + 24 = 0x400170`.
+3. The compiler asserts the layout it emits matches the one the bytes were
+   built for (`BASE + ht + note + pad == boot32_stub_base`, `phc == 5`) and
+   fails closed otherwise.
+
+`--bare` also: skips the mmap'd stack relocation (no syscalls in ring 0),
+switches to a fixed stack (top `0x2FF000`), and ends `_start` with a hlt loop
+instead of `exit(2)`.
+
+#### Four defects this phase found and fixed
+
+1. **`patch_globals()` hardcoded the code base** (`BASE + 288 + gp + 4`, where
+   288 = `ht` for the 4-phdr layout). In a `--bare` build `ht` is 344, so every
+   RIP-relative global access landed **56 bytes late** (112 in dynamic builds).
+   Measured symptom: the startup stub's argc/environ stores overwrote the first
+   bytes of a string literal in the data segment, so the banner printed shifted
+   garbage. Fixed with `code_vbase()` in `globals.quanta` (288/344/400 by
+   layout), now used by the global-patch path, `g_code_end`, and the try/catch
+   `catch_ip` patch. Full gate GREEN afterwards.
+2. **The fixed BSS base is ~1.03 GiB.** `GDATA = 0x42200000` sits *outside* a
+   1 GiB identity map and beyond a 256 MiB guest: the first global store took a
+   `#PF` (`CR2 = 0x42200168`, error 0x2) and the guest triple-faulted. The stub
+   now identity-maps the low **4 GiB with 1 GiB pages**, and the guest needs
+   **≥ 1.06 GiB of RAM**. Making the BSS base relocatable is the proper fix and
+   is recorded below as a follow-up.
+3. **`fnptr()` is a syscall in the tuple path** (it `mmap`s a 16-byte tuple), so
+   it cannot be used in ring 0. Under `--bare` it now yields the **raw code
+   address** — the same PIC lea the object-mode path emits — which is what
+   IDT/ISR tables need.
+4. **`asm!` hex hand-assembly has no operand checking.** `BA imm16` desynced the
+   byte stream (in 64-bit mode `BA` is `mov r32, imm32`, so the exit-port write
+   never happened and the harness hung until timeout). Recorded because it is
+   exactly the class of error C2 exists to remove for real projects — the fix is
+   to use `asm!` with operands (`"i"(imm)`) instead of hex.
+
+#### Gate coverage
+
+A `bare-metal` stage compiles both demos with `--bare` and runs them under
+QEMU, checking the serial stream **and** that QEMU exits (the guests end by
+writing to QEMU's `isa-debug-exit` port, so the test is ~0.3 s, not a timeout):
+
+```
+PASS: bare-metal UART write from ring 0 (PVH boot)
+PASS: ring-0 IDT + int3 handler prints from the handler
+```
+
+#### Still open in Phase D
+
+* **D4 (ring 3 → ring 0 and back).** Not attempted: it needs a TSS descriptor in
+  the stub's GDT, a TSS with a valid `rsp0`, `ltr`, an IDT gate with DPL 3, and
+  an `iretq` that returns to CPL 3. The milestone does not require it.
+* **Relocatable BSS base.** Removing the 1.06 GiB RAM requirement means making
+  `GDATA` a value the emitter can move for `--bare` (it is currently a compile
+  time constant referenced across `globals`/`elf`/`patch`). Until then a
+  bare-metal image is bound to `0x42200000`.
+* **Dynamic-layout `code_vbase`.** The old 288 constant was also wrong for the
+  6-phdr dynamic layout (400); `code_vbase()` now returns the correct value and
+  the gate is green, but no test exercises globals heavily in that mode.
+
 ### Tasks
 
 **D1: `packed` structs** — **CONFIRMED REQUIRED.** Verified: Quanta structs use 8-byte stride with no sub-word packing. An x86-64 IDT gate is 16 bytes with fields at offsets 0, 2, 4, 5, 6, 8, 12 — not expressible with 8-byte stride. Add `packed` (or explicit field offsets). This is its own version (0.0.230) and blocks D.
@@ -735,6 +886,6 @@ Both were correctness bugs with silent failure modes. They became Phases A and A
 | B2 | `packed` structs / explicit field offsets | 0.0.230 | D | Medium — layout change, touches struct codegen |
 | C1 | Minimal x86 assembler | 0.0.231 | C2, D | ✅ done — new module `asm_x86.quanta` |
 | C2 | Operands + constraints | 0.0.232 | D | ✅ done — operand blocks keyed by result vreg |
-| D | Ring-0 entry (IDT/GDT) | 0.0.233 | — | Medium — consumes B, B2, C |
+| D | Ring-0 entry (IDT/GDT) | 0.0.233 | ✅ done | Medium — consumes B, B2, C. D1/D2/D3/D5 done; D4 (ring 3) open |
 
 **The critical path is C1 → C2.** Everything else is either small (B, B2) or consumes what C produces (D). The assembler is the piece with no existing foundation in the compiler — `asm!` today is a hex-byte emitter with no mnemonic table.

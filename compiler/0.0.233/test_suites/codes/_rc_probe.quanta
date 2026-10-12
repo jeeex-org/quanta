@@ -1,0 +1,45 @@
+import std/secure
+fn main() {
+  // Compare keccak_rc called with constant vs runtime variable.
+  let c0 = keccak_rc(0)
+  let c1 = keccak_rc(1)
+  let c2 = keccak_rc(2)
+  let c23 = keccak_rc(23)
+  let r = 0
+  let v0 = keccak_rc(r)
+  r = 1
+  let v1 = keccak_rc(r)
+  r = 2
+  let v2 = keccak_rc(r)
+  r = 23
+  let v23 = keccak_rc(r)
+  // print each as 64-bit hex; if v0 != c0 etc, the bug is runtime-arg handling
+  let e = mem_alloc(64)
+  let b = 0
+  // dump c0 and v0 side by side
+  let lane = c0
+  let i = 0
+  while i < 8 {
+    let val = (lane >> (i*8)) & 255
+    let hi = val >> 4; let lo = val & 15
+    let c1d = 0; if hi < 10 { c1d = hi + 48 } else { c1d = hi + 87 }
+    let c2d = 0; if lo < 10 { c2d = lo + 48 } else { c2d = lo + 87 }
+    mem_store8(e + i*2, c1d); mem_store8(e + i*2 + 1, c2d)
+    i = i + 1
+  }
+  print(e, 16); print(" const-rc0\n", 11)
+  let lane2 = v0
+  let j = 0
+  while j < 8 {
+    let val = (lane2 >> (j*8)) & 255
+    let hi = val >> 4; let lo = val & 15
+    let c1d = 0; if hi < 10 { c1d = hi + 48 } else { c1d = hi + 87 }
+    let c2d = 0; if lo < 10 { c2d = lo + 48 } else { c2d = lo + 87 }
+    mem_store8(e + j*2, c1d); mem_store8(e + j*2 + 1, c2d)
+    j = j + 1
+  }
+  print(e, 16); print(" runtime-rc0\n", 13)
+  // exit 0 if v0==c0 (correct), 1 if mismatch
+  let diff = c0 ^ v0
+  if diff == 0 { exit(0) } else { exit(1) }
+}

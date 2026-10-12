@@ -1,0 +1,56 @@
+// x25519_step2_test.quanta — test more ops
+
+import std/x25519
+
+fn main() {
+  println("Test step 2...")
+  
+  let x1 = mem_alloc(8*8)
+  let x2 = mem_alloc(8*8)
+  let z2 = mem_alloc(8*8)
+  let x3 = mem_alloc(8*8)
+  let z3 = mem_alloc(8*8)
+  
+  let t0 = mem_alloc(8*8)
+  let t1 = mem_alloc(8*8)
+  let t2 = mem_alloc(8*8)
+  let t3 = mem_alloc(8*8)
+  let t4 = mem_alloc(8*8)
+  
+  // Initialize with u=9
+  let u = mem_alloc(32)
+  let i = 0
+  while i < 32 { mem_store8(u + i, 0); i = i + 1 }
+  mem_store8(u, 9)
+  
+  fe_from_bytes(u, x1)
+  fe_one(x2)
+  fe_zero(z2)
+  fe_from_bytes(u, x3)
+  fe_one(z3)
+  
+  println("init done")
+  
+  fe_add(x2, z2, t0)
+  fe_sub(x2, z2, t1)
+  fe_add(x3, z3, t2)
+  fe_sub(x3, z3, t3)
+  fe_mul(t0, t3, t4)
+  fe_mul(t1, t2, t0)
+  fe_add(t4, t0, t2)
+  fe_sq(t2, x3)
+  
+  println("first 9 done")
+  
+  // Next
+  fe_sub(t4, t0, t3)
+  println("sub 3 done")
+  fe_sq(t3, t2)
+  println("sq 2 done")
+  fe_mul(t2, x1, z3)
+  println("mul 3 done")
+  
+  println("all ops done")
+  println(0)
+  exit(0)
+}

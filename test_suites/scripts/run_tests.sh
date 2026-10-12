@@ -705,6 +705,59 @@ else
   ASM_RC=1
 fi
 
+# ---------------------------------------------------------------------------
+# Phase D (0.0.233): bare-metal ring 0 under QEMU (PVH boot).
+#
+# These are the only tests whose verification is a serial stream from a guest
+# with no OS underneath: the --bare ELF carries a 32-bit PVH entry stub + Xen
+# note, QEMU enters it, it enables long mode and jumps to Quanta's _start.
+# The guest ends by writing to isa-debug-exit so QEMU exits instead of hanging.
+#
+# Guest RAM: the compiler's fixed BSS base is 0x42200000 (~1.03 GiB), so the
+# guest needs >= 1.06 GiB of RAM for the data segment to exist at all (see
+# docs/plans/kernel-capability.md Phase D).
+# ---------------------------------------------------------------------------
+BM_RC=0
+if command -v qemu-system-x86_64 >/dev/null 2>&1; then
+  BM_QEMU="qemu-system-x86_64 -display none -no-reboot -m 1100 -cpu max -device isa-debug-exit,iobase=0x501,iosize=0x4"
+  bm_case() {
+    # $1 = test source, $2 = expected stdout (grep -F), $3 = label
+    if $QC --bare --no-overflow-trap "$TEST_SUITES/codes/$1" "$TEST_SUITES/run/bm_$1" >/tmp/bm_c.txt 2>&1; then
+      rm -f /tmp/bm_ser.txt
+      # The guest exits through QEMU's isa-debug-exit port, so a *successful*
+      # run makes qemu return 1 — under `set -e` that would abort the gate, so
+      # capture the status instead of letting it propagate.
+      local rc=0
+      timeout 30 $BM_QEMU -kernel "$TEST_SUITES/run/bm_$1" -serial file:/tmp/bm_ser.txt >/dev/null 2>&1 || rc=$?
+      local out=""
+      out="$(cat /tmp/bm_ser.txt 2>/dev/null)" || true
+      if [ $rc -eq 1 ] && printf '%s' "$out" | grep -qF "$2"; then
+        echo "  PASS: $3"
+      else
+        echo "  FAIL: $3 (qemu rc=$rc, serial: $(printf '%s' "$out" | head -2 | tr '\n' '|'))"
+        BM_RC=1
+      fi
+    else
+      echo "  FAIL: $1 failed to compile --bare: $(head -1 /tmp/bm_c.txt)"
+      BM_RC=1
+    fi
+  }
+  bm_case baremetal_uart_test.quanta "OK" "bare-metal UART write from ring 0 (PVH boot)"
+  bm_case baremetal_idt_test.quanta "Hello from Quanta" "ring-0 IDT + int3 handler prints from the handler"
+  # Independent check of the generated 32-bit PVH prefix that shipped: re-derive
+  # it from the ELF and compare against a fresh assembly of scripts/boot/boot32.S.
+  BM_VER="${QC%/bin/x86/qc}"
+  [ -f "$BM_VER/src/x86/boot32_bytes.quanta" ] || BM_VER="$REPO/compiler/$(cat "$REPO/VERSION")"
+  if python3 scripts/boot/verify_boot32.py "$TEST_SUITES/run/bm_baremetal_idt_test.quanta" "$BM_VER" >/tmp/bm_ver.txt 2>&1; then
+    echo "  PASS: PVH prefix verified against scripts/boot/boot32.S ($(grep -c . /tmp/bm_ver.txt) checks)"
+  else
+    echo "  FAIL: PVH prefix verification: $(tail -1 /tmp/bm_ver.txt)"
+    BM_RC=1
+  fi
+else
+  echo "  SKIP: bare-metal (qemu-system-x86_64 not installed)"
+fi
+
 echo "=== GATE SUMMARY ==="
 echo "  functional     : $([ $FUNCTIONAL_RC = 0 ] && echo GREEN || echo RED)"
 echo "  native        : $([ $NATIVE_RC = 0 ] && echo GREEN || echo RED)  (no extern, no libc -- the default path)"
@@ -728,6 +781,7 @@ echo "  qobj          : $([ $QOBJ_RC = 0 ] && echo GREEN || echo RED)  (module c
 echo "  output-path   : $([ $OUTGUARD_RC = 0 ] && echo GREEN || echo RED)  (qc must refuse to overwrite its own input)"
 echo "  naked         : $([ $NAKED_RC = 0 ] && echo GREEN || echo RED)  (naked fn + section + no_mangle, 0.0.229 Phase B)"
 echo "  asm-assembler : $([ $ASM_RC = 0 ] && echo GREEN || echo RED)  (mnemonic asm! + rejection, 0.0.231 Phase C1)"
+echo "  bare-metal    : $([ $BM_RC = 0 ] && echo GREEN || echo RED)  (ring-0 under QEMU: PVH boot, UART + IDT/int3 handler, 0.0.233 Phase D)"
 # Block promotion on a real functional/security/perf/valgrind/fuzz/diff/stdlib/mtu/qobj/verify-status
 # regression. Security KNOWN issues are surfaced by the script but do not turn
 # the gate red.
@@ -742,7 +796,7 @@ echo "  asm-assembler : $([ $ASM_RC = 0 ] && echo GREEN || echo RED)  (mnemonic 
 if [ $FUNCTIONAL_RC -ne 0 ] || [ $NATIVE_RC -ne 0 ] || [ $SECURITY_RC -ne 0 ] || [ $PERF_RC -ne 0 ] \
    || [ $VALGRIND_RC -ne 0 ] || [ $FUZZ_RC -ne 0 ] || [ $DIFF_RC -ne 0 ] \
    || [ $GENERICS_RC -ne 0 ] || [ $STDLIB_RC -ne 0 ] || [ $MTU_RC -ne 0 ] \
-   || [ $QOBJ_RC -ne 0 ] || [ $VERIFY_STATUS_RC -ne 0 ] || [ $OUTGUARD_RC -ne 0 ] || [ $NAKED_RC -ne 0 ] || [ $ASM_RC -ne 0 ]; then
+   || [ $QOBJ_RC -ne 0 ] || [ $VERIFY_STATUS_RC -ne 0 ] || [ $OUTGUARD_RC -ne 0 ] || [ $NAKED_RC -ne 0 ] || [ $ASM_RC -ne 0 ] || [ $BM_RC -ne 0 ]; then
   exit 1
 fi
 exit 0
