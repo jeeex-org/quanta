@@ -622,6 +622,46 @@ else
   OUTGUARD_RC=1
 fi
 
+# --- Stage 14: NAKED fn / section / no_mangle (0.0.229 Phase B) --------------
+echo ""
+echo "########## NAKED / SECTION ##########"
+NAKED_RC=0
+NAKED_BIN="$TEST_SUITES/run/naked_gate"
+if $QC --no-overflow-trap "$TEST_SUITES/codes/naked_test.quanta" "$NAKED_BIN" 2>/tmp/naked_gate_compile.txt; then
+  NAKED_OUT="$(./scripts/quanta_run.sh "$NAKED_BIN" < /dev/null 2>&1)"
+  if printf '%s' "$NAKED_OUT" | grep -q "^naked: ok$"; then
+    echo "  PASS: naked fn callable, returns asm value"
+  else
+    echo "  FAIL: naked fn runtime check: $NAKED_OUT"
+    NAKED_RC=1
+  fi
+  # Negative fixture: naked fn WITH PARAMETERS must fail to compile (fail closed).
+  if $QC --no-overflow-trap "$TEST_SUITES/codes/naked_neg_test.quanta" /tmp/naked_neg_gate 2>/tmp/naked_neg_gate.txt; then
+    echo "  FAIL: naked fn with parameters compiled (must be a compile error)"
+    NAKED_RC=1
+  else
+    echo "  PASS: naked fn with parameters rejected at compile time"
+  fi
+  # Object mode: section("...") must produce the NAMED section and bind the
+  # fn's symbol to it; the name must be EXACT (no_mangle semantics).
+  if $QC --emit-obj "$TEST_SUITES/codes/naked_test.quanta" /tmp/naked_gate.o 2>/dev/null; then
+    if readelf -SW /tmp/naked_gate.o 2>/dev/null | grep -q "text.startup" \
+       && readelf -sW /tmp/naked_gate.o 2>/dev/null | grep -q "startup_stub" \
+       && [ "$(readelf -sW /tmp/naked_gate.o 2>/dev/null | awk '$8=="startup_stub" {print $7}')" = "8" ]; then
+      echo "  PASS: section(".text.startup") emitted, symbol bound, name exact"
+    else
+      echo "  FAIL: section/no_mangle object checks"
+      NAKED_RC=1
+    fi
+  else
+    echo "  FAIL: --emit-obj failed on naked_test"
+    NAKED_RC=1
+  fi
+else
+  echo "  FAIL: naked_test failed to compile: $(cat /tmp/naked_gate_compile.txt | head -1)"
+  NAKED_RC=1
+fi
+
 echo "=== GATE SUMMARY ==="
 echo "  functional     : $([ $FUNCTIONAL_RC = 0 ] && echo GREEN || echo RED)"
 echo "  native        : $([ $NATIVE_RC = 0 ] && echo GREEN || echo RED)  (no extern, no libc -- the default path)"
@@ -643,6 +683,7 @@ echo "  gguf-corrupt  : $([ $GGUF_RC = 0 ] && echo GREEN || echo RED)  (byte-lev
 echo "  verify-status : $([ $VERIFY_STATUS_RC = 0 ] && echo GREEN || echo RED)  (docs/status.json consistency)"
 echo "  qobj          : $([ $QOBJ_RC = 0 ] && echo GREEN || echo RED)  (module cache write/read/cache-only, G1+G3+G5+G4, plus G6 cache self-compile)"
 echo "  output-path   : $([ $OUTGUARD_RC = 0 ] && echo GREEN || echo RED)  (qc must refuse to overwrite its own input)"
+echo "  naked         : $([ $NAKED_RC = 0 ] && echo GREEN || echo RED)  (naked fn + section + no_mangle, 0.0.229 Phase B)"
 # Block promotion on a real functional/security/perf/valgrind/fuzz/diff/stdlib/mtu/qobj/verify-status
 # regression. Security KNOWN issues are surfaced by the script but do not turn
 # the gate red.
@@ -657,7 +698,7 @@ echo "  output-path   : $([ $OUTGUARD_RC = 0 ] && echo GREEN || echo RED)  (qc m
 if [ $FUNCTIONAL_RC -ne 0 ] || [ $NATIVE_RC -ne 0 ] || [ $SECURITY_RC -ne 0 ] || [ $PERF_RC -ne 0 ] \
    || [ $VALGRIND_RC -ne 0 ] || [ $FUZZ_RC -ne 0 ] || [ $DIFF_RC -ne 0 ] \
    || [ $GENERICS_RC -ne 0 ] || [ $STDLIB_RC -ne 0 ] || [ $MTU_RC -ne 0 ] \
-   || [ $QOBJ_RC -ne 0 ] || [ $VERIFY_STATUS_RC -ne 0 ] || [ $OUTGUARD_RC -ne 0 ]; then
+   || [ $QOBJ_RC -ne 0 ] || [ $VERIFY_STATUS_RC -ne 0 ] || [ $OUTGUARD_RC -ne 0 ] || [ $NAKED_RC -ne 0 ]; then
   exit 1
 fi
 exit 0

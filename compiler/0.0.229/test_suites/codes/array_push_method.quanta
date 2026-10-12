@@ -1,0 +1,11 @@
+// Array push, method form: the pushed element must read back correctly.
+// REGRESSION GUARD: IR_CLOSURE was introduced at opcode 72, colliding with
+// IR_APUSH (also 72). parse_let's fn-value tagging then misread every array
+// push as a closure literal and corrupted the result vreg, so the appended
+// element silently read back as 0 while len() still reported the new length.
+// Worked in 0.0.64, broke in 0.0.65, fixed in 0.0.66.
+fn main() {
+    let r = [9]
+    r.push(7)
+    return r[1]        // 7, NOT 0
+}

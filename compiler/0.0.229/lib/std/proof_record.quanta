@@ -1,0 +1,839 @@
+// ===========================================================================
+// Proof record and send-back -- Phase 11.5
+//
+// An agent that changed code and then said "done" was believed on its word.
+// Nothing tied finishing to having checked anything, so a change that broke the
+// tests was reported as finished in the same words as one that passed them, and
+// the person could not tell which they had.
+//
+// This keeps a record of proof and decides from it:
+//
+//   - every command the agent runs is SORTED -- test, lint, typecheck, build,
+//     format, or none of those -- and recorded with whether it passed, whether
+//     it covered the whole project or part of it, and whether it ran AFTER the
+//     lasti change to a code file;
+//   - when the agent tries to finish after changing code and no test has passed
+//     since that change, it is SENT BACK, at most twice (three in light mode);
+//   - the end-of-run summary is worked out from the RECORD, never from the
+//     agent's own words.
+//
+// From HashCortX src/js/code/verify.js, read from source:
+//   - commandKind            verify.js:86-136
+//   - commandScope           verify.js:137-158
+//   - CODE_FILE / isCode     verify.js:223-224
+//   - neverRan               verify.js:233-238
+//   - proofLog               verify.js:246-286
+//   - stopCheck              verify.js:349-381
+//   - proofLine              verify.js:774-793
+//   - sendBack ORDER         verify.js:755-769
+//
+// WHAT IS DELIBERATELY NOT HERE
+//
+// No running of anything. The app never runs the project's checks itself -- the
+// agent runs them and the result is RECORDED. That is upstream's rule and it is
+// the right one: an app that runs the tests behind the agent's back reports a
+// pass the agent never saw and cannot act on.
+//
+// PURE FUNCTIONS OF STRINGS AND INTEGERS. The log is a set of module globals the
+// caller drives; every decision function reads them and returns an answer.
+//
+// RESULTS, through module globals and std/vec because Quanta's typed lists
+// cannot hold a string and an integer in one record:
+//
+//   PV_STEP        the step counter; every event advances it
+//   PV_LAST_CODE   step of the last change to a CODE file, or -1
+//   PV_CHANGED     vec of changed paths (strings)
+//   PV_KIND        vec of check kinds, parallel (PK_TEST, PK_LINT, ...)
+//   PV_PASS        vec of 1/0
+//   PV_SCOPE       vec of PS_WHOLE / PS_PART
+//   PV_STEP_OF     vec of the step each check ran at
+//   PV_NCHK        how many checks are recorded
+//
+//   pv_reset()                     clear the log
+//   pv_edited(path)                record a file change
+//   pv_ran(cmd, code)              record a command that ran; returns 1 if it
+//                                  was classified and recorded, 0 if it proved
+//                                  nothing (unclassifiable, or never ran)
+//   pv_code_changed()              whether code changed in this run
+//   pv_since_code()                how many checks ran after the lasti code edit
+//   pv_passed_test_since()         how many PASSING tests ran after it
+//   pv_failed_test_since()         how many FAILING tests ran after it
+//   pv_stop_check(...)             the send-back decision, 0 = finish
+//   pv_proof_line(...)             the end-of-run summary
+//
+// Every decision is a FUNCTION OF THE LOG plus a small set of inputs, so the same
+// run always yields the same decision. That is what makes this testable with no
+// model at all.
+
+import std/str
+import std/vec
+
+// ---- check kinds (PK_NONE = not a check) ------------------------------------
+let PK_NONE = 0
+let PK_TEST = 1
+let PK_LINT = 2
+let PK_TYPECHECK = 3
+let PK_BUILD = 4
+let PK_FORMAT = 5
+
+// ---- scope ------------------------------------------------------------------
+let PS_WHOLE = 0
+let PS_PART = 1
+
+// ---- the log ----------------------------------------------------------------
+let PV_STEP = 0
+let PV_LAST_CODE = -1
+let PV_CHANGED = 0
+let PV_KIND = 0
+let PV_PASS = 0
+let PV_SCOPE = 0
+let PV_STEP_OF = 0
+let PV_NCHK = 0
+
+// Send-back limits. Upstream: 2 normally, 3 for a model in light mode, which gets
+// one more round to fix a failing test it ran itself.
+let PV_LIMIT = 2
+let PV_LIMIT_LIGHT = 3
+
+fn pv_reset() -> i64 {
+    PV_STEP = 0
+    PV_LAST_CODE = -1
+    PV_CHANGED = vec_new()
+    PV_KIND = vec_new()
+    PV_PASS = vec_new()
+    PV_SCOPE = vec_new()
+    PV_STEP_OF = vec_new()
+    PV_NCHK = 0
+    return 0
+}
+
+// Record a change to `path`. Quanta's own sources count as code.
+fn pv_edited(path) -> i64 {
+    PV_STEP = PV_STEP + 1
+    if pv_is_code(path) == 1 { PV_LAST_CODE = PV_STEP }
+    // a path changed twice is listed once
+    if vec_len(PV_CHANGED) > 0 {
+        let i = 0
+        while i < vec_len(PV_CHANGED) {
+            if equals(vec_at(PV_CHANGED, i), path) == 1 { return 0 }
+            i = i + 1
+        }
+    }
+    vec_push(PV_CHANGED, path)
+    return 0
+}
+
+// Whether a path is CODE. verify.js CODE_FILE:223. A change only to documents,
+// pages or settings does not require proof, and upstream does not send the agent
+// back for one.
+fn pv_is_code(path) -> i64 {
+    if equals(path, "") == 1 { return 0 }
+    return pv_has_code_ext(path)
+}
+
+fn pv_has_code_ext(path) -> i64 {
+    // the lasti '.' decides
+    let n = len(path)
+    if n < 2 { return 0 }
+    let dot = -1
+    let i = 0
+    while i < n {
+        if byte_at(path, i) == 46 { dot = i }
+        i = i + 1
+    }
+    if dot < 0 || dot == n - 1 { return 0 }
+    let ext = substr(path, dot + 1, n - dot - 1)
+    return pv_ext_is_code(ext)
+}
+
+fn pv_ext_is_code(ext) -> i64 {
+    if equals(ext, "js") == 1 { return 1 }
+    if equals(ext, "jsx") == 1 { return 1 }
+    if equals(ext, "ts") == 1 { return 1 }
+    if equals(ext, "tsx") == 1 { return 1 }
+    if equals(ext, "mjs") == 1 { return 1 }
+    if equals(ext, "cjs") == 1 { return 1 }
+    if equals(ext, "mts") == 1 { return 1 }
+    if equals(ext, "cts") == 1 { return 1 }
+    if equals(ext, "py") == 1 { return 1 }
+    if equals(ext, "rs") == 1 { return 1 }
+    if equals(ext, "go") == 1 { return 1 }
+    if equals(ext, "java") == 1 { return 1 }
+    if equals(ext, "kt") == 1 { return 1 }
+    if equals(ext, "kts") == 1 { return 1 }
+    if equals(ext, "swift") == 1 { return 1 }
+    if equals(ext, "rb") == 1 { return 1 }
+    if equals(ext, "php") == 1 { return 1 }
+    if equals(ext, "cs") == 1 { return 1 }
+    if equals(ext, "c") == 1 { return 1 }
+    if equals(ext, "cc") == 1 { return 1 }
+    if equals(ext, "cpp") == 1 { return 1 }
+    if equals(ext, "cxx") == 1 { return 1 }
+    if equals(ext, "h") == 1 { return 1 }
+    if equals(ext, "hpp") == 1 { return 1 }
+    if equals(ext, "m") == 1 { return 1 }
+    if equals(ext, "mm") == 1 { return 1 }
+    if equals(ext, "scala") == 1 { return 1 }
+    if equals(ext, "dart") == 1 { return 1 }
+    if equals(ext, "lua") == 1 { return 1 }
+    if equals(ext, "ex") == 1 { return 1 }
+    if equals(ext, "exs") == 1 { return 1 }
+    if equals(ext, "vue") == 1 { return 1 }
+    if equals(ext, "svelte") == 1 { return 1 }
+    if equals(ext, "quanta") == 1 { return 1 }
+    return 0
+}
+
+// ---------------------------------------------------------------------------
+// Sort a command into a kind of check. verify.js:86-136.
+//
+// `cmd` is the whole command line. The rules, in the reference's order:
+//   - npm/pnpm/yarn run a SCRIPT: the script's name decides (`t` is a test)
+//   - npx/pnpx/bunx delegate to the command after them
+//   - node/deno/bun: --test or `test` is a test, --check/-c is a lint, and a
+//     file whose name reads as test/spec is a test
+//   - python -m unittest/pytest is a test, -m py_compile/compileall is a lint
+//   - cargo/go: test, clippy/vet, build, check, fmt
+//   - make/just: the target decides; a bare `make` is a build
+//   - anything else: the bare program name, if it is a known tool
+//
+// PK_NONE means it proved nothing, and it is NOT recorded.
+// ---------------------------------------------------------------------------
+fn pv_command_kind(cmd) -> i64 {
+    let first = pv_first_word(cmd)
+    if equals(first, "") == 1 { return PK_NONE }
+    let prog = pv_basename(first)
+
+    if pv_is_runner(prog) == 1 {
+        let sub = pv_arg_after_script(cmd, prog)
+        if equals(sub, "t") == 1 { return PK_TEST }
+        if equals(sub, "exec") == 1 { return pv_kind_of_word(pv_nth_word(cmd, 2)) }
+        return pv_script_kind(sub)
+    }
+    if equals(prog, "npx") == 1 { return pv_kind_of_word(pv_nth_word(cmd, 2)) }
+    if equals(prog, "pnpx") == 1 { return pv_kind_of_word(pv_nth_word(cmd, 2)) }
+    if equals(prog, "bunx") == 1 { return pv_kind_of_word(pv_nth_word(cmd, 2)) }
+    if equals(prog, "node") == 1 { return pv_node_kind(cmd) }
+    if equals(prog, "deno") == 1 { return pv_node_kind(cmd) }
+    if equals(prog, "bun") == 1 { return pv_node_kind(cmd) }
+    if pv_is_python(prog) == 1 { return pv_python_kind(cmd) }
+    if equals(prog, "cargo") == 1 { return pv_cargo_go_kind(cmd, "cargo") }
+    if equals(prog, "go") == 1 { return pv_cargo_go_kind(cmd, "go") }
+    if equals(prog, "make") == 1 { return pv_make_kind(cmd, 1) }
+    if equals(prog, "just") == 1 { return pv_make_kind(cmd, 0) }
+    return pv_kind_of_word(prog)
+}
+
+// The word after `run`/`run-script` for a runner, else the first argument.
+fn pv_arg_after_script(cmd, prog) -> i64 {
+    let a1 = pv_nth_word(cmd, 2)
+    if equals(a1, "run") == 1 || equals(a1, "run-script") == 1 { return pv_nth_word(cmd, 3) }
+    return a1
+}
+
+// `npx <cmd>`: classify the word after npx.
+fn pv_command_kind_of_rest(cmd) -> i64 {
+    return pv_kind_of_word(pv_nth_word(cmd, 2))
+}
+
+fn pv_kind_of_word(w) -> i64 {
+    let b = pv_basename(w)
+    if equals(b, "pytest") == 1 { return PK_TEST }
+    if equals(b, "jest") == 1 { return PK_TEST }
+    if equals(b, "vitest") == 1 { return PK_TEST }
+    if equals(b, "mocha") == 1 { return PK_TEST }
+    if equals(b, "ava") == 1 { return PK_TEST }
+    if equals(b, "tsc") == 1 { return PK_TYPECHECK }
+    if equals(b, "eslint") == 1 { return PK_LINT }
+    if equals(b, "ruff") == 1 { return PK_LINT }
+    if equals(b, "flake8") == 1 { return PK_LINT }
+    if equals(b, "mypy") == 1 { return PK_TYPECHECK }
+    if equals(b, "prettier") == 1 { return PK_FORMAT }
+    if equals(b, "black") == 1 { return PK_FORMAT }
+    if equals(b, "clippy") == 1 { return PK_LINT }
+    return PK_NONE
+}
+
+fn pv_is_runner(prog) -> i64 {
+    if equals(prog, "npm") == 1 { return 1 }
+    if equals(prog, "pnpm") == 1 { return 1 }
+    if equals(prog, "yarn") == 1 { return 1 }
+    if equals(prog, "bun") == 1 { return 1 }
+    return 0
+}
+
+// A package.json script NAME decides. `t` is the conventional short test script.
+fn pv_script_kind(name) -> i64 {
+    if equals(name, "") == 1 { return PK_NONE }
+    let k = pv_kind_of_word(name)
+    if k != PK_NONE { return k }
+    if pv_has_word(name, "test") == 1 { return PK_TEST }
+    if pv_has_word(name, "lint") == 1 { return PK_LINT }
+    if pv_has_word(name, "check") == 1 { return PK_TYPECHECK }
+    if pv_has_word(name, "build") == 1 { return PK_BUILD }
+    if pv_has_word(name, "fmt") == 1 { return PK_FORMAT }
+    return PK_NONE
+}
+
+fn pv_node_kind(cmd) -> i64 {
+    if pv_has_flag(cmd, "--test") == 1 { return PK_TEST }
+    if pv_first_word_after(cmd) == "test" { return PK_TEST }
+    if pv_has_flag(cmd, "--check") == 1 { return PK_LINT }
+    let file = pv_first_nonflag(cmd, 2)
+    if equals(file, "") == 1 { return PK_NONE }
+    return pv_looks_like_test_file(file)
+}
+
+// python -m unittest/pytest is a test; -m py_compile/compileall is a lint.
+fn pv_python_kind(cmd) -> i64 {
+    let m = pv_index_of_flag(cmd, "-m")
+    if m >= 0 {
+        let pymod = pv_nth_word(cmd, m + 1)
+        if equals(pymod, "unittest") == 1 { return PK_TEST }
+        if equals(pymod, "pytest") == 1 { return PK_TEST }
+        if equals(pymod, "py_compile") == 1 { return PK_LINT }
+        if equals(pymod, "compileall") == 1 { return PK_LINT }
+        return pv_kind_of_word(pymod)
+    }
+    let file = pv_first_nonflag(cmd, 2)
+    if equals(file, "") == 1 { return PK_NONE }
+    return pv_looks_like_test_file(file)
+}
+
+fn pv_is_python(prog) -> i64 {
+    if equals(prog, "python") == 1 { return 1 }
+    if equals(prog, "py") == 1 { return 1 }
+    // python3, python3.11, python3.12 -- any pythonN[.M]
+    let n = len(prog)
+    if n < 7 { return 0 }
+    let head = substr(prog, 0, 6)
+    if equals(head, "python") == 0 { return 0 }
+    let c = byte_at(prog, 6)
+    if c < 48 || c > 57 { return 0 }
+    let i = 6
+    while i < n {
+        let d = byte_at(prog, i)
+        if d >= 48 && d <= 57 { i = i + 1; continue }
+        if d == 46 { i = i + 1; continue }
+        return 0
+    }
+    return 1
+}
+
+fn pv_cargo_go_kind(cmd, prog) -> i64 {
+    let sub = pv_nth_word(cmd, 2)
+    if equals(sub, "test") == 1 { return PK_TEST }
+    if equals(sub, "clippy") == 1 { return PK_LINT }
+    if equals(sub, "vet") == 1 { return PK_LINT }
+    if equals(sub, "fmt") == 1 { return PK_FORMAT }
+    if equals(sub, "build") == 1 { return PK_BUILD }
+    if equals(sub, "check") == 1 {
+        if equals(prog, "cargo") == 1 { return PK_TYPECHECK }
+        return PK_BUILD
+    }
+    return PK_NONE
+}
+
+fn pv_make_kind(cmd, bare_is_build) -> i64 {
+    let target = pv_first_nonflag(cmd, 2)
+    if equals(target, "") == 1 {
+        if bare_is_build == 1 { return PK_BUILD }
+        return PK_NONE
+    }
+    // upstream: scriptKind(target) || (target === 'check' ? 'test' : null).
+    // `check` is tested FIRST here because pv_script_kind maps the word `check` to
+    // a typecheck, which is right for `npm run check` and wrong for `make check`.
+    if equals(target, "check") == 1 { return PK_TEST }
+    let k = pv_script_kind(target)
+    if k != PK_NONE { return k }
+    return PK_NONE
+}
+
+// A file whose name reads as test/spec. Upstream's regex is
+// /(^|[\\/._-])(test|tests|spec)([\\/._-]|$)/i over the whole path.
+fn pv_looks_like_test_file(path) -> i64 {
+    if pv_has_segment(path, "test") == 1 { return 1 }
+    if pv_has_segment(path, "tests") == 1 { return 1 }
+    if pv_has_segment(path, "spec") == 1 { return 1 }
+    if pv_has_segment(path, "Test") == 1 { return 1 }
+    if pv_has_segment(path, "Spec") == 1 { return 1 }
+    return 0
+}
+
+// Is `word` a path SEGMENT of `path`, delimited by / \ . _ or - ?
+fn pv_has_segment(path, word) -> i64 {
+    let n = len(path)
+    let m = len(word)
+    if m == 0 || m > n { return 0 }
+    let i = 0
+    while i + m <= n {
+        if equals(substr(path, i, m), word) == 1 {
+            let before_ok = 1
+            if i > 0 {
+                let c = byte_at(path, i - 1)
+                if pv_is_sep(c) == 0 { before_ok = 0 }
+            }
+            let after_ok = 1
+            if i + m < n {
+                let c2 = byte_at(path, i + m)
+                if pv_is_sep(c2) == 0 { after_ok = 0 }
+            }
+            if before_ok == 1 && after_ok == 1 { return 1 }
+        }
+        i = i + 1
+    }
+    return 0
+}
+
+fn pv_is_sep(c) -> i64 {
+    if c == 47 || c == 92 { return 1 }        // / \
+    if c == 46 { return 1 }                    // .
+    if c == 95 { return 1 }                    // _
+    if c == 45 { return 1 }                    // -
+    return 0
+}
+
+// ---------------------------------------------------------------------------
+// Whether a check covered the WHOLE project or part of it. verify.js:137-158.
+//
+// `npm test` is whole. `npm test -- -t name`, `node --test test/one.test.js` and
+// `pytest -k name` are part, because a part can pass while the rest is broken.
+// ---------------------------------------------------------------------------
+fn pv_command_scope(cmd) -> i64 {
+    let first = pv_first_word(cmd)
+    let prog = pv_basename(first)
+    // a named file, a filter, or a single test makes it partial
+    if pv_has_flag(cmd, "-t") == 1 { return PS_PART }
+    if pv_has_flag(cmd, "-k") == 1 { return PS_PART }
+    if pv_has_flag(cmd, "--watch") == 1 { return PS_PART }
+    // python -m unittest/pytest with a module name or path is partial; with
+    // nothing after the module name it is the whole suite.
+    let mi = pv_index_of_flag(cmd, "-m")
+    if mi >= 0 && pv_is_python(pv_basename(pv_first_word(cmd))) == 1 {
+        let pymod = pv_nth_word(cmd, mi + 1)
+        if equals(pymod, "unittest") == 1 { return PS_WHOLE }
+        if equals(pymod, "pytest") == 1 { return PS_WHOLE }
+    }
+    // a bare `pytest` or `python file.py` naming one test file is partial
+    let pfile = pv_first_nonflag(cmd, 2)
+    if equals(pfile, "") == 0 {
+        if pv_is_python(pv_basename(pv_first_word(cmd))) == 1 { return PS_PART }
+        if pv_basename(pv_first_word(cmd)) == "pytest" { return PS_PART }
+    }
+    // a named source FILE limits the run -- but a runner's SCRIPT name is not a
+    // file. `npm test` and `make test` run the whole project; `npm test -- -t x`
+    // does not, and that case is already caught by the -t test above.
+    if pv_is_runner(prog) == 1 { return PS_WHOLE }
+    // a subcommand, not a file: `cargo test`, `go test ./...`, `make check`
+    if equals(prog, "cargo") == 1 { return PS_WHOLE }
+    if equals(prog, "go") == 1 { return PS_WHOLE }
+    if equals(prog, "make") == 1 { return PS_WHOLE }
+    if equals(prog, "just") == 1 { return PS_WHOLE }
+    let file = pv_first_nonflag(cmd, 2)
+    if equals(file, "") == 1 { return PS_WHOLE }
+    return PS_PART
+}
+
+// ---------------------------------------------------------------------------
+// Record a command that ran. `code` is its exit status, `output` whatever it
+// printed, or "" when there is none.
+//
+// A command that proved nothing is NOT recorded and this returns 0:
+//   - it is not a check at all
+//   - it never ran (verify.js:233-238): the shell said the program is not there,
+//     or the runner had no such script. Reading such a result as a failed test
+//     sent the agent back to fix a failure its change never caused.
+//
+// never_ran is DERIVED here rather than taken as a flag: a caller that passes 0
+// for a 127 exit records a test failure that never happened, which is exactly the
+// bug pv_never_ran exists to prevent.
+fn pv_ran(cmd, code, output) -> i64 {
+    let ckind = pv_command_kind(cmd)
+    if ckind == PK_NONE { return 0 }
+    if pv_never_ran(code, output) == 1 { return 0 }
+    PV_STEP = PV_STEP + 1
+    vec_push(PV_KIND, ckind)
+    if code == 0 { vec_push(PV_PASS, 1) } else { vec_push(PV_PASS, 0) }
+    vec_push(PV_SCOPE, pv_command_scope(cmd))
+    vec_push(PV_STEP_OF, PV_STEP)
+    PV_NCHK = vec_len(PV_KIND)
+    return 1
+}
+
+// A command whose result says nothing was run: verify.js:233-238. Exit 127 is the
+// shell's "command not found"; 9009 is Windows' equivalent.
+fn pv_never_ran(code, output) -> i64 {
+    if code == 127 { return 1 }
+    if code == 9009 { return 1 }
+    if pv_has_ci(output, "command not found") == 1 { return 1 }
+    if pv_has_ci(output, "is not recognized as an internal or external command") == 1 { return 1 }
+    if pv_has_ci(output, "Missing script") == 1 { return 1 }
+    return 0
+}
+
+fn pv_code_changed() -> i64 {
+    if PV_LAST_CODE >= 0 { return 1 }
+    return 0
+}
+
+fn pv_checks_since_code() -> i64 {
+    if PV_LAST_CODE < 0 { return 0 }
+    let n = 0
+    let i = 0
+    while i < PV_NCHK {
+        if vec_at(PV_STEP_OF, i) > PV_LAST_CODE { n = n + 1 }
+        i = i + 1
+    }
+    return n
+}
+
+fn pv_kind_at(i) -> i64 { return vec_at(PV_KIND, i) }
+fn pv_pass_at(i) -> i64 { return vec_at(PV_PASS, i) }
+fn pv_scope_at(i) -> i64 { return vec_at(PV_SCOPE, i) }
+
+// A PASSING test after the lasti code edit.
+fn pv_passed_test_since() -> i64 {
+    let n = 0
+    let i = 0
+    while i < PV_NCHK {
+        if vec_at(PV_STEP_OF, i) > PV_LAST_CODE {
+            if vec_at(PV_KIND, i) == PK_TEST {
+                if vec_at(PV_PASS, i) == 1 { n = n + 1 }
+            }
+        }
+        i = i + 1
+    }
+    return n
+}
+
+// A FAILING test after the lasti code edit, the LAST one's index or -1.
+fn pv_failed_test_since() -> i64 {
+    let lasti = -1
+    let i = 0
+    while i < PV_NCHK {
+        if vec_at(PV_STEP_OF, i) > PV_LAST_CODE {
+            if vec_at(PV_KIND, i) == PK_TEST {
+                if vec_at(PV_PASS, i) == 0 { lasti = i }
+            }
+        }
+        i = i + 1
+    }
+    return lasti
+}
+
+// ---------------------------------------------------------------------------
+// Should the agent be sent back before it finishes? verify.js:349-381.
+//
+// Returns a reason code, and writes the message into PV_MESSAGE:
+//
+//   0  finish
+//   1  send back: a test FAILED after the last change
+//   2  send back: code changed and no test has run since
+//   3  send back: words only, no change made (a model under 15B)
+//
+// Not sent back when:
+//   - no code changed (a docs-only or settings-only change needs no proof)
+//   - the send-back limit is already reached
+//   - the reply ends by ASKING the person something -- the person is the answer
+//   - a test has passed since the last change
+//   - a failing test exists but the project names no test command (so there is
+//     nothing to tell it to run); a project with no test command cannot prove
+//     anything and must not send the agent in circles
+// ---------------------------------------------------------------------------
+let PV_REASON = 0
+let PV_MESSAGE = ""
+
+fn pv_stop_check(reply, has_test_cmd, sent_back, light) -> i64 {
+    PV_MESSAGE = ""
+    PV_REASON = 0
+    if pv_code_changed() == 0 { return 0 }
+    let limit = PV_LIMIT
+    if light == 1 { limit = PV_LIMIT_LIGHT }
+    if sent_back >= limit { return 0 }
+    if pv_ends_with_question(reply) == 1 { return 0 }
+    if pv_passed_test_since() > 0 { return 0 }
+    let failed = pv_failed_test_since()
+    if failed >= 0 {
+        PV_MESSAGE = pv_failed_message(failed)
+        PV_REASON = 1
+        return 1
+    }
+    if has_test_cmd != 1 { return 0 }
+    PV_MESSAGE = pv_untested_message()
+    PV_REASON = 2
+    return 1
+}
+
+fn pv_failed_message(failed) -> str {
+    return concat("Note from HashCoder, not from the person: ", concat(pv_kind_name(pv_kind_at(failed)), " failed after your last change. Read the failure, change the code to fix the cause, and run it again. Make the fix, do not describe it. Then finish by saying which checks passed. If it cannot be made to pass, say what still fails and why."))
+}
+
+fn pv_untested_message() -> str {
+    return concat("Note from HashCoder, not from the person: you changed ", concat(pv_code_file_list(), " and no test has run since. Run the project's test now. If it fails, read the failure and fix it. Then finish by saying which checks passed. If it cannot run here, say so and why."))
+}
+
+// Up to four changed code files, by name only. verify.js:358.
+fn pv_code_file_list() -> str {
+    let out = ""
+    let shown = 0
+    let i = 0
+    while i < vec_len(PV_CHANGED) && shown < 4 {
+        let p = vec_at(PV_CHANGED, i)
+        if pv_is_code(p) == 1 {
+            if len(out) > 0 { out = concat(out, ", ") }
+            out = concat(out, pv_basename(p))
+            shown = shown + 1
+        }
+        i = i + 1
+    }
+    return out
+}
+
+// A reply that ends by asking the person something is not a finished run.
+fn pv_ends_with_question(reply) -> i64 {
+    if equals(reply, "") == 1 { return 0 }
+    let e = len(reply)
+    while e > 0 && pv_is_space_byte(byte_at(reply, e - 1)) == 1 { e = e - 1 }
+    if e == 0 { return 0 }
+    if byte_at(reply, e - 1) == 63 { return 1 }   // '?'
+    return 0
+}
+
+fn pv_is_space_byte(c) -> i64 {
+    if c == 32 || c == 9 || c == 10 || c == 13 { return 1 }
+    return 0
+}
+
+// ---------------------------------------------------------------------------
+// The one line the PERSON is shown at the end. verify.js:774-793.
+//
+// Worked out from the record, never from the agent's words -- that is the whole
+// point of the module.
+// ---------------------------------------------------------------------------
+fn pv_proof_line() -> str {
+    if pv_code_changed() == 0 { return "Not checked: no code was changed." }
+    let test = pv_last_kind_since(PK_TEST)
+    if test >= 0 {
+        if pv_pass_at(test) == 1 {
+            let line = concat("Checked after the last change: ", concat(pv_kind_name(PK_TEST), " passed."))
+            if pv_scope_at(test) == PS_PART {
+                return concat(line, " (for part of the project.)")
+            }
+            return line
+        }
+        return concat("Not proven: ", concat(pv_kind_name(PK_TEST), " failed after the last change."))
+    }
+    // a passing check of another kind, but no test
+    let other = pv_last_passing_since()
+    if other >= 0 {
+        return concat("Not tested: ", concat(pv_kind_name(pv_kind_at(other)), " passed after the last change, but no test ran."))
+    }
+    return "Not checked: no test ran after the last change."
+}
+
+// The lasti check of `kind` after the lasti code edit, or -1.
+fn pv_last_kind_since(want_kind) -> i64 {
+    let lasti = -1
+    let i = 0
+    while i < PV_NCHK {
+        if vec_at(PV_STEP_OF, i) > PV_LAST_CODE {
+            if vec_at(PV_KIND, i) == want_kind { lasti = i }
+        }
+        i = i + 1
+    }
+    return lasti
+}
+
+fn pv_last_passing_since() -> i64 {
+    let lasti = -1
+    let i = 0
+    while i < PV_NCHK {
+        if vec_at(PV_STEP_OF, i) > PV_LAST_CODE {
+            if vec_at(PV_PASS, i) == 1 { lasti = i }
+        }
+        i = i + 1
+    }
+    return lasti
+}
+
+fn pv_kind_name(k) -> str {
+    if k == PK_TEST { return "The test" }
+    if k == PK_LINT { return "The lint" }
+    if k == PK_TYPECHECK { return "The type check" }
+    if k == PK_BUILD { return "The build" }
+    if k == PK_FORMAT { return "The format check" }
+    return "The check"
+}
+
+// ---- word helpers ------------------------------------------------------------
+fn pv_is_space_word(c) -> i64 {
+    if c == 32 || c == 9 { return 1 }
+    return 0
+}
+
+fn pv_nth_word(s, n) -> str {
+    let want = n
+    if want < 1 { return "" }
+    let cur = 1
+    let i = 0
+    let start = 0
+    while i < len(s) {
+        if pv_is_space_word(byte_at(s, i)) == 1 {
+            if cur == want { return substr(s, start, i - start) }
+            cur = cur + 1
+            start = i + 1
+        }
+        i = i + 1
+    }
+    if cur == want { return substr(s, start, len(s) - start) }
+    return ""
+}
+
+fn pv_first_word(s) -> str {
+    return pv_nth_word(s, 1)
+}
+
+fn pv_first_word_after(s) -> str {
+    return pv_nth_word(s, 2)
+}
+
+// The first word that is not a flag, counting words from 1 (the program) and
+// counting FLAGS too, so `from` matches pv_nth_word's numbering.
+//
+// `from` is the 1-based word position to start counting FROM, and the answer is
+// the first non-flag word at or after it. `node --test a.js` from=2 skips the
+// flag and answers `a.js`; `npm test -- -t name` from=2 answers `test`, which is
+// a script name and not a file -- pv_command_scope handles that separately.
+fn pv_first_nonflag(s, from) -> str {
+    let cur = 0
+    let i = 0
+    let start = 0
+    let inword = 0
+    while i < len(s) {
+        if pv_is_space_word(byte_at(s, i)) == 1 {
+            if inword == 1 {
+                cur = cur + 1
+                let w = substr(s, start, i - start)
+                let isflag = 0
+                if len(w) > 0 { if byte_at(w, 0) == 45 { isflag = 1 } }
+                if isflag == 0 {
+                    if cur >= from { return w }
+                }
+                inword = 0
+            }
+            start = i + 1
+        } else {
+            inword = 1
+        }
+        i = i + 1
+    }
+    if inword == 1 {
+        cur = cur + 1
+        let w = substr(s, start, len(s) - start)
+        let isflag = 0
+        if len(w) > 0 { if byte_at(w, 0) == 45 { isflag = 1 } }
+        if isflag == 0 {
+            if cur >= from { return w }
+        }
+    }
+    return ""
+}
+
+// The index, in words, of a flag. -1 when absent. Word 1 is the program.
+fn pv_index_of_flag(s, flag) -> i64 {
+    let cur = 1
+    let i = 0
+    let start = 0
+    let inword = 0
+    while i < len(s) {
+        if pv_is_space_word(byte_at(s, i)) == 1 {
+            if inword == 1 {
+                let w = substr(s, start, i - start)
+                if equals(w, flag) == 1 { return cur }
+                cur = cur + 1
+                inword = 0
+            }
+            start = i + 1
+        } else {
+            inword = 1
+        }
+        i = i + 1
+    }
+    if inword == 1 {
+        let w = substr(s, start, len(s) - start)
+        if equals(w, flag) == 1 { return cur }
+    }
+    return -1
+}
+
+fn pv_has_flag(s, flag) -> i64 {
+    if pv_index_of_flag(s, flag) >= 0 { return 1 }
+    return 0
+}
+
+fn pv_has_word(s, w) -> i64 {
+    if pv_nth_index(s, w) >= 0 { return 1 }
+    return 0
+}
+
+// The word index of `w` in `s`, or -1.
+fn pv_nth_index(s, w) -> i64 {
+    let cur = 1
+    let i = 0
+    let start = 0
+    let inword = 0
+    while i < len(s) {
+        if pv_is_space_word(byte_at(s, i)) == 1 {
+            if inword == 1 {
+                let cur_word = substr(s, start, i - start)
+                if equals(cur_word, w) == 1 { return cur }
+                cur = cur + 1
+                inword = 0
+            }
+            start = i + 1
+        } else {
+            inword = 1
+        }
+        i = i + 1
+    }
+    if inword == 1 {
+        let cur_word = substr(s, start, len(s) - start)
+        if equals(cur_word, w) == 1 { return cur }
+    }
+    return -1
+}
+
+fn pv_has_ci(s, w) -> i64 {
+    let n = len(s)
+    let m = len(w)
+    if m == 0 || m > n { return 0 }
+    let i = 0
+    while i + m <= n {
+        let j = 0
+        let same = 1
+        while j < m {
+            if pv_lower(byte_at(s, i + j)) != pv_lower(byte_at(w, j)) { same = 0; break }
+            j = j + 1
+        }
+        if same == 1 { return 1 }
+        i = i + 1
+    }
+    return 0
+}
+
+fn pv_lower(c) -> i64 {
+    if c >= 65 && c <= 90 { return c + 32 }
+    return c
+}
+
+// The part of a path after the lasti '/'.
+fn pv_basename(path) -> str {
+    let cut = -1
+    let i = 0
+    while i < len(path) {
+        if byte_at(path, i) == 47 { cut = i }
+        i = i + 1
+    }
+    if cut < 0 { return path }
+    return substr(path, cut + 1, len(path) - cut - 1)
+}

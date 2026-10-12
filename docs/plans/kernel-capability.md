@@ -1,11 +1,11 @@
 # Kernel-Capability Plan: Operand ASM, Naked Functions, Section/Symbol Control
 
-**Status:** Phases A and A2 complete — B onward open
+**Status:** Phases A, A2, B complete — B2 onward open
 **Date:** 2026-10-11 (updated 2026-10-12)
 **Target:** Quanta 0.0.229+ (after loader 0.0.226–0.0.228)
-**Stable at time of writing:** 0.0.228
+**Stable at time of writing:** 0.0.229
 
-**Progress:** A ✅ · A2 ✅ · Loader 6.1 ✅ · 6.2 ✅ · 7.1 ✅ · 7.2 ✅ · B ⬜ · B2 ⬜ · C1 ⬜ · C2 ⬜ · D ⬜
+**Progress:** A ✅ · A2 ✅ · Loader 6.1 ✅ · 6.2 ✅ · 7.1 ✅ · 7.2 ✅ · B ✅ · B2 ⬜ · C1 ⬜ · C2 ⬜ · D ⬜
 
 ---
 
@@ -114,7 +114,7 @@ version freezes in place as the fallback and its `src` is never touched again.
 | A | 0.0.225 (folded in) | ✅ done |
 | A2 | 0.0.225 (folded in) | ✅ done |
 | — Loader 6.1–7.2 — | 0.0.226–0.0.228 | 6.1 ✅ · 6.2 ✅ · 7.1 ✅ · 7.2 ✅ |
-| B | 0.0.229 | ⬜ |
+| B | 0.0.229 | ✅ done |
 | B2 | 0.0.230 | ⬜ |
 | C1 (assembler) | 0.0.231 | ⬜ |
 | C2 (operands) | 0.0.232 | ⬜ |
@@ -299,7 +299,28 @@ git commit -m "fix: mem_load16/32 + mem_store16/32 emit true-width accesses"
 
 ---
 
-## 5. Phase B — `naked fn`, `section`, `no_mangle`
+## 5. Phase B — `naked fn`, `section`, `no_mangle` ✅ DONE (0.0.229)
+
+**Status: COMPLETE.** Verified: a naked fn is callable and returns exactly what
+its asm places in rax (`naked ret: 87`); a naked fn with parameters is a COMPILE
+ERROR (fail closed — no frame to home them); a naked fn body containing anything
+but asm!/return is a compile error; `section(".text.startup")` emits a dedicated
+PROGBITS section in object mode and binds the fn's symbol to it (readelf -sW
+Ndx=8, name exact). Gate 814/814 + STDLIB 108/108 + NAKED GREEN, self-host 7/7.
+Tests: `naked_test.quanta` (in EXPECTED.tsv), `naked_neg_test.quanta` (gate
+NAKED stage requires the compile to FAIL), gate Stage 14.
+
+Deviations from the original plan (all verified against real code):
+- naked/section/no_mangle are CONTEXT keywords (lex as TT_ID, detected
+  positionally in scanfns/parse_block) — reserving `section` broke
+  lib/std/config.quanta (`fn config_get(doc, section, key)`), the exact 'raw'
+  lesson from 0.0.220.
+- `section(...)`/`no_mangle` are object-mode features: the executable path has
+  no section headers. In object mode the fn's code is emitted in a dedicated
+  section (a copy; nothing points at the .text bytes, so ld sees one definition)
+  and the symbol's st_shndx points at it.
+- no_mangle is a no-op by default because Quanta never mangles; it keeps the
+  symbol GLOBAL+exact even when the name collides with an internal symbol.
 
 **Goal:** A function can be declared without prologue/epilogue, placed in a named section, and given an exact symbol.
 

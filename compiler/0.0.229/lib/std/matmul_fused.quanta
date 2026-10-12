@@ -1,0 +1,54 @@
+// Fused Q4_K_M matvec -- DEPRECATED. Use lib/std/matmul_q4k.quanta.
+//
+// This file was WRONG in four independent ways and never worked. Kept only
+// as a record of the failures, because each one produces plausible garbage
+// rather than a crash, which is the expensive kind of bug to rediscover.
+//
+// 1. BLOCK SIZE. The comments talked themselves into 146 bytes:
+//      "2 bytes scale (f16) + 128 bytes quads = 144 bytes per 256 elements
+//       Actually ... = 146 bytes?
+//       Let me use the standard: Q4_K = 2 + 16 + 128 = 146 bytes
+//       But the file uses Q4_K_M which is 2 + 2 + 128 = 132 bytes?"
+//    The real super-block is 144 bytes:
+//      +0  f16 d        (2)   scale for sub-block scales
+//      +2  f16 dmin     (2)   scale for sub-block mins
+//      +4  u8 scales[12] (12) eight (scale,min) 6-bit pairs, bit-packed
+//      +16 u8 qs[128]   (128) 4-bit quants, low nibble even / high odd
+//    A 146 stride walks 2 bytes out of alignment per block, so every block
+//    after the first reads garbage.
+//
+// 2. FIELD OFFSETS. It read quads at +18 with a 16-byte scale table. Both are
+//    off: the table is 12 bytes at +4, quads are at +16.
+//
+// 3. NIBBLE SEMANTICS. It used (nibble - 8), which is Q4_0's signed
+//    4-bit-with-bias-8 encoding. Q4_K nibbles are UNSIGNED 0..15; the
+//    negative direction comes entirely from the per-sub-block min term.
+//    Applying a -8 bias here is roughly a factor-of-2 scale error on every
+//    weight.
+//
+// 4. NO SCALE BIT-PACKING. The 12-byte table holds 6-bit (scale, min) pairs
+//    whose layout differs above and below index 4:
+//      j < 4 : sc[j] & 63            -> scale
+//              sc[j+4] & 63           -> min
+//      j >= 4: sc[j+4] & 0xF          scale low nibble
+//              (sc[j-4] >> 6) << 4    scale high bits   <- j-4, not j
+//              sc[j+4] >> 4           min low nibble
+//              (sc[j]   >> 6) << 4    min high bits      <- j,   not j-4
+//    This file used the raw byte as a scale, ignoring the min entirely, so
+//    even with the right offsets the weights would be wrong.
+//
+// The verified replacement is lib/std/matmul_q4k.quanta. Its
+// q4k_matvec_real() dequantizes each 144-byte super-block on the fly (never
+// materializing an f32 weight copy) and is bit-for-bit identical to Python
+// on the same bytes -- see test_suites/codes/q4k_matvec_test.quanta, which
+// also asserts that the compiler's own q4k_matvec builtin is still a stub.
+//
+// matvec_q4k() is kept as a thin alias so any existing caller keeps working,
+// but it is no longer an independent implementation.
+
+import std/gguf
+import std/matmul_q4k
+
+fn matvec_q4k(W_raw, x, rows, cols, y) -> i64 {
+    return q4k_matvec_real(W_raw, x, rows, cols, y)
+}

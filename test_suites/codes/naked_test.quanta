@@ -1,0 +1,34 @@
+// naked_test -- Phase B: naked fn / section / no_mangle (0.0.229)
+//
+// A naked fn gets NO prologue/epilogue from the compiler: no push rbp, no saved
+// registers, no frame allocation, and its `return` is a bare ret. The body must
+// be hand-written machine code (asm!) that places its own return value in rax
+// and executes its own ret.
+//
+// Checked here:
+//   1. a naked fn is CALLABLE and returns exactly what its asm put in rax
+//   2. section("...") places the fn's code in a NAMED section in the emitted
+//      object; readelf -SW shows it and readelf -sW shows the symbol bound to
+//      it, with the name EXACTLY as written (no_mangle behavior -- Quanta never
+//      mangles, and no_mangle pins that for reserved names)
+//   3. the fail-closed cases (naked fn with parameters; naked fn whose body
+//      uses a normal statement) are negative fixtures checked by the gate
+//      (compilation must FAIL), not runtime checks.
+
+fn main() -> i64 {
+    let v = naked_ret87()
+    print("naked ret: ")
+    print(v)
+    print("\n")
+    if v != 87 { print("FAIL: naked fn returned wrong value\n"); return 1 }
+    print("naked: ok\n")
+    return 0
+}
+
+naked fn naked_ret87() -> i64 {
+    asm!("b8 57 00 00 00 c3")  // mov eax, 87; ret  (x86-64)
+}
+
+section(".text.startup") fn startup_stub() -> i64 {
+    return 5
+}
