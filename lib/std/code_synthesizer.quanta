@@ -1,5 +1,11 @@
 // std/code_synthesizer.quanta - Phase 2: Code Synthesis
 // Generates Quanta module files from gap_specs.json
+//
+// Encoding convention for generated status fields (ONE convention, enforced here
+// and in scripts/normalize_specs.py): status is PLAIN ASCII -- exactly one of
+// `planned`, `done`, `partial` -- and priority is a SEPARATE field
+// (`""|low|medium|high|critical`), never smuggled into status. A generated stub
+// is always `planned`.
 
 module std_code_synthesizer;
 
@@ -131,6 +137,12 @@ fn emit_quanta_module(domain, category, module) -> i64 {
     file_write(fd, "_", 1);
     file_write(fd, clean_module + 8, len(clean_module));
     file_write(fd, ";\n\n", 2);
+    file_write(fd, "// Status: planned\n", len("// Status: planned\n"));
+    // Encoding convention, applied HERE so generated files cannot drift from it:
+    // status is plain ASCII -- exactly one of planned | done | partial -- and
+    // priority is a separate field (see scripts/normalize_specs.py). A freshly
+    // generated stub is, by definition, `planned`.
+    file_write(fd, "const MODULE_STATUS = \"planned\";\n\n", len("const MODULE_STATUS = \"planned\";\n\n"));
     file_write(fd, "import std/types;\n\n", len("import std/types;\n\n"));
     file_write(fd, "fn init() -> i64 { return 0; }\n\n", len("fn init() -> i64 { return 0; }\n\n"));
     file_write(fd, "fn main() -> i64 { return init(); }\n", len("fn main() -> i64 { return init(); }\n"));

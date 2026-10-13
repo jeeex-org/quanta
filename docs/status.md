@@ -1,6 +1,6 @@
 # Quanta Status Dashboard (AUTO-GENERATED)
 
-Generated at **2026-10-13T21:25:44Z** (epoch 1791926744) by `scripts/regen_status.sh`.
+Generated at **2026-10-13T21:35:11Z** (epoch 1791927311) by `scripts/regen_status.sh`.
 Freshness is enforced by the gate's verify-status stage
 (`test_suites/scripts/verify_status.quanta`, threshold 30 days) --
 run `bash scripts/regen_status.sh` to refresh.
@@ -9,10 +9,10 @@ run `bash scripts/regen_status.sh` to refresh.
 
 | metric | value |
 |---|---|
-| gap_specs specs | 9026 |
+| gap_specs specs | 9011 |
 | distinct domains | 97 |
-| distinct categories | 2163 |
-| distinct modules named | 5505 |
+| distinct categories | 2159 |
+| distinct modules named | 5499 |
 | modules delivered in lib/std | 22 |
 | delivery ratio | 0.4% |
 | lib/std real modules | 165 |
@@ -28,7 +28,7 @@ run `bash scripts/regen_status.sh` to refresh.
 | std/spec_parser | lib/std/spec_parser.quanta | 187 | yes |
 | std/spec_to_ir | lib/std/spec_to_ir.quanta | 193 | yes |
 | std/pattern_library | lib/std/pattern_library.quanta | 105 | yes |
-| std/code_synthesizer | lib/std/code_synthesizer.quanta | 286 | yes |
+| std/code_synthesizer | lib/std/code_synthesizer.quanta | 298 | yes |
 | std/test_generator | lib/std/test_generator.quanta | 262 | yes |
 | std/si_main | lib/std/si_main.quanta | 109 | yes |
 
@@ -44,7 +44,7 @@ run `bash scripts/regen_status.sh` to refresh.
 
 | domain | specs | delivered | % |
 |---|---|---|---|
-| programming_language | 611 | 20 | 3.3% |
+| programming_language | 596 | 20 | 3.4% |
 | countries | 360 | 0 | 0.0% |
 | investment | 244 | 1 | 0.4% |
 | airlines | 169 | 6 | 3.6% |
