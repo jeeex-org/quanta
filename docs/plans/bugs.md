@@ -208,15 +208,27 @@ dispatch then declines to fill. Recorded rather than given a version.
   decoder, and add a negative-control test per unsupported type. This is a one-session change and closes the
   whole class.
 
-### A4 · LIVE · recursion depth ceiling ≈ 7 000 frames
+### A4 · MEASURED · recursion depth ceiling ~8 000 frames (no separate fix — it is the frame size)
 
-Quanta emits a **1104-byte frame** per function (`sub $0x450,%rsp`, one home slot per vreg). Verified:
-mutual recursion deeper than ~7k dies with SIGSEGV where the C twin reaches depth 200 000+ comfortably.
-Bounded by the same spill-everything defect the speed series targets, but the *bug* is the crash.
+**Measured 0.0.235** with a probe whose recursion cannot be tail-call optimised (`return 1 + down(n-1)`; a
+bare `return down(n-1)` compiles to a jump — my first probe "survived 2 000 000" that way and was
+measuring iterations, not frames):
 
-- Fix approach: shrink the frame (share home slots for non-overlapping live ranges) — this is the same work
-  as the eviction/frame-size item in `performance.md`, so it lands once and satisfies both.
-- Gate: a recursion-depth test at a depth both sides survive today, plus one that documents the ceiling.
+| | depth survived | frame |
+|---|---|---|
+| Quanta | **~8 000** frames | `sub $0x450,%rsp` = **1104 bytes** |
+| C twin, `-O0 -fno-optimize-sibling-calls` | **~262 000** frames | ~32 bytes |
+
+Both die at their own stack limit (8 000 x 1104 B ≈ 8.8 MB ≈ the 8 MB stack; 262 000 x 32 B likewise), and
+the 33x ratio IS the frame ratio — so the depth is fully explained by the frame size, nothing else.
+
+- **No separate fix, and re-scoped out of the defect pass.** The crash is inherent to a fixed stack (the C
+  twin segfaults the same way at its own depth); the lever is the frame — the eviction / shared-home-slot
+  work in `docs/plans/performance.md`, which now has a measured motivation: every halving of the frame
+  doubles the usable recursion depth.
+- **Gate guard added:** `test_suites/codes/recursion_depth_test.quanta` (EXPECTED 184) recurses to 3 000,
+  a depth both sides survive. It PASSES on 0.0.235, so it is a regression guard, not a red-first row —
+  labelled that way deliberately, because rule #16 applies to rows asserting new behaviour.
 
 ### A5 · DOC · `mem_alloc` inside a loop body can be clobbered by the next iteration
 
