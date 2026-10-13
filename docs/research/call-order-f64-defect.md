@@ -87,6 +87,34 @@ by a GLOBAL flag reflecting whether a `-> f64` call has been compiled *somewhere
 value's own `vfloat` tag — hence "first call wins", and hence why a dead call in an unrelated function changes
 another function's arithmetic.
 
+## Hypotheses ELIMINATED by reading the code (0.0.235) — do not re-test these
+
+Both of the obvious "stale tag" explanations are wrong, and each cost one read:
+
+1. **"`f64of` does not tag its result."** It does: the handler at `emitter.quanta:1259` ends with
+   `sdef(irres(ii), 0)` and `w8(vfloat+irres(ii), 1)`, and it emits `fld_x(7,0)` / `fst_x(0,0)`
+   (`movq`), with a comment saying it must be `0F 7E` and not `0F 2A` "which reinterprets the bits as an
+   integer". The handler is correct.
+2. **"`vclr()` does not clear `vfloat`."** It does (`helpers.quanta:586-587`), and correctly: every clearing
+   loop in `vclr()` — `vreg_type`, `vfloat` (its own `w8` loop, since 0 is its unset value), and the four
+   `-1`-sentinel tables — runs *before* `varc = 0; vreg_n = 0` on line 608, so the loops still see the
+   previous function's range. Also correct.
+
+## Where it is now narrowed to
+
+- The wrong encoding is at an **early** instruction index (line 190 of the dump), i.e. inside a function
+  emitted long before `main` — yet an unreachable call *in main* changes it. So the decision is fed by
+  whole-program information gathered before codegen, not by the state at the emit site. `funcscan`'s
+  type/tag pass is the place that sets `vfloat` for parameters and returns from whole-program evidence
+  (`codegen.quanta:205-220` tags parameters after that pass).
+- The site itself is the `movq`-vs-`cvtsi2sd` choice when a value that already IS an f64 bit pattern in a GPR
+  is fed to an SSE operation — `fopld_rr`'s callers (`codegen.quanta:1418-1420`, `1647-1650`). The compiler's
+  own comments record the same symptom in **both** directions (`803-805`: `movq` where `cvtsi2sd` was wanted;
+  `1229`: `cvtsi2sd` where `movq` was wanted), so whatever selects between them is not a single missing tag.
+- Next probe: print `vfloat[irres(...)]` for the operand at the emit site in both programs, and the same for
+  the value in the funcscan pass. That distinguishes "tag never set" from "tag set to the wrong value", which
+  the two reads above did not.
+
 ## Suspected cause
 
 A float vreg is being coalesced or reused across call boundaries when the callee
