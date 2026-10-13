@@ -192,6 +192,27 @@ the `pio2_1()`/`qmult()` calls in B, and whether `vclr()`'s per-function `vfloat
 and the read of that same vreg index (the tag is written while emitting one function, and `vclr()` wipes
 `vfloat` when the next function starts, so a tag that must survive into a later function's emit cannot).
 
+## ROOT CAUSE CLASS FOUND (0.0.235): the tagging pass and the emitter disagree on the vreg INDEX
+
+Instrumented every `w8(vfloat+...)` tagging site (markers P1-P13) plus `vclr()`'s clear (CLR) and ran both
+isolated programs. The streams are 198 events each, in identical order, with the same 188 CLR events — and the
+ONLY difference is which vreg index one tagging site fires on:
+
+    B: 1 P5 5    1 P5 0        <- IR_CALL float-result tagging lands on vreg 0
+    A: 1 P5 5    1 P5 6        <- ... and on vreg 6 when a dead call exists in main
+
+So the tag is not missing by accident: it is written against a **different vreg index than the one the emitter
+reads** at `fopld_rr` (`emitter.quanta:928-930`). The tagging pass works in the index space of the scan, while
+codegen's emit assigns vreg numbers itself (`vreg_n` reset per function by `vclr()`, indices reused by the next
+function), so the two only agree when the program's vreg layout happens to line up. Adding an unreachable call
+in `main` shifts the numbering enough to break the coincidence — which is precisely why the defect looks like
+"a call elsewhere changes this function's arithmetic".
+
+This is the per-function vreg-index reuse hazard already recorded for other side tables (see the
+`quanta-vreg-tag-recycling` skill). The fix is not another tag write but making the two agree on the index: tag
+by the same numbering the emit uses (write the tag where the result vreg is bound during emit), or key the
+propagation on something stable across the reset.
+
 ## Suspected cause
 
 A float vreg is being coalesced or reused across call boundaries when the callee
