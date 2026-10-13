@@ -249,14 +249,26 @@ it is tracked separately; silent clobbering in this shape is not happening.
 - If a clobber IS found: decide the semantics (arena per iteration vs leak-until-function-exit) and either
   make it safe or make it a compile error — a silent clobber is the one outcome that must not remain.
 
-### A6 · LIVE (minimal repro saved) · a `-> f64` user function's result depends on what the program called earlier
+### A6 · FIXED in 0.0.236 (promotion pending) · a `-> f64` user function's result depended on what ran earlier
 
 Documented at length in `docs/research/call-order-f64-defect.md` and `WIP.md`: `reduce(0.5)` is correct only
 if `qmult` was called earlier in the program; the builtin path was fixed by `as_f64_rdi()` (0d7950b6) but
 nothing equivalent exists for the *user-function* path. It holds back a complete fdlibm `sin` reduction
 (kept at `/tmp/negctl/math.sin-attempt`).
 
-- **CONFIRMED LIVE with a minimal repro, 0.0.235.** Built from the real bodies in
+- **ROOT CAUSE: a parameter written without `: f64`.** `fn qmult(x) -> f64` with
+  `let y = x * (2.0 / 3.14159265358979323846)`. Annotating `x: f64` alone makes the failing program correct, and
+  drops its untagged-conversion count from 2 to 1. The tagging case at `codegen.quanta:1123-1137` covers only
+  DECLARED `: f64` parameters, so `x` reached the SSE multiply untagged and `fopld_rr` emitted `cvtsi2sd` over an
+  f64 bit pattern. "Call-order sensitivity" was a red herring: an unreachable call elsewhere tagged that vreg
+  index by another route.
+- **FIX (0.0.236):** at both SSE emit sites, tag both operands before loading them — the branch is the SSE form,
+  so both operands are f64 by construction and the load must not re-decide from `vfloat`. Verified: repro correct,
+  `cvtsi2sd` 2 -> 1, fixpoint `08acae941891e1d387b550ca1d4a5554` (3 generations identical), new gate row
+  `f64_call_order_test.quanta` RED on 0.0.235 (rc=1) and GREEN on 0.0.236 (rc=0). A rejected first attempt (a
+  rule in the `changed=1` tag pass) produced a byte-identical binary and was reverted — the pass has no float
+  evidence to propagate from.
+- **Original report, kept for the record:** Built from the real bodies in
   `/tmp/negctl/math.sin-attempt` and saved as `tests/f64_call_order_defect.quanta` (182 lines):
 
   | program | output |

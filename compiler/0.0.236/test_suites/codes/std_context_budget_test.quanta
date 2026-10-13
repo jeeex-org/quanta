@@ -1,0 +1,145 @@
+import std/context_budget
+import std/model_size
+
+// Phase 11.2 -- context budgeting.
+//
+// SPECIFICATION: HashCortX's own assertions, at
+// src/../scripts/checks/agent-context.mjs:77-80, plus the documented behaviour
+// of hiddenCount/inSteps in src/js/agent-context.js:39-78.
+//
+// THE PROPERTY THAT MATTERS, and the one most easily broken by a "helpful"
+// refactor: hiding happens in STEPS, never one message per turn. A per-turn
+// change touches the START of the prompt every turn, so the whole run is
+// re-read and prefix-cache reuse is destroyed. Between steps the request is
+// the previous one with more on the END, so the common prefix is untouched.
+//
+// Checks carry NUMERIC ids. print() on a string pointer emits an ADDRESS, so a
+// label-based failure cannot identify itself -- already learned the hard way
+// in std_model_temp_test.quanta.
+
+// ---- helpers --------------------------------------------------------------
+
+fn close_to(a: f64, b: f64) -> i64 {
+    let d = a - b
+    if d < 0.0 { d = 0.0 - d }
+    if d < 0.0000001 { return 1 }
+    return 0
+}
+
+// Build a lengths array of `n` entries each holding `each`.
+fn lens(n: i64, each: i64) -> u64 {
+    let p = mem_alloc(64)
+    let i = 0
+    while i < n {
+        mem_store(p + i * 8, each)
+        i = i + 1
+    }
+    return p
+}
+
+fn main() -> i64 {
+    let fails = 0
+
+    // --- Group 1: no unnecessary hiding -------------------------------------
+    // Below the budget nothing is hidden, whatever the count. This is the
+    // reference's core assertion: short runs must not be trimmed at all.
+    qctx_options(QSIZE_FULL)
+    let small = lens(5, 100)
+    if qctx_hidden_count(small, 5) != 0 {
+        print("FAIL 1: hid "); print(qctx_hidden_count(small, 5))
+        print(" from a 5-result run well under budget\n"); fails = fails + 1
+    }
+    // 2. A single result is never hidden -- it IS the current answer.
+    let one = lens(1, 90000)
+    if qctx_hidden_count(one, 1) != 0 { print("FAIL 2: hid the only result\n") fails = fails + 1 }
+    // 3. Empty list is safe.
+    if qctx_hidden_count(one, 0) != 0 { print("FAIL 3: n=0\n") fails = fails + 1 }
+
+    // --- Group 2: stepped, not per-turn -------------------------------------
+    // This is the prefix-cache guarantee, stated as an arithmetic fact: the
+    // count changes only in multiples of `step`. full tier: keep=10, step=6.
+    qctx_options(QSIZE_FULL)
+    if qctx_keep_results() != 10 { print("FAIL 4: keep="); print(qctx_keep_results()); print("\n") fails = fails + 1 }
+    if qctx_hide_step() != 6 { print("FAIL 5: step="); print(qctx_hide_step()); print("\n") fails = fails + 1 }
+
+    // qctx_in_steps(n, keep, step): no hiding until keep+step, then multiples.
+    if qctx_in_steps(15, 10, 6) != 0 { print("FAIL 6: n=15 hides\n") fails = fails + 1 }
+    if qctx_in_steps(16, 10, 6) != 6 { print("FAIL 7: n=16 hides "); print(qctx_in_steps(16, 10, 6)); print(" want 6\n") fails = fails + 1 }
+    // 6. Every step is a multiple of `step` -- the cache property itself.
+    let n = 10
+    let bad = 0
+    while n <= 40 {
+        let h = qctx_in_steps(n, 10, 6)
+        if h % 6 != 0 { bad = bad + 1 }
+        n = n + 1
+    }
+    // 8. Zero results under keep+step, and never more than n-1 anywhere.
+    if qctx_in_steps(5, 10, 6) != 0 { print("FAIL 9: n=5 hides\n") fails = fails + 1 }
+    if qctx_in_steps(10, 10, 6) != 0 { print("FAIL 10: n=10 hides\n") fails = fails + 1 }
+
+    // --- Group 3: never the newest result ----------------------------------
+    // Even when wildly over budget, the newest result stays. It is what the
+    // model is reasoning about; hiding it would be nonsense.
+    let huge = lens(20, 40000)
+    let h20 = qctx_hidden_count(huge, 20)
+    // 11. Bounded at n-1.
+    if h20 > 19 { print("FAIL 11: hid all 20, h="); print(h20); print("\n") fails = fails + 1 }
+    // 12. And it must actually hide a lot here: 20 x 40000 = 800000 vs a
+    //     60000 budget, so refusing to hide anything would be wrong too.
+    if h20 < 10 { print("FAIL 12: hid only "); print(h20); print(" of an 800000-char run\n") fails = fails + 1 }
+
+    // --- Group 4: the shown total comes back under budget -------------------
+    // After hiding, what remains shown must fit. This is the real requirement;
+    // hiding "enough" only matters if the arithmetic actually converges.
+    let total = 20 * 40000
+    let shown = total - h20 * 40000
+    // 13. Shown total is at or under the tool budget.
+    if shown > qctx_budget_tool() {
+        print("FAIL 13: shown "); print(shown)
+        print(" exceeds budget "); print(qctx_budget_tool()); print("\n"); fails = fails + 1
+    }
+
+    // --- Group 5: tiers -----------------------------------------------------
+    // 14. small is the tightest tier.
+    qctx_options(QSIZE_SMALL)
+    if qctx_budget_tool() != 12000 { print("FAIL 14: small budget="); print(qctx_budget_tool()); print("\n") fails = fails + 1 }
+    if qctx_keep_results() != 4 { print("FAIL 15: small keep="); print(qctx_keep_results()); print("\n") fails = fails + 1 }
+    if qctx_hide_step() != 4 { print("FAIL 16: small step="); print(qctx_hide_step()); print("\n") fails = fails + 1 }
+    // 16. mid.
+    qctx_options(QSIZE_MID)
+    if qctx_budget_tool() != 24000 { print("FAIL 17: mid budget="); print(qctx_budget_tool()); print("\n") fails = fails + 1 }
+    if qctx_keep_results() != 5 { print("FAIL 18: mid keep="); print(qctx_keep_results()); print("\n") fails = fails + 1 }
+    // 19. full.
+    qctx_options(QSIZE_FULL)
+    if qctx_budget_tool() != 60000 { print("FAIL 19: full budget="); print(qctx_budget_tool()); print("\n") fails = fails + 1 }
+    // 20. hide_to is a FRACTION in (0, 0.9], clamped at both ends. full = 0.5.
+    if close_to(qctx_hide_to(), 0.5) != 1 {
+        printi(f64bits("FAIL 20: full hide_to=")); printi(f64bits(qctx_hide_to())); print("\n") fails = fails + 1
+    }
+
+    // --- Group 6: purity ----------------------------------------------------
+    // Same input, same answer, repeatedly, and across a tier change in
+    // between. Any hidden state between turns would break both the cache and
+    // this test.
+    qctx_options(QSIZE_FULL)
+    let a1 = qctx_hidden_count(huge, 20)
+    qctx_options(QSIZE_SMALL)
+    let s1 = qctx_hidden_count(huge, 20)
+    qctx_options(QSIZE_FULL)
+    let a2 = qctx_hidden_count(huge, 20)
+    // 21. Deterministic across the detour.
+    if a1 != a2 { print("FAIL 21: not deterministic "); print(a1); print(" vs "); print(a2); print("\n") fails = fails + 1 }
+    // 22. The small tier really is tighter -- it should hide at least as much.
+    if s1 < a1 { print("FAIL 22: small hid "); print(s1); print(" < full "); print(a1); print("\n") fails = fails + 1 }
+
+    // --- Group 7: degenerate step guards -----------------------------------
+    // A step of 0 must not divide by zero; it clamps to 1.
+    // 23.
+    if qctx_in_steps(20, 10, 0) != 10 { print("FAIL 23: step=0 gave "); print(qctx_in_steps(20, 10, 0)); print("\n") fails = fails + 1 }
+
+    if bad > 0 { print("FAIL 24: "); print(bad); print(" of the stepped counts were not multiples of 6\n") fails = fails + 1 }
+
+    if fails == 0 { print("std_context_budget: PASS\n") return 0 }
+    print("std_context_budget: FAILS="); print(fails); print("\n")
+    return 1
+}

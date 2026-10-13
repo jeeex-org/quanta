@@ -1,0 +1,33 @@
+// A6 (0.0.236): a `-> f64` user function whose parameter is written WITHOUT
+// `: f64`, used in float arithmetic alongside an f64 constant.
+//
+// The parameter never got tagged as a float, so the SSE operand load chose
+// fi2f_gp (cvtsi2sd) and CONVERTED an f64 bit pattern instead of moving it
+// (fld_x/movq) -- silently returning garbage. Fixed by tagging both operands at
+// the two SSE emit sites, where the operation being SSE already proves both
+// operands are f64.
+//
+// RED on the previous compiler: this exact program printed
+// -4336984033343832063 (rc 1). GREEN on 0.0.236: 4602678819172646912 (rc 0).
+// The dead-call sensitivity that hid this is documented in
+// docs/research/call-order-f64-defect.md; the repro is tests/f64_call_order_defect.quanta.
+fn qmult(x) -> f64 {
+    let y = x * (2.0 / 3.14159265358979323846)
+    if y >= 4503599627370496.0 { return y }
+    if y <= 0.0 - 4503599627370496.0 { return y }
+    let magic = 4503599627370496.0
+    return (y + magic) - magic
+}
+
+fn reduce(x) -> f64 {
+    let ax = x
+    if x < 0.0 { ax = 0.0 - x }
+    let nf = qmult(x)
+    if ax < 1048576.0 { return x - nf * f64of(4609753056924401664) }
+    return x
+}
+
+fn main() {
+    if f64bits(reduce(0.5)) == 4602678819172646912 { exit(0) }
+    exit(1)
+}

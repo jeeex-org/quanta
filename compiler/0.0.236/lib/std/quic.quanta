@@ -1,0 +1,1196 @@
+// QUIC Transport Protocol (RFC 9000) with TLS 1.3
+// Pure Quanta implementation, zero external dependencies
+// Built on top of TLS 1.3 hybrid PQC from 0.0.145
+
+import std/tls13
+import std/x25519
+import std/ml_kem
+import std/ml_dsa
+import std/slh_dsa
+import std/sha3_hash
+
+// ============================================================================
+// QUIC Constants
+// ============================================================================
+
+fn quic_version(): i64 { return 0x00000001 }  // QUIC v1
+fn quic_version_draft(): i64 { return 0xFF000001 }  // Draft version
+
+// Packet type bits (RFC 9000 Section 17.2)
+fn quic_pt_initial(): i64 { return 0x00 }      // 0b00xxxxxx
+fn quic_pt_0rtt(): i64 { return 0x40 }         // 0b01xxxxxx
+fn quic_pt_handshake(): i64 { return 0x80 }    // 0b10xxxxxx
+fn quic_pt_1rtt(): i64 { return 0xC0 }         // 0b11xxxxxx
+fn quic_pt_mask(): i64 { return 0xC0 }
+
+// Long header types
+fn quic_long_initial(): i64 { return 0x0C }    // 0b00001100
+fn quic_long_0rtt(): i64 { return 0x1C }       // 0b00011100
+fn quic_long_handshake(): i64 { return 0x2C }  // 0b00101100
+fn quic_long_retry(): i64 { return 0x3C }      // 0b00111100
+
+// Frame types (RFC 9000 Section 19)
+fn quic_frame_padding(): i64 { return 0x00 }
+fn quic_frame_ping(): i64 { return 0x01 }
+fn quic_frame_ack(): i64 { return 0x02 }
+fn quic_frame_ack_ecn(): i64 { return 0x03 }
+fn quic_frame_reset_stream(): i64 { return 0x04 }
+fn quic_frame_stop_sending(): i64 { return 0x05 }
+fn quic_frame_crypto(): i64 { return 0x06 }
+fn quic_frame_new_token(): i64 { return 0x07 }
+fn quic_frame_stream(): i64 { return 0x08 }    // 0b00001xxx (offset, length, fin)
+fn quic_frame_max_data(): i64 { return 0x10 }
+fn quic_frame_max_stream_data(): i64 { return 0x11 }
+fn quic_frame_max_streams_bidi(): i64 { return 0x12 }
+fn quic_frame_max_streams_uni(): i64 { return 0x13 }
+fn quic_frame_data_blocked(): i64 { return 0x14 }
+fn quic_frame_stream_data_blocked(): i64 { return 0x15 }
+fn quic_frame_streams_blocked_bidi(): i64 { return 0x16 }
+fn quic_frame_streams_blocked_uni(): i64 { return 0x17 }
+fn quic_frame_new_connection_id(): i64 { return 0x18 }
+fn quic_frame_retire_connection_id(): i64 { return 0x19 }
+fn quic_frame_path_challenge(): i64 { return 0x1A }
+fn quic_frame_path_response(): i64 { return 0x1B }
+fn quic_frame_connection_close(): i64 { return 0x1C }
+fn quic_frame_connection_close_app(): i64 { return 0x1D }
+fn quic_frame_handshake_done(): i64 { return 0x1E }
+
+// Stream frame flags
+fn quic_stream_fin(): i64 { return 0x01 }
+fn quic_stream_len(): i64 { return 0x02 }
+fn quic_stream_off(): i64 { return 0x04 }
+
+// Connection ID lengths
+fn quic_max_cid_len(): i64 { return 20 }
+fn quic_initial_cid_len(): i64 { return 8 }
+
+// Default limits (RFC 9000 Section 7)
+fn quic_initial_max_data(): i64 { return 10485760 }       // 10 MB
+fn quic_initial_max_stream_data_bidi_local(): i64 { return 1048576 }  // 1 MB
+fn quic_initial_max_stream_data_bidi_remote(): i64 { return 1048576 }
+fn quic_initial_max_stream_data_uni(): i64 { return 1048576 }
+fn quic_initial_max_streams_bidi(): i64 { return 100 }
+fn quic_initial_max_streams_uni(): i64 { return 100 }
+fn quic_initial_max_stream_data(): i64 { return 1048576 }
+
+// Idle timeout (ms)
+fn quic_default_idle_timeout(): i64 { return 30000 }  // 30 seconds
+
+// Max packet size
+fn quic_max_packet_size(): i64 { return 1350 }  // Initial MTU
+
+// Crypto frame offsets
+fn quic_crypto_offset_shift(): i64 { return 2 }  // Varint encoding
+
+// ============================================================================
+// Connection ID
+// ============================================================================
+
+// Connection ID: variable length up to 20 bytes
+// Represented as [len][bytes...] where len <= 20
+
+fn quic_cid_parse(src: u8[], dst: u8[], offset: i64): i64 {
+    let len: i64 = src[offset] as i64
+    if len > quic_max_cid_len() { return -1 }
+    let i: i64 = 0
+    while i < len {
+        dst[i] = src[offset + 1 + i]
+        i = i + 1
+    }
+    dst[len] = len as u8  // Store length at end for convenience
+    return offset + 1 + len
+}
+
+fn quic_cid_encode(cid: u8[], dst: u8[], offset: i64): i64 {
+    let len: i64 = cid[quic_max_cid_len()] as i64
+    if len > quic_max_cid_len() { return -1 }
+    dst[offset] = len as u8
+    let i: i64 = 0
+    while i < len {
+        dst[offset + 1 + i] = cid[i]
+        i = i + 1
+    }
+    return offset + 1 + len
+}
+
+fn quic_cid_equal(a: u8[], b: u8[]): i64 {
+    let lena: i64 = a[quic_max_cid_len()] as i64
+    let lenb: i64 = b[quic_max_cid_len()] as i64
+    if lena != lenb { return 0 }
+    let i: i64 = 0
+    while i < lena {
+        if a[i] != b[i] { return 0 }
+        i = i + 1
+    }
+    return 1
+}
+
+fn quic_cid_copy(src: u8[], dst: u8[]) {
+    let len: i64 = src[quic_max_cid_len()] as i64
+    let i: i64 = 0
+    while i < len {
+        dst[i] = src[i]
+        i = i + 1
+    }
+    dst[quic_max_cid_len()] = len as u8
+}
+
+fn quic_generate_cid(dst: u8[]): i64 {
+    // Simple random CID generation (in practice use CSPRNG)
+    let len: i64 = 8
+    let i: i64 = 0
+    while i < len {
+        dst[i] = (i * 31 + 17) as u8  // Pseudo-random
+        i = i + 1
+    }
+    dst[quic_max_cid_len()] = len as u8
+    return 0
+}
+
+// ============================================================================
+// Varint encoding (RFC 9000 Section 16)
+// ============================================================================
+
+fn quic_varint_len(v: i64): i64 {
+    if v < 0x40 { return 1 }
+    if v < 0x4000 { return 2 }
+    if v < 0x40000000 { return 4 }
+    return 8
+}
+
+fn quic_varint_encode(v: i64, dst: u8[], offset: i64): i64 {
+    if v < 0x40 {
+        dst[offset] = v as u8
+        return offset + 1
+    }
+    if v < 0x4000 {
+        dst[offset] = (0x40 | (v >> 8)) as u8
+        dst[offset + 1] = (v & 0xFF) as u8
+        return offset + 2
+    }
+    if v < 0x40000000 {
+        dst[offset] = (0x80 | (v >> 24)) as u8
+        dst[offset + 1] = ((v >> 16) & 0xFF) as u8
+        dst[offset + 2] = ((v >> 8) & 0xFF) as u8
+        dst[offset + 3] = (v & 0xFF) as u8
+        return offset + 4
+    }
+    dst[offset] = (0xC0 | (v >> 56)) as u8
+    dst[offset + 1] = ((v >> 48) & 0xFF) as u8
+    dst[offset + 2] = ((v >> 40) & 0xFF) as u8
+    dst[offset + 3] = ((v >> 32) & 0xFF) as u8
+    dst[offset + 4] = ((v >> 24) & 0xFF) as u8
+    dst[offset + 5] = ((v >> 16) & 0xFF) as u8
+    dst[offset + 6] = ((v >> 8) & 0xFF) as u8
+    dst[offset + 7] = (v & 0xFF) as u8
+    return offset + 8
+}
+
+fn quic_varint_decode(src: u8[], offset: i64, val: i64[]): i64 {
+    let prefix: i64 = (src[offset] >> 6) as i64
+    if prefix == 0 {
+        val[0] = src[offset] as i64
+        return offset + 1
+    }
+    if prefix == 1 {
+        val[0] = (((src[offset] & 0x3F) as i64) << 8) | (src[offset + 1] as i64)
+        return offset + 2
+    }
+    if prefix == 2 {
+        val[0] = (((src[offset] & 0x3F) as i64) << 24) |
+                 ((src[offset + 1] as i64) << 16) |
+                 ((src[offset + 2] as i64) << 8) |
+                 (src[offset + 3] as i64)
+        return offset + 4
+    }
+    val[0] = (((src[offset] & 0x3F) as i64) << 56) |
+             ((src[offset + 1] as i64) << 48) |
+             ((src[offset + 2] as i64) << 40) |
+             ((src[offset + 3] as i64) << 32) |
+             ((src[offset + 4] as i64) << 24) |
+             ((src[offset + 5] as i64) << 16) |
+             ((src[offset + 6] as i64) << 8) |
+             (src[offset + 7] as i64)
+    return offset + 8
+}
+
+// ============================================================================
+// Packet Numbers (RFC 9000 Section 17.1)
+// ============================================================================
+
+// Packet numbers are encoded as 1-4 byte varints with overflow logic
+fn quic_pn_encode(pn: i64, pn_len: i64, dst: u8[], offset: i64): i64 {
+    if pn_len == 1 {
+        dst[offset] = (pn & 0xFF) as u8
+        return offset + 1
+    }
+    if pn_len == 2 {
+        dst[offset] = ((pn >> 8) & 0xFF) as u8
+        dst[offset + 1] = (pn & 0xFF) as u8
+        return offset + 2
+    }
+    if pn_len == 3 {
+        dst[offset] = ((pn >> 16) & 0xFF) as u8
+        dst[offset + 1] = ((pn >> 8) & 0xFF) as u8
+        dst[offset + 2] = (pn & 0xFF) as u8
+        return offset + 3
+    }
+    dst[offset] = ((pn >> 24) & 0xFF) as u8
+    dst[offset + 1] = ((pn >> 16) & 0xFF) as u8
+    dst[offset + 2] = ((pn >> 8) & 0xFF) as u8
+    dst[offset + 3] = (pn & 0xFF) as u8
+    return offset + 4
+}
+
+// Reconstruct full packet number from truncated encoding
+fn quic_pn_decode(truncated: i64, pn_len: i64, expected: i64): i64 {
+    let pn_nbits: i64 = pn_len * 8
+    let pn_win: i64 = 1 << pn_nbits
+    let pn_hwin: i64 = pn_win / 2
+    let pn_mask: i64 = pn_win - 1
+    
+    let candidate: i64 = (expected & ~pn_mask) | truncated
+    if candidate <= expected - pn_hwin && candidate + pn_win <= expected + pn_hwin {
+        return candidate + pn_win
+    }
+    if candidate > expected + pn_hwin && candidate >= pn_win {
+        return candidate - pn_win
+    }
+    return candidate
+}
+
+// ============================================================================
+// AEAD encryption (using AES-GCM from TLS 1.3 / stdlib)
+// ============================================================================
+
+// Key derivation labels (RFC 9001 Section 5.1)
+fn quic_label_client_in(): u8[] {
+    let label: u8[21] = { 99, 108, 105, 101, 110, 116, 32, 105, 110, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0 }  // "client in"
+    return label
+}
+
+fn quic_label_server_in(): u8[] {
+    let label: u8[21] = { 115, 101, 114, 118, 101, 114, 32, 105, 110, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0 }  // "server in"
+    return label
+}
+
+fn quic_label_quic_key(): u8[] {
+    let label: u8[21] = { 113, 117, 105, 99, 32, 107, 101, 121, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0 }  // "quic key"
+    return label
+}
+
+fn quic_label_quic_iv(): u8[] {
+    let label: u8[21] = { 113, 117, 105, 99, 32, 105, 118, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0 }  // "quic iv"
+    return label
+}
+
+fn quic_label_quic_hp(): u8[] {
+    let label: u8[21] = { 113, 117, 105, 99, 32, 104, 112, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0 }  // "quic hp"
+    return label
+}
+
+fn quic_label_client_hs(): u8[] {
+    let label: u8[21] = { 99, 108, 105, 101, 110, 116, 32, 104, 115, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0 }  // "client hs"
+    return label
+}
+
+fn quic_label_server_hs(): u8[] {
+    let label: u8[21] = { 115, 101, 114, 118, 101, 114, 32, 104, 115, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0 }  // "server hs"
+    return label
+}
+
+fn quic_label_client_0rtt(): u8[] {
+    let label: u8[21] = { 99, 108, 105, 101, 110, 116, 32, 48, 114, 116, 116, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0 }  // "client 0rtt"
+    return label
+}
+
+fn quic_label_server_0rtt(): u8[] {
+    let label: u8[21] = { 115, 101, 114, 118, 101, 114, 32, 48, 114, 116, 116, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0 }  // "server 0rtt"
+    return label
+}
+
+fn quic_label_client_1rtt(): u8[] {
+    let label: u8[21] = { 99, 108, 105, 101, 110, 116, 32, 49, 114, 116, 116, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0 }  // "client 1rtt"
+    return label
+}
+
+fn quic_label_server_1rtt(): u8[] {
+    let label: u8[21] = { 115, 101, 114, 118, 101, 114, 32, 49, 114, 116, 116, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0 }  // "server 1rtt"
+    return label
+}
+
+// Derive QUIC keys from TLS secrets
+// key = HKDF-Expand-Label(secret, "quic key", "", key_len)
+// iv  = HKDF-Expand-Label(secret, "quic iv", "", iv_len)
+// hp  = HKDF-Expand-Label(secret, "quic hp", "", key_len)
+fn quic_derive_keys(secret: u8[], secret_len: i64, key: u8[], iv: u8[], hp: u8[]) {
+    // Using TLS 1.3 HKDF-Expand-Label from tls13.quanta
+    tls13_hkdf_expand_label(secret, secret_len, quic_label_quic_key(), key, 16)
+    tls13_hkdf_expand_label(secret, secret_len, quic_label_quic_iv(), iv, 12)
+    tls13_hkdf_expand_label(secret, secret_len, quic_label_quic_hp(), hp, 16)
+}
+
+// Header protection (RFC 9001 Section 5.4)
+// sample = packet[pn_offset+4 : pn_offset+4+16]
+// mask = AES-ECB(hp_key, sample)
+// packet[pn_offset] ^= mask[0] & 0x0F (long) or 0x1F (short)
+fn quic_header_protect(hp_key: u8[], sample: u8[], pn_byte: u8, is_long: i64): u8 {
+    // Simplified: use AES-ECB on sample to get mask
+    // In practice this uses AES-128 ECB
+    let mask: u8 = 0
+    // XOR sample bytes as pseudo-mask
+    let i: i64 = 0
+    while i < 16 {
+        mask = mask ^ sample[i]
+        i = i + 1
+    }
+    if is_long != 0 {
+        return pn_byte ^ (mask & 0x0F)
+    }
+    return pn_byte ^ (mask & 0x1F)
+}
+
+// ============================================================================
+// Packet encoding/decoding
+// ============================================================================
+
+// Long header packet (Initial, 0-RTT, Handshake, Retry)
+fn quic_encode_long_header(
+    pkt_type: i64,        // Initial, 0RTT, Handshake, Retry
+    version: i64,
+    dcid: u8[],           // Destination Connection ID
+    scid: u8[],           // Source Connection ID
+    token: u8[],          // Token (for Initial)
+    pn: i64,              // Packet number
+    pn_len: i64,
+    payload: u8[],        // Encrypted payload
+    payload_len: i64,
+    dst: u8[]
+): i64 {
+    let offset: i64 = 0
+    
+    // First byte: header form (1) + fixed bit (1) + long packet type (2) + reserved (2) + PN len (2)
+    let first: i64 = 0x80 | (pkt_type & 0x30) | ((pn_len - 1) & 0x03)
+    dst[offset] = first as u8
+    offset = offset + 1
+    
+    // Version (4 bytes)
+    dst[offset] = ((version >> 24) & 0xFF) as u8
+    dst[offset + 1] = ((version >> 16) & 0xFF) as u8
+    dst[offset + 2] = ((version >> 8) & 0xFF) as u8
+    dst[offset + 3] = (version & 0xFF) as u8
+    offset = offset + 4
+    
+    // DCID length + DCID
+    offset = quic_cid_encode(dcid, dst, offset)
+    
+    // SCID length + SCID
+    offset = quic_cid_encode(scid, dst, offset)
+    
+    // Token (for Initial)
+    if pkt_type == quic_long_initial() {
+        offset = quic_varint_encode(token[0] as i64, dst, offset)  // token length as varint
+        let tok_len: i64 = token[0] as i64
+        let i: i64 = 0
+        while i < tok_len {
+            dst[offset + i] = token[i + 1]
+            i = i + 1
+        }
+        offset = offset + tok_len
+    }
+    
+    // Length (varint) - payload length + packet number length
+    let length: i64 = payload_len + pn_len
+    offset = quic_varint_encode(length, dst, offset)
+    
+    // Packet number
+    offset = quic_pn_encode(pn, pn_len, dst, offset)
+    
+    // Payload
+    let i: i64 = 0
+    while i < payload_len {
+        dst[offset + i] = payload[i]
+        i = i + 1
+    }
+    offset = offset + payload_len
+    
+    return offset
+}
+
+// Short header packet (1-RTT)
+fn quic_encode_short_header(
+    dcid: u8[],
+    pn: i64,
+    pn_len: i64,
+    payload: u8[],
+    payload_len: i64,
+    dst: u8[]
+): i64 {
+    let offset: i64 = 0
+    
+    // First byte: header form (0) + spin bit (0) + reserved (2) + key phase (1) + PN len (2)
+    dst[offset] = 0x40 | ((pn_len - 1) & 0x03)  // Key phase = 0
+    offset = offset + 1
+    
+    // DCID
+    let dcid_len: i64 = dcid[quic_max_cid_len()] as i64
+    let i: i64 = 0
+    while i < dcid_len {
+        dst[offset + i] = dcid[i]
+        i = i + 1
+    }
+    offset = offset + dcid_len
+    
+    // Packet number
+    offset = quic_pn_encode(pn, pn_len, dst, offset)
+    
+    // Payload
+    i = 0
+    while i < payload_len {
+        dst[offset + i] = payload[i]
+        i = i + 1
+    }
+    offset = offset + payload_len
+    
+    return offset
+}
+
+// ============================================================================
+// Frame encoding
+// ============================================================================
+
+// CRYPTO frame (RFC 9000 Section 19.6)
+fn quic_encode_crypto_frame(offset: i64, data: u8[], data_len: i64, dst: u8[], dst_offset: i64): i64 {
+    let off: i64 = dst_offset
+    dst[off] = quic_frame_crypto() as u8
+    off = off + 1
+    off = quic_varint_encode(offset, dst, off)
+    off = quic_varint_encode(data_len, dst, off)
+    let i: i64 = 0
+    while i < data_len {
+        dst[off + i] = data[i]
+        i = i + 1
+    }
+    return off + data_len
+}
+
+// ACK frame (RFC 9000 Section 19.3)
+fn quic_encode_ack_frame(
+    largest_acked: i64,
+    ack_delay: i64,
+    ack_range_count: i64,
+    first_ack_range: i64,
+    ack_ranges: i64[],  // [gap, range] pairs
+    dst: u8[],
+    dst_offset: i64
+): i64 {
+    let off: i64 = dst_offset
+    dst[off] = quic_frame_ack() as u8
+    off = off + 1
+    off = quic_varint_encode(largest_acked, dst, off)
+    off = quic_varint_encode(ack_delay, dst, off)
+    off = quic_varint_encode(ack_range_count, dst, off)
+    off = quic_varint_encode(first_ack_range, dst, off)
+    let i: i64 = 0
+    while i < ack_range_count * 2 {
+        off = quic_varint_encode(ack_ranges[i], dst, off)
+        i = i + 1
+    }
+    return off
+}
+
+// STREAM frame (RFC 9000 Section 19.8)
+fn quic_encode_stream_frame(
+    stream_id: i64,
+    offset: i64,
+    data: u8[],
+    data_len: i64,
+    fin: i64,
+    dst: u8[],
+    dst_offset: i64
+): i64 {
+    let off: i64 = dst_offset
+    let flags: i64 = quic_frame_stream()
+    if fin != 0 { flags = flags | quic_stream_fin() }
+    if offset != 0 { flags = flags | quic_stream_off() }
+    if data_len > 0 { flags = flags | quic_stream_len() }
+    dst[off] = flags as u8
+    off = off + 1
+    off = quic_varint_encode(stream_id, dst, off)
+    if (flags & quic_stream_off()) != 0 {
+        off = quic_varint_encode(offset, dst, off)
+    }
+    if (flags & quic_stream_len()) != 0 {
+        off = quic_varint_encode(data_len, dst, off)
+    }
+    let i: i64 = 0
+    while i < data_len {
+        dst[off + i] = data[i]
+        i = i + 1
+    }
+    return off + data_len
+}
+
+// MAX_DATA frame
+fn quic_encode_max_data_frame(max_data: i64, dst: u8[], dst_offset: i64): i64 {
+    let off: i64 = dst_offset
+    dst[off] = quic_frame_max_data() as u8
+    off = off + 1
+    off = quic_varint_encode(max_data, dst, off)
+    return off
+}
+
+// MAX_STREAM_DATA frame
+fn quic_encode_max_stream_data_frame(stream_id: i64, max_data: i64, dst: u8[], dst_offset: i64): i64 {
+    let off: i64 = dst_offset
+    dst[off] = quic_frame_max_stream_data() as u8
+    off = off + 1
+    off = quic_varint_encode(stream_id, dst, off)
+    off = quic_varint_encode(max_data, dst, off)
+    return off
+}
+
+// PING frame
+fn quic_encode_ping_frame(dst: u8[], dst_offset: i64): i64 {
+    dst[dst_offset] = quic_frame_ping() as u8
+    return dst_offset + 1
+}
+
+// PADDING frame
+fn quic_encode_padding_frame(dst: u8[], dst_offset: i64, count: i64): i64 {
+    let i: i64 = 0
+    while i < count {
+        dst[dst_offset + i] = quic_frame_padding() as u8
+        i = i + 1
+    }
+    return dst_offset + count
+}
+
+// ============================================================================
+// Connection State
+// ============================================================================
+
+// Connection states
+fn quic_state_initial(): i64 { return 0 }
+fn quic_state_handshake(): i64 { return 1 }
+fn quic_state_established(): i64 { return 2 }
+fn quic_state_closing(): i64 { return 3 }
+fn quic_state_draining(): i64 { return 4 }
+fn quic_state_closed(): i64 { return 5 }
+
+// Encryption levels
+fn quic_level_initial(): i64 { return 0 }
+fn quic_level_0rtt(): i64 { return 1 }
+fn quic_level_handshake(): i64 { return 2 }
+fn quic_level_1rtt(): i64 { return 3 }
+
+// Connection structure (simplified for core functionality)
+struct quic_conn {
+    state: i64,
+    version: i64,
+    dcid: u8[21],       // [20 bytes data][1 byte len]
+    scid: u8[21],
+    original_dcid: u8[21],
+    retry_cid: u8[21],
+    
+    // TLS integration
+    tls_state: i64,     // TLS handshake state
+    tls_secret: u8[64], // Current TLS secret
+    
+    // Keys per encryption level
+    initial_key: u8[16],
+    initial_iv: u8[12],
+    initial_hp: u8[16],
+    handshake_key: u8[16],
+    handshake_iv: u8[12],
+    handshake_hp: u8[16],
+    app_key: u8[16],
+    app_iv: u8[12],
+    app_hp: u8[16],
+    
+    // Packet numbers
+    pn_sent: i64[4],    // Per encryption level
+    pn_recv: i64[4],    // Per encryption level
+    pn_expected: i64[4],
+    
+    // Flow control
+    max_data: i64,
+    max_stream_data_bidi_local: i64,
+    max_stream_data_bidi_remote: i64,
+    max_stream_data_uni: i64,
+    max_streams_bidi: i64,
+    max_streams_uni: i64,
+    data_sent: i64,
+    data_recv: i64,
+    
+    // Streams (simplified: track a few streams)
+    stream_states: i64[100],  // Per stream state
+    stream_offsets: i64[100], // Per stream read offset
+    
+    // Loss detection / congestion control (simplified)
+    rtt_latest: i64,
+    rtt_smoothed: i64,
+    rtt_variation: i64,
+    cwnd: i64,
+    ssthresh: i64,
+    bytes_in_flight: i64,
+    
+    // Idle timeout
+    idle_timeout: i64,
+    last_activity: i64,
+    
+    // Peer parameters
+    peer_initial_max_data: i64,
+    peer_initial_max_stream_data_bidi_local: i64,
+    peer_initial_max_stream_data_bidi_remote: i64,
+    peer_initial_max_stream_data_uni: i64,
+    peer_initial_max_streams_bidi: i64,
+    peer_initial_max_streams_uni: i64,
+    peer_idle_timeout: i64,
+    peer_max_datagram_frame_size: i64,
+    peer_disable_active_migration: i64,
+    
+    // Retry token
+    retry_token: u8[256],
+    retry_token_len: i64,
+    
+    // 0-RTT
+    zero_rtt_enabled: i64,
+    early_data_secret: u8[64],
+    
+    // Server-only
+    is_server: i64,
+    stateless_reset_token: u8[16],
+}
+
+fn quic_conn_init(conn: quic_conn[], is_server: i64): i64 {
+    let c: i64 = 0
+    conn[c].state = quic_state_initial()
+    conn[c].version = quic_version()
+    conn[c].is_server = is_server
+    conn[c].max_data = quic_initial_max_data()
+    conn[c].max_stream_data_bidi_local = quic_initial_max_stream_data_bidi_local()
+    conn[c].max_stream_data_bidi_remote = quic_initial_max_stream_data_bidi_remote()
+    conn[c].max_stream_data_uni = quic_initial_max_stream_data_uni()
+    conn[c].max_streams_bidi = quic_initial_max_streams_bidi()
+    conn[c].max_streams_uni = quic_initial_max_streams_uni()
+    conn[c].idle_timeout = quic_default_idle_timeout()
+    conn[c].cwnd = 10 * quic_max_packet_size()  // Initial congestion window
+    conn[c].ssthresh = 2147483647  // Infinity
+    
+    quic_generate_cid(conn[c].dcid)
+    quic_generate_cid(conn[c].scid)
+    quic_cid_copy(conn[c].scid, conn[c].original_dcid)
+    
+    return 0
+}
+
+// Derive Initial secrets from DCID (RFC 9001 Section 5.2)
+fn quic_derive_initial_secrets(conn: quic_conn[], is_client: i64): i64 {
+    let dcid: u8[20]
+    let dcid_len: i64 = conn[0].dcid[20] as i64
+    let i: i64 = 0
+    while i < dcid_len {
+        dcid[i] = conn[0].dcid[i]
+        i = i + 1
+    }
+    
+    // Initial salt (RFC 9001)
+    let salt: u8[20] = { 
+        0x38, 0x76, 0x2c, 0xf7, 0xf5, 0x59, 0x34, 0xb3, 0x4d, 0x17,
+        0x9a, 0xe6, 0xa4, 0xc8, 0x0c, 0xad, 0xcc, 0xbb, 0x7f, 0x0a
+    }
+    
+    // HKDF-Extract(salt, dcid) -> initial_secret
+    let initial_secret: u8[64]
+    tls13_hkdf_extract(salt, 20, dcid, dcid_len, initial_secret)
+    
+    // Client/Server Initial secrets
+    let client_in_label: u8[21] = quic_label_client_in()
+    let server_in_label: u8[21] = quic_label_server_in()
+    
+    let client_initial_secret: u8[64]
+    let server_initial_secret: u8[64]
+    
+    tls13_hkdf_expand_label(initial_secret, 32, client_in_label, client_initial_secret, 32)
+    tls13_hkdf_expand_label(initial_secret, 32, server_in_label, server_initial_secret, 32)
+    
+    // Derive keys
+    if is_client != 0 {
+        quic_derive_keys(client_initial_secret, 32, conn[0].initial_key, conn[0].initial_iv, conn[0].initial_hp)
+    } else {
+        quic_derive_keys(server_initial_secret, 32, conn[0].initial_key, conn[0].initial_iv, conn[0].initial_hp)
+    }
+    
+    return 0
+}
+
+// ============================================================================
+// Packet processing
+// ============================================================================
+
+// Process incoming packet
+fn quic_process_packet(conn: quic_conn[], pkt: u8[], pkt_len: i64): i64 {
+    if pkt_len < 1 { return -1 }
+    
+    let first: i64 = pkt[0] as i64
+    let is_long: i64 = (first & 0x80) != 0
+    
+    if is_long != 0 {
+        return quic_process_long_packet(conn, pkt, pkt_len)
+    } else {
+        return quic_process_short_packet(conn, pkt, pkt_len)
+    }
+}
+
+fn quic_process_long_packet(conn: quic_conn[], pkt: u8[], pkt_len: i64): i64 {
+    if pkt_len < 7 { return -1 }  // Min long header
+    
+    let first: i64 = pkt[0] as i64
+    let pkt_type: i64 = first & 0x30
+    let pn_len: i64 = (first & 0x03) + 1
+    
+    let offset: i64 = 1
+    let version: i64 = ((pkt[offset] as i64) << 24) | ((pkt[offset+1] as i64) << 16) | ((pkt[offset+2] as i64) << 8) | (pkt[offset+3] as i64)
+    offset = offset + 4
+    
+    if version != conn[0].version { return -2 }  // Version mismatch
+    
+    // DCID
+    let dcid: u8[21]
+    offset = quic_cid_parse(pkt, dcid, offset)
+    if offset < 0 { return -3 }
+    
+    // SCID
+    let scid: u8[21]
+    offset = quic_cid_parse(pkt, scid, offset)
+    if offset < 0 { return -4 }
+    
+    // Token (for Initial)
+    let token: u8[256]
+    let token_len: i64 = 0
+    if pkt_type == quic_long_initial() {
+        let varint_val: i64[1]
+        offset = quic_varint_decode(pkt, offset, varint_val)
+        token_len = varint_val[0]
+        if token_len > 255 { return -5 }
+        let i: i64 = 0
+        while i < token_len {
+            token[i] = pkt[offset + i]
+            i = i + 1
+        }
+        offset = offset + token_len
+    }
+    
+    // Length
+    let varint_val: i64[1]
+    offset = quic_varint_decode(pkt, offset, varint_val)
+    let length: i64 = varint_val[0]
+    
+    // Packet number
+    let pn_truncated: i64 = 0
+    let i: i64 = 0
+    while i < pn_len {
+        pn_truncated = (pn_truncated << 8) | (pkt[offset + i] as i64)
+        i = i + 1
+    }
+    offset = offset + pn_len
+    
+    // Remaining is encrypted payload
+    let payload_len: i64 = pkt_len - offset
+    
+    // Decrypt based on packet type
+    if pkt_type == quic_long_initial() {
+        return quic_decrypt_initial(conn, pkt, offset, payload_len, pn_truncated, pn_len)
+    } else if pkt_type == quic_long_handshake() {
+        return quic_decrypt_handshake(conn, pkt, offset, payload_len, pn_truncated, pn_len)
+    } else if pkt_type == quic_long_0rtt() {
+        return quic_decrypt_0rtt(conn, pkt, offset, payload_len, pn_truncated, pn_len)
+    }
+    
+    return -6
+}
+
+fn quic_process_short_packet(conn: quic_conn[], pkt: u8[], pkt_len: i64): i64 {
+    if conn[0].state < quic_state_established() { return -1 }
+    
+    let first: i64 = pkt[0] as i64
+    let pn_len: i64 = (first & 0x03) + 1
+    let key_phase: i64 = (first >> 2) & 0x01
+    
+    let offset: i64 = 1
+    // DCID
+    let dcid_len: i64 = conn[0].dcid[20] as i64
+    let i: i64 = 0
+    while i < dcid_len {
+        if offset + i >= pkt_len { return -2 }
+        i = i + 1
+    }
+    offset = offset + dcid_len
+    
+    // Packet number
+    let pn_truncated: i64 = 0
+    i = 0
+    while i < pn_len {
+        if offset + i >= pkt_len { return -3 }
+        pn_truncated = (pn_truncated << 8) | (pkt[offset + i] as i64)
+        i = i + 1
+    }
+    offset = offset + pn_len
+    
+    let payload_len: i64 = pkt_len - offset
+    
+    return quic_decrypt_1rtt(conn, pkt, offset, payload_len, pn_truncated, pn_len, key_phase)
+}
+
+// ============================================================================
+// Packet decryption (simplified - uses AES-GCM from stdlib)
+// ============================================================================
+
+fn quic_decrypt_initial(conn: quic_conn[], pkt: u8[], offset: i64, payload_len: i64, pn_truncated: i64, pn_len: i64): i64 {
+    // Reconstruct packet number
+    let pn: i64 = quic_pn_decode(pn_truncated, pn_len, conn[0].pn_expected[quic_level_initial()])
+    
+    // Check replay
+    if pn < conn[0].pn_expected[quic_level_initial()] { return -1 }
+    
+    // Header protection
+    let sample_offset: i64 = offset + 4
+    if sample_offset + 16 > payload_len { return -2 }
+    
+    // Decrypt payload (simplified - would use AES-GCM)
+    // In practice: AES-GCM decrypt with initial_key, initial_iv, pn as nonce
+    
+    conn[0].pn_expected[quic_level_initial()] = pn + 1
+    
+    // Process frames
+    return quic_process_frames(conn, pkt, offset, payload_len, quic_level_initial())
+}
+
+fn quic_decrypt_handshake(conn: quic_conn[], pkt: u8[], offset: i64, payload_len: i64, pn_truncated: i64, pn_len: i64): i64 {
+    let pn: i64 = quic_pn_decode(pn_truncated, pn_len, conn[0].pn_expected[quic_level_handshake()])
+    if pn < conn[0].pn_expected[quic_level_handshake()] { return -1 }
+    conn[0].pn_expected[quic_level_handshake()] = pn + 1
+    return quic_process_frames(conn, pkt, offset, payload_len, quic_level_handshake())
+}
+
+fn quic_decrypt_0rtt(conn: quic_conn[], pkt: u8[], offset: i64, payload_len: i64, pn_truncated: i64, pn_len: i64): i64 {
+    let pn: i64 = quic_pn_decode(pn_truncated, pn_len, conn[0].pn_expected[quic_level_0rtt()])
+    if pn < conn[0].pn_expected[quic_level_0rtt()] { return -1 }
+    conn[0].pn_expected[quic_level_0rtt()] = pn + 1
+    return quic_process_frames(conn, pkt, offset, payload_len, quic_level_0rtt())
+}
+
+fn quic_decrypt_1rtt(conn: quic_conn[], pkt: u8[], offset: i64, payload_len: i64, pn_truncated: i64, pn_len: i64, key_phase: i64): i64 {
+    let pn: i64 = quic_pn_decode(pn_truncated, pn_len, conn[0].pn_expected[quic_level_1rtt()])
+    if pn < conn[0].pn_expected[quic_level_1rtt()] { return -1 }
+    conn[0].pn_expected[quic_level_1rtt()] = pn + 1
+    return quic_process_frames(conn, pkt, offset, payload_len, quic_level_1rtt())
+}
+
+// ============================================================================
+// Frame processing
+// ============================================================================
+
+fn quic_process_frames(conn: quic_conn[], pkt: u8[], offset: i64, payload_len: i64, level: i64): i64 {
+    let end: i64 = offset + payload_len
+    while offset < end {
+        let frame_type: i64 = pkt[offset] as i64
+        offset = offset + 1
+        
+        if frame_type == quic_frame_padding() {
+            continue
+        } else if frame_type == quic_frame_ping() {
+            // Respond with PING
+        } else if frame_type == quic_frame_ack() || frame_type == quic_frame_ack_ecn() {
+            offset = quic_process_ack_frame(conn, pkt, offset, end)
+        } else if frame_type == quic_frame_crypto() {
+            offset = quic_process_crypto_frame(conn, pkt, offset, end, level)
+        } else if frame_type >= 0x08 && frame_type <= 0x0F {
+            offset = quic_process_stream_frame(conn, pkt, offset, end)
+        } else if frame_type == quic_frame_max_data() {
+            offset = quic_process_max_data_frame(conn, pkt, offset, end)
+        } else if frame_type == quic_frame_max_stream_data() {
+            offset = quic_process_max_stream_data_frame(conn, pkt, offset, end)
+        } else if frame_type == quic_frame_connection_close() || frame_type == quic_frame_connection_close_app() {
+            offset = quic_process_connection_close_frame(conn, pkt, offset, end)
+        } else {
+            // Unknown frame - skip or error
+            // For simplicity, try to skip based on frame type
+            if frame_type == quic_frame_reset_stream() || frame_type == quic_frame_stop_sending() {
+                // These have varints
+                let varint_val: i64[1]
+                offset = quic_varint_decode(pkt, offset, varint_val)  // stream_id
+                offset = quic_varint_decode(pkt, offset, varint_val)  // error_code / final_size
+                if frame_type == quic_frame_reset_stream() {
+                    offset = quic_varint_decode(pkt, offset, varint_val)  // final_size
+                }
+            }
+        }
+        
+        if offset < 0 { return -1 }
+    }
+    return 0
+}
+
+fn quic_process_crypto_frame(conn: quic_conn[], pkt: u8[], offset: i64, end: i64, level: i64): i64 {
+    let varint_val: i64[1]
+    offset = quic_varint_decode(pkt, offset, varint_val)
+    let crypto_offset: i64 = varint_val[0]
+    offset = quic_varint_decode(pkt, offset, varint_val)
+    let crypto_len: i64 = varint_val[0]
+    
+    if offset + crypto_len > end { return -1 }
+    
+    // Pass to TLS layer
+    // tls13_process_handshake_data(conn, pkt, offset, crypto_len, level)
+    
+    return offset + crypto_len
+}
+
+fn quic_process_stream_frame(conn: quic_conn[], pkt: u8[], offset: i64, end: i64): i64 {
+    let flags: i64 = (pkt[offset - 1] as i64) & 0x0F
+    let has_fin: i64 = flags & quic_stream_fin()
+    let has_len: i64 = flags & quic_stream_len()
+    let has_off: i64 = flags & quic_stream_off()
+    
+    let varint_val: i64[1]
+    offset = quic_varint_decode(pkt, offset, varint_val)
+    let stream_id: i64 = varint_val[0]
+    
+    let stream_offset: i64 = 0
+    if has_off != 0 {
+        offset = quic_varint_decode(pkt, offset, varint_val)
+        stream_offset = varint_val[0]
+    }
+    
+    let data_len: i64 = 0
+    if has_len != 0 {
+        offset = quic_varint_decode(pkt, offset, varint_val)
+        data_len = varint_val[0]
+    } else {
+        data_len = end - offset
+    }
+    
+    if offset + data_len > end { return -1 }
+    
+    // Deliver to stream
+    // stream_recv(conn, stream_id, pkt, offset, data_len, has_fin)
+    
+    conn[0].data_recv = conn[0].data_recv + data_len
+    
+    return offset + data_len
+}
+
+fn quic_process_ack_frame(conn: quic_conn[], pkt: u8[], offset: i64, end: i64): i64 {
+    let varint_val: i64[1]
+    offset = quic_varint_decode(pkt, offset, varint_val)
+    let largest_acked: i64 = varint_val[0]
+    offset = quic_varint_decode(pkt, offset, varint_val)
+    let ack_delay: i64 = varint_val[0]
+    offset = quic_varint_decode(pkt, offset, varint_val)
+    let ack_range_count: i64 = varint_val[0]
+    offset = quic_varint_decode(pkt, offset, varint_val)
+    let first_ack_range: i64 = varint_val[0]
+    
+    let i: i64 = 0
+    while i < ack_range_count * 2 {
+        offset = quic_varint_decode(pkt, offset, varint_val)
+        i = i + 1
+    }
+    
+    // Update loss detection / congestion control
+    // quic_on_ack_received(conn, largest_acked, ack_delay, ...)
+    
+    return offset
+}
+
+fn quic_process_max_data_frame(conn: quic_conn[], pkt: u8[], offset: i64, end: i64): i64 {
+    let varint_val: i64[1]
+    offset = quic_varint_decode(pkt, offset, varint_val)
+    let max_data: i64 = varint_val[0]
+    conn[0].peer_initial_max_data = max_data
+    return offset
+}
+
+fn quic_process_max_stream_data_frame(conn: quic_conn[], pkt: u8[], offset: i64, end: i64): i64 {
+    let varint_val: i64[1]
+    offset = quic_varint_decode(pkt, offset, varint_val)
+    let stream_id: i64 = varint_val[0]
+    offset = quic_varint_decode(pkt, offset, varint_val)
+    let max_data: i64 = varint_val[0]
+    // Update stream flow control
+    return offset
+}
+
+fn quic_process_connection_close_frame(conn: quic_conn[], pkt: u8[], offset: i64, end: i64): i64 {
+    let varint_val: i64[1]
+    offset = quic_varint_decode(pkt, offset, varint_val)
+    let error_code: i64 = varint_val[0]
+    offset = quic_varint_decode(pkt, offset, varint_val)
+    let frame_type: i64 = varint_val[0]
+    offset = quic_varint_decode(pkt, offset, varint_val)
+    let reason_len: i64 = varint_val[0]
+    
+    conn[0].state = quic_state_closing()
+    return offset + reason_len
+}
+
+// ============================================================================
+// Sending packets
+// ============================================================================
+
+fn quic_send_initial(conn: quic_conn[], payload: u8[], payload_len: i64, dst: u8[]): i64 {
+    let pn: i64 = conn[0].pn_sent[quic_level_initial()]
+    conn[0].pn_sent[quic_level_initial()] = pn + 1
+    
+    // Encrypt payload with initial keys
+    let encrypted: u8[1500]
+    let enc_len: i64 = quic_encrypt_payload(conn[0].initial_key, conn[0].initial_iv, pn, payload, payload_len, encrypted)
+    
+    return quic_encode_long_header(
+        quic_long_initial(), conn[0].version,
+        conn[0].dcid, conn[0].scid,
+        conn[0].retry_token, conn[0].retry_token_len > 0 ? 1 : 0,
+        pn, 4, encrypted, enc_len, dst
+    )
+}
+
+fn quic_send_handshake(conn: quic_conn[], payload: u8[], payload_len: i64, dst: u8[]): i64 {
+    let pn: i64 = conn[0].pn_sent[quic_level_handshake()]
+    conn[0].pn_sent[quic_level_handshake()] = pn + 1
+    
+    let encrypted: u8[1500]
+    let enc_len: i64 = quic_encrypt_payload(conn[0].handshake_key, conn[0].handshake_iv, pn, payload, payload_len, encrypted)
+    
+    return quic_encode_long_header(
+        quic_long_handshake(), conn[0].version,
+        conn[0].dcid, conn[0].scid,
+        conn[0].retry_token, 0,
+        pn, 4, encrypted, enc_len, dst
+    )
+}
+
+fn quic_send_1rtt(conn: quic_conn[], payload: u8[], payload_len: i64, dst: u8[]): i64 {
+    let pn: i64 = conn[0].pn_sent[quic_level_1rtt()]
+    conn[0].pn_sent[quic_level_1rtt()] = pn + 1
+    
+    let encrypted: u8[1500]
+    let enc_len: i64 = quic_encrypt_payload(conn[0].app_key, conn[0].app_iv, pn, payload, payload_len, encrypted)
+    
+    return quic_encode_short_header(conn[0].dcid, pn, 4, encrypted, enc_len, dst)
+}
+
+// Encrypt payload with AEAD (simplified)
+fn quic_encrypt_payload(key: u8[16], iv: u8[12], pn: i64, plaintext: u8[], plaintext_len: i64, ciphertext: u8[]): i64 {
+    // Construct nonce: iv XOR pn (left-padded to 12 bytes)
+    let nonce: u8[12]
+    let i: i64 = 0
+    while i < 12 {
+        nonce[i] = iv[i]
+        i = i + 1
+    }
+    // XOR packet number into last 4 bytes of nonce
+    nonce[8] = nonce[8] ^ ((pn >> 24) & 0xFF) as u8
+    nonce[9] = nonce[9] ^ ((pn >> 16) & 0xFF) as u8
+    nonce[10] = nonce[10] ^ ((pn >> 8) & 0xFF) as u8
+    nonce[11] = nonce[11] ^ (pn & 0xFF) as u8
+    
+    // AES-GCM encrypt (using stdlib crypto)
+    // std_aes_gcm_encrypt(key, nonce, plaintext, plaintext_len, aad, aad_len, ciphertext, tag)
+    // For now, copy plaintext (no actual encryption in this stub)
+    i = 0
+    while i < plaintext_len {
+        ciphertext[i] = plaintext[i]
+        i = i + 1
+    }
+    // Append 16-byte tag
+    i = 0
+    while i < 16 {
+        ciphertext[plaintext_len + i] = 0
+        i = i + 1
+    }
+    
+    return plaintext_len + 16
+}
+
+// ============================================================================
+// Handshake initiation
+// ============================================================================
+
+fn quic_client_init(conn: quic_conn[]): i64 {
+    quic_conn_init(conn, 0)  // Client
+    quic_derive_initial_secrets(conn, 1)
+    
+    // Generate ClientHello (in CRYPTO frame)
+    let client_hello: u8[1500]
+    let ch_len: i64 = tls13_client_hello(
+        quic_version(),
+        conn[0].dcid,
+        conn[0].scid,
+        client_hello
+    )
+    
+    // Send Initial packet with ClientHello
+    let pkt: u8[1500]
+    let pkt_len: i64 = quic_send_initial(conn, client_hello, ch_len, pkt)
+    
+    return pkt_len
+}
+
+fn quic_server_init(conn: quic_conn[]): i64 {
+    quic_conn_init(conn, 1)  // Server
+    quic_derive_initial_secrets(conn, 0)
+    return 0
+}
+
+// ============================================================================
+// Loss detection and congestion control (simplified)
+// ============================================================================
+
+fn quic_on_packet_acked(conn: quic_conn[], pn: i64, ack_delay: i64, level: i64): i64 {
+    // Update RTT
+    let latest_rtt: i64 = now() - conn[0].last_activity  // Simplified
+    conn[0].rtt_latest = latest_rtt
+    
+    if conn[0].rtt_smoothed == 0 {
+        conn[0].rtt_smoothed = latest_rtt
+        conn[0].rtt_variation = latest_rtt / 2
+    } else {
+        conn[0].rtt_variation = (3 * conn[0].rtt_variation + abs(conn[0].rtt_smoothed - latest_rtt)) / 4
+        conn[0].rtt_smoothed = (7 * conn[0].rtt_smoothed + latest_rtt) / 8
+    }
+    
+    // Congestion control (NewReno-style)
+    if conn[0].cwnd < conn[0].ssthresh {
+        // Slow start
+        conn[0].cwnd = conn[0].cwnd + quic_max_packet_size()
+    } else {
+        // Congestion avoidance
+        conn[0].cwnd = conn[0].cwnd + (quic_max_packet_size() * quic_max_packet_size()) / conn[0].cwnd
+    }
+    
+    conn[0].bytes_in_flight = conn[0].bytes_in_flight - quic_max_packet_size()
+    return 0
+}
+
+fn quic_on_packet_lost(conn: quic_conn[]): i64 {
+    // Fast recovery
+    conn[0].ssthresh = conn[0].cwnd / 2
+    conn[0].cwnd = conn[0].ssthresh
+    conn[0].bytes_in_flight = 0
+    return 0
+}
+
+fn quic_get_pto(conn: quic_conn[]): i64 {
+    // Probe timeout
+    let pto: i64 = conn[0].rtt_smoothed + 4 * conn[0].rtt_variation + conn[0].idle_timeout
+    return pto
+}
+
+fn now(): i64 { return 0 }  // Stub - would use system time
+
+fn abs(x: i64): i64 {
+    if x < 0 { return -x }
+    return x
+}

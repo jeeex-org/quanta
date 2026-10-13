@@ -1,0 +1,26 @@
+import std/fs
+import std/sp_tokenizer
+
+// Test SentencePiece tokenizer
+fn main() {
+    let rc = sp_init("/opt/ai/models/quanta/QUANTA-LFM2.5-2.6Bv1-Q4_K_M.gguf")
+    // For now, init may fail (no .model file), so just test byte fallback
+    
+    let text = "Hello world"
+    let tokens = mem_alloc(256 * 8)
+    let n = sp_encode(text, tokens, 256)
+    
+    if n != 11 { return 1 }  // "Hello world" = 11 chars
+    
+    // Check first few tokens
+    if mem_load(tokens) != i2f(72) { return 1 }   // 'H'
+    if mem_load(tokens + 8) != i2f(101) { return 1 }  // 'e'
+    
+    // Test decode
+    let decoded = mem_alloc(256)
+    sp_decode(tokens, 3, decoded, 256)
+    if mem_load8(decoded + 8) != 72 { return 1 }  // 'H'
+    
+    sp_free()
+    return 0
+}

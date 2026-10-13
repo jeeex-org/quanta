@@ -1,0 +1,47 @@
+// raii_test.quanta — 0.0.112 RAII: compiler-inserted drop() at scope exit.
+// An owned `mem_alloc` binding must be auto-recycled to the free-list when its
+// introducing scope exits (normal fall-through AND early return), with no
+// manual mem_free/drop. Verifies the block is reusable afterward and there is
+// no use-after-free crash. Prints 0 on full success.
+fn scoped() {
+    let p = mem_alloc(4)            // owned -> auto drop() at fn exit (RAII)
+    mem_store(p + 8, 111)
+    mem_store(p + 16, 222)
+    mem_store(p + 24, 333)
+    mem_store(p + 32, 444)
+    let a = mem_load(p + 8)
+    let b = mem_load(p + 16)
+    let c = mem_load(p + 24)
+    let d = mem_load(p + 32)
+    if a != 111 { exit(1) }
+    if b != 222 { exit(2) }
+    if c != 333 { exit(3) }
+    if d != 444 { exit(4) }
+    // early-return path: scope-exit RAII must still fire before we leave
+    if p != 0 { return }            // p is non-null; returns via normal path
+}
+fn inner_leak() {
+    let x = mem_alloc(2)            // owned -> auto drop at inner scope exit
+    mem_store(x + 8, 7)
+    if mem_load(x + 8) != 7 { exit(5) }
+}                                   // x auto-recycled here
+fn main() {
+    scoped()
+    inner_leak()
+    // After both scopes exited, the recycled blocks must be reusable. Allocate
+    // several and confirm they hold independent values (no cross-contamination
+    // from a missed/duplicate free).
+    let q = mem_alloc(2)
+    let r = mem_alloc(2)
+    mem_store(q + 8, 11)
+    mem_store(r + 8, 22)
+    if mem_load(q + 8) != 11 { exit(6) }
+    if mem_load(r + 8) != 22 { exit(7) }
+    // explicit drop still available as a user hook
+    drop(q)
+    let s = mem_alloc(2)
+    mem_store(s + 8, 33)
+    if mem_load(s + 8) != 33 { exit(8) }
+    println(0)                      // all checks passed
+    exit(0)
+}
