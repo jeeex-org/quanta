@@ -1,1 +1,0 @@
-/opt/tali/quanta/README.md
