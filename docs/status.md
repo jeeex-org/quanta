@@ -1,98 +1,61 @@
-# Quanta Status Dashboard (Auto-Generated)
+# Quanta Status Dashboard (AUTO-GENERATED)
 
-## Core Compiler
-| Module | Status | Lines | Source |
-|--------|--------|-------|--------|
-| std/ir | ✅ verified | 1240 | quanta.md:44 |
-| std/types | ✅ verified | 890 | quanta.md:45 |
-| std/codegen | ✅ verified | 560 | quanta.md:46 |
-| std/ast | ✅ verified | 430 | quanta.md:47 |
-| std/fmt_ir | ✅ verified | 310 | quanta.md:48 |
-| std/testing | ✅ verified | 280 | quanta.md:49 |
-| std/git | ✅ verified | 190 | quanta.md:50 |
-| std/ci | ✅ verified | 150 | quanta.md:51 |
-| std/json | ✅ verified | 340 | quanta.md:52 |
-| std/crypto | ✅ verified | 2100 | quanta.md:53 |
-| std/tls13 | ✅ verified | 1800 | quanta.md:54 |
-| std/quic | ✅ verified | 1600 | quanta.md:55 |
-| std/h3 | ✅ verified | 870 | quanta.md:56 |
-| std/net | ✅ verified | 720 | quanta.md:57 |
-| std/str | ✅ verified | 410 | quanta.md:58 |
-| std/vec | ✅ verified | 180 | quanta.md:59 |
-| std/map | ✅ verified | 220 | quanta.md:60 |
-| std/math | ✅ verified | 680 | quanta.md:61 |
-| std/linalg | ✅ verified | 540 | quanta.md:62 |
-| std/big | ✅ verified | 980 | quanta.md:63 |
-| std/quantum | ✅ verified | 450 | quanta.md:64 |
-| std/trig | ✅ verified | 320 | quanta.md:65 |
-| std/clock | ✅ verified | 150 | quanta.md:66 |
-| std/process | ✅ verified | 280 | quanta.md:67 |
-| std/thread | ✅ verified | 240 | quanta.md:68 |
-| std/futex | ✅ verified | 190 | quanta.md:69 |
-| std/pty | ✅ verified | 210 | quanta.md:70 |
-| std/stack_trace | ✅ verified | 340 | quanta.md:71 |
-| std/raii | ✅ verified | 180 | quanta.md:72 |
-| std/mem | ✅ verified | 220 | quanta.md:73 |
-| std/io | ✅ verified | 380 | quanta.md:12 |
-| std/regex | ✅ verified | 420 | quanta.md:12 |
+Generated at **2026-10-13T21:25:44Z** (epoch 1791926744) by `scripts/regen_status.sh`.
+Freshness is enforced by the gate's verify-status stage
+(`test_suites/scripts/verify_status.quanta`, threshold 30 days) --
+run `bash scripts/regen_status.sh` to refresh.
 
-## SI Pipeline
-| Module | Claimed | Actual | Source |
-|--------|---------|--------|--------|
-| std/spec_parser | ✅ COMPLETE | ✅ VERIFIED | SELF_IMPROVEMENT.md:26 |
-| std/spec_to_ir | ✅ COMPLETE | ✅ VERIFIED | SELF_IMPROVEMENT.md:27 |
-| std/pattern_library | ✅ COMPLETE | ✅ VERIFIED | SELF_IMPROVEMENT.md:28 |
-| std/code_synthesizer | ✅ COMPLETE | ✅ VERIFIED | SELF_IMPROVEMENT.md:29 |
-| std/test_generator | ✅ COMPLETE | ✅ VERIFIED | SELF_IMPROVEMENT.md:30 |
+## SI / roadmap delivery
 
-## GPU Backend
-| Milestone | Target | Status | Source |
-|-----------|--------|--------|--------|
-| GPU_0.0.001 | Target select | 🔲 planned | GPU_ROADMAP.md:28 |
-| GPU_0.0.002 | Thin FFI | 🔲 planned | GPU_ROADMAP.md:29 |
-| GPU_0.0.003 | Minimal CUDA host | 🔲 planned | GPU_ROADMAP.md:30 |
-| GPU_0.0.004 | IR design | 🔲 planned | GPU_ROADMAP.md:36 |
-| GPU_0.0.005 | GPU emitter | 🔲 planned | GPU_ROADMAP.md:37 |
-| GPU_0.0.006 | Build script | 🔲 planned | GPU_ROADMAP.md:38 |
-| GPU_0.0.007 | First GPU binary | 🔲 planned | GPU_ROADMAP.md:39 |
-| GPU_0.0.008 | VRAM model | 🔲 planned | GPU_ROADMAP.md:45 |
-| GPU_0.0.009 | Fail-closed OOM | 🔲 planned | GPU_ROADMAP.md:46 |
-| GPU_0.0.010 | Memory safety arg | 🔲 planned | GPU_ROADMAP.md:47 |
-| GPU_0.0.011 | VRAM differential fuzz | 🔲 planned | GPU_ROADMAP.md:48 |
-| GPU_0.0.012 | Tensor ops | 🔲 planned | GPU_ROADMAP.md:54 |
-| GPU_0.0.013 | LLM ops | 🔲 planned | GPU_ROADMAP.md:55 |
-| GPU_0.0.014 | KV cache | 🔲 planned | GPU_ROADMAP.md:56 |
-| GPU_0.0.015 | FlashAttn/NF4 | 🔲 planned | GPU_ROADMAP.md:57 |
-| GPU_0.0.016 | LLM gateway | 🔲 planned | GPU_ROADMAP.md:58 |
-| GPU_0.0.017 | SI Phase 1 on GPU | 🔲 planned | GPU_ROADMAP.md:64 |
-| GPU_0.0.018 | SI Phase 2 on GPU | 🔲 planned | GPU_ROADMAP.md:65 |
-| GPU_0.0.019 | Merge on GPU | 🔲 planned | GPU_ROADMAP.md:66 |
-| GPU_0.0.020 | Brain substrate | 🔲 planned | GPU_ROADMAP.md:67 |
+| metric | value |
+|---|---|
+| gap_specs specs | 9026 |
+| distinct domains | 97 |
+| distinct categories | 2163 |
+| distinct modules named | 5505 |
+| modules delivered in lib/std | 22 |
+| delivery ratio | 0.4% |
+| lib/std real modules | 165 |
+| test_suites/codes tests | 619 |
+| planned/ module stubs | 9237 |
+| planned/ generated tests | 16861 |
+| planned/INDEX.tsv rows | 26098 |
 
-## Flint/Soup Libraries (Not in Roadmap)
-| Module | Status | Needed By | In Roadmap |
-|--------|--------|-----------|------------|
-| std/net/http | ❌ missing | flintai-cli, Soup | false |
-| std/jsonrpc | ❌ missing | Flint LSP | false |
-| std/lsp | ❌ missing | Flint LSP | false |
-| std/html_parser | ❌ missing | Soup | false |
-| std/graphics | ❌ missing | flint-chart | false |
+## SI pipeline modules
 
-## Domain Coverage
-| Domain | Modules | Done | Planned | Source |
-|--------|---------|------|---------|--------|
-| programming_language | 400 | 30 | 370 | quanta.md:86 |
-| mathematics | 54 | 4 | 50 | quanta.md:87 |
-| physics | 65 | 0 | 65 | quanta.md:88 |
-| chemistry | 68 | 0 | 68 | quanta.md:89 |
-| biology | 95 | 0 | 95 | quanta.md:90 |
-| computer_science | 45 | 0 | 45 | quanta.md:91 |
-| medicine | 50 | 0 | 50 | quanta.md:92 |
-| engineering | 100 | 0 | 100 | quanta.md:93 |
-| finance | 80 | 0 | 80 | quanta.md:94 |
-| law | 90 | 0 | 90 | quanta.md:95 |
-| education | 80 | 0 | 80 | quanta.md:96 |
-| agriculture | 90 | 0 | 90 | quanta.md:97 |
-| energy | 90 | 0 | 90 | quanta.md:98 |
-| manufacturing | 100 | 0 | 100 | quanta.md:99 |
-| construction | 90 | 0 | 90 | quanta.md:100 |
+| module | file | lines | present |
+|---|---|---|---|
+| std/spec_parser | lib/std/spec_parser.quanta | 187 | yes |
+| std/spec_to_ir | lib/std/spec_to_ir.quanta | 193 | yes |
+| std/pattern_library | lib/std/pattern_library.quanta | 105 | yes |
+| std/code_synthesizer | lib/std/code_synthesizer.quanta | 286 | yes |
+| std/test_generator | lib/std/test_generator.quanta | 262 | yes |
+| std/si_main | lib/std/si_main.quanta | 109 | yes |
+
+## Genuinely missing stdlib targets
+
+- `std/net/http` -- MISSING
+- `std/jsonrpc` -- MISSING
+- `std/lsp` -- MISSING
+- `std/html_parser` -- MISSING
+- `std/graphics` -- MISSING
+
+## Delivery by domain (top 15 by spec count)
+
+| domain | specs | delivered | % |
+|---|---|---|---|
+| programming_language | 611 | 20 | 3.3% |
+| countries | 360 | 0 | 0.0% |
+| investment | 244 | 1 | 0.4% |
+| airlines | 169 | 6 | 3.6% |
+| advertising | 168 | 12 | 7.1% |
+| insurance_industry | 162 | 3 | 1.9% |
+| chemicals_industry | 159 | 0 | 0.0% |
+| accounting | 149 | 3 | 2.0% |
+| logistics | 149 | 11 | 7.4% |
+| manufacturing | 146 | 0 | 0.0% |
+| defense | 139 | 2 | 1.4% |
+| entertainment | 134 | 0 | 0.0% |
+| tobacco | 134 | 0 | 0.0% |
+| construction | 130 | 0 | 0.0% |
+| real_estate | 129 | 0 | 0.0% |

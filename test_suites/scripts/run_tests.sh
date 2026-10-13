@@ -596,17 +596,21 @@ else
   QOBJ_RC=1
 fi
 
-# --- Stage 12: STATUS VERIFICATION (docs vs source consistency) --------------
+# --- Stage 12: STATUS VERIFICATION (docs/status.json freshness + integrity) ---
+# The checker (test_suites/scripts/verify_status.quanta) only READS
+# docs/status.json and fails closed when it is missing, malformed, or stale. It
+# used to regenerate the file with a hard-coded generated_at, which made the
+# stage GREEN regardless of staleness. Regenerate with: bash scripts/regen_status.sh
 echo ""
 echo "########## STATUS VERIFICATION GATE ##########"
 VERIFY_STATUS_RC=0
 QC_STATUS="$QC"
 if $QC_STATUS test_suites/scripts/verify_status.quanta /tmp/verify_status 2>/tmp/verify_status_compile.txt; then
   if /tmp/verify_status >/tmp/verify_status_run.txt 2>&1; then
-    echo "  PASS: status verification consistent"
+    echo "  PASS: docs/status.json present, well-formed and fresh"
     VERIFY_STATUS_RC=0
   else
-    echo "  FAIL: status verification found inconsistencies"
+    echo "  FAIL: status verification failed (freshness/integrity)"
     cat /tmp/verify_status_run.txt
     VERIFY_STATUS_RC=1
   fi
