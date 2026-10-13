@@ -154,6 +154,25 @@ Next step for the fix (narrow): instrument where a `-> f64` user call's result v
 whether it fires for the `pio2_1()` / `qmult()` calls in program B. If it does not fire, the fix is that missing
 tag write; if it fires and is then lost, the caller's vreg churn is overwriting it.
 
+## WHY THE TAG IS MISSING: two writers of `fn_retflt`, one erasing the other
+
+The tagging at `codegen.quanta:1251` (`if ... r64(fn_retflt + tcf*8)==1 { w8(vfloat+tres,1) }`) is gated on
+`fn_retflt[callee]`, and `fn_retflt` has **two writers that disagree**:
+
+| writer | site | writes |
+|---|---|---|
+| declared return type (`-> f64`) | `helpers.quanta:441` (the 0.0.220 fix) | 1 for every function whose signature says `-> f64` |
+| body inference (`return` analysis) | `funcscan.quanta:1396`, `1419-1438` | 1 if a `return` is a float literal / float expression / float-bound identifier, and **`0` on a conditional reset at 1396** |
+
+`helpers.quanta:426` already carries the lesson from an earlier round in its own comment: an unconditional
+`w64(fn_retflt + i*8, 0)` "silently erased that inference". The same hazard is still present from the other
+direction — `fn_retflt` is a single slot per function, written by both passes, and the body-inference pass can
+leave it 0 for a function whose signature says `-> f64`.
+
+**And the index is the order dependence.** `fn_retflt` is indexed by function *index*, assigned during the
+scan. Adding a call (even an unreachable one) can change which function index gets which slot when the passes
+write at different times, which is exactly why a dead call in `main` changes an earlier function's arithmetic.
+
 ## Suspected cause
 
 A float vreg is being coalesced or reused across call boundaries when the callee
