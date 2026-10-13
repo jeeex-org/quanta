@@ -174,7 +174,7 @@ loses its float-ness at a builtin's boundary. The consequence is bigger than a w
 Fix both ends: make `exit`/`print` convert a float-tagged argument (A2's fix), **and** change the checklist §4
 line to `exit(f2i(p))` so it can fail for the reason it exists.
 
-### A3 · LIVE (re-scoped) · `gguf_type_size` succeeds for types that have no decoder
+### A3 · STALE — already fixed in the tree (verified 0.0.235) · `gguf_type_size` succeeds for types with no decoder
 
 **Re-verified 0.0.235 — half the original claim was stale.** The decoder entry points that exist are:
 `dequant_f32`, `dequant_q4_0`, `dequant_q4_1`, `dequant_q5_0`, `dequant_q5_1`, `dequant_q5k`, `dequant_q6k`,
@@ -189,8 +189,20 @@ What is genuinely missing, and still claimed by the size path:
 | 14–16+ = the IQ family | yes (block table returns 256) | **none** |
 
 A caller therefore sizes a buffer correctly and reads garbage — the same trap that hid the earlier F32 gap.
-Scope is smaller than originally written, and the fix is the same: **fail closed** for a dtype with no
-decoder, plus a negative-control test per unsupported type.
+**Further re-verification settles it: this is STALE, and my own re-scope was also incomplete.** Two things the
+first pass missed:
+
+1. `dequant_f16` **does** exist (called from the dispatch at `read_block_f64`). My entry-point grep pattern
+   was too narrow — the same "measured incompletely, concluded too fast" error the entry above warns about.
+   `dequant_iq4_nl` (20), `dequant_iq4_xs` (23), `dequant_mxfp4` (39) and `dequant_nvfp4` (40) exist too.
+2. The dispatch **already fails closed**: `read_block_f64` starts with
+   `if gguf_dtype_supported(dtype) == 0 { return 0 }`, and that predicate enumerates exactly the set with a
+   decoder — F32, F16, Q4_0/Q4_1/Q5_0/Q5_1/Q8_0, Q2_K…Q8_K, IQ4_NL, IQ4_XS, BF16, MXFP4, NVFP4.
+
+A dtype with no decoder (IQ2/IQ3, F64) therefore cannot be decoded into garbage: the dispatch refuses
+before touching a byte. The residual nit — `gguf_type_size` answering a number for those dtypes instead
+of -1 — is a *consistency* wart, not a corruption path, since the size only allocates a buffer the
+dispatch then declines to fill. Recorded rather than given a version.
 
 - Fix approach: **fail closed** — return -1/error from both the size and the dispatch for a type with no
   decoder, and add a negative-control test per unsupported type. This is a one-session change and closes the
