@@ -264,8 +264,8 @@ nothing equivalent exists for the *user-function* path. It holds back a complete
   index by another route.
 - **ROOT CAUSE (certain):** an untyped parameter used as a float. `fn qmult(x) -> f64` with `let y = x * (2.0 / 3.14159265358979323846)`: annotating `x: f64` alone makes it correct and drops the untagged-conversion count 2 -> 1. So the tagging at `codegen.quanta:1123-1137` (declared `: f64` only) is the gap, and `fopld_rr` emits `cvtsi2sd` over an f64 bit pattern. "Call-order sensitivity" was a red herring.
 - **THREE MECHANISMS TRIED, ALL REJECTED BY MEASUREMENT** — do not retry any: (1) a one-sided float rule in the `changed=1` tag pass -> **byte-identical binary**, inert; (2) tagging both operands at the two SSE emit sites -> repro fixed but §5 gate **rc=1** with 4 new stdlib failures (`embedding_test`, a clean A/B) — *which branch is taken is itself decided by `vfloat`*, so a wrong tag gets cemented; (3) call-argument tag -> callee parameter via `fn_parflt` -> the rule **fires** (32 events incl. `callee=0, 1 arg` for `qmult`) but the repro stays garbage, inert.
-- **WHY MECHANISM 3 WAS INERT — CONFIRMED, with the code:** `fn_parflt` is keyed by the parameter's **vreg**, not by its ordinal. Proof: `codegen.quanta:455` reads `if op==IR_PARAM { w8(live_bits+o0,1) }   // PARAM target vreg is live`, so an `IR_PARAM` record's `a0` IS the target vreg; both readers then use it as the key — the pass case at `1136-1137` (`ppi = ira0(mp)`) and the second at `1245` (`ta0`). My rule wrote `fn_parflt[callee][arg_ordinal]`, so it wrote a different slot than the callee reads. Fires 32 times, changes nothing — consistent.
-- **THE FIX, now mechanical:** at the call site, map the argument ordinal to the callee's parameter **vreg** before writing — walk the callee's own `IR_PARAM` records (the function body is reachable from the `fns` table, and the codebase already walks callee IR for other passes) and take their `a0` in order. Then `fn_parflt[callee][param_vreg] = 1` is read by the callee's own `IR_PARAM` case and the parameter gets tagged in its own numbering. Alternatively skip the table and tag the parameter vreg directly. Either way the evidence (the argument's tag) stays independent of the tag that picks the SSE branch — which is what made mechanism 2 regress.
+- **WHY MECHANISM 3 WAS INERT — CORRECTED. The \"wrong key\" explanation recorded here earlier was itself wrong.** `fn_parflt` is keyed by (function, parameter **ordinal**), not by a vreg, so the write mechanism 3 made was already the right slot. Settled from the CREATION site and the two readers, not from a name: `entry.quanta:856` is `let vr=nv(); iremit(IR_PARAM, vr, pc, 0, 0)`; `helpers.quanta:374` lays an IR record out as `res` at +8 and `a0` at +16; and both `fn_parflt` readers index it with `ira0(...)` — the pass case at `codegen.quanta:1136-1137` (`let ppi = ira0(mp)`) and the second at `1245` (`ta0`). So for `IR_PARAM` the RESULT (`irres`) is the target vreg and `a0` is `pc`, the ordinal. The `codegen.quanta:455` line cited as proof (`w8(live_bits+o0,1)   // PARAM target vreg is live`) is a different context — live-range marking over `live_bits`, a different table — and does not bear on `fn_parflt` at all. The real reason a call-argument rule was inert is the **layer**, not the key: parse and emit are fused per function, so a callee is fully emitted before any call site that could say what type is coming has been read, and the caller's and callee's vreg spaces are not joined by any `IR_MOV` chain. The inference has to be complete *before* the callee is emitted, which only a whole-file token scan can do.
+- **THE FIX (landed 0.0.236): a whole-program token scan, not an emit-time rule.** `scan_call_types()` (`funcscan.quanta`, called from `entry.quanta` right after `scan_retstr()`) extends `scan_call_float`'s literal rule to an argument that NAMES an already-typed parameter of the enclosing function or is a call to a `-> f64`/`-> str` function, monotone to a fixpoint. It writes the same `fn_parflt`/`fn_parstr` slot at the same (function, ordinal) key `scan_call_float` already uses — no ordinal->vreg mapping is involved, so the earlier \"map the ordinal to the vreg first\" plan below was solving a problem that did not exist. The evidence (the argument's type) stays independent of the tag that picks the SSE branch, which is the constraint mechanism 2 broke.
 - **FIX ATTEMPT (0.0.236) — REJECTED BY THE GATE.** At both SSE emit sites, tag both operands before loading
   them. It makes the repro correct (`cvtsi2sd` 2 -> 1, fixpoint holds), but the §5 gate on that tree returns
   **rc=1: 821/822 functional and 4 new stdlib failures** — `embedding_test` is a clean A/B (pass on 0.0.235, fail
@@ -327,17 +327,19 @@ type of the argument the caller passes.
 (untyped param used as str -> pointer instead of text) are the same mechanism: the parameter slot carries no
 type, so the callee takes the integer path. One propagation fixes both.
 
-**It is also already 90% written.** Mechanism 3 (call-argument tag -> callee parameter) is exactly this fix; it
-fails only because the writer keys `fn_parflt` by argument ordinal while both readers key it by the parameter's
-**vreg** (`codegen.quanta:455` proves `IR_PARAM.a0` is the target vreg; readers at `1136-1137` and `1245`).
-Remaining detail to implement: either walk the callee's `IR_PARAM` records (`fn_ir_start`/`fn_ir_count` locate a
-function's slice) to map ordinal -> vreg at the write, or track the parameter ordinal at the read. Either way the
-evidence stays independent of the tag that picks the branch — which is what made the SSE-site attempt regress.
+**Mechanism 3 had the right idea and the right key; what it lacked was the layer.** It wrote `fn_parflt` at the
+same (callee, parameter-ordinal) key the table is keyed by (see the corrected bullet under A6), so the write
+itself was correct — an earlier note here claimed the opposite and was wrong. It was inert because a rule placed
+in the per-function emit path cannot see a function's signature and its call sites at the same time: parse and
+emit are fused per function, so the callee is already emitted before the call site that would inform it is read.
+The fix therefore had to run at the whole-program token level, before codegen, and be monotone to a fixpoint —
+which is what `scan_call_types()` does. The constraint from the SSE-site attempt still holds: the evidence (the
+argument's type) must stay independent of the tag that picks the branch.
 
 **Severity is higher than the ticket implied:** untyped parameters are the norm in this codebase, not an edge
 case, so A6/A7 are the visible tip of a very common pattern.
 
-### A6+A7 · FIXED (0.0.236 source tree) · one gate row regresses, and it is not the fix
+### A6+A7 · FIXED and PROMOTED (0.0.236) · the stdlib row it first uncovered is fixed too; gate fully green
 
 **The fix: `scan_call_types()` — `funcscan.quanta`, called from `entry.quanta` after `scan_retstr()`.**
 It extends `scan_call_float`'s rule past float literals: for every call `name(args)` inside function `g`,
@@ -359,24 +361,35 @@ parameter `k` of every top-level `name` is then marked float/string, monotone to
 - **The record above is wrong about mechanism 3**, and the source says so: `iremit(op,res,a0,a1,a2)` plus
   `entry.quanta:851` (`iremit(IR_PARAM,vr,pc,0,0)`) make `IR_PARAM.a0` the parameter ORDINAL and `irres` the
   target vreg. Both readers (`codegen.quanta:1136`, `1245`) key `fn_parflt` by that ordinal, and
-  `scan_call_float` writes it by ordinal too — so mechanism 3 wrote exactly the slot the existing pass already
-  wrote, which is why it "fired 32 times and changed nothing". The codegen.quanta:455 comment ("PARAM target
-  vreg is live" reading `o0`) is the misreading that produced the wrong explanation.
+  `scan_call_float` writes it by ordinal too — so mechanism 3's write went to the right slot already. The
+  inertness was the LAYER, not the key: a call-argument rule placed in the per-function emit path cannot see a
+  function's signature and its call sites at the same time (parse and emit are fused per function, so the callee
+  is emitted before its call site is read) — which is why the fix had to move to a whole-program token scan. The
+  `codegen.quanta:455` comment ("PARAM target vreg is live" reading `o0`) is the misreading that produced the
+  earlier, wrong "wrong key" explanation.
 - **Verified (0.0.236):** A6 repro `4602678819172646912` (was `-4336984033343832063`); A7 repro prints
   `untyped tag: GLOBAL` / `untyped lit: TEXT` (was two 20-digit numbers); `codes/f64_call_order_test.quanta`
   run rc 1 -> 0; `tests/f64_call_order_defect.quanta` still `0` then `4602678819172646912`;
   `codes/embedding_test.quanta` still rc=0; fixpoint `203e0d772ca38e903ad27c921645d10a` (3/3 generations);
   **STDLIB 108/108 GREEN** — the layer the rejected SSE-site mechanism broke.
-- **Gate (not promotable yet, and not because of the fix):** `818/821 pass, 3 fail` (rc=1) against a
-  same-environment 0.0.235 baseline of `820/821 pass, 1 fail`. The shared failure is the pre-existing
-  `recv_loop_test.quanta` compile rc=14. The single distinct regressing row is
-  `std_code_synthesizer_const_test.quanta` (listed twice), and it is a previously-dead code path being
-  entered for the first time: the pass flips exactly two slots there (`synthesize_all` p0, `register_pattern`
-  p0, both string), `file_open("gap_specs.json")` now succeeds, and `lib/std/code_synthesizer.quanta` then
-  overruns a 2 MB buffer with a 16 MB read and parses garbage. With that buffer enlarged locally and the
-  parameter typed EXPLICITLY `: str`, the PRISTINE 0.0.235 compiler reproduces the same three outcomes
-  (rc=0 x3, rc=124 x2, rc=135/SIGBUS x4 over nine runs), so the row's instability is inherent to that module,
-  not to this change. Details and the recommended next step: `compiler/0.0.236/WIP.md`.
+- **Gate — RESOLVED, PROMOTED as 0.0.236.** The row this fix first uncovered is
+  `lib/std/code_synthesizer.quanta`, and it had two defects of its own, independent of A6/A7: `read(2)` was asked
+  for 16 MB into a 2 MB `mmap`, and `sanitize_ident()` returned a headerless buffer that every caller read with
+  `len()`/`+8` (so the copy loops ran off the mapping). Both are fixed in that module, along with the required
+  3-argument `file_open` and staging its output under a CWD-relative `synth_out/` so a gate run cannot rewrite
+  the tracked `lib/std` tree. Full evidence: `compiler/0.0.236/WIP.md`.
+- **Gate (promoted tree, official command, this environment):** `=== Results: 212/212 pass, 0 fail (incl. 0
+  compile-fail) ===  rc=0`; every layer GREEN; `STDLIB: 108/108 GREEN`. `scripts/verify-release.sh 0.0.236
+  0.0.235` -> 14 passed, 0 failed. The row itself: `std_code_synthesizer_const_test.quanta rc=0` in 9/9
+  consecutive runs.
+- **The row still exercises the module** — its `main` is the module's `main`, which runs `synthesize_all()`,
+  reads all 2,290,042 bytes of `gap_specs.json` and emits 9,026 modules into `test_suites/run/synth_out` — so
+  the pass is not a test that stopped testing anything.
+- **Red-first for the buffer defect, on the PRISTINE compiler.** The original module with only its parameter
+  typed `: str` and its buffer enlarged (so A6/A7 is out of the picture), compiled by the untouched 0.0.235
+  golden, gives over nine runs **rc=0 x3, rc=124 x4, rc=135/SIGBUS x2** — flaky and not the expected 0, i.e.
+  the module was broken before this change. (Earlier recorded as rc=0 x3 / rc=124 x2 / rc=135 x4; the
+  re-measurement is the authority.)
 
 ### A7 · NOT REPRODUCED for typed paths; LIVE for an UNTYPED parameter (same family as A6)
 

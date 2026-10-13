@@ -15,20 +15,32 @@ let pattern_names = mmap(1024 * 8);
 let pattern_types = mmap(1024 * 8);
 let pattern_count = 0;
 
+// sanitize_ident(name) -> a Quanta string holding the path-safe form of name
+// (any byte outside [0-9A-Za-z] becomes '_').
+//
+// It must return a REAL Quanta string: an 8-byte length header at +0 and the
+// bytes at +8. The previous version wrote the bytes at +0 with no header, but
+// every caller reads the result with len() and mem_load8(p + 8 + i) -- so
+// len(out) read the first eight ASCII bytes as a little-endian integer (for
+// "accounting": 0x69746e756f636361, ~7.6e18) and the copy loops ran off the
+// end of the mapping. That out-of-bounds scribble is what made a run crash
+// (SIGBUS/SEGV) or spin (timeout), non-deterministically, once the A6/A7
+// call-argument typing fix let file_open() past its early return.
 fn sanitize_ident(name) {
     let len_n = len(name);
-    let out = mmap(len_n + 1);
+    let out = mmap(len_n + 9);
+    mem_store(out, len_n);
     let i = 0;
     while i < len_n {
         let c = mem_load8(name + 8 + i);
         if (c >= 48 && c <= 57) || (c >= 65 && c <= 90) || (c >= 97 && c <= 122) {
-            mem_store8(out + i, c);
+            mem_store8(out + 8 + i, c);
         } else {
-            mem_store8(out + i, 95);
+            mem_store8(out + 8 + i, 95);
         }
         i = i + 1;
     }
-    mem_store8(out + len_n, 0);
+    mem_store8(out + 8 + len_n, 0);
     return out;
 }
 
@@ -65,8 +77,16 @@ fn emit_quanta_module(domain, category, module) -> i64 {
     let clean_category = sanitize_ident(category);
     let clean_module = sanitize_ident(module);
 
+    // Output goes to a scratch staging dir under the CWD, NOT into the tracked
+    // lib/std tree. This module's `main` IS the entry point of the
+    // std_code_synthesizer_const_test gate row (an imported module's main wins
+    // over the test file's own), so a gate run executes this code. The old
+    // hard-coded "lib/std/" target rewrote thousands of module stubs straight
+    // into the source tree on every run -- measured: 9,026 files. The gate's
+    // scratch cwd (test_suites/run) is git-ignored and wiped every run, so a
+    // CWD-relative staging dir is generated output that is never committed.
     let out_path = mmap(512);
-    let base = "lib/std/";
+    let base = "synth_out/";
     let i = 0;
     while i < len(base) { mem_store8(out_path + i, mem_load8(base + 8 + i)); i = i + 1; }
     let j = 0;
@@ -86,15 +106,20 @@ fn emit_quanta_module(domain, category, module) -> i64 {
     i = i + j;
     mem_store8(out_path + i, 0);
 
-    let fd = file_open(out_path, 577);
+    // open(2) needs its mode argument (arg 2). With O_CREAT and only two args
+    // the kernel reads mode from R10, which here holds unrelated garbage, so
+    // the file was created mode 000 and every later run's O_TRUNC open-for-write
+    // then failed with EACCES (measured: run 1 -> 9,026 modules, runs 2..n -> 0).
+    // 420 = 0o644.
+    let fd = file_open(out_path, 577, 420);
     if fd < 0 { return 0; }
 
     file_write(fd, "module std_", len("module std_"));
-    file_write(fd, clean_domain, len(clean_domain));
+    file_write(fd, clean_domain + 8, len(clean_domain));
     file_write(fd, "_", 1);
-    file_write(fd, clean_category, len(clean_category));
+    file_write(fd, clean_category + 8, len(clean_category));
     file_write(fd, "_", 1);
-    file_write(fd, clean_module, len(clean_module));
+    file_write(fd, clean_module + 8, len(clean_module));
     file_write(fd, ";\n\n", 2);
     file_write(fd, "import std/types;\n\n", len("import std/types;\n\n"));
     file_write(fd, "fn init() -> i64 { return 0; }\n\n", len("fn init() -> i64 { return 0; }\n\n"));
@@ -109,12 +134,23 @@ fn synthesize_all(specs_path) -> i64 {
     let pat_count = init_pattern_library();
     prints("Pattern library initialized: "); printi(pat_count); prints(" patterns\n");
 
+    // Staging directory for the generated modules (see emit_quanta_module).
+    mkdir("synth_out", 493);
+
     let fd = file_open(specs_path, 0);
     if fd < 0 { return 0; }
-    let buf = mmap(2097152);
-    let n = file_read(fd, buf + 8, 16777216);
+    // Size the read buffer from the FILE, not a flat constant. The old code
+    // asked read(2) for 16 MB into a 2 MB mmap(2097152); gap_specs.json is
+    // 2,290,042 bytes, so the kernel wrote ~193 KB past the end of the mapping
+    // -- memory corruption that surfaced as SIGBUS or a hang. file_size() is
+    // exact (lseek SEEK_END), so the buffer fits the input by construction and
+    // read(2) cannot return more than was mapped.
+    let fsz = file_size(fd);
+    let buf = mmap(fsz + 16);
+    let n = file_read(fd, buf + 8, fsz);
     file_close(fd);
     if n <= 0 { return 0; }
+    if n > fsz { n = fsz; }
     mem_store(buf, n);
 
     let i = 0;

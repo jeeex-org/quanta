@@ -151,7 +151,7 @@ These are non-negotiable. Violating any of them is a gate failure by itself.
 ---
 
 ## Terminology (derive from `VERSION`, never hardcode)
-- `<VER>`   = released/live stable   -> `cat VERSION`        (currently **0.0.225**; never type a literal — read it)
+- `<VER>`   = released/live stable   -> `cat VERSION`        (currently **0.0.236**; never type a literal — read it)
 - `<NEXT>`  = the version being built -> exactly ONE patch above `<VER>`
 - `<PRIOR>` = `<VER>` itself; its committed golden `compiler/<VER>/bin/x86/qc`
   is the seed for `<NEXT>`. There is NO separate `bootstrap/` directory.
@@ -163,9 +163,9 @@ These are non-negotiable. Violating any of them is a gate failure by itself.
   is not a usable fallback and the promotion is not done.
 
 ## LIVE STATE (advance this on every promotion)
-- Current stable compiler: **0.0.225** — see `cat VERSION`, this literal goes stale.
+- Current stable compiler: **0.0.236** — see `cat VERSION`, this literal goes stale.
 - Golden binary: `compiler/$(cat VERSION)/bin/x86/qc`
-- Gate: 813/813, 19/19 stages GREEN. Self-host behaviour: SELFHOST 7/7.
+- Gate: 212/212 rows (`grep -c . test_suites/EXPECTED.tsv`), 24/24 stages GREEN. Self-host behaviour: SELFHOST 7/7.
 - Per-version state is recorded in `compiler/<VER>/WIP.md` and MUST be updated
   each promotion — and its title must match its directory. `0.0.225/WIP.md` was
   headed `0.0.224 — WIP`, which misinforms a reader who trusts it (rule #18).
