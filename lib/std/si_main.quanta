@@ -1,6 +1,30 @@
 // std/si_main.quanta - Phase 3: Self-Improvement Main Loop (0.0.178)
-// Wires: spec_parser → spec_to_ir → pattern_library → code_synthesizer → test_generator → COMPILE + TEST → verify_status
-// FULLY AUTONOMOUS: runs until all planned specs implemented, compiles generated code, runs tests, auto-updates status
+// Wires: spec_parser -> spec_to_ir -> pattern_library -> code_synthesizer -> test_generator
+//
+// WHAT THIS ACTUALLY DOES (measured against 0.0.236): loads gap_specs.json via
+// spec_parser (std/json), filters the "planned" specs, maps them to an in-memory
+// IR, registers patterns, then calls code_synthesizer.emit_quanta_module and
+// test_generator.generate_all -- both of which stage their output under the
+// CWD-relative SYNTH_OUT_ROOT ("synth_out", git-ignored), never a tracked tree.
+//
+// WHAT IT DOES NOT DO (the header this file shipped with claimed all of it):
+//   * it does NOT compile or run the generated code. Step 7 is
+//     `let test_passed = 1` -- a placeholder -- and run_tests.sh is never invoked.
+//   * it does NOT update any status file; the SI_STATE_FILE / TEST_RUNNER
+//     constants are declared and unused.
+//   * it is NOT "fully autonomous to completion". Its spec input stops at the
+//     std/json array cap: std/vec.vec_new() is a fixed 64-slot vector and
+//     vec_push() silently drops pushes past capacity, so json_array_get /
+//     get_spec_count only ever see the FIRST 64 specs (measured:
+//     json_array_len(gap_specs.json.specs) == 64 of 9,011). code_synthesizer
+//     does not use std/json -- it scans the JSON bytes -- so it generates all
+//     9,011 stubs; the json-based stages above it see 64.
+//
+// The end-to-end half that DOES work (spec -> generate -> compile the generated
+// stub) is therefore proven from the shell, not by this file:
+//   qc -O test_suites/codes/std_code_synthesizer_const_test.quanta /tmp/cs
+//   (cd test_suites/run && /tmp/cs)                 # stages 9,011 modules
+//   qc synth_out/<one>.quanta /tmp/one && /tmp/one  # rc 0
 
 import std/spec_parser
 import std/spec_to_ir
