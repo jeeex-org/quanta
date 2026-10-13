@@ -249,7 +249,7 @@ it is tracked separately; silent clobbering in this shape is not happening.
 - If a clobber IS found: decide the semantics (arena per iteration vs leak-until-function-exit) and either
   make it safe or make it a compile error — a silent clobber is the one outcome that must not remain.
 
-### A6 · FIXED in 0.0.236 (promotion pending) · a `-> f64` user function's result depended on what ran earlier
+### A6 · ROOT CAUSE CONFIRMED, FIX NOT SHIPPABLE · the 0.0.236 fix fails the gate (see WIP.md)
 
 Documented at length in `docs/research/call-order-f64-defect.md` and `WIP.md`: `reduce(0.5)` is correct only
 if `qmult` was called earlier in the program; the builtin path was fixed by `as_f64_rdi()` (0d7950b6) but
@@ -262,8 +262,14 @@ nothing equivalent exists for the *user-function* path. It holds back a complete
   DECLARED `: f64` parameters, so `x` reached the SSE multiply untagged and `fopld_rr` emitted `cvtsi2sd` over an
   f64 bit pattern. "Call-order sensitivity" was a red herring: an unreachable call elsewhere tagged that vreg
   index by another route.
-- **FIX (0.0.236):** at both SSE emit sites, tag both operands before loading them — the branch is the SSE form,
-  so both operands are f64 by construction and the load must not re-decide from `vfloat`. Verified: repro correct,
+- **FIX ATTEMPT (0.0.236) — REJECTED BY THE GATE.** At both SSE emit sites, tag both operands before loading
+  them. It makes the repro correct (`cvtsi2sd` 2 -> 1, fixpoint holds), but the §5 gate on that tree returns
+  **rc=1: 821/822 functional and 4 new stdlib failures** — `embedding_test` is a clean A/B (pass on 0.0.235, fail
+  on 0.0.236) and the other three are the same float-heavy family. The reasoning was unsound: *which branch is
+  taken is itself decided by the `vfloat` tag*, so a wrong tag is cemented and a genuinely-integer operand then
+  gets marked float. `compiler/0.0.236/WIP.md` carries a DO-NOT-PROMOTE banner and the constraint for the next
+  attempt: tag from evidence **independent** of the tag that chose the branch. The other rejected attempt (a rule
+  in the `changed=1` tag pass) stays rejected — byte-identical binary, no float evidence in that pass. Verified: repro correct,
   `cvtsi2sd` 2 -> 1, fixpoint `08acae941891e1d387b550ca1d4a5554` (3 generations identical), new gate row
   `f64_call_order_test.quanta` RED on 0.0.235 (rc=1) and GREEN on 0.0.236 (rc=0). A rejected first attempt (a
   rule in the `changed=1` tag pass) produced a byte-identical binary and was reverted — the pass has no float
