@@ -13,7 +13,8 @@ TEST_SUITES="./test_suites"
 PASS=0
 FAIL=0
 COMPILE_FAIL=0
-# Tests skipped because a declared prerequisite file was absent (see the
+# Tests skipped because a declared prerequisite path was absent -- a file OR a
+# device node such as /dev/nvidia0 (see the
 # SKIP_IF_MISSING column). Excluded from TOTAL so a skip can never read as a pass.
 SKIP=0
 
@@ -56,7 +57,10 @@ while IFS=$'\t' read -r name expected skip_if_missing; do
   # Declared prerequisite absent (SKIP_IF_MISSING column, third field): a test
   # needing a real model cannot pass on a runner that has none. Printed, never
   # silent, and excluded from the totals so a skip cannot read as a pass.
-  if [ -n "$skip_if_missing" ] && [ ! -f "$skip_if_missing" ]; then
+  # `-e`, not `-f`: a declared prerequisite may be a DEVICE node (e.g.
+  # /dev/nvidia0 for the CUDA rows), and `-f` is false for those -- which silently
+  # skipped every GPU row even on a machine that has the GPU.
+  if [ -n "$skip_if_missing" ] && [ ! -e "$skip_if_missing" ]; then
     echo "  SKIP $name (missing: $skip_if_missing)"
     SKIP=$((SKIP + 1)); continue
   fi
@@ -499,7 +503,7 @@ if [ -f "$TEST_SUITES/EXPECTED_STDLIB.tsv" ]; then
     # FAIL on a runner without the model, which is the point: a new
     # model-dependent test cannot be added by accident.
     if [ -n "$skip_if_missing" ]; then
-      if [ ! -f "$skip_if_missing" ]; then
+      if [ ! -e "$skip_if_missing" ]; then
         echo "  SKIP $name (missing: $skip_if_missing)"
         STDLIB_SKIP=$((STDLIB_SKIP + 1)); continue
       fi
@@ -542,7 +546,7 @@ if [ -f "$TEST_SUITES/EXPECTED_STDLIB.tsv" ]; then
     wait "$CUDA_DAEMON_PID" 2>/dev/null || true
   fi
   if [ "$STDLIB_SKIP" -gt 0 ]; then
-    echo "  STDLIB: $STDLIB_PASS/$((STDLIB_PASS + STDLIB_FAIL)) GREEN ($STDLIB_SKIP skipped: model absent)"
+    echo "  STDLIB: $STDLIB_PASS/$((STDLIB_PASS + STDLIB_FAIL)) GREEN ($STDLIB_SKIP skipped: prerequisite absent)"
   else
     echo "  STDLIB: $STDLIB_PASS/$((STDLIB_PASS + STDLIB_FAIL)) GREEN"
   fi

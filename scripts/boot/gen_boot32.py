@@ -18,7 +18,7 @@ Layout (must match the compiler's bare-mode ELF: BASE=0x400000, phc=5 -> ht=344)
   file offset ht+20 ..      stub code  (= STUB_BASE, what QEMU jumps to)
   file offset ht+20+len ..  the 64-bit Quanta startup stub (= ENTRY_BASE)
 
-Usage: python3 scripts/boot/gen_boot32.py compiler/0.0.233
+Usage: python3 scripts/boot/gen_boot32.py compiler/$(cat VERSION)
 """
 import os
 import subprocess

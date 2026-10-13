@@ -27,10 +27,26 @@
 | fixpoint, 3 generations | `md5 4d08aaac7e3e27f199f6700fdc3fe7f0`, distinct md5 = **1** |
 | §2 self-host consistency | **7/7** |
 | §4 smoke (`exit(f2i(p))`) | rc **20** |
-| §5 full gate | **820/820 functional, 0 fail, 0 skip, 0 compile-fail**; all 24 layers GREEN |
+| §5 full gate | **820/820 functional, 0 fail, 0 compile-fail, 0 skips**; all **23** layers GREEN; stdlib 108/108 |
 | §6 verify-release | **14 passed, 0 failed** |
 | A1 probe matrix | 7 previously-crashing probes now compile and return correct values; control unchanged |
 | A1 repro runtime | prints **8** (correct) |
+
+## CI (remote)
+
+The push published every commit made locally since the last remote run (2026-10-07, `496425b5`), so CI met this
+tree's model/CUDA-bearing stdlib rows for the first time and went RED on them, not on the A1 change:
+
+| row | why it failed on a runner without the prerequisites |
+|---|---|
+| `std_tokenizer_trait_test`, `std_model_size_test` | pin `/opt/ai/models/…/QUANTA-LFM2.5-2.6Bv1-Q4_K_M.gguf`; neither declared it in the `SKIP_IF_MISSING` column that 20 sibling rows already use |
+| `std_cuda_daemon_test`, `_pool_`, `_kernels_` | need a CUDA daemon; a GPU-less runner cannot start one, and the gate deliberately treats a CUDA SKIP as FAIL |
+
+Fixed by declaring the prerequisites (5 rows, found by auditing every stdlib row against its own source rather
+than only the 4 CI happened to run). While verifying, `run_tests.sh` turned out to test prerequisites with
+`[ -f ]`, which is **false for a device node** — `/dev/nvidia0` read as "missing" even on this machine, so the
+new GPU prerequisite silently skipped the CUDA rows here. Both sites now use `[ -e ]`; re-run shows
+**0 skips**, stdlib **108/108** (was 105/105 with 3 skipped).
 
 ## Not in this version
 

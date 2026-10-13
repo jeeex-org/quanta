@@ -2,7 +2,7 @@
 
 **Run:** `bash scripts/bench.sh` — `--md` for a markdown table, `--runs N` for more repetitions.
 Both sides are compiled fresh each run and executed through `scripts/qcrun.sh` (hard memory cap, nice,
-timeout), alternating, best-of-N. Current VERSION: **0.0.233**.
+timeout), alternating, best-of-N. Current VERSION: **0.0.234**.
 
 **What this suite is:** 37 core-language **performance shapes** — it exists to catch codegen regressions.
 It is **not** a feature-coverage matrix; correctness lives in the gate (`test_suites/EXPECTED.tsv`, 819 rows,
