@@ -308,6 +308,35 @@ nothing equivalent exists for the *user-function* path. It holds back a complete
   the builtin path is driven by `as_f64_rdi()` (0d7950b6). When fixed, promote the saved repro into a gate row —
   it is red-first by construction.
 
+### A6+A7 ARE ONE FIX · parameter typing inferred from the call argument (decision made)
+
+**Decision: INFER, do not refuse.** Measured untyped-parameter signatures in this repo (param list containing an
+identifier with no `:`):
+
+| area | untyped-param signatures |
+|---|---|
+| `compiler/0.0.235/src/x86` (the compiler's own source) | **316** |
+| `lib/std` | **1082** |
+| `tests` + `test_suites/codes` | **493** |
+
+Refusing an untyped parameter would therefore break over 1,800 signatures, including the 316 that must keep
+self-hosting — so refusal is not an option and the question is closed. The fix is to make the parameter take the
+type of the argument the caller passes.
+
+**This is one change for two defects.** A6 (untyped param used as f64 -> bit pattern instead of a value) and A7
+(untyped param used as str -> pointer instead of text) are the same mechanism: the parameter slot carries no
+type, so the callee takes the integer path. One propagation fixes both.
+
+**It is also already 90% written.** Mechanism 3 (call-argument tag -> callee parameter) is exactly this fix; it
+fails only because the writer keys `fn_parflt` by argument ordinal while both readers key it by the parameter's
+**vreg** (`codegen.quanta:455` proves `IR_PARAM.a0` is the target vreg; readers at `1136-1137` and `1245`).
+Remaining detail to implement: either walk the callee's `IR_PARAM` records (`fn_ir_start`/`fn_ir_count` locate a
+function's slice) to map ordinal -> vreg at the write, or track the parameter ordinal at the read. Either way the
+evidence stays independent of the tag that picks the branch — which is what made the SSE-site attempt regress.
+
+**Severity is higher than the ticket implied:** untyped parameters are the norm in this codebase, not an edge
+case, so A6/A7 are the visible tip of a very common pattern.
+
 ### A7 · NOT REPRODUCED for typed paths; LIVE for an UNTYPED parameter (same family as A6)
 
 **Measured on 0.0.236. The typed paths are fine; an untyped parameter is not.**
