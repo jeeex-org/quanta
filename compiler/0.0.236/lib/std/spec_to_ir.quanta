@@ -38,10 +38,14 @@ fn str_equals(a, b) -> i64 {
 fn load_gap_specs(path) -> i64 {
     let fd = file_open("gap_specs.json", 0);
     if fd < 0 { return 0; }
-    let buf = mmap(2097152);
-    let n = file_read(fd, buf + 8, 16777216);
+    // Size the buffer from the FILE (see spec_parser.load_gap_specs): a flat
+    // 2 MB mmap with a 16 MB read wrote past the mapping.
+    let fsz = file_size(fd);
+    let buf = mmap(fsz + 16);
+    let n = file_read(fd, buf + 8, fsz);
     file_close(fd);
     if n <= 0 { return 0; }
+    if n > fsz { n = fsz; }
     mem_store(buf, n);
 
     let parsed = json_parse(buf);

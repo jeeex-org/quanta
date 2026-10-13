@@ -11,6 +11,17 @@ import std/fs
 
 const TEST_CAP = 10000;
 
+// Staging root for generated *tests*. MUST never name a tracked tree:
+// test_suites/codes is where these files used to land (9,026 per run) and this
+// module's `main` IS the entry point of the std_test_generator_const_test gate
+// row (an imported module's main wins over the test file's own), so a gate run
+// executes it. CWD-relative and git-ignored; the gate's scratch cwd
+// (test_suites/run) wipes it every run. Spell the path here only.
+const SYNTH_OUT_ROOT = "synth_out";
+// SYNTH_OUT_ROOT + "/tests" -- its own const only because Quanta consts cannot be
+// concatenated. It MUST stay under SYNTH_OUT_ROOT and never name a tracked tree.
+const TEST_STAGE_DIR = "synth_out/tests";
+
 // Build path string using Quanta string format
 // slugify(s) -> Quanta string: a PATH-SAFE form of a human display title.
 //
@@ -65,25 +76,34 @@ fn slugify(s) -> i64 {
 }
 
 fn build_test_path(domain, category, module) -> i64 {
-    let base = "test_suites/codes/std_";
+    // Base = TEST_STAGE_DIR + "/std_". NEVER test_suites/codes -- see
+    // SYNTH_OUT_ROOT. The old "test_suites/codes/std_" base wrote generated
+    // tests straight into the tracked test tree.
+    let sub = "/std_";
     let suffix = "_const_test.quanta";
-    
+
     // Calculate total length
-    let len = len(base) + len(domain) + 1 + len(category) + 1 + len(module) + len(suffix);
-    
+    let len = len(TEST_STAGE_DIR) + len(sub) + len(domain) + 1 + len(category) + 1 + len(module) + len(suffix);
+
     // Allocate Quanta string (8 bytes header + data + null)
     let path = mem_alloc(len + 9);
     mem_store(path, len);
     let pos = 8;
-    
-    // Copy base
+
+    // Copy staging base
     let i = 0;
-    while i < len(base) {
-        mem_store8(path + pos, mem_load8(base + 8 + i));
+    while i < len(TEST_STAGE_DIR) {
+        mem_store8(path + pos, mem_load8(TEST_STAGE_DIR + 8 + i));
         pos = pos + 1;
         i = i + 1;
     }
-    
+    i = 0;
+    while i < len(sub) {
+        mem_store8(path + pos, mem_load8(sub + 8 + i));
+        pos = pos + 1;
+        i = i + 1;
+    }
+
     // Copy domain
     i = 0;
     while i < len(domain) {
@@ -132,7 +152,11 @@ fn generate_const_test(domain, category, module) -> i64 {
     let path = build_test_path(dslug, cslug, mslug);
     if path == 0 { return 0; }
     
-    let fd = file_open(path, 577);
+    // build_test_path returns a QUANTA string (8-byte length header + NUL-terminated
+    // chars). file_open() takes a raw C path, so pass `path + 8`: without the
+    // offset the kernel read the length byte as the filename (a 73-char path
+    // created a file named "I") -- the source of the stray one-character files.
+    let fd = file_open(path + 8, 577, 420);
     if fd < 0 { return 0; }
     
     // Write header (DISPLAY titles -- this is prose, spaces are fine here)
@@ -145,7 +169,9 @@ fn generate_const_test(domain, category, module) -> i64 {
     // The import is CODE, so it takes the slug. A display title here truncated
     // the import at the first space and handed the rest to the compiler as an
     // output path -- the source of the stray root files.
-    file_write(fd, "\nimport std/", 11);
+    // "\nimport std/" is 12 bytes; the old 11 dropped the final '/' and emitted
+    // "import std<domain>...", which is not a valid import.
+    file_write(fd, "\nimport std/", 12);
     file_write(fd, dslug + 8, len(dslug));
     file_write(fd, "_", 1);
     file_write(fd, cslug + 8, len(cslug));
@@ -163,11 +189,22 @@ fn generate_all(specs_path) -> i64 {
     
     let fd = file_open("gap_specs.json", 0);
     if fd < 0 { return 0; }
-    let buf = mmap(2097152);
-    let n = file_read(fd, buf + 8, 16777216);
+    // Size the read buffer from the FILE, not a flat 16 MB constant: the old
+    // mmap(2097152) + file_read(..., 16777216) asked the kernel to write ~14 MB
+    // past a 2 MB mapping (gap_specs.json is 2,290,042 B), which is memory
+    // corruption -- the same defect the code_synthesizer repair fixed.
+    let fsz = file_size(fd);
+    let buf = mmap(fsz + 16);
+    let n = file_read(fd, buf + 8, fsz);
     file_close(fd);
     if n <= 0 { return 0; }
+    if n > fsz { n = fsz; }
     mem_store(buf, n);
+
+    // Staging dirs (see SYNTH_OUT_ROOT). Generated tests never go into a tracked
+    // tree.
+    mkdir(SYNTH_OUT_ROOT, 493);
+    mkdir(TEST_STAGE_DIR, 493);
     
     let parsed = json_parse(buf);
     if parsed < 0 { return 0; }

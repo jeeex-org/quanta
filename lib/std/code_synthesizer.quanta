@@ -10,6 +10,16 @@ import std/fs
 
 const SYNTH_CAP = 10000;
 
+// The ONE staging root every generated module is written under. It MUST never
+// name a tracked source tree (lib/std, test_suites/codes, compiler/*/lib/std):
+// this module's `main` IS the entry point of the std_code_synthesizer_const_test
+// gate row (an imported module's main wins over the test file's own), so a run
+// would otherwise rewrite thousands of stubs straight into version control --
+// measured at 9,026 files per run against the old hard-coded "lib/std/" target.
+// "synth_out" is CWD-relative and git-ignored (see .gitignore); the gate's
+// scratch cwd (test_suites/run) wipes it every run. Spell the path here only.
+const SYNTH_OUT_ROOT = "synth_out";
+
 // Pattern registry
 let pattern_names = mmap(1024 * 8);
 let pattern_types = mmap(1024 * 8);
@@ -77,18 +87,18 @@ fn emit_quanta_module(domain, category, module) -> i64 {
     let clean_category = sanitize_ident(category);
     let clean_module = sanitize_ident(module);
 
-    // Output goes to a scratch staging dir under the CWD, NOT into the tracked
-    // lib/std tree. This module's `main` IS the entry point of the
-    // std_code_synthesizer_const_test gate row (an imported module's main wins
-    // over the test file's own), so a gate run executes this code. The old
-    // hard-coded "lib/std/" target rewrote thousands of module stubs straight
-    // into the source tree on every run -- measured: 9,026 files. The gate's
-    // scratch cwd (test_suites/run) is git-ignored and wiped every run, so a
-    // CWD-relative staging dir is generated output that is never committed.
+    // Output goes to a scratch staging dir under the CWD (SYNTH_OUT_ROOT), NOT
+    // into a tracked source tree. This module's `main` IS the entry point of the
+    // std_code_synthesizer_const_test gate row, so a gate run executes this code.
+    // The old hard-coded "lib/std/" target rewrote thousands of module stubs
+    // straight into the source tree on every run -- measured: 9,026 files. The
+    // gate's scratch cwd (test_suites/run) is git-ignored and wiped every run,
+    // so a CWD-relative staging dir is generated output that is never committed.
     let out_path = mmap(512);
-    let base = "synth_out/";
+    let base = SYNTH_OUT_ROOT;
     let i = 0;
     while i < len(base) { mem_store8(out_path + i, mem_load8(base + 8 + i)); i = i + 1; }
+    mem_store8(out_path + i, 47); i = i + 1;   // '/'
     let j = 0;
     while j < len(clean_domain) { mem_store8(out_path + i + j, mem_load8(clean_domain + 8 + j)); j = j + 1; }
     i = i + j;
@@ -135,7 +145,7 @@ fn synthesize_all(specs_path) -> i64 {
     prints("Pattern library initialized: "); printi(pat_count); prints(" patterns\n");
 
     // Staging directory for the generated modules (see emit_quanta_module).
-    mkdir("synth_out", 493);
+    mkdir(SYNTH_OUT_ROOT, 493);
 
     let fd = file_open(specs_path, 0);
     if fd < 0 { return 0; }

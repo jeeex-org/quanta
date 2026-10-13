@@ -19,12 +19,16 @@ fn spec_parser_init() -> i64 {
 fn load_gap_specs(path) -> i64 {
     let fd = file_open("gap_specs.json", 0);
     if fd < 0 { return 0; }
-    // Allocate buffer with space for length header (8 bytes) + JSON data
-    let buf = mmap(2097152);  // 16MB / 8 = 2M pages
-    // Read JSON directly into buf + 8 (after length header)
-    let n = file_read(fd, buf + 8, 16777216);
+    // Size the buffer from the FILE. The old mmap(2097152) + 16 MB file_read
+    // wrote ~14 MB past a 2 MB mapping (gap_specs.json is 2,290,042 B) -- memory
+    // corruption of the same kind the code_synthesizer repair fixed.
+    let fsz = file_size(fd);
+    // length header (8 bytes) + JSON data
+    let buf = mmap(fsz + 16);
+    let n = file_read(fd, buf + 8, fsz);
     file_close(fd);
     if n <= 0 { return 0; }
+    if n > fsz { n = fsz; }
     // Store length at buf, JSON data is at buf+8
     mem_store(buf, n);
 
