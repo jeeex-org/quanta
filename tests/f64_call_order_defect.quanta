@@ -1,0 +1,182 @@
+// 0.0.235 A6: LIVE repro -- a `-> f64` USER function result depends on what ran first.
+//
+// Built from the bodies extracted from /tmp/negctl/math.sin-attempt (the saved
+// fdlibm argument-reduction attempt, whose docs/research/call-order-f64-defect.md
+// entry records the exact wrong bits). `qmult` is the trigger: its body holds the
+// 2^52 magic AND a pair of guarded early returns. The builtin f64 path was fixed
+// by as_f64_rdi() (0d7950b6); the USER-function path has no equivalent.
+//
+// Compare the two programs at the bottom: with this file as-is main() prints
+// -4336984033343832063 (garbage). Comment in the qmult() call and it prints
+// 4602678819172646912 (correct). Each value is stable across runs and recompiles,
+// so it is deterministic codegen keyed on call order, not uninitialised memory.
+//
+// When this is FIXED, promote the shape into a gate row (it is a red-first row by
+// construction) and delete this note.
+fn qmult(x) -> f64 {
+    let y = x * (2.0 / 3.14159265358979323846)
+    if y >= 4503599627370496.0 { return y }
+    if y <= 0.0 - 4503599627370496.0 { return y }
+    let magic = 4503599627370496.0
+    return (y + magic) - magic
+}
+fn pio2_1() -> f64 { return f64of(4609753056924401664) }
+fn pio2_1t() -> f64 { return f64of(4454258360616903473) }
+fn pio2_2() -> f64 { return f64of(4454258360616747008) }
+fn pio2_2t() -> f64 { return f64of(4297306550709743731) }
+fn pio2_3() -> f64 { return f64of(4297306550709518336) }
+fn pio2_3t() -> f64 { return f64of(4142048980368378305) }
+  // 0x397B839A252049C1
+
+// rint_half(x) -> integer: round to the nearest integer, ties to even.
+//
+// `floor()` is NOT a Quanta builtin -- calling it returned the argument
+// unchanged, so the first version used an unrounded n and every result was
+// garbage. The magic-constant method is exact and needs no library call: for
+// |x| < 2^52 the sum x + 2^52 is exactly representable with its low 52 bits
+// zero, so subtracting 2^52 rounds to the nearest integer.
+//
+// The `-> f64` on the FLOAT-returning helpers is load-bearing: an untyped
+// function whose `return` yields a float hands the caller the RAW INTEGER BITS.
+fn rint_half(x) -> f64 {
+    if x >= 4503599627370496.0 { return x }   // 2^52, already integral
+    if x <= 0.0 - 4503599627370496.0 { return x }
+    let magic = 4503599627370496.0
+    return (x + magic) - magic
+}
+fn pio2_1t() -> f64 { return f64of(4454258360616903473) }
+fn pio2_2() -> f64 { return f64of(4454258360616747008) }
+fn pio2_2t() -> f64 { return f64of(4297306550709743731) }
+fn pio2_3() -> f64 { return f64of(4297306550709518336) }
+fn pio2_3t() -> f64 { return f64of(4142048980368378305) }
+  // 0x397B839A252049C1
+
+// rint_half(x) -> integer: round to the nearest integer, ties to even.
+//
+// `floor()` is NOT a Quanta builtin -- calling it returned the argument
+// unchanged, so the first version used an unrounded n and every result was
+// garbage. The magic-constant method is exact and needs no library call: for
+// |x| < 2^52 the sum x + 2^52 is exactly representable with its low 52 bits
+// zero, so subtracting 2^52 rounds to the nearest integer.
+//
+// The `-> f64` on the FLOAT-returning helpers is load-bearing: an untyped
+// function whose `return` yields a float hands the caller the RAW INTEGER BITS.
+fn rint_half(x) -> f64 {
+    if x >= 4503599627370496.0 { return x }   // 2^52, already integral
+    if x <= 0.0 - 4503599627370496.0 { return x }
+    let magic = 4503599627370496.0
+    return (x + magic) - magic
+}
+fn pio2_2() -> f64 { return f64of(4454258360616747008) }
+fn pio2_2t() -> f64 { return f64of(4297306550709743731) }
+fn pio2_3() -> f64 { return f64of(4297306550709518336) }
+fn pio2_3t() -> f64 { return f64of(4142048980368378305) }
+  // 0x397B839A252049C1
+
+// rint_half(x) -> integer: round to the nearest integer, ties to even.
+//
+// `floor()` is NOT a Quanta builtin -- calling it returned the argument
+// unchanged, so the first version used an unrounded n and every result was
+// garbage. The magic-constant method is exact and needs no library call: for
+// |x| < 2^52 the sum x + 2^52 is exactly representable with its low 52 bits
+// zero, so subtracting 2^52 rounds to the nearest integer.
+//
+// The `-> f64` on the FLOAT-returning helpers is load-bearing: an untyped
+// function whose `return` yields a float hands the caller the RAW INTEGER BITS.
+fn rint_half(x) -> f64 {
+    if x >= 4503599627370496.0 { return x }   // 2^52, already integral
+    if x <= 0.0 - 4503599627370496.0 { return x }
+    let magic = 4503599627370496.0
+    return (x + magic) - magic
+}
+fn pio2_2t() -> f64 { return f64of(4297306550709743731) }
+fn pio2_3() -> f64 { return f64of(4297306550709518336) }
+fn pio2_3t() -> f64 { return f64of(4142048980368378305) }
+  // 0x397B839A252049C1
+
+// rint_half(x) -> integer: round to the nearest integer, ties to even.
+//
+// `floor()` is NOT a Quanta builtin -- calling it returned the argument
+// unchanged, so the first version used an unrounded n and every result was
+// garbage. The magic-constant method is exact and needs no library call: for
+// |x| < 2^52 the sum x + 2^52 is exactly representable with its low 52 bits
+// zero, so subtracting 2^52 rounds to the nearest integer.
+//
+// The `-> f64` on the FLOAT-returning helpers is load-bearing: an untyped
+// function whose `return` yields a float hands the caller the RAW INTEGER BITS.
+fn rint_half(x) -> f64 {
+    if x >= 4503599627370496.0 { return x }   // 2^52, already integral
+    if x <= 0.0 - 4503599627370496.0 { return x }
+    let magic = 4503599627370496.0
+    return (x + magic) - magic
+}
+fn pio2_3() -> f64 { return f64of(4297306550709518336) }
+fn pio2_3t() -> f64 { return f64of(4142048980368378305) }
+  // 0x397B839A252049C1
+
+// rint_half(x) -> integer: round to the nearest integer, ties to even.
+//
+// `floor()` is NOT a Quanta builtin -- calling it returned the argument
+// unchanged, so the first version used an unrounded n and every result was
+// garbage. The magic-constant method is exact and needs no library call: for
+// |x| < 2^52 the sum x + 2^52 is exactly representable with its low 52 bits
+// zero, so subtracting 2^52 rounds to the nearest integer.
+//
+// The `-> f64` on the FLOAT-returning helpers is load-bearing: an untyped
+// function whose `return` yields a float hands the caller the RAW INTEGER BITS.
+fn rint_half(x) -> f64 {
+    if x >= 4503599627370496.0 { return x }   // 2^52, already integral
+    if x <= 0.0 - 4503599627370496.0 { return x }
+    let magic = 4503599627370496.0
+    return (x + magic) - magic
+}
+fn pio2_3t() -> f64 { return f64of(4142048980368378305) }
+  // 0x397B839A252049C1
+
+// rint_half(x) -> integer: round to the nearest integer, ties to even.
+//
+// `floor()` is NOT a Quanta builtin -- calling it returned the argument
+// unchanged, so the first version used an unrounded n and every result was
+// garbage. The magic-constant method is exact and needs no library call: for
+// |x| < 2^52 the sum x + 2^52 is exactly representable with its low 52 bits
+// zero, so subtracting 2^52 rounds to the nearest integer.
+//
+// The `-> f64` on the FLOAT-returning helpers is load-bearing: an untyped
+// function whose `return` yields a float hands the caller the RAW INTEGER BITS.
+fn rint_half(x) -> f64 {
+    if x >= 4503599627370496.0 { return x }   // 2^52, already integral
+    if x <= 0.0 - 4503599627370496.0 { return x }
+    let magic = 4503599627370496.0
+    return (x + magic) - magic
+}
+fn reduce(x) -> f64 {
+    let ax = 0.0
+    if x < 0.0 { ax = 0.0 - x } else { ax = x }
+    let nf = qmult(x)
+
+    if ax < 1048576.0 {
+        // |n| < 2^20: both products exact.
+        return x - nf * pio2_1() - nf * pio2_1t()
+    }
+    if ax < 68719476736.0 {
+        // |n| < 2^36: split so the leading product stays under 2^20.
+        let nh = 0.0
+        if nf >= 1048576.0 { nh = nf - 1048576.0 } else { if nf <= 0.0 - 1048576.0 { nh = nf + 1048576.0 } else { nh = nf } }
+        let nl = nf - nh
+        return x - nh * pio2_1() - nh * pio2_1t() - nl * pio2_2() - nl * pio2_2t()
+    }
+    if ax < 140737488355328.0 {
+        // |n| < 2^47: three stages.
+        let nh = 0.0
+        if nf >= 1048576.0 { nh = nf - 1048576.0 } else { if nf <= 0.0 - 1048576.0 { nh = nf + 1048576.0 } else { nh = nf } }
+        let nl = nf - nh
+        return x - nh * pio2_1() - nh * pio2_1t() - nl * pio2_2() - nl * pio2_2t() - nf * pio2_3() - nf * pio2_3t()
+    }
+    // Beyond 2^47 the caller's own argument has lost more precision than a
+    // binary64 result can express, so a longer table buys nothing real.
+    return x - nf * pio2_1() - nf * pio2_1t()
+}
+fn main() {
+    println(f64bits(qmult(0.5)))      // comment this line out to see the defect
+    println(f64bits(reduce(0.5)))
+}

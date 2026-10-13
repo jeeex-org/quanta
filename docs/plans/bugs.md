@@ -249,16 +249,30 @@ it is tracked separately; silent clobbering in this shape is not happening.
 - If a clobber IS found: decide the semantics (arena per iteration vs leak-until-function-exit) and either
   make it safe or make it a compile error — a silent clobber is the one outcome that must not remain.
 
-### A6 · DOC · a `-> f64` user function's result can depend on what the program called earlier
+### A6 · LIVE (minimal repro saved) · a `-> f64` user function's result depends on what the program called earlier
 
 Documented at length in `docs/research/call-order-f64-defect.md` and `WIP.md`: `reduce(0.5)` is correct only
 if `qmult` was called earlier in the program; the builtin path was fixed by `as_f64_rdi()` (0d7950b6) but
 nothing equivalent exists for the *user-function* path. It holds back a complete fdlibm `sin` reduction
 (kept at `/tmp/negctl/math.sin-attempt`).
 
-- **My simple repro does not reproduce it** (`fn qmult(x: f64) -> f64` / `reduce` return 8 and 4/8 correctly
-  in both call orders), so the trigger is narrower: the fdlibm shape (2^52 magic constant + guarded early
-  returns). Verify against that file first, then bisect.
+- **CONFIRMED LIVE with a minimal repro, 0.0.235.** Built from the real bodies in
+  `/tmp/negctl/math.sin-attempt` and saved as `tests/f64_call_order_defect.quanta` (182 lines):
+
+  | program | output |
+  |---|---|
+  | `println(f64bits(reduce(0.5)))` alone | **-4336984033343832063** — garbage, and the exact value the
+    original report recorded |
+  | with a preceding `println(f64bits(qmult(0.5)))` | **4602678819172646912** — correct |
+
+  Both stable across runs and recompiles, so it is deterministic codegen keyed on call order, not
+  uninitialised memory. The trigger is `qmult`: the only callee whose body has the 2^52 magic AND the pair
+  of guarded early returns (the `pio2_*` helpers are single-expression `return f64of(...)` bodies).
+  My earlier "simple repro does not reproduce it" note stands — the reduction shape is required.
+- **Fix direction:** the builtin f64 path was fixed by `as_f64_rdi()` (0d7950b6); a `-> f64` USER function
+  is a distinct path with no equivalent. Suspected cause (from the research doc): a float vreg coalesced or
+  reused across a call boundary, with the register class decided once by the first call in the program.
+  When fixed, promote the saved repro into a gate row — it is red-first by construction.
 
 ### A7 · DOC · raw-pointer vs Quanta-string separation is unresolved
 
