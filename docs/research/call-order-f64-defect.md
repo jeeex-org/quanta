@@ -173,6 +173,25 @@ leave it 0 for a function whose signature says `-> f64`.
 scan. Adding a call (even an unreachable one) can change which function index gets which slot when the passes
 write at different times, which is exactly why a dead call in `main` changes an earlier function's arithmetic.
 
+## ELIMINATED: `fn_retflt` is NOT the difference (0.0.235)
+
+Instrumented both writers of `fn_retflt` — the declared `-> f64` scan (`helpers.quanta:441`, marker `D`), the
+per-function reset (`funcscan.quanta:1396`, marker `R` with the prior value), and the float-literal inference
+(`funcscan.quanta:1419`, marker `F1`) — and ran both isolated programs:
+
+    events: A=37  B=37      diff: EMPTY (identical event streams, identical values)
+
+So the flag ends up the same for every function in both programs, and the "two writers disagree / order changes
+which index holds what" theory is **wrong**. The declared pass tags function indices 0-8 in both, and the
+guarded resets behave identically.
+
+That leaves the consumers rather than the flag: the three `w8(vfloat+...)` tagging sites in codegen
+(`codegen.quanta:205/210/220` parameters, `382`, `981/989`, `1251` call result). The next probe is to instrument
+those sites and print `(function index, result vreg, tag after the write)` — in particular whether 1251 fires for
+the `pio2_1()`/`qmult()` calls in B, and whether `vclr()`'s per-function `vfloat` clear runs *between* the write
+and the read of that same vreg index (the tag is written while emitting one function, and `vclr()` wipes
+`vfloat` when the next function starts, so a tag that must survive into a later function's emit cannot).
+
 ## Suspected cause
 
 A float vreg is being coalesced or reused across call boundaries when the callee
