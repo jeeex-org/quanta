@@ -230,14 +230,24 @@ the 33x ratio IS the frame ratio — so the depth is fully explained by the fram
   a depth both sides survive. It PASSES on 0.0.235, so it is a regression guard, not a red-first row —
   labelled that way deliberately, because rule #16 applies to rows asserting new behaviour.
 
-### A5 · DOC · `mem_alloc` inside a loop body can be clobbered by the next iteration
+### A5 · NOT REPRODUCED (one shape) · `mem_alloc` in a loop body clobbered by the next iteration
 
 Recorded in `WIP.md` "Still open" and in this project's known-gotchas list. Allocate up front is the
 workaround, but a language whose allocator returns memory that a later iteration can reuse is a
 memory-safety defect, not a style note.
 
-- Fix approach: decide the semantics (arena per loop iteration vs leak-until-function-exit) and either make it
-  safe or make it a compile error. A silent clobber is the one outcome that must not remain.
+**Probed 0.0.235, not reproduced.** Allocate in iteration 0, store 111, allocate again in iteration 1, store
+222 into the NEW pointer, then read the OLD pointer after the loop: the old block still reads 111 (`rc=0`
+from the probe). That is what the allocator's own behaviour predicts — `mem_alloc` never pops its freed
+list (recorded in `docs/AUDIT_ROADMAP.md` as "leaks every freed block"), so it bump-allocates and hands
+out fresh blocks rather than reusing a live one. Runaway *growth* is the consequence of that design, and
+it is tracked separately; silent clobbering in this shape is not happening.
+
+- **Still needs the original repro before it can be called live or stale.** One shape was tested; the WIP
+  note that raised this may describe a different pattern (e.g. interaction with scope-exit `IR_FREE`, or a
+  `mem_free` followed by re-allocation). Whoever has that shape should attach it here.
+- If a clobber IS found: decide the semantics (arena per iteration vs leak-until-function-exit) and either
+  make it safe or make it a compile error — a silent clobber is the one outcome that must not remain.
 
 ### A6 · DOC · a `-> f64` user function's result can depend on what the program called earlier
 
