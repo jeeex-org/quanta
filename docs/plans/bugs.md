@@ -269,10 +269,22 @@ nothing equivalent exists for the *user-function* path. It holds back a complete
   uninitialised memory. The trigger is `qmult`: the only callee whose body has the 2^52 magic AND the pair
   of guarded early returns (the `pio2_*` helpers are single-expression `return f64of(...)` bodies).
   My earlier "simple repro does not reproduce it" note stands — the reduction shape is required.
-- **Fix direction:** the builtin f64 path was fixed by `as_f64_rdi()` (0d7950b6); a `-> f64` USER function
-  is a distinct path with no equivalent. Suspected cause (from the research doc): a float vreg coalesced or
-  reused across a call boundary, with the register class decided once by the first call in the program.
-  When fixed, promote the saved repro into a gate row — it is red-first by construction.
+- **MECHANISM CONFIRMED (0.0.235), at the instruction level.** An **unreachable** `qmult` call fixes the
+  result, so the trigger is compile-time bookkeeping, not execution; the two binaries are the same size and
+  differ only in re-encodings. The site:
+
+  | program | emitted code |
+  |---|---|
+  | no `qmult` call anywhere | `f2 48 0f 2a c0  cvtsi2sd %rax,%xmm0` — **converts** it |
+  | with a dead `qmult` call | `66 48 0f 6e c0  movq %rax,%xmm0` — **moves** the bits |
+
+  The value is an f64 bit pattern already in a GPR (what `f64of(<bits>)` produces); `movq` is correct and
+  `cvtsi2sd` mangles it. Which one is emitted comes from a GLOBAL "has a `-> f64` call been compiled"
+  flag rather than from the value's `vfloat` tag — that is "first call wins", and it is why a dead call in an
+  unrelated function changes another function's arithmetic.
+- **Fix direction:** drive that encoding from `vfloat[vreg]` (the tag the value actually carries), the same way
+  the builtin path is driven by `as_f64_rdi()` (0d7950b6). When fixed, promote the saved repro into a gate row —
+  it is red-first by construction.
 
 ### A7 · DOC · raw-pointer vs Quanta-string separation is unresolved
 

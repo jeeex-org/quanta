@@ -64,6 +64,29 @@ Every individual step is correct when executed alone:
 
 So the arithmetic is right and the codegen loses it.
 
+## MECHANISM CONFIRMED at the instruction level (0.0.235)
+
+Two isolated programs, identical except that A contains an **unreachable** `qmult` call and B does not:
+
+    A  fn main() { if 0 == 1 { println(f64bits(qmult(0.5))) } println(f64bits(reduce(0.5))) }
+    B  fn main() { println(f64bits(reduce(0.5))) }
+
+    A -> 4602678819172646912   (correct)      B -> -4336984033343832063   (garbage)
+
+**The dead, never-executed call fixes it.** So the trigger is compile-time bookkeeping, not execution —
+and the two binaries are the same size (8912 bytes, 835 differing bytes), so nothing is added, only
+re-encoded. Diffing the instruction streams isolates the site:
+
+    B : f2 48 0f 2a c0   cvtsi2sd %rax,%xmm0     <- CONVERTS the value (int -> double)
+    A : 66 48 0f 6e c0   movq     %rax,%xmm0     <- MOVES the bits
+
+The value here is an f64 **bit pattern already in a GPR** — exactly what `f64of(<bits>)` produces, and what
+`return f64of(...)` bodies like `pio2_1()` return. The correct encoding is `movq`; B instead converts the bit
+pattern as if it were an integer, which is where the garbage comes from. Which encoding is emitted is decided
+by a GLOBAL flag reflecting whether a `-> f64` call has been compiled *somewhere in the program*, not by the
+value's own `vfloat` tag — hence "first call wins", and hence why a dead call in an unrelated function changes
+another function's arithmetic.
+
 ## Suspected cause
 
 A float vreg is being coalesced or reused across call boundaries when the callee
