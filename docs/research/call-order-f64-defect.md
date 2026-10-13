@@ -236,6 +236,39 @@ Next step is therefore a read, not a build: instrument `1015`/`1098` and the `fo
 `(op, ira0, ira1, irres)` and see which op produced the untagged value in program B. That names the missing
 case, and the fix is to add it to this pass — extending the propagation, not writing a one-off tag.
 
+## ROOT CAUSE (0.0.235): an UNTYPED parameter used as a float — and two failed fix locations
+
+**Confirmed root cause.** `fn qmult(x) -> f64 { let y = x * (2.0 / 3.14159265358979323846) ... }` — the parameter
+is written **without `: f64`**. Annotating it `: f64` alone makes the failing program print the correct
+4602678819172646912, and drops the untagged-conversion count from 2 to 1 (matching the program that works). The
+parameter-tagging case at `codegen.quanta:1123-1137` only covers parameters **declared** `: f64`, and nothing
+else supplies the tag, so `x` reaches the SSE multiply with `vfloat[x]==0` and `fopld_rr` emits `cvtsi2sd` over an
+f64 bit pattern. The "call-order sensitivity" was a red herring: an unreachable call in another function
+happened to tag that vreg index by a different route.
+
+Instrumented proof of which site fires: `fopld_rr`'s register-case decision printed an untagged conversion
+**inside `qmult`** on operand vreg 0, once in the working program and **twice** in the failing one.
+
+### Fix location 1 — REJECTED (the tag pass is the wrong place)
+
+Added the natural inference rule to the `changed=1` pass (`ira0`/`ira1` one-sided float evidence for
+IR_ADD/IR_SUB/IR_MUL). Result: **byte-identical output for the failing program** (0 differing bytes, same
+`cvtsi2sd` count of 2), i.e. the rule never fired. The reason is in the trace: the f64 **constant** beside `x` is
+not tagged at that point either, so "one operand is an f64" has no evidence to propagate from. A pass-level rule
+cannot infer from information the pass does not have. Patch reverted.
+
+### Fix location 2 — the SSE operand load (where the fix belongs)
+
+The op itself is already being emitted as SSE, so the emitter **knows** the operation is float while only one
+operand carries the tag. The load that must not re-decide from `vfloat` is the `fopld_rr` call in the SSE path
+(`codegen.quanta:1418-1420`, `1647-1650`): when one operand is known to be an f64, the other must be loaded as a
+raw bit pattern (`fld_x`), not converted. Equivalent statement: the declared type is the source of truth — the
+rule the IR_PARAM case already follows for annotated parameters.
+
+Cheapest first step for it: tag the sibling operand at the SSE emit site (one line beside each `fopld_rr` call),
+then confirm with the same binary-diff probe used above — the `cvtsi2sd` count for the failing program must drop
+from 2 to 1 and the saved repro must print 4602678819172646912 without the dead call.
+
 ## Suspected cause
 
 A float vreg is being coalesced or reused across call boundaries when the callee
