@@ -1,0 +1,34 @@
+import std/fs
+import std/pool
+
+// Test memory pool: alloc, reset, reuse
+fn main() {
+    pool_init(1024 * 1024)  // 1MB pool
+    
+    // Allocate some buffers
+    let a = pool_alloc(2048 * 8)
+    if a == 0 { return 1 }
+    
+    let b = pool_alloc(4096 * 8)
+    if b == 0 { return 1 }
+    
+    // Write to them
+    mem_store(a, i2f(42))
+    mem_store(b, i2f(99))
+    
+    // Verify
+    if mem_load(a) != i2f(42) { return 1 }
+    if mem_load(b) != i2f(99) { return 1 }
+    
+    // Reset and reuse
+    pool_reset()
+    
+    let c = pool_alloc(1024 * 8)
+    if c == 0 { return 1 }
+    
+    mem_store(c, i2f(123))
+    if mem_load(c) != i2f(123) { return 1 }
+    
+    pool_free()
+    return 0
+}

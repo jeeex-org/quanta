@@ -29,25 +29,25 @@ import std/math
 let MODEL = "/opt/ai/models/quanta/QUANTA-LFM2.5-2.6Bv1-Q4_K_M.gguf"
 
 fn main() {
-    if gguf_load(MODEL) != 0 { print("FAIL gguf_load"); return 1 }
+    if gguf_load(MODEL) != 0 { printi(f64bits("FAIL gguf_load")); return 1 }
 
     // ---- 1. f32 metadata --------------------------------------------------
     let rb = gguf_kv_find("lfm2.rope.freq_base")
-    if rb < 0 { print("FAIL no rope.freq_base"); return 1 }
+    if rb < 0 { printi(f64bits("FAIL no rope.freq_base")); return 1 }
     let rope = gguf_kv_float(rb)
     // 1e7 exactly. Compared as bits: any denormal or zero fails this.
     if rope <= 9999999.0 || rope >= 10000001.0 {
         prints("FAIL rope_base bits=")
-        print(rope)
+        printi(f64bits(rope))
         return 1
     }
     let eb = gguf_kv_find("lfm2.attention.layer_norm_rms_epsilon")
-    if eb < 0 { print("FAIL no rms eps"); return 1 }
+    if eb < 0 { printi(f64bits("FAIL no rms eps")); return 1 }
     let eps = gguf_kv_float(eb)
     // 1e-5. The old bug denormalised this to ~1e-315, which printed 0.000000.
     if eps <= 0.0 || eps >= 0.001 {
         prints("FAIL rms_eps bits=")
-        print(eps)
+        printi(f64bits(eps))
         return 1
     }
 

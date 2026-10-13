@@ -75,7 +75,7 @@ capture runs fine, and a capturing closure called *once* runs fine — which is 
 
 ### A1b · OPEN · block bindings are never popped, so an inner `let` clobbers an outer name
 
-### A2 · LIVE · `print` on an `f64` emits the raw bit pattern, not the value
+### A2 · FIXED (0.0.235) · `print` on an `f64` emitted the raw bit pattern, not the value
 
 ```quanta
 print(fadd(i2f(3), i2f(2)))     // prints 4617315517961601024, expected 5
@@ -95,8 +95,44 @@ in `docs/research/native-inference-gaps.md` §6 ("`print` is BROKEN for all f64"
 
 `docs/RELEASE_CHECKLIST.md` §4 smoke test is exactly the first row, so **the release smoke has been passing for
 the wrong reason** — it asserted a value it never observed. Fixed in 0.0.234 by writing `exit(f2i(p))` in the
-checklist, and §4 now carries a note saying why. The underlying conversion (`exit`/`print` on a float) is still
-A2 and still open.
+checklist, and §4 now carries a note saying why.
+
+**Fix (0.0.235) — a compile error, not auto-formatting.** The generic printers already dispatch on the vreg
+tags; a float simply had no branch and fell into the integer path. Two ways to close that and the choice
+matters: auto-rendering the value (`print(5.0)` -> `5.000000`) hides the type, and a systems language that
+silently picks a float format is how the original trap got written in the first place. So the tag is checked at
+compile time and the six handlers that could write a float **refuse it**, naming both correct routes:
+
+| handler | message names |
+|---|---|
+| `print`, `echo`, `println` (1-arg, non-string) | `print_f(x)` (decimal, `std/fs`) and `f64bits(x)` (exact bits) |
+| `printi`, `printsp` (the explicit integer printers) | same |
+| `exit` | `exit(f2i(x))` — it previously passed the bit pattern to the exit syscall, which takes the low byte, so `exit(5.0)` exited **0** |
+
+Both routes were verified working before the guards were trusted: `print_f` prints `5.000000` and
+`f64bits(x)` prints `4617315517961601024` for the same value, and `f64bits` is a builtin, so bit-exact IEEE
+testing is unaffected.
+
+**The sweep was done with the compiler as the oracle, not by eye.** 28 files in the tree printed a float
+(`tests/`, `benchmarks/`, `test_suites/codes`). The refusal now names the offending line **and its source
+text**, which is what made an exact sweep possible: the token arena has no line field (`tokln` is the token's
+LENGTH — `funcscan` reads it as a module-name length), and a bare line number is ambiguous once `import` pulls
+modules in (`std_context_budget_test` reported line 8161 for a ~150-line file). Text needs no mapping.
+
+Result: **all 28 compile**, and **27 of them were verified byte-identical** in runtime output against the
+original code compiled by 0.0.234 (`f64bits` reproduces the old bit pattern exactly); the 28th
+(`tests/test_float_bench.quanta`) prints a timing measurement — its `result=` line matches and only
+`ns_per_iter` differs. Two rewrite classes were caught and reverted by that diff rather than shipped: wrapping
+a **string** argument (a label became a printed pointer — 7 files) and wrapping an **int** argument. Both are
+now excluded in the rewriter, and the diff is the standing check.
+
+**Gate coverage:** new stage `float-print` — two negative probes (a float to `print` and to `exit` must each be
+rejected with the right message) plus a positive control asserting `print_f` and `f64bits` agree
+(`5.000000 4617315517961601024`). Negative rows are the right shape here: on 0.0.234 the probes *compiled*, so
+the stage is red before the fix and green after.
+
+**Not done, deliberately:** `print(x)` auto-formatting a float as a decimal. It is an ergonomics upgrade with a
+format to choose (six decimals? shortest round-trip?), not a defect fix — recorded here rather than smuggled in.
 
 ---
 

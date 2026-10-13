@@ -1,0 +1,75 @@
+import std/model_size
+import std/gguf
+import std/fs
+
+// Phase 11.1 -- model size class.
+//
+// The tiers come from HashCortX (src/platform/tauri/hashcoder.js:1067):
+//   < 5B small, 5B-15B mid, >= 15B full, and -- the rule that matters most --
+//   an UNKNOWN count is 'full', never 'small'. Falling back to small would strip
+//   tools from a large model purely because we failed to measure it, which is
+//   the worst failure mode: a silent capability cut that reads as policy.
+//
+// The count itself is Quanta's improvement on the reference: the exact
+// parameter count is the sum of element counts over the tensor table the loader
+// already holds, so no name parsing is needed. HashCortX has to parse "7b" out
+// of a filename because it did not load the model.
+//
+// Tests the boundaries exactly, because the boundaries are the whole point:
+// 5B must be 'mid' and 15B must be 'full', not the other way round.
+
+// Numeric id, not a string label: print() on a string pointer emits an ADDRESS,
+// so a label-based failure cannot identify itself. This never fired while the
+// checks all passed, which is exactly how such a flaw stays invisible.
+fn chk(id: i64, got: i64, want: i64) -> i64 {
+    if got == want { return 0 }
+    print("FAIL check #")
+    print(id)
+    print(" got ")
+    print(got)
+    print(" want ")
+    print(want)
+    print("\n")
+    return 1
+}
+
+fn main() -> i64 {
+    let bad = 0
+
+    // --- unknown must never degrade a model ---
+    bad = bad + chk(1, qsize_class_of(0), QSIZE_FULL)
+    bad = bad + chk(2, qsize_class_of(0 - 1), QSIZE_FULL)
+
+    // --- the boundaries themselves ---
+    bad = bad + chk(3, qsize_of_billions(1), QSIZE_SMALL)
+    bad = bad + chk(4, qsize_class_of(4990000000), QSIZE_SMALL)
+    bad = bad + chk(5, qsize_of_billions(5), QSIZE_MID)
+    bad = bad + chk(6, qsize_of_billions(7), QSIZE_MID)
+    bad = bad + chk(7, qsize_of_billions(15), QSIZE_FULL)
+    bad = bad + chk(8, qsize_of_billions(70), QSIZE_FULL)
+    bad = bad + chk(9, qsize_of_billions(671), QSIZE_FULL)
+
+    // --- a real model, counted from the tensor table ---
+    // file_exists() is not in std/fs (it lives in the SI modules), so the load
+    // result is the availability signal: a missing corpus is not a test failure.
+    // The boundary checks above are the part that must always run.
+    let path = "/opt/ai/models/quanta/QUANTA-LFM2.5-2.6Bv1-Q4_K_M.gguf"
+    if gguf_load(path) == 0 {
+        let n = gguf_param_count()
+        print("param count = ")
+        print(n)
+        print("\n")
+        // 2.70B for a model named 2.6B -- the sum is real, not a guess.
+        if n < 2000000000 || n > 3500000000 {
+            print("FAIL: parameter count outside the expected 2-3.5B range\n")
+            bad = bad + 1
+        }
+        bad = bad + chk(10, gguf_size_class(), QSIZE_SMALL)
+        gguf_close()
+    } else {
+        print("note: LFM2 model absent, boundary checks only\n")
+    }
+
+    if bad == 0 { print("OK model_size\n") }
+    return bad
+}

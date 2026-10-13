@@ -1,0 +1,23 @@
+// unsigned_ops: udiv/umod/ult/ugt/ulte/ugte + u8/u32/u64 truncation builtins
+// (P4 required all of them ported into arm_emit_bltn).
+fn main() {
+  // treat -1 as unsigned max: -1 udiv 2 = 0x7FFF...
+  let m = 0-1
+  if ult(m, 1) != 0 { return 1 }    // max < 1 unsigned: false
+  if ugt(m, 1) != 1 { return 2 }    // max > 1 unsigned: true
+  if ulte(5, 5) != 1 { return 3 }
+  if ugte(5, 6) != 0 { return 4 }
+  if udiv(100, 7) != 14 { return 5 }
+  if umod(100, 7) != 2 { return 6 }
+  // -8 udiv 2: high-bit-set value halves without sign extension
+  let big = 0-8
+  let h = udiv(big, 2)
+  if ugt(h, 0) != 1 { return 7 }
+  if h == big/2 { return 8 }        // must differ from signed division
+  // truncations
+  if u8(511) != 255 { return 9 }
+  if u8(256) != 0 { return 10 }
+  if u32(4294967296 + 5) != 5 { return 11 }
+  if u64(7) != 7 { return 12 }
+  return 0
+}

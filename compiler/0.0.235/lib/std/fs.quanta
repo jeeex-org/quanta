@@ -1,0 +1,319 @@
+// std/fs - file I/O over the existing file_* builtins (syscalls:
+// open=2, read=0, write=1, close=3). Quanta talks to the OS directly (no libc).
+// Import with:  import std/fs
+//
+// NOTE: Quanta strings are length-prefixed, NOT null-terminated, and store their
+// bytes at [ptr+8]. The syscalls expect C-strings (null-terminated) and raw byte
+// buffers, so the wrappers below convert: open() null-terminates the path, and
+// write_str()/read_str() address the byte buffer at ptr+8.
+
+// open(path, flags, mode): null-terminate `path`, return fd (i64) or -1.
+fn open(path, flags, mode) {
+  let n = len(path)
+  let cp = mem_alloc((n + 1 + 7) / 8)
+  let i = 0
+  while i < n { mem_store8(cp + 8 + i, mem_load8(path + 8 + i)); i = i + 1 }
+  mem_store8(cp + 8 + n, 0)            // C null terminator
+  return file_open(cp + 8, flags, mode)
+}
+
+// write_str(fd, s): write the bytes of string s. Returns bytes written.
+fn write_str(fd, s) {
+  return file_write(fd, s + 8, len(s))
+}
+
+// read_str(fd, max): read up to `max` bytes into a fresh string. Returns it.
+fn read_str(fd, max) {
+  let buf = mem_alloc((max + 9 + 7) / 8)
+  let n = file_read(fd, buf + 8, max)
+  mem_store(buf, n)                    // header: actual bytes read
+  return buf
+}
+
+// Low-level raw read into a caller-provided buffer (from mem_alloc). Returns bytes.
+fn read_raw(fd, buf, count) {
+  return file_read(fd, buf, count)
+}
+
+// Low-level raw write from a caller-provided byte buffer. Returns bytes.
+fn write_raw(fd, buf, count) {
+  return file_write(fd, buf, count)
+}
+
+fn close(fd) {
+  return file_close(fd)
+}
+
+// --- 0.0.129: missing fs ops (FIX partial core) ---
+// All wrappers null-terminate the path(s) the same way open() does, then call
+// the corresponding file_* syscall builtin. Return values follow POSIX:
+// 0 = success, -errno = failure.
+
+// stat(path, buf): buf must be a byte buffer >= 144 bytes (struct stat on x86-64).
+// Returns 0 on success, -errno on failure.
+fn stat(path, buf) {
+  let n = len(path)
+  let cp = mem_alloc((n + 1 + 7) / 8)
+  let i = 0
+  while i < n { mem_store8(cp + 8 + i, mem_load8(path + 8 + i)); i = i + 1 }
+  mem_store8(cp + 8 + n, 0)
+  return file_stat(cp + 8, buf)
+}
+
+// unlink(path): delete a file. Returns 0 / -errno.
+fn unlink(path) {
+  let n = len(path)
+  let cp = mem_alloc((n + 1 + 7) / 8)
+  let i = 0
+  while i < n { mem_store8(cp + 8 + i, mem_load8(path + 8 + i)); i = i + 1 }
+  mem_store8(cp + 8 + n, 0)
+  return file_unlink(cp + 8)
+}
+
+// mkdir(path, mode): create a directory. Returns 0 / -errno.
+fn mkdir(path, mode) {
+  let n = len(path)
+  let cp = mem_alloc((n + 1 + 7) / 8)
+  let i = 0
+  while i < n { mem_store8(cp + 8 + i, mem_load8(path + 8 + i)); i = i + 1 }
+  mem_store8(cp + 8 + n, 0)
+  return file_mkdir(cp + 8, mode)
+}
+
+// chdir(path): change working directory. Returns 0 / -errno.
+fn chdir(path) {
+  let n = len(path)
+  let cp = mem_alloc((n + 1 + 7) / 8)
+  let i = 0
+  while i < n { mem_store8(cp + 8 + i, mem_load8(path + 8 + i)); i = i + 1 }
+  mem_store8(cp + 8 + n, 0)
+  return file_chdir(cp + 8)
+}
+
+// rename(old, new): move/rename a file or directory. Returns 0 / -errno.
+fn rename(oldp, newp) {
+  let no = len(oldp)
+  let co = mem_alloc((no + 1 + 7) / 8)
+  let i = 0
+  while i < no { mem_store8(co + 8 + i, mem_load8(oldp + 8 + i)); i = i + 1 }
+  mem_store8(co + 8 + no, 0)
+  let nn = len(newp)
+  let cn = mem_alloc((nn + 1 + 7) / 8)
+  let j = 0
+  while j < nn { mem_store8(cn + 8 + j, mem_load8(newp + 8 + j)); j = j + 1 }
+  mem_store8(cn + 8 + nn, 0)
+  return file_rename(co + 8, cn + 8)
+}
+
+// rmdir(path): remove an empty directory. Returns 0 / -errno.
+fn rmdir(path) {
+  let n = len(path)
+  let cp = mem_alloc((n + 1 + 7) / 8)
+  let i = 0
+  while i < n { mem_store8(cp + 8 + i, mem_load8(path + 8 + i)); i = i + 1 }
+  mem_store8(cp + 8 + n, 0)
+  return file_rmdir(cp + 8)
+}
+
+// lseek(fd, offset, whence): reposition file offset. Returns new offset or -errno.
+fn lseek(fd, offset, whence) {
+  return file_lseek(fd, offset, whence)
+}
+
+// fstat(fd, buf): get file status from fd. buf must be >= 144 bytes.
+fn fstat(fd, buf) {
+  return file_fstat(fd, buf)
+}
+
+// mmap_file(addr, len, prot, flags, fd, offset): memory map a file.
+// Returns the mapped address, or a negative errno (e.g. -22 EINVAL on a bad
+// length, -9 EBADF on a closed fd). Check `p < 0`, do not compare to -1.
+//
+// NOTE: the name is deliberately NOT `mmap`. The compiler has a 1-argument
+// anonymous-mapping builtin named `mmap` (features.quanta is_builtin / the
+// emitter's syscall-9 path); a 6-argument call spelled `mmap` would be claimed
+// by that builtin and silently map `size` bytes of anonymous memory instead of
+// the file. Distinct names keep the two unambiguous.
+fn mmap_file(addr, len, prot, flags, fd, offset) {
+  return syscall(9, addr, len, prot, flags, fd, offset)
+}
+
+// munmap(addr, len): unmap a mapping. Returns 0, or a negative errno.
+// Same naming reason as mmap_file -- there is no user-level `munmap` builtin,
+// but keeping the pair together avoids anyone re-deriving this trap.
+fn munmap_file(addr, len) {
+  return syscall(11, addr, len, 0, 0, 0, 0)
+}
+
+// file_size(fd): size in bytes via lseek(SEEK_END). Corrects the previous
+// approach of reading st_size out of an fstat buffer: file_stat/fstat returns
+// EFAULT on this target and leaves the buffer untouched, so every caller that
+// sized a buffer from it got 0. lseek(SEEK_END) is exact and cheap.
+// The file offset is left unchanged (SEEK_END is a query here, restored to 0).
+fn file_size(fd) {
+  let sz = file_lseek(fd, 0, 2)
+  file_lseek(fd, 0, 0)
+  return sz
+}
+
+// mem_load32(p): read a little-endian u32/i32 from memory.
+//
+// Why this exists: `mem_load(p)` reads a full 8-byte qword, so it is WRONG for
+// any 32-bit field. GGUF is full of them (value types, n_dims, tensor dims,
+// most KV scalars), and over-reading by 4 bytes there silently corrupts the
+// next field instead of faulting -- which is what desynchronized the metadata
+// walk in test_mmap_loader.
+//
+// Implemented with the 4 x mem_load8 reads rather than a 4-byte mov so it does
+// not depend on unaligned-load support. `u32()` exists as a builtin but only
+// masks an already-loaded VALUE; it is not a memory read and must not be
+// called with a pointer.
+fn mem_load32(p) {
+  let b0 = mem_load8(p)
+  let b1 = mem_load8(p + 1)
+  let b2 = mem_load8(p + 2)
+  let b3 = mem_load8(p + 3)
+  return b0 + b1 * 256 + b2 * 65536 + b3 * 16777216
+}
+
+// mem_load16(p): read a little-endian u16/i16. Same rationale as mem_load32.
+fn mem_load16(p) {
+  let b0 = mem_load8(p)
+  let b1 = mem_load8(p + 1)
+  return b0 + b1 * 256
+}
+
+// f16_to_f64(p): decode a little-endian IEEE-754 binary16 stored at `p`.
+//
+// Required by every quantised GGUF block: Q8_0, Q4_K, Q6_K and Q5_K all lead
+// their block with an f16 scale. There was no half-precision reader anywhere in
+// the tree, so every quantised tensor was unreadable.
+//
+// IEEE-754 binary16 layout: sign(1) exp(5, bias 15) frac(10).
+//   exp==0    -> subnormal/zero: value = frac * 2^-24
+//   exp==31   -> inf (frac==0) or NaN (frac!=0)
+//   otherwise -> (-1)^sign * (1 + frac/1024) * 2^(exp-15)
+fn f16_to_f64(p) {
+  // Widen an IEEE 754 binary16 to binary64. Every binary16 is exactly
+  // representable in binary64, so this is a widening with no rounding: only
+  // exponent rebasing and a mantissa shift.
+  //
+  // THIS FUNCTION HAD THREE DEFECTS, all of which produced plausible numbers:
+  //
+  //  1. `let exp = bits / 1024` never masked to 5 bits. `bits` is 0..65535, so
+  //     bits/1024 is 0..63 and the SIGN BIT leaks into the exponent. For 0xC000
+  //     (-2.0) it gave exp = 48 instead of 16, e = 33 instead of 1, and returned
+  //     -8589934592.0 = -2 * 2^32. Every NEGATIVE half was wrong.
+  //
+  //  2. Inf and NaN were faked: `return sign * 1.0e308` for Inf and `return 0.0`
+  //     for NaN. A caller that checks for infinity with `> 1e308` works by
+  //     accident, but `Inf - Inf` does not produce NaN and `Inf * 0` does not
+  //     produce NaN, so any arithmetic on an f16 Inf silently gives a finite
+  //     number. Both are synthesised properly now.
+  //
+  //  3. The subnormal scale was the decimal literal 1e-27, which is not 2^-24
+  //     (5.9604644775390625e-08). Every subnormal half was off by 19 orders of
+  //     magnitude.
+  let bits = mem_load16(p)
+  let sign = 1.0
+  if bits >= 32768 { sign = -1.0 }
+  let exp = (bits / 1024) - ((bits / 1024) / 32) * 32   // (bits >> 10) & 31
+  let frac = bits - (bits / 1024) * 1024               // bits & 1023
+
+  if exp == 31 {
+    // Inf when frac == 0, NaN otherwise. 2^1023 is the largest finite f64, so
+    // one more doubling overflows to exactly +Inf; Inf - Inf is the canonical
+    // quiet NaN.
+    let pinf = 1.0
+    let n = 0
+    while n < 1023 { pinf = pinf * 2.0; n = n + 1 }
+    pinf = pinf * 2.0
+    if frac != 0 {
+      // Inf - Inf gives x87's indefinite value 0xC000000000000000, a NEGATIVE
+      // quiet NaN, so a positive input NaN came out with its sign flipped.
+      // Build the NaN from its bits: exponent all ones, quiet bit set, sign from
+      // the input. 0x7FF8000000000000 = 9221120237041090560. (The first constant
+      // written here was 2251799813685248 = 2^51, a small NORMAL float, not a
+      // NaN -- the exponent field was 0, not 2047.)
+      if sign < 0.0 { return f64of(0 - 9221120237041090560) }
+      return f64of(9221120237041090560)
+    }
+    if sign < 0.0 { return 0.0 - pinf }
+    return pinf
+  }
+
+  if exp == 0 {
+    // Signed zero, or a subnormal: value = sign * frac * 2^-24. Build the scale
+    // by exact halving rather than from a decimal literal.
+    if frac == 0 {
+      if sign < 0.0 { return 0.0 * -1.0 }
+      return 0.0
+    }
+    let scale = 1.0
+    let n = 0
+    while n < 24 { scale = scale / 2.0; n = n + 1 }
+    return sign * (frac * scale)
+  }
+
+  let mant = 1.0 + frac / 1024.0
+  // 2^(exp-15) by exact squaring on the integer exponent.
+  let e = exp - 15
+  let p2 = 1.0
+  if e > 0 {
+    let n = e
+    while n > 0 { p2 = p2 * 2.0; n = n - 1 }
+  }
+  if e < 0 {
+    let n = 0 - e
+    while n > 0 { p2 = p2 / 2.0; n = n - 1 }
+  }
+  return sign * mant * p2
+}
+
+
+// print_f(v: f64): print a float VALUE as decimal with six fractional digits.
+//
+// There was no float formatter anywhere in the tree, so every float result had
+// to be read as its raw bit pattern -- which makes a 1-ULP error
+// indistinguishable from a 100x one. Needed to validate dequant output.
+//
+// The sign is emitted separately and the magnitude is printed, so the
+// fractional digits never go negative and borrow back through the integer
+// part (which a naive `v = -v` rounding causes).
+fn print_f(v: f64) {
+    if v == 0.0 {
+        print("0.000000")
+        return
+    }
+    let neg = 0
+    let m = v
+    if m < 0.0 {
+        neg = 1
+        m = 0.0 - m
+    }
+    if neg == 1 { print("-") }
+
+    let ip = 0
+    while m >= 1.0 {
+        m = m - 1.0
+        ip = ip + 1
+    }
+    printi(ip)
+    print(".")
+
+    // Six fractional digits, each from a multiply-by-ten so rounding does not
+    // accumulate across digits. Digit extraction truncates; the residual
+    // fraction is carried into the next digit, which is what keeps 0.008069
+    // from printing as 0.008068.
+    let k = 0
+    while k < 6 {
+        m = m * 10.0
+        let d = 0
+        while m >= 1.0 {
+            m = m - 1.0
+            d = d + 1
+        }
+        printi(d)
+        k = k + 1
+    }
+}

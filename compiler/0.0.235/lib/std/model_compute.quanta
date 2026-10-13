@@ -1,0 +1,248 @@
+// std/model_compute.quanta -- tensor-role to compute mapping (Phase 5).
+// Each role maps to a tensor kind, and each kind has a fixed compute path.
+// No function pointers, no branching on role at inference time.
+
+import std/math
+import std/model_arch
+import std/lfm2_mm
+
+// =====================================================================
+// TENSOR KIND ENUM (shared with model_arch)
+// =====================================================================
+const KIND_MATRIX      = 1  // [rows, cols] -- mm_matvec
+const KIND_MATRIX_T    = 2  // [cols, rows] -- mm_matvec_t (transposed)
+const KIND_VECTOR      = 3  // [n] -- elementwise add/mul
+const KIND_STATE       = 4  // per-layer recurrent state -- state update
+const KIND_ROUTER      = 5  // router indices / probs -- special
+
+// =====================================================================
+// ALIGNMENT / GROUP SIZE PER KIND
+// =====================================================================
+// Equivalent to llama.cpp's get_tp_alignment / get_type_traits.
+// Quantized tensors must declare their group size for correct dequant.
+// Alignment in bytes for the base pointer.
+fn kind_alignment(kind: i64) -> i64 {
+    if kind == KIND_MATRIX   { return 32 }  // 32-byte aligned for SIMD
+    if kind == KIND_MATRIX_T { return 32 }
+    if kind == KIND_VECTOR   { return 16 }
+    if kind == KIND_STATE    { return 64 }  // state may be larger
+    if kind == KIND_ROUTER   { return 16 }
+    return 32
+}
+
+// Group size for quantized tensors of this kind
+fn kind_group_size(kind: i64) -> i64 {
+    if kind == KIND_MATRIX   { return 32 }  // typical GGUF group size
+    if kind == KIND_MATRIX_T { return 32 }
+    if kind == KIND_VECTOR   { return 0 }   // vectors usually not quantized
+    if kind == KIND_STATE    { return 0 }
+    if kind == KIND_ROUTER   { return 0 }
+    return 32
+}
+
+// =====================================================================
+// COMPUTE OPERATIONS PER KIND
+// =====================================================================
+
+// mm_matvec: y = A @ x where A is [rows, cols], x is [cols], y is [rows]
+// A is row-major: row i starts at A + i * cols * element_size
+// This is the standard forward pass for weight matrices.
+// dst must have space for rows elements.
+fn mc_matvec(A: u64, rows: i64, cols: i64, x: u64, dst: u64) {
+    let i = 0
+    while i < rows {
+        // Dot product of A[i, :] with x. Follows the proven pattern in
+        // lfm2_mm.quanta::mm_matvec: the accumulator MUST be typed f64 and the
+        // loads MUST be inlined into the expression. An untyped accumulator
+        // takes the integer path; an untyped intermediate holding raw bits
+        // faults. Both were hit here.
+        let acc: f64 = 0.0
+        let j = 0
+        while j < cols {
+            acc = acc + f64of(mem_load(A + (i * cols + j) * 8)) * f64of(mem_load(x + j * 8))
+            j = j + 1
+        }
+        mem_store(dst + i * 8, acc)
+        i = i + 1
+    }
+}
+
+// mm_matvec_t: y = A^T @ x where A is [rows, cols] (stored transposed: [cols, rows])
+// x is [rows], y is [cols]
+fn mc_matvec_t(A: u64, rows: i64, cols: i64, x: u64, dst: u64) {
+    // A is stored as [cols, rows] so A[j, i] = A_transposed[j * rows + i]
+    let j = 0
+    while j < cols {
+        let sum: f64 = 0.0
+        let i = 0
+        while i < rows {
+            // A_transposed[j, i] = A[j * rows + i]
+            let a = mem_load(A + (j * rows + i) * 8)
+            let xv = mem_load(x + i * 8)
+            sum = sum + f64of(a) * f64of(xv)
+            i = i + 1
+        }
+        mem_store(dst + j * 8, sum)
+        j = j + 1
+    }
+}
+
+// elementwise_add: dst = a + b (in-place on dst)
+fn elementwise_add(dst: u64, a: u64, b: u64, n: i64) {
+    let i = 0
+    while i < n {
+        let av: f64 = f64of(mem_load(a + i * 8))
+        let bv: f64 = f64of(mem_load(b + i * 8))
+        mem_store(dst + i * 8, av + bv)
+        i = i + 1
+    }
+}
+
+// elementwise_mul: dst = a * b (in-place on dst)
+fn elementwise_mul(dst: u64, a: u64, b: u64, n: i64) {
+    let i = 0
+    while i < n {
+        let av: f64 = f64of(mem_load(a + i * 8))
+        let bv: f64 = f64of(mem_load(b + i * 8))
+        mem_store(dst + i * 8, av * bv)
+        i = i + 1
+    }
+}
+
+// rms_norm: dst = (x * rsqrt(mean(x^2))) * w
+// x: [n], w: [n], dst: [n]
+fn rms_norm(dst: u64, x: u64, w: u64, n: i64) {
+    // mean of squares
+    let sum_sq: f64 = 0.0
+    let i = 0
+    while i < n {
+        let xv: f64 = f64of(mem_load(x + i * 8))
+        sum_sq = sum_sq + xv * xv
+        i = i + 1
+    }
+    let mean_sq: f64 = sum_sq / i2f(n)
+    let scale: f64 = 1.0 / sqrtf(mean_sq)
+    
+    i = 0
+    while i < n {
+        let xv: f64 = f64of(mem_load(x + i * 8))
+        let wv: f64 = f64of(mem_load(w + i * 8))
+        mem_store(dst + i * 8, xv * scale * wv)
+        i = i + 1
+    }
+}
+
+// silu: dst = x * sigmoid(x)
+fn silu(dst: u64, x: u64, n: i64) {
+    let i = 0
+    while i < n {
+        let xv: f64 = f64of(mem_load(x + i * 8))
+        let sig: f64 = 1.0 / (1.0 + expf(-xv))
+        mem_store(dst + i * 8, xv * sig)
+        i = i + 1
+    }
+}
+
+// rope_apply: apply RoPE to query/key vectors
+// x: [n_head, head_dim], freqs: [n_pos, head_dim/2], dst: [n_head, head_dim]
+// NEOX half-split: component i pairs with i + head_dim/2
+fn rope_apply(x: u64, freqs: u64, dst: u64, n_head: i64, head_dim: i64, pos: i64) {
+    let half = head_dim / 2
+    let h = 0
+    while h < n_head {
+        let i = 0
+        while i < half {
+            let xi: f64 = f64of(mem_load(x + (h * head_dim + i) * 8))
+            let xj: f64 = f64of(mem_load(x + (h * head_dim + i + half) * 8))
+            let freq: f64 = f64of(mem_load(freqs + (pos * half + i) * 8))
+            let cos_f: f64 = cos(freq)
+            let sin_f: f64 = sin(freq)
+            // NEOX: (xi, xj) rotated
+            mem_store(dst + (h * head_dim + i) * 8, xi * cos_f - xj * sin_f)
+            mem_store(dst + (h * head_dim + i + half) * 8, xi * sin_f + xj * cos_f)
+            i = i + 1
+        }
+        h = h + 1
+    }
+}
+
+// shortconv_step: single step of short convolution
+// conv: [l_cache, n_embd], state: [l_cache+1, n_embd], x: [n_embd], dst: [n_embd]
+// Returns new state pointer (prepended)
+fn shortconv_step(conv: u64, state: u64, x: u64, dst: u64, l_cache: i64, n_embd: i64, new_state: u64) {
+    // Shift state: new_state[0] = x, new_state[1:] = state[:-1]
+    // Then dst = sum(conv[t] * new_state[t])
+    // Implementation simplified for now
+    return 0
+}
+
+// =====================================================================
+// ROLE -> KIND -> COMPUTE DISPATCH
+// =====================================================================
+// Given a role and tensor metadata, return the compute function to use.
+// This is compile-time dispatch: the caller switches on role_kind.
+
+// Get the tensor kind for a role (re-exported from model_arch)
+fn role_compute_kind(role: i64) -> i64 {
+    return role_kind(role)
+}
+
+// Dispatch mm_matvec for a role's tensor
+// Returns 0 on success
+fn dispatch_mm_matvec(role: i64, A: u64, rows: i64, cols: i64, x: u64, dst: u64) -> i64 {
+    let kind = role_kind(role)
+    if kind == KIND_MATRIX {
+        mc_matvec(A, rows, cols, x, dst)
+        return 0
+    } else if kind == KIND_MATRIX_T {
+        mc_matvec_t(A, rows, cols, x, dst)
+        return 0
+    }
+    return 0 - 1  // not a matrix kind
+}
+
+// Dispatch elementwise for vector roles
+fn dispatch_elementwise_add(role: i64, dst: u64, a: u64, b: u64, n: i64) -> i64 {
+    if role_kind(role) == KIND_VECTOR {
+        elementwise_add(dst, a, b, n)
+        return 0
+    }
+    return 0 - 1
+}
+
+// Dispatch RMS norm for norm roles
+fn dispatch_rms_norm(role: i64, dst: u64, x: u64, w: u64, n: i64) -> i64 {
+    if role_kind(role) == KIND_VECTOR {
+        rms_norm(dst, x, w, n)
+        return 0
+    }
+    return 0 - 1
+}
+
+// Dispatch SiLU for gate/activation roles
+fn dispatch_silu(role: i64, dst: u64, x: u64, n: i64) -> i64 {
+    if role_kind(role) == KIND_MATRIX || role_kind(role) == KIND_VECTOR {
+        silu(dst, x, n)
+        return 0
+    }
+    return 0 - 1
+}
+
+// Dispatch RoPE for Q/K roles
+fn dispatch_rope(role: i64, x: u64, freqs: u64, dst: u64, n_head: i64, head_dim: i64, pos: i64) -> i64 {
+    if role == ROLE_ATTN_Q || role == ROLE_ATTN_K {
+        rope_apply(x, freqs, dst, n_head, head_dim, pos)
+        return 0
+    }
+    return 0 - 1
+}
+
+// =====================================================================
+// TENSOR METADATA (for loader integration)
+// =====================================================================
+// When loading a tensor, the loader provides:
+// - role (from arch_resolve_name)
+// - shape [rows, cols] or [n]
+// - quantization info (type, group_size, scales)
+// This module provides the compute path; the loader provides the data.
+

@@ -1,0 +1,65 @@
+// stdlib_model_compute_test -- tensor-role to compute mapping (Phase 5).
+//
+// Each role names a tensor KIND (matrix / vector / state / router), and the
+// kind picks the compute path. No branching on role at inference time.
+//
+// The matvec here is checked against a hand-computed product. A 4x4 matrix
+// [1..16] times a vector of ones is [10, 26, 42, 58].
+
+import std/model_arch
+import std/model_compute
+
+fn main() {
+    // ---- kind -> alignment / group size ----
+    if kind_alignment(KIND_MATRIX) != 32 { print("FAIL: matrix alignment"); return 1 }
+    if kind_alignment(KIND_VECTOR) != 16 { print("FAIL: vector alignment"); return 1 }
+    if kind_alignment(KIND_STATE)  != 64 { print("FAIL: state alignment"); return 1 }
+    if kind_group_size(KIND_MATRIX) != 32 { print("FAIL: matrix group size"); return 1 }
+    if kind_group_size(KIND_VECTOR) != 0  { print("FAIL: vector group size"); return 1 }
+
+    // ---- role -> kind dispatch agrees with model_arch ----
+    if role_compute_kind(ROLE_ATTN_Q)   != KIND_MATRIX { print("FAIL: attn_q kind"); return 1 }
+    if role_compute_kind(ROLE_ATTN_NORM) != KIND_VECTOR { print("FAIL: attn_norm kind"); return 1 }
+
+    // ---- matvec against a hand-computed product ----
+    let A = mem_alloc(16 * 8)
+    let x = mem_alloc(4 * 8)
+    let dst = mem_alloc(4 * 8)
+    let i = 0
+    while i < 16 { mem_store(A + i * 8, i2f(i + 1)); i = i + 1 }
+    i = 0
+    while i < 4 { mem_store(x + i * 8, i2f(1)); i = i + 1 }
+
+    let rc = dispatch_mm_matvec(ROLE_ATTN_Q, A, 4, 4, x, dst)
+    if rc != 0 { print("FAIL: dispatch_mm_matvec rc"); return 1 }
+    if f2i(f64of(mem_load(dst + 0 * 8))) != 10 { print("FAIL: row 0 != 10"); return 1 }
+    if f2i(f64of(mem_load(dst + 1 * 8))) != 26 { print("FAIL: row 1 != 26"); return 1 }
+    if f2i(f64of(mem_load(dst + 2 * 8))) != 42 { print("FAIL: row 2 != 42"); return 1 }
+    if f2i(f64of(mem_load(dst + 3 * 8))) != 58 { print("FAIL: row 3 != 58"); return 1 }
+
+    // ---- a vector role must NOT take the matvec path ----
+    if dispatch_mm_matvec(ROLE_ATTN_NORM, A, 4, 4, x, dst) >= 0 {
+        print("FAIL: vector role accepted by matvec dispatch"); return 1
+    }
+
+    // ---- elementwise add ----
+    let p = mem_alloc(4 * 8)
+    let q = mem_alloc(4 * 8)
+    let r = mem_alloc(4 * 8)
+    i = 0
+    while i < 4 { mem_store(p + i * 8, i2f(2)); mem_store(q + i * 8, i2f(3)); i = i + 1 }
+    if dispatch_elementwise_add(ROLE_ATTN_NORM, r, p, q, 4) != 0 { print("FAIL: elementwise rc"); return 1 }
+    if f2i(f64of(mem_load(r))) != 5 { print("FAIL: 2+3 != 5"); return 1 }
+
+    // ---- rms_norm of ones with unit weights is exactly ones ----
+    let ones = mem_alloc(4 * 8)
+    let wts = mem_alloc(4 * 8)
+    let out = mem_alloc(4 * 8)
+    i = 0
+    while i < 4 { mem_store(ones + i * 8, i2f(1)); mem_store(wts + i * 8, i2f(1)); i = i + 1 }
+    if dispatch_rms_norm(ROLE_ATTN_NORM, out, ones, wts, 4) != 0 { print("FAIL: rms_norm rc"); return 1 }
+    if f2i(f64of(mem_load(out))) != 1 { print("FAIL: rms_norm(1s) != 1"); return 1 }
+
+    print("OK model_compute")
+    return 0
+}

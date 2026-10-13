@@ -762,6 +762,53 @@ else
   echo "  SKIP: bare-metal (qemu-system-x86_64 not installed)"
 fi
 
+# --- Stage 25: FLOAT-PRINT GUARD (0.0.235 A2) --------------------------------
+# print/println/echo on an f64 used to fall into the INTEGER path and write the
+# raw bit pattern (5.0 -> 4617315517961601024) -- a silent wrong value -- and
+# exit(f64) silently exited 0. Both are compile errors now, naming the routes.
+echo ""
+echo "########## FLOAT-PRINT GUARD ##########"
+FPR_RC=0
+printf 'fn main() {\n    print(fadd(i2f(3), i2f(2)))\n    return 0\n}\n' > /tmp/fpr_print.quanta
+if $QC --no-overflow-trap /tmp/fpr_print.quanta /tmp/fpr_print 2>/tmp/fpr_print_err.txt; then
+  echo "  FAIL: print(f64) compiled (must be a compile error: it would write the bit pattern)"
+  FPR_RC=1
+else
+  if grep -q "raw bit pattern" /tmp/fpr_print_err.txt; then
+    echo "  PASS: print(f64) rejected, and the message names print_f/f64bits"
+  else
+    echo "  FAIL: print(f64) rejection message wrong: $(head -1 /tmp/fpr_print_err.txt)"
+    FPR_RC=1
+  fi
+fi
+printf 'fn main() {\n    exit(fadd(i2f(2), i2f(3)))\n    return 0\n}\n' > /tmp/fpr_exit.quanta
+if $QC --no-overflow-trap /tmp/fpr_exit.quanta /tmp/fpr_exit 2>/tmp/fpr_exit_err.txt; then
+  echo "  FAIL: exit(f64) compiled (must be a compile error: it silently exits 0)"
+  FPR_RC=1
+else
+  if grep -q "exit() takes an int" /tmp/fpr_exit_err.txt; then
+    echo "  PASS: exit(f64) rejected, and the message names f2i"
+  else
+    echo "  FAIL: exit(f64) rejection message wrong: $(head -1 /tmp/fpr_exit_err.txt)"
+    FPR_RC=1
+  fi
+fi
+printf 'import std/fs\nfn main() {\n    let s = fadd(i2f(2), i2f(3))\n    print_f(s)\n    print(" ")\n    printi(f64bits(s))\n    print("\\n")\n    exit(f2i(s))\n}\n' > /tmp/fpr_ok.quanta
+if $QC --no-overflow-trap /tmp/fpr_ok.quanta /tmp/fpr_ok 2>/tmp/fpr_ok_err.txt; then
+  # `|| true`: the control exits 5 (from f2i), and run_tests.sh runs under `set -e`,
+  # where a failing command substitution in an assignment aborts the whole gate.
+  FPR_OUT="$(./scripts/quanta_run.sh /tmp/fpr_ok < /dev/null 2>&1 || true)"
+  if printf '%s' "$FPR_OUT" | grep -q "^5.000000 4617315517961601024$"; then
+    echo "  PASS: print_f(f64) prints the decimal value, f64bits(x) the exact bits"
+  else
+    echo "  FAIL: sanctioned float output: $FPR_OUT (want '5.000000 4617315517961601024')"
+    FPR_RC=1
+  fi
+else
+  echo "  FAIL: sanctioned float routes failed to compile: $(head -1 /tmp/fpr_ok_err.txt)"
+  FPR_RC=1
+fi
+
 echo "=== GATE SUMMARY ==="
 echo "  functional     : $([ $FUNCTIONAL_RC = 0 ] && echo GREEN || echo RED)"
 echo "  native        : $([ $NATIVE_RC = 0 ] && echo GREEN || echo RED)  (no extern, no libc -- the default path)"
@@ -785,7 +832,8 @@ echo "  qobj          : $([ $QOBJ_RC = 0 ] && echo GREEN || echo RED)  (module c
 echo "  output-path   : $([ $OUTGUARD_RC = 0 ] && echo GREEN || echo RED)  (qc must refuse to overwrite its own input)"
 echo "  naked         : $([ $NAKED_RC = 0 ] && echo GREEN || echo RED)  (naked fn + section + no_mangle, 0.0.229 Phase B)"
 echo "  asm-assembler : $([ $ASM_RC = 0 ] && echo GREEN || echo RED)  (mnemonic asm! + rejection, 0.0.231 Phase C1)"
-echo "  bare-metal    : $([ $BM_RC = 0 ] && echo GREEN || echo RED)  (ring-0 under QEMU: PVH boot, UART + IDT/int3 handler, 0.0.233 Phase D)"
+echo "  bare-metal    : $([ $BM_RC = 0 ] && echo GREEN || echo RED)  (ring-0 under QEMU: PVH boot, UART + IDT/int3 handler, 0.0.233 Phase D)
+  float-print   : $([ $FPR_RC = 0 ] && echo GREEN || echo RED)  (0.0.235 A2: print/exit on an f64 is a compile error; print_f/f64bits are the routes)"
 # Block promotion on a real functional/security/perf/valgrind/fuzz/diff/stdlib/mtu/qobj/verify-status
 # regression. Security KNOWN issues are surfaced by the script but do not turn
 # the gate red.
