@@ -213,6 +213,29 @@ This is the per-function vreg-index reuse hazard already recorded for other side
 by the same numbering the emit uses (write the tag where the result vreg is bound during emit), or key the
 propagation on something stable across the reset.
 
+## THE FIX SITE, NARROWED TO THE PROPAGATION PASS (0.0.235)
+
+The tag pass is the `changed=1` fixpoint walking each function's IR (`codegen.quanta:1053-1122`), and its own
+comments state the governing rule: a tag has to be (re)asserted **after** the per-function clear, because
+"tagging at parse time is wiped before the emit pass runs" (`1124-1126`). It handles the cases it knows:
+
+| IR op | code | tags |
+|---|---|---|
+| `IR_RET` in a `-> f64` function | `1120-1122` | `ira0(mp)` |
+| `IR_PARAM` declared `: f64` | `1123-1137` | via `fn_parflt` |
+| call result of a `-> f64` callee | `1251` (site P5) | `tres` |
+| **move** | `1015`, `1098` | `ira0(mp)` -> `irres(mp)` |
+
+That last row is the gap to check first: `vfloat` is propagated through a move only when the source is in
+**`ira0`**. The measured symptom is that the tag lands on a *different vreg index* than the one the consumer
+reads, so the value reaching `fopld_rr` is very plausibly a **copy** of the tagged vreg that the pass did not
+follow — either because the copy's source sits in `ira1`, or because the op carrying it is not one of the four
+handled above.
+
+Next step is therefore a read, not a build: instrument `1015`/`1098` and the `fopld_rr` operand to print
+`(op, ira0, ira1, irres)` and see which op produced the untagged value in program B. That names the missing
+case, and the fix is to add it to this pass — extending the propagation, not writing a one-off tag.
+
 ## Suspected cause
 
 A float vreg is being coalesced or reused across call boundaries when the callee
