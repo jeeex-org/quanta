@@ -115,6 +115,25 @@ Both of the obvious "stale tag" explanations are wrong, and each cost one read:
   the value in the funcscan pass. That distinguishes "tag never set" from "tag set to the wrong value", which
   the two reads above did not.
 
+## THE DECISION, FOUND (0.0.235) — `fopld_rr`, `emitter.quanta:928-930`
+
+    if r8(vfloat+a)==1 { fld_x(sc, xmm) } else { fi2f_gp(xmm, sc) }     // spilled case
+    if r8(vfloat+a)==1 { fld_x(r,  xmm) } else { fi2f_gp(xmm, r)  }     // register case
+
+`fld_x` is the `movq` (raw bits — correct when the value already is an f64 pattern); `fi2f_gp` is the
+`cvtsi2sd` (int -> double, which mangles it). So the single question is whether **`vfloat[operand]` is 1**, and
+in program B it is not.
+
+That also frames the fix. The gate already has a layer for exactly this — `float-return : GREEN (a call to a
+-> f64 function tags its result; fixed 0.0.220)` — so the mechanism exists and works for the simple case; A6's
+shape is one where the tag does not reach the operand. The operand here is a value crossing a `-> f64`
+**call boundary** inside the reduction (`pio2_1()`, and the result of `qmult`), which is what `as_f64_rdi()`
+(0d7950b6) fixed for the *builtin* path and what has no equivalent for the *user-function* path.
+
+Next probe (narrow, one build): print `a` and `r8(vfloat+a)` at those two lines for programs A and B, and the
+same at the point where a `-> f64` user call's result vreg is bound. That says whether the tag is never set on
+the call result or is set and then overwritten by the caller's own vreg churn.
+
 ## Suspected cause
 
 A float vreg is being coalesced or reused across call boundaries when the callee
