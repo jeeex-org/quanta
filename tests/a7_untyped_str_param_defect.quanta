@@ -1,0 +1,32 @@
+// 0.0.236 A7: a string passed through an UNTYPED parameter prints a POINTER,
+// not text. Same root-cause family as A6 (which was the f64 case): the parameter
+// slot carries no type, the callee's `print` therefore takes the integer path,
+// and the user sees a 20-digit number where text was expected.
+//
+// Verified with the 0.0.236 compiler:
+//   - this file prints two large integers (pointer/bit-pattern values)
+//   - annotating `fn show(tag: str, x: str)` makes the SAME program print
+//     "global     : GLOBAL" etc. correctly
+//   - both forms compile WITHOUT complaint, so the failure is silent
+//
+// Every TYPED string path was checked and is correct: global, local, struct
+// field, array element, returned value, and a returned value held in a local.
+// So A7's original wording ("other string paths can still emit a pointer") does
+// NOT reproduce; the untyped parameter is the live case.
+//
+// When fixed, promote this into a gate row (red-first by construction).
+fn make_one() -> str {
+    return "GLOBAL"
+}
+
+fn show(tag, x) {
+    print(tag)
+    print(x)
+    print("\n")
+}
+
+fn main() {
+    show("untyped tag: ", make_one())
+    show("untyped lit: ", "TEXT")
+    exit(0)
+}

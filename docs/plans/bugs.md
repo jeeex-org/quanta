@@ -298,10 +298,26 @@ nothing equivalent exists for the *user-function* path. It holds back a complete
   the builtin path is driven by `as_f64_rdi()` (0d7950b6). When fixed, promote the saved repro into a gate row —
   it is red-first by construction.
 
-### A7 · DOC · raw-pointer vs Quanta-string separation is unresolved
+### A7 · NOT REPRODUCED for typed paths; LIVE for an UNTYPED parameter (same family as A6)
 
-`print` on a string *parameter* emits text, but other string paths can still emit a pointer
-(`WIP.md` "Still open"). Same user-visible class as A2: an integer-looking value where text was expected.
+**Measured on 0.0.236. The typed paths are fine; an untyped parameter is not.**
+
+Every typed string path was probed and is CORRECT — global, local, struct field, array element, a returned
+value, and a returned value held in a local all print their text. So the original wording ("other string paths
+can still emit a pointer") does **not** reproduce.
+
+The live case is an **untyped parameter** carrying a string, and it is the same root-cause family as A6 — the
+parameter slot has no type, so the callee's `print` takes the integer path:
+
+    fn show(tag, x) { print(tag); print(x) }      -> 11093940081109393752  (pointer/bits)
+    fn show(tag: str, x: str) { ... }             -> global     : GLOBAL   (correct)
+
+Both forms compile **without complaint**, so the failure is silent — the A2 class: an integer-looking value
+where text was expected. Repro saved as `tests/a7_untyped_str_param_defect.quanta`.
+
+Note the A6 fix does not reach this: A6 tagged `vfloat` at the SSE operand site, while this needs the string tag
+(`vreg_is_str`) supplied where the argument's string-ness is known. Same principle, different table — and the
+same question applies to whether an untyped parameter should be refused rather than silently mis-typed.
 
 ---
 
