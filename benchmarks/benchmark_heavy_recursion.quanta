@@ -1,0 +1,29 @@
+// Heavy call benchmark: 10000 calls of an ITERATIVE fib (name is historical), magnitude chosen to
+// fit int64. It previously used fib(1000) (~4.3e208) -> int64 overflow: Quanta's overflow trap
+// fired (SIGILL, correct) while the C twin wrapped silently (UB), so the row compared nothing.
+fn fib(n) {
+    if n <= 1 { return n }
+    let a = 0
+    let b = 1
+    let i = 2
+    while i <= n {
+        let t = a + b
+        a = b
+        b = t
+        i = i + 1
+    }
+    return b
+}
+
+fn main() {
+    let sum = 0
+    let i = 0
+    while i < 10000 {
+        sum = sum + fib(60)
+        i = i + 1
+    }
+    print("sum=")
+    print(sum)
+    print("\n")
+    return 0
+}

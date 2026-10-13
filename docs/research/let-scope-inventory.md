@@ -1,0 +1,76 @@
+# Block-scoped `let`: migration inventory
+
+**Status: not applied. This is preparation for a language-semantics decision, kept out of the A1 crash fix
+on purpose (see `docs/plans/bugs.md` A1b).**
+
+## What the language does today
+
+`parse_block()` (`compiler/<VER>/src/x86/parse.quanta:153`) pushes/pops only the *ownership* scope
+(`owned_scope_push()` … `owned_scope_pop_one(my_scope)`, single exit at the end of the function). Local
+bindings live in the `vars` table with `varc` as the count, appended once per `let`, and `vfind()`
+(`helpers.quanta:493`) resolves by scanning **newest-first** — deliberately, so that a re-`let` inside a
+loop or branch binds to itself. Nothing truncates `varc` when a block ends, so the innermost binding of a
+name stays the resolution target for the rest of the function.
+
+Measured on the **shipping** compiler, both 0.0.233 and 0.0.234:
+
+```quanta
+fn f(p) { let a = 1
+ if a == 1 { let p = 99 }
+ print(p) }          // 99 -- the parameter is gone
+fn g(p) { let q = 0
+ while q < 1 { let p = 77; q = q + 1 }
+ print(p) }          // 77
+```
+
+## The one-line patch (block scoping)
+
+```quanta
+fn parse_block() {
+    let my_scope = owned_sctop
+    owned_scope_push()
+    let my_varc = varc                 // <-- save
+    ...
+    defer_replay_range(my_scope)
+    owned_scope_pop_one(my_scope)
+    varc = my_varc                     // <-- restore: drop this block's bindings
+    blk_depth = blk_depth - 1
+```
+
+Every block entry point in the compiler routes through `parse_block()` (`parse.quanta` call sites at
+`if`/`else`/`while`/`for`/`match` arms/`unsafe`), so one save/restore pair covers them all. Nesting is
+handled naturally (each invocation saves its own `varc`).
+
+## Why it must be its own version
+
+Applying exactly that patch and rebuilding the compiler **from its own source** makes the fixed compiler
+reject 11 sites in its own 23k lines — code that declares inside a block and reads after it. That is the
+migration list, and it is the compile-time proof that the current behaviour is load-bearing:
+
+```
+is_novf (1), init_call (1), sc (1), rp (1), zr (1), a (3), vr (3)
+```
+
+(sites, from the merged-stream line numbers the compiler prints). Two of them sit in `fn main()` of
+`entry.quanta`: `stub_call` (declared in the startup-stub `if`, read at the ELF patch ~500 lines later) and
+`init_call` (same shape) — hoisting those to function scope and turning the declaration into an assignment
+fixed the first two. Regenerate the full list the same way at any time:
+
+```bash
+cd /opt/tali/quanta
+ulimit -c 0 -v 8000000
+# with a compiler built from the patched parse_block:
+<patched-qc> compiler/<NEXT>/src/x86/main.quanta /tmp/out 2>&1 | grep "undeclared variable" | sort -u
+```
+
+## Decision inputs
+
+- `docs/SPEC.md:94` lists a bare `{ … }` block as "(scoping)", and `docs/SYNTAX.md:126-127` says a bare
+  `name = expr` "at function-top-level or in a block" introduces a new local binding — the spec leans
+  **block-scoped**.
+- `docs/SYNTAX.md:400` documents shadowing for `match` arm patterns ("Binds the matched value to a new
+  identifier (shadows outer)") — shadowing is a recognised concept, so the question is about its *extent*.
+- Cost of the change: the 11 hoists, then the full gate + self-host fixpoint. Risk is concentrated in the
+  compiler's own source, not in user programs.
+- Cheap non-breaking mitigation available regardless: warn on "re-`let` of an existing binding"
+  (a diagnostic, no semantics change) — that alone would have caught A1's trigger at build time.

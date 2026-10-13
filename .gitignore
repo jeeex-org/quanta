@@ -85,6 +85,12 @@ test_suites/codes/std_aes_gcm_min.quanta
 !/docs/
 !/lib/
 !/tests/
+# benchmarks/ — the perf suite (core-language cases + C twins). Without the next two lines the
+# whole suite is invisible under /* and only BENCHMARK.md is tracked. NOTE: gitignore has no
+# inline comments -- a trailing "# ..." becomes part of the pattern and silently never matches.
+!/benchmarks/
+!/benchmarks/**
+benchmarks/*_c
 !gap_specs.json
 # (test_suites/ contents are un-ignored in the block immediately above this one,
 #  together with the re-exclusions for bin/ and the scratch probes.)
@@ -142,6 +148,11 @@ tools/**/*.bin
 !/scripts/
 /scripts/*
 !/scripts/rag_config.py
+# The benchmark runner: it carries the guards that keep the perf series honest
+# (twin-constant-fold detector, output-equality check, XFAIL rows). Untracked it
+# would be rediscovered from scratch on the next perf round -- same reason as
+# qcrun.sh and selfhost_consistency.sh.
+!/scripts/bench.sh
 # The threading prototype (Phase 7a). This is the evidence for the only
 # remaining performance lever (20 cores vs 1), and it records three traps that
 # each cost a debug round. Tracked for the same reason as qcrun.sh: an untracked
@@ -208,7 +219,12 @@ tools/**/*.bin
 # These two negations guarantee a future broad ignore can never silently drop
 # compiler/<VER>/bin (promoted golden seed) or compiler/<VER>/src (source).
 # Order matters: they must follow the !/compiler/ negation above.
-!compiler/**/bin/
+# NOTE: `**` here also matched `compiler/<VER>/test_suites/bin/`, which re-included
+# ~9,810 compiled test binaries per version tree (all of 0.0.233's are committed).
+# The golden is the ONLY binary that belongs in a version tree, so anchor to the
+# tree's own bin/ and never to a nested one.
+!compiler/*/bin/
+compiler/*/test_suites/bin/
 !compiler/**/src/
 
 # --- test_suites/ generated output ---

@@ -87,9 +87,12 @@ These are non-negotiable. Violating any of them is a gate failure by itself.
       QUANTA_MEM_MB is clamped to 1536 so an env var cannot raise it.
       ⚠ The **compiler itself needs > 3 GB of address space and dies SILENTLY
       (no output, no binary, exit 0) below that.** Measured 0.0.225: fails at
-      1536 MB and 3072 MB, succeeds at 6144 MB. The `6000000` in the gate command
-      below is 5.7 GB — only just above the threshold, so a single new arena in
-      the compiler would break every gate silently. Treat a missing binary from a
+      1536 MB and 3072 MB, succeeds at 6144 MB. Re-measured at 0.0.234: fails at
+      6200000 KB, succeeds at 6300000 KB — so the old `6000000` in the gate command
+      below (5.7 GB) HAD crossed the threshold and silently failed every compile
+      layer (`rc=1`, no stderr, no binary, empty `stderr:` in the gate report).
+      The gate command now uses `8000000` (7.6 GB) for ~20% headroom. The
+      prediction below came true; keep this number ahead of the arena total. Treat a missing binary from a
       "successful" compile as a failed compile until the cap is proven sufficient.
     - Execute compiled `.bin` ONLY through the gate (`run_tests.sh`) or
       `quanta_run.sh` (768MB VSZ, nice 19). **NEVER run a `.bin` raw** (a raw
@@ -230,7 +233,9 @@ rm -f /tmp/f1.bin /tmp/f2.bin /tmp/f3.bin
 ## 4. Functional smoke (CORE language only — no stdlib; stdlib is deferred)
 ```bash
 cd /opt/tali/quanta
-printf 'fn main(){ let s = fadd(i2f(2), i2f(3)); let p = fmul(s, i2f(4)); exit(p) }\n' > /tmp/sm.quanta
+# NOTE: exit() takes an int -- `exit(p)` with p:f64 silently exits 0, so this
+# smoke "passed" while asserting nothing. Convert explicitly.
+printf 'fn main(){ let s = fadd(i2f(2), i2f(3)); let p = fmul(s, i2f(4)); exit(f2i(p)) }\n' > /tmp/sm.quanta
 Q=compiler/<NEXT>/bin/x86/qc
 "$Q" /tmp/sm.quanta /tmp/sm.bin && /tmp/sm.bin < /dev/null >/dev/null 2>&1; echo "rc=$? (expect 20)"
 rm -f /tmp/sm.quanta /tmp/sm.bin
@@ -241,10 +246,10 @@ rm -f /tmp/sm.quanta /tmp/sm.bin
 ## 5. Full gate (7 layers + generics) — EXACT command, uses VERSION
 ```bash
 cd /opt/tali/quanta
-ulimit -c 0 -v 6000000
+ulimit -c 0 -v 8000000
 QC=./compiler/$(cat VERSION)/bin/x86/qc bash test_suites/scripts/run_tests.sh
 ```
-- [ ] All GREEN: functional (matches `EXPECTED.tsv` row count — **currently 143**,
+- [ ] All GREEN: functional (matches `EXPECTED.tsv` row count — **currently 820**,
       0 fail), extern-c, security 8/8, performance, **valgrind clean**,
       **fuzz fail-closed (0 crashes)**, **differential consistent**,
       **generics-negative GREEN**.

@@ -1,0 +1,30 @@
+// Mutual recursion, NON-tail (work after the recursive call), so both sides make real calls.
+// Depth is capped: Quanta's frames are ~1104 bytes, so depth beyond ~7k overflows an 8 MB stack.
+// NOTE: the tail-recursive form of this loop is a separate finding -- gcc converts mutual tail
+// recursion into a loop (-foptimize-sibling-calls, on by default) and executed 40M calls in 15 ms
+// (~1 cycle/call) where Quanta kept every frame. Quanta has no sibling-call elimination.
+fn is_odd(n) {
+    if n == 0 { return 0 }
+    return is_even(n - 1) + 1
+}
+
+fn is_even(n) {
+    if n == 0 { return 1 }
+    return is_odd(n - 1) + 1
+}
+
+fn main() {
+    let s = 0
+    let outer = 0
+    while outer < 20 {
+        let i = 0
+        while i < 2000 {
+            s = s + is_even(i)
+            i = i + 1
+        }
+        outer = outer + 1
+    }
+    print(s)
+    print("\n")
+    return 0
+}

@@ -1,0 +1,95 @@
+// Q4_K matmul benchmark - bigger
+const Q8_SCALE = 128
+
+fn f16_to_q8(f16) {
+    let sign = (f16 / 32768) * 32768
+    let exp = (f16 - sign) / 1024
+    let mant = f16 - sign - exp * 1024
+    
+    if exp == 0 {
+        if mant == 0 { return 0 }
+        return mant * Q8_SCALE / 1048576
+    }
+    if exp == 31 { return 0 }
+    
+    let base = 1024 + mant
+    let shift = exp - 15
+    if shift >= 0 {
+        return base * (1 * shift) * Q8_SCALE / 1024
+    } else {
+        return base * Q8_SCALE / 1024 / (1 * (-shift))
+    }
+}
+
+fn dequant_q4k(W_base, out) {
+    let scale_q8 = f16_to_q8(mem_load8(W_base) + mem_load8(W_base + 1) * 256)
+    let qi = 0
+    while qi < 256 {
+        let sub_q8 = mem_load8(W_base + 2 + qi / 16)
+        let byte_val = mem_load8(W_base + 18 + qi / 2)
+        let nibble = 0
+        if qi - (qi / 2) * 2 == 0 {
+            nibble = byte_val - (byte_val / 16) * 16
+        } else {
+            nibble = byte_val / 16
+        }
+        let val_q8 = scale_q8 * sub_q8 * (nibble - 8) / Q8_SCALE
+        mem_store(out + qi * 8, val_q8)
+        qi = qi + 1
+    }
+}
+
+fn matvec_q4k(W, x, rows, cols, y) {
+    let n_blocks = cols / 256
+    let i = 0
+    while i < rows {
+        let sum = 0
+        let bi = 0
+        while bi < n_blocks {
+            let dequant = mem_alloc(256 * 8)
+            dequant_q4k(W + (i * n_blocks + bi) * 144, dequant)
+            let j = 0
+            while j < 256 {
+                let w_val = mem_load(dequant + j * 8)
+                let x_val = mem_load(x + (bi * 256 + j) * 8)
+                sum = sum + w_val * x_val / Q8_SCALE
+                j = j + 1
+            }
+            bi = bi + 1
+        }
+        mem_store(y + i * 8, sum)
+        i = i + 1
+    }
+}
+
+fn main() {
+    // 10 blocks * 256 = 256 cols, 100 rows
+    let rows = 100
+    let cols = 2560
+    let n_blocks = cols / 256
+    
+    let W = mem_alloc(rows * n_blocks * 144)
+    let x = mem_alloc(cols * 8)
+    let y = mem_alloc(rows * 8)
+    
+    // Init W with test data
+    let i = 0
+    while i < rows * n_blocks * 144 {
+        mem_store8(W + i, 0x97)
+        i = i + 1
+    }
+    
+    i = 0
+    while i < cols {
+        mem_store(x + i * 8, 128)
+        i = i + 1
+    }
+    
+    matvec_q4k(W, x, rows, cols, y)
+    
+    let result = mem_load(y)
+    print("result[0]=")
+    print(result)
+    print("\n")
+    return 0
+}

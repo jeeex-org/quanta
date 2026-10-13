@@ -1,0 +1,17 @@
+// known-fail: compiler SEGFAULT — a capturing closure invoked inside a loop crashes qc
+// (minimal repro: let y = 7  let f = |x| { x + y }  while i < 3 { i = i + f(1) }).
+// The gate's closure_capture.quanta passes because it calls f ONCE, outside a loop.
+// Remove this marker when the fix lands (bench.sh flags a marker that outlives its bug).
+fn main() {
+    let y = 7
+    let f = |x| { x + y }
+    let s = 0
+    let i = 0
+    while i < 1000000 {
+        s = s + f(i)
+        i = i + 1
+    }
+    print(s)
+    print("\n")
+    return 0
+}

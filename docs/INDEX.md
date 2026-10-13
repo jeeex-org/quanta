@@ -41,6 +41,7 @@ because the reasoning is not recoverable from the diff.
 
 | Doc | Status |
 |---|---|
+| `docs/research/let-scope-inventory.md` | **Active** — block-scoped `let` migration inventory: the one-line `parse_block` patch, the 11 compiler-internal sites it would break, and the decision inputs (A1b) |
 | `docs/research/trait-dispatch-increment-plan.md` | **Active** — the 0.0.224 plan |
 | `docs/research/native-inference-gaps.md` | **Active** — verified gap list |
 | `docs/research/struct-return-defects.md` | Active — what is fixed, what is not |
@@ -85,6 +86,28 @@ See "Roadmap accuracy" below — these were stale and have been corrected.
 | `docs/OS_ROADMAP.md` | OS/kernel roadmap |
 | `docs/AUDIT_ROADMAP.md` | Compiler security audit, 86 items |
 
+## Plans — active work
+
+| Doc | Note |
+|---|---|
+| `docs/plans/bugs.md` | **Active, first** — every verified defect; fixes land from 0.0.234 before any speed work. Includes the LIVE/STALE verification pass (two compiler crashes, `print` on f64, fail-open `gguf_type_size`, recursion ceiling). |
+| `docs/plans/performance.md` | **Active, after `bugs.md`** — compiler codegen performance; fix-forward series opening at 0.0.234 (renumbers if the bug pass takes the next versions). Supersedes the 2026-10-12 draft (its `100x`/`no register allocation` claims were wrong; see the plan's §2.3). |
+| `docs/plans/lfm2-native-inference-perf.md` | **Active** — native LFM2 *speed* (CPU first, GPU when available). The *what* is `lfm2-native-inference-spec.md`. |
+| `docs/plans/kernel-capability.md` | Kernel capability phases A-D done (0.0.233); D4 ring-3 + relocatable BSS base open, then ARM64 |
+| `docs/plans/model-loader-features.md` | Loader: 18/18 phases complete |
+| `docs/plans/loader-phase67.md` | Loader phase record 6.1/6.2/7.1/7.2 → 0.0.226-0.0.228 (referenced by `kernel-capability.md`) |
+| `docs/plans/lfm2-native-inference-spec.md` | **What** to implement (stages 0-7) — the spec behind the engine |
+| `docs/plans/arm64-backend.md` | AArch64 backend, deferred post-0.1.0 |
+
+**Sequencing (standing instruction):** defects first (`bugs.md`), then performance (`performance.md`), then
+model/inference speed (`lfm2-native-inference-perf.md`). Version numbers are allocated at release time, so the
+series renumber as the bug pass consumes versions.
+
+**Convention:** one file per topic, lowercase-hyphenated, **no dates in the filename**; plans live here and
+nowhere else (`.hermes_plans/` is gitignored by `.gitignore:19:/*` and can never be committed —
+`~/.hermes/plans/` is outside the repo). Work inside a plan is organised by **fix-forward version numbers**
+(`VERSION`+1 per release, `RELEASE_CHECKLIST.md` §9) — not by invented stage labels.
+
 ## Roadmap accuracy — measured 2026-10-05
 
 The roadmaps were **not** up to date. Measured against reality:
@@ -117,6 +140,9 @@ The roadmaps were **not** up to date. Measured against reality:
 | `docs/SI_CONTINUOUS.md`, `docs/SKILLS_DESIGN.md`, `docs/BRAIN_DESIGN.md` | Overlapping aspirational designs for the same subsystem; content folded into `docs/SELF_IMPROVEMENT.md` |
 | `docs/QOBJ_PLAN.md`, `docs/QOBJ_ROADMAP.md` | Superseded by `docs/roadmap/QOBJ_FEATURE_COVERAGE.md` and the `qobj` gate |
 | `docs/PERF_REGRESSION_pre_existing.md` | Finding folded into the gate history |
+| `docs/plans/performance.md` (2026-10-12 draft) + `docs/plans/speedup-first.md` | Merged into the rewritten `docs/plans/performance.md`. The draft's two headline claims did not survive measurement (`100x slower than C` was a dead-code-elimination artefact in the C twin; `no register allocation` missed the 13-register pool with a LIFO victim policy). |
+| `.hermes_plans/` (repo dir) | Gitignored by `/*` so nothing in it could ever be committed; the two plan files there were moved to `docs/plans/` and the directory removed. |
+| `docs/plans/loader-6.1-multi-model.md` | Duplicate: its phase (6.1, 0.0.226) is a ✅ DONE section inside `docs/plans/loader-phase67.md`, which records 6.1/6.2/7.1/7.2. Nothing referenced it except the INDEX row it appeared in. |
 
 ## The one thing to read first
 
