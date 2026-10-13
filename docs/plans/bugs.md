@@ -249,7 +249,7 @@ it is tracked separately; silent clobbering in this shape is not happening.
 - If a clobber IS found: decide the semantics (arena per iteration vs leak-until-function-exit) and either
   make it safe or make it a compile error — a silent clobber is the one outcome that must not remain.
 
-### A6 · ROOT CAUSE CONFIRMED, FIX NOT SHIPPABLE · the 0.0.236 fix fails the gate (see WIP.md)
+### A6 · ROOT CAUSE CONFIRMED · three fix mechanisms measured and rejected; fix belongs on the read/emit side
 
 Documented at length in `docs/research/call-order-f64-defect.md` and `WIP.md`: `reduce(0.5)` is correct only
 if `qmult` was called earlier in the program; the builtin path was fixed by `as_f64_rdi()` (0d7950b6) but
@@ -262,6 +262,9 @@ nothing equivalent exists for the *user-function* path. It holds back a complete
   DECLARED `: f64` parameters, so `x` reached the SSE multiply untagged and `fopld_rr` emitted `cvtsi2sd` over an
   f64 bit pattern. "Call-order sensitivity" was a red herring: an unreachable call elsewhere tagged that vreg
   index by another route.
+- **ROOT CAUSE (certain):** an untyped parameter used as a float. `fn qmult(x) -> f64` with `let y = x * (2.0 / 3.14159265358979323846)`: annotating `x: f64` alone makes it correct and drops the untagged-conversion count 2 -> 1. So the tagging at `codegen.quanta:1123-1137` (declared `: f64` only) is the gap, and `fopld_rr` emits `cvtsi2sd` over an f64 bit pattern. "Call-order sensitivity" was a red herring.
+- **THREE MECHANISMS TRIED, ALL REJECTED BY MEASUREMENT** — do not retry any: (1) a one-sided float rule in the `changed=1` tag pass -> **byte-identical binary**, inert; (2) tagging both operands at the two SSE emit sites -> repro fixed but §5 gate **rc=1** with 4 new stdlib failures (`embedding_test`, a clean A/B) — *which branch is taken is itself decided by `vfloat`*, so a wrong tag gets cemented; (3) call-argument tag -> callee parameter via `fn_parflt` -> the rule **fires** (32 events incl. `callee=0, 1 arg` for `qmult`) but the repro stays garbage, inert.
+- **NEXT STEP, from mechanism 3's evidence:** the write lands in `fn_parflt[callee][arg_ordinal]`, but the callee's `IR_PARAM` case reads `fn_parflt + (fi*200 + ppi)*8` with `ppi = ira0(mp)` — a **vreg**, not an ordinal — and/or the fixpoint never re-walks the callee after the write. So fix the **read** side (same key as the write, or tag the parameter vreg straight from the call site) or the **emit**, not another pass rule.
 - **FIX ATTEMPT (0.0.236) — REJECTED BY THE GATE.** At both SSE emit sites, tag both operands before loading
   them. It makes the repro correct (`cvtsi2sd` 2 -> 1, fixpoint holds), but the §5 gate on that tree returns
   **rc=1: 821/822 functional and 4 new stdlib failures** — `embedding_test` is a clean A/B (pass on 0.0.235, fail
