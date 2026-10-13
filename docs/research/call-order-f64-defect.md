@@ -134,6 +134,26 @@ Next probe (narrow, one build): print `a` and `r8(vfloat+a)` at those two lines 
 same at the point where a `-> f64` user call's result vreg is bound. That says whether the tag is never set on
 the call result or is set and then overwritten by the caller's own vreg churn.
 
+## PROBE RESULT (0.0.235): the tag is NEVER SET on that operand
+
+`dbg_num` instrumentation on `fopld_rr`'s register-case line, printing `a`, `r` and `r8(vfloat+a)` per decision,
+run on the two isolated programs (same binary, same build):
+
+    B (no qmult call):    X2 01   X4 1 1   X 0 0 0   X3 2 1   X15 0 1   X18 1 1
+    A (dead qmult call):  X2 01   X4 1 1   X 0 0 1   X3 2 1   X15 0 1   X18 1 1
+
+Exactly one decision differs, and it is the `movq`-vs-`cvtsi2sd` one: operand vreg 0, already in a register
+(`r=0`, so not the spill path), tag **0** in B and **1** in A. So the answer to the previous open question is
+"never set" — not "set to the wrong value" — for that value.
+
+Note this is the *register* case (the second of the two lines); the spill case never fires here. The value is a
+`-> f64` call result that the caller then consumes, which is what `as_f64_rdi()` covers for builtins and what
+the gate's `float-return` layer covers for the simple user-function case (fixed 0.0.220).
+
+Next step for the fix (narrow): instrument where a `-> f64` user call's result vreg is tagged float and check
+whether it fires for the `pio2_1()` / `qmult()` calls in program B. If it does not fire, the fix is that missing
+tag write; if it fires and is then lost, the caller's vreg churn is overwriting it.
+
 ## Suspected cause
 
 A float vreg is being coalesced or reused across call boundaries when the callee
