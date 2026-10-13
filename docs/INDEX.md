@@ -3,6 +3,22 @@
 Consolidated 2026-10-05. This file is the index; the docs it lists are the
 source of truth. Anything not listed here has been removed as superseded.
 
+> **WARNING — `SPEC.md` is NOT current and must not be used as the normative
+> contract until it is refreshed.** It was last edited at the 2026-10-05
+> consolidation and **eight promoted versions have landed since** (0.0.229 ->
+> 0.0.235), none of them reflected: `asm!`, `naked` / `section` / `no_mangle`,
+> packed structs, ring-0 / IDT / bare-metal boot, and the 0.0.235 A2 change that
+> makes a float at `print`/`exit` a compile error (`print_f` / `f64bits` are the
+> routes) all have **zero mentions**. Measured with
+> `grep -ci '<feature>' docs/SPEC.md`. Under rule 1 above this file is in
+> violation of its own convention: a doc is either current or gone.
+>
+> Consequence for defect triage: a classification may not rest on a SPEC.md line
+> alone. A1b's "block scope" question is the live example -- SPEC.md:94 calls a
+> bare `{ }` block "(scoping)" while the implementation leaks bindings out of it
+> and 11 sites in the compiler's own source depend on the leak, so which side is
+> authoritative is an author decision, not something the stale line settles.
+
 ## Ground rules for docs in this repo
 
 1. **A doc is either current or gone.** No document is kept "for history" — git
