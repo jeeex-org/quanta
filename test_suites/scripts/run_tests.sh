@@ -92,9 +92,9 @@ done < "$TEST_SUITES/EXPECTED.tsv"
 TOTAL=$((PASS + FAIL + COMPILE_FAIL))
 echo ""
 if [ "$SKIP" -gt 0 ]; then
-  echo "=== Results: $PASS/$TOTAL pass, $((FAIL + COMPILE_FAIL)) fail (incl. $COMPILE_FAIL compile-fail), $SKIP skipped (model absent) ==="
+  echo "=== Results: $PASS/$TOTAL pass, $((FAIL + COMPILE_FAIL)) fail (incl. $COMPILE_FAIL compile-fail), $SKIP skipped (model absent) [rows: EXPECTED.tsv] ==="
 else
-  echo "=== Results: $PASS/$TOTAL pass, $((FAIL + COMPILE_FAIL)) fail (incl. $COMPILE_FAIL compile-fail) ==="
+  echo "=== Results: $PASS/$TOTAL pass, $((FAIL + COMPILE_FAIL)) fail (incl. $COMPILE_FAIL compile-fail) [rows: EXPECTED.tsv] ==="
 fi
 # A compile-fail is a broken feature, not a green row. Exit non-zero if anything
 # failed to compile or produced the wrong result, so CI / promotion gates catch it.
