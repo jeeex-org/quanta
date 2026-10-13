@@ -73,7 +73,7 @@ capture runs fine, and a capturing closure called *once* runs fine — which is 
   `test_suites/codes/closure_capture_branch_test.quanta` (`EXPECTED.tsv` → 23) is **red on 0.0.233**
   (rc=139) and green on 0.0.234, per rule #16.
 
-### A1b · OPEN · block bindings are never popped, so an inner `let` clobbers an outer name
+### A1b · MEASURED (0.0.236 attempt reverted) · block bindings are never popped, so an inner `let` clobbers an outer name
 
 ### A2 · FIXED (0.0.235) · `print` on an `f64` emitted the raw bit pattern, not the value
 
@@ -174,12 +174,23 @@ loses its float-ness at a builtin's boundary. The consequence is bigger than a w
 Fix both ends: make `exit`/`print` convert a float-tagged argument (A2's fix), **and** change the checklist §4
 line to `exit(f2i(p))` so it can fail for the reason it exists.
 
-### A3 · DOC · `gguf_type_size` succeeds for types that have no decoder
+### A3 · LIVE (re-scoped) · `gguf_type_size` succeeds for types that have no decoder
 
-`std/gguf.quanta` covers F32, Q4_K, Q6_K (266/266 for the reference model) but returns a byte size for
-types 0..13 plus 30 while decoders for **F16, Q5_K, Q8_0 and the IQ family** do not exist. A caller therefore
-sizes a buffer correctly and reads garbage — the exact trap that hid the earlier F32 gap (`WIP.md`
-"OPEN DEFECTS").
+**Re-verified 0.0.235 — half the original claim was stale.** The decoder entry points that exist are:
+`dequant_f32`, `dequant_q4_0`, `dequant_q4_1`, `dequant_q5_0`, `dequant_q5_1`, `dequant_q5k`, `dequant_q6k`,
+`dequant_q8_0`, `dequant_q8k`, `dequant_bf16` — so **Q5_K and Q8_0 DO have decoders** and the plan's claim
+about them was wrong (the accuracy notes saying Q8_0 is "present and exact" were right).
+
+What is genuinely missing, and still claimed by the size path:
+
+| dtype | claimed by `gguf_type_size` / the block table | decoder |
+|---|---|---|
+| 1 = F16 | yes (`return 1`) | **none** — there is `dequant_bf16` but no `dequant_f16` |
+| 14–16+ = the IQ family | yes (block table returns 256) | **none** |
+
+A caller therefore sizes a buffer correctly and reads garbage — the same trap that hid the earlier F32 gap.
+Scope is smaller than originally written, and the fix is the same: **fail closed** for a dtype with no
+decoder, plus a negative-control test per unsupported type.
 
 - Fix approach: **fail closed** — return -1/error from both the size and the dispatch for a type with no
   decoder, and add a negative-control test per unsupported type. This is a one-session change and closes the

@@ -63,6 +63,31 @@ ulimit -c 0 -v 8000000
 <patched-qc> compiler/<NEXT>/src/x86/main.quanta /tmp/out 2>&1 | grep "undeclared variable" | sort -u
 ```
 
+## MEASURED (0.0.236 attempt, reverted): this is a migration, not a version
+
+The one-line patch was applied to a `compiler/0.0.236` tree, the 12 leak-dependent sites in the compiler's own
+source were hoisted (54 individual edits, mechanical), and the result was fully built and gated:
+
+| measurement | result |
+|---|---|
+| self-build of the compiler's own source | **OK** after the hoists |
+| semantics | correct: the shadow probe prints `11` where it printed `9977`, i.e. an inner `let` no longer clobbers a parameter |
+| fixpoint (3 generations) | `4badeb351ed47212d7797f0c039f3891`, distinct = 1 |
+| full gate | **RED** — 819/824 pass, 5 fail, 38 compile failures, `STDLIB` **74/108** |
+
+So `lib/std` and the corpus depend on the leak in far more places than the compiler's own 12: fixing the
+language semantics requires migrating the whole tree, and **the hoist is NOT semantics-preserving in general** —
+a `let x = f()` inside a loop, hoisted to the function top, initialises once instead of per iteration, so every
+site needs a human decision about whether the binding should be per-iteration or per-function. That is why this
+was reverted rather than shipped: it is a dedicated migration, not the lever for a version.
+
+Two honest routes, in preference order:
+1. **Keep the current semantics and correct the documents** (`SPEC.md:94`, `SYNTAX.md:126-127`) to say a binding
+   lives to the end of its enclosing FUNCTION, and add the re-`let` warning — the warning alone would have
+   caught A1 at build time, and this costs one version.
+2. Do the migration with the hoist tooling as a starting point, but with per-site review of loop-carried
+   bindings, and a gate row per migrated module.
+
 ## Decision inputs
 
 - `docs/SPEC.md:94` lists a bare `{ … }` block as "(scoping)", and `docs/SYNTAX.md:126-127` says a bare
