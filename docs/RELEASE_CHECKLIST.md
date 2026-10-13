@@ -249,7 +249,7 @@ cd /opt/tali/quanta
 ulimit -c 0 -v 8000000
 QC=./compiler/$(cat VERSION)/bin/x86/qc bash test_suites/scripts/run_tests.sh
 ```
-- [ ] All GREEN: functional (matches `EXPECTED.tsv` row count — **currently 820**,
+- [ ] All GREEN: functional (matches `EXPECTED.tsv` row count — **currently 213**,
       0 fail), extern-c, security 8/8, performance, **valgrind clean**,
       **fuzz fail-closed (0 crashes)**, **differential consistent**,
       **generics-negative GREEN**.
