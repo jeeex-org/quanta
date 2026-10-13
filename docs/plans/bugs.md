@@ -337,6 +337,47 @@ evidence stays independent of the tag that picks the branch — which is what ma
 **Severity is higher than the ticket implied:** untyped parameters are the norm in this codebase, not an edge
 case, so A6/A7 are the visible tip of a very common pattern.
 
+### A6+A7 · FIXED (0.0.236 source tree) · one gate row regresses, and it is not the fix
+
+**The fix: `scan_call_types()` — `funcscan.quanta`, called from `entry.quanta` after `scan_retstr()`.**
+It extends `scan_call_float`'s rule past float literals: for every call `name(args)` inside function `g`,
+argument `k` carries a type when (1) it holds a float/string literal, (2) it NAMES a parameter of `g` whose
+`fn_parflt`/`fn_parstr` slot is already set, or (3) it is a call to a function flagged `fn_retflt`/`fn_retstr`;
+parameter `k` of every top-level `name` is then marked float/string, monotone to a fixpoint. Not one literal.
+
+- **A6, the whole of it:** `reduce(0.5)` marks reduce's parameter from the literal; `qmult(x)` marks qmult's
+  from reduce's already-marked parameter. The "a dead `qmult(0.5)` fixes it" puzzle falls out — the old rule
+  needed a LITERAL at a call site, this pass reads the token stream, so reachability never enters into it.
+- **A7 needed a scan that did not exist.** Verified by grep: `fn_parstr` had only two writers, both
+  declaration/import metadata (`funcscan.quanta:319`, `objfmt.quanta:1252`) — there was no call-site inference
+  for strings at all. The same rule now writes `fn_parstr`, which `entry.quanta:893` turns into `vreg_is_str`
+  on the parameter vreg. Measured: `file_open(p, 0)` with an UNTYPED `p` returned `-2` on 0.0.235 and `3` on
+  0.0.236, exactly matching `fn p: str` (3 on both).
+- **Why the enclosing function is resolved from BRACES, not a name:** a name-only rule would tag any call that
+  happens to pass an identifier spelled like some other function's float parameter, and a wrongly-float
+  parameter is the same miscompile class this fix removes. Method calls are skipped (a preceding `.`).
+- **The record above is wrong about mechanism 3**, and the source says so: `iremit(op,res,a0,a1,a2)` plus
+  `entry.quanta:851` (`iremit(IR_PARAM,vr,pc,0,0)`) make `IR_PARAM.a0` the parameter ORDINAL and `irres` the
+  target vreg. Both readers (`codegen.quanta:1136`, `1245`) key `fn_parflt` by that ordinal, and
+  `scan_call_float` writes it by ordinal too — so mechanism 3 wrote exactly the slot the existing pass already
+  wrote, which is why it "fired 32 times and changed nothing". The codegen.quanta:455 comment ("PARAM target
+  vreg is live" reading `o0`) is the misreading that produced the wrong explanation.
+- **Verified (0.0.236):** A6 repro `4602678819172646912` (was `-4336984033343832063`); A7 repro prints
+  `untyped tag: GLOBAL` / `untyped lit: TEXT` (was two 20-digit numbers); `codes/f64_call_order_test.quanta`
+  run rc 1 -> 0; `tests/f64_call_order_defect.quanta` still `0` then `4602678819172646912`;
+  `codes/embedding_test.quanta` still rc=0; fixpoint `203e0d772ca38e903ad27c921645d10a` (3/3 generations);
+  **STDLIB 108/108 GREEN** — the layer the rejected SSE-site mechanism broke.
+- **Gate (not promotable yet, and not because of the fix):** `818/821 pass, 3 fail` (rc=1) against a
+  same-environment 0.0.235 baseline of `820/821 pass, 1 fail`. The shared failure is the pre-existing
+  `recv_loop_test.quanta` compile rc=14. The single distinct regressing row is
+  `std_code_synthesizer_const_test.quanta` (listed twice), and it is a previously-dead code path being
+  entered for the first time: the pass flips exactly two slots there (`synthesize_all` p0, `register_pattern`
+  p0, both string), `file_open("gap_specs.json")` now succeeds, and `lib/std/code_synthesizer.quanta` then
+  overruns a 2 MB buffer with a 16 MB read and parses garbage. With that buffer enlarged locally and the
+  parameter typed EXPLICITLY `: str`, the PRISTINE 0.0.235 compiler reproduces the same three outcomes
+  (rc=0 x3, rc=124 x2, rc=135/SIGBUS x4 over nine runs), so the row's instability is inherent to that module,
+  not to this change. Details and the recommended next step: `compiler/0.0.236/WIP.md`.
+
 ### A7 · NOT REPRODUCED for typed paths; LIVE for an UNTYPED parameter (same family as A6)
 
 **Measured on 0.0.236. The typed paths are fine; an untyped parameter is not.**

@@ -1,0 +1,150 @@
+import std/math
+
+// Float RESULT TAGGING and f2i/f64bits round-tripping.
+//
+// WHY THIS TEST EXISTS, and the trap it is built to catch:
+//
+// For ten sessions I believed f2i was broken. It returned "3" for every
+// computed float, while literals worked. I chased that through nine separate
+// compiler patches -- register allocation, REX.B encoding, resolve_mov wiring,
+// float tag propagation -- and every one was reverted because it changed
+// nothing.
+//
+// The defect was in MY TEST DATA, not the compiler. The constant I had been
+// writing as "10.0" --
+//
+//     mem_store(p, 4614256656552045840)
+//
+// is the IEEE-754 bit pattern of the double 3.1415926535897896, not of 10.0.
+// (It is NOT math.pi, which is 8 ULP away: bits(pi) = 4614256656552045848. Both
+//  truncate to 3, so the arithmetic was right either way.) The real 10.0 is
+//
+//     4621819117588971520   (0x4024000000000000)
+//
+// so f2i was correctly returning trunc(3.1415926535897896) == 3 the whole time.
+// Ten sessions
+// of hunting a compiler bug that was arithmetic I did in my head.
+//
+// The lesson encoded here: NEVER hand-write an IEEE-754 constant. Derive it
+// with f64bits() on a literal, or this exact failure repeats. Every constant
+// below is a REAL value, verified against Python struct.pack, and the test
+// asserts on the ROUND TRIP (value -> bits -> value) rather than on a
+// memorised decimal, so a wrong constant fails loudly and immediately instead
+// of masquerading as a compiler defect.
+
+fn close_to(a: f64, b: f64) -> i64 {
+    let d = a - b
+    if d < 0.0 { d = 0.0 - d }
+    if d < 0.0000001 { return 1 }
+    return 0
+}
+
+fn main() -> i64 {
+    let fails = 0
+
+    // --- Group 1: the true bit patterns. Derived, not memorised. -----------
+    // 10.0 = 0x4024000000000000 = 4621819117588971520
+    //  2.0 = 0x4000000000000000 = 4611686018427387904
+    //  3.5 = 0x400c000000000000 = 4615063718147915776
+    // 200.0 = 0x4069000000000000 = 4641240890982006784
+    // 1e6  = 0x412e848000000000 = 4696837146684686336
+    // 3.1415926535897896 = 0x400921fb54442d10 = 4614256656552045840  <-- impostor
+
+    // 1. f64bits of a literal must be the documented pattern. This is the
+    //    ground truth every other check is calibrated against.
+    if f64bits(10.0) != 4621819117588971520 {
+        print("FAIL 1: f64bits(10.0)="); print(f64bits(10.0)); print("\n")
+        fails = fails + 1
+    }
+
+    // 2. And the impostor really is that double, which is what misled me.
+    //    the trap is documented in executable form.
+    if f64bits(f64of(4614256656552045840)) != 4614256656552045840 {
+        print("FAIL 2: f64of round trip\n")
+        fails = fails + 1
+    }
+
+    // --- Group 2: f2i on a COMPUTED float (the case that "failed") ---------
+    // Each loads from memory, so the operand is a call result -- never a
+    // literal. These are the exact shapes that returned 3.
+    let p10   = mem_alloc(8)   // 10.0
+    let p2    = mem_alloc(8)   // 2.0
+    let p35   = mem_alloc(8)   // 3.5
+    let p200  = mem_alloc(8)   // 200.0
+    let p1e6  = mem_alloc(8)   // 1000000.0
+    mem_store(p10,  4621819117588971520)
+    mem_store(p2,   4611686018427387904)
+    mem_store(p35,  4615063718147915776)
+    mem_store(p200, 4641240890982006784)
+    mem_store(p1e6, 4696837146684686336)
+
+    let f10  = f64_load(p10)
+    let f2   = f64_load(p2)
+    let f35  = f64_load(p35)
+    let f200 = f64_load(p200)
+    let f1e6 = f64_load(p1e6)
+
+    // 3-7. f2i of a computed float. Also truncates toward zero, so 3.5 -> 3.
+    if f2i(f10) != 10 { print("FAIL 3: f2i(10.0)="); print(f2i(f10)); print("\n")  fails = fails + 1 }
+    if f2i(f2)  != 2  { print("FAIL 4: f2i(2.0)=");  print(f2i(f2));  print("\n")  fails = fails + 1 }
+    if f2i(f35) != 3  { print("FAIL 5: f2i(3.5)=");  print(f2i(f35)); print("\n")  fails = fails + 1 }
+    if f2i(f200) != 200 { print("FAIL 6: f2i(200.0)="); print(f2i(f200)); print("\n") fails = fails + 1 }
+    if f2i(f1e6) != 1000000 { print("FAIL 7: f2i(1e6)="); print(f2i(f1e6)); print("\n") fails = fails + 1 }
+
+    // 8. f2i of that double is 3 -- CORRECT, and the fact that started all ten
+    //    sessions. Asserting it stops anyone re-deriving the same confusion.
+    let ppi = mem_alloc(8)
+    mem_store(ppi, 4614256656552045840)
+    let fpi = f64_load(ppi)
+    if f2i(fpi) != 3 { print("FAIL 8: f2i(PI)="); print(f2i(fpi)); print("\n") fails = fails + 1 }
+
+    // 9. Literal, for parity with the computed path.
+    if f2i(10.0) != 10 { print("FAIL 9: f2i(10.0 literal)\n") fails = fails + 1 }
+
+    // 10. f64of -> f2i round trip: the bits survive reinterpreting back.
+    if f2i(f64of(4621819117588971520)) != 10 {
+        print("FAIL 10: f2i(f64of(10.0))\n") fails = fails + 1
+    }
+
+    // --- Group 3: f2i must not clobber its operand (commit f404b38a) -------
+    // This is a REAL fix and is verified here so it cannot silently regress
+    // back into "the value after f2i is the truncation of the result".
+    let keep = mem_alloc(8)
+    mem_store(keep, 4621819117588971520)
+    let fk = f64_load(keep)
+    let before = f64bits(fk)
+    let junk = f2i(fk)
+    let after = f64bits(fk)
+
+    // 11. The operand's bits survive f2i.
+    if before != after {
+        print("FAIL 11: f2i CLOBBERED operand "); print(before)
+        print(" -> "); print(after); print("\n")
+        fails = fails + 1
+    }
+    // 12. And memory is untouched too, ruling out a store-level cause.
+    if mem_load(keep) != 4621819117588971520 {
+        print("FAIL 12: f2i wrote through to memory\n") fails = fails + 1
+    }
+    // 13. Sanity: junk was in fact the right answer.
+    if junk != 10 { print("FAIL 13: junk="); print(junk); print("\n") fails = fails + 1 }
+
+    // --- Group 4: float result tagging on ARITHMETIC ----------------------
+    // Both operands tagged float -> the result must stay float. This is the
+    // codegen rule that was repaired; if it regresses, these become integers
+    // and f64bits of them returns a coincidentally wrong pattern.
+    let b1 = f64bits(20.0 * 0.5)
+    if b1 != 4621819117588971520 {
+        print("FAIL 14: 20.0*0.5 bits="); print(b1); print("\n") fails = fails + 1
+    }
+    let b2 = f64bits(4.0 + 2.0)
+    if b2 != f64bits(6.0) { print("FAIL 15: 4.0+2.0\n") fails = fails + 1 }
+    let b3 = f64bits(8.0 - 2.0)
+    if b3 != f64bits(6.0) { print("FAIL 16: 8.0-2.0\n") fails = fails + 1 }
+    let b4 = f64bits(9.0 / 3.0)
+    if b4 != f64bits(3.0) { print("FAIL 17: 9.0/3.0\n") fails = fails + 1 }
+
+    if fails == 0 { print("std_vfloat_result: 17/17 PASS\n") return 0 }
+    print("std_vfloat_result: FAILS="); print(fails); print("\n")
+    return 1
+}

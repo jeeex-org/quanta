@@ -294,3 +294,47 @@ in some programs is worse than the x87 one whose worst case is 57 ULP.
 Once the defect is fixed, re-applying that file is the whole change; the
 accuracy claim to verify afterwards is `sin(x)` near pi, which x87 got 19558 ULP
 out of, and 1e15, which it got 7.7e-7 relative out of.
+
+## RESOLVED (0.0.236 source tree): the call site is the source of truth
+
+The fix is `scan_call_types()` in `funcscan.quanta`, called from `entry.quanta`
+right after `scan_retstr()`. It extends `scan_call_float()`'s existing rule past
+float LITERALS: an argument also carries a type when it NAMES a parameter of the
+enclosing function whose `fn_parflt`/`fn_parstr` slot is already set, or when it
+is a call to a function flagged `fn_retflt`/`fn_retstr`. The callee's parameter is
+then marked, monotone to a fixpoint.
+
+For this report's chain that is two steps:
+
+    reduce(0.5)   ->  reduce's param marked from the LITERAL (already worked)
+    qmult(x)      ->  qmult's param marked from reduce's marked PARAM (the gap)
+
+**The dead-call puzzle is explained by that and nothing else.** The old rule
+worked from literals, so an unreachable `qmult(0.5)` in `main` supplies the
+literal the rule needs; it also runs on the TOKEN stream, so reachability is
+irrelevant. The "call order" framing was never right. With `qmult`'s parameter
+marked, `fopld_rr` takes the `fld_x` (movq) branch and the program prints
+4602678819172646912 with no `qmult` call in `main`.
+
+Same mechanism, same fix, for strings (A7): nothing at all marked `fn_parstr`
+from a call site before this, so an untyped parameter carrying a string printed
+its pointer. `tests/a7_untyped_str_param_defect.quanta` now prints text.
+
+Measured on 0.0.236: A6 repro `4602678819172646912`; A7 repro `untyped tag:
+GLOBAL` / `untyped lit: TEXT`; gate row `codes/f64_call_order_test.quanta` rc
+1 -> 0; fixpoint `203e0d772ca38e903ad27c921645d10a` across three generations;
+STDLIB GREEN. The one regressing gate row (`std_code_synthesizer_const_test`) is
+a previously-dead module path that the fix uncovers, and the crash reproduces on
+the PRISTINE 0.0.235 compiler once that parameter is typed `: str` — evidence and
+the recommended resolution in `compiler/0.0.236/WIP.md` and `docs/plans/bugs.md`.
+
+Two mechanisms recorded above stay rejected, for the reasons given: tagging at the
+two SSE emit sites (which branch is taken IS the tag, so a wrong tag is cemented —
+it turned the STDLIB suite RED), and a rule inside the `changed=1` tag pass (no
+float evidence ever reached it; byte-identical binary). A third, the
+argument-ordinal write into `fn_parflt`, was inert for a different reason than the
+record claims: `fn_parflt` IS keyed by ordinal (`entry.quanta:851` puts `pc` in
+`IR_PARAM.a0` and the target vreg in `res`, and both readers key on `a0`), so that
+write duplicated `scan_call_float`'s. The gap was never the key — it was that no
+rule looked at a non-literal argument.
+

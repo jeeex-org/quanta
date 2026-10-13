@@ -1,0 +1,93 @@
+// Quanta RAG CLI - reads from shell commands
+import std/io
+import std/str
+
+fn str_index(s, sub) -> i64 {
+    let n = len(s)
+    let m = len(sub)
+    if m == 0 { return 0 }
+    if m > n { return -1 }
+    let i = 0
+    while i <= n - m {
+        let j = 0
+        let found = 1
+        while j < m {
+            if byte_at(s, i + j) != byte_at(sub, j) { found = 0; break }
+            j = j + 1
+        }
+        if found == 1 { return i }
+        i = i + 1
+    }
+    return -1
+}
+
+fn json_extract(json, key) -> str {
+    let search = "\"" + key + "\":\""
+    let pos = str_index(json, search)
+    if pos == -1 { return "[not found]" }
+    let start = pos + len(search)
+    let end = start
+    while byte_at(json, end) != 34 {
+        if byte_at(json, end) == 92 { end = end + 1 }
+        end = end + 1
+    }
+    return substr(json, start, end - start)
+}
+
+fn str_replace(s, old, new) -> str {
+    let result = s
+    let pos = str_index(result, old)
+    while pos >= 0 {
+        let before = substr(result, 0, pos)
+        let after = substr(result, pos + len(old), len(result) - pos - len(old))
+        result = concat(concat(before, new), after)
+        pos = str_index(result, old)
+    }
+    return result
+}
+
+fn str_upper(s) -> str {
+    let n = len(s)
+    let result = ""
+    let i = 0
+    while i < n {
+        let c = byte_at(s, i)
+        if c >= 97 && c <= 122 { c = c - 32 }
+        let buf = mem_alloc(2)
+        mem_store8(buf + 8, c)
+        mem_store8(buf + 9, 0)
+        result = concat(result, buf)
+        i = i + 1
+    }
+    return result
+}
+
+fn main() {
+    print("Quanta RAG CLI\n")
+    print("==============\n\n")
+    
+    // Read query from stdin
+    print("Enter your Quanta question: ")
+    let query = readline()
+    
+    if len(query) == 0 {
+        print("Error: no query\n")
+        exit(1)
+    }
+    
+    print("Model: E2B\n\n")
+    
+    // Call Python helper
+    let cmd = "python3 /opt/tali/quanta/scripts/rag_helper.py \"" + query + "\" e2b"
+    let result = exec(cmd)
+    
+    let answer = json_extract(result, "answer")
+    answer = str_replace(answer, "\\n", "\n")
+    answer = str_replace(answer, "\\\"", "\"")
+    
+    print("============================================================\n")
+    print("ANSWER\n")
+    print("============================================================\n")
+    print(answer)
+    print("\n============================================================\n")
+}

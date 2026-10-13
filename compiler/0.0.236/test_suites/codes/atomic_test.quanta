@@ -1,0 +1,25 @@
+// atomic builtins: 0.0.105. rc encodes pass/fail per op.
+fn main() -> i64 {
+    let c = 0
+    atomic_store(&c, 42)
+    let v = atomic_load(&c)
+    if v != 42 { return 1 }
+    let o1 = atomic_add(&c, 8)      // c=50, o1=42
+    if o1 != 42 { return 2 }
+    if c != 50 { return 3 }
+    let o2 = atomic_swap(&c, 100)   // c=100, o2=50
+    if o2 != 50 { return 4 }
+    if c != 100 { return 5 }
+    // cmpxchg: expected 100 -> swap to 7, returns old 100, c becomes 7
+    let o3 = atomic_cmpxchg(&c, 100, 7)
+    if o3 != 100 { return 6 }
+    if c != 7 { return 7 }
+    // cmpxchg: expected 999 (wrong) -> no swap, returns current (7), c stays 7
+    let o4 = atomic_cmpxchg(&c, 999, 123)
+    if o4 != 7 { return 8 }
+    if c != 7 { return 9 }
+    // final load confirms consistency
+    let fin = atomic_load(&c)
+    if fin != 7 { return 10 }
+    return 11
+}
