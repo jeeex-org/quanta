@@ -1,4 +1,4 @@
-# 0.0.239 — WIP
+# 0.0.239 — WIP · **PROMOTED** (gate fully green, 225/225, STDLIB 108/108)
 
 **Lever: vector-register SIMD dequantisation of Q4_K weights.** One lever, one version,
 one mechanism: two new emitter builtins (`dq32lo` / `dq32hi`) that turn 32 raw Q4_K bytes
@@ -191,7 +191,7 @@ interpretable.
 |---|---|
 | fixed point (3 generations, seeded from the 0.0.238 golden) | `6f83fe08a7f8819a725fe50c81680ef1` x3, **distinct = 1** |
 | committed binary == that fixed point | yes |
-| `verify-release.sh` | **13 passed, 1 failed** — the one FAIL is `NEXT is not VER plus one patch`, an artifact of running it in the POST-bump state (root VERSION is already 0.0.239). Every substantive check passed: source rebuilds bit-for-bit, committed binary IS the seed-chain fixed point, self-host fixed point gen0==gen1==gen2, gate 225/225. |
+| `verify-release.sh` | **14 passed, 0 failed, exit 0** — run the sanctioned way (`0.0.239` vs `0.0.238`, root VERSION still naming the stable). Re-running in the POST-bump state gives `13 passed, 1 failed`, and that one FAIL is only `NEXT is not VER plus one patch` — an artifact of root VERSION already being 0.0.239. Every substantive check passes either way: source rebuilds bit-for-bit, committed binary IS the seed-chain fixed point, self-host fixed point gen0==gen1==gen2, gate 225/225. |
 
 Note the fixpoint is reached at **generation 1**, unlike 0.0.238: this version adds a
 builtin but changes no existing construct's codegen, so even the seed-built compiler
