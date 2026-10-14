@@ -32,19 +32,42 @@ source of truth. Anything not listed here has been removed as superseded.
 4. **Root `VERSION` is the only version pointer.** There is no `compiler/VERSION`.
    Deleted in `3631dd95` after it was found reading `0.0.192` across 30 releases
    while nothing consumed it.
-5. **The frozen baseline is the release one behind stable.** With stable at
-   `0.0.224` that is `0.0.223` (`md5=ff78dcbbb0cbfb94a1127c7813595f83`),
-   measured to rebuild bit-for-bit from its own source. It is never modified
-   after promotion; the next release opens as a copy of it. `0.0.222` is one
-   behind the baseline and is kept only because it reproduces bit-for-bit too.
+5. **The frozen baseline is the release one behind stable.** Derive it, never quote
+   it: stable is `cat VERSION`, so the baseline is `compiler/<one patch below>/`, and
+   `bash scripts/verify-release.sh <NEXT> "$(cat VERSION)"` (check 5) proves it
+   rebuilds bit-for-bit from its own source. It is never modified after promotion;
+   the next release opens as a copy of it. (This rule used to quote a literal
+   version and md5, which went stale the moment it was written.)
+
+## Branching and state
+
+- **One branch and one worktree per work unit**, named `v<VER>-<lever>` (`<VER>` =
+  `cat VERSION`, `<lever>` = the concern it carries, e.g. `v0.0.237-regalloc`). The
+  naming is what keeps parallel units from sharing a checkout, and it makes
+  `git worktree list` legible: one entry per live unit, and a stale tree is pruned
+  (`git worktree prune`) as soon as its branch is merged.
+- **`compiler/<VER>/WIP.md` is the frozen release record.** It is written *on that
+  version's branch*, finalized at promotion, and while the gate is red it carries a
+  **DO NOT PROMOTE** banner. It is the one history-kept document in this repo
+  (ground rule 1) because it records the state of a specific release.
+- **PR descriptions carry ephemeral state.** Progress notes, "currently working
+  on", and any in-flight claim belong in the PR body, never in a committed doc --
+  so no document in this tree ever describes work in progress.
+- **Project state is generated.** `docs/status.json` is rebuilt from the tree by
+  `bash scripts/regen_status.sh` and freshness-gated by the gate's verify-status
+  stage; it is not hand-edited. Counts and the live version are derived by command
+  (`cat VERSION`, `grep -c . test_suites/EXPECTED.tsv`, the last gate log), never
+  quoted as literals.
 
 ## Compiler — current
 
+The live version is `cat VERSION`; these paths derive from it rather than quoting it.
+
 | Doc | What it is |
 |---|---|
-| `compiler/0.0.224/WIP.md` | Current stable release record |
-| `compiler/0.0.223/WIP.md` | Frozen baseline — one behind stable |
-| `compiler/0.0.222/WIP.md` | Older fallback, retained (reproduces bit-for-bit) |
+| `compiler/$(cat VERSION)/WIP.md` | Current stable release record |
+| `compiler/<one patch below $(cat VERSION)>/WIP.md` | Frozen baseline — one behind stable |
+| earlier `compiler/<VER>/WIP.md` trees, retained while they reproduce bit-for-bit | older fallbacks |
 | `docs/SYNTAX.md` | Language syntax reference |
 | `docs/SPEC.md` | Language specification |
 | `docs/FLAGS.md` | Compiler flags |
@@ -162,6 +185,6 @@ The roadmaps were **not** up to date. Measured against reality:
 
 ## The one thing to read first
 
-`compiler/0.0.224/WIP.md`. It states the measured current state of the compiler,
-the root cause of the four trait failures it fixed, and the exact commands that
-produced every number in it.
+`compiler/$(cat VERSION)/WIP.md`. It states the measured current state of the
+compiler, the root cause of the failures that version fixed, and the exact commands
+that produced every number in it.

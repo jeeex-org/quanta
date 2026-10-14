@@ -151,7 +151,7 @@ These are non-negotiable. Violating any of them is a gate failure by itself.
 ---
 
 ## Terminology (derive from `VERSION`, never hardcode)
-- `<VER>`   = released/live stable   -> `cat VERSION`        (currently **0.0.236**; never type a literal — read it)
+- `<VER>`   = released/live stable   -> `cat VERSION`        (never type a literal — read it; the value is whatever that command prints)
 - `<NEXT>`  = the version being built -> exactly ONE patch above `<VER>`
 - `<PRIOR>` = `<VER>` itself; its committed golden `compiler/<VER>/bin/x86/qc`
   is the seed for `<NEXT>`. There is NO separate `bootstrap/` directory.
@@ -162,10 +162,15 @@ These are non-negotiable. Violating any of them is a gate failure by itself.
   source rebuilds to its own committed md5 BIT-FOR-BIT (step 5) — otherwise it
   is not a usable fallback and the promotion is not done.
 
-## LIVE STATE (advance this on every promotion)
-- Current stable compiler: **0.0.236** — see `cat VERSION`, this literal goes stale.
+## LIVE STATE (derive it — never quote it)
+Every value below is a command, so this section cannot go stale -- the same rule the
+row count now follows (`grep -c . test_suites/EXPECTED.tsv`, derived, never quoted).
+- Current stable compiler: `cat VERSION` (the number is whatever that prints).
 - Golden binary: `compiler/$(cat VERSION)/bin/x86/qc`
-- Gate: 212/212 rows (`grep -c . test_suites/EXPECTED.tsv`), 24/24 stages GREEN. Self-host behaviour: SELFHOST 7/7.
+- Gate: row count `grep -c . test_suites/EXPECTED.tsv`; the last result and the
+  per-stage status are read from the last gate log, e.g.
+  `grep -E 'Results:|RED' /tmp/gate_final.log` (the log the last `run_tests.sh` wrote).
+  Self-host behaviour: `bash scripts/selfhost_consistency.sh` -> `SELFHOST: 7/7`, rc 0.
 - Per-version state is recorded in `compiler/<VER>/WIP.md` and MUST be updated
   each promotion — and its title must match its directory. `0.0.225/WIP.md` was
   headed `0.0.224 — WIP`, which misinforms a reader who trusts it (rule #18).
