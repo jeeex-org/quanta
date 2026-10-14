@@ -5,221 +5,347 @@
 //   rag_query("pattern matching syntax", "e4b")
 //
 // Architecture: Quanta orchestrates, external tools do heavy lifting
-//   - python3: sentence-transformers embedding
-//   - sqlite3: vector search
+//   - python3 (embed.python): sentence-transformers embedding AND the vec0 KNN
 //   - curl: llama-server inference
+//
+// WHY THE PIECES ARE SHAPED THE WAY THEY ARE
+//
+//   * `exec(cmd)` in this language is execve("/bin/sh","-c",cmd). It REPLACES
+//     the process image and NEVER RETURNS; it does NOT capture stdout. Every
+//     subprocess here is therefore fork()+exec() in the child, with the child's
+//     stdout sent to a FILE by the shell (`cmd > file`), and the parent reads
+//     that file after wait(). Writing to a file -- rather than wiring a pipe --
+//     keeps the helpers' plain-stdout contract and needs no pipe plumbing.
+//
+//   * There is no `sqlite3` CLI on this host and vec_distance_euclidean() is not
+//     a sqlite-vec function name (the real one is vec_distance_l2). The old
+//     search shelled out to that CLI and could never have worked. Search now
+//     runs scripts/rag_search_file.py under embed.python -- the interpreter
+//     that has sqlite-vec 0.1.9 -- against the vec0 index.
+//
+//   * `+` does NOT concatenate strings and `str(a,b)` takes EXACTLY two
+//     arguments, so every join below is nested two-argument str().
+//
+//   * `config::name` module-qualified calls do not resolve (hard error:
+//     "undeclared variable: config"). std/config is imported and its functions
+//     are called by BARE name.
+//
+//   * str_split returns a TYPED string list: length at the pointer itself,
+//     elements at +8. Use len() and [i]; vec_len/vec_at on it read an element
+//     pointer as a length and segfault.
 
 import std/str
 import std/io
+import std/fs
 import std/config
 
-// Query embedding via Python helper
+// --- process + file plumbing -------------------------------------------------
+
+// Run `cmd` through /bin/sh in a child and return its exit status.
+fn rag_run_sh(cmd) -> i64 {
+    let pid = fork()
+    if pid == 0 {
+        exec(cmd)   // replaces the child image; exits 127 itself on failure
+        exit(127)   // only reached if execve could not even be attempted
+    }
+    return wait(pid)
+}
+
+// Read a whole file into a length-prefixed Quanta string. "" if it cannot open.
+fn rag_slurp(path) -> str {
+    let fd = open(path, 0, 0)          // O_RDONLY
+    if fd < 0 { return "" }
+    let sz = file_size(fd)
+    let s = read_str(fd, sz)
+    close(fd)
+    return s
+}
+
+// Write `s` to `path`, truncating. Returns 0 on success, -1 otherwise.
+fn rag_spill(path, s) -> i64 {
+    let fd = open(path, 577, 420)      // O_WRONLY|O_CREAT|O_TRUNC, mode 0644
+    if fd < 0 { return -1 }
+    write_str(fd, s)
+    close(fd)
+    return 0
+}
+
+// Run `cmd` and return its stdout: the shell redirects it to `outfile`, which
+// is read back. This is the only way to get a subprocess's output back, because
+// exec() replaces the image rather than returning a captured string.
+fn rag_cmd_capture(cmd, outfile) -> str {
+    rag_run_sh(str(cmd, str(" > ", outfile)))
+    return rag_slurp(outfile)
+}
+
+// Prefix a python invocation with a capped BLAS/OMP thread count. Under a
+// bounded address space (./scripts/quanta_run.sh caps a run at 1536 MB VA) the
+// BLAS/OpenMP thread pools cannot be created -- numpy's import then dies with
+// "pthread_create failed ... Resource temporarily unavailable". Pinning every
+// pool to one thread keeps the helpers working inside that cap. The command
+// runs via `/bin/sh -c`, so the VAR=value prefix is a normal shell assignment
+// and is not part of argv.
+fn rag_py_cmd(py, args) -> str {
+    return str("OPENBLAS_NUM_THREADS=1 OMP_NUM_THREADS=1 MKL_NUM_THREADS=1 ", str(py, str(" ", args)))
+}
+
+// i64 -> decimal string, via std/str's str_fmt ("%d").
+fn rag_i64_str(v) -> str {
+    let b = mem_alloc(8)               // 64 bytes, ample for a decimal i64
+    str_fmt(b, 64, "%d", v)
+    return b
+}
+
+// Strip trailing whitespace from a string (a helper may end its output with a
+// newline). Returns a substring, so the result is an ordinary Quanta string.
+fn rag_rstrip(s) -> str {
+    let n = len(s)
+    while n > 0 {
+        let c = mem_load8(s + 8 + n - 1)
+        if c == 10 || c == 13 || c == 32 || c == 9 { n = n - 1 } else { break }
+    }
+    if n == len(s) { return s }
+    return substr(s, 0, n)
+}
+
+// --- embedding ---------------------------------------------------------------
+
+// Query embedding via the configured interpreter + helper script. The query
+// goes in a FILE (spaces/quotes/newlines survive with no shell quoting); the
+// helper's hex output comes back through a second FILE because exec() cannot
+// capture stdout. Returns the embedding as hex, or an [error: ...] string.
 fn rag_embed(query) -> str {
-    // Write query to temp file (handles special chars safely)
-    let qf = config::rag_query_file()
-    file_write(qf, query)
-    // Interpreter and script both come from config/rag.conf. Neither path is
-    // written here, so relocating either needs no edit to this file.
-    let py = config::embed_python()
-    let sc = config::cfg_str("embed", "script", "")
+    let py = embed_python()
+    let sc = cfg_str("embed", "script", "")
     if len(py) == 0 || len(sc) == 0 {
-        // embed.python / embed.script are unset in the config. Say so plainly
-        // rather than running a `python3` that cannot load sentence-transformers.
+        // embed.python / embed.script are unset. Say so plainly rather than
+        // running a bare `python3` that cannot load sentence-transformers.
         return "[error: embed.python / embed.script not set in config/rag.conf]"
     }
-    let cmd = str(str(py, " "), str(sc, str(" ", qf)))
-    return exec(cmd)
+    let qf  = rag_query_file()
+    let out = cfg_str("embed", "out_file", "/tmp/rag_embed_out.txt")
+    rag_spill(qf, query)
+    // py " " sc " " qf
+    let cmd = rag_py_cmd(py, str(sc, str(" ", qf)))
+    return rag_rstrip(rag_cmd_capture(cmd, out))
 }
 
-// Search for similar chunks using sqlite3 + sqlite-vec
+// --- search ------------------------------------------------------------------
+
+// Search the vec0 index for the top_k chunks nearest `embedding_hex` (as
+// returned by rag_embed). Returns one row per hit, one line each:
+//     source|type|chunk_index|content|distance
+// The KNN runs in embed.python (it has sqlite-vec); the query CLI `sqlite3` is
+// not installed and vec_distance_euclidean is not a sqlite-vec function, so the
+// old shell-out could never work. The interface is unchanged from before --
+// callers still pass (embedding_hex, top_k) and still get pipe-delimited rows.
 fn rag_search(embedding_hex, top_k) -> str {
-    // Use sqlite3 with vec0 extension
-    // Path from config/rag.conf, not from this file.
-    let db = config::rag_db()
-    let cmd = "sqlite3 "
-    cmd = cmd = cmd + db
-    cmd = cmd = cmd + " \""
-    cmd = cmd = cmd + "SELECT source, type, chunk_index, content "
-    cmd = cmd = cmd + "FROM chunks "
-    cmd = cmd = cmd + "WHERE embedding IS NOT NULL "
-    cmd = cmd = cmd + "ORDER BY vec_distance_euclidean(embedding, X'" + embedding_hex + "') "
-    cmd = cmd = cmd + "LIMIT " + str(top_k)
-    cmd = cmd = cmd + "\""
-    return exec(cmd)
+    let py = embed_python()
+    let sc = cfg_str("search", "script", "")
+    if len(py) == 0 || len(sc) == 0 {
+        return "[error: search.script / embed.python not set in config/rag.conf]"
+    }
+    let inf  = cfg_str("search", "in_file", "/tmp/rag_search_in.txt")
+    let outf = cfg_str("search", "out_file", "/tmp/rag_search_out.txt")
+    rag_spill(inf, embedding_hex)
+    let k = rag_i64_str(top_k)
+    // py " " sc " " inf " " k
+    let cmd = rag_py_cmd(py, str(sc, str(" ", str(inf, str(" ", k)))))
+    return rag_cmd_capture(cmd, outf)
 }
 
-// Call llama-server for answer generation
-fn rag_generate(prompt, model_port) -> str {
-    // Build JSON payload
-    let escaped = prompt
-    escaped = str_replace(escaped, "\\", "\\\\")
-    escaped = str_replace(escaped, "\"", "\\\"")
-    escaped = str_replace(escaped, "\n", "\\n")
-    
-    let json = "{\"messages\":[{\"role\":\"user\",\"content\":\"" + escaped + "\"}],"
-    json = json + "\"max_tokens\":256,"
-    json = json + "\"temperature\":0.3,"
-    json = json + "\"top_p\":0.95,"
-    json = json + "\"chat_template_kwargs\":{\"enable_thinking\":false}}"
-    
-    let cmd = "curl -s -X POST http://localhost:" + model_port + "/v1/chat/completions "
-    cmd = cmd + "-H 'Content-Type: application/json' "
-    cmd = cmd + "-d '" + json + "'"
-    
-    return exec(cmd)
+// Convenience: embed a query and return its ranked rows in one call.
+fn rag_retrieve(query, top_k) -> str {
+    let emb = rag_embed(query)
+    if len(emb) == 0 || mem_load8(emb + 8) == 91 {   // '[' -> an [error: ...]
+        return emb
+    }
+    return rag_search(emb, top_k)
 }
 
-// Main RAG query function
-fn rag_query(query, model) {
-    // Default to e2b
-    if str_len(model) == 0 { model = "e2b" }
-    
-    // Port from [models] in the config, by name.
-    let port = config::model_port(model)
-    
-    print("Quanta RAG Query: " + query)
-    print("Model: " + str_upper(model))
-    print("")
-    
-    // Step 1: Get embedding
-    print("[1/4] Computing embedding...")
-    let emb_hex = rag_embed(query)
-    
-    // Step 2: Search
-    print("[2/4] Searching knowledge base...")
-    let results = rag_search(emb_hex, config::rag_default_top_k())
-    
-    // Step 3: Parse and build prompt
-    print("[3/4] Building context...")
-    let context = rag_parse_results(results)
-    let prompt = rag_build_prompt(query, context)
-    
-    // Step 4: Generate
-    print("[4/4] Generating answer...")
-    let response = rag_generate(prompt, port)
-    let answer = rag_extract_answer(response)
-    
-    // Display
-    print("\n" + str_repeat("=", 70))
-    print("ANSWER")
-    print(str_repeat("=", 70))
-    print(answer)
-    print(str_repeat("=", 70))
-}
+// --- context assembly --------------------------------------------------------
 
-// Parse sqlite3 results into context chunks
-fn rag_parse_results(raw) -> vec {
+// Turn raw search rows into "source|content" lines, one per chunk. Returns a
+// STRING of newline-separated lines. Fields are split on '|' and the content
+// field (index 3) is taken; each helper row is a single line with the content
+// already collapsed, so one row maps to exactly one output line.
+fn rag_parse_results(raw) -> str {
     let lines = str_split(raw, "\n")
-    let chunks = vec_new()
+    let out = ""
     let i = 0
-    while i < vec_len(lines) {
+    let n = len(lines)
+    while i < n {
         let line = lines[i]
-        if str_len(line) > 0 {
-            // Format: source|type|chunk_index|content
+        if len(line) > 0 {
             let parts = str_split(line, "|")
-            if vec_len(parts) >= 4 {
-                let chunk = parts[0] + "|" + parts[3]  // source|content
-                vec_push(chunks, chunk)
+            if len(parts) >= 4 {
+                out = str(out, str(str(parts[0], "|"), parts[3]))
+                out = str(out, "\n")
             }
         }
         i = i + 1
     }
-    return chunks
+    return out
 }
 
-// Build RAG prompt with context
+// Build the generation prompt from a "source|content" line block.
 fn rag_build_prompt(query, context) -> str {
     let prompt = "You are a Quanta programming language expert.\n"
-    prompt = prompt + "Use ONLY the following context to answer the question.\n"
-    prompt = prompt + "DO NOT reference Python, Rust, C++, Go, or other languages.\n"
-    prompt = prompt + "DO NOT make up information.\n\n"
-    prompt = prompt + "CONTEXT FROM QUANTA SOURCE:\n"
-    
+    prompt = str(prompt, "Use ONLY the following context to answer the question.\n")
+    prompt = str(prompt, "DO NOT reference Python, Rust, C++, Go, or other languages.\n")
+    prompt = str(prompt, "DO NOT make up information.\n\n")
+    prompt = str(prompt, "CONTEXT FROM QUANTA SOURCE:\n")
+
+    let lines = str_split(context, "\n")
     let i = 0
-    while i < vec_len(context) {
-        let chunk = context[i]
-        let parts = str_split(chunk, "|")
-        if vec_len(parts) >= 2 {
-            prompt = prompt + "\n--- " + parts[0] + " ---\n"
-            prompt = prompt + parts[1]
+    let n = len(lines)
+    while i < n {
+        let line = lines[i]
+        if len(line) > 0 {
+            let parts = str_split(line, "|")
+            if len(parts) >= 2 {
+                prompt = str(prompt, str(str("\n--- ", parts[0]), " ---\n"))
+                prompt = str(prompt, parts[1])
+            }
         }
         i = i + 1
-        if i >= 3 { break }  // Limit context to 3 chunks
+        if i >= rag_context_chunks() { break }   // context_chunks from config
     }
-    
-    prompt = prompt + "\n\nQUESTION: " + query + "\n\nANSWER:"
+
+    prompt = str(prompt, str("\n\nQUESTION: ", query))
+    prompt = str(prompt, "\n\nANSWER:")
     return prompt
 }
 
-// Extract answer from JSON response
-fn rag_extract_answer(json_str) -> str {
-    // Find "content":"..." in JSON response
-    let key = "\"content\":\""
-    let start = str_index(json_str, key)
-    if start == -1 { return "[Error: no content in response]" }
-    
-    start = start + str_len(key)
-    let end = str_find_escape(json_str, start)
-    if end == -1 { return "[Error: unterminated content]" }
-    
-    let raw = str_substring(json_str, start, end)
-    // Unescape JSON strings
-    raw = str_replace(raw, "\\n", "\n")
-    raw = str_replace(raw, "\\\"", "\"")
-    raw = str_replace(raw, "\\\\", "\\")
-    return raw
-}
+// --- generation --------------------------------------------------------------
 
-// Find next unescaped quote
-fn str_find_escape(s, from) -> i64 {
-    let i = from
+// Escape a string for embedding in a JSON string literal.
+fn rag_json_escape(s) -> str {
+    let out = ""
     let n = len(s)
+    let i = 0
     while i < n {
         let c = mem_load8(s + 8 + i)
-        if c == 34 {  // double quote
-            // Check if escaped
-            if i > from && mem_load8(s + 8 + i - 1) == 92 {
-                // Escaped, skip
+        if c == 34 { out = str(out, "\\\"") }        // "
+        else if c == 92 { out = str(out, "\\\\") }    // backslash
+        else if c == 10 { out = str(out, "\\n") }     // newline
+        else if c == 13 { out = str(out, "\\r") }     // CR
+        else if c == 9 { out = str(out, "\\t") }      // tab
+        else { out = str(out, substr(s, i, 1)) }
+        i = i + 1
+    }
+    return out
+}
+
+// Call llama-server (OpenAI-compatible) for answer generation.
+fn rag_generate(prompt, model_port) -> str {
+    let esc = rag_json_escape(prompt)
+    let body = str("{\"messages\":[{\"role\":\"user\",\"content\":\"", esc)
+    body = str(body, "\"}],\"max_tokens\":")
+    body = str(body, rag_i64_str(llm_max_tokens()))
+    body = str(body, ",\"temperature\":0.3,\"top_p\":0.95,")
+    body = str(body, "\"chat_template_kwargs\":{\"enable_thinking\":false}}")
+
+    let cmd = str(str("curl -s -X POST ", llm_base()), str(":", rag_i64_str(model_port)))
+    cmd = str(cmd, str(llm_path(), " -H 'Content-Type: application/json' -d '"))
+    cmd = str(cmd, str(body, "'"))
+
+    let out = cfg_str("rag", "cmd_out_file", "/tmp/rag_cmd_out.txt")
+    return rag_cmd_capture(cmd, out)
+}
+
+// Extract the first "content":"..." value from an OpenAI-style JSON response.
+fn rag_extract_answer(json_str) -> str {
+    let key = "\"content\":\""
+    let parts = str_split(json_str, key)
+    if len(parts) < 2 { return "[error: no content in response]" }
+    let rest = parts[1]
+    // Content ends at the first unescaped double-quote.
+    let n = len(rest)
+    let i = 0
+    let end = -1
+    while i < n {
+        let c = mem_load8(rest + 8 + i)
+        if c == 34 {
+            if i > 0 && mem_load8(rest + 8 + i - 1) == 92 {
+                // escaped \" -- keep going
             } else {
-                return i
+                end = i
+                break
             }
         }
         i = i + 1
     }
-    return -1
+    if end < 0 { return rest }
+    return substr(rest, 0, end)
 }
 
-// Helper: repeat string
-fn str_repeat(s, n) -> str {
-    let result = ""
-    let i = 0
-    while i < n {
-        result = result + s
-        i = i + 1
-    }
-    return result
-}
+// --- entry point -------------------------------------------------------------
 
-// Helper: uppercase
-fn str_upper(s) -> str {
-    let n = len(s)
-    let result = ""
+// Print each ranked row's source and distance (fields 0 and 4).
+fn rag_print_rows(rows) {
+    let lines = str_split(rows, "\n")
     let i = 0
+    let n = len(lines)
     while i < n {
-        let c = mem_load8(s + 8 + i)
-        if c >= 97 && c <= 122 {  // a-z
-            c = c - 32  // to uppercase
+        let line = lines[i]
+        if len(line) > 0 {
+            let f = str_split(line, "|")
+            if len(f) >= 5 {
+                prints("  ")
+                prints(rag_i64_str(i + 1))
+                prints(". ")
+                prints(f[0])
+                prints("   distance=")
+                prints(f[4])
+                newline()
+            }
         }
-        result = result + str_from_byte(c)
         i = i + 1
     }
-    return result
 }
 
-// Helper: byte to string
-fn str_from_byte(b) -> str {
-    let buf = mem_alloc(2)
-    mem_store8(buf + 8, b)
-    mem_store8(buf + 9, 0)
-    return buf
+// Main RAG query: retrieve, then generate.
+fn rag_query(query, model) {
+    if len(model) == 0 { model = "e2b" }
+
+    let port = model_port(model)
+
+    prints(str("Quanta RAG Query: ", str(query, "\n")))
+    prints(str("Model: ", str(model, "\n\n")))
+
+    // Step 1+2: embedding + semantic search (both external, via python).
+    prints("[1/3] Embedding + searching (semantic, sqlite-vec)...\n")
+    let rows = rag_retrieve(query, rag_default_top_k())
+    prints("Retrieved chunks:\n")
+    rag_print_rows(rows)
+
+    // Step 3: build the prompt from the retrieved chunks.
+    prints("\n[2/3] Building context...\n")
+    let context = rag_parse_results(rows)
+    let prompt = rag_build_prompt(query, context)
+
+    // Step 4: generate.
+    prints("[3/3] Generating answer...\n")
+    let response = rag_generate(prompt, port)
+    let answer = rag_extract_answer(response)
+
+    prints("\n")
+    prints(str_repeat_eq(70))
+    prints("\nANSWER\n")
+    prints(str_repeat_eq(70))
+    prints("\n")
+    prints(str(answer, "\n"))
+    prints(str_repeat_eq(70))
+    prints("\n")
+}
+
+fn str_repeat_eq(n) -> str {
+    let out = ""
+    let i = 0
+    while i < n {
+        out = str(out, "=")
+        i = i + 1
+    }
+    return out
 }
