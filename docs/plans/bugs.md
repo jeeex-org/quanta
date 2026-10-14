@@ -412,6 +412,36 @@ Note the A6 fix does not reach this: A6 tagged `vfloat` at the SSE operand site,
 (`vreg_is_str`) supplied where the argument's string-ness is known. Same principle, different table — and the
 same question applies to whether an untyped parameter should be refused rather than silently mis-typed.
 
+### A8 · CLOSED (stale report) · `SYNTH_CAP` was a dead constant; it is now an enforced ceiling
+
+**Reported as a dead constant at `lib/std/code_synthesizer.quanta:17` (one declaration, no
+uses). Re-measured: the report predates HEAD `36760cd0` ("chore(std/code_synthesizer): make
+SYNTH_CAP a real ceiling"), the commit that closed it, so the premise is stale.** The task
+that raised it was to file the finding and leave the code to the file's owner — the owner
+landed the fix first.
+
+grep evidence in `lib/std/code_synthesizer.quanta` (`grep -n 'SYNTH_CAP' ...`):
+
+```
+18:// (exit 1, with a printed message) if a run would stage more than SYNTH_CAP
+22:const SYNTH_CAP = 10000;
+292:            // SYNTH_CAP is enforced, not decorative: fail loudly rather than
+294:            if generated > SYNTH_CAP {
+295:                prints("code_synthesizer: SYNTH_CAP ("); printi(SYNTH_CAP);
+```
+
+One declaration, and it is **read** at lines 294-295 inside `synthesize_all()`. (The
+declaration is at line **22**, not 17 — the file grew above it; the cited line was right for
+the pre-HEAD revision.) The two options on the table were delete it, or enforce it; the
+**second** was taken — a loud failure (`exit 1` plus a printed message), never a silent stop,
+which is the `std/vec` defect class (`vec_push` silently dropped pushes past capacity; see
+`SELF_IMPROVEMENT.md` item 4). It is a no-op today: `gap_specs.json` holds 9,000 specs
+(11 were removed in the SI contamination pass, this session) against a cap of 10,000.
+
+- No code change is recorded here: `lib/std/**` belongs to another work unit and the ceiling
+  is already in place. The entry exists so the next reader does not re-raise a closed report
+  — the same reason A3 and A5 carry a status line instead of a fix.
+
 ---
 
 ## Severity B — accuracy (0.0.235)
