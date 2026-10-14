@@ -9,14 +9,17 @@ seconds and the model is 1.67 GB: the gate's 15 s / 1536 MB guards cannot hold i
 same reason `tests/threaded_forward_twice.quanta` is here).
 
     bash tests/run_lfm2_generate.sh          # compiles then runs, 8 GB cap
-    # conf:   tests/lfm2_gen.conf    "<workers> <max_new> <temp_milli> <top_k>"
+    # conf:   tests/lfm2_gen.conf    "<workers> <max_new> <temp_milli> <top_k> [seed]"
     # prompt: tests/lfm2_prompt.txt  (the user turn; read from a FILE, not stdin)
+
+The 5th conf field is optional: it seeds the sampler (`sampling.sample_seed`), so a
+run is reproducible from a chosen seed instead of the module's fixed 12345.
 
 ## WIRING, the two traps this wires (both real, both cost time to find)
 
 1. **`fc_kv_init(NCTX)` before the first forward.** It is declared in
    `lib/std/lfm2_forward.quanta` and *nothing in lib/std calls it*; with the KV base at
-   0 the first forward SIGSEGVs.
+   0 the first forward SIGSEGVs. Wire it, do not assume it.
 2. **`mm_pool_begin()` / `mm_pool_end()` around the WHOLE loop**, not the per-forward
    bracket inside `fc_forward_token_ex`: `thread_create()` never unmaps its 1 MB child
    stack, so a 300-token run would leak 300 x nworkers stacks and die mid-run with exit
@@ -35,47 +38,64 @@ Two more traps the driver hit and documents in-line, because both are silent:
 
 Failure paths `return 1`; the runner reports the program's own rc.
 
-## MEASURED, this build (0.0.239, 20 cores, load ~10 — a second unit was running)
+## MEASURED, 0.0.240 (20 cores, load ~9.5 — other units running)
 
 | quantity | value |
 |---|---|
-| load | 4.0 s |
+| load | 3.5 s |
 | prompt | 42 bytes -> `chat_build` 102 bytes -> **34 ids** |
-| prefill (20 workers) | `prefill_ms=195460`, **5.75 s/prompt-token** |
-| prefill (8 workers) | `prefill_ms=253042`, **7.44 s/prompt-token** |
+| prefill (20 workers) | `prefill_ms=197852`, **5.82 s/prompt-token** |
 | decode, argmax (temp_milli=0) | first token is `<|im_end|>` (EOS) -> `new_tokens=0` |
-| decode, sampled (temp_milli=500) | `new_tokens=6`, **6.55 s/token**, rc=0 |
-| RSS | ~110-150 MB |
+| decode, sampled (temp 0.7, top_k 40) | first token EOS -> `new_tokens=0` |
+| `sample_full` at n_vocab=128000, k=40 | **62 ms** (top-k is 60 ms of it) |
+| RSS | 130-180 MB (under the 8 GB cap) |
 
-Command behind the decode-argmax row:
+## The sampler was the first blocker and 0.0.240 fixes it — but it was not the only one
 
-    printf '8 8 0 0\n'  > tests/lfm2_gen.conf
-    printf 'What is 2+2? Answer with the number only.\n' > tests/lfm2_prompt.txt
-    ./compiler/0.0.239/bin/x86/qc tests/lfm2_generate.quanta /tmp/lfm2_gen.bin
-    ( ulimit -c 0 -v 8000000; timeout 560 nice -n 19 /tmp/lfm2_gen.bin </dev/null )
+**Fixed and verified in 0.0.240** (`lib/std/sampling.quanta`; reference harness
+`tests/sampling_ref.quanta` + `tests/verify_sampling_ref.py`, run with
+`bash tests/run_sampling_ref.sh`). Before: `sample_softmax` used `1 + (v - max)` as its
+"exp" (measured: it collapsed to a one-hot), `sample_top_k` was an O(n^2) sort that
+measured **110,080 ms** at n=128000/k=40, and `sample_draw` compared `cumsum*1000`
+against the raw rng value in [0, 2^31), which is never true — so **every draw returned
+index 0, and token 0 is `'Ċ'x10`, ten newlines.** That is the whitespace this driver
+used to print. After: 13 reference checks pass against numpy + a bit-exact replica of
+the LCG and the draw; top-k is 60 ms at n=128000/k=40 (1834x faster).
 
-## VERDICT: the driver runs, the native path still cannot be used by the SI loop
+**Still blocking text, and NOT a sampling defect.** With sampling enabled this driver's
+first token is EOS, because the prompt it builds is not the prompt the model's own chat
+template specifies:
 
-Stated plainly, because it is the point:
+* `chat_build` writes a **literal backslash-n** where the template renders a real
+  newline. `llama.cpp`'s `/apply-template` (its Jinja renderer, same GGUF) returns
+  `...<|im_start|>assistant\n thinking` with a REAL newline; `chat_build` returns
+  `assistant` + `\` + `n` + ` thinking`. Verified by comparing both byte strings.
+* the driver calls `bpe_encode`, which does **no special-token matching**; the
+  special-aware entry point `bpe_encode_special` exists in `lib/std/lfm2_bpe.quanta` and
+  is called by nobody, so `<|im_start|>`/`<|im_end|>` are encoded as text pieces
+  (34 ids) where llama.cpp's `/tokenize` produces single ids (22-23 ids).
 
-* The driver completes end to end with **rc=0** (load -> template -> tokenize -> prefill ->
-  sample -> detokenize -> print), so the plumbing is proven.
-* **With argmax it emits EOS as the first token**, so no text is produced for this prompt.
-  That is a model/prompt behaviour, recorded as a blocker, not worked around.
-* **With sampling it emits 6 tokens of whitespace.** `std/sampling.quanta`'s
-  `sample_softmax` uses `1 + (v - max)` as its "exp" — it is not a softmax — and
-  `sample_top_k` is an O(n^2) sort that allocates n x 8 bytes per call, so top-k must be
-  left at 0 at n_vocab = 128000. The sampler is the weak link once the engine is fast
-  enough to reach it.
-* **Cost:** 300 tokens is ~50 min at 8 workers and ~40 min at 20 (from measured per-token
-  times; not run end to end). Prefill alone is 5.7-7.4 s **per prompt token** because
-  prefill is one unbatched forward per token, so a 2.6k-token retrieved context is hours
-  before the first output token.
+Measured consequence, same engine, same 23 prompt ids:
 
-So: the engine got ~1.6x faster (see `compiler/0.0.239/WIP.md` §4), and that is still
-~65x short of llama-server's 8.24 tok/s on a larger model, with ~30% of each token now in
-an untouched Q6_K output projection. The honest conclusion is the one
-`docs/plans/lfm2-native-inference-perf.md` §4 already allows: the native CPU path stays
-what it is good at (correctness, verification, a bounded-memory loader), and generation
-should run through llama.cpp or the GPU while Quanta owns the loop, the gate and the
-proofs.
+| prompt ids | argmax | first sampled token |
+|---|---|---|
+| literal backslash-n tail | 124900 = `<|im_end|>` (EOS) | EOS -> `new_tokens=0` |
+| llama.cpp-rendered tail (newline + ` thinking`) | **597 = `The`** | real text |
+
+With the correctly rendered prompt and sampling ON (temp 0.25, top_k 40, seed 12345) the
+native engine produced **`The answer is: 2`** in 6 tokens at **7.85 s/token**, RSS
+142 MB — real words, from `sample_full`, no whitespace. llama.cpp's own argmax for the
+same prompt is also 597 = `The`.
+
+**Residual divergence, not investigated here:** the native logits are still flatter than
+llama.cpp's on the same ids (`p(The)` 0.251 native vs 0.847 llama.cpp; EOS sits at #2 in
+the native top-10). The argmax agrees; the tail does not. That is a logits/forward-pass
+question — the tied output projection is **Q6_K**, whose dequant has never been checked
+against a reference (0.0.239 verified Q4_K only) — and it is outside the sampling lever.
+
+## Cost
+
+300 tokens is ~40 min at 20 workers from the measured 7.85-8.2 s/token. Prefill is
+5.8-7.4 s **per prompt token** because prefill is one unbatched forward per token, so a
+2.6k-token retrieved context is hours before the first output token. Both are recorded
+as queued levers in `compiler/0.0.240/WIP.md`.

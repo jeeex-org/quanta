@@ -21,13 +21,13 @@
 //      stack, so one forward leaks nworkers stacks; a 300-token generation
 //      would leak 300x that and die mid-run with exit status 0 (defect A9).
 //
-// SAMPLING, stated honestly: the DEFAULT is argmax, which is deterministic and
-// is the path the correctness oracle uses. `sample_full` (std/sampling.quanta)
-// is wired and used only when the conf sets a positive temperature, and it has
-// two measured limitations a caller must know: sample_top_k() sorts with an
-// O(n^2) loop and allocates n*8 bytes per call, so it must be left OFF at
-// n_vocab = 128000; and sample_softmax() uses `1 + (v - max)` as its "exp", so
-// it is a crude approximation, not a real softmax.
+// SAMPLING: the DEFAULT is argmax (temp_milli = 0), deterministic and the path
+// the correctness oracle uses. `sample_full` (std/sampling.quanta) is used when
+// the conf sets a positive temperature; since 0.0.240 it is a real sampler --
+// stable softmax via std/math.expf, O(n*k) top-k, and a draw whose rng value is
+// scaled into the cumsum domain. Before 0.0.240 the draw compared cumsum*1000
+// against the raw rng output (never true), so every draw returned index 0 and the
+// run emitted whitespace no matter the temperature. See tests/README-lfm2-generate.md.
 //
 // Conf file tests/lfm2_gen.conf: "<workers> <max_new_tokens> <temp_milli> <top_k>"
 // Prompt file tests/lfm2_prompt.txt: the user turn.
@@ -119,21 +119,25 @@ fn main() {
     let maxnew = 8
     let tempmilli = 0     // 0 = argmax (deterministic)
     let topk = 0
+    let seed = 12345      // 5th field; sample_seed(seed) before the first draw
     if cfgb != 0 {
-        if parse_ints(cfgb, conf) >= 4 {
+        let nfields = parse_ints(cfgb, conf)
+        if nfields >= 4 {
             nw = mem_load(conf)
             maxnew = mem_load(conf + 8)
             tempmilli = mem_load(conf + 16)
             topk = mem_load(conf + 24)
         }
+        if nfields >= 5 { seed = mem_load(conf + 32) }
     } else {
         prints("warn: "); prints(CONF_PATH); prints(" unreadable; using defaults\n")
     }
     if maxnew < 1 { maxnew = 1 }
     if maxnew > 256 { maxnew = 256 }
     prints("workers="); print(nw); prints(" max_new="); print(maxnew)
-    prints(" temp_milli="); print(tempmilli); prints(" top_k="); print(topk); prints("\n")
-    if topk > 0 { prints("WARN: top_k > 0 is O(n_vocab^2) in std/sampling; expect no tokens.\n") }
+    prints(" temp_milli="); print(tempmilli); prints(" top_k="); print(topk)
+    prints(" seed="); print(seed); prints("\n")
+    if topk > 0 { prints("top_k=on (O(n*k) since 0.0.240)\n") }
 
     // ---- model ----
     let t0 = clock()
@@ -184,6 +188,8 @@ fn main() {
     let outbuf = mem_alloc(4096)
     let pos = n
     let k = 0
+    // Fixed seed -> the whole run is reproducible. Only meaningful when sampling.
+    if tempmilli > 0 { sample_seed(seed) }
     let g0 = clock()
     while k < maxnew {
         let id = 0
