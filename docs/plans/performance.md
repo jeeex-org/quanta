@@ -19,6 +19,21 @@ verified on its own.
 **Supersedes:** the 2026-10-12 draft that lived here (`100x slower than C`, `no register allocation`). Its
 claims are corrected in §2.3 from measurement; the draft is recorded as removed in `docs/INDEX.md`.
 
+> **STATUS 2026-10-14 (0.0.238) — the first codegen lever landed, and it REFUTES this document's premise.**
+> The 0.0.235 item (constant division/modulo by strength reduction) shipped as **0.0.238**. Removing
+> essentially every hot-loop `idiv` — plus the dead `sar`-then-`idiv` double work the old power-of-two path
+> emitted, which meant constant division *never* actually got the shift — bought only **0-12 %** on the 12
+> benchmark rows whose machine code changed (`heavy_int` −12.2 %, `div_const` −10.2 %, `heavy_int2` −7.3 %,
+> best-of-15 interleaved A/B via `scripts/bench_ab.sh`, load ~9.8). The predicted "move toward ≤3×" did NOT
+> happen: `heavy_int2` went 35.5× → 27.7×, `arith` 14.4× → 14.7×, `heavy_int` 22.0× → 22.0×.
+>
+> **So `idiv` was not the dominant cost**, and §1.1's causal claim is wrong. The per-operation spill/reload
+> traffic is the cost — §2.1 already measures it: `work()` = 254 instructions vs gcc's 9. **The next lever
+> is A4 / next-use eviction (home-slot reuse), not more division work.** Caveat that applies to every ratio
+> in this document: 25 of 37 suite rows emit byte-identical code across that change and still swing ±17 %,
+> and every row under 30 ms is noise-dominated — see `benchmarks/BENCHMARK.md` tables 3-4. The version's
+> full evidence is `compiler/0.0.238/WIP.md`.
+
 ---
 
 ## 1. Measured baseline — the existing suite on 0.0.233

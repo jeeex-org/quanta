@@ -51,7 +51,27 @@ is known stale (flagged in `docs/INDEX.md`).
 
 ## 2. Speed up Quanta vs C
 
-**Premise (measured on 0.0.233, suite still in `benchmarks/`):** the gap is bimodal —
+**DONE (0.0.238) — but it was NOT the lever this entry expected, and that is the finding.**
+Constant division/modulo by strength reduction landed (0.0.238): `/` and `%` by a positive
+compile-time constant no longer emit `idiv`. It also removed a real defect — the old
+power-of-two path emitted the `sar` and then fell through into the idiv sequence, so
+constant division paid both.
+
+**Measured effect: 0-12 % on the 12 rows whose machine code changed** (`heavy_int` -12.2 %,
+`div_const` -10.2 %, `heavy_int2` -7.3 %, best-of-15 interleaved A/B; the other 25 rows are
+byte-identical and swing +-17 %, i.e. noise). The premise below — that this cluster's
+6.8-32.3x is caused by `idiv` and will "move toward <=3x" — is **REFUTED**: `heavy_int2`
+moved 35.5x -> 27.7x, `arith` 14.4x -> 14.7x, `heavy_int` 22.0x -> 22.0x.
+
+**The real cost is the spill/reload traffic** (one home slot per vreg; `work()` = 254
+instructions vs gcc's 9; 1104-byte frames). So the next lever is **A4 / next-use eviction**,
+which A1b unblocked. Evidence: `compiler/0.0.238/WIP.md`, `benchmarks/BENCHMARK.md`,
+`scripts/bench_ab.sh` (the tool that made the answer decidable — comparing two compilers on
+the same source, and reporting whether they even emitted the same machine code).
+
+Original premise, kept for the record and now marked wrong:
+
+**Premise (measured on 0.0.233, suite in `benchmarks/`):** the gap is bimodal —
 12 cases at 0.7-2.3x (several faster than gcc), 9 arithmetic-loop cases at 6.8-32.3x.
 Worst offenders divide by a constant in a hot loop (`div_const` 19.9x, `heavy_int2`
 24.9x, `arith` 15.1x). Root cause is `idiv` (40-80 cycles) for constant division, **not**
