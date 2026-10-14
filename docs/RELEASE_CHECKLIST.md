@@ -271,6 +271,17 @@ QC=./compiler/$(cat VERSION)/bin/x86/qc bash test_suites/scripts/run_tests.sh
 - NOTE: verify-release.sh stage-4 "binary drift" checks `src/x86/qc` which NEVER
   exists here (golden is `bin/x86/qc`, never in `src/`). Ignore that one FAIL when
   `bin/x86/qc` == fixpoint md5 (it does). The real identity is §3.
+- NOTE (check 6 on a CODEGEN-changing release): check 6 requires
+  `compiler/<NEXT>/bin/x86/qc` to be the fixed point of the seed chain
+  (VER golden -> g1 -> g2 -> ...), i.e. reproducible from the committed tree. On a
+  release that changes codegen the FIRST generation is NOT the fixed point, by
+  construction: the seed-built compiler still carries the previous release's
+  codegen for the compiler's own source. Measured on 0.0.238 — seed-built `idiv`
+  count 147 vs committed 9, while both compile any given program to
+  BYTE-IDENTICAL output, and 0.0.237-golden -> g1(b1623ec1) -> g2(a87e6e1f) == the
+  committed binary. Do not "fix" this by committing the first generation: that
+  binary does not reproduce itself, and `.github/workflows/ci.yml` promotes the
+  recovered fixed point for exactly this reason.
 
 ## 7. CI pin (must match released version)
 - [ ] `.github/workflows/ci.yml` golden == `compiler/<VER>/bin/x86/qc` where

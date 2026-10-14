@@ -103,18 +103,50 @@ else
 fi
 
 # --- 6. src/bin lockstep for <NEXT> ----------------------------------------
-# Build to a SEPARATE path. qc cannot write its own binary in place: doing so
-# truncates the running file to 0 bytes.
+# <NEXT>'s committed binary must be REPRODUCIBLE from the committed tree.
+#
+# Comparing against a build by <VER> ALONE (the previous form of this check)
+# silently assumes the two releases emit the same machine code. That holds only
+# for a front-end change. When a release changes CODEGEN -- as every codegen lever
+# does -- the <VER>-built binary still carries the OLD codegen for the compiler's
+# own source, so it is necessarily a different (though functionally identical)
+# artifact, and this check produced a permanent false red.
+#
+# Measured on 0.0.238: the seed-built compiler contains 147 `idiv` instructions
+# and the committed one 9 (the release's whole point), yet compiling any given
+# program with either produces BYTE-IDENTICAL output. The committed binary is also
+# reproducible from version control alone: 0.0.237 golden builds the 0.0.238 source
+# to b1623ec1, and b1623ec1 builds it to a87e6e1f, which IS the committed binary.
+# .github/workflows/ci.yml promotes exactly that artifact and records the same
+# property ("the fixpoint is the SECOND generation, not the first").
+#
+# So the invariant tested here is the one that matters: walk the seed chain
+# (VER golden -> g1 -> g2 -> ...) to its fixed point and require the committed
+# binary to BE that fixed point. A committed binary no chain from the committed
+# tree can produce still FAILS. Build to a SEPARATE path: qc cannot write its own
+# binary in place (that truncates the running file to 0 bytes).
 if [[ -x "compiler/$VER/bin/x86/qc" && -f "compiler/$NEXT/src/x86/main.quanta" ]]; then
     T=$(mktemp -d)
-    if (cd "compiler/$NEXT" && "../$VER/bin/x86/qc" -O src/x86/main.quanta "$T/n.bin") >/dev/null 2>&1 \
-       && [[ -s "$T/n.bin" ]]; then
-        A=$(md5sum "compiler/$NEXT/bin/x86/qc" | cut -d' ' -f1)
-        B=$(md5sum "$T/n.bin" | cut -d' ' -f1)
-        [[ "$A" == "$B" ]] && ok "<NEXT> src rebuilds to its committed binary (md5 $A) -- SRC and BIN in lockstep" \
-                           || bad "<NEXT> src DIVERGED (committed $A, rebuilt $B) -- SRC and BIN out of lockstep"
-    else
-        bad "<NEXT> failed to rebuild from <VER> compiler"
+    SRC="$(pwd)/compiler/$NEXT/src/x86/main.quanta"
+    CUR="$(pwd)/compiler/$VER/bin/x86/qc"
+    CONV=0; LAST=""
+    for i in 1 2 3; do
+        if ! "$CUR" -O "$SRC" "$T/g$i" >/dev/null 2>&1 || [[ ! -s "$T/g$i" ]]; then
+            bad "<NEXT> seed-chain generation $i failed to build"; CONV=-1; break
+        fi
+        M=$(md5sum "$T/g$i" | cut -d' ' -f1)
+        if [[ "$M" == "$LAST" ]]; then CONV=1; break; fi
+        LAST="$M"; CUR="$T/g$i"
+    done
+    A=$(md5sum "compiler/$NEXT/bin/x86/qc" | cut -d' ' -f1)
+    if [[ $CONV -eq 1 ]]; then
+        if [[ "$A" == "$LAST" ]]; then
+            ok "<NEXT> src/bin lockstep: committed binary ($A) IS the seed-chain fixed point built from $VER + the committed source"
+        else
+            bad "<NEXT> src/bin lockstep: committed $A is NOT the seed-chain fixed point $LAST -- not reproducible from the committed tree"
+        fi
+    elif [[ $CONV -eq 0 ]]; then
+        bad "<NEXT> seed chain did not reach a fixed point in 3 generations"
     fi
     rm -rf "$T"
 fi
