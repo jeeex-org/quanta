@@ -1,0 +1,141 @@
+import std/fs
+import std/sampling
+
+// Reference harness for std/sampling. Emits f64 BIT PATTERNS (integers) so an
+// external reference (numpy + a bit-exact Python replica of the draw) can decode
+// the exact values. Bits, not formatted decimals -- print_f rounds to 6 places
+// and hides 1-ULP differences.
+
+fn mklogits(p, n) {
+    let i = 0
+    while i < n {
+        let m = (i * 2654435761) % 1000003
+        let x: f64 = i2f(m) / 200000.0 - 5.0
+        mem_store(p + i * 8, f64bits(x))
+        i = i + 1
+    }
+}
+
+fn copy_n(dst, src, n) {
+    let i = 0
+    while i < n { mem_store(dst + i * 8, mem_load(src + i * 8)); i = i + 1 }
+}
+
+fn dump(tag, p, n) {
+    prints(tag)
+    let i = 0
+    while i < n { prints(" "); print(f64bits(f64of(mem_load(p + i * 8)))); i = i + 1 }
+    newline()
+}
+
+fn main() {
+    let n = 4096
+    let a = mem_alloc(n)
+    let b = mem_alloc(n)
+    mklogits(a, n)
+    dump("LOGITS", a, n)
+
+    // ---- softmax reference ----
+    copy_n(b, a, n)
+    sample_softmax(b, n)
+    dump("SOFTMAX", b, n)
+
+    // ---- argmax / temperature 0 ----
+    prints("ARGMAX "); print(sample_argmax(a, n)); newline()
+    prints("FULL_T0 "); print(sample_full(a, n, 0.0, 0)); newline()
+
+    // ---- top-k: which indices survive ----
+    let k = 8
+    copy_n(b, a, n)
+    sample_top_k(b, n, k)
+    let sent: f64 = 0.0 - 1.0e30
+    prints("SENT_BITS "); print(f64bits(sent)); newline()
+    prints("TOPK ")
+    let i = 0
+    let kept = 0
+    let sb = f64bits(sent)
+    while i < n {
+        let v: f64 = f64of(mem_load(b + i * 8))
+        if f64bits(v) != sb { prints(" "); print(i); kept = kept + 1 }
+        i = i + 1
+    }
+    newline()
+    prints("TOPK_KEPT "); print(kept); newline()
+
+    // ---- draw sequence, fixed seed: expected to be reproduced bit-exactly by
+    //      an external replica of rng_next + the cumsum walk ----
+    copy_n(b, a, n)
+    sample_softmax(b, n)
+    sample_seed(4242)
+    prints("DRAWS")
+    i = 0
+    while i < 200 { prints(" "); print(sample_draw(b, n)); i = i + 1 }
+    newline()
+
+    // ---- reproducibility: same seed twice, then a different seed ----
+    prints("REPRO_A")
+    sample_seed(1234)
+    i = 0
+    while i < 6 {
+        copy_n(b, a, n)
+        prints(" "); print(sample_full(b, n, 1.0, 0))
+        i = i + 1
+    }
+    newline()
+    prints("REPRO_B")
+    sample_seed(1234)
+    i = 0
+    while i < 6 {
+        copy_n(b, a, n)
+        prints(" "); print(sample_full(b, n, 1.0, 0))
+        i = i + 1
+    }
+    newline()
+    prints("REPRO_C")
+    sample_seed(7)
+    i = 0
+    while i < 6 {
+        copy_n(b, a, n)
+        prints(" "); print(sample_full(b, n, 1.0, 0))
+        i = i + 1
+    }
+    newline()
+
+    // ---- top-k + temperature path (k > 0) ----
+    prints("TOPKPATH")
+    sample_seed(55)
+    i = 0
+    while i < 20 {
+        copy_n(b, a, n)
+        prints(" "); print(sample_full(b, n, 0.8, 16))
+        i = i + 1
+    }
+    newline()
+
+    // ---- large-magnitude logits: only a max-subtracting softmax survives.
+    //      exp(1003) overflows f64 to inf, so a softmax that did NOT subtract the
+    //      max would produce NaN/0 probabilities here. ----
+    let big = mem_alloc(8)
+    mem_store(big + 0 * 8, f64bits(1002.5))
+    mem_store(big + 1 * 8, f64bits(1000.0))
+    mem_store(big + 2 * 8, f64bits(1001.25))
+    mem_store(big + 3 * 8, f64bits(0.0 - 1000.0))
+    mem_store(big + 4 * 8, f64bits(1003.0))
+    mem_store(big + 5 * 8, f64bits(999.5))
+    mem_store(big + 6 * 8, f64bits(1000.75))
+    mem_store(big + 7 * 8, f64bits(1001.0))
+    dump("BIGLOG", big, 8)
+    sample_softmax(big, 8)
+    dump("BIGPROB", big, 8)
+
+    // all-equal, very negative: exp(v - max) == exp(0) == 1, so uniform 0.25
+    let neg = mem_alloc(4)
+    let q = 0
+    while q < 4 { mem_store(neg + q * 8, f64bits(0.0 - 1000.0)); q = q + 1 }
+    dump("NEGLOG", neg, 4)
+    sample_softmax(neg, 4)
+    dump("NEGPROB", neg, 4)
+
+    prints("DONE\n")
+    return 0
+}

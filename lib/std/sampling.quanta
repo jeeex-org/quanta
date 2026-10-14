@@ -1,95 +1,196 @@
 import std/fs
+import std/math
 
-// Sampling: temperature scaling, top-k filtering, nucleus (top-p) sampling
+// Sampling: temperature scaling, top-k filtering, softmax, categorical draw.
+//
+// STATUS (0.0.240): rewritten for correctness against a numpy reference. Three
+// defects, each measured with a synthetic logits vector (see
+// compiler/0.0.240/WIP.md):
+//
+//   1. sample_softmax used `1 + (v - max)` as its "exp". That is a shifted
+//      value, not an exponential, so the result was not a distribution. MEASURED
+//      worse than that: on 10 distinct logits it collapsed to a ONE-HOT at the
+//      argmax (only the max element survived, with probability 1.0).
+//
+//   2. sample_draw compared `cumsum * 1000` (a number in [0, 1000]) against the
+//      raw rng output `r` in [0, 2^31). That is never true, so it always fell
+//      through to `return 0`. Token id 0 is a WHITESPACE token -- this, not the
+//      softmax, is why the native generator emitted spaces. MEASURED: 10/10
+//      draws returned 0, and sample_full returned 0 for all 10 calls.
+//
+//   3. sample_top_k was a full O(n^2) exchange sort AND allocated n*8 bytes per
+//      call. At n_vocab = 128000 it measured 110,080 ms (110 s) per call at
+//      k = 40, so the driver had to run top_k = 0.
+//
+// THE RULE THAT MAKES THIS FILE WORK: every float local is a TYPED f64, and
+// every value read out of a mem_alloc'd buffer goes through f64of() first.
+// mem_load() yields a raw 64-bit INTEGER, and a float builtin handed an untagged
+// operand does not compute on the value -- it takes the integer path over the
+// bit pattern. Measured on this compiler: an untyped param receiving 3.0 and
+// doing `t * 0.5` returned 2.3e18, while the same body with `x: f64` returned
+// 1.5. So float PARAMETERS here are declared `: f64`, not left untyped.
+//
+// Transcendentals come from std/math.expf, verified against Python's math.exp
+// over 293 cases on the raw IEEE-754 bits (worst 7.0e-14 relative).
+
 let rng_state = 12345
 
+// Magnitude of the top-k sentinel. expf() returns exactly 0.0 for any argument
+// below -745.2, so after `v - max` a sentinel logit contributes zero mass.
+//
+// NOT a `const`: on this compiler a top-level `const` with a float initialiser
+// evaluates to 0 (measured: `const CF = 2.5` -> f64bits(CF) == 0), so a const
+// sentinel silently became 0.0 and the masked tail stayed in the distribution.
+// Negative float literals are spelled `0.0 - X` in this tree.
+
+// LCG step. Returns an i64 in [0, 2^31).
 fn rng_next() {
     rng_state = (rng_state * 1103515245 + 12345) - ((rng_state * 1103515245 + 12345) / 2147483648) * 2147483648
     return rng_state
 }
 
-fn sample_temperature(logits, n, temperature) {
+// Reset the RNG to a fixed seed so a run is reproducible.
+fn sample_seed(s) {
+    rng_state = s
+    return s
+}
+
+// Scale every logit by 1/temperature, in place.
+fn sample_temperature(logits, n, temperature: f64) {
+    let inv: f64 = 1.0 / temperature
     let i = 0
     while i < n {
-        let v = mem_load(logits + i * 8)
-        mem_store(logits + i * 8, fdiv(v, temperature))
+        let v: f64 = f64of(mem_load(logits + i * 8))
+        mem_store(logits + i * 8, f64bits(v * inv))
         i = i + 1
     }
 }
 
-fn sample_top_k(logits, n, k) {
-    let sorted = mem_alloc(n * 8)
-    let i = 0
-    while i < n {
-        mem_store(sorted + i * 8, mem_load(logits + i * 8))
-        i = i + 1
-    }
-    
-    i = 0
-    while i < n {
-        let j = i + 1
-        while j < n {
-            if f2i(mem_load(sorted + j * 8)) > f2i(mem_load(sorted + i * 8)) {
-                let tmp = mem_load(sorted + i * 8)
-                mem_store(sorted + i * 8, mem_load(sorted + j * 8))
-                mem_store(sorted + j * 8, tmp)
-            }
-            j = j + 1
-        }
-        i = i + 1
-    }
-    
-    let threshold = mem_load(sorted + k * 8)
-    
-    i = 0
-    while i < n {
-        if f2i(mem_load(logits + i * 8)) < f2i(threshold) {
-            mem_store(logits + i * 8, fsub(i2f(0), i2f(1000)))
-        }
-        i = i + 1
-    }
-}
-
-fn sample_softmax(logits, n) {
-    let max_val = mem_load(logits)
+// Index of the largest logit. Ties resolve to the LOWEST index (strict `>`).
+fn sample_argmax(logits, n) {
+    let best: f64 = f64of(mem_load(logits))
+    let bi = 0
     let i = 1
     while i < n {
-        let v = mem_load(logits + i * 8)
-        if f2i(v) > f2i(max_val) { max_val = v }
+        let v: f64 = f64of(mem_load(logits + i * 8))
+        if v > best {
+            best = v
+            bi = i
+        }
         i = i + 1
     }
-    
-    let sum = i2f(0)
-    i = 0
-    while i < n {
-        let v = mem_load(logits + i * 8)
-        let ev = fadd(i2f(1), fsub(v, max_val))
-        if f2i(ev) < 0 { ev = i2f(0) }
-        sum = fadd(sum, ev)
-        mem_store(logits + i * 8, ev)
-        i = i + 1
-    }
-    
-    i = 0
-    while i < n {
-        mem_store(logits + i * 8, fdiv(mem_load(logits + i * 8), sum))
-        i = i + 1
-    }
+    return bi
 }
 
-fn sample_draw(probs, n) {
-    let r = rng_next()
-    let cumsum = i2f(0)
+// Keep the k largest logits; push everything else to the sentinel.
+//
+// O(n * k) via k repeated max-scans: pass p finds the largest value strictly
+// below the value found in pass p-1, so after k passes `cut` is the k-th largest
+// logit. One O(n) threshold pass then masks the tail. No allocation.
+//
+// The previous version was O(n^2) -- 110 s at n = 128000, k = 40 -- and
+// allocated n*8 bytes on every call.
+//
+// Ties: a repeated max-scan finds the k-th largest DISTINCT value, so a value
+// repeated at the cut is kept in full and the retained set can exceed k when the
+// top of the distribution has exact ties. Ties are arbitrary in every reference
+// implementation; stated rather than hidden.
+fn sample_top_k(logits, n, k) {
+    if k <= 0 { return 0 }
+    if k >= n { return 0 }
+    // hi starts strictly above every logit (global max + 1), so pass 1 finds the
+    // global max without assuming any bound on logit magnitude.
+    let hi: f64 = f64of(mem_load(logits))
+    let j = 1
+    while j < n {
+        let v: f64 = f64of(mem_load(logits + j * 8))
+        if v > hi { hi = v }
+        j = j + 1
+    }
+    hi = hi + 1.0
+    let cut: f64 = hi
+    let p = 0
+    while p < k {
+        let best: f64 = 0.0 - 1e300
+        let i = 0
+        while i < n {
+            let v: f64 = f64of(mem_load(logits + i * 8))
+            if v < hi && v > best { best = v }
+            i = i + 1
+        }
+        cut = best
+        hi = best
+        p = p + 1
+    }
+    let sentinel: f64 = 0.0 - 1.0e30
     let i = 0
     while i < n {
-        cumsum = fadd(cumsum, mem_load(probs + i * 8))
-        if f2i(fmul(cumsum, i2f(1000))) > r { return i }
+        let v: f64 = f64of(mem_load(logits + i * 8))
+        if v < cut { mem_store(logits + i * 8, f64bits(sentinel)) }
         i = i + 1
     }
     return 0
 }
 
-fn sample_full(logits, n, temperature, k) {
+// Softmax in place, numerically stable: p[i] = exp(v[i] - max) / sum.
+fn sample_softmax(logits, n) {
+    if n <= 0 { return 0 }
+    let max_val: f64 = f64of(mem_load(logits))
+    let i = 1
+    while i < n {
+        let v: f64 = f64of(mem_load(logits + i * 8))
+        if v > max_val { max_val = v }
+        i = i + 1
+    }
+    let sum: f64 = 0.0
+    i = 0
+    while i < n {
+        let v: f64 = f64of(mem_load(logits + i * 8))
+        let ev: f64 = expf(v - max_val)
+        mem_store(logits + i * 8, f64bits(ev))
+        sum = sum + ev
+        i = i + 1
+    }
+    if sum > 0.0 {
+        let inv: f64 = 1.0 / sum
+        i = 0
+        while i < n {
+            let p: f64 = f64of(mem_load(logits + i * 8))
+            mem_store(logits + i * 8, f64bits(p * inv))
+            i = i + 1
+        }
+    }
+    return 0
+}
+
+// Categorical draw from a normalised probability vector.
+//
+// rng_next() is in [0, 2^31); it is scaled into [0, 1) so the comparison is in
+// the same domain as the running cumsum. The old form compared cumsum*1000
+// (< 1000) against the raw rng output (< 2^31), which was never true and made
+// every draw return index 0.
+fn sample_draw(probs, n) {
+    let r = rng_next()
+    let u: f64 = fdiv(i2f(r), i2f(2147483648))
+    let cumsum: f64 = 0.0
+    let i = 0
+    while i < n {
+        let p: f64 = f64of(mem_load(probs + i * 8))
+        cumsum = cumsum + p
+        if cumsum > u { return i }
+        i = i + 1
+    }
+    return n - 1
+}
+
+// Full sampler. Signature unchanged from 0.0.239.
+//
+// temperature <= 0 is GREEDY: return the argmax. This is load-bearing -- the old
+// code would have divided by zero, producing inf logits whose softmax is
+// meaningless. Greedy is deterministic and is what a caller's correctness oracle
+// uses.
+fn sample_full(logits, n, temperature: f64, k) {
+    if temperature <= 0.0 { return sample_argmax(logits, n) }
     sample_temperature(logits, n, temperature)
     if k > 0 && k < n { sample_top_k(logits, n, k) }
     sample_softmax(logits, n)
