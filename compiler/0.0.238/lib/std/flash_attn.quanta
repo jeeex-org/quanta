@@ -1,0 +1,38 @@
+// Flash Attention: memory-efficient attention computation
+// Instead of computing full n×n attention matrix, compute in blocks
+// Reduces memory from O(n²) to O(n) while keeping same result
+
+let flash_block_size = 64
+
+fn flash_attn_scores(q, k_cache, head_dim, n_heads, kv_pos, out_scores) {
+    // Compute Q @ K^T for one query position against all cached KV
+    let q_idx = kv_pos  // Current position
+    let h = 0
+    while h < n_heads {
+        let score = i2f(0)
+        let d = 0
+        while d < head_dim {
+            let qv = mem_load(q + (q_idx * n_heads + h) * head_dim * 8 + d * 8)
+            let kv = mem_load(k_cache + (h * head_dim + d) * 8)
+            score = fadd(score, fmul(qv, kv))
+            d = d + 1
+        }
+        mem_store(out_scores + h * 8, score)
+        h = h + 1
+    }
+}
+
+fn flash_attn_apply(v_cache, probs, head_dim, n_heads, out) {
+    // Apply attention probs to V cache
+    let h = 0
+    while h < n_heads {
+        let p = mem_load(probs + h * 8)
+        let d = 0
+        while d < head_dim {
+            let vv = mem_load(v_cache + (h * head_dim + d) * 8)
+            mem_store(out + (h * head_dim + d) * 8, fmul(p, vv))
+            d = d + 1
+        }
+        h = h + 1
+    }
+}

@@ -1,0 +1,92 @@
+// Verification for lib/std/transformer.quanta.
+//
+// NOTE ON METHOD: `print(f64)` emits the raw bit pattern, so nothing here
+// prints a float. Every check converts with f2i(fmul(v, scale)) and compares
+// to an integer, or compares floats directly. Expected values were computed
+// with Python, not by hand -- hand-computed f64 bit patterns are a reliable
+// way to invent bugs that are not there.
+import std/math
+import std/transformer
+
+fn main(): i64 {
+    let f = 0
+
+    // --- RMSNorm: [1,2,3,4], w=1. rms = sqrt(30/4) = 2.7386128 ---
+    let x = mem_alloc(8 * 4)
+    let w = mem_alloc(8 * 4)
+    let o = mem_alloc(8 * 4)
+    let vals: i64[4] = { 4607182418800017408, 4611686018427387904, 4613937818241073152, 4616189618054758400 }
+    let i = 0
+    while i < 4 {
+        mem_store(x + i * 8, f64of(vals[i]))
+        mem_store(w + i * 8, f64of(4607182418800017408))
+        i = i + 1
+    }
+    rmsnorm(o, x, w, 4, 0.000001)
+    let want4: i64[4] = { 365, 730, 1095, 1460 }
+    let j = 0
+    while j < 4 {
+        if f2i(fmul(f64_load(o + j * 8), i2f(1000))) != want4[j] {
+            printi(f2i(fmul(f64_load(o + j * 8), i2f(1000))))
+            prints(" rmsnorm mismatch\n")
+            f = f + 1
+        }
+        j = j + 1
+    }
+
+    // --- Softmax [4,0,2] -> 0.866808, 0.015875, 0.117311 ---
+    let a = mem_alloc(8 * 3)
+    let sv: i64[3] = { 4616189618054758400, 0, 4611686018427387904 }
+    let k = 0
+    while k < 3 { mem_store(a + k * 8, f64of(sv[k])) k = k + 1 }
+    softmax(a, 3)
+    let se: i64[3] = { 86681, 1587, 11731 }
+    let m = 0
+    while m < 3 {
+        if f2i(fmul(f64_load(a + m * 8), i2f(100000))) != se[m] { printi(m) prints(" softmax mismatch\n") f = f + 1 }
+        m = m + 1
+    }
+    // Stability: without the max subtraction this overflows to inf/NaN.
+    let b = mem_alloc(8 * 2)
+    mem_store(b, f64of(4652007308841189376))   // 1000.0
+    mem_store(b + 8, f64of(4652007308841189376))
+    softmax(b, 2)
+    if f2i(fmul(f64_load(b), i2f(100000))) != 50000 { printi(f2i(fmul(f64_load(b), i2f(100000)))) prints(" softmax unstable\n") f = f + 1 }
+
+    // --- RoPE: identity at pos 0, exact cos/sin rotation at pos 1 ---
+    let r = mem_alloc(8 * 2)
+    mem_store(r, f64of(4607182418800017408))
+    mem_store(r + 8, f64of(0))
+    rope(r, 2, 0, 10000.0)
+    if f2i(fmul(f64_load(r), i2f(1000))) != 1000 { prints(" rope pos0 x\n") f = f + 1 }
+    if f2i(fmul(f64_load(r + 8), i2f(1000))) != 0 { prints(" rope pos0 y\n") f = f + 1 }
+    rope(r, 2, 1, 10000.0)
+    if f2i(fmul(f64_load(r), i2f(1000))) != 540 { printi(f2i(fmul(f64_load(r), i2f(1000)))) prints(" rope pos1 x\n") f = f + 1 }
+    if f2i(fmul(f64_load(r + 8), i2f(1000))) != 841 { printi(f2i(fmul(f64_load(r + 8), i2f(1000)))) prints(" rope pos1 y\n") f = f + 1 }
+
+    // --- silu ---
+    if f2i(fmul(silu(0.0), i2f(1000000))) != 0 { prints(" silu(0)\n") f = f + 1 }
+    if f2i(fmul(silu(1.0), i2f(1000000))) != 731058 { printi(f2i(fmul(silu(1.0), i2f(1000000)))) prints(" silu(1)\n") f = f + 1 }
+    if f2i(fmul(silu(0.0 - 1.0), i2f(1000000))) != 0 - 268941 { printi(f2i(fmul(silu(0.0 - 1.0), i2f(1000000)))) prints(" silu(-1)\n") f = f + 1 }
+    // Overflow guard: the naive silu(x)=x*exp(x)/(1+exp(x)) gives 0*inf = NaN
+    // here, because expf overflows above 709.78.
+    if silu(800.0) != 800.0 { printi(f2i(fmul(silu(800.0), i2f(1000)))) prints(" silu(800) overflow\n") f = f + 1 }
+
+    // --- swiglu end to end ---
+    let g = mem_alloc(8 * 2)
+    let u = mem_alloc(8 * 2)
+    let sw = mem_alloc(8 * 2)
+    let so = mem_alloc(8 * 2)
+    mem_store(g, f64of(4607182418800017408))     // 1.0
+    mem_store(g + 8, f64of(0))
+    mem_store(u, f64of(4611686018427387904))     // 2.0
+    mem_store(u + 8, f64of(0))
+    mem_store(sw, f64of(4607182418800017408))    // w=1.0
+    mem_store(sw + 8, f64of(4607182418800017408))
+    swiglu(so, g, u, sw, 2)
+    if f2i(fmul(f64_load(so), i2f(1000000))) != 1462117 { printi(f2i(fmul(f64_load(so), i2f(1000000)))) prints(" swiglu\n") f = f + 1 }
+
+    if f == 0 { prints("TRANSFORMER PRIMITIVES ALL PASS\n") return 0 }
+    prints("TRANSFORMER PRIMITIVES FAIL\n")
+    return 1
+}

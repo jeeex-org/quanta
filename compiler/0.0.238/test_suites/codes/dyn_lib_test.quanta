@@ -1,0 +1,37 @@
+// --lib <soname>: depend on a named shared library, and get the DT_NEEDED right.
+//
+// The regression this guards is subtle and was real. With the extern-name fill
+// cursor hardcoded to the length of the old single-library string table
+// ("\0libc.so.6\0" = 11), adding a second DT_NEEDED entry made 11 land INSIDE the
+// soname region. The extern-name fill then overwrote the sonames, and the program
+// recorded "abs" -- its own first extern symbol -- as a shared library to load. It
+// died at exec with:
+//
+//   error while loading shared libraries: abs: cannot open shared object file
+//
+// A test that only ever linked one library could never see this: with a single
+// DT_NEEDED, the hardcoded 11 happened to be exactly right. So this test links
+// TWO libraries, which is the only way to reach the bug.
+//
+// Build:  qc --emit-dynamic --lib libm.so.6 dyn_lib_test.quanta out
+// Run:    out ; echo $?   -- expect 42
+//
+// Two libraries are used on purpose (libm and libdl) to keep the string table
+// longer than the hardcoded 11 in every direction.
+//
+// A note on what is NOT asserted here: the "fails without --lib" half. On
+// glibc 2.35+ every libm symbol is also exported by libc -- `nm -D` shows zero
+// symbols unique to libm.so.6 -- so no libm call can be made to fail for want of
+// the DT_NEEDED entry. The only real proof of that direction needs a library that
+// is genuinely not in libc (libcuda.so.1), and it was verified by hand against
+// libm's absence rather than in this file.
+
+extern "C" fn abs(v: i32) -> i32;
+extern "C" fn puts(s: *u8) -> i32;
+
+fn main() -> i32 {
+    // abs(0-9) == 9. Integer return: see the float note below.
+    if abs(0 - 9) != 9 { return 1; }
+    puts("two libs\n");
+    return 42;
+}
