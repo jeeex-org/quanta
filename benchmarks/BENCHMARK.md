@@ -2,164 +2,308 @@
 
 **Run:** `bash scripts/bench.sh` — `--md` for a markdown table, `--runs N` for more repetitions.
 Both sides are compiled fresh each run and executed through `scripts/qcrun.sh` (hard memory cap, nice,
-timeout), alternating, best-of-N. Current VERSION: **0.0.234**.
+timeout), alternating, best-of-N. Current VERSION: **0.0.238**.
 
-**What this suite is:** 37 core-language **performance shapes** — it exists to catch codegen regressions.
-It is **not** a feature-coverage matrix; correctness lives in the gate (`test_suites/EXPECTED.tsv`, 819 rows,
-plus 20 gate stages) and in `tests/`.
+**A/B between two compilers:** `bash scripts/bench_ab.sh <qcA> <qcB> [--runs N]` compiles every case
+with BOTH compilers and runs the two *Quanta* binaries interleaved. It removes the gcc denominator and
+the cross-run load drift, and it reports whether the two compilers emitted **byte-identical machine
+code**. That last column is the cheapest explanation to test and the one most often skipped: if the
+binaries are identical, the delta is noise *by definition*.
 
-## Guards (all three learned the hard way)
+## Guards
 
 1. **Twin fold check** — if the C source has a loop but the compiled twin has no jump inside `main`, gcc
-   deleted the loop; the row is reported `TWIN_FOLDED` instead of a ratio. A "0.005 s" C baseline for a
-   1M-iteration arith loop was exactly this artifact and produced a bogus "560x" claim.
-2. **Output equality** — both sides must print the same thing (whitespace-insensitive) or the row is flagged
-   `MISMATCH`. A fast wrong answer is not a result.
+   deleted the loop; the row is reported `TWIN_FOLDED`. A "0.005 s" C baseline for a 1M-iteration arith
+   loop was exactly this artifact and produced a bogus "560x" claim.
+2. **Output equality** — both sides must print the same thing (whitespace-insensitive) or the row is
+   flagged `MISMATCH`. A fast wrong answer is not a result.
 3. **Devirtualisation is invisible to guard 1.** gcc also deletes *calls*: it inlines constant function
-   pointers, and `-foptimize-sibling-calls` (on by default) turns mutual **tail** recursion into a loop.
-   Call-shaped twins therefore need `noinline` + `volatile` pointers / an opaque base case, and the
-   disassembly has to be checked by hand — it changed two numbers below by up to 4x.
+   pointers, and `-foptimize-sibling-calls` turns mutual **tail** recursion into a loop. Call-shaped
+   twins need `noinline` + `volatile` pointers / an opaque base case.
+4. **Resolution floor.** Below **30 ms** the row's ratio is decided by scheduler jitter, not by code:
+   the SAME C binary (byte-identical, unchanged source) reported 10 ms in one baseline run and 6 ms in
+   the next — a 40 % swing on a program that did not change. Rows under 30 ms therefore keep running up
+   to **15** interleaved repetitions and report the best-of, tagged `best-of-15 (<30ms row)`. Above 30 ms
+   the spread is a few percent. Until this floor was added, *every* row under ~15 ms was
+   noise-dominated, including the ones that looked like wins.
+5. **Quarantine marker.** `// mismatch-reason: <text>` attaches a reason to a row that is known to
+   diverge; unlike `twin-output: not-comparable` it does NOT silence the equality check, so a quarantined
+   row can never be mistaken for parity.
 
-The script exits non-zero if a row fails to compile or a twin got folded (currently `exit 0`).
-`// known-fail: <reason>` in a case marks a documented defect: the row stays visible, the suite stays green,
-and a marker that still passes is itself a failure — so it cannot outlive its bug.
+`// known-fail: <reason>` in a case marks a documented defect: the row stays visible and a marker that
+still passes is itself a failure, so it cannot outlive its bug.
 
-## Baseline — 37 cases, best of 3 (2026-10-13)
+## Table 1 — baseline, compiler 0.0.237 (the reference for every claim below)
 
-| benchmark_arith | 267 ms | 17 ms | 15.71x |  |
-| benchmark_big_array | 9 ms | 7 ms | 1.29x |  |
-| benchmark_closure_call | 15 ms | 10 ms | 1.50x |  |
-| benchmark_closure_capture | - ms | - ms | -x | KNOWN-BROKEN (marker): compiler SEGFAULT — a capturing closure invoked inside a loop crashes qc |
-| benchmark_div_const | 151 ms | 10 ms | 15.10x |  |
-| benchmark_enum | 9 ms | 7 ms | 1.29x |  |
-| benchmark_fib | 8 ms | 8 ms | 1.00x |  |
-| benchmark_fib_recursive | 24 ms | 10 ms | 2.40x |  |
-| benchmark_file_io | 8 ms | 7 ms | 1.14x |  |
-| benchmark_fileio | 88 ms | 30 ms | 2.93x |  |
-| benchmark_float | 116 ms | 20 ms | 5.80x |  |
-| benchmark_float_ops | 7 ms | 7 ms | 1.00x |  |
-| benchmark_fnptr_indirect | 26 ms | 10 ms | 2.60x |  |
-| benchmark_generic_call | 21 ms | 11 ms | 1.91x |  |
-| benchmark_heavy_div | 88 ms | 11 ms | 8.00x |  |
-| benchmark_heavy_div2 | 818 ms | 28 ms | 29.21x |  |
-| benchmark_heavy_float | 94 ms | 14 ms | 6.71x |  |
-| benchmark_heavy_float2 | 479 ms | 41 ms | 11.68x |  |
-| benchmark_heavy_int | 445 ms | 18 ms | 24.72x |  |
-| benchmark_heavy_int2 | 1865 ms | 52 ms | 35.87x |  |
-| benchmark_heavy_mem | 23 ms | 11 ms | 2.09x |  |
-| benchmark_heavy_recursion | 10 ms | 6 ms | 1.67x |  |
-| benchmark_higher_order | 21 ms | 9 ms | 2.33x |  |
-| benchmark_int_ops | 6 ms | 6 ms | 1.00x |  |
-| benchmark_loop_sum | 13 ms | 9 ms | 1.44x |  |
-| benchmark_match | 8 ms | 8 ms | 1.00x |  |
-| benchmark_mem | 23 ms | 10 ms | 2.30x |  |
-| benchmark_mem_ops | 10 ms | 10 ms | 1.00x |  |
-| benchmark_mutual_recursion | 754 ms | 63 ms | 11.97x |  |
-| benchmark_nested_calls | 6 ms | 7 ms | 0.86x |  |
-| benchmark_params8 | 29 ms | 7 ms | 4.14x |  |
-| benchmark_q4k | 10 ms | 8 ms | 1.25x | MISMATCH: quanta='-1280' gcc='0' |
-| benchmark_q4k_heavy | 22 ms | 9 ms | 2.44x | MISMATCH: quanta='result[0]=-1280' gcc='result[0]=0' |
-| benchmark_q4k_matmul | 8 ms | 8 ms | 1.00x |  |
-| benchmark_recursion | 8 ms | 5 ms | 1.60x |  |
-| benchmark_string | 6 ms | 6 ms | 1.00x |  |
-| benchmark_struct | 7 ms | 6 ms | 1.17x |  |
+### 0.0.237 — 37 cases, best-of-3 (best-of-15 under 30 ms) (load 10.14, 9.78, 9.79)
 
+| case | Quanta ms | gcc -O2 ms | ratio | note |
+|---|---|---|---|---|
+| arith | 202 | 14 | 14.43× | best-of-15 (<30ms row) |
+| big_array | 9 | 7 | 1.29× | best-of-15 (<30ms row) |
+| closure_call | 15 | 8 | 1.88× | best-of-15 (<30ms row) |
+| closure_capture | 16 | 9 | 1.78× | best-of-15 (<30ms row) |
+| div_const | 120 | 9 | 13.33× | best-of-15 (<30ms row) |
+| enum | 7 | 7 | 1.00× | best-of-15 (<30ms row) |
+| fib | 6 | 6 | 1.00× | best-of-15 (<30ms row) |
+| fib_recursive | 23 | 8 | 2.88× | best-of-15 (<30ms row) |
+| file_io | 6 | 6 | 1.00× | best-of-15 (<30ms row) |
+| fileio | 90 | 23 | 3.91× | best-of-15 (<30ms row) |
+| float | 103 | 18 | 5.72× | best-of-15 (<30ms row) |
+| float_ops | 6 | 6 | 1.00× | best-of-15 (<30ms row) |
+| fnptr_indirect | 23 | 8 | 2.88× | best-of-15 (<30ms row) |
+| generic_call | 19 | 8 | 2.38× | best-of-15 (<30ms row) |
+| heavy_div | 75 | 8 | 9.38× | best-of-15 (<30ms row) |
+| heavy_div2 | 789 | 24 | 32.88× | best-of-15 (<30ms row) |
+| heavy_float | 89 | 14 | 6.36× | best-of-15 (<30ms row) |
+| heavy_float2 | 493 | 42 | 11.74× |  |
+| heavy_int | 417 | 19 | 21.95× | best-of-15 (<30ms row) |
+| heavy_int2 | 1881 | 53 | 35.49× |  |
+| heavy_mem | 23 | 8 | 2.88× | best-of-15 (<30ms row) |
+| heavy_recursion | 10 | 7 | 1.43× | best-of-15 (<30ms row) |
+| higher_order | 17 | 6 | 2.83× | best-of-15 (<30ms row) |
+| int_ops | 6 | 6 | 1.00× | best-of-15 (<30ms row) |
+| loop_sum | 10 | 6 | 1.67× | best-of-15 (<30ms row) |
+| match | 6 | 6 | 1.00× | best-of-15 (<30ms row) |
+| mem | 18 | 7 | 2.57× | best-of-15 (<30ms row) |
+| mem_ops | 6 | 6 | 1.00× | best-of-15 (<30ms row) |
+| mutual_recursion | 659 | 60 | 10.98× |  |
+| nested_calls | 6 | 6 | 1.00× | best-of-15 (<30ms row) |
+| params8 | 27 | 7 | 3.86× | best-of-15 (<30ms row) |
+| q4k | 8 | 6 | 1.33× | best-of-15 (<30ms row) |
+| q4k_heavy | 18 | 6 | 3.00× | best-of-15 (<30ms row) |
+| q4k_matmul | 6 | 6 | 1.00× | best-of-15 (<30ms row) |
+| recursion | 6 | 6 | 1.00× | best-of-15 (<30ms row) |
+| string | 6 | 6 | 1.00× | best-of-15 (<30ms row) |
+| struct | 6 | 6 | 1.00× | best-of-15 (<30ms row) |
 
-`benchmark_fib` is the **iterative** fib(40); `benchmark_fib_recursive` is recursive fib(30).
+## Table 2 — with the 0.0.238 constant-division strength reduction
 
-**Reading it:** 12 cases sit at 0.86-1.60× (several *faster* than gcc); the arithmetic/division cluster sits at
-2.4-32.4×. The gap is **workload-dependent and bimodal** — never quote a single number for "Quanta vs C".
+### 0.0.238 — 37 cases, best-of-3 (best-of-15 under 30 ms) (load 11.72, 10.36, 9.99)
+
+| case | Quanta ms | gcc -O2 ms | ratio | note |
+|---|---|---|---|---|
+| arith | 206 | 14 | 14.71× | best-of-15 (<30ms row) |
+| big_array | 8 | 7 | 1.14× | best-of-15 (<30ms row) |
+| closure_call | 15 | 8 | 1.88× | best-of-15 (<30ms row) |
+| closure_capture | 14 | 8 | 1.75× | best-of-15 (<30ms row) |
+| div_const | 110 | 9 | 12.22× | best-of-15 (<30ms row) |
+| enum | 5 | 5 | 1.00× | best-of-15 (<30ms row) |
+| fib | 6 | 6 | 1.00× | best-of-15 (<30ms row) |
+| fib_recursive | 23 | 8 | 2.88× | best-of-15 (<30ms row) |
+| file_io | 6 | 6 | 1.00× | best-of-15 (<30ms row) |
+| fileio | 82 | 19 | 4.32× | best-of-15 (<30ms row) |
+| float | 104 | 17 | 6.12× | best-of-15 (<30ms row) |
+| float_ops | 6 | 6 | 1.00× | best-of-15 (<30ms row) |
+| fnptr_indirect | 20 | 7 | 2.86× | best-of-15 (<30ms row) |
+| generic_call | 20 | 7 | 2.86× | best-of-15 (<30ms row) |
+| heavy_div | 74 | 8 | 9.25× | best-of-15 (<30ms row) |
+| heavy_div2 | 715 | 21 | 34.05× | best-of-15 (<30ms row) |
+| heavy_float | 104 | 14 | 7.43× | best-of-15 (<30ms row) |
+| heavy_float2 | 493 | 44 | 11.20× |  |
+| heavy_int | 396 | 18 | 22.00× | best-of-15 (<30ms row) |
+| heavy_int2 | 1664 | 60 | 27.73× |  |
+| heavy_mem | 21 | 8 | 2.62× | best-of-15 (<30ms row) |
+| heavy_recursion | 8 | 5 | 1.60× | best-of-15 (<30ms row) |
+| higher_order | 20 | 7 | 2.86× | best-of-15 (<30ms row) |
+| int_ops | 6 | 6 | 1.00× | best-of-15 (<30ms row) |
+| loop_sum | 9 | 5 | 1.80× | best-of-15 (<30ms row) |
+| match | 6 | 7 | 0.86× | best-of-15 (<30ms row) |
+| mem | 20 | 7 | 2.86× | best-of-15 (<30ms row) |
+| mem_ops | 5 | 6 | 0.83× | best-of-15 (<30ms row) |
+| mutual_recursion | 605 | 63 | 9.60× |  |
+| nested_calls | 6 | 6 | 1.00× | best-of-15 (<30ms row) |
+| params8 | 25 | 6 | 4.17× | best-of-15 (<30ms row) |
+| q4k | 8 | 8 | 1.00× | best-of-15 (<30ms row) |
+| q4k_heavy | 22 | 8 | 2.75× | best-of-15 (<30ms row) |
+| q4k_matmul | 7 | 7 | 1.00× | best-of-15 (<30ms row) |
+| recursion | 5 | 5 | 1.00× | best-of-15 (<30ms row) |
+| string | 5 | 6 | 0.83× | best-of-15 (<30ms row) |
+| struct | 5 | 5 | 1.00× | best-of-15 (<30ms row) |
+
+## Table 3 — the noise-free A/B (SAME source, both Quanta compilers, 15 runs interleaved)
+
+This is the table to read for "did the codegen change help?" — the gcc denominator is gone and the two
+binaries are alternated inside one loop. `d_best`/`d_med` are B_best/A_best and B_med/A_med.
+
+| case | A 0.0.237 best | B 0.0.238 best | A med | B med | d_best | d_med | machine code |
+|---|---|---|---|---|---|---|---|
+| arith | 199 | 192 | 254 | 229 | -3.5% | -9.8% | differs |
+| big_array | 7 | 7 | 10 | 9 | +0.0% | -10.0% | differs |
+| closure_call | 12 | 12 | 18 | 17 | +0.0% | -5.6% | IDENTICAL |
+| closure_capture | 15 | 13 | 18 | 17 | -13.3% | -5.6% | IDENTICAL |
+| div_const | 127 | 114 | 148 | 142 | -10.2% | -4.1% | differs |
+| enum | 5 | 5 | 8 | 7 | +0.0% | -12.5% | IDENTICAL |
+| fib | 7 | 7 | 8 | 8 | +0.0% | +0.0% | IDENTICAL |
+| fib_recursive | 23 | 23 | 25 | 28 | +0.0% | +12.0% | IDENTICAL |
+| file_io | 4 | 4 | 7 | 7 | +0.0% | +0.0% | differs |
+| fileio | 90 | 87 | 102 | 99 | -3.3% | -2.9% | differs |
+| float | 100 | 99 | 136 | 117 | -1.0% | -14.0% | IDENTICAL |
+| float_ops | 6 | 6 | 8 | 8 | +0.0% | +0.0% | IDENTICAL |
+| fnptr_indirect | 24 | 23 | 27 | 26 | -4.2% | -3.7% | IDENTICAL |
+| generic_call | 20 | 20 | 24 | 23 | +0.0% | -4.2% | IDENTICAL |
+| heavy_div | 73 | 70 | 88 | 76 | -4.1% | -13.6% | differs |
+| heavy_div2 | 686 | 672 | 852 | 724 | -2.0% | -15.0% | differs |
+| heavy_float | 91 | 99 | 111 | 118 | +8.8% | +6.3% | IDENTICAL |
+| heavy_float2 | 471 | 469 | 518 | 522 | -0.4% | +0.8% | IDENTICAL |
+| heavy_int | 433 | 380 | 481 | 420 | -12.2% | -12.7% | differs |
+| heavy_int2 | 1622 | 1503 | 1919 | 1666 | -7.3% | -13.2% | differs |
+| heavy_mem | 22 | 21 | 27 | 25 | -4.5% | -7.4% | IDENTICAL |
+| heavy_recursion | 10 | 11 | 12 | 13 | +10.0% | +8.3% | IDENTICAL |
+| higher_order | 19 | 19 | 24 | 24 | +0.0% | +0.0% | IDENTICAL |
+| int_ops | 6 | 5 | 8 | 8 | -16.7% | +0.0% | IDENTICAL |
+| loop_sum | 11 | 10 | 13 | 13 | -9.1% | +0.0% | IDENTICAL |
+| match | 6 | 6 | 8 | 7 | +0.0% | -12.5% | IDENTICAL |
+| mem | 21 | 20 | 27 | 26 | -4.8% | -3.7% | IDENTICAL |
+| mem_ops | 6 | 7 | 8 | 8 | +16.7% | +0.0% | IDENTICAL |
+| mutual_recursion | 619 | 601 | 717 | 711 | -2.9% | -0.8% | IDENTICAL |
+| nested_calls | 6 | 6 | 8 | 7 | +0.0% | -12.5% | IDENTICAL |
+| params8 | 26 | 24 | 31 | 30 | -7.7% | -3.2% | IDENTICAL |
+| q4k | 9 | 8 | 11 | 10 | -11.1% | -9.1% | differs |
+| q4k_heavy | 22 | 22 | 27 | 26 | +0.0% | -3.7% | differs |
+| q4k_matmul | 6 | 6 | 7 | 7 | +0.0% | +0.0% | differs |
+| recursion | 6 | 6 | 7 | 8 | +0.0% | +14.3% | IDENTICAL |
+| string | 6 | 6 | 7 | 7 | +0.0% | +0.0% | IDENTICAL |
+| struct | 6 | 6 | 9 | 8 | +0.0% | -11.1% | IDENTICAL |
+
+### Reading table 3
+
+**25 of 37 cases produce BYTE-IDENTICAL machine code on both compilers.** For those, any timing or ratio
+difference in tables 1/2 is noise: the swings in table 3 reach ±17 % (`mem_ops` +16.7 %, `recursion`
++14.3 %, `fib_recursive` +12.0 %, `struct` −11.1 %) on code that did not change by a single byte.
+
+**12 cases changed code, and every one of them is neutral-to-faster:**
+
+| case | mechanism | d_best | d_med |
+|---|---|---|---|
+| arith | ÷3 magic, %5 magic | -3.5% | -9.8% |
+| big_array | ÷ const | +0.0% | -10.0% |
+| div_const | ÷128,÷64,÷32 → sar (was sar+idiv) | -10.2% | -4.1% |
+| file_io | ÷ const | +0.0% | +0.0% |
+| fileio | ÷ const | -3.3% | -2.9% |
+| heavy_div | ÷128 → sar | -4.1% | -13.6% |
+| heavy_div2 | ÷128 → sar | -2.0% | -15.0% |
+| heavy_int | ÷3 magic | -12.2% | -12.7% |
+| heavy_int2 | ÷3 magic | -7.3% | -13.2% |
+| q4k | ÷128,÷16,÷2 → sar/and | -11.1% | -9.1% |
+| q4k_heavy | ÷ const | +0.0% | -3.7% |
+| q4k_matmul | ÷ const | +0.0% | +0.0% |
+
+No changed-code case is slower on either statistic. The largest wins are `heavy_int` (−12.2 %),
+`div_const` (−10.2 %) and `heavy_int2` (−7.3 %) best-of-15.
+
+### The payoff is small, and that REFUTES the recorded premise
+
+`docs/plans/performance.md` recorded (on 0.0.233) that the 6.8-32.3× arithmetic-loop cluster was caused
+by `idiv` for constant division, and predicted those rows would "move toward ≤3×" once strength
+reduction landed. Measured on 0.0.238 the ratios barely move: `heavy_int2` 35.5→27.7, `div_const`
+13.3→12.2, `arith` 14.4→14.7, `heavy_int` 22.0→22.0. Removing essentially every hot-loop `idiv` (and
+the dead `sar`-then-`idiv` double work) buys 0-12 %, not multiples.
+
+So `idiv` was **not** the dominant cost. What is left is the per-operation spill/reload traffic that the
+same document measures as `work()` = 254 instructions vs gcc's 9 — the A4 / next-use-eviction lever
+(1104-byte frames, one home slot per vreg). That is where the remaining gap lives.
 
 ## Flagged rows — findings, not suite bugs
 
 | row | flag | status |
 |---|---|---|
-| `benchmark_closure_capture` | `KNOWN-BROKEN`: **compiler SEGFAULT** | real defect — 6-line repro in the case header |
-| `benchmark_q4k`, `benchmark_q4k_heavy` | `MISMATCH` `-1280` vs `0` | by design: integer division semantics, see below |
+| `closure_capture` | none (repaired) | Was `known-fail: compiler SEGFAULT`. Fixed in 0.0.237 by the A1b block-scoping work; the marker was removed and the C twin repaired — see Defect 3. |
+| `q4k`, `q4k_heavy` | none (repaired) | Were `MISMATCH` `-1280` vs `0`. Both were twin derivation errors, not a compiler defect — see Defect 4. |
 
-### Defect 1 — a capturing closure invoked in a loop crashes the compiler
 
-```
-fn main() { let y = 7
- let f = |x| { x + y }
- let i = 0
- while i < 3 { i = i + f(1) }
- print(i) }
-```
+## Suite repair (0.0.238 prep) — four repaired cases, one found by the equality guard
 
-`qc` segfaults (rc=139). Neither ingredient alone crashes: a closure in a loop without capture runs, and a
-capturing closure called *once* runs — which is why the gate's `closure_capture.quanta` passes. Needs a gate
-row alongside the fix, per rule #16.
+| case | defect | disposition |
+|---|---|---|
+| `closure_capture` | carried `known-fail: compiler SEGFAULT`. That defect was fixed in 0.0.237 by the A1b block-scoping work; the marker outlived it, which `bench.sh` flags as a structural failure. | marker removed; verified 0.0.237 compiles + runs and prints `500006500000` = sum(i+7, i=0..999999), matching the twin. |
+| `closure_capture` (C) | the C twin did not COMPILE: `struct env` was declared inside the function-pointer parameter list, so it was a prototype-scoped type and `add_y`'s pointer was incompatible. The row was measuring nothing — the stale marker short-circuited it before the C side was reached. | `struct env` declared once, before the typedef. |
+| `closure_capture` (C) | with the compile error fixed, gcc devirtualised the struct-held function pointer and folded the loop to its closed form: **zero jumps inside `main`**. Guard 3's exact failure mode. | the closure object is `volatile`, so the pointer is reloaded and the indirect call is real (1 jump, 2 call sites). |
+| `heavy_float2` | the Quanta side printed `printi(f64bits("sum="))` — `f64bits` is a float bit-pattern extractor and it was being handed a STRING literal, so the row printed a garbage 10-digit number where the C twin printed the text `sum=`. The arithmetic itself was correct: the f64 bit pattern matched gcc's exactly (`4945415844807707746`). | `print("sum=")`, so the twins agree byte-for-byte. |
+| `q4k`, `q4k_heavy` | `MISMATCH` `-1280` vs `0` — Defect 4 below. | C twin corrected; both rows now agree. |
 
-### Defect 2 — no sibling-call (tail-call) elimination
+## Defect 4 — `q4k` / `q4k_heavy` MISMATCH: a TWIN divergence, not a compiler defect (RESOLVED)
 
-Tail-form mutual recursion: gcc converts it to a loop and ran 40M calls in **15 ms** (~1 cycle/call) while
-Quanta kept every frame at **637 ms**. The non-tail form (both sides make real calls) is the honest
-comparison: **735 ms vs 75 ms = 9.80x**. Candidate for the optimizer phase.
+The rows printed `-1280` (Quanta) against `0` (gcc), identically before and after 0.0.238's codegen
+change. There were **two independent causes**, and each one alone flips the value:
 
-### Defect 3 — recursion depth ceiling from frame size
+1. **Algorithm.** The Quanta twin's `f16_to_q8` computes `base * (1 * (-shift)) * Q8_SCALE / 1024`, a
+   plain multiply by the shift amount; the derived C twin said `base * (1 << (-shift)) * Q8_SCALE / 1024`,
+   i.e. 2^shift. For the benchmark's own input (`W = 0x97`, `f16 = 38807`, `shift = -10`) that is
+   `scale_q8 = 1943*128/1024/10 = 24` on the Quanta side and `1943*128/1024/1024 = 0` on the C side. The
+   two sides were not running the same algorithm at all.
+2. **Semantics.** Quanta's `/` is FLOOR and `%` takes the divisor's sign; C truncates toward zero. The
+   dequant numerator is negative for half the nibbles, and `-3624 / 128` is **-29** in Quanta and **-28**
+   in C.
 
-Quanta emits a **1104-byte frame** per function (`sub $0x450,%rsp`, one home slot per vreg), so recursion
-deeper than roughly **7k** overflows an 8 MB stack (SIGSEGV) where C reaches 200k+. The same
-spill-everything defect, seen from the stack side.
+Isolation, computed in Python from each source (not by trusting either program):
 
-### Quanta's integer division is FLOOR, not C truncation
+| model | y[0] | printed by |
+|---|---|---|
+| Quanta algorithm (/10) + floor | **-1280** | the Quanta twin |
+| Quanta algorithm (/10) + truncation | 0 | — |
+| C algorithm (/1024) + floor | 0 | — |
+| C algorithm (/1024) + truncation | **0** | the C twin |
+
+**Verdict: Quanta was not miscompiling.** Its `-1280` is exactly what its own source plus its documented
+floor semantics produce, and the value was identical before and after the codegen change, so the change
+did not cause it. The C twin — the DERIVED artifact — had two derivation errors, and both are now
+corrected in `benchmark_q4k.c` / `benchmark_q4k_heavy.c`: it uses the same arithmetic as the program it
+mirrors, and a `qdiv()` floor-division helper. The rows now agree exactly (`-1280`). Note this makes the C
+side slightly slower (the floor helper), so the `q4k` ratios are not comparable with the pre-repair runs.
+
+## Defect 5 — the `1 * shift` typo in the `q4k` Quanta twins (FILED, not fixed here)
+
+`base * (1 * shift) * Q8_SCALE / 1024` looks like a typo for `1 << shift`: 2^shift is the standard FP16
+exponent scale, and `<<` is used throughout `lib/std` (e.g. `lib/std/gguf.quanta`). It is a
+**benchmark-data** question, not a compiler one, and it is deliberately left alone here because
+correcting it changes the result: with `1 << (-shift)` the scale for the current input becomes 0, i.e. the
+payload degenerates to zero and the benchmark stops exercising meaningful values. The correct fix is to
+correct the expression AND retune the `W` byte in the same change (an exponent giving `shift >= 0`), which
+is a separate piece of benchmark work. Recorded so it cannot be lost.
+
+## Quanta's integer division is FLOOR, not C truncation
 
 ```
 -7 / 2      quanta: -4   gcc: -3
 -7 % 2      quanta: +1   gcc: -1
+ 7 / -2     quanta: -4   gcc: -3
+ 7 % -2     quanta: -1   gcc: -1
+-7 / -3     quanta:  2   gcc:  2      (signs agree here)
+INT64_MIN / 3, % 3      quanta: -3074457345618258603, 1
 ```
 
-Any twin that divides negative intermediates disagrees with C *by design* (this is the q4k row). It also
-settles the strength-reduction question in `docs/plans/performance.md`: a power-of-two divisor is one `sar`,
-modulo by a power of two is an `and`.
-
-## Coverage notes
-
-- **Function shapes were the suite's biggest blind spot** and are now covered: `closure_call`,
-  `closure_capture` (known-broken), `fnptr_indirect`, `higher_order`, `generic_call`, `params8`,
-  `mutual_recursion`, `heavy_recursion` (misnomer: it calls an *iterative* fib), `nested_calls`, `recursion`,
-  `fib_recursive`.
-- Still uncovered: traits/dispatch, arrays and slices beyond simple indexing, string building/comparison,
-  match-heavy dispatch, allocation-heavy patterns, struct-heavy mutation in a loop, FFI call cost.
-- Two historical rows were **invalid** and are fixed: `heavy_recursion` computed `fib(1000)` (~4.3e208 →
-  int64 overflow; Quanta's overflow trap fired correctly, gcc wrapped with UB), and `loop_sum`'s twin had its
-  loop folded away.
+Any twin that divides negative intermediates disagrees with C by design (this was the `q4k` row). It is
+also what makes constant-divisor strength reduction simple: a power-of-two divisor is one `sar` and
+`% 2^k` is one `and`. Two gate rows pin it — `divmod_floor_semantics_test` (runtime divisors) and
+`divmod_const_strength_test` (literal divisors, i.e. the strength-reduction path) — and both are
+**red-first**: compiled with the floor corrections removed they return rc 101 / 105 instead of 42.
 
 ## History
 
-- **0.0.211 — loop flush hoisting.** `flush_all()` ran before every IR operation (38 locations); moved to loop
-  entry/exit only → **25×** on integer loops (0.33 s → 0.013 s).
-- **0.0.212 — loop register pinning.** Loop-carried vregs pinned to callee-saved registers; marginal further
-  gain (~0.011 s → ~0.010 s).
+- **0.0.211 — loop flush hoisting.** `flush_all()` ran before every IR operation (38 locations); moved to
+  loop entry/exit only → **25×** on integer loops (0.33 s → 0.013 s).
+- **0.0.212 — loop register pinning.** Loop-carried vregs pinned to callee-saved registers; marginal.
+- **0.0.237 — A1b block scoping** retired the `closure_capture` SEGFAULT that this suite had marked.
+- **0.0.238 — constant division/modulo strength reduction.** `/` and `%` by a positive compile-time
+  constant no longer emit `idiv`: `d = 2^k` → `sar` / `and`, `d = 1` → copy / zero, other `d ≤ 2^31-1` →
+  magic multiply with the floor correction. It also removes a real defect: the previous power-of-two path
+  emitted the `sar` and then **fell through** into the idiv sequence, so every constant division paid
+  `sar` + `idiv` for the same value. Measured effect: tables 2 and 3 above — 0-12 % on the 12 rows whose
+  code changed, no regression anywhere.
 - **0.0.212 table (superseded, kept for reference).** Heavy Int 14.8-16.7×, Heavy Float 10.1-10.7×, Arith
-  7.9-13.2×, Div Const 15.8-17.2×, Int Ops / Float Ops / Fib near parity. Its "Next Steps for Parity" list
-  (LICM, basic-block scheduling, 4× unrolling, SSA + linear-scan RA, strength reduction) is still sound input
-  to ordering. Correctness noted then: `f2i(3.0)`→3, `i2f/fadd/fsub/fmul/fdiv` correct,
-  `gguf_tensor_info_test` PASS, self-host 0.0.202→0.0.212 chain verified.
-- **Two claims in that table are now known wrong and must not be inherited:**
-  1. *"The register allocator runs `aphys()` for every operand … 60M allocator calls vs C's zero."* `aphys()`
-     is **compile-time** machinery — it picks registers while emitting. It does not run inside the generated
-     loop. The runtime cost is the **spill/reload traffic it emits**: measured `work()` = 254 instructions vs
-     gcc's 9, with a store/reload pair per operation.
-  2. *"div with magic constants (done for pow2)."* Not done in the code generator: `benchmark_div_const`
-     (`i/128*3 + i/64 - i/32`, three power-of-two divides) still measures **14.1×**, explicable only as real
-     `idiv`s. The shift-for-divide fix exists **only inside the `q4k` kernels in `lib/std`**.
-- **Suite repair (0.0.234 prep).** 30/30 compile again: `benchmark_enum` (variant syntax is now `Color.Green`
-  + `match`), `benchmark_int_ops` (`mod` is reserved → variable is `rem`), `benchmark_struct` (struct-typed
-  parameter must be annotated: `fn area(r: Rectangle)`). Four float twins cast doubles to `long` (UB →
-  INT64_MIN); they now print the f64 **bit pattern**, matching what Quanta's `print` emits, so those rows
-  became bitwise checks. `benchmark_loop_sum`'s twin had its loop folded away (fixed with an argc-dependent
-  bound). `test_avx2.quanta` — an AVX2 builtin feature test with no twin — moved to
-  `tests/test_avx2_builtins.quanta`. `benchmark_fib_recursive` added. The directory is now visible to git
-  (`!/benchmarks/` in `.gitignore`); the 29 stale compiled twins were deleted.
+  7.9-13.2×, Div Const 15.8-17.2×, Int Ops / Float Ops / Fib near parity.
+- **Two claims in that table are known wrong and must not be inherited:** (1) "the register allocator runs
+  `aphys()` per operand" — `aphys()` is compile-time machinery; the runtime cost is the spill/reload
+  traffic it emits. (2) "div with magic constants (done for pow2)" — not done in the code generator; the
+  shift-for-divide fix existed only inside the `q4k` kernels in `lib/std`.
 
-## Function coverage vs the gate (context)
+## Coverage notes
 
-The 30 original cases contained only three call-shaped rows (`nested_calls`, `recursion`, `fib_recursive`),
-all measuring call/recursion *overhead*. Function **correctness** was never thin — `EXPECTED.tsv` carries ~20
-function rows: `closure_basic`/`closure_capture`/`closure_capture_byvalue`/`closure_capture_multi`/
-`closure_higher_order`/`closure_multi_param`/`closure_named_fn`/`closure_selfrec_test`/`array_push_closure_mix`,
-`fnptr_test`, `func_call_args`, `param8`/`param9`/`param12`, `generics_test`/`generics_typecheck`/
-`generics_const_test`, `op_overload_recur`, `external_call`, plus the raw-pointer rows. The gap was
-*performance* coverage — and closing it immediately exposed Defect 1 and Defect 2 above.
+- **Function shapes** are covered: `closure_call`, `closure_capture`, `fnptr_indirect`, `higher_order`,
+  `generic_call`, `params8`, `mutual_recursion`, `heavy_recursion`, `nested_calls`, `recursion`,
+  `fib_recursive`.
+- Still uncovered: traits/dispatch, arrays and slices beyond simple indexing, string building/comparison,
+  match-heavy dispatch, allocation-heavy patterns, struct-heavy mutation in a loop, FFI call cost.
+- **Every row under 30 ms is noise-dominated** even with best-of-15 (table 4's `best-of-15 (<30ms row)`
+  tag). Quote those rows as "at the resolution floor", never as parity.

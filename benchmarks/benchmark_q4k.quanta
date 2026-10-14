@@ -1,4 +1,14 @@
 // Q4_K matmul benchmark (smaller)
+// TWIN DIVERGENCE, RESOLVED (0.0.238 prep) -- it was NOT a codegen defect, and the
+// fix is in the C side. This Quanta program is the artifact under test; the C twin
+// is derived from it and had two derivation errors: (1) it used `1 << (-shift)`
+// (= /1024) where this program says `1 * (-shift)` (= /10), so the two sides ran
+// DIFFERENT ALGORITHMS (scale_q8 24 here vs 0 there); (2) it used C truncation
+// where this language's `/` is FLOOR, so even with the same algorithm -3624/128
+// is -29 here and -28 there. With both corrected in the C twin the two sides
+// agree exactly (-1280). Python was used to derive the expected value from each
+// source independently. See benchmarks/BENCHMARK.md "Defect 4" (and "Defect 5"
+// for the separate `1 * shift` typo question, which is a data retune).
 const Q8_SCALE = 128
 
 fn f16_to_q8(f16) {

@@ -20,7 +20,7 @@ while [ $# -gt 0 ]; do
     *) echo "usage: scripts/bench.sh [--runs N] [--md]" >&2; exit 2 ;;
   esac
 done
-QC="$REPO/compiler/$(cat "$REPO/VERSION")/bin/x86/qc"
+QC="${QC:-$REPO/compiler/$(cat "$REPO/VERSION")/bin/x86/qc}"
 [ -x "$QC" ] || { echo "bench.sh: no compiler at $QC" >&2; exit 1; }
 OUT=/tmp/bench_run; mkdir -p "$OUT"
 FAIL=0   # structural failures: compile failures + folded twins (a folded twin is a fictional baseline)
@@ -74,6 +74,12 @@ for q in "$REPO"/benchmarks/benchmark_*.quanta; do
   fi
 
   note=""; skip_diff=0
+  # `// mismatch-reason: <text>` marks a row whose two sides are KNOWN to print
+  # different values, with the REASON attached to the row in the table. Unlike
+  # `twin-output: not-comparable` this does NOT silence the equality check: the
+  # row still reports MISMATCH, so the divergence stays visible, and the reason
+  # is printed beside it. A quarantined row must not be able to look like parity.
+  mreason=$(sed -n 's|^// mismatch-reason: *||p' "$q" | head -1)
   # Opt-out marker for rows whose two sides legitimately print different representations.
   if grep -q 'twin-output: not-comparable' "$q"; then skip_diff=1; note="output not comparable by design"; fi
   if grep -qE '\b(for|while)\b' "$c"; then
@@ -90,9 +96,29 @@ for q in "$REPO"/benchmarks/benchmark_*.quanta; do
     read -r ms rc < <(timeit "$cb" "$co"); [ "$ms" -lt "$bestc" ] && bestc=$ms
     i=$((i + 1))
   done
+  # RESOLUTION FLOOR. Above ~30 ms the run-to-run spread is a few percent, but a
+  # 5-10 ms row is decided by scheduler jitter, not by code: measured on this box,
+  # the SAME C binary (byte-identical, unchanged source) reported 10 ms in one
+  # baseline run and 6 ms in the next -- a 40% swing on a program that did not
+  # change. On such a row the ratio's denominator moves more than any plausible
+  # codegen effect moves the numerator. Below SMALL_MS the row therefore keeps
+  # running (still interleaved) up to SMALL_RUNS and reports the best-of, which is
+  # the robust estimator of "how fast can this row go". The row is tagged so a
+  # reader can tell a 15-run number from a 3-run one.
+  SMALL_MS=${SMALL_MS:-30}
+  SMALL_RUNS=${SMALL_RUNS:-15}
+  if [ "$bestq" -lt "$SMALL_MS" ] || [ "$bestc" -lt "$SMALL_MS" ]; then
+    while [ "$i" -lt "$SMALL_RUNS" ]; do
+      read -r ms rc < <(timeit "$qb" "$qo"); [ "$ms" -lt "$bestq" ] && bestq=$ms
+      read -r ms rc < <(timeit "$cb" "$co"); [ "$ms" -lt "$bestc" ] && bestc=$ms
+      i=$((i + 1))
+    done
+    note="${note:+$note; }best-of-${SMALL_RUNS} (<${SMALL_MS}ms row)"
+  fi
 
   if [ "$skip_diff" -eq 0 ] && ! diff -q <(tr -d '[:space:]' < "$qo") <(tr -d '[:space:]' < "$co") >/dev/null 2>&1; then
-    note="MISMATCH: quanta='$(tr -d '[:space:]' < "$qo" | head -c 20)' gcc='$(tr -d '[:space:]' < "$co" | head -c 20)'"
+    note="${note:+$note; }MISMATCH: quanta='$(tr -d '[:space:]' < "$qo" | head -c 20)' gcc='$(tr -d '[:space:]' < "$co" | head -c 20)'"
+    [ -n "$mreason" ] && note="$note  [quarantined: $mreason]"
   fi
 
   ratio=$(awk -v a="$bestq" -v b="$bestc" 'BEGIN{ if (b > 0) printf "%.2f", a/b; else print "inf" }')

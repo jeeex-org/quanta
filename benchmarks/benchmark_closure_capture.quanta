@@ -1,7 +1,12 @@
-// known-fail: compiler SEGFAULT — a capturing closure invoked inside a loop crashes qc
-// (minimal repro: let y = 7  let f = |x| { x + y }  while i < 3 { i = i + f(1) }).
-// The gate's closure_capture.quanta passes because it calls f ONCE, outside a loop.
-// Remove this marker when the fix lands (bench.sh flags a marker that outlives its bug).
+// Capturing closure invoked inside a hot loop.
+//
+// This case USED to carry `// known-fail: compiler SEGFAULT — a capturing
+// closure invoked inside a loop crashes qc`. That defect is FIXED as of 0.0.237
+// (the A1b block-scoping work replaced the binding-table use that path leaned
+// on). Measured on 0.0.237: compiles rc=0, runs rc=0, and prints 500006500000 —
+// which is the hand-computed sum(i + 7, i = 0..999999) = 499999500000 + 7000000,
+// identical to the C twin. bench.sh flags a known-fail marker that outlives its
+// bug, so the marker was removed with the fix (0.0.238 prep).
 fn main() {
     let y = 7
     let f = |x| { x + y }
