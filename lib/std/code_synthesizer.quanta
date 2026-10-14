@@ -14,6 +14,11 @@ import std/vec
 import std/map
 import std/fs
 
+// Hard ceiling on staged modules. This is REAL: synthesize_all() aborts
+// (exit 1, with a printed message) if a run would stage more than SYNTH_CAP
+// modules, so a spec set that outgrows the cap fails LOUDLY instead of silently
+// generating past it. gap_specs.json currently has 9,011 specs, so there is
+// headroom; raise the cap deliberately when the set genuinely grows.
 const SYNTH_CAP = 10000;
 
 // The ONE staging root every generated module is written under. It MUST never
@@ -282,7 +287,16 @@ fn synthesize_all(specs_path) -> i64 {
         mem_store8(mod_str + 8 + mod_len, 0);
         
         let result = emit_quanta_module(domain_str, cat_str, mod_str);
-        if result != 0 { generated = generated + 1; }
+        if result != 0 {
+            generated = generated + 1;
+            // SYNTH_CAP is enforced, not decorative: fail loudly rather than
+            // silently staging modules past the ceiling.
+            if generated > SYNTH_CAP {
+                prints("code_synthesizer: SYNTH_CAP ("); printi(SYNTH_CAP);
+                prints(") exceeded -- refusing to stage further modules\n");
+                exit(1);
+            }
+        }
     }
     
     return generated;
