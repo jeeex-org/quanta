@@ -6,30 +6,41 @@
 // CONTINUE_FINAL_MESSAGE_TAG -- none of which a plain single-turn chat needs.
 //
 // So this implements the SINGLE-TURN path only, transcribed from the template's
-// literal strings rather than guessed:
+// literal strings rather than guessed. Per message, role == "assistant" is
+// content then the im_end tag + newline; every other role (user/system) is the
+// parsed content then the same tag + newline. With add_generation_prompt the
+// template ends with the assistant opener + a REAL newline + the thinking-open
+// tag (7 bytes 3c 74 68 69 6e 6b 3e, vocab id 124901).
 //
-//   {%- if add_generation_prompt -%}
-//       {{- "<|im_start|>assistant\n thinking" -}}
-//   {%- endif -%}
+// THREE THINGS THAT WERE WRONG HERE UNTIL 0.0.240, all measured, all fixed:
 //
-// and per message, for role == "assistant" the content goes through
-// `{{- content -}}` then `{{- "<|im_end|>\n" -}}`; for every other role
-// (user/system) it is `{{- parse_content(message["content"]) -}}` then
-// `{{- "<|im_end|>\n" -}}`.
+//  1. THE ESCAPES. The template source stores a doubled backslash + n (a literal
+//     backslash inside the Jinja string), which Jinja2 renders as a REAL newline.
+//     This file instead wrote a literal backslash byte + 'n' (bytes 92,110), in
+//     BOTH the system opener and the generation prompt, so the model was handed
+//     the two characters `\` and `n` where a newline belongs. Verified against
+//     llama.cpp's own Jinja renderer (`/apply-template`, same GGUF): every `\n`
+//     in its output is a real newline (0x0a).
+//  2. THE THINKING TAG. This file wrote `space + "thinking"` -- one byte wrong
+//     (0x20 where 0x3c belongs). The correct tag is 3c 74 68 69 6e 6b 3e, i.e.
+//     vocab token 124901. A reader gets the space for free from any renderer that
+//     strips `<...>`, which is exactly how the mistake survives review.
+//     Symptom of (1)+(2) together, measured: the assistant turn's first-token
+//     argmax was the EOS token <|im_end|> (p=0.744) instead of `The`, so the
+//     in-tree generator emitted NOTHING at all.
+//  3. THE CALLER. A chat-templated prompt contains SPECIAL tokens, and
+//     bpe_encode() does no special-token matching; bpe_encode_special() does.
+//     That is the caller's decision, not this file's -- see TRAP 3 in
+//     tests/lfm2_generate.quanta.
 //
-// The two trap strings, both verified byte-for-byte out of the GGUF:
-//   "<|im_start|>system\n"        <- a literal backslash-n, NOT a newline
-//   "<|im_start|>assistant\n<think"
-// Everything else uses a REAL newline: "<|im_start|>" + role + "\n".
-//
-// WHY THIS MATTERS: fed a bare word with no template, this instruct model
-// answers with end_of_turn immediately. The template is what makes it reply.
+// With all three fixed, chat_build() + bpe_encode_special() + BOS reproduces
+// llama.cpp's /tokenize for the same prompt EXACTLY (23 ids, byte-for-byte),
+// and the driver generates real text.
 
 import std/fs
 import std/str
 
 // ---- literal pieces, as they appear in the template ----
-// system/assistant openers embed a literal backslash-n; user does not.
 
 fn chat_append_str(dst, off, s) {
     let n = len(s)
@@ -49,12 +60,13 @@ fn chat_open_role(dst, off, role) {
     return off + 1
 }
 
-// "<|im_start|>system\n" with a LITERAL backslash-n
+// "<|im_start|>system" + REAL newline (0x0a). Was bytes 92+110, a literal
+// backslash + n; llama.cpp's renderer of the same template emits a real newline
+// here too. See the header note.
 fn chat_open_system_literal(dst, off) {
     off = chat_append_str(dst, off, "<|im_start|>system")
-    mem_store8(dst + off, 92)   // backslash
-    mem_store8(dst + off + 1, 110)  // 'n'
-    return off + 2
+    mem_store8(dst + off, 10)   // real newline
+    return off + 1
 }
 
 fn chat_close(dst, off) {
@@ -78,11 +90,25 @@ fn chat_build(sys, user, dst) -> i64 {
     off = chat_open_role(dst, off, "user")
     off = chat_append_str(dst, off, user)
     off = chat_close(dst, off)
-    // generation prompt
+    // generation prompt: "<|im_start|>assistant" + REAL newline + the thinking tag
     off = chat_append_str(dst, off, "<|im_start|>assistant")
-    mem_store8(dst + off, 92)       // backslash
-    mem_store8(dst + off + 1, 110)  // 'n'
-    off = off + 2
-    off = chat_append_str(dst, off, " thinking")
+    mem_store8(dst + off, 10)       // real newline (was 92+110, a literal backslash-n)
+    off = off + 1
+    // THE THINKING TAG, written as bytes on purpose.
+    //
+    // It is the 7 bytes 3c 74 68 69 6e 6b 3e and it is vocab token 124901. This
+    // was previously the 9-byte text `space + thinking`, a mis-transcription: some
+    // renderers STRIP <...> so the tag reads as the word "thinking", and the space
+    // is what a reader of that rendering writes down. That single wrong byte put
+    // the model out of distribution -- measured: argmax <|im_end|> (EOS, p=0.744)
+    // instead of `The`, i.e. the generator emitted nothing at all. Spelling it out
+    // byte by byte means no display can silently put the space back.
+    mem_store8(dst + off, 60)       off = off + 1   // 3c '<'
+    mem_store8(dst + off, 116)      off = off + 1   // 74 't'
+    mem_store8(dst + off, 104)      off = off + 1   // 68 'h'
+    mem_store8(dst + off, 105)      off = off + 1   // 69 'i'
+    mem_store8(dst + off, 110)      off = off + 1   // 6e 'n'
+    mem_store8(dst + off, 107)      off = off + 1   // 6b 'k'
+    mem_store8(dst + off, 62)       off = off + 1   // 3e '>'
     return off
 }

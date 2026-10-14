@@ -6,18 +6,28 @@
 // implement is EXACT -- one wrong byte and the model sees a malformed turn and
 // answers with end_of_turn.
 //
-// The two places the template is not what it looks like, both read out of the
-// GGUF as raw bytes:
-//   "<|im_start|>system\n"           -- literal backslash + n
-//   "<|im_start|>assistant\n<think"  -- literal backslash + n, then " thinking"
-// Every other separator is a REAL newline (byte 10), e.g. the user opener is
-// "<|im_start|>" + "user" + newline.
+// THIS TEST USED TO ASSERT THE DEFECT. Until 0.0.240 it required
+//   - a literal backslash + 'n' (bytes 92,110) after "<|im_start|>system" and
+//     after "<|im_start|>assistant", and
+//   - the assistant turn to end with `space + "thinking"`.
+// Both were wrong, and this file is why they survived: the test pinned the wrong
+// bytes, so the gate stayed green while the built-in generator emitted NOTHING
+// (the model's first-token argmax was EOS, p=0.744).
+//
+// The template source stores `\\n`, which Jinja2 renders as a REAL newline
+// (byte 10) in EVERY separator, and the assistant turn ends with the 7-byte
+// thinking tag 3c 74 68 69 6e 6b 3e (vocab id 124901), NOT with " thinking".
+// Both facts were read off llama.cpp's own renderer and tokenizer for this GGUF
+// (`/apply-template` and `/tokenize`), and the whole prompt now round-trips
+// byte-for-byte: chat_build + bpe_encode_special + BOS == llama.cpp's id list.
 //
 // SOURCE NOTE: in Quanta a "\n" inside a string literal IS a real newline
 // (byte 10); there is no escape for a literal backslash. The expected strings
-// below therefore stop short of the assistant opener and the three trap bytes
-// are asserted individually. Writing them into a literal would silently compare
-// against a newline and the test would fail against correct code.
+// below therefore stop short of the assistant opener, and the trap bytes are
+// asserted individually from a numeric table. Writing them into a literal would
+// silently compare against a newline and the test would fail against correct
+// code -- and spelling the thinking tag as text is exactly how the wrong byte
+// got in, because some renderers strip it.
 
 import std/lfm2_chat
 
@@ -56,30 +66,57 @@ fn cmp_at(dst, start, want) {
     return bad
 }
 
+// The bytes every assistant/system opener separator must be: a REAL newline,
+// then, for the assistant turn only, the thinking tag 3c 74 68 69 6e 6b 3e.
+// Kept as numbers on purpose -- see the SOURCE NOTE above.
+fn nl_byte() { return 10 }
+fn tag_len() { return 7 }
+
 fn main() {
     let dst = mem_alloc(8192)
 
     // ---- user turn only, no system ----
     let n1 = chat_build(0, "Hi", dst)
     let p1 = "<|im_start|>user\nHi<|im_end|>\n<|im_start|>assistant"
-    if n1 != len(p1) + 2 + len(" thinking") { print("FAIL: user-only length"); print(n1); return 1 }
+    if n1 != len(p1) + 1 + tag_len() { print("FAIL: user-only length"); print(n1); return 1 }
     if cmp_prefix(dst, p1) != 0 { print("FAIL: user-only prefix"); return 1 }
+
+    // the assistant separator: REAL newline, NOT a literal backslash + 'n'
     let aoff = len(p1)
-    if mem_load8(dst + aoff) != 92 { print("FAIL: assistant opener lost the literal backslash"); return 1 }
-    if mem_load8(dst + aoff + 1) != 110 { print("FAIL: assistant opener lost the 'n'"); return 1 }
-    if cmp_at(dst, aoff + 2, " thinking") != 0 { print("FAIL: missing think prefix"); return 1 }
-    // the user opener must use a REAL newline (10), not a backslash
+    if mem_load8(dst + aoff) != nl_byte() {
+        print("FAIL: assistant separator is not a real newline (want 10, got "); print(mem_load8(dst + aoff)); print(")"); return 1
+    }
+    // then the 7-byte thinking tag 3c 74 68 69 6e 6b 3e
+    let tag = mem_alloc(8 * 8)
+    mem_store(tag + 0, 60)      // '<'
+    mem_store(tag + 8, 116)     // 't'
+    mem_store(tag + 16, 104)    // 'h'
+    mem_store(tag + 24, 105)    // 'i'
+    mem_store(tag + 32, 110)    // 'n'
+    mem_store(tag + 40, 107)    // 'k'
+    mem_store(tag + 48, 62)     // '>'
+    let t = 0
+    let tbad = 0
+    while t < tag_len() {
+        if u8(mem_load8(dst + aoff + 1 + t)) != mem_load(tag + t * 8) { tbad = tbad + 1 }
+        t = t + 1
+    }
+    if tbad != 0 {
+        print("FAIL: assistant opener must end with 3c 74 68 69 6e 6b 3e, not space+thinking"); return 1
+    }
+    // the user opener must also use a REAL newline (10), not a backslash
     let uoff = len("<|im_start|>user")
-    if mem_load8(dst + uoff) != 10 { print("FAIL: user opener should use a real newline"); return 1 }
+    if mem_load8(dst + uoff) != nl_byte() { print("FAIL: user opener should use a real newline"); return 1 }
 
     // ---- with a system message ----
     let n2 = chat_build("Be brief.", "Hi", dst)
     let p2 = "<|im_start|>system"
     if cmp_prefix(dst, p2) != 0 { print("FAIL: system prefix"); return 1 }
     let soff = len(p2)
-    if mem_load8(dst + soff) != 92 { print("FAIL: system opener lost the literal backslash"); return 1 }
-    if mem_load8(dst + soff + 1) != 110 { print("FAIL: system opener lost the 'n'"); return 1 }
-    if cmp_at(dst, soff + 2, "Be brief.<|im_end|>\n<|im_start|>user\nHi<|im_end|>\n<|im_start|>assistant") != 0 {
+    if mem_load8(dst + soff) != nl_byte() {
+        print("FAIL: system separator is not a real newline (want 10, got "); print(mem_load8(dst + soff)); print(")"); return 1
+    }
+    if cmp_at(dst, soff + 1, "Be brief.<|im_end|>\n<|im_start|>user\nHi<|im_end|>\n<|im_start|>assistant") != 0 {
         print("FAIL: system + user body"); return 1
     }
 
@@ -94,6 +131,10 @@ fn main() {
     while k < 2000 { mem_store8(big + 8 + k, 65); k = k + 1 }
     mem_store(big, 2000)
     let n5 = chat_build(0, big, dst)
+    // The 2000-byte body replaces the 2-byte "Hi" of the n1 prompt; nothing else
+    // changes, so the length delta is exactly -2 + 2000. (A 0.0.240 transcription
+    // wrote `-(1 + tag_len())` here -- subtracting 8 instead of 2 -- which expected
+    // 2051 while the correct build is 2057. The formula, not the code, was wrong.)
     if n5 != n1 - 2 + 2000 { print("FAIL: long user turn length"); print(n5); return 1 }
     let coff = len("<|im_start|>user\n")
     let bad = 0
