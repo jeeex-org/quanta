@@ -22,6 +22,29 @@ const SYNTH_OUT_ROOT = "synth_out";
 // concatenated. It MUST stay under SYNTH_OUT_ROOT and never name a tracked tree.
 const TEST_STAGE_DIR = "synth_out/tests";
 
+// --- scratch arena (per-call, reused) -------------------------------------
+// generate_const_test() runs once per spec (9,011 over gap_specs.json) and used
+// to `mem_alloc` a fresh domain/category/module slug plus a path buffer on EVERY
+// call. mem_alloc rounds each request up to a 4 KiB page and nothing reuses them
+// (std/map's arena is the only reuse in the tree; the free list is never
+// consumed), so a full run leaked ~144 MB of dead pages. That is what pushed this
+// module's own gate row, std_test_generator_const_test, over the runner's 1 GiB
+// address-space cap: the row was GREEN while std/json could only see 64 specs and
+// went RED the moment std/vec could see all 9,011. The slug/path buffers only need
+// to outlive one generate_const_test call, so they come from a bump arena reset at
+// the top of every call. Fail-closed: overflowing it aborts (exit 1) rather than
+// scribbling past the mapping.
+const SCRATCH_ARENA = 65536   // a per-call need is <300 B (titles are <=27 B)
+let scratch_base = mmap(SCRATCH_ARENA)
+let scratch_used = 0
+fn scratch_reset() { scratch_used = 0 }
+fn scratch_alloc(n) {
+    let p = scratch_base + scratch_used
+    scratch_used = scratch_used + n
+    if scratch_used > SCRATCH_ARENA { exit(1) }
+    return p
+}
+
 // Build path string using Quanta string format
 // slugify(s) -> Quanta string: a PATH-SAFE form of a human display title.
 //
@@ -43,7 +66,7 @@ const TEST_STAGE_DIR = "synth_out/tests";
 fn slugify(s) -> i64 {
     let n = len(s);
     let cap = n + 8;
-    let out = mem_alloc(cap + 9);
+    let out = scratch_alloc(cap + 9);
     mem_store(out, cap);
     let pos = 8;
     let last_us = 1;   // suppress a leading '_'
@@ -86,7 +109,7 @@ fn build_test_path(domain, category, module) -> i64 {
     let len = len(TEST_STAGE_DIR) + len(sub) + len(domain) + 1 + len(category) + 1 + len(module) + len(suffix);
 
     // Allocate Quanta string (8 bytes header + data + null)
-    let path = mem_alloc(len + 9);
+    let path = scratch_alloc(len + 9);
     mem_store(path, len);
     let pos = 8;
 
@@ -143,6 +166,8 @@ fn build_test_path(domain, category, module) -> i64 {
 }
 
 fn generate_const_test(domain, category, module) -> i64 {
+    // All slug/path buffers for this call come from the per-call scratch arena.
+    scratch_reset();
     // The PATH and the emitted `import` must use the slug; the header comment
     // keeps the display title so the file still reads correctly.
     let dslug = slugify(domain);
