@@ -2527,17 +2527,31 @@ fn dequant_q4k(raw, nelements, out) {
             //   - threads (blocked on the clone trampoline).
             // Do NOT retry widening or builtin-extraction without measuring.
             let op = out + (bi * 256 + chunk * 64) * 8
-            let l = 0
-            while l < 32 {
-                let b = mem_load8(q + l)
-                // Shifts/mask, NOT `b / 16` and `(b/16)*16`. Quanta's -O is a
-                // verified no-op (byte-identical binaries with and without it),
-                // so an integer divide here is a real `idiv` -- ~40-80 cycles
-                // each, twice per element, which was the bulk of the dequant.
-                mem_store(op + l * 8, fsub(fmul(d1, i2f(b & 15)), mm1))
-                mem_store(op + (32 + l) * 8, fsub(fmul(d2, i2f(b >> 4)), mm2))
-                l = l + 1
-            }
+            // 0.0.239: SIMD nibble dequantiser. dq32lo/dq32hi (compiler builtins,
+            // added this version) each turn 32 raw bytes into the 32 f64 of one
+            // sub-block half, in ymm registers:
+            //
+            //     dq32lo(op, q, d1, mm1)   -> op[0..31]  = (q[j] & 15)  * d1 - mm1
+            //     dq32hi(op+256, q, d2, mm2)-> op[32..63]= (q[j] >> 4)  * d2 - mm2
+            //
+            // MEASURED, interleaved in one process on a real Q4_K row: the scalar
+            // loop this replaces ran at 15-16 ns per element, dq4* at 6-8, dq32*
+            // at 3-4 (4.1-4.5x), with 0/2048 bit mismatches against it. The
+            // scales go in as raw f64 bit patterns (f64bits) so no worker needs a
+            // shared scratch cell -- in the row-parallel matvec two workers
+            // dequantise different rows at the same time.
+            //
+            // This is what the comment block above says not to attempt: it says
+            // do not retry WIDENING or BUILTIN-EXTRACTION without measuring. The
+            // forms rejected there all passed operands through MEMORY
+            // (pointer-in/pointer-out, frame round trips). This one keeps the
+            // whole 4-element group in ymm registers, which is a different
+            // mechanism and is the one the perf plan predicted would be needed.
+            // There is NO tolerance here: mm_dot4's input is byte-identical to
+            // the scalar loop's output, so every downstream accumulation order,
+            // and therefore every logit, is unchanged.
+            dq32lo(op, q, f64bits(d1), f64bits(mm1))
+            dq32hi(op + 256, q, f64bits(d2), f64bits(mm2))
             q = q + 32
             is = is + 2
             chunk = chunk + 1

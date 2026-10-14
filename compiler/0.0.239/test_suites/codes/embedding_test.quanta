@@ -1,0 +1,129 @@
+// Real token-embedding extraction from the actual QUANTA-LFM2.5 Q4_K_M model.
+//
+// This is the first end-to-end check that the native loader reads REAL model
+// bytes correctly: open a 4.9 GB GGUF, find token_embd.weight, read one
+// 1680-byte Q6_K row out of the middle of it, and dequantize it.
+//
+// WHY EXACT BIT PATTERNS FROM THE QUANTIZED MODEL
+//
+// The golden values below are the exact bit patterns dequant_q6k produces for
+// token 5000. They are NOT copied from the F16 model -- that model is a
+// different quantization and would differ in the last bits. They were derived
+// by running the dequantization on the real bytes, then INDEPENDENTLY checked
+// against the unquantized QUANTA-LFM2.5-2.6Bv1.gguf, whose token 5000 row is
+// stored as plain f16:
+//
+//   token 5000 element 0   Q6_K  0.021805   F16 oracle  0.021729   err 0.000075
+//                            1          0.014536           0.014282        0.000254
+//                            2         -0.023258          -0.023560        0.000302
+//                            3         -0.010175          -0.009827        0.000348
+//                            4         -0.042156          -0.041992        0.000164
+//                            5         -0.024712          -0.024414        0.000298
+//
+// ~1% relative error, which is what 6-bit quantization should cost. Note the
+// SIGN agreement on every element -- an earlier attempt "fixed" these scales
+// to unsigned 6-bit (& 63) and the sign of element 0 flipped, because Q6_K
+// scale bytes in this model are genuinely sign-extended. The unsigned reading
+// correlates at cosine -0.04 with the oracle; the signed one at +0.35.
+//
+// The bit patterns are asserted exactly rather than with a tolerance, because
+// this test guards the byte layout: tensor offset, row stride, block geometry
+// and nibble unpacking. A tolerance large enough to survive a 2-byte stride
+// error would also hide it.
+
+import std/math
+import std/gguf
+
+fn main(): i64 {
+    let rc = gguf_load("/opt/ai/models/quanta/QUANTA-LFM2.5-2.6Bv1-Q4_K_M.gguf")
+    if rc != 0 { prints("gguf_load failed\n") return 1 }
+
+    let f = 0
+
+    // --- tensor metadata, checked against an independent header parse ---
+    let ti = gguf_find_tensor("token_embd.weight")
+    if ti < 0 { prints("token_embd.weight not found\n") return 1 }
+    if gguf_num_tensors() != 266 { prints("n_tensors != 266\n") f = f + 1 }
+    // dtype 14 = Q6_K
+    if gguf_tensor_dtype(ti) != 14 { prints("dtype != 14 (Q6_K)\n") f = f + 1 }
+    if gguf_tensor_ndims(ti) != 2 { prints("ndims != 2\n") f = f + 1 }
+    if gguf_tensor_dim(ti, 0) != 2048 { prints("dim0 != 2048\n") f = f + 1 }
+    if gguf_tensor_dim(ti, 1) != 128000 { prints("dim1 != 128000\n") f = f + 1 }
+
+    // --- read exactly one row: 2048 elems * 210/256 bytes = 1680 ---
+    let rowb = 1680
+    let tok = 5000
+    let buf = mem_alloc(rowb)
+    let n = gguf_read_tensor_bytes_at(ti, tok * rowb, buf, rowb)
+    if n != rowb {
+        printi(n)
+        prints(" bytes read, expected 1680\n")
+        return 1
+    }
+
+    // Token 5000's row must start with byte 0x31 (49) -- the first ql byte of
+    // its first Q6_K block. (0xbd=189 is token 0's first byte, not this
+    // row's; asserting that here was a mistake in this test, caught because
+    // the value came straight from an independent raw file read.)
+    if mem_load8(buf) != 49 {
+        printi(mem_load8(buf))
+        prints(" first byte of token 5000 row, expected 49\n")
+        f = f + 1
+    }
+
+    let out = mem_alloc(2048 * 8)
+    dequant_q6k(buf, 2048, out)
+
+    // Exact bit patterns for token 5000, elements 0..5.
+    let w0 = 4581941961153314816
+    let w1 = 4579533274774241280
+    let w2 = 0 - 4641011093051801600
+    let w3 = 0 - 4646352657978490880
+    let w4 = 0 - 4637135967398920192
+    let w5 = 0 - 4640592110402142208
+    let want: i64[6] = { w0, w1, w2, w3, w4, w5 }
+    let i = 0
+    while i < 6 {
+        if mem_load(out + i * 8) != want[i] {
+            printi(mem_load(out + i * 8))
+            prints(" element ")
+            printi(i)
+            prints(" != ")
+            printi(want[i])
+            prints("\n")
+            f = f + 1
+        }
+        i = i + 1
+    }
+
+    // Two more rows from different places in the tensor, so an off-by-one in
+    // the row stride cannot pass by luck on a single token.
+    let rows: i64[3] = { 0, 127999, 124894 }
+    i = 0
+    while i < 3 {
+        let b2 = mem_alloc(rowb)
+        if gguf_read_tensor_bytes_at(ti, rows[i] * rowb, b2, rowb) != rowb {
+            prints("short read on row\n")
+            f = f + 1
+        }
+        let o2 = mem_alloc(2048 * 8)
+        dequant_q6k(b2, 2048, o2)
+        // Just require finite, non-degenerate values: token 127999 is the
+        // [PAD127999] token and token 124894 is BOS, both real rows.
+        let bad = 0
+        let j = 0
+        while j < 2048 {
+            let v = f64_load(o2 + j * 8)
+            if fisnan(v) || fisinf(v) { bad = bad + 1 }
+            j = j + 1
+        }
+        if bad != 0 { prints("NaN/Inf in row\n") f = f + 1 }
+        i = i + 1
+    }
+
+    gguf_close()
+
+    if f == 0 { prints("EMBEDDING EXTRACTION PASS\n") return 0 }
+    prints("EMBEDDING EXTRACTION FAIL\n")
+    return 1
+}

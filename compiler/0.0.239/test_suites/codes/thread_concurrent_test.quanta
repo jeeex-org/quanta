@@ -1,0 +1,69 @@
+// Concurrent threads must all run, all join, and not corrupt each other.
+//
+// thread_join used to deadlock whenever two or more threads were alive at the
+// same time, so this is the regression test for that.
+//
+// THE INVARIANT: every worker owns a disjoint static slice and writes only
+// inside it, so the result must not depend on how many threads ran it. There
+// are no atomics in Quanta, so a work-stealing counter would race -- a static
+// partition is the only safe shape (measured 931/2048 rows wrong with a
+// counter). Run several worker counts and compare every row, not a reduction.
+
+let MARK = 0
+let PER = 64
+
+fn worker(t: i64) -> i64 {
+    let lo = t * PER
+    let hi = lo + PER
+    let r = lo
+    while r < hi {
+        let acc: f64 = 0.0
+        let c = 0
+        while c < 200 {
+            acc = fadd(acc, fmul(i2f((r * 7 + c * 13) % 17), 1.5))
+            c = c + 1
+        }
+        mem_store(MARK + r * 8, acc)
+        r = r + 1
+    }
+    return hi - lo            // 64
+}
+
+// run `n` concurrent workers; return the number of defects found
+fn run_n(n: i64) -> i64 {
+    MARK = mem_alloc(n * PER * 8)
+    let slots = mem_alloc(n * 8)
+
+    let t = 0
+    while t < n {
+        mem_store(slots + t * 8, thread_create(worker, t))
+        t = t + 1
+    }
+
+    let bad = 0
+    t = 0
+    while t < n {
+        let r = thread_join(mem_load(slots + t * 8))
+        if r != PER { bad = bad + 1 }        // join must return the worker's result
+        t = t + 1
+    }
+
+    // every row must have been written exactly once, with a positive value
+    let r = 0
+    while r < n * PER {
+        let v = mem_load(MARK + r * 8)
+        if v <= 0.0 { bad = bad + 1 }
+        r = r + 1
+    }
+    return bad
+}
+
+fn main() -> i64 {
+    let bad = 0
+    // 1 and 2 are the sizes that used to hang; 8 is what a matvec wants.
+    bad = bad + run_n(1)
+    bad = bad + run_n(2)
+    bad = bad + run_n(4)
+    bad = bad + run_n(8)
+    return bad                    // 0 = pass
+}

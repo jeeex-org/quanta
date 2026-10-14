@@ -1,0 +1,100 @@
+// stdlib_loader_multi_test -- Phase 6.1: more than one model open at once.
+//
+// Before this, loader_traits held its state in module globals: opening a second
+// model silently replaced the first, and every handle resolved to the same
+// storage. This asserts the property directly -- two live handles, interleaved
+// reads, and a close that leaves the survivor intact -- rather than only that
+// open returned a number.
+//
+// The GGUF context is a separate 136-byte allocation from the 48-byte handle
+// slot. An earlier revision passed the slot where the context was expected, so
+// the two layouts aliased: qmodel_close closed fd 0 (stdin) and unmapped
+// whatever the slot happened to hold. Both are exercised below.
+
+import std/loader_traits
+
+const GGUF = "/opt/ai/models/quanta/QUANTA-LFM2.5-2.6Bv1-Q4_K_M.gguf"
+const ST = "/opt/ai/models/qwen3.5-2b/model.safetensors-00001-of-00001.safetensors"
+
+fn main() -> i64 {
+    // ---- two handles on the same file ----
+    let h1 = qmodel_open(GGUF)
+    let h2 = qmodel_open(GGUF)
+    if h1 < 0 { print("FAIL: first open\n"); return 1 }
+    if h2 < 0 { print("FAIL: second open rejected\n"); return 1 }
+    if h1 == h2 { print("FAIL: handles are not distinct\n"); return 1 }
+
+    let n1 = qmodel_num_tensors(h1)
+    let n2 = qmodel_num_tensors(h2)
+    if n1 != n2 { print("FAIL: tensor counts differ\n"); return 1 }
+    if n1 != 266 { print("FAIL: unexpected tensor count\n"); return 1 }
+
+    // Both handles resolve the same name to the same index.
+    let i1 = qmodel_find(h1, "token_embd.weight")
+    let i2 = qmodel_find(h2, "token_embd.weight")
+    if i1 != i2 || i1 < 0 { print("FAIL: find disagrees\n"); return 1 }
+
+    // Interleaved reads: h1, then h2, then h1 again. Each must be unaffected by
+    // the other's use of the shared underlying machinery.
+    let want = 4096
+    let a1 = mem_alloc(want)
+    let a2 = mem_alloc(want)
+    let a3 = mem_alloc(want)
+    if qmodel_read(h1, i1, a1, want) != want { print("FAIL: read h1\n"); return 1 }
+    if qmodel_read(h2, i2, a2, want) != want { print("FAIL: read h2\n"); return 1 }
+    if qmodel_read(h1, i1, a3, want) != want { print("FAIL: reread h1\n"); return 1 }
+
+    let d12 = 0
+    let d13 = 0
+    let j = 0
+    while j < want {
+        if mem_load8(a1 + j) != mem_load8(a2 + j) { d12 = d12 + 1 }
+        if mem_load8(a1 + j) != mem_load8(a3 + j) { d13 = d13 + 1 }
+        j = j + 1
+    }
+    if d12 != 0 { print("FAIL: h1 and h2 disagree\n"); return 1 }
+    if d13 != 0 { print("FAIL: h1 changed after h2 was used\n"); return 1 }
+
+    // Closing h1 must not disturb h2.
+    qmodel_close(h1)
+    if qmodel_num_tensors(h2) != n2 { print("FAIL: h2 damaged by close(h1)\n"); return 1 }
+    let a4 = mem_alloc(want)
+    if qmodel_read(h2, i2, a4, want) != want { print("FAIL: read h2 after close(h1)\n"); return 1 }
+    let d24 = 0
+    j = 0
+    while j < want {
+        if mem_load8(a2 + j) != mem_load8(a4 + j) { d24 = d24 + 1 }
+        j = j + 1
+    }
+    if d24 != 0 { print("FAIL: h2 content changed after close(h1)\n"); return 1 }
+    qmodel_close(h2)
+
+    // ---- GGUF and safetensors open together ----
+    let hg = qmodel_open(GGUF)
+    let hs = qmodel_open(ST)
+    if hg < 0 || hs < 0 { print("FAIL: mixed open\n"); return 1 }
+    if qmodel_kind(hg) != QMODEL_GGUF { print("FAIL: gguf kind\n"); return 1 }
+    if qmodel_kind(hs) != QMODEL_ST { print("FAIL: st kind\n"); return 1 }
+
+    let ng = qmodel_num_tensors(hg)
+    let ns = qmodel_num_tensors(hs)
+    if ng != 266 { print("FAIL: gguf count\n"); return 1 }
+    if ns <= 0 { print("FAIL: st count\n"); return 1 }
+
+    // The safetensors handle must answer while the GGUF one is live.
+    let st0 = qmodel_name(hs, 0)
+    if st0 == 0 { print("FAIL: st name\n"); return 1 }
+    if mem_load(st0) <= 0 { print("FAIL: st name length\n"); return 1 }
+    if qmodel_nelements(hs, 0) <= 0 { print("FAIL: st nelements\n"); return 1 }
+    if qmodel_nbytes(hs, 0) <= 0 { print("FAIL: st nbytes\n"); return 1 }
+
+    // ...and the GGUF handle must still answer after the safetensors calls.
+    if qmodel_find(hg, "token_embd.weight") != i1 { print("FAIL: gguf find after st\n"); return 1 }
+
+    qmodel_close(hg)
+    if qmodel_num_tensors(hs) != ns { print("FAIL: st damaged by close(gguf)\n"); return 1 }
+    qmodel_close(hs)
+
+    print("OK loader multi\n")
+    return 0
+}
