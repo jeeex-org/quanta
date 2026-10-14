@@ -73,7 +73,32 @@ capture runs fine, and a capturing closure called *once* runs fine — which is 
   `test_suites/codes/closure_capture_branch_test.quanta` (`EXPECTED.tsv` → 23) is **red on 0.0.233**
   (rc=139) and green on 0.0.234, per rule #16.
 
-### A1b · MEASURED (0.0.236 attempt reverted) · block bindings are never popped, so an inner `let` clobbers an outer name
+### A1b · FIXED (0.0.237) · block bindings are never popped, so an inner `let` clobbers an outer name
+
+**Full record: `compiler/0.0.237/WIP.md`.** Fix: a watermark on the binding stack, saved at every
+block entry and given back at its single exit (`a1b_enter`/`a1b_leave`), so a block's bindings die
+with the block; per-vreg tag tables are provably safe to leave alone (vreg indices are never reused
+inside a function and `nv()` writes every tag at allocation). Fail closed: a use after its block is
+the existing located `undeclared variable` error.
+
+Measured, warn-first, before the flip (the whole tree: compiler's own source, `lib/std`, all 619
+`test_suites/codes`, `benchmarks`, `tools`, `scripts`, `tests`, `temp` = 1052 compile units):
+**26 distinct sites in 6 files** — `lib/std/gguf.quanta` 12, `x86/method.quanta` 6,
+`x86/entry.quanta` 3, `x86/lexer.quanta` 2 (one of them silent), `x86/funcscan.quanta` 1,
+`x86/parse.quanta` 1, plus one frozen fuzz seed. All migrated here. Gate: 222/222 (214 core + 8
+new rows), STDLIB 108/108, all stages GREEN, EXIT=0; 3-generation fixpoint `dca6b4ab…74e401`.
+
+It was not hygiene. On 0.0.236 the leak **SIGSEGVs the compiler** (rc=139, 3/3 runs) on a
+tuple-payload enum constructor, a bare `Ok(7)` payload reads back as **5**, `let x = 1.5` inside a
+block makes a later `print(x)` on the outer INTEGER a hard compile error, and
+`lib/std/gguf.quanta`'s Q4_1/Q5_0/Q5_1/Q2_K/Q3_K/Q8_K dequant arms passed an **uninitialised
+pointer** to the dequant routine and then to `mem_free` (preserved-not-authored in `cc7ff74b`).
+
+Two corrections to the 0.0.236 entry that used to be here: those "819/824, 38 compile failures,
+STDLIB 74/108" figures describe a HOISTING transformation (`let x = f()` pulled out of a loop, so it
+initialises once instead of per iteration) plus an 821-row suite — `EXPECTED.tsv` was pruned to 214
+core rows since (`git show c55a6d11:test_suites/EXPECTED.tsv | grep -c .` = 821), so they are not
+comparable to the 222 above and are not the cost of this fix.
 
 ### A2 · FIXED (0.0.235) · `print` on an `f64` emitted the raw bit pattern, not the value
 

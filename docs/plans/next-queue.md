@@ -5,6 +5,13 @@ have to be re-derived, and a pointer to where the detail lives.
 
 ## 1. Fix A1b — block bindings are never popped (best practice, secure, AND performance)
 
+**DONE (0.0.237).** Watermark on the binding stack at every block entry/exit, fail-closed, warn-first
+blast radius measured at **26 sites in 6 files** (1052 compile units), all migrated; gate 222/222 +
+STDLIB 108/108 all stages GREEN; fixpoint `dca6b4ab…74e401`. Detail: `compiler/0.0.237/WIP.md`. The
+0.0.236 attempt's "819/824" figures were a HOISTING transformation on an 821-row suite — not this
+fix's cost. The A4 lever (home-slot reuse, 1104-byte frames) is still open: this version only makes
+the live ranges non-overlapping.
+
 **Behaviour:** an inner-block `let` rebinds the enclosing name's storage and stays
 visible after the block. Verified live: `fn f(n) { let a = 1; if a == 1 { let p = 99 }; p = 77; print(p) }`
 compiles and prints `77`.

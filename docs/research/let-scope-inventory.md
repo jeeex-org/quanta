@@ -1,7 +1,22 @@
 # Block-scoped `let`: migration inventory
 
-**Status: not applied. This is preparation for a language-semantics decision, kept out of the A1 crash fix
-on purpose (see `docs/plans/bugs.md` A1b).**
+**Status: APPLIED in 0.0.237 — route 2 below, done properly.** Route 1 (keep the leak, correct the
+documents) was **rejected**: the leak is a memory-corruption primitive, not a documented extent — on
+0.0.236 it SIGSEGVs the compiler on a tuple-payload enum, makes a bare `Ok(7)` payload read back as
+5, and in `lib/std/gguf.quanta` passed an uninitialised pointer to six dequant routines and then to
+`mem_free`.
+
+**Where the shipped numbers are:** `compiler/0.0.237/WIP.md`. Measured warn-first over 1052 compile
+units: **26 sites in 6 files** (gguf 12, method 6, entry 3, lexer 2 — one silent, funcscan 1,
+parse 1, plus a frozen fuzz seed), all migrated; gate 222/222 + STDLIB 108/108, all stages GREEN;
+3-generation fixpoint `dca6b4ab…74e401`.
+
+**What is history below, not measurement of the fix:** the reverted 0.0.236 attempt applied the
+one-line patch and then HOISTED 12 sites, which is not semantics-preserving (`let x = f()` inside a
+loop, hoisted, initialises once), and it reported against a suite that then had 821 `EXPECTED.tsv`
+rows (214 core rows now). Its "819/824, 38 compile failures, STDLIB 74/108" are the cost of that
+transformation plus that suite, not of block scoping. The pre-fix preparation text is kept unchanged
+so the reasoning that led to the decision stays legible.
 
 ## What the language does today
 
