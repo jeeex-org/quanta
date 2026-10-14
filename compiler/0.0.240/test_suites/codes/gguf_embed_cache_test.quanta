@@ -1,0 +1,46 @@
+import std/fs
+import std/gguf
+
+// Test embedding cache loading
+fn dequant_q6k_block(raw, out) {
+    let scale = mem_load8(raw) + mem_load8(raw + 1) * 256
+    let gi = 0
+    while gi < 64 {
+        let b0 = mem_load8(raw + 2 + gi * 3)
+        let b1 = mem_load8(raw + 2 + gi * 3 + 1)
+        let b2 = mem_load8(raw + 2 + gi * 3 + 2)
+        
+        let q0 = b0 - (b0 / 64) * 64
+        let q1 = (b0 / 64) + (b1 - (b1 / 16) * 16) * 4
+        let q2 = (b1 / 16) + (b2 - (b2 / 4) * 4) * 16
+        let q3 = b2 / 4
+        
+        mem_store(out + (gi * 4) * 8, scale * q0 / 63)
+        mem_store(out + (gi * 4 + 1) * 8, scale * q1 / 63)
+        mem_store(out + (gi * 4 + 2) * 8, scale * q2 / 63)
+        mem_store(out + (gi * 4 + 3) * 8, scale * q3 / 63)
+        gi = gi + 1
+    }
+}
+
+fn main() {
+    let rc = gguf_load("/opt/ai/models/quanta/QUANTA-LFM2.5-2.6Bv1-Q4_K_M.gguf")
+    if rc != 0 { return 1 }
+    
+    let token_embd = gguf_find_tensor("token_embd.weight")
+    let offset = gguf_tensor_offset(token_embd)
+    
+    // Read first block
+    let raw = mem_alloc(210)
+    lseek(gguf_fd, offset, 0)
+    file_read(gguf_fd, raw, 210)
+    
+    let out = mem_alloc(256 * 8)
+    dequant_q6k_block(raw, out)
+    
+    // Verify first value is non-zero
+    if mem_load(out) == i2f(0) { return 1 }
+    
+    gguf_close()
+    return 0
+}

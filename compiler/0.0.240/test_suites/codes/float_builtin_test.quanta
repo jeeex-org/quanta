@@ -1,0 +1,73 @@
+// The f64 BUILTINS (fadd/fsub/fmul/fdiv), as distinct from the + - * / operators.
+//
+// float_arith_test.quanta covers the operators, which take a different code path
+// in codegen. These four builtins are handled inside emit_bltn and are a separate
+// implementation; operator arithmetic being correct says nothing about them.
+//
+// MEASURED DEFECT (0.0.220, confirmed on the committed binary):
+//
+//   let a = 3.0
+//   let b = 4.0
+//   a + b          -> 7.0     correct (operator path)
+//   fadd(a, b)     -> 3.0     wrong  (builtin path)
+//
+// The result was one of the two ARGUMENTS rather than their sum, which is the
+// signature of the operands not being where the handler reads them. Probing
+// isolates it further: fadd(3.0, 0.0) -> 0.0 and fadd(0.0, 4.0) -> 4.0, so xmm0
+// always ends up holding arg1. Every sibling float builtin -- sqrt, pow, cos,
+// floor, log -- calls flush_all() before reading rdi/rsi; these four carried a
+// "NO flush_all -- uses only xmm0/xmm1" comment and did not, and the only
+// flush_all() above them sat in a different branch of emit_bltn.
+//
+// Also encoded wrongly: the result ended in `cvttsd2si rax, xmm0`, truncating the
+// double and returning an INTEGER, so fadd(3.0, 4.0) produced the integer 7 rather
+// than 7.0's bit pattern. And the result was never tagged in vfloat, so a chained
+// fadd -> fmul fed the bit pattern to cvtsi2sd as an integer.
+//
+// This test is expected to FAIL (exit 1) until the handlers are fixed. It is
+// here so the defect is captured rather than rediscovered.
+//
+// Build:  qc float_builtin_test.quanta out
+// Run:    out ; echo $?   -- expect 42 once fixed; 1 today
+
+fn main() -> i64 {
+    // --- literal operands -----------------------------------------------------
+    // fadd(3.0, 4.0) == 7.0
+    if fadd(3.0, 4.0) != 7.0 { return 1 }
+    if fsub(9.0, 3.0) != 6.0 { return 2 }
+    if fmul(2.0, 3.0) != 6.0 { return 3 }
+    if fdiv(8.0, 2.0) != 4.0 { return 4 }
+    if fdiv(7.0, 2.0) != 3.5 { return 5 }
+
+    // --- f64 locals -----------------------------------------------------------
+    let a: f64 = 3.0
+    let b: f64 = 4.0
+    if fadd(a, b) != 7.0 { return 6 }
+    if fsub(a, b) != -1.0 { return 7 }
+
+    // --- f64 parameters -------------------------------------------------------
+    // A returned float must keep its bit pattern across the call boundary.
+    if sum2(a, b) != 7.0 { return 8 }
+    if prod2(a, b) != 12.0 { return 9 }
+
+    // --- chained builtins -----------------------------------------------------
+    // The result of fadd must be tagged float or fmul treats the bits as an int.
+    if fmul(fadd(1.0, 5.0), 2.0) != 12.0 { return 10 }
+    if fadd(fmul(2.0, 3.0), 1.0) != 7.0 { return 11 }
+
+    // --- integer-argument forms still work ------------------------------------
+    // These take the cvtsi2sd path; keep them covered so a float fix cannot break
+    // integer coercion.
+    if f2i(fadd(3, 4)) != 7 { return 12 }
+    if f2i(fmul(6, 7)) != 42 { return 13 }
+
+    return 42
+}
+
+fn sum2(x: f64, y: f64) -> f64 {
+    return fadd(x, y)
+}
+
+fn prod2(x: f64, y: f64) -> f64 {
+    return fmul(x, y)
+}

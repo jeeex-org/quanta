@@ -1,0 +1,67 @@
+// config_test - the rag.conf reader
+//
+// 0.0.220. Every path RAG and TI use lives in config/rag.conf so a tree can be
+// moved without editing Quanta source. This asserts the reader actually reads
+// it: a reader that silently returns "" would leave every caller on its
+// compiled-in default, which is the exact failure the config exists to prevent.
+//
+// The values asserted here are the ones a wrong reader gets wrong. A reader that
+// skipped section tracking, or that failed to expand ${ti.root}, would return
+// empty or a partial path for `ai`, `kb` and `db` while `root` -- a plain literal
+// with no expansion -- still looked correct.
+
+import std/config
+import std/str
+
+fn main() -> i64 {
+    // --- TI: the root, and everything derived from it ---
+    let root = ti_root()
+    if len(root) == 0 { return 10 }            // config not found at all
+    if !equals(root, "/opt/tali/ti") { return 11 }
+
+    // `ai` and `kb` are `${ti.root}/...`, so they are wrong unless ${ti.root}
+    // expanded. An unexpanded reader yields "/ai" -- a path that is not merely
+    // different but plausible, which is why this is asserted explicitly.
+    let ai = ti_ai()
+    if !equals(ai, "/opt/tali/ti/ai") { return 12 }
+    let kb = ti_kb()
+    if !equals(kb, "/opt/tali/ti/kb") { return 13 }
+
+    // --- RAG: a two-level expansion, ${ti.ai} then ${rag.db} ---
+    let db = rag_db()
+    if !equals(db, "/opt/tali/ti/ai/rag/vectors.db") { return 20 }
+
+    // A key whose value is itself a reference to another section's key.
+    let wal = cfg("rag", "db_wal")
+    if !equals(wal, "/opt/tali/ti/ai/rag/vectors.db-wal") { return 21 }
+
+    // --- KB: a self-referential section (`${kb.root}` inside [kb]) ---
+    let idx = cfg("kb", "index")
+    if !equals(idx, "/opt/tali/ti/kb/INDEX.md") { return 30 }
+
+    // --- integers parse, and a float stored as tenths/hundredths round-trips ---
+    if rag_default_top_k() != 5 { return 40 }
+    if rag_context_chunks() != 3 { return 41 }
+    if embed_dim() != 384 { return 42 }
+    if model_port("e4b") != 1236 { return 43 }
+    if model_port("e2b") != 1235 { return 44 }
+
+    // An unset model is 0, not a crash and not a stale value.
+    if model_port("no_such_model") != 0 { return 45 }
+
+    // --- str_i64: digit order ---
+    // 1235 came out as "5321" before the reversal was added, which produced
+    // http://localhost:5321/... -- a wrong port that still looks like a port.
+    if !equals(llm_url("e2b"), "http://localhost:1235/v1/chat/completions") { return 50 }
+    if !equals(llm_url("e4b"), "http://localhost:1236/v1/chat/completions") { return 51 }
+
+    // --- a key that does not exist returns empty, and the default applies ---
+    if len(cfg("ti", "no_such_key")) != 0 { return 60 }
+    if !equals(cfg_str("ti", "no_such_key", "fallback"), "fallback") { return 61 }
+    if cfg_int("ti", "no_such_key", 7) != 7 { return 62 }
+
+    // --- a section that does not exist ---
+    if len(cfg("no_such_section", "root")) != 0 { return 63 }
+
+    return 42
+}

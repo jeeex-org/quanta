@@ -1,0 +1,20 @@
+// All four float builtins, weighted sum -- expected exit 159.
+//
+//   fadd(3,4)   =  7    fmul(6,7)   = 42
+//   fsub(10,3)  =  7    fdiv(20,4)  =  5
+//   7 + 42*2 + 7*4 + 5*8 = 159
+//
+// The 159 expectation was always correct. What broke (and SIGILL'd) was the
+// plumbing: each builtin stored its result with 66 48 0F 2C (CVTTSD2SI) instead
+// of 66 48 0F 7E (MOVQ), so `a` held the integer 7 only by accident and the
+// values were mixed as integers and float bit patterns. Fixed in 0.0.220; the
+// conversions to integers are now explicit.
+
+fn main() {
+    let a = f2i(fadd(i2f(3), i2f(4)))     //  7
+    let b = f2i(fmul(i2f(6), i2f(7)))     // 42
+    let c = f2i(fsub(i2f(10), i2f(3)))    //  7
+    let d = f2i(fdiv(i2f(20), i2f(4)))    //  5
+    let chk = a + b * 2 + c * 4 + d * 8
+    return chk
+}

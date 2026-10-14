@@ -1,0 +1,287 @@
+// std/test_generator.quanta - Phase 2: Test Generator
+// Generates const test files for synthesized Quanta modules
+
+module std_test_generator;
+
+import std/json
+import std/str
+import std/vec
+import std/map
+import std/fs
+
+const TEST_CAP = 10000;
+
+// Staging root for generated *tests*. MUST never name a tracked tree:
+// test_suites/codes is where these files used to land (9,026 per run) and this
+// module's `main` IS the entry point of the std_test_generator_const_test gate
+// row (an imported module's main wins over the test file's own), so a gate run
+// executes it. CWD-relative and git-ignored; the gate's scratch cwd
+// (test_suites/run) wipes it every run. Spell the path here only.
+const SYNTH_OUT_ROOT = "synth_out";
+// SYNTH_OUT_ROOT + "/tests" -- its own const only because Quanta consts cannot be
+// concatenated. It MUST stay under SYNTH_OUT_ROOT and never name a tracked tree.
+const TEST_STAGE_DIR = "synth_out/tests";
+
+// --- scratch arena (per-call, reused) -------------------------------------
+// generate_const_test() runs once per spec (9,011 over gap_specs.json) and used
+// to `mem_alloc` a fresh domain/category/module slug plus a path buffer on EVERY
+// call. mem_alloc rounds each request up to a 4 KiB page and nothing reuses them
+// (std/map's arena is the only reuse in the tree; the free list is never
+// consumed), so a full run leaked ~144 MB of dead pages. That is what pushed this
+// module's own gate row, std_test_generator_const_test, over the runner's 1 GiB
+// address-space cap: the row was GREEN while std/json could only see 64 specs and
+// went RED the moment std/vec could see all 9,011. The slug/path buffers only need
+// to outlive one generate_const_test call, so they come from a bump arena reset at
+// the top of every call. Fail-closed: overflowing it aborts (exit 1) rather than
+// scribbling past the mapping.
+const SCRATCH_ARENA = 65536   // a per-call need is <300 B (titles are <=27 B)
+let scratch_base = mmap(SCRATCH_ARENA)
+let scratch_used = 0
+fn scratch_reset() { scratch_used = 0 }
+fn scratch_alloc(n) {
+    let p = scratch_base + scratch_used
+    scratch_used = scratch_used + n
+    if scratch_used > SCRATCH_ARENA { exit(1) }
+    return p
+}
+
+// Build path string using Quanta string format
+// slugify(s) -> Quanta string: a PATH-SAFE form of a human display title.
+//
+// 0.0.219: `module` in gap_specs.json is a DISPLAY title ("Revenue Recognition",
+// "Arrays & Lists", "SOC 1"), and 1602 of them contain whitespace or shell
+// metacharacters. build_test_path() used it verbatim, so the generated filename
+// was `std_accounting_GAAP_Revenue Recognition_const_test.quanta` and the
+// `import std/...` line the generator writes ended at the first space. The
+// tokeniser then treated the remainder as the compiler's OUTPUT PATH and wrote
+// a file whose name was whatever came next -- which is how 21 files named
+// "A", "B", ";", ">", "@" appeared in the project root on every gate run. The
+// generator's own test (std_test_generator_const_test) ran it, so the gate kept
+// re-creating the mess.
+//
+// Rule: any byte that is not [A-Za-z0-9] or '_' becomes '_'; runs of '_'
+// collapse to one; leading/trailing '_' are trimmed. The display title is
+// still what gets written into the file's header comment -- only the PATH uses
+// the slug.
+fn slugify(s) -> i64 {
+    let n = len(s);
+    let cap = n + 8;
+    let out = scratch_alloc(cap + 9);
+    mem_store(out, cap);
+    let pos = 8;
+    let last_us = 1;   // suppress a leading '_'
+    let i = 0;
+    while i < n {
+        let c = mem_load8(s + 8 + i);
+        let ok = 0;
+        if c >= 65 && c <= 90 { ok = 1 }
+        if c >= 97 && c <= 122 { ok = 1 }
+        if c >= 48 && c <= 57 { ok = 1 }
+        if c == 95 { ok = 1 }
+        if ok == 1 {
+            mem_store8(out + pos, c);
+            pos = pos + 1;
+            last_us = 0;
+        } else {
+            if last_us == 0 {
+                mem_store8(out + pos, 95);
+                pos = pos + 1;
+                last_us = 1;
+            }
+        }
+        i = i + 1;
+    }
+    // trim a trailing '_'
+    if last_us == 1 && pos > 8 { pos = pos - 1 }
+    mem_store(out, pos - 8);
+    mem_store8(out + pos, 0);
+    return out;
+}
+
+fn build_test_path(domain, category, module) -> i64 {
+    // Base = TEST_STAGE_DIR + "/std_". NEVER test_suites/codes -- see
+    // SYNTH_OUT_ROOT. The old "test_suites/codes/std_" base wrote generated
+    // tests straight into the tracked test tree.
+    let sub = "/std_";
+    let suffix = "_const_test.quanta";
+
+    // Calculate total length
+    let len = len(TEST_STAGE_DIR) + len(sub) + len(domain) + 1 + len(category) + 1 + len(module) + len(suffix);
+
+    // Allocate Quanta string (8 bytes header + data + null)
+    let path = scratch_alloc(len + 9);
+    mem_store(path, len);
+    let pos = 8;
+
+    // Copy staging base
+    let i = 0;
+    while i < len(TEST_STAGE_DIR) {
+        mem_store8(path + pos, mem_load8(TEST_STAGE_DIR + 8 + i));
+        pos = pos + 1;
+        i = i + 1;
+    }
+    i = 0;
+    while i < len(sub) {
+        mem_store8(path + pos, mem_load8(sub + 8 + i));
+        pos = pos + 1;
+        i = i + 1;
+    }
+
+    // Copy domain
+    i = 0;
+    while i < len(domain) {
+        mem_store8(path + pos, mem_load8(domain + 8 + i));
+        pos = pos + 1;
+        i = i + 1;
+    }
+    mem_store8(path + pos, 95); pos = pos + 1;  // '_'
+    
+    // Copy category
+    i = 0;
+    while i < len(category) {
+        mem_store8(path + pos, mem_load8(category + 8 + i));
+        pos = pos + 1;
+        i = i + 1;
+    }
+    mem_store8(path + pos, 95); pos = pos + 1;  // '_'
+    
+    // Copy module
+    i = 0;
+    while i < len(module) {
+        mem_store8(path + pos, mem_load8(module + 8 + i));
+        pos = pos + 1;
+        i = i + 1;
+    }
+    
+    // Copy suffix
+    i = 0;
+    while i < len(suffix) {
+        mem_store8(path + pos, mem_load8(suffix + 8 + i));
+        pos = pos + 1;
+        i = i + 1;
+    }
+    mem_store8(path + pos, 0);
+    
+    return path;
+}
+
+fn generate_const_test(domain, category, module) -> i64 {
+    // All slug/path buffers for this call come from the per-call scratch arena.
+    scratch_reset();
+    // The PATH and the emitted `import` must use the slug; the header comment
+    // keeps the display title so the file still reads correctly.
+    let dslug = slugify(domain);
+    let cslug = slugify(category);
+    let mslug = slugify(module);
+    if dslug == 0 || cslug == 0 || mslug == 0 { return 0; }
+    let path = build_test_path(dslug, cslug, mslug);
+    if path == 0 { return 0; }
+    
+    // build_test_path returns a QUANTA string (8-byte length header + NUL-terminated
+    // chars). file_open() takes a raw C path, so pass `path + 8`: without the
+    // offset the kernel read the length byte as the filename (a 73-char path
+    // created a file named "I") -- the source of the stray one-character files.
+    let fd = file_open(path + 8, 577, 420);
+    if fd < 0 { return 0; }
+    
+    // Write header (DISPLAY titles -- this is prose, spaces are fine here)
+    file_write(fd, "// Auto-generated const test for std_", 37);
+    file_write(fd, domain + 8, len(domain));
+    file_write(fd, "_", 1);
+    file_write(fd, category + 8, len(category));
+    file_write(fd, "_", 1);
+    file_write(fd, module + 8, len(module));
+    // The import is CODE, so it takes the slug. A display title here truncated
+    // the import at the first space and handed the rest to the compiler as an
+    // output path -- the source of the stray root files.
+    // "\nimport std/" is 12 bytes; the old 11 dropped the final '/' and emitted
+    // "import std<domain>...", which is not a valid import.
+    file_write(fd, "\nimport std/", 12);
+    file_write(fd, dslug + 8, len(dslug));
+    file_write(fd, "_", 1);
+    file_write(fd, cslug + 8, len(cslug));
+    file_write(fd, "_", 1);
+    file_write(fd, mslug + 8, len(mslug));
+    file_write(fd, "\nfn main() {\n    return 0\n}\n", 30);
+    
+    file_close(fd);
+    return 1;
+}
+
+// Generate tests from gap_specs.json
+fn generate_all(specs_path) -> i64 {
+    prints("Generating tests from gap_specs.json\n");
+    
+    let fd = file_open("gap_specs.json", 0);
+    if fd < 0 { return 0; }
+    // Size the read buffer from the FILE, not a flat 16 MB constant: the old
+    // mmap(2097152) + file_read(..., 16777216) asked the kernel to write ~14 MB
+    // past a 2 MB mapping (gap_specs.json is 2,290,042 B), which is memory
+    // corruption -- the same defect the code_synthesizer repair fixed.
+    let fsz = file_size(fd);
+    let buf = mmap(fsz + 16);
+    let n = file_read(fd, buf + 8, fsz);
+    file_close(fd);
+    if n <= 0 { return 0; }
+    if n > fsz { n = fsz; }
+    mem_store(buf, n);
+
+    // Staging dirs (see SYNTH_OUT_ROOT). Generated tests never go into a tracked
+    // tree.
+    mkdir(SYNTH_OUT_ROOT, 493);
+    mkdir(TEST_STAGE_DIR, 493);
+    
+    let parsed = json_parse(buf);
+    if parsed < 0 { return 0; }
+    
+    let typ = json_get_type(parsed);
+    if typ != 5 { return 0; }  // JSON_OBJECT = 5
+    
+    let obj = json_get_object(parsed);
+    let specs = json_object_get(obj, "specs");
+    if specs == 0 { return 0; }
+    let specs_typ = json_get_type(specs);
+    if specs_typ != 4 { return 0; }  // JSON_ARRAY = 4
+    
+    let arr = json_get_array(specs);
+    let count = json_array_len(arr);
+    
+    let i = 0;
+    let generated = 0;
+    while i < count {
+        let spec_val = json_array_get(arr, i);
+        if spec_val != 0 {
+            let spec_obj = json_get_object(spec_val);
+            if spec_obj != 0 {
+                let domain_val = json_object_get(spec_obj, "domain");
+                let category_val = json_object_get(spec_obj, "category");
+                let module_val = json_object_get(spec_obj, "module");
+                
+                // json_get_string returns the Quanta string pointer (8-byte len header + data)
+                let domain = json_get_string(domain_val);
+                let category = json_get_string(category_val);
+                let module = json_get_string(module_val);
+                
+                // Check that we got valid pointers (non-zero)
+                if domain != 0 && category != 0 && module != 0 {
+                    let result = generate_const_test(domain, category, module);
+                    if result != 0 { generated = generated + 1; }
+                }
+            }
+        }
+        i = i + 1;
+    }
+    
+    prints("Generated "); printi(generated); prints(" const test files\n");
+    return generated;
+}
+
+fn init() -> i64 {
+    return 0;
+}
+
+fn main() -> i64 {
+    prints("Test generator: generating const tests from gap_specs.json\n");
+    let count = generate_all("gap_specs.json");
+    return 0;
+}

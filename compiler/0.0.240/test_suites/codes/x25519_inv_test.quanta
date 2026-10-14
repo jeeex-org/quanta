@@ -1,0 +1,40 @@
+// x25519_inv_test.quanta — test fe_inv in isolation
+
+import std/x25519
+
+fn main() {
+  println("Testing fe_inv...")
+  
+  let a = mem_alloc(5*8)
+  fe_zero(a)
+  mem_store(a, 2)
+  
+  let inv = mem_alloc(5*8)
+  fe_inv(a, inv)
+  
+  println("inv(2) computed")
+  
+  // Verify: 2 * inv(2) = 1
+  let prod = mem_alloc(5*8)
+  fe_mul(a, inv, prod)
+  
+  let one = mem_alloc(5*8)
+  fe_one(one)
+  
+  let i = 0
+  let ok = 1
+  while i < 5 {
+    if mem_load(prod + i*8) != mem_load(one + i*8) { ok = 0 }
+    i = i + 1
+  }
+  
+  if ok == 1 {
+    println("fe_inv PASS")
+    println(0)
+    exit(0)
+  } else {
+    println("fe_inv FAIL")
+    println(1)
+    exit(1)
+  }
+}

@@ -1,0 +1,43 @@
+// AES-GCM test using NIST SP 800-38D test vector 1 only (minimal)
+// Uses extern declarations for stdlib functions, not imports
+
+extern "C" fn aes128_gcm_enc(key: i64, iv: i64, iv_len: i64, aad: i64, aad_len: i64, pt: i64, pt_len: i64, ct: i64, tag: i64): i64;
+extern fn malloc(size: u64) -> u64;
+
+fn main() {
+  // NIST AES-GCM test vector 1: empty plaintext, empty AAD
+  // Key: 00000000000000000000000000000000
+  // IV:  000000000000000000000000
+  // PT:  (empty)
+  // AAD: (empty)
+  // CT:  (empty)
+  // Tag: 530f8afbc74536b9a963b4f1c4cb738b
+  
+  let key = malloc(16)
+  let i = 0
+  while i < 16 { mem_store8(key + i, 0); i = i + 1 }
+  
+  let iv = malloc(12)
+  i = 0
+  while i < 12 { mem_store8(iv + i, 0); i = i + 1 }
+  
+  let aad = malloc(1)
+  let aad_len = 0
+  let pt = malloc(1)
+  let pt_len = 0
+  
+  let ct = malloc(16)
+  let tag = malloc(16)
+  
+  let enc_res = aes128_gcm_enc(key, iv, 12, aad, aad_len, pt, pt_len, ct, tag)
+  
+  // Verify tag: 530f8afbc74536b9a963b4f1c4cb738b
+  let expected_tag = [0x53,0x0f,0x8a,0xfb,0xc7,0x45,0x36,0xb9,0xa9,0x63,0xb4,0xf1,0xc4,0xcb,0x73,0x8b]
+  i = 0
+  while i < 16 {
+    if mem_load8(tag + i) != expected_tag[i] { exit(i + 100) }
+    i = i + 1
+  }
+  
+  exit(0)
+}
