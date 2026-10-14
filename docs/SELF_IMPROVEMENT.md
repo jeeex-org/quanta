@@ -103,6 +103,15 @@ implemented features** — measured against the tree:
 The pipeline below is specified but not built. Treat it as a target, not a
 description of current behaviour.
 
+The three `scripts/si_*.sh` rows above are now **tracked** (`!/scripts/si_*.sh` in
+`.gitignore`, no inline comment there). `/scripts/*` had hidden them, so the SI
+shell tooling and its retargeting lived only in the working tree. They carry a
+safety property that must survive a model switch: `si_generate.sh` / `si_pipeline.sh`
+/ `si_continuous.sh` stage generated stubs to `synth_out/` and never into `lib/std`
+or `test_suites/codes`, which the generator used to rewrite (9,026 files) on every
+run. That is why they are versioned rather than left untracked -- an untracked
+guardrail is one the next session will not find.
+
 ## Continuous iteration loop (from SI_CONTINUOUS.md)
 
 ### Gap-spec status values
