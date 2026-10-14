@@ -442,6 +442,99 @@ which is the `std/vec` defect class (`vec_push` silently dropped pushes past cap
   is already in place. The entry exists so the next reader does not re-raise a closed report
   — the same reason A3 and A5 carry a status line instead of a fix.
 
+### A9 · FIXED here (lib/std) · the native engine dies after ONE threaded forward, with rc=0
+
+```quanta
+// stage1/par_test.quanta, ulimit -c 0 -v 4194304
+//   marker 111 written BEFORE fc_forward_token(35808, 0), marker 222 AFTER
+//   -> rc=0, before=ok, after=ABSENT, no stdout
+```
+
+`mm_set_workers(20)` then one forward; the process disappears inside the forward and
+is reported as **exited 0**. This is why every parallel benchmark in `stage1/bin/`
+(`native_bench2/3/5`) exited rc=0 in 8-12 s having printed nothing: each ran one
+forward and died.
+
+**ROOT CAUSE (measured, not inferred).** `mm_matvec_par` / `mm_embed_logits_par`
+spawned `nworkers` threads **per matvec call** with `thread_create`, which mmaps a
+fresh **1 MiB** child stack (+ a page-rounded 24-byte join slot) per call, and
+`thread_join` never unmaps either. `strace -f -e trace=mmap,clone,exit` over **one**
+30-layer forward at 20 workers:
+
+* `grep -c ' clone(' -> ` **2329 `clone()` calls** = **~2.33 GB of address space
+  leaked per forward** (plus a `mm_scratch_new` cell per worker per matvec).
+* The dying run ends:
+
+  ```
+  2219451 mmap(NULL, 1048576, PROT_READ|PROT_WRITE, MAP_PRIVATE|MAP_ANONYMOUS, -1, 0) = -1 ENOMEM
+  2219451 exit(1)     = ?
+  2219451 +++ exited with 0 +++
+  ```
+
+The `exit(1)` is `thread_create`'s child-stack MAP_FAILED guard
+(`emitter.quanta`, `mov edi,1; mov eax,60; syscall`) running **on the main thread**.
+It is `exit(60)`, not `exit_group(231)`, so the group's worker threads survive it,
+exit 0, and the process status comes out **0** — the silent death. The after-marker is
+never written because the main thread is gone.
+
+The cap decides when: at `-v 4194304` (1.67 GB model + heap) one forward exhausts the
+space; at `-v 8000000` forward 1 completes and forward **2** dies. Reproduced with
+`tests/threaded_forward_twice.quanta` (pre-fix: 4 GB -> both markers missing; 8 GB ->
+marker 1 present, marker 2 missing, rc=0; fixed -> rc=7, both markers, 4 GB and 8 GB).
+
+**REJECTED:** a swallowed trap (strace shows no signal, only the explicit `exit(1)`);
+a missing `fc_kv_init` in the threaded path (`par_test` calls it, and the serial path
+works with the same sequence — the threaded path's broken premise is **memory**, not
+initialisation); worker corruption (pooled output is element-wise identical to the
+serial block path, 0 mismatches at 2/4/8/20 workers); too many workers for the cores
+(20 workers on 20 cores is fine once memory suffices).
+
+**FIX (`lib/std/lfm2_mm.quanta` + `lib/std/lfm2_forward.quanta`):** a persistent worker
+pool. Workers are spawned **once** and fed jobs by a generation counter
+(`fence()` -> `atomic_store(pl_gen) -> futex_wake`; each worker stamps `done[t] = gen`;
+`done[t]` is written by exactly one worker, so nothing races). Scratch is allocated
+once per worker. `mm_pool_begin`/`mm_pool_end` nest by depth and
+`fc_forward_token_ex` brackets one forward, so no live worker is ever left at process
+exit (the runtime's end-of-main is `exit(60)`: a live worker **hangs** the process —
+measured, `stage1/hang_probe.quanta` rc=124). Clones per forward: **2329 -> 20**.
+
+**VERIFIED.** `par_test` under the recorded cap now gives `rc=0, before=ok, after=ok,
+r=0`; RSS 369 MB -> 116-154 MB. Real decode, same prompt, `-v 8000000`, load ~11/20:
+
+| workers | 1 | 2 | 4 | 8 | 20 |
+|---|---|---|---|---|---|
+| s/token | 70.5 | 41.8 | 24.5 | **16.7** | 12.8 |
+| tok/s | 0.014 | 0.024 | 0.041 | 0.060 | 0.078 |
+| x serial | 1.00 | 1.69 | 2.88 | 4.23 | 5.50 |
+
+`argmax=5922` at every worker count (equals the serial reference). Serial 70.5 s/token
+matches the plan's 69.4; **the plan's 25.8 s/token @8 workers is BEATEN (16.7 measured)**.
+8 -> 20 workers buys only 1.3x on 2.5x the threads — bandwidth-bound, as the plan
+predicts; the remaining lever is SIMD/blocked dot products, not worker count.
+
+**GATE.** New row `test_suites/codes/lfm2_threaded_pool_test.quanta` (EXPECTED.tsv ->
+**7**, model in SKIP_IF_MISSING): 150 jobs at 20 workers under one held pool plus 4 jobs
+each at 8/4/2, element-wise vs the serial block reference. **RED on the pre-fix tree**
+(`call to undeclared function: mm_pool_begin` / `mm_pool_end`, compiler rc=7, no binary),
+**GREEN post-fix (rc=7 in 3.78 s)**. It is a real leak guard: regressed to per-call
+threads the loop leaks 3 GB and the row TIMEOUTS (rc=124). Completion is rc=7 and not 0
+on purpose — this defect's failure mode also reports 0, so a rc=0 row would pass while
+dying (rule #16). The literal "two threaded forwards" repro is
+`tests/threaded_forward_twice.quanta` + `tests/run_threaded_forward_twice.sh` (tests/,
+not EXPECTED.tsv: it needs the model, takes ~26 s > the 15 s gate cap, and rc alone
+cannot detect the death so it asserts marker files).
+
+**NOT FIXED (follow-up):** `thread_create` still never unmaps its 1 MiB stack, so each
+pool leaks `nworkers` stacks — ~20 MB per forward as bracketed (was ~2.33 GB), or
+20 MB per process if a caller holds the pool across its loop. The complete fix is in the
+emitter (`thread_join` munmapping the child stack and slot, which needs the stack base
+recorded in the join slot) and belongs to the compiler work unit, whose `0.0.237` tree
+was in flight. Also unfixed: `fc_attn_workers`' parallel attention body still spawns
+per-call threads (never enabled, so unexercised); bare `mm_matvec_par` callers outside a
+bracket get a pool per call. A timed `futex_wait` was tried in the driver and reverted —
+it made argmax diverge (5922 -> 35808/8696, varying) while the untimed wait is stable.
+Full trail: `docs/research/threaded-forward-defect.md`.
+
 ---
 
 ## Severity B — accuracy (0.0.235)

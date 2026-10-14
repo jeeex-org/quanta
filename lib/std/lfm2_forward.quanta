@@ -1137,7 +1137,7 @@ let fc_ffn_f_up = 0
 // pure waste: a 46-token prompt was doing 46 full-vocab projections instead of
 // one, which is why a templated prefill could not finish inside a 870 s cap.
 // Decode must pass 1; prefill passes 0 except on the final token.
-fn fc_forward_token_ex(tok: i64, pos: i64, want_logits: i64) -> i64 {
+fn fc_forward_token_body(tok: i64, pos: i64, want_logits: i64) -> i64 {
     if fc_fw_init() != 0 { return -1 }
     let dm = fc_d_model
     let emb = lfm2_token_embd()
@@ -1181,10 +1181,24 @@ fn fc_forward_token_ex(tok: i64, pos: i64, want_logits: i64) -> i64 {
     return 0
 }
 
+// One token's forward, with the parallel worker pool held for the call.
+//
+// The pool is bracketed here so a caller gets the amortisation automatically
+// and the pool is torn down before this returns: the runtime ends main with
+// exit(60), not exit_group(231), so a worker thread left alive WOULD hang the
+// process. A generation loop that wants the stacks paid once per process wraps
+// its loop in mm_pool_begin()/mm_pool_end() -- begin/end nest by depth, so the
+// bracket here then costs nothing.
+fn fc_forward_token_ex(tok: i64, pos: i64, want_logits: i64) -> i64 {
+    mm_pool_begin()
+    let r = fc_forward_token_body(tok, pos, want_logits)
+    mm_pool_end()
+    return r
+}
+
 fn fc_forward_token(tok: i64, pos: i64) -> i64 {
     return fc_forward_token_ex(tok, pos, 1)
 }
-
 // Argmax over the first `n` logits. Returns the winning index.
 fn fc_argmax(n: i64) -> i64 {
     let best = 0

@@ -218,6 +218,13 @@ fn pm_worker(t: i64) -> i64 {
 
 // mm_matvec_par(idx, x, rows, cols, y, nworkers) -> 0 on success.
 // One output element per row, exactly as the serial path.
+//
+// WORKER POOL, NOT PER-CALL THREADS (see the pool section below for why):
+// thread_create() maps a fresh 1 MB child stack per call and thread_join()
+// never unmaps it, so one thread per worker per matvec leaked ~1 MB per worker
+// per matvec -- measured 2329 clone() calls inside ONE 30-layer forward, i.e.
+// ~2.3 GB of address space. The pool spawns the workers ONCE and feeds them
+// jobs, so a forward costs one set of stacks instead of thousands.
 fn mm_matvec_par(idx: u64, x: u64, rows: i64, cols: i64, y: u64, nworkers: i64) {
     if gguf_dtype_supported(gguf_tensor_dtype(idx)) == 0 { return -1 }
     if rows <= 0 || cols <= 0 { return -1 }
@@ -225,29 +232,25 @@ fn mm_matvec_par(idx: u64, x: u64, rows: i64, cols: i64, y: u64, nworkers: i64) 
     let per = rows / nworkers
     if per < 1 { return mm_matvec_blk(idx, x, rows, cols, y) }
 
-    pm_idx = idx
-    pm_x = x
-    pm_rows = rows
-    pm_cols = cols
-    pm_y = y
-    pm_nworkers = nworkers
-
     // zero y so a worker that fails leaves a detectable value rather than
     // whatever was there before
     let r = 0
     while r < rows { mem_store(y + r * 8, 0.0); r = r + 1 }
 
-    let slots = mem_alloc(nworkers * 8)
-    let t = 0
-    while t < nworkers {
-        mem_store(slots + t * 8, thread_create(pm_worker, t))
-        t = t + 1
-    }
-    t = 0
-    while t < nworkers {
-        thread_join(mem_load(slots + t * 8))
-        t = t + 1
-    }
+    pl_kind = 0
+    pl_idx = idx
+    pl_x = x
+    pl_rows = rows
+    pl_cols = cols
+    pl_y = y
+    pl_nw = nworkers
+    pl_active = nworkers
+    // pl_cols MUST be set before mm_pool_ensure(): a worker allocates its
+    // scratch cell from it at spawn time (mm_scratch_new(pl_cell_cols)).
+    pl_cell_cols = cols
+    if mm_pool_ensure(nworkers, cols) != 0 { return -1 }
+    if pl_submit() != 0 { pl_kill(); return -1 }
+    if pl_depth == 0 { mm_pool_end() }
     return 0
 }
 
@@ -375,26 +378,21 @@ fn mm_embed_logits_par(idx: u64, x: u64, v0: i64, vcount: i64, ncols: i64, y: u6
     let v = 0
     while v < vcount { mem_store(y + v * 8, 0.0); v = v + 1 }
 
-    // global params for the worker function (module-level, filled before thread_create)
-    pem_idx = idx
-    pem_x = x
-    pem_v0 = v0
-    pem_vcount = vcount
-    pem_ncols = ncols
-    pem_y = y
-    pem_nworkers = nworkers
-
-    let slots = mem_alloc(nworkers * 8)
-    let t = 0
-    while t < nworkers {
-        mem_store(slots + t * 8, thread_create(pem_worker, t))
-        t = t + 1
-    }
-    t = 0
-    while t < nworkers {
-        thread_join(mem_load(slots + t * 8))
-        t = t + 1
-    }
+    // job descriptor for the shared pool worker (module-level; the driver fills
+    // it BEFORE the generation bump, and the fence in pl_submit orders the two)
+    pl_kind = 1
+    pl_idx = idx
+    pl_x = x
+    pl_v0 = v0
+    pl_vcount = vcount
+    pl_ncols = ncols
+    pl_y = y
+    pl_nw = nworkers
+    pl_active = nworkers
+    pl_cell_cols = ncols
+    if mm_pool_ensure(nworkers, ncols) != 0 { return -1 }
+    if pl_submit() != 0 { pl_kill(); return -1 }
+    if pl_depth == 0 { mm_pool_end() }
     return 0
 }
 
@@ -563,4 +561,244 @@ fn mm_dot4(a: u64, b: u64, n: i64) -> f64 {
         c = c + 1
     }
     return t
+}
+
+// ===========================================================================
+// PERSISTENT WORKER POOL for the row-parallel matvecs
+// ===========================================================================
+//
+// WHY THIS EXISTS (measured, not assumed)
+// --------------------------------------
+// The per-call design -- thread_create() nworkers times, then thread_join() --
+// is CORRECT but leaks address space: thread_create() mmaps a fresh 1 MB child
+// stack (plus a 24-byte, page-rounded join slot) per call and thread_join()
+// never unmaps either. `strace -f -e trace=mmap,clone` over ONE 30-layer
+// forward at 20 workers counted **2329 clone() calls** = ~2.3 GB of address
+// space leaked per forward, and 20 worker scratch cells per matvec on top.
+// Under a 4 GB address-space cap (1.67 GB model + heap) the leak exhausts the
+// space mid-forward; the NEXT thread_create's 1 MB mmap returns ENOMEM, and the
+// emitter's MAP_FAILED guard runs `mov edi,1; mov eax,60; syscall` -- exit(1)
+// ON THE MAIN THREAD -- so the forward dies before the caller's next statement,
+// silently: the process is reported as exited 0 (the worker threads of the
+// group keep running and the group's final status comes out 0). That is the
+// "dies after exactly one threaded forward, rc=0" defect.
+//
+// THE FIX: spawn the workers ONCE and feed them jobs. A forward then costs one
+// set of stacks (nworkers) instead of 2329, and each worker allocates its
+// scratch cell once instead of per matvec.
+//
+// PROTOCOL -- one job in flight; the driver (main thread) is the only writer of
+// pl_gen, so no compare-and-swap is needed anywhere:
+//
+//   driver                         worker t
+//   ------                         --------
+//   fill pl_* job globals          loop:
+//   fence()                          if *stop: exit loop
+//   *gen = gen+1  (atomic_store)     g = *gen (atomic_load)
+//   futex_wake(*gen)                 if g == last: futex_wait(*gen, last)
+//   for each t:                      else: run its static slice;
+//     wait done[t] == gen                  atomic_store(done[t], g); wake;
+//                                          last = g
+//
+// done[t] is written by worker t ONLY and read by the driver, so there is no
+// shared counter to race on. The driver sleeps in futex_wait (it does not spin,
+// so it does not steal a core from the workers). futex_wait re-reads the word
+// inside the kernel, so a wake that lands between the driver's load and a
+// worker's wait is never lost.
+//
+// LIFETIME. `mm_pool_begin()` / `mm_pool_end()` nest by depth. The forward
+// brackets one forward with them, so a caller that forgets anything still tears
+// the pool down at the end of every forward and never hangs at process exit
+// (the runtime ends main with exit(60), NOT exit_group(231), so a surviving
+// worker thread WOULD hang the process). A generation loop can hold the pool
+// across many forwards by calling mm_pool_begin() before the loop and
+// mm_pool_end() after it -- then the stacks are paid once per process.
+let pl_genp = 0          // ptr: job generation (driver writes, workers read)
+let pl_stopp = 0         // ptr: 1 = tear the pool down
+let pl_donep = 0         // ptr: nworkers completion stamps (done[t] = gen)
+let pl_slots = 0         // ptr: nworkers join slots from thread_create
+let pl_size = 0          // workers currently alive (0 = no pool)
+let pl_depth = 0         // begin/end nesting depth
+let pl_cell_cols = 0     // cols the live workers' scratch cells were sized for
+let pl_kind = 0          // 0 = matvec rows, 1 = embedding logits
+let pl_idx = 0
+let pl_x = 0
+let pl_rows = 0
+let pl_cols = 0
+let pl_y = 0
+let pl_v0 = 0
+let pl_vcount = 0
+let pl_ncols = 0
+let pl_nw = 0            // active worker count for the current job
+let pl_active = 0
+
+// Static row slice, BYTE-IDENTICAL arithmetic to the old pm_worker: same reads
+// (mm_load_row_s), same summation order (mm_dot4_s), same partition rule (the
+// last worker absorbs the remainder).
+fn pl_run_rows(t: i64, cell) {
+    let per = pl_rows / pl_nw
+    let lo = t * per
+    let hi = lo + per
+    if t == pl_nw - 1 { hi = pl_rows }
+    if hi > pl_rows { hi = pl_rows }
+    let r = lo
+    while r < hi {
+        if mm_load_row_s(pl_idx, r, pl_cols, cell) != 0 { return -1 }
+        mem_store(pl_y + r * 8, mm_dot4_s(mem_load(cell + 8), pl_x, pl_cols, mem_load(cell + 16)))
+        r = r + 1
+    }
+    return hi - lo
+}
+
+// Static slice of [v0, v0+vcount), byte-identical to the old pem_worker.
+fn pl_run_embed(t: i64, cell) {
+    let per = pl_vcount / pl_nw
+    let lo = t * per
+    let hi = lo + per
+    if t == pl_nw - 1 { hi = pl_vcount }
+    if hi > pl_vcount { hi = pl_vcount }
+    let v = lo
+    while v < hi {
+        if mm_load_row_s(pl_idx, pl_v0 + v, pl_ncols, cell) != 0 { return -1 }
+        let acc: f64 = 0.0
+        let c = 0
+        while c < pl_ncols {
+            acc = acc + f64of(mem_load(mem_load(cell + 8) + c * 8)) * f64of(mem_load(pl_x + c * 8))
+            c = c + 1
+        }
+        mem_store(pl_y + (pl_v0 + v) * 8, acc)
+        v = v + 1
+    }
+    return hi - lo
+}
+
+fn pl_run(t: i64, cell) {
+    if pl_kind == 1 { return pl_run_embed(t, cell) }
+    return pl_run_rows(t, cell)
+}
+
+// One pool worker. Scratch is allocated ONCE here and reused for every job.
+// The worker function name is resolved at compile time by thread_create, and
+// the child trampoline hands it `t` off the child's OWN stack, so nothing here
+// depends on the creating frame surviving.
+fn pl_worker(t: i64) -> i64 {
+    let cell = mm_scratch_new(pl_cell_cols)
+    let last = 0
+    let go = 1
+    while go == 1 {
+        if atomic_load(pl_stopp) != 0 {
+            go = 0
+        } else {
+            let g = atomic_load(pl_genp)
+            if g != last {
+                lfence()
+                if t < pl_active { pl_run(t, cell) }
+                atomic_store(pl_donep + t * 8, g)
+                futex_wake(pl_donep + t * 8, 1)
+                last = g
+            } else {
+                // re-checked inside the kernel: a generation bump that lands
+                // between the load above and this call returns EAGAIN at once
+                futex_wait(pl_genp, last)
+            }
+        }
+    }
+    return 0
+}
+
+// Keep the pool alive across nested begin/end pairs (used by the forward).
+fn mm_pool_begin() {
+    pl_depth = pl_depth + 1
+    return 0
+}
+
+// Publish the next job generation and wait for every worker to finish it.
+//
+// The wait first re-checks worker liveness: thread_join() itself reads slot[0]
+// as "0 = the thread has exited", and the kernel owns that word
+// (CLONE_PARENT_SETTID writes the tid, exit clears it), so a zero while a job
+// is in flight means that worker is gone -- it died spawning its scratch (an
+// allocation failure) rather than stamping done[t]. Returning -1 then beats
+// blocking forever on a stamp that can never arrive.
+//
+// A TIMED wait was tried here and REVERTED: a raw
+// `syscall(202, uaddr, FUTEX_WAIT, val, &timespec, 0, 0)` made the token stream
+// diverge (argmax 5922 -> 35808 / 8696, varying run to run) where the untimed
+// wait below is stable at 5922 on the same binary. It corrupted the driver, so
+// it is not used. Residual exposure, stated rather than hidden: a worker that
+// dies AFTER this check (a trap inside its slice) still blocks the driver. The
+// slice itself allocates nothing, so that needs a trap -- which would kill the
+// serial path loudly too.
+fn pl_submit() -> i64 {
+    fence()
+    let g = atomic_load(pl_genp) + 1
+    atomic_store(pl_genp, g)
+    futex_wake(pl_genp, pl_size)
+    let t = 0
+    while t < pl_size {
+        let d = 1
+        while d != 0 {
+            if mem_load(mem_load(pl_slots + t * 8)) == 0 { return -1 }
+            d = atomic_load(pl_donep + t * 8)
+            if d == g { d = 0 } else { futex_wait(pl_donep + t * 8, d) }
+        }
+        t = t + 1
+    }
+    return 0
+}
+
+// Tear the pool down unconditionally: tell the workers to leave, wake them,
+// join them. Safe to call with no pool (pl_size == 0).
+fn pl_kill() {
+    if pl_size <= 0 { return 0 }
+    atomic_store(pl_stopp, 1)
+    fence()
+    let g = atomic_load(pl_genp) + 1
+    atomic_store(pl_genp, g)
+    futex_wake(pl_genp, pl_size)
+    let t = 0
+    while t < pl_size {
+        thread_join(mem_load(pl_slots + t * 8))
+        t = t + 1
+    }
+    pl_size = 0
+    return 0
+}
+
+// Leave one begin/end bracket. The pool is torn down when the OUTERMOST bracket
+// closes, so a caller holding the pool across a whole generation loop keeps it
+// and still leaves nothing alive at process exit.
+fn mm_pool_end() {
+    if pl_depth > 0 { pl_depth = pl_depth - 1 }
+    if pl_depth > 0 { return 0 }
+    return pl_kill()
+}
+
+// Ensure a pool of exactly `n` workers whose scratch cells can hold `maxcols`.
+// A different size or a wider row rebuilds the pool (tear down, spawn again).
+// The begin/end depth is NOT touched: a rebuild keeps the caller's bracket.
+fn mm_pool_ensure(n: i64, maxcols: i64) {
+    if n <= 0 { return -1 }
+    if pl_size == n && pl_cell_cols >= maxcols { return 0 }
+    pl_kill()
+
+    // fresh protocol cells every time: the workers start with last = 0 and the
+    // generation must start at 0 too, or a reused word would look like a job
+    pl_genp = mem_alloc(8)
+    pl_stopp = mem_alloc(8)
+    pl_donep = mem_alloc(n * 8)
+    pl_slots = mem_alloc(n * 8)
+    atomic_store(pl_genp, 0)
+    atomic_store(pl_stopp, 0)
+    // the workers size their scratch from this at spawn time
+    pl_cell_cols = maxcols
+
+    let t = 0
+    while t < n {
+        atomic_store(pl_donep + t * 8, 0)
+        mem_store(pl_slots + t * 8, thread_create(pl_worker, t))
+        t = t + 1
+    }
+    pl_size = n
+    return 0
 }

@@ -1,0 +1,57 @@
+// tests/threaded_forward_twice.quanta -- red-first repro for defect A9.
+//
+// Two threaded forward passes at 20 workers, asserting the SECOND completes.
+// "Completes" is encoded as rc=7 plus two marker files, because the defect's
+// failure mode is SILENT: the process dies inside a forward and is still
+// reported as exited 0. An rc-only check cannot see it, which is exactly why
+// this lives in tests/ (with a wrapper) and not a bare EXPECTED.tsv row.
+//
+// Pre-fix (lib/std/lfm2_mm.quanta before the worker pool): each matvec spawned
+// nworkers threads and thread_create() leaks a 1 MB stack per thread, so ONE
+// forward consumed ~2.3 GB of address space (2329 clone() calls measured) and
+// the process died before its second forward finished. Post-fix: 20 clones for
+// the whole process, both forwards complete.
+//
+// Run: ./tests/run_threaded_forward_twice.sh   (see that script for the caps)
+import std/gguf
+import std/lfm2_forward
+import std/lfm2_model
+import std/lfm2_mm
+import std/lfm2_bpe
+import std/fs
+
+// Paths are used DIRECTLY as top-level consts: an untyped path parameter loses
+// its string type (defect A7's shape), so no helper takes a path argument here.
+const Q4_PATH = "/opt/ai/models/quanta/QUANTA-LFM2.5-2.6Bv1-Q4_K_M.gguf"
+const W1 = "stage1/logs/tft_forward1.bin"
+const W2 = "stage1/logs/tft_forward2.bin"
+const NW = 20
+
+fn main() {
+    if gguf_load(Q4_PATH) != 0 { return 1 }
+    if fc_read_config() != 0 { return 2 }
+    if bpe_init_from_gguf() == 0 { return 3 }
+    if fc_kv_init(1024) != 0 { return 4 }
+    if fc_fw_init() != 0 { return 5 }
+    if fc_fw_reset() != 0 { return 6 }
+    mm_set_workers(NW)
+    mm_set_embed_workers(NW)
+
+    let b = mem_alloc(8)
+
+    // ---- forward 1 ----
+    if fc_forward_token(35808, 0) != 0 { return 8 }
+    mem_store(b, 1)
+    let fd1 = file_open(W1, 577, 420)
+    if fd1 >= 0 { file_write(fd1, b, 8); file_close(fd1) }
+
+    // ---- forward 2: the one that must complete ----
+    if fc_fw_reset() != 0 { return 9 }
+    if fc_forward_token(35808, 0) != 0 { return 10 }
+    mem_store(b, 2)
+    let fd2 = file_open(W2, 577, 420)
+    if fd2 >= 0 { file_write(fd2, b, 8); file_close(fd2) }
+
+    // 7 = both forwards ran; the wrapper also checks both markers.
+    return 7
+}
