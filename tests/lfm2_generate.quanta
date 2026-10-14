@@ -1,0 +1,214 @@
+// tests/lfm2_generate.quanta -- the native LFM2 generation driver, in the
+// TRACKED tree: prefill -> KV-cached decode -> sample -> print.
+//
+// Why it exists: every piece was present (gguf loader, BPE tokenizer, forward
+// pass, lfm2_chat.chat_build, sampling.sample_full) but no assembled entry
+// point was. stage1/native_gen.quanta was the first one and stage1/ is
+// gitignored, so the SI loop had nothing in the tree to call. This takes
+// `tests/` rather than the gate because it needs the 1.67 GB model and one
+// token costs tens of seconds, i.e. far past the gate's 15 s cap -- the same
+// reason tests/threaded_forward_twice.quanta lives here.
+//
+// THE TWO WIRING TRAPS, both measured:
+//
+//   1. fc_kv_init(NCTX) MUST run before the first forward. It is declared in
+//      lib/std/lfm2_forward.quanta and NOTHING in lib/std calls it; with the KV
+//      base left at 0 the first forward SIGSEGVs. Wire it, do not assume it.
+//
+//   2. The worker pool must be bracketed around the WHOLE generation loop
+//      (mm_pool_begin() ... mm_pool_end()), not left to the per-forward bracket
+//      inside fc_forward_token_ex. thread_create() never unmaps its 1 MB child
+//      stack, so one forward leaks nworkers stacks; a 300-token generation
+//      would leak 300x that and die mid-run with exit status 0 (defect A9).
+//
+// SAMPLING, stated honestly: the DEFAULT is argmax, which is deterministic and
+// is the path the correctness oracle uses. `sample_full` (std/sampling.quanta)
+// is wired and used only when the conf sets a positive temperature, and it has
+// two measured limitations a caller must know: sample_top_k() sorts with an
+// O(n^2) loop and allocates n*8 bytes per call, so it must be left OFF at
+// n_vocab = 128000; and sample_softmax() uses `1 + (v - max)` as its "exp", so
+// it is a crude approximation, not a real softmax.
+//
+// Conf file tests/lfm2_gen.conf: "<workers> <max_new_tokens> <temp_milli> <top_k>"
+// Prompt file tests/lfm2_prompt.txt: the user turn.
+import std/gguf
+import std/lfm2_forward
+import std/lfm2_model
+import std/lfm2_mm
+import std/lfm2_bpe
+import std/lfm2_chat
+import std/sampling
+import std/fs
+
+const Q4_PATH = "/opt/ai/models/quanta/QUANTA-LFM2.5-2.6Bv1-Q4_K_M.gguf"
+const CONF_PATH = "tests/lfm2_gen.conf"
+const PROMPT_PATH = "tests/lfm2_prompt.txt"
+const CAP = 16384
+const NCTX = 2048
+
+let plen = 0
+
+// Read a whole file, by FD, into a fresh buffer; returns 0 on failure.
+//
+// TAKES AN FD, NOT A PATH. An untyped `path` parameter loses its string type
+// (defect A7: the callee receives the wrong pointer), so `fn slurp(path)` then
+// `file_open(path, 0)` returns -1 for a file that plainly exists. This was
+// measured in this driver: with the path indirection the conf AND the prompt
+// both failed to open and the run reported workers=0 and "FAIL read prompt".
+// The observed-good idiom is to hand the top-level `const` STRAIGHT to
+// file_open, which is why the open() happens at the call site below.
+fn slurp(fd) {
+    if fd < 0 { return 0 }
+    let b = mem_alloc(CAP)
+    let got = read_raw(fd, b, CAP)
+    file_close(fd)
+    if got <= 0 { return 0 }
+    plen = got
+    return b
+}
+
+// Parse up to 8 decimal integers out of a conf buffer into `out` (8 i64s).
+// Non-digit characters separate. Returns the count found.
+fn parse_ints(buf, out) {
+    let n = 0
+    let cur = 0
+    let have = 0
+    let i = 0
+    while mem_load8(buf + i) != 0 {
+        let c = mem_load8(buf + i)
+        if c >= 48 && c <= 57 {
+            cur = cur * 10 + (c - 48)
+            have = 1
+        } else {
+            if have == 1 {
+                if n < 8 { mem_store(out + n * 8, cur) }
+                n = n + 1
+                cur = 0
+                have = 0
+            }
+        }
+        i = i + 1
+    }
+    if have == 1 { if n < 8 { mem_store(out + n * 8, cur) }; n = n + 1 }
+    return n
+}
+
+// Wrap raw file bytes in a Quanta STRING: [i64 length][bytes]. chat_build()
+// calls len(user) and then reads user+8+i, so a raw mem_alloc'd buffer handed
+// straight to it makes len() read garbage -- measured: SIGSEGV (rc=139) inside
+// chat_build. bpe_encode() takes an explicit length and is happy with raw bytes,
+// which is why the prompt needs both forms.
+fn as_str(raw, n) {
+    let s = mem_alloc(n + 16)
+    mem_store(s, n)
+    let i = 0
+    while i < n { mem_store8(s + 8 + i, mem_load8(raw + i)); i = i + 1 }
+    mem_store8(s + 8 + n, 0)
+    return s
+}
+
+fn main() {
+    prints("=== native LFM2 generate ===\n")
+    newline()
+
+    // ---- conf ----
+    // file_open gets the const DIRECTLY (never through an untyped parameter).
+    let cfgb = slurp(file_open(CONF_PATH, 0))
+    let conf = mem_alloc(64)
+    let nw = 0
+    let maxnew = 8
+    let tempmilli = 0     // 0 = argmax (deterministic)
+    let topk = 0
+    if cfgb != 0 {
+        if parse_ints(cfgb, conf) >= 4 {
+            nw = mem_load(conf)
+            maxnew = mem_load(conf + 8)
+            tempmilli = mem_load(conf + 16)
+            topk = mem_load(conf + 24)
+        }
+    } else {
+        prints("warn: "); prints(CONF_PATH); prints(" unreadable; using defaults\n")
+    }
+    if maxnew < 1 { maxnew = 1 }
+    if maxnew > 256 { maxnew = 256 }
+    prints("workers="); print(nw); prints(" max_new="); print(maxnew)
+    prints(" temp_milli="); print(tempmilli); prints(" top_k="); print(topk); prints("\n")
+    if topk > 0 { prints("WARN: top_k > 0 is O(n_vocab^2) in std/sampling; expect no tokens.\n") }
+
+    // ---- model ----
+    let t0 = clock()
+    if gguf_load(Q4_PATH) != 0 { prints("FAIL gguf_load\n"); return 1 }
+    if fc_read_config() != 0 { prints("FAIL fc_read_config\n"); return 1 }
+    if bpe_init_from_gguf() == 0 { prints("FAIL bpe_init\n"); return 1 }
+    // TRAP 1: without this the first forward SIGSEGVs.
+    if fc_kv_init(NCTX) != 0 { prints("FAIL fc_kv_init\n"); return 1 }
+    if fc_fw_init() != 0 { prints("FAIL fc_fw_init\n"); return 1 }
+    if fc_fw_reset() != 0 { prints("FAIL fc_fw_reset\n"); return 1 }
+    mm_set_workers(nw)
+    mm_set_embed_workers(nw)
+    prints("load_ms="); print((clock() - t0) / 1000000); prints("\n")
+
+    // ---- prompt ----
+    let rawprompt = slurp(file_open(PROMPT_PATH, 0))
+    if rawprompt == 0 { prints("FAIL read prompt\n"); return 1 }
+    let user = as_str(rawprompt, plen)
+    prints("user_bytes="); print(plen); prints("\n")
+    let pb = mem_alloc(CAP)
+    let pbytes = chat_build(0, user, pb)
+    prints("prompt_bytes="); print(pbytes); prints("\n")
+
+    let ids = mem_alloc(8192 * 8)
+    let n = bpe_encode(pb, pbytes, ids, 8000)
+    prints("prompt_ids="); print(n); prints("\n")
+    if n <= 0 { prints("FAIL encode\n"); return 1 }
+    if n >= NCTX { prints("FAIL prompt longer than context\n"); return 1 }
+
+    // TRAP 2: hold the pool across the whole loop, not per forward.
+    mm_pool_begin()
+
+    // ---- prefill: logits only on the LAST prompt position ----
+    let tp0 = clock()
+    let i = 0
+    while i < n {
+        let want = 0
+        if i == n - 1 { want = 1 }
+        if fc_forward_token_ex(mem_load(ids + i * 8), i, want) != 0 { mm_pool_end(); prints("FAIL prefill\n"); return 1 }
+        i = i + 1
+    }
+    let tp1 = clock()
+    prints("prefill_ms="); print((tp1 - tp0) / 1000000)
+    prints(" prefill_ms_per_tok="); print((tp1 - tp0) / 1000000 / n); prints("\n")
+
+    // ---- decode ----
+    prints("---generated---\n")
+    let outbuf = mem_alloc(4096)
+    let pos = n
+    let k = 0
+    let g0 = clock()
+    while k < maxnew {
+        let id = 0
+        if tempmilli > 0 {
+            id = sample_full(fc_fw_logits, fc_n_vocab, i2f(tempmilli) / 1000.0, topk)
+        } else {
+            id = fc_argmax(fc_n_vocab)
+        }
+        let bl = bpe_decode_token(id, outbuf)
+        if bl > 0 { print(outbuf, bl) }
+        if id == bpe_eos { prints("\n[EOS]\n"); break }
+        k = k + 1
+        if k >= maxnew { break }
+        if fc_forward_token_ex(id, pos, 1) != 0 { prints("FAIL decode\n"); break }
+        pos = pos + 1
+    }
+    let g1 = clock()
+    mm_pool_end()
+    prints("\n---end---\n")
+    prints("new_tokens="); print(k); prints("\n")
+    prints("gen_ms="); print((g1 - g0) / 1000000); prints("\n")
+    if k > 0 { prints("gen_ms_per_token="); print((g1 - g0) / 1000000 / k); prints("\n") }
+    if (g1 - g0) > 0 {
+        prints("decode_tok_per_s_x1000="); print(k * 1000000000000 / (g1 - g0)); prints("\n")
+    }
+    prints("DONE\n")
+    return 0
+}
