@@ -12,13 +12,15 @@
 //     `let test_passed = 1` -- a placeholder -- and run_tests.sh is never invoked.
 //   * it does NOT update any status file; the SI_STATE_FILE / TEST_RUNNER
 //     constants are declared and unused.
-//   * it is NOT "fully autonomous to completion". Its spec input stops at the
-//     std/json array cap: std/vec.vec_new() is a fixed 64-slot vector and
-//     vec_push() silently drops pushes past capacity, so json_array_get /
-//     get_spec_count only ever see the FIRST 64 specs (measured:
-//     json_array_len(gap_specs.json.specs) == 64 of 9,011). code_synthesizer
-//     does not use std/json -- it scans the JSON bytes -- so it generates all
-//     9,011 stubs; the json-based stages above it see 64.
+//   * it is NOT "fully autonomous to completion". (Its spec input USED to stop
+//     at a std/json array cap: std/vec was a fixed 64-slot vector and
+//     vec_push() silently dropped pushes past capacity, so json_array_get /
+//     get_spec_count only ever saw the first 64 specs. std/vec now GROWS, so
+//     the json-based stages see the whole file -- measured
+//     json_array_len(gap_specs.json.specs) == 9011, was 64.) The remaining gap
+//     is the steps named around this note, not the input cap. code_synthesizer
+//     never used std/json -- it scans the JSON bytes -- so it always generated
+//     all 9,011 stubs.
 //
 // The end-to-end half that DOES work (spec -> generate -> compile the generated
 // stub) is therefore proven from the shell, not by this file:

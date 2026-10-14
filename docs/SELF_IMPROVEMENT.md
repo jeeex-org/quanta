@@ -16,7 +16,7 @@ canonical, CI-tracked path is `test_suites/scripts/verify_status.quanta`.)
 
 | metric | value |
 |---|---|
-| gap_specs specs | 9026 |
+| gap_specs specs | 9011 |
 | distinct domains | 97 |
 | distinct categories | 2163 |
 | distinct modules named | **5505** |
@@ -41,14 +41,19 @@ have existed since 0.0.178. Marked done, with paths:
 1. ~~Implement real `spec_parser`~~ — **DONE**: `lib/std/spec_parser.quanta` (187 lines).
 2. ~~Implement real `spec_to_ir`~~ — **DONE**: `lib/std/spec_to_ir.quanta` (193 lines).
 3. ~~Flesh out `test_generator`~~ — **DONE**: `lib/std/test_generator.quanta` (262 lines).
-4. **`std/json` / `std/vec` array cap — the real blocker.** `std/vec.vec_new()`
-   allocates a **fixed 64-slot** vector and `vec_push()` *silently drops* pushes
-   past capacity (`if len < cap`). `std/json` parses arrays with it, so
-   `json_array_len(gap_specs.json.specs)` returns **64**, not 9026 — every
-   json-based SI stage can only ever see the first 64 specs. The earlier note
-   ("mem_alloc size calc / OOM") was wrong; there is no OOM. Fixing this (a
-   growable vector, or driving `json` with `vec_set` + an explicit counter) is the
-   single change that unblocks the json paths.
+4. ~~**`std/json` / `std/vec` array cap — the real blocker.**~~ **FIXED.** `std/vec`
+   was a **fixed 64-slot** vector and `vec_push()` had no else branch, so it
+   *silently dropped* every push past capacity (a SPEC.md §4.2 violation:
+   out-of-contract must fail secure, not corrupt silently). `std/vec` now GROWS
+   (capacity doubles; the handle is stable, so the callers that ignore
+   `vec_push`'s return value — all of them — still see the growth) and growth is
+   fail-closed (`exit(1)` if the new storage cannot be mapped) instead of a silent
+   drop. Measured: `json_array_len(gap_specs.json.specs)` == **9011** (was 64),
+   first/mid/last elements distinct. The json-based SI stages now see the whole
+   file. Remaining cost, not a cap: parsing the full file needs ~0.9 GB of address
+   space (`std/json` maps a page per small value/string and the free list is never
+   consumed), so a stage that consumes all 9,011 specs must run above the runner's
+   1 GiB default — see the `std_test_generator_const_test` note below.
 5. **Implement `std/net/http`** — MISSING. Unblocks flintai-cli + Soup.
 6. **Implement `std/html_parser`** — MISSING. Soup equivalent.
 7. **Implement `std/jsonrpc` + `std/lsp`** — MISSING. Flint LSP.
@@ -56,10 +61,11 @@ have existed since 0.0.178. Marked done, with paths:
 9. **GPU_0.0.001** — start CUDA target selection (parallel track).
 10. **SI codegen loop** — wire the CPU path end to end. What runs today:
     `lib/std/code_synthesizer.quanta` (286 lines) does **not** use `std/json`; it
-    scans `gap_specs.json` byte-by-byte and generates all **9026** module stubs
+    scans `gap_specs.json` byte-by-byte and generates all **9011** module stubs
     into the CWD-relative staging dir `synth_out/` (never a tracked tree — see
     `SYNTH_OUT_ROOT`). The json-based stages (`spec_parser` → `spec_to_ir` →
-    `test_generator` → `si_main`) stop at the 64-spec cap above. `si_main.quanta`
+    `test_generator` → `si_main`) now see all 9,011 specs too — the 64-spec cap
+    item 4 described is fixed. `si_main.quanta`
     claims to "run until all planned specs implemented, compiles generated code,
     runs tests, auto-updates status"; it does none of those yet (see the header
     note in that file).

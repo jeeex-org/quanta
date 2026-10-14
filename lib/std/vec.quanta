@@ -1,33 +1,66 @@
-// std/vec - dynamic array of i64 values, implemented in Quanta over mem_alloc.
-// Layout (header pointer):
-//   [0]  = capacity (number of element slots reserved)
-//   [8]  = length   (number of elements in use)
-//   [16] = element 0
-//   [24] = element 1  ...  element i at [16 + i*8]
+// std/vec - GROWABLE dynamic array of i64 values, implemented in Quanta over
+// mmap (element storage) + mem_alloc (the handle).
+//
+// HANDLE LAYOUT (the value vec_new returns; STABLE for the vector's lifetime):
+//   [0]  = capacity (element slots currently reserved in the storage buffer)
+//   [8]  = length   (elements in use)
+//   [16] = storage  (raw pointer to the element buffer; element i is at
+//                    storage + i*8)
+// vec_len/vec_set_len read/write capacity+8 exactly as before.
+//
+// WHY THE HANDLE IS STABLE: vec_push GREW the vector by allocating a larger
+// storage buffer and copying, but it never moves the handle. Every caller in
+// the tree discards vec_push's return value (std/json, std/spec_parser,
+// std/spec_to_ir, std/proof_record, std/light_mode, std/rag, and the tests),
+// and some push into a vector created by their CALLER (e.g.
+// spec_parser.filter_planned_specs(specs_arr, out_arr) returns only a count),
+// so a realloc-returns-a-new-pointer design could not propagate growth without
+// changing signatures. Indirection keeps all of them correct unchanged:
+// vec_push still returns v (the same handle).
+//
+// GROWTH (added to fix a silent-data-loss defect): the previous vec_new()
+// reserved a FIXED 64 slots and vec_push() had no else branch -- once
+// len == cap every further push was DISCARDED with no growth, no error, no
+// status (SPEC.md 4.2: out-of-contract operations must FAIL SECURE, never
+// corrupt silently). vec_push now doubles the capacity (or takes `need` when
+// larger), copying the live elements to the new storage.
+//
+// FAIL-CLOSED: if the new storage cannot be mapped, or capacity would overflow
+// the byte range, the process aborts with exit(1) -- a push is never silently
+// dropped. (mmap/mem_alloc are themselves fail-closed; the guards here are the
+// explicit contract the allocator's own behaviour already implies.)
+//
 // Import with:  import std/vec
 //
-// USAGE: drive pushes with an explicit caller counter and vec_set (avoids an
-// in-loop struct-field read that trips a latent allocator quirk). Set the length
-// with vec_set_len when done:
-//   let v = vec_new(); let n = 0;
-//   while i < N { vec_set(v, n, val); n = n + 1; i = i + 1 }
-//   vec_set_len(v, n)
-// (A convenience vec_push(v,x) wrapper is provided but the explicit form above is
-// the loop-safe one.)
+// USAGE: vec_push(v, x) appends and grows; vec_put(v, i, val) + vec_set_len(v, n)
+// remain available for callers that drive an explicit counter.
+
+const VEC_INIT_CAP = 64
+// 2^59: cap*8 = 2^62 stays below the i64/pointer range, so the byte count
+// passed to mmap can never wrap. Unreachable by doubling in practice.
+const VEC_MAX_CAP = 576460752303423488
 
 fn vec_new() {
-  let p = mem_alloc(64 + 3)    // 64 element slots + 24-byte header
-  mem_store(p, 64)              // capacity
-  mem_store(p + 8, 0)           // length
-  return p
+  let h = mem_alloc(3)              // [0]=capacity [8]=length [16]=storage
+  if h < 0 { exit(1) }              // fail closed (mem_alloc returns <0 on OOM)
+  let d = mmap(VEC_INIT_CAP * 8)    // raw element storage (no header to clobber)
+  if d < 0 { exit(1) }              // fail closed: mmap returned -errno
+  mem_store(h, VEC_INIT_CAP)        // capacity
+  mem_store(h + 8, 0)               // length
+  mem_store(h + 16, d)              // storage pointer
+  return h
+}
+
+fn vec_storage(v) {
+  return mem_load(v + 16)
 }
 
 fn vec_put(v, i, x) {
-  mem_store(v + 16 + i * 8, x)
+  mem_store(vec_storage(v) + i * 8, x)
 }
 
 fn vec_at(v, i) {
-  return mem_load(v + 16 + i * 8)
+  return mem_load(vec_storage(v) + i * 8)
 }
 
 fn vec_set_len(v, n) {
@@ -38,13 +71,35 @@ fn vec_len(v) {
   return mem_load(v + 8)
 }
 
-// Convenience push (single use; for loops prefer the explicit vec_set + counter form).
+// Ensure the storage can hold at least `need` elements, doubling if required.
+// The handle `v` is not moved; only [16] (storage) and [0] (capacity) change.
+// The old buffer is leaked (same policy as mem_realloc: no reuse yet).
+fn vec_grow(v, need) {
+  let cap = mem_load(v)
+  if need <= cap { return v }
+  let ncap = cap + cap
+  if ncap < need { ncap = need }          // handle a jump larger than doubling
+  if ncap > VEC_MAX_CAP { exit(1) }       // ncap*8 would overflow the pointer range
+  let len = vec_len(v)
+  let old = vec_storage(v)
+  let nd = mmap(ncap * 8)
+  if nd < 0 { exit(1) }                   // fail closed: never drop the push
+  let i = 0
+  while i < len {
+    mem_store(nd + i * 8, mem_load(old + i * 8))
+    i = i + 1
+  }
+  mem_store(v + 16, nd)                   // swap storage; the handle stays put
+  mem_store(v, ncap)                      // update capacity
+  return v
+}
+
+// Append x, growing the storage if the current capacity is exhausted. Never
+// drops the value. Returns v (the unchanged handle).
 fn vec_push(v, x) {
   let len = vec_len(v)
-  let cap = mem_load(v)
-  if len < cap {
-    vec_put(v, len, x)
-    vec_set_len(v, len + 1)
-  }
+  if len >= mem_load(v) { vec_grow(v, len + 1) }
+  vec_put(v, len, x)
+  vec_set_len(v, len + 1)
   return v
 }

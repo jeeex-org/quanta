@@ -119,3 +119,35 @@ removed, the duplicated `std_code_synthesizer_const_test` row deduped. Do not qu
 - Not done, deliberately: promoting `tests/a7_untyped_str_param_defect.quanta` into a gate row alongside
   `codes/f64_call_order_test.quanta`. The A6 row is gated; the A7 (string) half has no gate row yet. Left
   as a follow-up so this promotion did not change the row list under a reviewed gate.
+
+---
+
+## Post-promotion stdlib exception — `std/vec` silent data loss
+
+Per rule #12 stdlib work is deferred to the stdlib stage; per the same reasoning as "The uncovered stdlib
+defect" above, this exception is recorded explicitly rather than silently. It touched `lib/std` (and its
+`compiler/0.0.236/lib/std/` copies) on the already-promoted 0.0.236 tree. **No `src/` byte changed** — the
+fixpoint md5 is still `203e0d772ca38e903ad27c921645d10a`. It is not a stdlib *feature*: it is a data-loss
+defect and the blocker for the json-based SI stages.
+
+- **`lib/std/vec.quanta` — silent data loss.** `vec_new()` handed out a fixed 64-slot buffer and `vec_push()`
+  had **no else branch**: once `len == cap` every push was discarded with no growth, no error, no status.
+  Measured before (100 / 1000 / 10000 pushes): `len` stuck at 64, last element `1000063` — 36 / 936 / 9936
+  pushes lost. This is the opposite of SPEC.md §4.2 (out-of-contract operations must FAIL SECURE, not
+  corrupt silently), and it is why every json-based SI stage saw 64 of gap_specs.json's 9,011 specs.
+  **Fix:** the vector now GROWS — capacity doubles (or takes `need`), the live elements are copied, and the
+  storage sits behind a **stable handle** that `vec_push` returns unchanged, so the callers that ignore the
+  return value (all of them, including `spec_parser.filter_planned_specs`, which pushes into a vec created
+  by its caller) still observe the growth. Growth is **fail-closed**: `exit(1)` if the new storage cannot be
+  mapped or capacity would overflow — never a silent drop. Measured after: `len` == N for 100/1000/10000 with
+  correct first/mid/last; `json_array_len(gap_specs.json.specs)` == **9011** (was 64).
+- **`lib/std/test_generator.quanta` — the growth exposed a per-call `mmap` leak.** Once json could see all
+  9,011 specs, `generate_const_test()`'s four `mem_alloc`s per call (page-rounded, never reused) pushed this
+  module's own gate row `std_test_generator_const_test` over the runner's 1 GiB cap (peak RSS 1,053,556 KB ->
+  rc=1). **Fix:** a per-call scratch arena, reset at the top of each call (no leak, fail-closed on overflow);
+  the row is back to rc=0 at ~0.9 GB and the generated-file manifest is byte-identical.
+- **`lib/std/code_synthesizer.quanta` — `SYNTH_CAP` made real.** The constant was declared and unreferenced;
+  it is now enforced with a printed failure (`exit 1`) past the ceiling, never a silent stop.
+
+Gate after the change (official command): 213/213 pass, 0 fail; STDLIB 108/108 GREEN; every layer GREEN;
+fixpoint md5 unchanged at `203e0d772ca38e903ad27c921645d10a`.
