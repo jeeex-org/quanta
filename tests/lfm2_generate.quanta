@@ -161,10 +161,21 @@ fn main() {
     let pbytes = chat_build(0, user, pb)
     prints("prompt_bytes="); print(pbytes); prints("\n")
 
+    // TRAP 3 (added 0.0.240): the chat template starts with `{{- bos_token -}}`, so
+    // the prompt is BOS + the template text. And the template text contains SPECIAL
+    // tokens (<|im_start|>, <|im_end|> and the thinking tags). bpe_encode() does NO
+    // special-token matching, so those were encoded as ordinary text pieces and the
+    // model was fed a prompt it was never trained on -- measured, the first-token
+    // argmax was EOS (<|im_end|>) and the run produced nothing. bpe_encode_special()
+    // is the special-aware entry point and is what a chat-templated prompt needs.
+    // Verified: this exact construction reproduces llama.cpp's id list for the same
+    // prompt byte-for-byte (23 ids, /tokenize add_special=true).
     let ids = mem_alloc(8192 * 8)
-    let n = bpe_encode(pb, pbytes, ids, 8000)
-    prints("prompt_ids="); print(n); prints("\n")
-    if n <= 0 { prints("FAIL encode\n"); return 1 }
+    mem_store(ids, bpe_bos)
+    let n = bpe_encode_special(pb, pbytes, ids + 8, 8000) + 1
+    prints("prompt_ids="); print(n)
+    prints(" (bos="); print(bpe_bos); prints(")\n")
+    if n <= 1 { prints("FAIL encode\n"); return 1 }
     if n >= NCTX { prints("FAIL prompt longer than context\n"); return 1 }
 
     // TRAP 2: hold the pool across the whole loop, not per forward.
