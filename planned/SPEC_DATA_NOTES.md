@@ -19,16 +19,43 @@ Regenerate + re-apply with `python3 scripts/normalize_specs.py` (idempotent).
 
 ## cross-domain category contamination
 
-335 categories appear in more than one domain; the full map is in `planned/CATEGORY_CONTAMINATION.tsv`.
+334 categories appear in more than one domain; the full map is in `planned/CATEGORY_CONTAMINATION.tsv`.
 
-REMOVED from `domain=programming_language` (they are application content whose natural domains already exist), recorded verbatim:
+REMOVAL RULE -- every category in `PL_FOREIGN_CATEGORIES` (`scripts/normalize_specs.py`) is removed from `domain=programming_language`: it names application/vertical content whose natural domain already exists, not a language or stdlib capability area.
 
-| domain | category | module | status | notes |
-|---|---|---|---|---|
+- `Audio` -- content category under entertainment/electronics; redundant within PL (codecs duplicate Video, Recognition/Synthesis duplicate Speech)
+- `E-Commerce` -- retail vertical (retail/wholesale domains exist)
+- `Education` -- education vertical (education domain exists)
+- `Government` -- public-sector vertical (government domain exists)
+- `Healthcare` -- medical vertical (health/medicine domains exist)
+- `Insurance` -- insurance vertical operations (insurance domain exists)
+- `SCM` -- logistics vertical operations (logistics domain exists; module literally named "Logistics")
 
-(0 specs removed.)
+Specs removed from `domain=programming_language`, recorded verbatim:
 
-KEPT under `programming_language`: Audio, Video, Robotics, DL, Encryption, TLS, Hashing, Key Mgmt, PKI, Protocol, OS, Compiler, VM, Numerical, Serialization, CPU and the rest -- these are stdlib capability areas and several are exercised by gate rows in EXPECTED_STDLIB.tsv (programming_language_dl_*, _tls_*, _encryption_*, ...).
+<!-- removed-verbatim:start -->
+| domain | category | module | status | why foreign | notes |
+|---|---|---|---|---|---|
+| programming_language | Audio | Processing | planned | content category under entertainment/electronics; redundant within PL (codecs duplicate Video, Recognition/Synthesis duplicate Speech) | Filtering |
+| programming_language | Audio | Compression | planned | content category under entertainment/electronics; redundant within PL (codecs duplicate Video, Recognition/Synthesis duplicate Speech) | MP3/AAC |
+| programming_language | Audio | Recognition | planned | content category under entertainment/electronics; redundant within PL (codecs duplicate Video, Recognition/Synthesis duplicate Speech) | Speech-to-text |
+| programming_language | Audio | Synthesis | planned | content category under entertainment/electronics; redundant within PL (codecs duplicate Video, Recognition/Synthesis duplicate Speech) | TTS |
+| programming_language | SCM | Supply Chain | planned | logistics vertical operations (logistics domain exists; module literally named "Logistics") | Logistics |
+| programming_language | SCM | Procurement | planned | logistics vertical operations (logistics domain exists; module literally named "Logistics") | Purchasing |
+| programming_language | SCM | Warehouse | planned | logistics vertical operations (logistics domain exists; module literally named "Logistics") | WMS |
+| programming_language | SCM | Logistics | planned | logistics vertical operations (logistics domain exists; module literally named "Logistics") | Transport |
+| programming_language | Insurance | Policy | planned | insurance vertical operations (insurance domain exists) | Underwriting |
+| programming_language | Insurance | Claims | planned | insurance vertical operations (insurance domain exists) | Claims mgmt |
+| programming_language | Insurance | Actuarial | planned | insurance vertical operations (insurance domain exists) | Risk calc |
+<!-- removed-verbatim:end -->
+
+(The table above is preserved across idempotent re-runs; a category removed by the rule is listed once.)
+
+KEPT under `programming_language`: Video, Robotics, DL, Encryption, TLS, Hashing, Key Mgmt, PKI, Protocol, OS, Compiler, VM, Numerical, Serialization, CPU and the rest -- these are stdlib capability areas and several are exercised by gate rows in EXPECTED_STDLIB.tsv (programming_language_dl_*, _tls_*, _encryption_*, ...). Borderline categories were considered and KEPT because a library/framework is a plausible language capability: Trading (algorithmic trading), Payments/ERP/Collaboration (SDK / protocol integrations), PCB (EDA), Messaging (broker clients), Mobile/Desktop (platform targets).
+
+## consequence for derived documents
+
+`gap_specs.json` now holds 9000 specs. `docs/status.json` (generated) and `docs/SELF_IMPROVEMENT.md` quote that count and are refreshed by `bash scripts/regen_status.sh`; until that runs they trail the raw spec file. It is deliberately not run from the removal commit: it also counts `lib/std`, which a concurrent work unit is editing, so running it mid-flight would bake in a transient state.
 
 ## exact duplicate specs (recorded, not dropped)
 

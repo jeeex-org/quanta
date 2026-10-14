@@ -36,12 +36,45 @@ PRIO_MAP = {
 
 # Categories under domain=programming_language that are APPLICATION-domain content,
 # not language/stdlib capability areas. Their natural domains already exist
-# (health/medicine, government, education, retail/wholesale), so they are removed
-# from the PL roadmap and recorded verbatim below. Categories such as Audio, Video,
-# Robotics, DL, TLS stay: those are stdlib capability areas and several are
-# exercised by gate rows (EXPECTED_STDLIB rows programming_language_dl_*,
-# _tls_*, _encryption_*, ...).
-PL_FOREIGN_CATEGORIES = {'Healthcare', 'Government', 'Education', 'E-Commerce'}
+# (health/medicine, government, education, retail/wholesale, insurance, logistics),
+# so they are removed from the PL roadmap and recorded verbatim in the notes below.
+#
+#   Healthcare, Government, Education, E-Commerce -- removed in the 318dec22 pass.
+#   Audio     -- the whole category is redundant WITHIN PL: its codec modules
+#                (Processing/Compression) duplicate Video/Processing+Compression and
+#                its Recognition/Synthesis pair duplicates Speech/ASR+TTS, and Audio
+#                is itself a content category under entertainment/electronics. It is
+#                an application-domain name, not a language capability.
+#   Insurance -- the insurance vertical's own operations (Policy/Claims/Actuarial);
+#                the natural domain `insurance` already exists.
+#   SCM       -- the logistics vertical's own operations (Supply Chain/Procurement/
+#                Warehouse/Logistics); the natural domain `logistics` already exists
+#                and `Logistics` is literally one of the modules.
+#
+# Categories such as Video, Robotics, DL, TLS stay: those are stdlib capability
+# areas and several are exercised by gate rows (EXPECTED_STDLIB rows
+# programming_language_dl_*, _tls_*, _encryption_*, ...). Borderline categories were
+# considered and KEPT because a library/framework is a plausible language
+# capability: Trading (algorithmic trading), Payments/ERP/Collaboration (SDK /
+# protocol integrations), PCB (EDA), Messaging (broker clients), Mobile/Desktop
+# (platform targets).
+PL_FOREIGN_CATEGORIES = {
+    'Healthcare', 'Government', 'Education', 'E-Commerce',   # 318dec22 pass
+    'Audio', 'Insurance', 'SCM',                              # this pass
+}
+
+# One-line "why foreign" per removed category, written into the audit notes.
+PL_FOREIGN_REASONS = {
+    'Healthcare': 'medical vertical (health/medicine domains exist)',
+    'Government': 'public-sector vertical (government domain exists)',
+    'Education': 'education vertical (education domain exists)',
+    'E-Commerce': 'retail vertical (retail/wholesale domains exist)',
+    'Audio': 'content category under entertainment/electronics; redundant within '
+             'PL (codecs duplicate Video, Recognition/Synthesis duplicate Speech)',
+    'Insurance': 'insurance vertical operations (insurance domain exists)',
+    'SCM': 'logistics vertical operations (logistics domain exists; module '
+           'literally named "Logistics")',
+}
 
 
 def sanitize(s):
@@ -132,6 +165,18 @@ def main():
         for c, ds in shared:
             f.write(f"{c}\t{','.join(ds)}\n")
 
+    # Preserve the verbatim removal rows from the PREVIOUS run. This must be read
+    # BEFORE the notes file is opened for writing below -- `open(...,'w')`
+    # truncates immediately, so a read inside the writing block sees an empty file.
+    START = '<!-- removed-verbatim:start -->'
+    END = '<!-- removed-verbatim:end -->'
+    prev_rows = []
+    if os.path.exists('planned/SPEC_DATA_NOTES.md'):
+        _old = open('planned/SPEC_DATA_NOTES.md').read()
+        if START in _old and END in _old:
+            prev_rows = [l for l in _old.split(START, 1)[1].split(END, 1)[0].split('\n')
+                         if l.strip()]
+
     with open('planned/SPEC_DATA_NOTES.md', 'w') as f:
         f.write('# gap_specs.json normalization (scripts/normalize_specs.py)\n\n')
         f.write('Regenerate + re-apply with `python3 scripts/normalize_specs.py` '
@@ -155,20 +200,55 @@ def main():
         f.write('\n## cross-domain category contamination\n\n')
         f.write(f"{len(shared)} categories appear in more than one domain; the full "
                 "map is in `planned/CATEGORY_CONTAMINATION.tsv`.\n\n")
-        f.write('REMOVED from `domain=programming_language` (they are application '
-                'content whose natural domains already exist), recorded verbatim:\n\n')
-        f.write('| domain | category | module | status | notes |\n')
-        f.write('|---|---|---|---|---|\n')
+
+        # Removal rule -- deterministic, so it survives every re-run.
+        f.write('REMOVAL RULE -- every category in `PL_FOREIGN_CATEGORIES` '
+                '(`scripts/normalize_specs.py`) is removed from '
+                '`domain=programming_language`: it names application/vertical content '
+                'whose natural domain already exists, not a language or stdlib '
+                'capability area.\n\n')
+        for cat in sorted(PL_FOREIGN_CATEGORIES):
+            f.write(f"- `{cat}` -- {PL_FOREIGN_REASONS.get(cat, '')}\n")
+        f.write('\n')
+
+        # Verbatim rows -- present only on the run that removes them. When this run
+        # removed nothing, re-emit the block kept from the previous file so an
+        # idempotent re-run cannot erase the record. (Losing it this way is exactly
+        # how the 318dec22 removals vanished from the committed notes, which read
+        # "(0 specs removed.)".)
+        rows = ['| domain | category | module | status | why foreign | notes |',
+                '|---|---|---|---|---|---|']
         for x in removed:
-            f.write(f"| {x['domain']} | {x['category']} | {x['module']} | "
-                    f"{x['status']} | {x['notes']} |\n")
-        f.write(f"\n({len(removed)} specs removed.)\n\n")
-        f.write('KEPT under `programming_language`: Audio, Video, Robotics, DL, '
+            rows.append(f"| {x['domain']} | {x['category']} | {x['module']} | "
+                        f"{x['status']} | {PL_FOREIGN_REASONS.get(x['category'], '')} | "
+                        f"{x['notes']} |")
+        if not removed and len(prev_rows) > 2:
+            rows = prev_rows
+        f.write('Specs removed from `domain=programming_language`, recorded verbatim:\n\n')
+        f.write(START + '\n')
+        for r in rows:
+            f.write(r + '\n')
+        f.write(END + '\n')
+        f.write('\n(The table above is preserved across idempotent re-runs; a category '
+                'removed by the rule is listed once.)\n\n')
+
+        f.write('KEPT under `programming_language`: Video, Robotics, DL, '
                 'Encryption, TLS, Hashing, Key Mgmt, PKI, Protocol, OS, Compiler, '
                 'VM, Numerical, Serialization, CPU and the rest -- these are stdlib '
                 'capability areas and several are exercised by gate rows in '
                 'EXPECTED_STDLIB.tsv (programming_language_dl_*, _tls_*, '
-                '_encryption_*, ...).\n\n')
+                '_encryption_*, ...). Borderline categories were considered and '
+                'KEPT because a library/framework is a plausible language '
+                'capability: Trading (algorithmic trading), Payments/ERP/'
+                'Collaboration (SDK / protocol integrations), PCB (EDA), Messaging '
+                '(broker clients), Mobile/Desktop (platform targets).\n\n')
+        f.write('## consequence for derived documents\n\n')
+        f.write(f"`gap_specs.json` now holds {len(clean)} specs. `docs/status.json` "
+                "(generated) and `docs/SELF_IMPROVEMENT.md` quote that count and are "
+                "refreshed by `bash scripts/regen_status.sh`; until that runs they "
+                "trail the raw spec file. It is deliberately not run from the removal "
+                "commit: it also counts `lib/std`, which a concurrent work unit is "
+                "editing, so running it mid-flight would bake in a transient state.\n\n")
         f.write('## exact duplicate specs (recorded, not dropped)\n\n')
         if dups:
             for x in dups:
@@ -182,7 +262,7 @@ def main():
           f"priority extracted={sum(prio_extracted.values())} "
           f"version fixed={sum(version_fixed.values())}")
     print(f"  removed from programming_language={len(removed)} "
-          f"(Healthcare/Government/Education/E-Commerce)")
+          f"({', '.join(sorted(PL_FOREIGN_CATEGORIES))})")
     print(f"  duplicate specs recorded={len(dups)}")
     print(f"  wrote planned/SPEC_DATA_NOTES.md, planned/CATEGORY_CONTAMINATION.tsv")
 
