@@ -715,6 +715,83 @@ files. `test_suites/codes/mem_free_test.quanta` passes rc=0 on both compilers
 because it never inspects the free list. Fixed in the 0.0.242 WIP (not promoted,
 same gate-RED reason as A5). Discovery trail: `compiler/0.0.242/WIP.md` §3.
 
+### A16 · FIXED (0.0.243 tooling) · `stdlib_rag_search_gate_test.quanta` flaked RED under load — a row whose colour was decided by the page cache
+
+The row imports `std/rag` + `std/str` and fork+execs `scripts/rag_search_file.py`,
+a sqlite-vec vec0 KNN over the 21 GB `/opt/tali/ti/ai/rag/vectors.db`, TWICE
+(search + the determinism re-check). `quanta_run.sh` capped it at the global
+`QUANTA_TIME_S=15`, which is sized for a small in-process test: this row's runtime
+*is* the disk read, so it is green or red by host page cache and machine load, not
+by the code under test. It flaked `expected rc=0, got rc=124` in two separate gate
+runs — `/tmp/gate_full.log:638` (2026-10-15 14:29) and
+`/tmp/verify_release_gate.log:638` (2026-10-16 01:38).
+
+Measured 2026-10-16 on this box — governor `powersave` (~2.2-2.8 of 5.4 GHz), load
+10-14 with an ambient `Hermes` process at ~747-752 % CPU, recorded because the
+numbers below mean nothing without it; cold paths forced with
+`sudo sh -c 'echo 3 > /proc/sys/vm/drop_caches'`:
+
+| what | measured |
+|---|---|
+| full row at the 15 s cap, cold | **rc=124**, WALL 15.03 s |
+| `rag_search_file.py` alone (one KNN) | cold **16.86 s** / warm **2.11 s** |
+| full row, DB cold (n=2) | **18.54 s**, **18.80 s** |
+| full row, everything cold (n=1) | **66.54 s** |
+| full row, warm | 2.1-3.8 s |
+
+Fix: `test_suites/scripts/run_tests.sh` gained a per-row wall-clock budget
+(`stdlib_time_budget()`); this row is declared at **120 s**, ~1.8x the worst
+measured cold path and still bounding a genuine hang. Every other row keeps the
+15 s default and an explicit `QUANTA_TIME_S` still raises all of them. Demonstrated
+green under load: see `/tmp/vr_healthy_gate.log` (A17's run).
+
+### A17 · FIXED (0.0.243 tooling) · `scripts/verify-release.sh` read a healthy tree as RED — the version arithmetic assumed consecutive versions
+
+Check 2 required `<NEXT> == <VER> + 1 patch`. With `compiler/0.0.242/` committed as
+an unpromoted WIP (its own `WIP.md` says DO NOT PROMOTE; root `VERSION` stayed
+0.0.241), the next promotion 0.0.243 is **two** patches above the frozen baseline
+0.0.241 — so the check named the unpromoted WIP as the predecessor and failed. The
+reported run was **12 passed / 2 failed** (`compiler/0.0.243/WIP.md`, "FAIL 1"),
+and every real check passed: 0.0.241 rebuilds bit-for-bit (md5 `02b15543…`) and the
+committed 0.0.243 binary **is** the seed-chain fixed point built from 0.0.241
+(`26430066…`).
+
+Fix: check 2 now asserts ORDER — same major.minor, `<NEXT>` a strictly later patch
+than `<VER>` — and prints every committed tree in between as an unpromoted WIP.
+`<VER>` was already the explicit predecessor (`arg 2`, default `cat VERSION`); it is
+no longer assumed to be `<NEXT>-1`. Proving `<VER>` is the *right* seed remains
+check 6 (the seed chain must close on the committed binary) and still fails loudly.
+Demonstrated: healthy `0.0.243 0.0.241` → **11 passed / 0 failed, exit 0** (gate
+skipped); a deliberately mismatched binary (8 bytes flipped) in a sandbox copy of
+the two trees → **9 passed / 2 failed, exit 1** (check 6 and check 7, both naming
+the mismatch). Nothing under `compiler/**` was touched.
+
+### A18 · FIXED (0.0.243 tooling) · `test_suites/scripts/gguf_corrupt_gate.sh` ignored `QC=` and tested a compiler nobody handed it
+
+The script resolved `compiler/$(cat VERSION)/bin/x86/qc` itself, and
+`run_tests.sh` did not even pass `QC=` to it — unlike security / perf / generics /
+multi-tu / qobj_gate, which all do. A WIP gate (QC=0.0.243, VERSION=0.0.241)
+therefore compiled its probe with the OLD qc and reported
+`FAIL gguf-corrupt: real probe did not compile: line 2511: error: call to
+undeclared function: dq6`, `gguf-corrupt : RED`
+(`/tmp/gate243.log:646` and `:715`, 2026-10-16 00:46) — RED until VERSION was
+bumped, i.e. it measured the wrong compiler.
+
+Fix: `QC="${QC:-$REPO/compiler/$(cat "$REPO/VERSION")/bin/x86/qc}"`, and the harness
+now passes `QC="$QC"`. Demonstrated 2026-10-16 02:20 (load 14.57): handed the
+0.0.241 qc the stage now fails with the same `undeclared function: dq6` — proof it
+uses the compiler it is handed, where before it used VERSION's. The same pattern in
+the qobj chain the gate drives is fixed in the same commit: `scripts/g4_verify.sh`
+and `scripts/g4_transitive.sh` now read `qobj_write.quanta` from the handed
+compiler's own tree (fallback VERSION), and `scripts/promote.sh` honours `${QC:-}`
+for its seed. **Recorded, not fixed** (a separate defect, out of this fix's scope):
+`GGUF_RC` and `FPR_RC` are computed and printed in the gate summary but are absent
+from the exit condition (`run_tests.sh:888`), so a RED there cannot fail the gate —
+gate243.log shows `gguf-corrupt : RED` in a summary whose exit could not be
+non-zero. **Also recorded:** `scripts/g6_selfcache.sh:13` pins its source fixture
+with a literal `V=0.0.217` (rule #1), overriding the `V=$(cat VERSION)` on the line
+above it.
+
 ---
 
 ## Severity B — accuracy (0.0.235)
