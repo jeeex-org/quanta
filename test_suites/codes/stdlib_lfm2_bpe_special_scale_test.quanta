@@ -1,0 +1,238 @@
+// stdlib_lfm2_bpe_special_scale_test -- regression row for the A20 tokenizer
+// stall: the SPECIAL-token path must tokenize a >=10 KB prompt quickly AND
+// reproduce upstream's ids exactly.
+//
+// THE DEFECT THIS PINS (A20, fixed in 21a7be4b)
+// ---------------------------------------------
+// bpe_special_match() used bpe_rec_at(bpe_vocab, id) to get each special
+// token's bytes, and bpe_rec_at WALKS THE PACKED VOCAB FROM INDEX 0 -- O(id).
+// The model's 124 CONTROL/USER_DEFINED specials have ids summing to 15,494,358,
+// so EVERY pre-token boundary paid ~15.5 M record-steps. bpe_encode_special()
+// calls it once per boundary (~2,300 of them at 10,890 bytes), so the prompt
+// took MINUTES: measured 355,305 ms at this exact size (tests/lfm2_tok_bench.quanta).
+// The fix dereferences each special's bytes ONCE in bpe_build_specials() and the
+// match is a plain byte compare. Post-fix the same call is ~26 ms.
+//
+// WHY THIS SHAPE
+// --------------
+// * SIZE, not content: the stall was #boundaries x sum(special ids), and
+//   #boundaries grows with bytes whatever the content, so a SHORT prompt cannot
+//   catch it (at "Hello" there is one boundary and the walk is free). The row
+//   therefore tokenizes a committed 10,890-byte prompt -- the real SI-loop
+//   prompt, and the input the defect was measured on.
+// * The prompt contains NO control tokens (`grep -c '<|...|>'` = 0), so
+//   bpe_encode_special() and bpe_encode() must give the SAME ids on it. The
+//   special path is exercised by its per-boundary MATCH LOOP -- exactly where
+//   the walk was -- not by a special token appearing in the text. Both paths are
+//   checked against the fixture, which is why this row covers the fix even
+//   though the text has no specials in it.
+// * ID CORRECTNESS against a COMMITTED fixture (tests/fixtures/
+//   lfm2_bpe_special_scale_ref.txt), generated once by upstream llama.cpp's own
+//   test-tokenizer-0 via tests/gen_bpe_special_scale_ref.py. The reference
+//   binary will not exist on every runner, so it is NOT consulted at run time --
+//   the ids are frozen in the fixture. 3,638 ids, first=3582 last=318.
+// * AN EXPLICIT WALL-CLOCK CEILING, because id equality alone cannot prove the
+//   fix: the pre-fix code eventually produces the SAME ids, just in 355 s. A
+//   plain run would "pass" on a runner whose per-row timeout were long enough.
+//   So the tokenize is timed with clock() and must finish under CEILING_NS.
+//   THE NUMBER AND WHY IT IS SAFE UNDER LOAD: the ceiling is 3,000 ms. Measured
+//   post-fix on THIS box (governor `powersave` ~half clock, ambient `Hermes` at
+//   ~755% CPU, load 9.4-10.3), n=5: 19, 20, 25, 30, 24 ms -- worst 30.3 ms. The
+//   ceiling sits ~100x above the worst measured cost and ~12,000x below the
+//   pre-fix 355,305 ms, so load would have to slow a 30 ms call by over 100x to
+//   flake it, while reverting the fix (355 s) cannot pass it at all. The gate's
+//   own per-row budget is 15 s, which is the backstop if the ceiling is missed.
+//   RED-FIRST (verified): the SAME source compiled against the PARENT commit's
+//   (pre-fix) lib/std/lfm2_bpe.quanta and run at the gate's 15 s budget returns
+//   rc=124 (TIMEOUT) -- it hangs inside bpe_encode_special. With the fix it is
+//   rc=0, wall ~1.1-1.3 s including the model load. The ceiling assertion itself
+//   was checked to fire: built with CEILING_NS lowered to 1 ms it returns rc=1
+//   "FAIL over ceiling", so the assertion is wired and not dead.
+// * A LIVE-SPECIALS GUARD: bpe_encode_special() FALLS BACK to plain bpe_encode()
+//   when bpe_special_count() == 0, which would skip the fixed loop entirely and
+//   let this row pass vacuously. The row refuses to run in that state.
+//
+// Needs the 1.67 GB model for the vocab: EXPECTED_STDLIB.tsv carries the GGUF in
+// the SKIP_IF_MISSING (3rd) column, like the other LFM2 rows.
+import std/fs
+import std/gguf
+import std/lfm2_bpe
+
+const MODEL = "/opt/ai/models/quanta/QUANTA-LFM2.5-2.6Bv1-Q4_K_M.gguf"
+const PROMPT_PATH = "tests/lfm2_prefill_prompt.txt"
+const REF_PATH = "tests/fixtures/lfm2_bpe_special_scale_ref.txt"
+
+const MIN_BYTES = 10240          // the row is meaningless below 10 KB
+const MAXIDS = 16384             // 3,638 real ids; ample
+const REF_IDS = 3638             // frozen by the fixture header
+const CEILING_NS = 3000000000    // 3,000 ms -- see the header rationale
+
+let FAIL = 0
+let slurp_len = 0
+
+// Read a whole file. std/fs's open(path, flags, mode) converts the Quanta string
+// to a C path (+8 offset and NUL); the raw file_open() BUILTIN does NOT -- handed
+// a non-literal string it passes the [u64 len] HEADER as the path. That trap is
+// why this goes through std/fs open() rather than file_open().
+fn slurp(path, cap) {
+    let fd = open(path, 0, 0)
+    if fd < 0 { return 0 }
+    let b = mem_alloc(cap)
+    let got = read_raw(fd, b, cap)
+    file_close(fd)
+    if got <= 0 { return 0 }
+    slurp_len = got
+    return b
+}
+
+// Parse a decimal run starting at p. Chars consumed land in the module global
+// pdec_used (an out-parameter, per the house pattern).
+let pdec_used = 0
+fn parse_dec(s, p, n) {
+    let v = 0
+    let k = 0
+    while p + k < n {
+        let c = mem_load8(s + p + k)
+        if c < 48 || c > 57 { break }
+        v = v * 10 + (c - 48)
+        k = k + 1
+    }
+    pdec_used = k
+    return v
+}
+
+fn fail(msg) {
+    prints("FAIL ")
+    prints(msg)
+    newline()
+    FAIL = FAIL + 1
+    return 0
+}
+
+// Tokenize `buf` (n raw bytes) with the special-aware encoder, timed. Returns
+// the id count; the elapsed ns lands in out_ns. Returns -1 on encoder error.
+let out_ns = 0
+fn timed_special(buf, n, ids, max_ids) {
+    let t0 = clock()
+    let got = bpe_encode_special(buf, n, ids, max_ids)
+    let t1 = clock()
+    out_ns = t1 - t0
+    return got
+}
+
+fn main() {
+    prints("=== stdlib_lfm2_bpe_special_scale_test ===\n")
+
+    if gguf_load(MODEL) != 0 { prints("FAIL gguf_load\n"); return 1 }
+    if bpe_init_from_gguf() == 0 { prints("FAIL bpe_init\n"); return 1 }
+
+    // The fixed loop only runs while specials exist (see the header).
+    let nspec = bpe_special_count()
+    prints("specials=")
+    print(nspec)
+    newline()
+    if nspec <= 0 {
+        prints("FAIL no special tokens; the special path is not exercised\n")
+        return 1
+    }
+
+    let pbuf = slurp(PROMPT_PATH, 65536)
+    if pbuf == 0 { prints("FAIL read prompt\n"); return 1 }
+    let plen = slurp_len
+    prints("prompt_bytes=")
+    print(plen)
+    newline()
+    if plen < MIN_BYTES { prints("FAIL prompt below the 10 KB threshold\n"); return 1 }
+
+    let rbuf = slurp(REF_PATH, 131072)
+    if rbuf == 0 { prints("FAIL read fixture\n"); return 1 }
+    let rlen = slurp_len
+
+    let ids = mem_alloc(MAXIDS * 8)
+
+    // ---- the special path, timed --------------------------------------------
+    let got = timed_special(pbuf, plen, ids, MAXIDS)
+    let elapsed = out_ns
+    if got < 0 { prints("FAIL bpe_encode_special error\n"); return 1 }
+
+    prints("bytes=")
+    print(plen)
+    prints(" ids=")
+    print(got)
+    prints(" ns=")
+    print(elapsed)
+    prints(" ms=")
+    print(elapsed / 1000000)
+    newline()
+
+    // ---- compare against the committed llama.cpp fixture ---------------------
+    let ref_n = 0
+    let bad = 0
+    let pos = 0
+    while pos < rlen {
+        while pos < rlen && mem_load8(rbuf + pos) == 32 { pos = pos + 1 }
+        if pos >= rlen { break }
+        let c = mem_load8(rbuf + pos)
+        if c == 35 {                                  // '#' header line
+            while pos < rlen && mem_load8(rbuf + pos) != 10 { pos = pos + 1 }
+            continue
+        }
+        if c == 10 { pos = pos + 1; continue }
+        let want = parse_dec(rbuf, pos, rlen)
+        if pdec_used == 0 { pos = pos + 1; continue }
+        pos = pos + pdec_used
+        while pos < rlen && mem_load8(rbuf + pos) != 10 { pos = pos + 1 }
+
+        if ref_n >= MAXIDS { prints("FAIL fixture longer than MAXIDS\n"); return 1 }
+        if ref_n >= got {
+            bad = bad + 1
+            if bad <= 4 { prints("  tok "); print(ref_n); prints(" got <none> want "); print(want); newline() }
+        } else if mem_load(ids + ref_n * 8) != want {
+            bad = bad + 1
+            if bad <= 4 {
+                prints("  tok "); print(ref_n)
+                prints(" got "); print(mem_load(ids + ref_n * 8))
+                prints(" want "); print(want)
+                newline()
+            }
+        }
+        ref_n = ref_n + 1
+    }
+
+    if ref_n == 0 { prints("FAIL fixture empty\n"); return 1 }
+    if ref_n != REF_IDS {
+        prints("FAIL fixture has "); print(ref_n); prints(" ids, expected "); print(REF_IDS); newline()
+        return 1
+    }
+    if got != ref_n {
+        prints("FAIL count got="); print(got); prints(" want="); print(ref_n); newline()
+        return 1
+    }
+    if bad != 0 { prints("FAIL "); print(bad); prints(" id mismatches\n"); return 1 }
+
+    // ---- the plain path must agree (the prompt has no control tokens) --------
+    // This is what makes a control-token-free prompt a valid test of the special
+    // path: both encoders see the same pre-tokens, and the special encoder's
+    // extra work is the per-boundary match loop the fix made cheap.
+    let pids = mem_alloc(MAXIDS * 8)
+    let pgot = bpe_encode(pbuf, plen, pids, MAXIDS)
+    if pgot != got { prints("FAIL plain count="); print(pgot); prints(" special="); print(got); newline(); return 1 }
+    let k = 0
+    let pbad = 0
+    while k < got {
+        if mem_load(pids + k * 8) != mem_load(ids + k * 8) { pbad = pbad + 1 }
+        k = k + 1
+    }
+    if pbad != 0 { prints("FAIL plain vs special: "); print(pbad); prints(" differ\n"); return 1 }
+
+    // ---- the wall-clock ceiling (the red-first property) --------------------
+    if elapsed > CEILING_NS {
+        prints("FAIL over ceiling: ns="); print(elapsed)
+        prints(" ceiling_ns="); print(CEILING_NS)
+        newline()
+        return 1
+    }
+
+    prints("PASS bpe_special_scale (llama.cpp ids matched, under ceiling)\n")
+    return 0
+}
