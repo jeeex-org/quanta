@@ -412,7 +412,17 @@ unit's `docs/plans/bugs.md` was NOT swept in.
 3. **Prefill remains the top queued lever** (unchanged): 5.8 s per prompt token.
 4. **`stage1/`** (probes + logits artifacts, ~60 MB) is not part of the gate and
    was not pruned.
-5. **A peer unit runs concurrently in the same working tree** (this round it had
-   `docs/plans/bugs.md` and `docs/plans/defect-report-0.0.240.md` open). Those paths
-   are deliberately NOT staged by this unit. Manifest rows and their source files
-   landed in ONE commit, by targeted `git add` of named paths only.
+5. **A peer unit runs concurrently in the SAME working tree, and its commit swept
+   this unit's files in.** This unit staged its paths with targeted `git add` of
+   named paths only (never `git add -A`) — after which the peer committed with
+   `git add -A` and pushed: commit `12380ab2` ("docs(bugs): …") carries all 28078
+   files, including `VERSION`, `compiler/0.0.241/**` and the four new rows. The
+   CONTENT is intact and pushed (`git status` clean, `main == origin/main`), but
+   that commit message does not describe the 0.0.241 promotion, which is why a
+   follow-up commit records it. All four manifest rows and their source files did
+   land in ONE commit, so the "rows and sources together" rule held; the lesson is
+   that a shared working tree makes `git add -A` a cross-unit write.
+   `lib/std/sampling.quanta` was already committed by the peer (`59f58aaf`)
+   *before* this unit's gate run, so the 227/227 result includes it.
+   `docs/plans/bugs.md` was the peer's own change and is correctly attributed to
+   the peer's commit.
