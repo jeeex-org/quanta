@@ -10,6 +10,13 @@ both need compiler changes, so the binary moves.
 0.0.243 built   md5 26430066a4e04f61a687ccf6291b61d7
 ```
 
+Landed as commit **`1c392ed7`** — 28079 files, staged and committed by
+pathspec-limited `git commit -- <paths>` (never `git add -A`), so the concurrent
+peer's `docs/plans/bugs.md`, `test_suites/EXPECTED*.tsv` and `compiler/0.0.242/**`
+were not swept in. `git diff-tree --no-commit-id --name-only -r HEAD` is exactly the
+11 non-`compiler/0.0.243` paths listed in the dirty-path audit plus
+`compiler/0.0.243/**`.
+
 `compiler/0.0.243/src` vs `compiler/0.0.241/src` is **four files**; everything else is
 byte-identical. `compiler/0.0.243/lib/**` and `compiler/0.0.243/test_suites/**` are the
 0.0.241 snapshot copied verbatim (the same stale-snapshot situation 0.0.239, 0.0.240
