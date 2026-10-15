@@ -106,3 +106,30 @@ a first one was written by the Stage-1 unit under `stage1/`.
 context is ~2.6k tokens, i.e. ~4 minutes of prefill at the measured prompt rate before the
 first generated token. Prompt trimming and prefix caching matter whichever runtime is
 used.
+
+---
+
+## Correction (appended by the campaign lead, after 0.0.244): A4 is IMPLEMENTED and its premise is REFUTED
+
+`0.0.244` ships next-use eviction (nearest-use-farthest victim, dead-in-block values first, `>=` keeps LIFO ties,
+bounded 64-op block-aware scan; `emitter.quanta:312-331/343-361/365-376/381-396/574-600`, `codegen.quanta:1437-1440,3285-3289`).
+It is correct and semantics-preserving. It also has almost nothing to act on, measured:
+
+- **Evictions across the whole 37-case suite: 5** (`file_io` 2, `params8` 3). The compiler's own 427-fn self-build:
+  462 evictions out of 144,484 allocations. `arith`'s `main` peaks at **3 of 13 registers mapped — 0 evictions**.
+  The pool never fills, so victim selection cannot be the 6-32x cost.
+- **The real cost is home-slot STORE traffic:** home stores per hot-loop body are **39 / 43 / 28 / 55 / 71**
+  (`arith` / `div_const` / `heavy_int` / `fileio` / `float`) against **gcc's 0**. `sdef()` stores the home slot on
+  every definition, and `flush_all()` re-stores every live value at each block boundary **and at every `IR_CALL`**.
+  **That is the next lever** (obstacle to name up front: direct `spill_home()` readers in the SHL/SHR and IR_CALL paths).
+- **The frame is NOT gated by per-vreg slots.** `min_spill=1024` clamps `spill_size = 48 + vreg_n*8`, so `arith`'s
+  1120 B is floor+alignment and the ~8,000-vs-262,000 recursion depth is set by that constant. Shrinking `min_spill`
+  is the recursion-depth lever; home-slot reuse would not have moved it.
+- **`work()` = 254 instructions has no source in the tree** and was not reproducible (earlier notes quoted it).
+  The reproducible kernel is `heavy_int` `main` = **198** instructions, loop 75.
+
+**Method, because this box cannot be trusted for wall time:** `scripts/bench_instr.sh` reports instruction, frame and
+spill counts. 37 of 38 cases emit **byte-identical code** under 0.0.243 vs 0.0.244 and all 12 parity cases hold;
+`regpressure` (one of the three that changed) went 401 -> 381 instructions (-5.0 %) and 259 -> 239 home mem-ops.
+Meanwhile 36 byte-identical rows swung **-12.5 % to +20.0 %** in wall time, and the same binary gave `heavy_div2`
+32.85x at load 17-20 and 21.68x at load 12 — so instruction/frame/spill counts are the evidence and ratios are not.
