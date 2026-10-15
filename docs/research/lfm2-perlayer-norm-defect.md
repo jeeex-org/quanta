@@ -209,11 +209,15 @@ bash tests/run_lfm2_generate.sh
 
 ## 8. What is NOT verified
 
-* **`fc_attention_par` carries the same fix but has never been exercised.** No
-  test, and not the tracked driver, sets `fc_attn_workers > 1` (it defaults to 0),
-  so the parallel attention body is dead code in every run made here. The fix
-  there is a verbatim copy of the `fc_attention` one and is type-checked, nothing
-  more.
+* **`fc_attention_par` carries the same fix but was never exercised.** No test,
+  and not the tracked driver, ever set `fc_attn_workers > 1` (default 0), so the
+  parallel attention body was dead code in every run made here; the fix there was
+  a verbatim copy of the `fc_attention` one, type-checked only. `fc_attention_par`
+  and `fc_attn_workers` were **REMOVED** in `21a7be4b` (A21): as written the body
+  leaked 64 MB of address space per forward token (8 layers x 8 threads x 1 MB,
+  the retired per-call `thread_create` pattern), so it could not be enabled
+  despite being ~1.35x faster at `pos=1600`. The re-add is queued through the
+  persistent pool. See `docs/research/fc-attn-workers-removal.md`.
 * Positions 0..7 have carried-state dumps (`NSTATEPOS = 8` in the probe); the
   correlation table covers 0..22. The state claim is therefore about 0..7.
 * The reference K row is reconstructed from the **dumped layer input**, so it

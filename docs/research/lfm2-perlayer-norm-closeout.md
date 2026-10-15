@@ -68,10 +68,13 @@ so the once-sized buffers are correct here. It would overflow only for a model
 whose attention layers disagree on `head_count_kv`; worth a guard if such a model
 is ever targeted.
 
-Not changed by any of this: `fc_attention_par` still has **no runtime exercise** —
-nothing sets `fc_attn_workers > 1` (default 0), so its body is dead in every run
-here, exactly as the fixing unit's section 8 states. The fix there is confirmed by
-reading only.
+Not changed by any of this: `fc_attention_par` had **no runtime exercise** —
+nothing ever set `fc_attn_workers > 1` (default 0), so its body was dead in every
+run here, exactly as the fixing unit's section 8 states; the fix there was
+confirmed by reading only. `fc_attention_par` and `fc_attn_workers` were
+**REMOVED** in `21a7be4b` (A21) — as written it leaked 64 MB of address space per
+forward token and so could not be enabled; the re-add is queued through the
+persistent pool. See `docs/research/fc-attn-workers-removal.md`.
 
 ## 4. The one red row in the first run was a flake, not the fix
 

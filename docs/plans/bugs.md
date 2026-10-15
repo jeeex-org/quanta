@@ -643,7 +643,8 @@ pool leaks `nworkers` stacks — ~20 MB per forward as bracketed (was ~2.33 GB),
 emitter (`thread_join` munmapping the child stack and slot, which needs the stack base
 recorded in the join slot) and belongs to the compiler work unit, whose `0.0.237` tree
 was in flight. Also unfixed: `fc_attn_workers`' parallel attention body still spawns
-per-call threads (never enabled, so unexercised); bare `mm_matvec_par` callers outside a
+per-call threads (never enabled, so unexercised; **superseded — `fc_attn_workers`
+and its `fc_attention_par` body were REMOVED in `21a7be4b`, see A21/A22**); bare `mm_matvec_par` callers outside a
 bracket get a pool per call. A timed `futex_wait` was tried in the driver and reverted —
 it made argmax diverge (5922 -> 35808/8696, varying) while the untimed wait is stable.
 Full trail: `docs/research/threaded-forward-defect.md`.

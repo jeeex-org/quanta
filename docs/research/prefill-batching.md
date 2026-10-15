@@ -423,8 +423,11 @@ run: there is no new version for it to compare.
   needs the unbatched path re-measured against a freshly built llama.cpp reference.
 - **`B` beyond 8 is unmeasured.** The budget says the dot floors it at ~3.35x by
   B=64, but only B=4 and B=8 were timed.
-- **`fc_attn_workers` / `fc_attention_par` remain dead code**, as before this work
-  (the batched path uses `mm_matmul` through the worker pool instead).
+- **`fc_attn_workers` / `fc_attention_par` were dead code and are now REMOVED**
+  (`21a7be4b`, A21) — as written they leaked 64 MB of address space per forward
+  token, so they could not be enabled. As before this work, the batched path uses
+  `mm_matmul` through the worker pool instead. See
+  `docs/research/fc-attn-workers-removal.md`.
 - The `tests/lfm2_prefill_prompt.txt` fixture is a copy of
   `stage1/ctx/PROMPT_sorting.txt` (sha256
   `fbf2be64cf0c793ec5083f9c5bb7cb23b99ee17e714d55c29fcadebd48c8f62a`); `stage1/` is

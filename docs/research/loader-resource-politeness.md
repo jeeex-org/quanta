@@ -232,11 +232,14 @@ Reading it:
   measured). The loader itself has **no unbounded allocation** in the pool path.
   The remaining machine-level guard is the caller's `ulimit -v`
   (`scripts/quanta_run.sh` caps at 1–1.5 GB); the loader does not set one.
-* **`fc_attn_workers` (parallel attention body) — dead, reported.** It defaults 0
-  and has **no setter** in the tree (`grep` found only reads), so the per-call
-  `thread_create` attention body at `lib/std/lfm2_forward.quanta:940-950` is
-  never reached. Left as-is; noted so it is not mistaken for a live path when it
-  is later enabled (it would need the same pool treatment as A9).
+* **`fc_attn_workers` (parallel attention body) — REMOVED.** It defaulted 0 and had
+  **no setter** in the tree (`grep` found only reads), so nothing ever reached the
+  per-call `thread_create` attention body. It was **removed** in `21a7be4b` (A21)
+  rather than left as-is: enabling it was a leak bomb — ~1.35x faster at
+  `pos=1600`, but 64 MB of address space leaked per forward token (8 layers x 8
+  threads x 1 MB, the retired per-call `thread_create` pattern), dead at ~128
+  tokens under the 8 GB cap. The re-add is queued through the persistent pool (the
+  same pool treatment as A9). See `docs/research/fc-attn-workers-removal.md`.
 
 ---
 

@@ -223,9 +223,13 @@ git show HEAD:lib/std/lfm2_forward.quanta > lib/std/lfm2_forward.quanta
 2. **Bare `mm_matvec_par` callers outside a bracket** still get a pool created and
    torn down per call (i.e. `nworkers` thread spawns per call, no improvement).
    Bracket the loop to benefit. The forward does it for you.
-3. **`fc_attn_workers`** (the parallel attention body in `lfm2_forward.quanta`) still
-   spawns per-call threads. Nothing sets it (default 0), so it is unexercised -- a
-   latent copy of the same leak.
+3. **`fc_attn_workers`** (the parallel attention body in `lfm2_forward.quanta`) was
+   **REMOVED** in `21a7be4b` (A21) — it was a latent copy of the same leak, and a
+   leak bomb when enabled: ~1.35x faster at `pos=1600`, but it leaked 64 MB of
+   address space per forward token (8 attention layers x 8 threads x 1 MB, the
+   retired per-call `thread_create` pattern), dying at ~128 tokens under the 8 GB
+   cap. The re-add is queued through the persistent pool.
+   See `docs/research/fc-attn-workers-removal.md`.
 4. **A worker that traps mid-slice** blocks the driver. The slice allocates nothing,
    so this needs a trap; the pre-fix design would have reported a silently wrong
    result instead, so this is not obviously worse, but it is not fixed.

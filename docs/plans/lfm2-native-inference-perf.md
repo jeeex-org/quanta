@@ -25,7 +25,7 @@ not a core stage, which is how the loader work has landed all along (loader 6.1/
 | Largest single item | **logits matvec 2391 ms** (output head tied to `token_embd.weight` [2048×128000], 6× an FFN matvec) |
 | Inside a matvec | dequant **93 ms** vs dot **69 ms** (dequant = 57%) |
 | llama.cpp, same weights, CPU | **~110 tok/s** |
-| **The parallel paths exist but are OFF** | `mm_workers` and `fc_attn_workers` are **0** and **nothing in the tree calls `mm_set_workers`** → the shipped forward pass is serial |
+| **The parallel paths exist but are OFF** | `mm_workers` is **0** and **nothing in the tree calls `mm_set_workers`** → the shipped forward pass is serial. (`fc_attn_workers` — the other parallel path this row used to name — was **removed** in `21a7be4b`, A21: it leaked 64 MB of address space per forward token and so could not be enabled; the re-add is queued through the pool.) |
 | Block kernels | `q4k_dot`, `q4k_matvec`, `q4k_matvec_avx2` are registered builtin names whose emitter bodies are **`return y`** |
 | GPU | RTX 4070 Laptop (8188 MiB, cc 8.9, driver 615.71.09), ~7.4 GiB free; toolkit at `/usr/local/cuda-13.3` (nvcc not on PATH); `dequant_q4k`/`matvec_q4k`/`matvec_f32` kernels + `qg_*` wrappers exist; Quanta client `lib/std/cuda_daemon.quanta` |
 | CUDA daemon stability | **already fixed** — `b8870462` (sync-before-destroy, `stage_stream` cleanup, stream validation) with a negative control that reproduced the crash with the defenses removed. A 6h25m unattended run on 2026-10-13 with no crash supports it |
@@ -44,8 +44,11 @@ per-matvec PCIe traffic negligible. So `IPC_latency × ops_per_token` decides: 2
 
 `lib/std/lfm2_forward.quanta` (+ `mm_set_workers`/`mm_scratch_new`/`mm_matvec_par` already in `lfm2_mm.quanta`).
 
-1. One entry point (`fc_set_workers(n)`) setting `mm_set_workers(n)` **and** `fc_attn_workers = n`; keep default
-   0 so the byte-identical serial path stays default until measured.
+1. One entry point (`fc_set_workers(n)`) setting `mm_set_workers(n)`; keep default
+   0 so the byte-identical serial path stays default until measured. (The
+   `fc_attn_workers = n` half of this step is void: that global was **removed** in
+   `21a7be4b`, A21. The attention-body parallelism it gated is queued to be
+   re-added through the persistent pool, not as a per-call thread body.)
 2. Per-row element-wise identity serial vs 1/2/4/8/16 workers on **real** forward-path tensors (0 mismatches,
    5 repeats). Assert the setup call's return value — a parallel-matvec test once "passed" while comparing
    against zeros; use derived row counts, not round numbers.
