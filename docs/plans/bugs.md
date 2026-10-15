@@ -255,52 +255,75 @@ the 33x ratio IS the frame ratio — so the depth is fully explained by the fram
   a depth both sides survive. It PASSES on 0.0.235, so it is a regression guard, not a red-first row —
   labelled that way deliberately, because rule #16 applies to rows asserting new behaviour.
 
-### A5 · LATENT USE-AFTER-FREE (masked by deferred reuse) · `mem_alloc` in a loop body clobbered by the next iteration
+### A5 · DEFECT CONFIRMED (executed 0.0.240): the P2 RAII auto-free for `mem_alloc` is DEAD CODE · the loop-clobber shape cannot fire today
 
 Recorded in `WIP.md` "Still open" and in this project's known-gotchas list. Allocate up front is the
 workaround, but a language whose allocator returns memory that a later iteration can reuse is a
 memory-safety defect, not a style note.
 
-**Status: latent use-after-free, masked by a deliberately deferred optimisation - not absent.**
-`IR_FREE = 37` frees an `mem_alloc`-owned binding at scope end (`globals.quanta:29`), emitted per
-owned vreg at `features.quanta:24` - so a loop body's allocation IS freed every iteration. What
-prevents the next iteration clobbering it is that `mem_alloc` never reuses a freed block, stated
-as a deliberate deferral: `emitter.quanta:1980` "(Deferred reuse: mem_alloc left UNCHANGED to keep
-emitted bytes stable -> fixpoint-safe.)". Holding an owned pointer past its scope exit is already
-a use-after-free that the bump allocator masks; landing the deferred reuse turns it into silent
-aliasing, and `codegen.quanta:2741` already warns of "double-free -> aliased-block". Allocate up
-front is the correct pattern, not a workaround.
+**Probed 0.0.235, not reproduced** (allocate in iteration 0, read after the loop → old block intact).
+That much is real — but the *reason* was measured incompletely, twice. The first framing ("not
+reproduced") missed the defect behind it; the 2026-10-15 reclassification ("latent use-after-free,
+masked by deferred reuse") was also wrong, and this entry retracts it: it claimed "a loop body's
+allocation IS freed every iteration", and the emitted machine code says no free is ever emitted.
 
-**Probed 0.0.235, not reproduced in the alloc-alloc shape.** Allocate in iteration 0, store 111, allocate again in iteration 1, store
-222 into the NEW pointer, then read the OLD pointer after the loop: the old block still reads 111 (`rc=0`
-from the probe). That is what the allocator's own behaviour predicts — `mem_alloc` never pops its freed
-list (recorded in `docs/AUDIT_ROADMAP.md` as "leaks every freed block"), so it bump-allocates and hands
-out fresh blocks rather than reusing a live one. Runaway *growth* is the consequence of that design, and
-it is tracked separately; silent clobbering in this shape is not happening.
+**VERIFIED BY EXECUTION + DISASSEMBLY (0.0.240): the auto-free never fires at all.**
 
-**RECLASSIFIED 2026-10-15: latent use-after-free, not "not reproduced."** The mechanism is in the source:
+Four probes compiled with `qc --emit-obj` and disassembled — `mem_alloc` at (1) function scope,
+(2) inside an `if` block, (3) inside a `while` body, (4) the full original shape (alloc in loop,
+pointer escaping the body). Every one contains the `mmap` syscall for `mem_alloc` and **zero**
+free-list pushes: no instruction in `main` touches `HEAP_CTRL` (`0x42200408`); the byte pattern
+`89 1c 25` (the `mov %rbx,HEAP_CTRL` free-list-head store) has **0 occurrences** in all four
+objects. `vreg_owned` has exactly one writer that sets it to 1 (`parse.quanta:1437`) and that
+writer never fires, so `owned_scope_pop_one`'s `if r64(vreg_owned+ov*8)==1` is never true and
+`IR_FREE` is never emitted. The 0.0.235 probe read 111 back because the block was **never freed** —
+not because it was freed and not reused.
 
-| Evidence | Location |
-|---|---|
-| `IR_FREE = 37` — free the mem_alloc-owned binding at scope end | `globals.quanta:29` |
-| Scope exit emits `IR_FREE` for owned vregs | `features.quanta:24` |
-| `mem_alloc` leaves free-list reuse UNCHANGED (deferred) | `emitter.quanta:1980` |
-| `IR_FREE` pushes the block to the free-list via `drop()` | `codegen.quanta:2843` |
-| `codegen.quanta:2741` already worries about "double-free → aliased-block" | `codegen.quanta:2741` |
+**Root cause — a field-indexing bug in the ownership detector (`parse.quanta:1430-1443`):**
 
-A `mem_alloc`'d binding is freed at scope exit, including a loop body's scope. What prevents the next
-iteration from clobbering the previous one's block is **not** that no free happens — it is that `mem_alloc`
-never reuses a freed block. The free-list exists (`HEAP_CTRL`), `mem_free` pushes onto it, but `mem_alloc`
-never pops it. The reuse is explicitly deferred (`emitter.quanta:1980`, "Free-list recycling deferred;
-mem_alloc unchanged -> fixpoint-safe").
+The detector peeks the last IR record for `IR_CALL` with callee name `mem_alloc`:
 
-Holding an owned pointer past its scope exit is already a use-after-free. The bump allocator just hides
-the symptom today. "Allocate up front" is not a workaround for a quirk — it is the only correct pattern,
-and programs that rely on the current behaviour are relying on undefined memory.
+    let cnm = ira1(last); let cnl = ira2(last)
+    if cnl==9 && r8(src+cnm)=='m' && ... {
 
-**Forward-looking risk:** whoever lands the deferred reuse to fix memory growth turns every such program
-into silent, data-dependent aliasing corruption. That change has to land with the invariant written down
-and something that detects the alias.
+But the `IR_CALL` record layout (written at `method.quanta:387`, `iremit(IR_CALL, vr2, nm, nargs, avs)`;
+accessors `helpers.quanta:396-398`) is:
+
+| field | accessor | contents for `mem_alloc(8)` |
+|---|---|---|
+| a0 (+16) | `ira0` | **callee name offset** (`nm`) |
+| a1 (+24) | `ira1` | **argument count** (1) |
+| a2 (+32) | `ira2` | **arg-start IR index** (`avs`) |
+
+The detector reads the argument count as the "name" and the arg-start index as the "length".
+`cnl==9` therefore asks whether the arg-start IR index happens to equal 9 — a data-dependent
+coincidence, never the name length — and `src+cnm` reads a byte at `src+<arg count>`. Codegen's own
+`IR_CALL` handler proves the authoritative layout: `let nm=a0`, and it **re-scans the name length
+from the source bytes** (`codegen.quanta:2667-2674`) because the IR record does not even carry a
+length field.
+
+**Consequences:**
+
+1. `let p = mem_alloc(...)` never marks `p` owned; `owned_add` never runs; `IR_FREE` is never
+   emitted; the free-list push (`codegen.quanta:2843`) is unreachable on this path. The mechanism
+   exists (`globals.quanta:29`, `features.quanta:24`, `emitter.quanta:1980`) but is dead code.
+2. Every `mem_alloc` block leaks to process exit — consistent with, and now explaining,
+   `docs/AUDIT_ROADMAP.md`'s "leaks every freed block" note on this path.
+3. The original A5 loop-clobber shape is real but **two fixes away**: it goes live only when BOTH
+   (a) the field-indexing bug is fixed so `IR_FREE` actually fires per loop iteration, AND
+   (b) free-list reuse lands (recorded as deferred at `emitter.quanta:1980`). Whoever lands either
+   change must re-run the probes below; whoever lands both must carry the alias-detection
+   invariant — a pointer escaping a loop body that owns it is then silent, data-dependent
+   aliasing corruption (`codegen.quanta:2741` already warns of "double-free → aliased-block").
+
+**Regenerate the evidence at any time:**
+
+```bash
+cd /tmp && QC=/opt/tali/quanta/compiler/0.0.240/bin/x86/qc
+$QC --emit-obj a5_probe.quanta a5_probe.o
+objdump -d a5_probe.o | grep -c 42200408     # 0 = free never fires
+objdump -d a5_probe.o | grep -c "89 1c 25"   # 0 = no free-list store bytes
+```
 
 ### A6 · SUPERSEDED (see the FIXED and PROMOTED entry below) · root cause confirmed; three fix mechanisms measured and rejected
 
@@ -493,7 +516,8 @@ which is the `std/vec` defect class (`vec_push` silently dropped pushes past cap
 
 - No code change is recorded here: `lib/std/**` belongs to another work unit and the ceiling
   is already in place. The entry exists so the next reader does not re-raise a closed report
-  — the same reason A3 and A5 carry a status line instead of a fix.
+  — the same reason A3 carries a status line instead of a fix. (A5 is different: it records a
+  CONFIRMED open defect — the dead ownership detector — awaiting its fix version.)
 
 ### A9 · FIXED here (lib/std) · the native engine dies after ONE threaded forward, with rc=0
 

@@ -16,13 +16,13 @@
 | **A2b** | `exit(f64)` silently exits 0 | ✅ FIXED | 0.0.235 |
 | **A3** | `gguf_type_size` succeeds for types with no decoder | ✅ STALE | — |
 | **A4** | Recursion ceiling ~8,000 frames (1104-byte frame) | 📊 MEASURED | — |
-| **A5** | `mem_alloc` clobber in loop | ⚠ LATENT (masked by deferred reuse) | — |
+| **A5** | `mem_alloc` RAII auto-free — dead code (ownership detector reads wrong IR fields) | 🔴 CONFIRMED DEFECT (open) | — |
 | **A6** | Untyped param used as float → bit pattern | ✅ FIXED | 0.0.236 |
 | **A7** | Untyped param used as string → pointer | ✅ FIXED | 0.0.236 |
 | **A8** | `SYNTH_CAP` believed dead | ✅ CLOSED (stale report; now enforced) | — |
 | **A9** | Native engine dies after ONE threaded forward with rc=0 | ✅ FIXED | 0.0.239 |
 
-**Status:** A1, A1b, A2, A2b, A6, A7 and A9 fixed (7). A3 stale. A8 closed as a stale report. A4 measured, no fix (the frame size is the performance lever). **A5 is latent, not absent.** Defects found after this table was written are in section 6.
+**Status:** A1, A1b, A2, A2b, A6, A7 and A9 fixed (7). A3 stale. A8 closed as a stale report. A4 measured, no fix (the frame size is the performance lever). **A5 is a confirmed OPEN defect: the P2 RAII auto-free for `mem_alloc` is dead code — the ownership detector reads the wrong IR fields, so `IR_FREE` never fires and every `mem_alloc` block leaks.** Defects found after this table was written are in section 6.
 
 ---
 
@@ -110,11 +110,17 @@ print(p) }          // prints 99, not the parameter
 
 ---
 
-### A5 — `mem_alloc` clobber in loop ❌ NOT REPRODUCED
+### A5 — `mem_alloc` RAII auto-free is DEAD CODE 🔴 CONFIRMED DEFECT (executed 0.0.240)
 
-**Status:** One shape tested, not reproduced. `mem_alloc` never pops its freed list, so it bump-allocates and hands out fresh blocks rather than reusing a live one. Runaway growth is the consequence of that design; silent clobbering in this shape is not happening.
+**Symptom (the original report):** a `mem_alloc` block in a loop body might be clobbered by the next iteration.
 
-**Still needs the original repro before it can be called live or stale.**
+**Verified by execution + disassembly:** the clobber cannot fire today — but not for the reason first recorded. The P2 RAII auto-free for `mem_alloc` never fires at all. Four probes (`mem_alloc` at function scope, in an `if`, in a `while`, in the full escaping-pointer shape) all emit the `mmap` syscall and **zero** free-list pushes: no instruction touches `HEAP_CTRL`, byte pattern `89 1c 25` has 0 occurrences.
+
+**Root cause:** the ownership detector at `parse.quanta:1434` reads the wrong IR fields — `ira1` (arg count) as the callee name and `ira2` (arg-start index) as the name length. The `IR_CALL` record keeps the name in `a0` (`ira0`) and carries no length field at all (codegen re-scans it from source). The detector's `cnl==9` test can never pass except by coincidence, so `vreg_owned` is never set, `IR_FREE` is never emitted, and every `mem_alloc` block leaks to process exit.
+
+**Consequence:** every `mem_alloc` block leaks (consistent with `AUDIT_ROADMAP`'s note). The loop-clobber hazard goes live only when BOTH the detector bug is fixed AND free-list reuse lands — whoever lands both must carry an alias-detection invariant.
+
+**Status: open defect awaiting a fix version.** See `docs/plans/bugs.md` A5 for the full evidence and the reproduction recipe.
 
 ---
 
@@ -249,15 +255,20 @@ Next-use eviction policy (phase 3 of `docs/plans/performance.md`). Not started.
 
 ## 6. Findings after this table (added on review)
 
-**A5 is latent, not absent.** `IR_FREE = 37` frees an `mem_alloc`-owned binding at scope end
-(`globals.quanta:29`, emitted per owned vreg at `features.quanta:24`), so a loop body's allocation IS
-freed each iteration. What prevents the next iteration clobbering it is that `mem_alloc` never reuses
-a freed block - and the emitter says so as a deliberate deferral: `emitter.quanta:1980`
-"(Deferred reuse: mem_alloc left UNCHANGED to keep emitted bytes stable -> fixpoint-safe.)". So the
-0.0.235 probe read 111 back because reuse does not exist yet, not because the hazard does not.
-Holding an owned pointer past its scope exit is already a use-after-free that the bump allocator
-masks; landing the deferred reuse turns it into silent aliasing. `codegen.quanta:2741` already warns
-of "double-free -> aliased-block". Allocate-up-front is the correct pattern, not a workaround.
+**A5 corrected — retracted, then verified by execution.** The paragraph below this line was the
+second of three wrong framings of A5 and is kept struck for the record:
+
+~~A5 is latent, not absent. `IR_FREE = 37` frees an `mem_alloc`-owned binding at scope end, so a loop body's allocation IS freed each iteration...~~
+
+**What execution actually shows (0.0.240, four compiled probes, zero `HEAP_CTRL` stores in all
+four disassemblies): the auto-free never fires at all.** The ownership detector at
+`parse.quanta:1434` reads the wrong IR fields — `ira1` (arg count) as the callee name and `ira2`
+(arg-start index) as the name length, while the name lives in `a0`/`ira0` and the record carries
+no length field. So `vreg_owned` is never set, `IR_FREE` is never emitted, and every `mem_alloc`
+block leaks to process exit. The 0.0.235 probe read 111 back because nothing was freed — not
+because a free happened and reuse did not. The loop-clobber hazard goes live only when BOTH the
+detector bug is fixed AND deferred reuse lands; whoever lands both must carry the alias-detection
+invariant. Full evidence and the regeneration recipe: `docs/plans/bugs.md` A5.
 
 **Defects found after this report was written** (all measured, all in `docs/plans/bugs.md` or the
 version WIPs):
