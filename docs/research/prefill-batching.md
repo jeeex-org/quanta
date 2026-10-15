@@ -68,6 +68,21 @@ what batching can and cannot amortise -- is the number that closes:
 
 Per-element rates are `FFN_GATE_DEQ` 8,376 ns / 2048 = 4.09, `FFN_DOWN_DEQ`
 268,731 / 10752 = 25.0, `FFN_GATE_DOT` 5,588 / 2048 = 2.73.
+
+### Syscalls: one `pread64` per matvec row, and 0.4% of the time
+
+The count is consequence of the row-wise design and it cross-checks exactly. Per
+token the forward issues `30 x (10752+10752+2048) + 8 x (2048+512+512+2048) +
+22 x (6144+2048)` = **927,744** matvec rows, plus 128,000 output-projection rows
+and 1 embedding row = **1,055,745** -- which is the 0.0.239 `strace -f -c`
+`pread64` count for one serial forward, to the call. A prefill token skips the
+output projection, so it is **927,745** reads. Batching does not change the
+per-ROW count; it divides it by B, so at B=8 prefill costs ~116,000 reads per
+token instead of 927,745.
+
+The cost is negligible and was measured, not argued: `/usr/bin/time -v` on a
+serial run gives **System 0.79 s** against User 198.38 s, i.e. **0.4%**. This is
+not a syscall-bound loop and there is nothing to win here.
 The 313 M Q6_K elements are the 14 `ffn_down` tensors that ship as Q6_K plus 4
 `attn_v`; verified from the GGUF header: 19 Q6_K tensors totalling 574,619,648
 elements, of which `token_embd` is 262.1 M (output projection only).
@@ -349,6 +364,18 @@ the *compilation* of both changed files, and they pass -- see the gate result be
 
 ## 7. Gate, self-hosting, verify-release
 
+**Decode is untouched, and that is checkable rather than asserted.** The diff to
+both library files is **insertions only** -- `git diff --numstat` gives
+`546 0` for `lib/std/lfm2_forward.quanta` and `218 0` for `lib/std/lfm2_mm.quanta`,
+i.e. no pre-existing line was deleted or modified, so `fc_forward_token_body`,
+`fc_layer`, `fc_attention`, `fc_short_conv`, `mm_matvec` and `mm_embed_logits`
+are the same code they were. The decode rate is therefore exactly the closed-out
+7.35-7.9 s/token and was not re-timed here. The decode lever is section 4: the
+tied output projection is 8.92 s of a serial token, 73% of it the scalar Q6_K
+dequant -- and `mm_embed_logits`' `pl_run_embed`/`mm_embed_logits_par` paths use a
+LEFT-TO-RIGHT scalar accumulate (9.0 ns/element) where the rest of the forward
+uses `mm_dot4` (2.73).
+
 **No compiler file was changed**, so there is nothing to re-prove about
 self-hosting and no version tree was created: `VERSION` stays **0.0.241**,
 `compiler/0.0.241/bin/x86/qc` keeps md5 `02b155430d10661b17645680b4092987`, and
@@ -378,6 +405,32 @@ run: there is no new version for it to compare.
     <qc> tests/lfm2_prompt_budget.quanta    /tmp/pb.bin && /tmp/pb.bin </dev/null
     bash tests/run_lfm2_prefill_probe.sh          # the reference dump (one per token)
     bash tests/run_lfm2_prefill_batched_probe.sh  # diff vs it + the llama.cpp oracle
+
+## 9. Not verified / stated plainly
+
+- **The 20-worker batched rate (~1,539 ms/prompt-token) is DERIVED**, not measured.
+  The box could not deliver it: with the ambient 878%-CPU process present, a
+  serial 4-token run took 525 s wall against a `User time` of 520 s and a 20-worker
+  run of the SAME 15-second workload hit a 300 s timeout with 198 s of user time
+  (1.0 cores of progress). Every measured number here is serial for that reason.
+- **The B=23 (one-chunk) point is not on the throughput curve**: the 23-token run
+  was the probe, which also computes the output projection at EVERY position. Use
+  the B=4 / B=8 bench rows for the scaling claim.
+- **Positions 1 and 3 correlate 0.9983 / 0.9985**, a hair below the 0.9991-0.9997
+  band quoted for positions 0-7 in the per-layer-norm close-out. Bit-identity
+  between the two paths proves this is not from batching, but whether the quoted
+  band or that run's reference is the thing that differs was NOT established; it
+  needs the unbatched path re-measured against a freshly built llama.cpp reference.
+- **`B` beyond 8 is unmeasured.** The budget says the dot floors it at ~3.35x by
+  B=64, but only B=4 and B=8 were timed.
+- **`fc_attn_workers` / `fc_attention_par` remain dead code**, as before this work
+  (the batched path uses `mm_matmul` through the worker pool instead).
+- The `tests/lfm2_prefill_prompt.txt` fixture is a copy of
+  `stage1/ctx/PROMPT_sorting.txt` (sha256
+  `fbf2be64cf0c793ec5083f9c5bb7cb23b99ee17e714d55c29fcadebd48c8f62a`); `stage1/` is
+  gitignored, which is why it was copied rather than referenced.
+
+## 10. Reproduce
 
 Record `/proc/loadavg` with every number. Two environment traps found the hard
 way, both of which silently produced a 20x-wrong number rather than an error:
