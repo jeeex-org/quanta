@@ -372,3 +372,16 @@ spill counts. 37 of 38 cases emit **byte-identical code** under 0.0.243 vs 0.0.2
 `regpressure` (one of the three that changed) went 401 -> 381 instructions (-5.0 %) and 259 -> 239 home mem-ops.
 Meanwhile 36 byte-identical rows swung **-12.5 % to +20.0 %** in wall time, and the same binary gave `heavy_div2`
 32.85x at load 17-20 and 21.68x at load 12 — so instruction/frame/spill counts are the evidence and ratios are not.
+
+---
+
+## Next lever (appended after 0.0.245): cross-block liveness
+
+Home-store elimination (0.0.245, write-back on demand) cut suite-wide home stores 3,395 -> 1,963 (-42.2 %)
+and loop instructions 11.7-18.6 % with frames and loads unchanged. What remains in the hot loops is the
+boundary flush: `flush_all()` re-stores every live value at each block boundary and every `IR_CALL`, and
+some of those values are **dead** in the successor block. Cross-block liveness (is this vreg read again
+after this boundary?) is the next lever; the divmod floor-semantics row that caught the miscompile during
+0.0.245's development is the existing red-first guard for the whole home-store invariant.
+Also note: the gate command documented in this file ran with `ulimit -v 6000000`, which is below the
+compiler's ~6.2 GB floor and once produced 229 spurious compile-fails; it is 8000000 now. Use 8 GB.
