@@ -885,10 +885,21 @@ echo "  bare-metal    : $([ $BM_RC = 0 ] && echo GREEN || echo RED)  (ring-0 und
 # stale IR). qobj_gate.sh is the only stage that exercises the format.
 # NATIVE_RC is folded into FUNCTIONAL_RC above and listed separately for
 # clarity: a native regression blocks promotion even though extern still works.
+# The float-oper/float-builtin/float-return/float-operpath and extern/extern-ld
+# stages likewise fold into FUNCTIONAL_RC at their definitions, so their
+# separate RC names are redundant in this test -- adding them would change
+# nothing.
+#
+# GGUF_RC and FPR_RC are DIFFERENT: they are set (0/1) and PRINTED in the
+# summary, but they were NEVER folded into FUNCTIONAL_RC and never named here,
+# so a RED gguf-corrupt or float-print stage could not fail the gate -- a check
+# whose colour the exit ignored (the "a check that cannot fail is worse than no
+# check" class). They are named explicitly below.
 if [ $FUNCTIONAL_RC -ne 0 ] || [ $NATIVE_RC -ne 0 ] || [ $SECURITY_RC -ne 0 ] || [ $PERF_RC -ne 0 ] \
    || [ $VALGRIND_RC -ne 0 ] || [ $FUZZ_RC -ne 0 ] || [ $DIFF_RC -ne 0 ] \
    || [ $GENERICS_RC -ne 0 ] || [ $STDLIB_RC -ne 0 ] || [ $MTU_RC -ne 0 ] \
-   || [ $QOBJ_RC -ne 0 ] || [ $VERIFY_STATUS_RC -ne 0 ] || [ $OUTGUARD_RC -ne 0 ] || [ $NAKED_RC -ne 0 ] || [ $ASM_RC -ne 0 ] || [ $BM_RC -ne 0 ]; then
+   || [ $QOBJ_RC -ne 0 ] || [ $VERIFY_STATUS_RC -ne 0 ] || [ $OUTGUARD_RC -ne 0 ] || [ $NAKED_RC -ne 0 ] || [ $ASM_RC -ne 0 ] || [ $BM_RC -ne 0 ] \
+   || [ $GGUF_RC -ne 0 ] || [ $FPR_RC -ne 0 ]; then
   exit 1
 fi
 exit 0
