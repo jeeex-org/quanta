@@ -325,6 +325,42 @@ objdump -d a5_probe.o | grep -c 42200408     # 0 = free never fires
 objdump -d a5_probe.o | grep -c "89 1c 25"   # 0 = no free-list store bytes
 ```
 
+#### A5 · FIXED in the 0.0.242 WIP tree — **NOT PROMOTED** (gate RED). Detector + handler + return ordering.
+
+Full trail: `compiler/0.0.242/WIP.md`. The detector was worse than the field
+bug above: it had **two** record-read defects. Measured with an instrumented
+compiler on `let p = mem_alloc(8)` — `irop(irc-1)` is `IR_MOV` (the binding MOV
+that `parse_let` emits at `parse.quanta:1315`); the `IR_CALL` is at `irc-2`;
+`ira0(irc-2)=22` with `src+22=="mem_alloc(8)"`, `ira1=1` (nargs), `ira2=1`
+(arg-start). So the old code read a MOV (never entering the `IR_CALL` branch)
+*and* the wrong fields. Fixed: step over the binding MOV, read `a0`, scan the
+name length from the source bytes.
+
+Two more defects on the same path had to be fixed before the free was correct:
+
+- **The IR_FREE handler was mis-encoded.** It emitted `48 89 5b 08`
+  (`mov %rbx,0x8(%rbx)`) and `48 89 1b` (`mov %rbx,(%rbx)`) — clobbering the
+  block's length header `[p]` and **never writing `HEAP_CTRL`**. Correct ModRM
+  `48 89 43 08` / `48 89 1C 25` (the idiom at `codegen.quanta:2551`). A
+  detector-only build corrupts memory; proof: `tests/raii_autofree_test.quanta`
+  exits 1 with `139773645234176 139773645234176 …`.
+- **`parse_ret` freed before evaluating the return expression**
+  (`parse.quanta:490-491`): `return file_open(cp + 8, …)` in `lib/std/fs`'s
+  `open()` freed `cp` before the call read `cp+8` → `open` returned "open
+  failed". Fixed by emitting the frees after `parse_expr()`.
+
+Proven firing: `0x42200408` refs 0→2 and `48 89 1c 25` 0→1 per free site; the
+free-list chain test is `tests/raii_autofree_test.quanta` (0.0.241 golden rc=3
+→ 0.0.242 rc=0, 5/5 deterministic).
+
+**Why it is NOT promoted:** enabling the auto-free changes 341 of 821 corpus
+units' codegen and breaks **26 `EXPECTED.tsv` rows** (`219/229`; see
+`compiler/0.0.242/WIP.md` §5). The ownership rule ("any block-scoped
+`mem_alloc` is owned") is unsound without escape detection — `lib/std/fmt`
+returns a `mem_alloc` buffer and double-frees it. The recorded memory win is
+also nil (peak RSS 79 840 → 82 064 kB over 20 000 allocs: reuse is deferred, so
+the free only pushes onto a list nobody consumes).
+
 ### A6 · SUPERSEDED (see the FIXED and PROMOTED entry below) · root cause confirmed; three fix mechanisms measured and rejected
 
 Documented at length in `docs/research/call-order-f64-defect.md` and `WIP.md`: `reduce(0.5)` is correct only
@@ -611,6 +647,73 @@ per-call threads (never enabled, so unexercised); bare `mm_matvec_par` callers o
 bracket get a pool per call. A timed `futex_wait` was tried in the driver and reverted —
 it made argmax diverge (5922 -> 35808/8696, varying) while the untimed wait is stable.
 Full trail: `docs/research/threaded-forward-defect.md`.
+
+### A10 · FIXED (0.0.241) · a top-level `const` with a FLOAT initialiser evaluated to 0
+
+Root-caused: the lexer emits a float literal as **`TT_FNUM` (7)**, value
+`(mantissa << 8) | frac_digits` with the decimal exponent in the token's side
+word, but `eval_const()`'s literal branch tests **`TT_NUM` (2)** — so a float
+literal matched nothing, `ec_factor()` returned 0 *without consuming the token*,
+and 0 was written to the const table. Two sites (`features.quanta` kt==57, which
+is the one that runs for a top-level const, and `parse_const()`) had copied the
+bug. `CF + 2.5` returned 2.5 on 0.0.240, 5.0 on 0.0.241. Row:
+`test_suites/codes/const_float_test.quanta` (EXPECTED.tsv, rc 0; RED on 0.0.240).
+**Still unsupported:** a negative float literal `-2.5` (unary minus in front of a
+float literal) — recorded here so it is not mistaken for fixed. Full trail:
+`compiler/0.0.241/WIP.md` §1.
+
+### A11 · gate-covered (0.0.241) · the sampling EOS-exclusion policy had no gate row
+
+The EOS-exclusion policy in the sampler (an EOS id must be excluded from the
+candidate set except where the policy allows it) was ungated. Row added:
+`test_suites/codes/sampling_eos_test.quanta` (EXPECTED.tsv, rc 0; commit
+5ed79597). `docs/README-lfm2-generate.md` said the row did not exist and was
+corrected in a1c8eef6.
+
+### A12 · FIXED (0.0.241) · `lib/std/tokenizer_trait.quanta` called `bpe_encode`, not `bpe_encode_special`
+
+The delegation used `bpe_encode`, which does no special-token matching, so the
+thinking/BOS ids were tokenised as ordinary text. Fix: call
+`bpe_encode_special`. Row: `test_suites/codes/std_tokenizer_trait_special_test.quanta`
+(EXPECTED_STDLIB.tsv; RED — 4 check(s) rc=1 — before the fix, PASS rc=0 after).
+Full trail: `compiler/0.0.241/WIP.md` §2.
+
+### A13 · gate coverage ADDED (0.0.241) · `lib/std/rag.quanta` was exercised by nothing
+
+`lib/std/rag.quanta` was absent from `EXPECTED_STDLIB.tsv`, so the RAG unit's
+edits to it were tested by no gate row (the live probe needs a hand-placed
+`/tmp/rag_emb_hex.txt` that nothing creates — the real encoder needs torch, which
+cannot map its shared objects under the runner's address-space cap). Row added:
+`test_suites/codes/stdlib_rag_search_gate_test.quanta` (EXPECTED_STDLIB.tsv, rc 0
+— it builds a deterministic index in-language, hex-encodes it itself and drives
+the whole spill → fork/exec → sqlite-vec KNN path). Full trail:
+`compiler/0.0.241/WIP.md` §4.
+
+### A14 · root-caused (0.0.241) · native logits diverge from the reference with prefill position
+
+Premise: native `p("The") = 0.251` vs llama.cpp `0.847`, top-10 overlap 1/10,
+argmax agrees. Measured: the Q6_K dequant is **bit-exact** (0 ULP, real kernel
+via a shim — prime suspect refuted), the tied output projection is exact
+(max 2.7e-14), and forward positions 0-2 agree to corr 0.988-0.9997 against
+llama.cpp on identical ids. The first clear break is **between prefill positions
+3 and 4** (corr 0.9538 → 0.6881) and grows with position → the defect is in
+**state carried across positions** (per-layer short-conv state and/or the KV
+cache), not in the Q6_K decoder or the projection. Reference row (no model
+needed): `test_suites/codes/q6k_dequant_ref_test.quanta` (EXPECTED.tsv, rc 0).
+**The follow-on per-layer-norm fix and its evidence live in the peer unit's
+write-up — `docs/research/lfm2-perlayer-norm-defect.md` (referenced, not edited
+here).** 0.0.241 trail: `compiler/0.0.241/WIP.md` §3.
+
+### A15 · FIXED in the 0.0.242 WIP tree — `mem_free` / `drop` never wrote the free list
+
+Same mis-encoding as the A5 IR_FREE handler (below §A5): `emitter.quanta:1995-1996`
+(mem_free) and `2056-2057` (drop) emitted `48 89 5b 08` (`mov %rbx,0x8(%rbx)`) and
+`48 89 1b` (`mov %rbx,(%rbx)`) instead of `48 89 43 08` (`[ptr+8] = old head`) and
+`48 89 1C 25` (`[HEAP_CTRL] = ptr`), so a manual free has **never** pushed onto
+the free list — it corrupted `[p]` and `[p+8]`. `lib/std` calls `mem_free` in 13
+files. `test_suites/codes/mem_free_test.quanta` passes rc=0 on both compilers
+because it never inspects the free list. Fixed in the 0.0.242 WIP (not promoted,
+same gate-RED reason as A5). Discovery trail: `compiler/0.0.242/WIP.md` §3.
 
 ---
 
