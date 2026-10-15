@@ -170,7 +170,7 @@ above). Policy now: exclude `sampling_eos` unless it is the argmax; optional
 behaviour moved. Signatures unchanged (`sample_full` is still 4 args); a caller
 opts in with `sample_set_eos(bpe_eos)`. Also see `tests/sampling_eos_selfcheck.quanta`
 — the numpy-free, model-free property check written to be registrable as a gate
-row, since `lib/std/sampling.quanta` has no row in either manifest today.
+row, since `lib/std/sampling.quanta` was ungated until `5ed79597` added `sampling_eos_test.quanta` to `EXPECTED.tsv` (now 228 native rows); it was ungated when this was written.
 
 ## Cost — and the blocker that outranks all of the above
 
