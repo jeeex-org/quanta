@@ -448,6 +448,37 @@ else
   echo "  SKIP: generics_neg_tests.sh missing"
 fi
 
+# --- per-row wall-clock budget ------------------------------------------------
+# quanta_run.sh caps every binary at QUANTA_TIME_S (default 15 s). That default
+# is right for a small in-process test and WRONG for a row whose runtime is
+# dominated by reading a multi-GB store off disk: its duration then tracks the
+# host page cache and the machine load, not the code under test, so at a fixed
+# 15 s it is randomly RED -- and a row that is green or red by load is worse than
+# no row, because it trains people to ignore the gate.
+#
+# So the heavy rows declare a real allowance here, by name, with the measurement
+# that justifies the number. This is the mechanism; a new heavy row is one case
+# arm plus the numbers that size it. Rows not listed keep the 15 s default (an
+# explicit QUANTA_TIME_S still raises every row, as before).
+#
+# MEASURED (this box, governor `powersave` (~2.2-2.8 of 5.4 GHz); load 10-12 with
+# an ambient `Hermes` process at ~747% CPU -- recorded because the numbers are
+# only meaningful with the load beside them; `sudo sh -c 'echo 3 >/proc/sys/vm/
+# drop_caches'` to force the cold paths):
+#   stdlib_rag_search_gate_test warm 2.1-3.8 s | DB-cold 18.5-18.8 s (n=2)
+#   | everything-cold 66.5 s (n=1)  -- vs the 15 s cap it was killed at.
+stdlib_time_budget() {
+  case "$1" in
+    # fork+execs scripts/rag_search_file.py: a sqlite-vec vec0 KNN over the 21 GB
+    # /opt/tali/ti/ai/rag/vectors.db, run TWICE (search + determinism re-check).
+    # It flaked rc=124 in two separate gate runs (see docs/plans/bugs.md A16).
+    # 120 s covers the worst measured cold path (66.5 s) with ~1.8x headroom and
+    # still bounds a genuine hang.
+    stdlib_rag_search_gate_test.quanta) echo 120 ;;
+    *) echo "${QUANTA_TIME_S:-15}" ;;
+  esac
+}
+
 echo "########## STDLIB SUITE (lib/std/* via import) ##########"
 STDLIB_RC=0
 if [ -f "$TEST_SUITES/EXPECTED_STDLIB.tsv" ]; then
@@ -522,7 +553,7 @@ if [ -f "$TEST_SUITES/EXPECTED_STDLIB.tsv" ]; then
     # Capture output so a self-reported SKIP can be detected. A CUDA test that
     # skips has not tested anything, so counting it as a pass is how the CUDA
     # path stayed "green" while the daemon was actually broken.
-    STDLIB_OUT="$(./scripts/quanta_run.sh "$bin" < /dev/null 2>&1)"
+    STDLIB_OUT="$(QUANTA_TIME_S="$(stdlib_time_budget "$name")" ./scripts/quanta_run.sh "$bin" < /dev/null 2>&1)"
     actual=$?
     set -e
     case "$name" in
@@ -577,7 +608,12 @@ echo "########## QOBJ (module cache: write, read, cache-only consume) ##########
 # cache-only build was silently broken for a long time.
 QOBJ_RC=0
 if [ -f "$TEST_SUITES/scripts/gguf_corrupt_gate.sh" ]; then
-  if bash "$TEST_SUITES/scripts/gguf_corrupt_gate.sh"; then
+  # Hand it the compiler UNDER TEST, exactly like security/perf/generics/
+  # multi_tu/qobj_gate below. Without QC= here the script resolved
+  # compiler/$(cat VERSION) itself, so a WIP gate (QC=<NEXT>, VERSION=<VER>)
+  # compiled its probe with the OLD qc and reported RED on a compiler nobody
+  # handed it (`undeclared function: dq6` until VERSION was bumped).
+  if QC="$QC" bash "$TEST_SUITES/scripts/gguf_corrupt_gate.sh"; then
     GGUF_RC=0
   else
     GGUF_RC=1
