@@ -1,7 +1,17 @@
 // known-fail: on the shipping compiler (0.0.241) this exits 3 -- the A5 RAII
 // auto-free is dead code. It exits 0 on the 0.0.242 WIP build (detector fixed).
-// Not a gate row yet: enabling the auto-free breaks 26 EXPECTED rows (see
-// compiler/0.0.242/WIP.md), so it must not enter test_suites/EXPECTED.tsv until
+// DO NOT add this to a manifest (EXPECTED.tsv OR EXPECTED_STDLIB.tsv).
+// Enabling the auto-free on 0.0.242 breaks 26 EXPECTED rows, and the blocker is
+// UNSOUND OWNERSHIP, not a detector that still needs work:
+//   * lib/std/fmt.quanta fmt_print_char does `let buf = mem_alloc(3)` (owned ->
+//     auto-freed at scope exit) and then `free(buf)` -- a DOUBLE FREE, because
+//     `free` is not mem_free/drop and the RAII pass does not know that;
+//   * functions that RETURN a mem_alloc buffer (formatted strings) hand the
+//     caller a block the RAII pass also frees.
+// Marking a block-scoped mem_alloc owned is correct only when the pointer cannot
+// escape (returned, stored, captured, passed to a retainer), and deciding that
+// needs escape/alias analysis, which does not exist. See
+// compiler/0.0.242/WIP.md sections 5b-5c. The row becomes registrable when
 // escape detection lands.
 //
 // Run manually:
