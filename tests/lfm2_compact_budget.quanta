@@ -1,0 +1,172 @@
+// tests/lfm2_compact_budget.quanta -- what the PROPOSED compact SI prompt costs,
+// counted with the SAME in-tree BPE the forward pass uses, next to what the
+// CURRENT assembled prompt costs, section by section.
+//
+// WHY: tests/lfm2_prompt_budget.quanta measured the shipped prompt at 3,638
+// tokens -- LANGUAGE_CARD 1,973 (54%), SYSTEM card + labels 1,115 (31%),
+// retrieved neighbour 344 (9%), spec 206 (6%) -- i.e. 85% static scaffolding
+// re-prefilled on every attempt. That is ~43 min per attempt batched, so the
+// budget has to come down to the low hundreds. This does NOT argue that; it
+// counts both prompts with the encoder the model actually sees, so the shrink is
+// a measurement and not an estimate.
+//
+// WHAT IT MEASURES
+//   tests/lfm2_prefill_prompt.txt  (the CURRENT assembled prompt, unchanged)
+//       head  = SYSTEM card + section labels   [0, m1)
+//       card  = LANGUAGE_CARD                  [m1, m2)
+//       neigh = retrieved neighbour            [m2, m3)
+//       spec  = the task                       [m3, n)
+//   tests/lfm2_compact_card.txt    (the PROPOSED replacement head)
+//       compact = a terse rules card; the LANGUAGE_CARD dump is NOT retrieved at
+//                 all and the duplicate RETRIEVED CONTEXT 1/3 section is gone
+//
+//   Reported: every section of both, the proposed per-attempt prompt
+//   (compact + spec, no neighbour), that same prompt with the compact card
+//   PREFIX-CACHED (spec only), and the byte counts, so the difference between a
+//   token count and a byte count cannot hide.
+//
+// Section boundaries are found by the marker TEXT, not by a run of '=': two
+// weaker scans (see tests/lfm2_prompt_budget.quanta) both produced wrong
+// boundaries, which is exactly how a token budget goes quietly wrong.
+//
+// Build:  compiler/<ver>/bin/x86/qc tests/lfm2_compact_budget.quanta <bin>
+// Run:    ( ulimit -c 0 -v 8000000; <bin> </dev/null )   from the repo root
+
+import std/gguf
+import std/lfm2_bpe
+import std/fs
+
+const PROMPT_PATH = "tests/lfm2_prefill_prompt.txt"
+const COMPACT_PATH = "tests/lfm2_compact_card.txt"
+const CAP = 131072
+const MAXIDS = 16384
+
+let plen = 0
+
+fn slurp(fd) {
+    if fd < 0 { return 0 }
+    let b = mem_alloc(CAP)
+    let got = read_raw(fd, b, CAP)
+    file_close(fd)
+    if got <= 0 { return 0 }
+    plen = got
+    return b
+}
+
+fn is_eq(buf, i, n) {
+    if i < 0 || i >= n { return 0 }
+    if mem_load8(buf + i) == 61 { return 1 }
+    return 0
+}
+
+fn marker_like(buf, i, n, c0, c1, c2, c3) {
+    if i < 1 || i + 9 >= n { return 0 }
+    if mem_load8(buf + i - 1) != 10 { return 0 }
+    if is_eq(buf, i, n) == 0 { return 0 }
+    if is_eq(buf, i + 1, n) == 0 { return 0 }
+    if is_eq(buf, i + 2, n) == 0 { return 0 }
+    if is_eq(buf, i + 3, n) == 0 { return 0 }
+    if is_eq(buf, i + 4, n) == 0 { return 0 }
+    if mem_load8(buf + i + 5) != 32 { return 0 }
+    if mem_load8(buf + i + 6) != c0 { return 0 }
+    if mem_load8(buf + i + 7) != c1 { return 0 }
+    if mem_load8(buf + i + 8) != c2 { return 0 }
+    if mem_load8(buf + i + 9) != c3 { return 0 }
+    return 1
+}
+
+fn find_retr(buf, n, which) {
+    let found = 0
+    let i = 1
+    while i < n - 10 {
+        if marker_like(buf, i, n, 82, 69, 84, 82) == 1 {
+            if found == which { return i }
+            found = found + 1
+        }
+        i = i + 1
+    }
+    return 0 - 1
+}
+
+fn find_task(buf, n) {
+    let i = 1
+    while i < n - 10 {
+        if marker_like(buf, i, n, 84, 65, 83, 75) == 1 { return i }
+        i = i + 1
+    }
+    return 0 - 1
+}
+
+fn count_tokens(buf, p, len, ids) {
+    if len <= 0 { return 0 }
+    let n = bpe_encode(buf + p, len, ids, MAXIDS)
+    if n < 0 { return 0 - 1 }
+    return n
+}
+
+fn show(label, tokens, bytes) {
+    prints(label)
+    prints(" tokens=")
+    print(tokens)
+    prints(" bytes=")
+    print(bytes)
+    newline()
+    return 0
+}
+
+fn main() {
+    prints("=== SI prompt budget: current vs proposed compact (in-tree BPE) ===\n")
+    if gguf_load("/opt/ai/models/quanta/QUANTA-LFM2.5-2.6Bv1-Q4_K_M.gguf") != 0 {
+        prints("FAIL gguf_load\n"); return 1
+    }
+    if bpe_init_from_gguf() == 0 { prints("FAIL bpe_init\n"); return 1 }
+
+    let ids = mem_alloc(MAXIDS * 8)
+
+    // ---- the CURRENT assembled prompt, section by section ----
+    let buf = slurp(file_open(PROMPT_PATH, 0))
+    if buf == 0 { prints("FAIL read prompt\n"); return 1 }
+    let n = plen
+    let m1 = find_retr(buf, n, 0)
+    let m2 = find_retr(buf, n, 1)
+    let m3 = find_task(buf, n)
+    prints("current markers="); print(m1); prints(" "); print(m2)
+    prints(" "); print(m3); prints(" whole_bytes="); print(n); newline()
+    if m1 < 0 || m2 < 0 || m3 < 0 { prints("FAIL markers\n"); return 1 }
+
+    let headn = count_tokens(buf, 0, m1, ids)
+    let cardn = count_tokens(buf, m1, m2 - m1, ids)
+    let neighn = count_tokens(buf, m2, m3 - m2, ids)
+    let specn = count_tokens(buf, m3, n - m3, ids)
+    let alln = count_tokens(buf, 0, n, ids)
+    show("current SYSTEM+labels      ", headn, m1)
+    show("current LANGUAGE_CARD      ", cardn, m2 - m1)
+    show("current neighbour          ", neighn, m3 - m2)
+    show("current spec               ", specn, n - m3)
+    show("current WHOLE PROMPT       ", alln, n)
+    prints("current STATIC (head+card)=")
+    print(headn + cardn)
+    newline()
+
+    // ---- the PROPOSED compact card ----
+    let cbuf = slurp(file_open(COMPACT_PATH, 0))
+    if cbuf == 0 { prints("FAIL read compact card\n"); return 1 }
+    let cn = plen
+    let compactn = count_tokens(cbuf, 0, cn, ids)
+    show("compact card (proposed)    ", compactn, cn)
+
+    // ---- the proposed prompt ----
+    prints("--- proposed ---\n")
+    show("per-attempt = compact+spec ", compactn + specn, cn + (n - m3))
+    show("per-attempt, card PREFIX-CACHED (spec only)", specn, n - m3)
+    show("with one neighbour retained", compactn + specn + neighn, cn + (n - m3) + (m3 - m2))
+    prints("shrink vs current whole x100=")
+    print(alln * 100 / (compactn + specn))
+    newline()
+    prints("shrink vs current static x100=")
+    print((headn + cardn) * 100 / compactn)
+    newline()
+
+    prints("COMPACT_BUDGET DONE\n")
+    return 0
+}

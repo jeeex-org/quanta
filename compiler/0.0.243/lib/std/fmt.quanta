@@ -1,0 +1,180 @@
+// Native Quanta formatted output (replaces libc printf)
+// Uses existing print/println/printi builtins + mem_load8 for byte access
+
+import std/str
+
+// Helper: create a 1-char string on the stack and print it
+fn fmt_print_char(c: i64): i64 {
+    // Allocate a small string header: [len=1][char]
+    let buf = mem_alloc(3)  // 3 * 8 = 24 bytes, enough for header + 1 byte
+    mem_store(buf, 1)       // length = 1
+    mem_store8(buf + 8, c)  // character
+    prints(buf)
+    free(buf)
+    return 1
+}
+
+// printf-like formatting using native Quanta builtins
+// Supports: %d (int), %s (string), %% (literal %)
+// Returns number of characters written (like printf)
+
+fn fmt_write_str(s: i64): i64 {
+    // s is a string (ptr to [len][bytes])
+    prints(s)
+    return len(s)
+}
+
+fn fmt_write_int(val: i64): i64 {
+    printi(val)
+    // We can't easily get the count, return approximate
+    if val == 0 { return 1 }
+    let n = val
+    let count = 0
+    if n < 0 { count = 1; n = -n }
+    while n > 0 {
+        count = count + 1
+        n = n / 10
+    }
+    return count
+}
+
+// Simple printf: scan fmt string, handle %d %s %%
+fn fmt_printf(fmt: i64): i64 {
+    let fmt_len = len(fmt)
+    let fmt_ptr = fmt + 8
+    let written = 0
+    let i = 0
+    
+    while i < fmt_len {
+        let c = mem_load8(fmt_ptr + i)
+        if c == 37 {  // '%'
+            i = i + 1
+            if i >= fmt_len { break }
+            let next = mem_load8(fmt_ptr + i)
+            if next == 100 {  // 'd' - integer
+                prints("INT_PLACEHOLDER")
+                written = written + 13
+            } else if next == 115 {  // 's' - string
+                prints("STR_PLACEHOLDER")
+                written = written + 13
+            } else if next == 37 {  // '%' - literal %
+                fmt_print_char(37)
+                written = written + 1
+            } else {
+                prints("%")
+                fmt_print_char(next)
+                written = written + 2
+            }
+        } else {
+            // Regular character - print one char
+            fmt_print_char(c)
+            written = written + 1
+        }
+        i = i + 1
+    }
+    return written
+}
+
+// printf with int arg: fmt_printf_int(fmt, val) for %d
+fn fmt_printf_int(fmt: i64, val: i64): i64 {
+    let fmt_len = len(fmt)
+    let fmt_ptr = fmt + 8
+    let written = 0
+    let i = 0
+    
+    while i < fmt_len {
+        let c = mem_load8(fmt_ptr + i)
+        if c == 37 {
+            i = i + 1
+            if i >= fmt_len { break }
+            let next = mem_load8(fmt_ptr + i)
+            if next == 100 {  // %d
+                written = written + fmt_write_int(val)
+            } else if next == 37 {  // %%
+                fmt_print_char(37)
+                written = written + 1
+            } else {
+                prints("%")
+                fmt_print_char(next)
+                written = written + 2
+            }
+        } else {
+            fmt_print_char(c)
+            written = written + 1
+        }
+        i = i + 1
+    }
+    return written
+}
+
+// printf with string arg: fmt_printf_str(fmt, s) for %s
+fn fmt_printf_str(fmt: i64, s: i64): i64 {
+    let fmt_len = len(fmt)
+    let fmt_ptr = fmt + 8
+    let written = 0
+    let i = 0
+    
+    while i < fmt_len {
+        let c = mem_load8(fmt_ptr + i)
+        if c == 37 {
+            i = i + 1
+            if i >= fmt_len { break }
+            let next = mem_load8(fmt_ptr + i)
+            if next == 115 {  // %s
+                written = written + fmt_write_str(s)
+            } else if next == 37 {  // %%
+                fmt_print_char(37)
+                written = written + 1
+            } else {
+                prints("%")
+                fmt_print_char(next)
+                written = written + 2
+            }
+        } else {
+            fmt_print_char(c)
+            written = written + 1
+        }
+        i = i + 1
+    }
+    return written
+}
+
+// printf with int + string: fmt_printf_int_str(fmt, val, s) for %d %s
+fn fmt_printf_int_str(fmt: i64, val: i64, s: i64): i64 {
+    let fmt_len = len(fmt)
+    let fmt_ptr = fmt + 8
+    let written = 0
+    let i = 0
+    let seen_int = 0
+    
+    while i < fmt_len {
+        let c = mem_load8(fmt_ptr + i)
+        if c == 37 {
+            i = i + 1
+            if i >= fmt_len { break }
+            let next = mem_load8(fmt_ptr + i)
+            if next == 100 {  // %d
+                if seen_int == 0 {
+                    written = written + fmt_write_int(val)
+                    seen_int = 1
+                } else {
+                    written = written + fmt_write_int(0)
+                }
+            } else if next == 115 {  // %s
+                written = written + fmt_write_str(s)
+            } else if next == 37 {  // %%
+                fmt_print_char(37)
+                written = written + 1
+            } else {
+                prints("%")
+                fmt_print_char(next)
+                written = written + 2
+            }
+        } else {
+            fmt_print_char(c)
+            written = written + 1
+        }
+        i = i + 1
+    }
+    return written
+}

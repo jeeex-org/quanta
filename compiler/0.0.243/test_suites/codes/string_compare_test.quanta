@@ -1,0 +1,45 @@
+// Regression test for String comparison (str_eq / str_ne / == / !=).
+// Length-aware byte compare; the previous silent bug returned garbage for
+// equal 2+ char strings (rax clobbered by 'mov al,[rsi]') and pointed the
+// loop at the length header instead of char data.
+// Exits 0 only if EVERY check passes; otherwise a distinct non-zero code.
+fn main() {
+  // --- str_eq: 1 if equal, 0 if differ ---
+  if str_eq("aa", "aa") == 0 { exit(1) }
+  if str_eq("ab", "ab") == 0 { exit(2) }
+  if str_eq("abc", "abc") == 0 { exit(3) }
+  if str_eq("hello", "hello") == 0 { exit(4) }
+  if str_eq("aa", "ab") == 1 { exit(5) }
+  if str_eq("ab", "abc") == 1 { exit(6) }       // length differs
+  if str_eq("hello", "world") == 1 { exit(7) }
+  if str_eq("same", "samex") == 1 { exit(8) }    // prefix, length differs
+
+  // --- str_ne: 1 if differ, 0 if equal ---
+  if str_ne("aa", "aa") == 1 { exit(9) }
+  if str_ne("ab", "ab") == 1 { exit(10) }
+  if str_ne("aa", "ab") == 0 { exit(11) }
+  if str_ne("hello", "world") == 0 { exit(12) }
+  if str_ne("ab", "abc") == 0 { exit(13) }
+
+  // --- == / != desugar on String bindings ---
+  let s1: String = "abc"
+  let s2: String = "abc"
+  let e1 = s1 == s2
+  if e1 == 0 { exit(14) }
+  let n1 = s1 != s2
+  if n1 == 1 { exit(15) }
+  let s3: String = "abd"
+  let e2 = s1 == s3
+  if e2 == 1 { exit(16) }
+  let n2 = s1 != s3
+  if n2 == 0 { exit(17) }
+
+  // --- concat then compare (string ops compose) ---
+  let c: String = "ab" .. "cd"
+  let ec = c == "abcd"
+  if ec == 0 { exit(18) }
+  let nc = c != "abcd"
+  if nc == 1 { exit(19) }
+
+  exit(0)
+}

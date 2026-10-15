@@ -1,0 +1,192 @@
+// tests/f64of_mem_load_shape_test.quanta -- pins the SHAPE CLASS that a 0.0.241
+// research note (docs/research/prefill-batching.md, section 3) reported as
+// crashing: two `f64of(mem_load(...))` operands inside ONE arithmetic
+// expression, "the second operand's address comes out 0 -> SIGSEGV at address
+// 0". The workaround it records is one mem_load per `let`.
+//
+// MEASURED NEGATIVE RESULT -- THIS TEST DOES NOT REPRODUCE A DEFECT.
+//   On the 0.0.241 golden compiler the shape is CORRECT in every form tried:
+//
+//     * 1920 generated programs (8 index forms x 8 x 5 contexts x 3 pointer
+//       kinds -- local, module-global, function-parameter -- x 2 operators),
+//       compiled and run: 0 crashes, 0 wrong values (the 384 lines the first
+//       harness flagged were the harness reading P[0] after storing to P[i*8]);
+//     * all FIVE sites the note names (conv gate, conv kernel, conv output and
+//       both residuals) re-inlined into the real fc_conv_batch / fc_layer_batch
+//       in lib/std/lfm2_forward.quanta and run through
+//       tests/lfm2_batch_layer_unit.quanta: TOTAL_MISMATCH=0, rc=0.
+//
+//   So this file PINS the behaviour rather than reproducing a bug. It is GREEN
+//   on 0.0.241 and on 0.0.243, and it goes RED the moment a compiler change
+//   makes the idiom start mis-evaluating -- which is exactly the failure the
+//   original report describes, and which nothing in the tree currently covers.
+//   The full record, including why the codegen is safe here (an IR_CALL always
+//   calls flush_all() first, and spill_home(v) is unique per vreg, so no two
+//   live operands can share a home slot), is in
+//   docs/research/f64of-mem-load-shape.md.
+//
+// WHY PIN IT RATHER THAN DELETE IT
+//   The author's rule is "fixit, always verify no assume". A claim that a shape
+//   is SAFE is a claim, and this is the executable form of it. Every other
+//   mem_load-heavy file in lib/std (lfm2_mm, gguf, model_compute) uses this
+//   idiom heavily -- lib/std/lfm2_mm.quanta alone has 10 sites -- so a
+//   regression here would be silent and wide.
+//
+// Build:  compiler/<ver>/bin/x86/qc tests/f64of_mem_load_shape_test.quanta <bin>
+// Run:    ( ulimit -c 0 -v 4000000; <bin> </dev/null )
+//
+// Exit 0 and prints SHAPE PASS when every shape evaluates both operands at its
+// own address; exit 1 otherwise.
+
+// A holds 1.5, B holds 2.25 everywhere, and they DIFFER deliberately: if the
+// second operand ever read the first operand's address, the product would be
+// 1.5*1.5 and this test would see it. The same for the sums.
+const VA = 4609434218613702656   // f64bits(1.5)   -- derived: struct.unpack("<q",struct.pack("<d",1.5))
+const VB = 4612248968380809216   // f64bits(2.25)  -- derived: struct.unpack("<q",struct.pack("<d",2.25))
+const VAB_MUL = 4614782243171205120   // f64bits(1.5*2.25) = 3.375
+const VAB_ADD = 4615626668101337088   // f64bits(1.5+2.25) = 3.75
+
+let GA = 0
+let GB = 0
+let FAIL = 0
+
+fn fill(p) {
+    let i = 0
+    while i < 1024 { mem_store(p + i * 8, f64bits(1.5)); i = i + 1 }
+    return 0
+}
+fn fillb(p) {
+    let i = 0
+    while i < 1024 { mem_store(p + i * 8, f64bits(2.25)); i = i + 1 }
+    return 0
+}
+
+fn chk(label, want, got) {
+    if want != got {
+        prints("FAIL ")
+        prints(label)
+        prints(": got ")
+        print(got)
+        prints(" want ")
+        print(want)
+        newline()
+        FAIL = FAIL + 1
+    }
+    return 0
+}
+
+// The shape under test, as a function with POINTER PARAMETERS (the reported
+// sites used module globals and locals; parameters are the third kind).
+fn mul_two(p, a, b, t, k) {
+    mem_store(p, f64of(mem_load(a + t * 8)) * f64of(mem_load(b + (k + t) * 8)))
+    return 0
+}
+fn add_two(p, a, b, t) {
+    mem_store(p, f64of(mem_load(a + t * 8)) + f64of(mem_load(b + t * 8)))
+    return 0
+}
+fn three(p, a, b, t) {
+    mem_store(p, f64of(mem_load(a + t * 8)) * f64of(mem_load(b + t * 8)) * f64of(mem_load(a + (t + 1) * 8)))
+    return 0
+}
+
+fn main() -> i64 {
+    prints("=== f64of(mem_load) shape pin ===\n")
+    let A = mem_alloc(8192)
+    let B = mem_alloc(8192)
+    let P = mem_alloc(8192)
+    fill(A)
+    fillb(B)
+
+    // The two operand values must be DIFFERENT, or a clobber is invisible.
+    chk("A holds 1.5", VA, f64bits(f64of(mem_load(A))))
+    chk("B holds 2.25", VB, f64bits(f64of(mem_load(B))))
+    // f64of(mem_load(p)) and f64_load(p) must agree bit for bit.
+    chk("f64of==f64_load A", f64bits(f64_load(A)), f64bits(f64of(mem_load(A))))
+    chk("f64of==f64_load B", f64bits(f64_load(B)), f64bits(f64of(mem_load(B))))
+
+    let t = 5
+    let k = 3
+
+    // 1. let-bound product (the shape the note says was worked around).
+    let v1: f64 = f64of(mem_load(A + t * 8)) * f64of(mem_load(B + (k + t) * 8))
+    chk("let product", VAB_MUL, f64bits(v1))
+
+    // 2. stored directly, constant destination.
+    mem_store(P, f64of(mem_load(A + t * 8)) * f64of(mem_load(B + (k + t) * 8)))
+    chk("mem_store product", VAB_MUL, f64bits(f64_load(P)))
+
+    // 3. sum, not product -- a different opcode path.
+    mem_store(P, f64of(mem_load(A + t * 8)) + f64of(mem_load(B + (k + t) * 8)))
+    chk("mem_store sum", VAB_ADD, f64bits(f64_load(P)))
+
+    // 4. computed destination, so the store address also competes for a register.
+    mem_store(P + t * 8, f64of(mem_load(A + t * 8)) * f64of(mem_load(B + (k + t) * 8)))
+    chk("computed dst", VAB_MUL, f64bits(f64_load(P + t * 8)))
+
+    // 5. accumulated in a loop: both operands recomputed every iteration.
+    let acc: f64 = 0.0
+    let j = 0
+    while j < 4 {
+        acc = acc + f64of(mem_load(A + t * 8)) * f64of(mem_load(B + (k + t) * 8))
+        j = j + 1
+    }
+    chk("loop accumulate", f64bits(4.0 * 3.375), f64bits(acc))
+
+    // 6. THREE loads in one expression (a * b * a).
+    mem_store(P, f64of(mem_load(A + t * 8)) * f64of(mem_load(B + (k + t) * 8)) * f64of(mem_load(A + (t + 1) * 8)))
+    chk("three loads", f64bits(3.375 * 1.5), f64bits(f64_load(P)))
+
+    // 7. through a function, pointer parameters.
+    if mul_two(P, A, B, t, k) != 0 { FAIL = FAIL + 1 }
+    chk("param fn product", VAB_MUL, f64bits(f64_load(P)))
+    if add_two(P, A, B, t) != 0 { FAIL = FAIL + 1 }
+    chk("param fn sum", VAB_ADD, f64bits(f64_load(P)))
+    if three(P, A, B, t) != 0 { FAIL = FAIL + 1 }
+    chk("param fn three", f64bits(3.375 * 1.5), f64bits(f64_load(P)))
+
+    // 8. module globals (the reported sites read fc_pf_* globals).
+    GA = A
+    GB = B
+    mem_store(P, f64of(mem_load(GA + t * 8)) * f64of(mem_load(GB + (k + t) * 8)))
+    chk("global product", VAB_MUL, f64bits(f64_load(P)))
+
+    // 9. a nested mem_load in the FIRST pointer, second operand a plain one --
+    //    the mm_embed_logits shape that ships in lib/std/lfm2_mm.quanta.
+    let cell = mem_alloc(64)
+    mem_store(cell, A)
+    mem_store(P, f64of(mem_load(mem_load(cell) + t * 8)) * f64of(mem_load(B + (k + t) * 8)))
+    chk("nested pointer", VAB_MUL, f64bits(f64_load(P)))
+
+    // 10. the operands swapped: the SECOND operand is the one that was reported
+    //     broken, so read it first and last and check both orders agree.
+    mem_store(P, f64of(mem_load(B + (k + t) * 8)) * f64of(mem_load(A + t * 8)))
+    chk("operands swapped", VAB_MUL, f64bits(f64_load(P)))
+
+    // 11. both operands from the SAME base at adjacent addresses: an
+    //     off-by-one-discard of the second address shows up as 2.25 (VA-ish)
+    //     instead of the product, because A and B differ.
+    mem_store(P, f64of(mem_load(A + t * 8)) * f64of(mem_load(B + t * 8)))
+    chk("same index both", VAB_MUL, f64bits(f64_load(P)))
+
+    // 12. a differing pair per element across a whole row: 16_384 products, so a
+    //     clobber that only fires under register pressure is inside the sample.
+    let row = mem_alloc(1024 * 8)
+    let i = 0
+    while i < 1024 {
+        mem_store(row + i * 8, f64of(mem_load(A + i * 8)) * f64of(mem_load(B + i * 8)))
+        i = i + 1
+    }
+    let bad = 0
+    i = 0
+    while i < 1024 {
+        if mem_load(row + i * 8) != VAB_MUL { bad = bad + 1 }
+        i = i + 1
+    }
+    chk("1024-row sweep", 0, bad)
+
+    newline()
+    if FAIL == 0 { prints("SHAPE PASS\n"); return 0 }
+    prints("SHAPE FAIL\n")
+    return 1
+}

@@ -1,0 +1,180 @@
+// tests/lfm2_mm_workers_zero_test.quanta -- A12 (0.0.243): `mm_workers = 0`, the
+// DOCUMENTED serial setting, was an integer division by zero in the batched
+// entry points, and batched prefill made those the default path.
+//
+// THE DEFECT (found while landing batched prefill, fixed in c77d06db and pinned
+// here). mm_workers / mm_embed_workers default to 0 and `mm_set_workers(0)` is
+// documented as "the serial path, so nothing changes for callers that do not opt
+// in" (lib/std/lfm2_mm.quanta:258-265). mm_matvec and mm_embed_logits guard
+// BEFORE dividing --
+//
+//     if mm_workers > 1 { if rows / mm_workers >= 1 { return mm_matvec_par(...) } }
+//
+// -- but the new mm_matmul and mm_embed_logits_batch computed
+//
+//     let per = rows / mm_workers            // rcx = 0  ->  idiv %rcx  ->  SIGFPE
+//
+// BEFORE testing `<= 1`. `tests/lfm2_op_profile.quanta` runs with mm_workers = 0,
+// so the first batched probe died with SIGFPE at `idiv %rcx`, rcx = 0. Nothing in
+// the benchmark path saw it because the bench's serial runs pass workers=1, not 0.
+//
+// THE FIX. Guard first, divide second, at BOTH sites:
+//     if mm_workers <= 1 { return mm_matmul_ser(...) }
+//     let per = rows / mm_workers
+//     if per < 1 { return mm_matmul_ser(...) }
+//
+// RED-FIRST. Reverting the guard in lib/std/lfm2_mm.quanta -- so the division
+// runs first again -- makes this file die with SIGFPE (rc=136, no output) at the
+// first workers=0 call; with the guard in place it prints WORKERS0 PASS, rc=0.
+// Both states were measured; the transcripts are in
+// docs/research/lfm2-defects-0.0.243.md.
+//
+// WHAT IT ASSERTS, beyond "does not trap":
+//   1. mm_workers = 0 returns 0 from mm_matmul (not -1, not a fault);
+//   2. its output is BIT-IDENTICAL to the mm_workers = 1 serial path -- the
+//      guard is documented as "same reads, same arithmetic, same summation
+//      order", and that is the property the default depends on;
+//   3. the same for mm_embed_workers = 0 and mm_embed_logits_batch;
+//   4. a negative worker count clamps to 0 and still works (mm_set_workers does
+//      `if n < 0 { n = 0 }`), and mm_workers = 4 still runs the pool path and
+//      still agrees bit for bit.
+//
+// Model-bearing, like the other lfm2 unit tests: the gate's 15 s / 1536 MB
+// ceiling is below the model mapping alone, which is why this is a tests/ driver
+// and NOT proposed as an EXPECTED.tsv row (same reason as lfm2_batch_unit).
+//
+// Build:  compiler/<ver>/bin/x86/qc tests/lfm2_mm_workers_zero_test.quanta <bin>
+// Run:    ( ulimit -c 0 -v 8000000; <bin> </dev/null )   from the repo root
+
+import std/gguf
+import std/lfm2_forward
+import std/lfm2_model
+import std/lfm2_mm
+import std/fs
+
+const Q4_PATH = "/opt/ai/models/quanta/QUANTA-LFM2.5-2.6Bv1-Q4_K_M.gguf"
+const NCTX = 2048
+const B = 4
+const NC = 256
+const VC = 8
+
+let nbad = 0
+let X = 0
+let Y = 0
+let Z = 0
+let sink = 0.0
+
+fn fill(vec, n, seed) {
+    let i = 0
+    while i < n {
+        let v: f64 = i2f((i + 1 + seed * 7) % 97) / 100.0 - 0.4
+        mem_store(vec + i * 8, v)
+        i = i + 1
+    }
+    return 0
+}
+
+fn mismatch(dst, rf, n) {
+    let bad = 0
+    let i = 0
+    while i < n {
+        if mem_load(dst + i * 8) != mem_load(rf + i * 8) { bad = bad + 1 }
+        i = i + 1
+    }
+    return bad
+}
+
+// Reference at workers = 1 into Y, the case under test at `w` into Z, compare.
+// Both workers=0 and workers=1 take mm_matmul_ser, so this also pins that the
+// guard routes 0 to the SAME function 1 does -- not to the pool, not to -1.
+fn matmul_case(label, W, rows, cols, w) {
+    mm_set_workers(1)
+    let r1 = mm_matmul(W, X, rows, cols, B, Y)
+    if r1 != 0 { prints("FAIL ref rc\n"); nbad = nbad + 1; return 0 }
+    mm_set_workers(w)
+    let r0 = mm_matmul(W, X, rows, cols, B, Z)
+    prints(label)
+    prints(" workers=")
+    print(mm_get_workers())
+    prints(" rc=")
+    print(r0)
+    if r0 != 0 { prints("  <- EXPECTED 0\n"); nbad = nbad + 1; return 0 }
+    let bad = mismatch(Z, Y, B * rows)
+    prints(" mismatch=")
+    print(bad)
+    prints("/")
+    print(B * rows)
+    newline()
+    nbad = nbad + bad
+    let acc: f64 = 0.0
+    let i = 0
+    while i < B * rows {
+        acc = acc + f64of(mem_load(Z + i * 8))
+        i = i + 1
+    }
+    sink = sink + acc
+    return 0
+}
+
+fn main() {
+    prints("=== mm_workers = 0 (documented serial) ===\n")
+    if gguf_load(Q4_PATH) != 0 { prints("FAIL gguf_load\n"); return 1 }
+    if fc_read_config() != 0 { prints("FAIL fc_read_config\n"); return 1 }
+    if fc_kv_init(NCTX) != 0 { prints("FAIL fc_kv_init\n"); return 1 }
+    if fc_fw_init() != 0 { prints("FAIL fc_fw_init\n"); return 1 }
+    let dff = fc_d_ff
+    let dm = fc_d_model
+
+    X = mem_alloc((dff + 64) * B * 8)
+    Y = mem_alloc(dff * B * 8)
+    Z = mem_alloc(dff * B * 8)
+    let b = 0
+    while b < B {
+        fill(X + b * dff * 8, dff, b)
+        b = b + 1
+    }
+
+    // THE DEFECT. Before the fix the FIRST of these was `idiv %rcx` with rcx = 0
+    // -> SIGFPE, so the program produced no output at all.
+    matmul_case("ffn_gate(Q4_K)", lfm2_ffn_gate(0), dff, dm, 0)
+    matmul_case("ffn_down(Q6_K)", lfm2_ffn_down(0), dm, dff, 0)
+    matmul_case("conv_out(Q4_K)", lfm2_conv_out_proj(0), dm, dm, 0)
+    // mm_set_workers clamps a negative count to 0, so this must be the same case.
+    matmul_case("ffn_gate(-1)", lfm2_ffn_gate(0), dff, dm, 0 - 1)
+    // The opt-in pool path is unchanged and still bit-identical to serial.
+    mm_pool_begin()
+    matmul_case("ffn_gate(pool4)", lfm2_ffn_gate(0), dff, dm, 4)
+    mm_pool_end()
+
+    // mm_embed_logits_batch: same guard, same defect, and its own sentinel
+    // (mm_embed_workers, which mm_set_workers does NOT touch).
+    let emb = lfm2_token_embd()
+    mm_set_embed_workers(1)
+    if mm_embed_logits_batch(emb, X, 0, VC, NC, B, Y) != 0 { prints("FAIL embed ref\n"); return 1 }
+    mm_set_embed_workers(0)
+    let re = mm_embed_logits_batch(emb, X, 0, VC, NC, B, Z)
+    prints("embed_batch workers=0 rc=")
+    print(re)
+    if re != 0 {
+        prints("  <- EXPECTED 0\n")
+        nbad = nbad + 1
+    } else {
+        let bad = mismatch(Z, Y, B * VC)
+        prints(" mismatch=")
+        print(bad)
+        prints("/")
+        print(B * VC)
+        newline()
+        nbad = nbad + bad
+    }
+
+    prints("SINK ")
+    print(f2i(sink))
+    newline()
+    prints("TOTAL_MISMATCH=")
+    print(nbad)
+    newline()
+    if nbad != 0 { prints("WORKERS0 FAIL\n"); return 1 }
+    prints("WORKERS0 PASS\n")
+    return 0
+}

@@ -1,0 +1,221 @@
+// tests/q6k_dequant_simd_test.quanta -- the 0.0.243 dq6() builtin: BIT-IDENTITY
+// against the scalar Q6_K dequant it replaces, on a synthetic sweep AND on the
+// real model's Q6_K tensors, plus the ns/element both ways.
+//
+// WHY THIS TEST EXISTS
+//   The Q6_K dequant was the single largest per-element cost left in the token
+//   after the 0.0.239 Q4_K SIMD work: 25.0 ns/element scalar against 4.09 for
+//   Q4_K, over 21.3% of the model's weight elements (7.81 s of a 23.1 s serial
+//   prefill token; 73% of the tied output projection, itself 28% of a decode
+//   token). dq6() replaces the loop with 4-element AVX2 groups.
+//
+//   The safety argument is the same one dq32* made and it has to be TESTED, not
+//   argued: the builtin produces the DEQUANTISED VALUES only, never a sum, and
+//   it performs the multiplications in the same order the scalar does --
+//   (double)q * (double)sc first, then * d. sc*q is an integer in [-4064,4064]
+//   so that first product is exact in binary64, and only the multiply by d
+//   rounds. Pre-folding d*sc would round twice and is deliberately NOT done.
+//   If that reasoning is wrong the bit comparison below goes red immediately.
+//
+//   The AMD64 oracle is separate and stronger: test_suites/codes/
+//   q6k_dequant_ref_test.quanta compares the SAME new dequant_q6k() against
+//   committed bit patterns dumped from llama.cpp's dequantize_row_q6_K, plus the
+//   f64 sum and sumsq over 1024 elements. Two paths that share a bug cannot pass
+//   that by agreeing with each other.
+//
+// Build:  compiler/<ver>/bin/x86/qc tests/q6k_dequant_simd_test.quanta <bin>
+// Run:    ( ulimit -c 0 -v 8000000; <bin> </dev/null )   from the repo root
+//         (the import path is relative to CWD: ./, std/, ext/, lib/)
+//
+// Exit 0 and prints PASS when every value is bit-identical; exit 1 otherwise.
+
+import std/gguf
+import std/fs
+
+const Q4_PATH = "/opt/ai/models/quanta/QUANTA-LFM2.5-2.6Bv1-Q4_K_M.gguf"
+
+const NBLK = 256              // synthetic Q6_K super-blocks
+const REAL_ELEMS = 2097152    // 8192 real super-blocks, so the timed section is
+                              // long enough that clock() resolution and a lucky
+                              // sample cannot manufacture the ratio
+
+let FAIL = 0
+
+fn put8(p, v) { mem_store8(p, v); return 0 }
+
+fn chk(label, want, got) {
+    if want != got {
+        prints("FAIL ")
+        prints(label)
+        prints(": got ")
+        print(got)
+        prints(" want ")
+        print(want)
+        newline()
+        FAIL = FAIL + 1
+    }
+    return 0
+}
+
+// The first Q6_K (GGML dtype 14) tensor in the file, or -1.
+fn find_q6k() {
+    let i = 0
+    while i < gguf_n_tensors {
+        if gguf_tensor_dtype(i) == 14 { return i }
+        i = i + 1
+    }
+    return -1
+}
+
+// Count differing f64 BIT PATTERNS (mem_load, not ==, so NaN and -0.0 are
+// compared as bytes and a difference in a sign bit cannot hide).
+fn diff_bits(a, b, n) {
+    let bad = 0
+    let i = 0
+    while i < n {
+        if mem_load(a + i * 8) != mem_load(b + i * 8) { bad = bad + 1 }
+        i = i + 1
+    }
+    return bad
+}
+
+fn main() -> i64 {
+    // ---------------------------------------------------------------- synthetic
+    // Every byte of ql/qh/sc is swept through its whole range, and `d` alternates
+    // between 1.0 and -0.5 so the sign of the super-block scale is exercised --
+    // a builtin that dropped the sign, or that read the scale plane unsigned,
+    // moves both the count and the sum below.
+    prints("=== q6k dequant: scalar vs dq6() ===\n")
+    let nb = NBLK * 210
+    let raw = mem_alloc(nb)
+    let b = 0
+    while b < NBLK {
+        let j = 0
+        while j < 208 {
+            put8(raw + b * 210 + j, (b * 37 + j * 101 + 7) % 256)
+            j = j + 1
+        }
+        put8(raw + b * 210 + 208, 0)                       // d low byte (always 0x00)
+        if b % 2 == 0 { put8(raw + b * 210 + 209, 60) }    // 0x3C -> f16 1.0
+        else { put8(raw + b * 210 + 209, 184) }            // 0xB8 -> f16 -0.5
+        b = b + 1
+    }
+    let ne = NBLK * 256
+    let sS = mem_alloc(ne * 8)
+    let sV = mem_alloc(ne * 8)
+    dequant_q6k_scalar(raw, ne, sS)
+    dequant_q6k(raw, ne, sV)
+    let sb = diff_bits(sS, sV, ne)
+    prints("synthetic: differing f64 bit patterns = ")
+    print(sb)
+    prints(" / ")
+    print(ne)
+    newline()
+    chk("synthetic bit-identity", 0, sb)
+
+    // Aggregates over the same vectors: a wrong scale or a wrong qh field
+    // changes the SUM even where individual elements happen to coincide.
+    let aS: f64 = 0.0
+    let aV: f64 = 0.0
+    let sq: f64 = 0.0
+    let i = 0
+    while i < ne {
+        let v = f64of(mem_load(sV + i * 8))
+        aS = aS + f64of(mem_load(sS + i * 8))
+        aV = aV + v
+        sq = sq + v * v
+        i = i + 1
+    }
+    chk("synthetic sum", f64bits(aS), f64bits(aV))
+    prints("synthetic: f64 sum = ")
+    print(f64bits(aV))
+    prints("  sumsq = ")
+    print(f64bits(sq))
+    newline()
+    if sq == 0.0 { prints("FAIL synthetic sumsq is zero -- nothing was dequantised\n"); FAIL = FAIL + 1 }
+
+    // ------------------------------------------------------------------- real
+    // The synthetic block exercises the FORMAT; a real tensor exercises the
+    // actual byte distribution the model ships with, at row-length scale.
+    if gguf_load(Q4_PATH) != 0 { prints("FAIL gguf_load\n"); return 1 }
+    let ti = find_q6k()
+    if ti < 0 { prints("FAIL no Q6_K tensor in the file\n"); return 1 }
+    let nel = gguf_tensor_nelements(ti)
+    prints("real tensor idx=")
+    print(ti)
+    prints(" dtype=")
+    print(gguf_tensor_dtype(ti))
+    prints(" nelements=")
+    print(nel)
+    newline()
+    if nel < REAL_ELEMS { prints("FAIL tensor too small for the probe\n"); return 1 }
+
+    let rnb = REAL_ELEMS / 256 * 210
+    let rraw = mem_alloc(rnb)
+    let got = gguf_read_tensor_bytes_at(ti, 0, rraw, rnb)
+    if got != rnb { prints("FAIL short read: "); print(got); prints("/"); print(rnb); newline(); return 1 }
+    let o1 = mem_alloc(REAL_ELEMS * 8)
+    let o2 = mem_alloc(REAL_ELEMS * 8)
+
+    // The file's bytes against llama.cpp's semantics, via the committed oracle,
+    // are checked by the gate row; here the question is only scalar == dq6().
+    dequant_q6k_scalar(rraw, REAL_ELEMS, o1)
+    dequant_q6k(rraw, REAL_ELEMS, o2)
+    let rb2 = diff_bits(o1, o2, REAL_ELEMS)
+    prints("real:      differing f64 bit patterns = ")
+    print(rb2)
+    prints(" / ")
+    print(REAL_ELEMS)
+    newline()
+    chk("real bit-identity", 0, rb2)
+
+    // ---------------------------------------------------------------- ns/elem
+    // Best of 3 per path, interleaved, one process. NOTE: these are ns/element
+    // RATES, so they are honest under load only because both paths are timed in
+    // the same process back to back -- the ratio is the meaningful quantity. The
+    // absolute value moves with the governor and the ambient load; /proc/loadavg
+    // and the top CPU consumer at the time of the run are recorded in
+    // docs/research/q6k-simd-dequant.md.
+    let bs = 0
+    let bv = 0
+    let r = 0
+    while r < 3 {
+        let t0 = clock()
+        dequant_q6k_scalar(rraw, REAL_ELEMS, o1)
+        let t1 = clock()
+        let u0 = clock()
+        dequant_q6k(rraw, REAL_ELEMS, o2)
+        let u1 = clock()
+        let ds = t1 - t0
+        let dv = u1 - u0
+        if bs == 0 || ds < bs { bs = ds }
+        if bv == 0 || dv < bv { bv = dv }
+        r = r + 1
+    }
+    prints("scalar: ")
+    print(bs / 1000)
+    prints(" us total  = ")
+    print((bs * 1000) / REAL_ELEMS)
+    prints(" ps/elem  (")
+    print(bs / 1000000)
+    prints(" ms for ")
+    print(REAL_ELEMS)
+    prints(" elements)\n")
+    prints("dq6():  ")
+    print(bv / 1000)
+    prints(" us total  = ")
+    print((bv * 1000) / REAL_ELEMS)
+    prints(" ps/elem  (")
+    print(bv / 1000000)
+    prints(" ms)\n")
+    if bv > 0 { prints("ratio scalar/dq6 x"); print((bs * 100) / bv); prints("/100\n") }
+
+    // Re-verify after the timed runs: a builtin that corrupts its own inputs
+    // would agree on the first call and diverge on the third.
+    chk("real bit-identity after repeats", 0, diff_bits(o1, o2, REAL_ELEMS))
+
+    newline()
+    if FAIL == 0 { prints("Q6K_SIMD PASS\n"); return 0 }
+    prints("Q6K_SIMD FAIL\n")
+    return 1
+}

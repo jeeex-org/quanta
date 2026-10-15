@@ -1,0 +1,312 @@
+// std/code_synthesizer.quanta - Phase 2: Code Synthesis
+// Generates Quanta module files from gap_specs.json
+//
+// Encoding convention for generated status fields (ONE convention, enforced here
+// and in scripts/normalize_specs.py): status is PLAIN ASCII -- exactly one of
+// `planned`, `done`, `partial` -- and priority is a SEPARATE field
+// (`""|low|medium|high|critical`), never smuggled into status. A generated stub
+// is always `planned`.
+
+module std_code_synthesizer;
+
+import std/str
+import std/vec
+import std/map
+import std/fs
+
+// Hard ceiling on staged modules. This is REAL: synthesize_all() aborts
+// (exit 1, with a printed message) if a run would stage more than SYNTH_CAP
+// modules, so a spec set that outgrows the cap fails LOUDLY instead of silently
+// generating past it. gap_specs.json currently has 9,011 specs, so there is
+// headroom; raise the cap deliberately when the set genuinely grows.
+const SYNTH_CAP = 10000;
+
+// The ONE staging root every generated module is written under. It MUST never
+// name a tracked source tree (lib/std, test_suites/codes, compiler/*/lib/std):
+// this module's `main` IS the entry point of the std_code_synthesizer_const_test
+// gate row (an imported module's main wins over the test file's own), so a run
+// would otherwise rewrite thousands of stubs straight into version control --
+// measured at 9,026 files per run against the old hard-coded "lib/std/" target.
+// "synth_out" is CWD-relative and git-ignored (see .gitignore); the gate's
+// scratch cwd (test_suites/run) wipes it every run. Spell the path here only.
+const SYNTH_OUT_ROOT = "synth_out";
+
+// Pattern registry
+let pattern_names = mmap(1024 * 8);
+let pattern_types = mmap(1024 * 8);
+let pattern_count = 0;
+
+// sanitize_ident(name) -> a Quanta string holding the path-safe form of name
+// (any byte outside [0-9A-Za-z] becomes '_').
+//
+// It must return a REAL Quanta string: an 8-byte length header at +0 and the
+// bytes at +8. The previous version wrote the bytes at +0 with no header, but
+// every caller reads the result with len() and mem_load8(p + 8 + i) -- so
+// len(out) read the first eight ASCII bytes as a little-endian integer (for
+// "accounting": 0x69746e756f636361, ~7.6e18) and the copy loops ran off the
+// end of the mapping. That out-of-bounds scribble is what made a run crash
+// (SIGBUS/SEGV) or spin (timeout), non-deterministically, once the A6/A7
+// call-argument typing fix let file_open() past its early return.
+fn sanitize_ident(name) {
+    let len_n = len(name);
+    let out = mmap(len_n + 9);
+    mem_store(out, len_n);
+    let i = 0;
+    while i < len_n {
+        let c = mem_load8(name + 8 + i);
+        if (c >= 48 && c <= 57) || (c >= 65 && c <= 90) || (c >= 97 && c <= 122) {
+            mem_store8(out + 8 + i, c);
+        } else {
+            mem_store8(out + 8 + i, 95);
+        }
+        i = i + 1;
+    }
+    mem_store8(out + 8 + len_n, 0);
+    return out;
+}
+
+fn register_pattern(name, ty) -> i64 {
+    if pattern_count >= 1024 { return 0; }
+    let name_copy = mem_alloc(len(name) + 9);
+    mem_store(name_copy, len(name));
+    let i = 0;
+    while i < len(name) {
+        mem_store8(name_copy + 8 + i, mem_load8(name + 8 + i));
+        i = i + 1;
+    }
+    mem_store(pattern_names + pattern_count * 8, name_copy);
+    mem_store(pattern_types + pattern_count * 8, ty);
+    pattern_count = pattern_count + 1;
+    return 1;
+}
+
+fn init_pattern_library() -> i64 {
+    register_pattern("accounting_gaap", 1);
+    register_pattern("accounting_ifrs", 1);
+    register_pattern("accounting_tax", 2);
+    register_pattern("chain_tx", 1);
+    register_pattern("chain_block", 1);
+    register_pattern("quantum_qft", 2);
+    register_pattern("ai_rope", 2);
+    register_pattern("math_linalg", 2);
+    register_pattern("crypto_aes_gcm", 2);
+    return pattern_count;
+}
+
+fn emit_quanta_module(domain, category, module) -> i64 {
+    let clean_domain = sanitize_ident(domain);
+    let clean_category = sanitize_ident(category);
+    let clean_module = sanitize_ident(module);
+
+    // Output goes to a scratch staging dir under the CWD (SYNTH_OUT_ROOT), NOT
+    // into a tracked source tree. This module's `main` IS the entry point of the
+    // std_code_synthesizer_const_test gate row, so a gate run executes this code.
+    // The old hard-coded "lib/std/" target rewrote thousands of module stubs
+    // straight into the source tree on every run -- measured: 9,026 files. The
+    // gate's scratch cwd (test_suites/run) is git-ignored and wiped every run,
+    // so a CWD-relative staging dir is generated output that is never committed.
+    let out_path = mmap(512);
+    let base = SYNTH_OUT_ROOT;
+    let i = 0;
+    while i < len(base) { mem_store8(out_path + i, mem_load8(base + 8 + i)); i = i + 1; }
+    mem_store8(out_path + i, 47); i = i + 1;   // '/'
+    let j = 0;
+    while j < len(clean_domain) { mem_store8(out_path + i + j, mem_load8(clean_domain + 8 + j)); j = j + 1; }
+    i = i + j;
+    mem_store8(out_path + i, 95); i = i + 1;
+    j = 0;
+    while j < len(clean_category) { mem_store8(out_path + i + j, mem_load8(clean_category + 8 + j)); j = j + 1; }
+    i = i + j;
+    mem_store8(out_path + i, 95); i = i + 1;
+    j = 0;
+    while j < len(clean_module) { mem_store8(out_path + i + j, mem_load8(clean_module + 8 + j)); j = j + 1; }
+    i = i + j;
+    let ext = ".quanta";
+    j = 0;
+    while j < len(ext) { mem_store8(out_path + i + j, mem_load8(ext + 8 + j)); j = j + 1; }
+    i = i + j;
+    mem_store8(out_path + i, 0);
+
+    // open(2) needs its mode argument (arg 2). With O_CREAT and only two args
+    // the kernel reads mode from R10, which here holds unrelated garbage, so
+    // the file was created mode 000 and every later run's O_TRUNC open-for-write
+    // then failed with EACCES (measured: run 1 -> 9,026 modules, runs 2..n -> 0).
+    // 420 = 0o644.
+    let fd = file_open(out_path, 577, 420);
+    if fd < 0 { return 0; }
+
+    file_write(fd, "module std_", len("module std_"));
+    file_write(fd, clean_domain + 8, len(clean_domain));
+    file_write(fd, "_", 1);
+    file_write(fd, clean_category + 8, len(clean_category));
+    file_write(fd, "_", 1);
+    file_write(fd, clean_module + 8, len(clean_module));
+    file_write(fd, ";\n\n", 2);
+    file_write(fd, "// Status: planned\n", len("// Status: planned\n"));
+    // Encoding convention, applied HERE so generated files cannot drift from it:
+    // status is plain ASCII -- exactly one of planned | done | partial -- and
+    // priority is a separate field (see scripts/normalize_specs.py). A freshly
+    // generated stub is, by definition, `planned`.
+    file_write(fd, "const MODULE_STATUS = \"planned\";\n\n", len("const MODULE_STATUS = \"planned\";\n\n"));
+    file_write(fd, "import std/types;\n\n", len("import std/types;\n\n"));
+    file_write(fd, "fn init() -> i64 { return 0; }\n\n", len("fn init() -> i64 { return 0; }\n\n"));
+    file_write(fd, "fn main() -> i64 { return init(); }\n", len("fn main() -> i64 { return init(); }\n"));
+    file_close(fd);
+    return 1;
+}
+
+// Simple JSON parser: extract all "domain", "category", "module" triplets
+// by scanning for the key names and extracting the following quoted value
+fn synthesize_all(specs_path) -> i64 {
+    let pat_count = init_pattern_library();
+    prints("Pattern library initialized: "); printi(pat_count); prints(" patterns\n");
+
+    // Staging directory for the generated modules (see emit_quanta_module).
+    mkdir(SYNTH_OUT_ROOT, 493);
+
+    let fd = file_open(specs_path, 0);
+    if fd < 0 { return 0; }
+    // Size the read buffer from the FILE, not a flat constant. The old code
+    // asked read(2) for 16 MB into a 2 MB mmap(2097152); gap_specs.json is
+    // 2,290,042 bytes, so the kernel wrote ~193 KB past the end of the mapping
+    // -- memory corruption that surfaced as SIGBUS or a hang. file_size() is
+    // exact (lseek SEEK_END), so the buffer fits the input by construction and
+    // read(2) cannot return more than was mapped.
+    let fsz = file_size(fd);
+    let buf = mmap(fsz + 16);
+    let n = file_read(fd, buf + 8, fsz);
+    file_close(fd);
+    if n <= 0 { return 0; }
+    if n > fsz { n = fsz; }
+    mem_store(buf, n);
+
+    let i = 0;
+    let generated = 0;
+    
+    while i < n {
+        // Scan for "domain" key
+        let found = 0;
+        while i < n - 10 {
+            if mem_load8(buf + 8 + i) == 34 && 
+               mem_load8(buf + 8 + i + 1) == 100 &&  // d
+               mem_load8(buf + 8 + i + 2) == 111 &&  // o
+               mem_load8(buf + 8 + i + 3) == 109 &&  // m
+               mem_load8(buf + 8 + i + 4) == 97 &&   // a
+               mem_load8(buf + 8 + i + 5) == 105 &&  // i
+               mem_load8(buf + 8 + i + 6) == 110 &&  // n
+               mem_load8(buf + 8 + i + 7) == 34 {    // "
+                found = 1;
+                i = i + 8;
+                break;
+            }
+            i = i + 1;
+        }
+        if found == 0 { break; }
+        
+        // Skip to value
+        while i < n && mem_load8(buf + 8 + i) != 34 { i = i + 1; }
+        if i >= n { break; }
+        i = i + 1;
+        let domain_start = i;
+        while i < n && mem_load8(buf + 8 + i) != 34 { i = i + 1; }
+        let domain_len = i - domain_start;
+        
+        // Now look for "category" key
+        found = 0;
+        while i < n - 12 {
+            if mem_load8(buf + 8 + i) == 34 && 
+               mem_load8(buf + 8 + i + 1) == 99 &&   // c
+               mem_load8(buf + 8 + i + 2) == 97 &&   // a
+               mem_load8(buf + 8 + i + 3) == 116 &&  // t
+               mem_load8(buf + 8 + i + 4) == 101 &&  // e
+               mem_load8(buf + 8 + i + 5) == 103 &&  // g
+               mem_load8(buf + 8 + i + 6) == 111 &&  // o
+               mem_load8(buf + 8 + i + 7) == 114 &&  // r
+               mem_load8(buf + 8 + i + 8) == 121 &&  // y
+               mem_load8(buf + 8 + i + 9) == 34 {    // "
+                found = 1;
+                i = i + 10;
+                break;
+            }
+            i = i + 1;
+        }
+        if found == 0 { break; }
+        
+        // Skip to value
+        while i < n && mem_load8(buf + 8 + i) != 34 { i = i + 1; }
+        if i >= n { break; }
+        i = i + 1;
+        let cat_start = i;
+        while i < n && mem_load8(buf + 8 + i) != 34 { i = i + 1; }
+        let cat_len = i - cat_start;
+        
+        // Now look for "module" key
+        found = 0;
+        while i < n - 10 {
+            if mem_load8(buf + 8 + i) == 34 && 
+               mem_load8(buf + 8 + i + 1) == 109 &&  // m
+               mem_load8(buf + 8 + i + 2) == 111 &&  // o
+               mem_load8(buf + 8 + i + 3) == 100 &&  // d
+               mem_load8(buf + 8 + i + 4) == 117 &&  // u
+               mem_load8(buf + 8 + i + 5) == 108 &&  // l
+               mem_load8(buf + 8 + i + 6) == 101 &&  // e
+               mem_load8(buf + 8 + i + 7) == 34 {    // "
+                found = 1;
+                i = i + 8;
+                break;
+            }
+            i = i + 1;
+        }
+        if found == 0 { break; }
+        
+        // Skip to value
+        while i < n && mem_load8(buf + 8 + i) != 34 { i = i + 1; }
+        if i >= n { break; }
+        i = i + 1;
+        let mod_start = i;
+        while i < n && mem_load8(buf + 8 + i) != 34 { i = i + 1; }
+        let mod_len = i - mod_start;
+        
+        // Create Quanta strings for domain, category, module
+        let domain_str = mmap(domain_len + 9);
+        mem_store(domain_str, domain_len);
+        let di = 0;
+        while di < domain_len { mem_store8(domain_str + 8 + di, mem_load8(buf + 8 + domain_start + di)); di = di + 1; }
+        mem_store8(domain_str + 8 + domain_len, 0);
+        
+        let cat_str = mmap(cat_len + 9);
+        mem_store(cat_str, cat_len);
+        let ci = 0;
+        while ci < cat_len { mem_store8(cat_str + 8 + ci, mem_load8(buf + 8 + cat_start + ci)); ci = ci + 1; }
+        mem_store8(cat_str + 8 + cat_len, 0);
+        
+        let mod_str = mmap(mod_len + 9);
+        mem_store(mod_str, mod_len);
+        let mi = 0;
+        while mi < mod_len { mem_store8(mod_str + 8 + mi, mem_load8(buf + 8 + mod_start + mi)); mi = mi + 1; }
+        mem_store8(mod_str + 8 + mod_len, 0);
+        
+        let result = emit_quanta_module(domain_str, cat_str, mod_str);
+        if result != 0 {
+            generated = generated + 1;
+            // SYNTH_CAP is enforced, not decorative: fail loudly rather than
+            // silently staging modules past the ceiling.
+            if generated > SYNTH_CAP {
+                prints("code_synthesizer: SYNTH_CAP ("); printi(SYNTH_CAP);
+                prints(") exceeded -- refusing to stage further modules\n");
+                exit(1);
+            }
+        }
+    }
+    
+    return generated;
+}
+
+fn init() -> i64 { return 0; }
+
+fn main() -> i64 {
+    prints("Code synthesizer running...\n");
+    let count = synthesize_all("gap_specs.json");
+    prints("Generated modules: "); printi(count); prints("\n");
+    return 0;
+}

@@ -1,0 +1,146 @@
+// tests/const_large_int_test.quanta -- A11 (0.0.243): an integer `const` whose
+// value is at or above 2^60 made the COMPILER segfault.
+//
+// THE MINIMAL REPRO (on the 0.0.241 golden, and on 0.0.243 before the fix):
+//
+//     const V = 2305843009213693952          // 2^61
+//     fn main() { print(V); return 0 }
+//     -> qc: Segmentation fault (core dumped), rc=139
+//
+// ROOT CAUSE. A bare enum-variant name is registered in the const table as a
+// MARKED value, `bvmark() + ei*1048576 + vidx` with bvmark() == 2^60, and the
+// const-use site decided "this is a marker" with
+//
+//     if cv0 >= bvmark() { ... evariant_tag(bei, bvidx) ... }
+//
+// i.e. by VALUE RANGE -- and that range belongs to the user. Any integer const
+// at or above 2^60 was therefore decoded as a variant mark; for `V = 2^61` that
+// is bei = 2^40, and `evariant_tag` then read `enums + 2^40*96 + 24`, tens of
+// gigabytes past the table. A well-formed program crashed the compiler with no
+// diagnostic at all.
+//
+// WHY IT MATTERS MORE THAN THE SINGLE CONST. This tree writes f64 BIT PATTERNS
+// as integer constants constantly (it is how a float literal is pinned exactly):
+// f64bits(1.5) is 4609434218613702656 and f64bits(2.0) is 4611686018427387904
+// -- both >= 2^60. `2.5 -> 4612811918334230528` is quoted in the 0.0.241 WIP as
+// the reason the FLOAT-const path had to run before the bvmark() test. So the
+// idiom is one keystroke from the crash, and the crash is in the COMPILER, not
+// the program.
+//
+// THE FIX (0.0.243, globals.quanta + method.quanta). The marker is keyed on the
+// const's KIND (3), not on its value: globals.quanta writes kind 3 for a bare
+// variant and method.quanta tests `ckind(cvi)==3`. The ambiguous value range is
+// returned to the user -- an integer const >= 2^60 is now an integer.
+//
+// MEASURED THRESHOLD (0.0.241 golden, `const V = <v>` + `print(V)`):
+//     2^60         1152921504606846976   ok
+//     2^60 + 1     1152921504606846977   ok     (bei = 0, bvidx = 1)
+//     ~1.18e18     1179675606577200000   CRASH  (bei != 0)
+//     2^61         2305843009213693952   CRASH
+//     2^62         4611686018427387904   CRASH
+//     unused const (2^60)                ok     -- it must be USED to be decoded
+//     `let V = ...` (global or local)    ok     -- only the const table is marked
+//
+// RED-FIRST: this file does not compile at all on 0.0.241 (qc dies), and it
+// compiles and passes on 0.0.243. It is a gate row (test_suites/EXPECTED.tsv),
+// which is only sound because 0.0.243 is the version that ships the fix.
+//
+// Build:  compiler/<ver>/bin/x86/qc tests/const_large_int_test.quanta <bin>
+// Run:    ( ulimit -c 0 -v 4000000; <bin> </dev/null )
+
+// A value at the wide end that is NOT an f64 bit pattern, so the test also
+// covers "genuinely large integer" and not only the float idiom.
+const BIG = 2305843009213693952          // 2^61
+const BIG2 = 4611686018427387904         // 2^62 == f64bits(2.0)
+// An f64 bit pattern used as an integer const: the idiom that makes this matter.
+const BITS_1_5 = 4609434218613702656     // f64bits(1.5)
+const BITS_2_25 = 4612248968380809216    // f64bits(2.25)
+// Just below the marker bit must keep working.
+const SMALL = 1152921504606846975        // 2^60 - 1
+const ORDINARY = 7
+
+enum Colour { Red, Green, Blue }
+enum Fruit  { Apple, Pear }
+
+let FAIL = 0
+
+fn chk(label, want, got) {
+    if want != got {
+        prints("FAIL ")
+        prints(label)
+        prints(": got ")
+        print(got)
+        prints(" want ")
+        print(want)
+        newline()
+        FAIL = FAIL + 1
+    }
+    return 0
+}
+
+fn main() -> i64 {
+    prints("=== const >= 2^60 ===\n")
+
+    // The crashing shape: a large integer const, USED.
+    chk("BIG", 2305843009213693952, BIG)
+    chk("BIG2", 4611686018427387904, BIG2)
+    chk("SMALL", 1152921504606846975, SMALL)
+    chk("ORDINARY", 7, ORDINARY)
+
+    // The idiom: f64 bit patterns as integer consts, round-tripped through f64of.
+    chk("BITS_1_5 value", 4609434218613702656, BITS_1_5)
+    chk("BITS_2_25 value", 4612248968380809216, BITS_2_25)
+    let f15 = f64of(BITS_1_5)
+    let f225 = f64of(BITS_2_25)
+    chk("f64of(BITS_1_5) bits", 4609434218613702656, f64bits(f15))
+    chk("f64of(BITS_2_25) bits", 4612248968380809216, f64bits(f225))
+    let prod = f15 * f225
+    chk("1.5 * 2.25 bits", 4614782243171205120, f64bits(prod))   // 3.375
+
+    // Arithmetic on a large const must not saturate or wrap oddly.
+    chk("BIG/2", 1152921504606846976, BIG / 2)
+    chk("BIG - BIG2/2", 0, BIG - BIG2 / 2)
+    chk("SMALL + 1 == 2^60", 1152921504606846976, SMALL + 1)
+
+    // THE REGRESSION THIS FIX COULD HAVE CAUSED: a bare enum variant is a MARKED
+    // const, and it now carries kind 3. If the keying were wrong, `Red` would
+    // stop resolving (or would resolve to the raw marker value instead of the
+    // unit variant), and the match below would take the wrong arm.
+    // A BARE variant name resolves through the const table as a marked entry --
+    // that is the mechanism this fix re-keys -- so a bare name must still name
+    // the right variant. The match arms are QUALIFIED: bare ARMS collapse to the
+    // first arm on 0.0.241 AND 0.0.243 (measured, `let v = match c { Red => 1,
+    // Green => 2, Blue => 3 }` returns 1 for Blue on both), which is a separate
+    // pre-existing limitation and deliberately NOT asserted here -- this file
+    // must fail only for the defect it is about.
+    let c = Red
+    let hit = match c {
+        Colour.Red => 1,
+        Colour.Green => 2,
+        Colour.Blue => 3,
+    }
+    chk("bare name Red -> variant 0", 1, hit)
+    let c2 = Blue
+    let hit2 = match c2 {
+        Colour.Red => 1,
+        Colour.Green => 2,
+        Colour.Blue => 3,
+    }
+    chk("bare name Blue -> variant 2", 3, hit2)
+    let f = Pear
+    let hit4 = match f {
+        Fruit.Apple => 1,
+        Fruit.Pear => 2,
+    }
+    chk("bare name Pear -> variant 1", 2, hit4)
+
+    // A big const and a variant in the SAME expression, which is what put the two
+    // decoders on one path in the first place.
+    let both = BIG - BIG + hit4
+    chk("big const beside a variant", 2, both)
+
+    newline()
+    if FAIL == 0 { prints("CONST_BIG PASS\n"); return 0 }
+    prints("CONST_BIG FAIL\n")
+    return 1
+}

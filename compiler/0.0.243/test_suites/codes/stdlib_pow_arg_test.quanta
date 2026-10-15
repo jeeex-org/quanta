@@ -1,0 +1,81 @@
+// stdlib_pow_arg_test -- pow() must use the ARGUMENT'S VALUE, not a stale spill
+// slot.
+//
+// FOUND WHILE BUILDING THE LFM2 FORWARD PASS. pow(base, -2/head_dim) produced
+// 0.261068 where the correct answer is 0.978572 -- silently, with no trap, and
+// the base printed correctly on its own.
+//
+// Root cause: the pow builtin in compiler/0.0.225/src/x86/emitter.quanta loads
+// its operands with
+//     rbp(7, spill_home(arg0v))
+//     rbp(6, spill_home(arg1v))
+// spill_home(v) is -(SPILL_BASE + (v+1)*8): a fixed per-vreg home slot. That is
+// only the argument's value if the vreg was actually SPILLED there. When the
+// value instead lives in a physical register (aphys mapped it) or arrived from
+// an array read or module global, the home slot holds something else, and pow
+// silently computes on the wrong bits. aphys(vr) is the accessor that handles
+// this correctly -- it returns the live register, or reloads from home only when
+// the vreg is initialized.
+//
+// Observed matrix, verified against Python:
+//
+//   pow(2.0, e)                  correct   literal base
+//   pow(local_assigned_literal)  correct
+//   pow(array_element, e)        WRONG     a0 = arr[0] prints 2.0, pow gives 0.261068
+//   pow(module_global, e)        WRONG     g_base prints 2.0, pow gives 0.261068
+//   pow(local_copy_of_global, e) WRONG     copying to a local does NOT fix it
+//   pow(2.0, module_global_exp)  correct   the exponent slot is not the problem
+//
+// The correct value 2^-0.03125 = 0.978572. The wrong one 0.261068 is what you
+// get from a garbage base.
+//
+// This test is EXPECTED TO FAIL on 0.0.225. It is in the gate so the defect stays
+// visible and gets closed when the emitter is fixed -- the same treatment the
+// other verified findings in this project got. Do not delete it as a flaky test;
+// if it starts passing, the emitter is fixed and this test should be moved to a
+// positive assertion that all six rows are correct.
+
+import std/fs
+import std/math
+
+let g_base = 0.0
+
+fn main() {
+    let e: f64 = 0.0 - 2.0 / i2f(64)      // -0.03125
+    let want = 0.978572                  // 2.0 ^ e
+    let eps: f64 = 0.001
+
+    // Row 1: literal base -- known correct, pins the reference value.
+    let r1 = pow(2.0, e)
+    if r1 > want + eps || r1 < want - eps { print("FAIL literal base"); return 1 }
+
+    // Row 2: local assigned a literal -- known correct.
+    let b_local: f64 = 2.0
+    let r2 = pow(b_local, e)
+    if r2 > want + eps || r2 < want - eps { print("FAIL local base"); return 1 }
+
+    // Row 3: array element -- BROKEN on 0.0.225.
+    let arr = [2.0]
+    let a0 = arr[0]
+    let r3 = pow(a0, e)
+    if r3 > want + eps || r3 < want - eps { print("FAIL array-element base"); return 1 }
+
+    // Row 4: module global -- BROKEN on 0.0.225.
+    g_base = 2.0
+    let r4 = pow(g_base, e)
+    if r4 > want + eps || r4 < want - eps { print("FAIL global base"); return 1 }
+
+    // Row 5: local copy of a global -- still BROKEN, so copying does not help.
+    let cpy: f64 = g_base
+    let r5 = pow(cpy, e)
+    if r5 > want + eps || r5 < want - eps { print("FAIL local copy of global"); return 1 }
+
+    // Row 6: global as the EXPONENT -- known correct.
+    let g_e = 0.0
+    g_e = e
+    let r6 = pow(2.0, g_e)
+    if r6 > want + eps || r6 < want - eps { print("FAIL global exponent"); return 1 }
+
+    print("OK pow-args")
+    return 0
+}

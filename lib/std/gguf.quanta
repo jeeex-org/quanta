@@ -1821,7 +1821,42 @@ fn f16_to_f64(ptr) {
 //   y[l+32] = d * sc[is+2] * q2
 //   y[l+64] = d * sc[is+4] * q3
 //   y[l+96] = d * sc[is+6] * q4        is = l/16
+
+// dequant_q6k(raw, nelements, out): the 0.0.243 SIMD path.
+//
+// One dq6() builtin call per 128-element half of each 256-element super-block,
+// so a block costs two calls. The arithmetic is the SAME arithmetic the scalar
+// loop below performs -- d*(sc*q) with sc*q exact -- only vectorised four
+// elements at a time; bit-identity against dequant_q6k_scalar is asserted by
+// tests/q6k_dequant_simd_test.quanta and the llama.cpp oracle row
+// test_suites/codes/q6k_dequant_ref_test.quanta is unchanged.
+//
+// WHY this exists: Q6_K dequant measured 25.0 ns/element (the scalar loop)
+// against Q4_K's 4.09 (SIMD, 0.0.239) -- 6.1x -- over 21.3% of the model's
+// weight elements. That is 7.81 s of a 23.1 s serial prefill token, and 73% of
+// the tied output projection in decode, which is 28% of a decode token.
+//
+// The scalar loop is KEPT as dequant_q6k_scalar: it is the reference the SIMD
+// path is diffed against (and the readable statement of the format), and it is
+// what a non-AVX2 host would fall back to.
 fn dequant_q6k(raw, nelements, out) {
+    let n_blocks = nelements / 256
+    let bi = 0
+    while bi < n_blocks {
+        let bo = bi * 210
+        let d = f16_to_f64(raw + bo + 208)
+        let dbits = f64bits(d)
+        let n = 0
+        while n < 2 {
+            dq6(out + (bi * 256 + n * 128) * 8, raw + bo + n * 64, raw + bo + 128 + n * 32, dbits, raw + bo + 192 + n * 8)
+            n = n + 1
+        }
+        bi = bi + 1
+    }
+    return 0
+}
+
+fn dequant_q6k_scalar(raw, nelements, out) {
     let n_blocks = nelements / 256
     let bi = 0
     while bi < n_blocks {
