@@ -35,6 +35,42 @@ import std/math
 
 let rng_state = 12345
 
+// ---- EOS (end-of-turn) policy state -------------------------------------
+//
+// WHY THIS EXISTS: a sampler that can emit the end-of-turn id as a RANDOM DRAW
+// truncates answers, and the tracked driver did exactly that. MEASURED on the
+// driver before this change (see tests/README-lfm2-generate.md): at
+// temp_milli=700, top_k=40 the run printed the first token `str` and then
+// stopped -- `new_tokens=1` -- because <|im_end|> (id 124900) was inside the
+// top-40 candidate set and the draw landed on it. The native logit tail is
+// flatter than llama.cpp's (EOS sits at #2 in the native top-10 on that same
+// prompt), so a top-k that CONTAINS EOS keeps it as a live candidate at any
+// temperature. A generation that sampling noise can cut short is not usable by
+// a loop that needs complete answers.
+//
+// The policy is the standard one (llama.cpp's `--no-...`, transformers'
+// `SuppressTokens`-style handling plus `min_new_tokens`):
+//
+//   * EXCLUDE the end-of-turn id from the sampled candidate set UNLESS it is
+//     the argmax, so the model can still finish a turn -- but only when ending
+//     is its CLEAR CHOICE, not when the draw happened to hit it;
+//   * optionally refuse EOS until at least `sampling_min_len` tokens have been
+//     generated (belt and braces for a policy that wants a floor).
+//
+// BOTH ARE OFF BY DEFAULT (sampling_eos = -1), so every existing caller -- the
+// greedy correctness oracle included -- is bit-for-bit unaffected: with the id
+// invalid the policy is a single compare and a return. A caller opts in with
+// sample_set_eos(id) before the generation loop; the id is a caller fact (for
+// this model it comes from the GGUF, `tokenizer.ggml.eos_token_id` = 124900,
+// which bpe.quanta already exposes as `bpe_eos`), never guessed here.
+//
+// Integers, not floats: -1 is "disabled" and no model id is negative, so the
+// sentinel is unambiguous. Unlike a top-level float `const` (which this
+// compiler evaluates to 0 -- see the top-k note), an int `let` reads its value.
+let sampling_eos = 0 - 1
+let sampling_min_len = 0
+let sampling_gen_len = 0
+
 // Magnitude of the top-k sentinel. expf() returns exactly 0.0 for any argument
 // below -745.2, so after `v - max` a sentinel logit contributes zero mass.
 //
@@ -49,10 +85,55 @@ fn rng_next() {
     return rng_state
 }
 
-// Reset the RNG to a fixed seed so a run is reproducible.
+// Reset the RNG to a fixed seed so a run is reproducible. Also zeroes the
+// EOS-policy generation counter, so this is the single reset point a generation
+// loop calls before its first draw (the driver does exactly that).
 fn sample_seed(s) {
     rng_state = s
+    sampling_gen_len = 0
     return s
+}
+
+// Enable the EOS policy for id `id` (e.g. bpe_eos). Returns the id.
+fn sample_set_eos(id) {
+    sampling_eos = id
+    return id
+}
+
+// Require at least `m` generated tokens before EOS may be drawn. Returns m.
+// A negative m clamps to 0 = off. The counter this is compared against is reset
+// by sample_seed(), which a generation loop calls before its first draw.
+fn sample_set_min_len(m) {
+    let v = m
+    if v < 0 { v = 0 }
+    sampling_min_len = v
+    return v
+}
+
+// Apply the EOS policy to a logits buffer IN PLACE. Returns 1 if this call
+// REMOVED the EOS id from the candidate set, 0 if it left it in place.
+//
+// Preconditions are checked here, not assumed by callers:
+//   * sampling_eos < 0            -> policy disabled, no-op (default);
+//   * sampling_eos >= n           -> the id is not in this distribution, no-op;
+//   * EOS is the argmax AND at least sampling_min_len tokens have already been
+//     generated -> LEFT IN PLACE (the model's clear choice -- it may end);
+//   * otherwise                   -> EOS is pushed to the -1e30 sentinel, so
+//     expf(v - max) is exactly 0.0 for it and the draw can never land on it.
+//
+// The sentinel, not a removal/compaction, is what keeps this O(1): every other
+// routine (sample_argmax, sample_top_k, sample_softmax, sample_draw) already
+// treats -1e30 correctly, so no index bookkeeping has to move. sample_argmax()
+// is deliberately NOT changed: a caller asking "what is the argmax" still gets
+// EOS when EOS is the argmax.
+fn sample_eos_policy(logits, n) {
+    if sampling_eos < 0 { return 0 }
+    if sampling_eos >= n { return 0 }
+    if sampling_gen_len >= sampling_min_len {
+        if sample_argmax(logits, n) == sampling_eos { return 0 }
+    }
+    mem_store(logits + sampling_eos * 8, f64bits(0.0 - 1.0e30))
+    return 1
 }
 
 // Scale every logit by 1/temperature, in place.
@@ -183,13 +264,22 @@ fn sample_draw(probs, n) {
     return n - 1
 }
 
-// Full sampler. Signature unchanged from 0.0.239.
+// Full sampler. Signature unchanged from 0.0.239 (and 0.0.240): callers keep
+// calling sample_full(logits, n, temperature, k). The EOS policy is configured
+// separately via sample_set_eos()/sample_set_min_len(), so no call site had to
+// change to gain the fix.
 //
-// temperature <= 0 is GREEDY: return the argmax. This is load-bearing -- the old
-// code would have divided by zero, producing inf logits whose softmax is
-// meaningless. Greedy is deterministic and is what a caller's correctness oracle
-// uses.
+// ORDER: the EOS policy runs FIRST, before temperature scaling and top-k, so a
+// masked EOS cannot be re-introduced by the top-k pass: top-k then selects the k
+// largest of the REMAINING logits, which is exactly "exclude EOS, then top-k".
+//
+// temperature <= 0 is GREEDY: return the argmax. Load-bearing -- the old code
+// would have divided by zero. Greedy still honours a FORCED exclusion (EOS was
+// the argmax but min_len is not yet satisfied): EOS is already at -1e30 by then,
+// so sample_argmax returns the best non-EOS logit without extra machinery.
 fn sample_full(logits, n, temperature: f64, k) {
+    sample_eos_policy(logits, n)
+    sampling_gen_len = sampling_gen_len + 1
     if temperature <= 0.0 { return sample_argmax(logits, n) }
     sample_temperature(logits, n, temperature)
     if k > 0 && k < n { sample_top_k(logits, n, k) }

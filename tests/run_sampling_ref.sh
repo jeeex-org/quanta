@@ -4,8 +4,14 @@
 # Compiles tests/sampling_ref.quanta with the version's compiler, runs it (no
 # model needed; the vectors are synthetic), and checks the result against an
 # independent numpy reference plus a bit-exact Python replica of the RNG+draw.
+# 33 checks: the 13 from 0.0.240 plus the EOS-policy cases (EOS inside top-k but
+# not the argmax must be excluded; EOS as the argmax must stay returnable;
+# min_len), each emitted policy-OFF and policy-ON from the same seed.
 #
 #   bash tests/run_sampling_ref.sh          # prints the check table, exits 0/1
+#
+# The numpy-free companion check (registrable as a gate row) is
+# tests/sampling_eos_selfcheck.quanta; run it with qc + scripts/quanta_run.sh.
 #
 # Requires python3 WITH numpy: /usr/bin/python3 on this box (the Hermes python
 # does not have numpy).

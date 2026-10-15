@@ -28,6 +28,25 @@ fn dump(tag, p, n) {
     newline()
 }
 
+// Print the indices of a logits buffer that still carry their real value, i.e.
+// were not pushed to the -1e30 sentinel. Used for the EOS policy: both the
+// top-k mask and the policy mask write the SAME sentinel, so one comparison
+// covers both.
+fn dump_kept(tag, p, n) {
+    let sent: f64 = 0.0 - 1.0e30
+    let sb = f64bits(sent)
+    let kept = 0
+    prints(tag)
+    let i = 0
+    while i < n {
+        let v: f64 = f64of(mem_load(p + i * 8))
+        if f64bits(v) != sb { prints(" "); print(i); kept = kept + 1 }
+        i = i + 1
+    }
+    newline()
+    prints(tag); prints("_COUNT "); print(kept); newline()
+}
+
 fn main() {
     let n = 4096
     let a = mem_alloc(n)
@@ -135,6 +154,153 @@ fn main() {
     dump("NEGLOG", neg, 4)
     sample_softmax(neg, 4)
     dump("NEGPROB", neg, 4)
+
+    // ==================== EOS POLICY =====================================
+    // THE DEFECT THIS PINS: with EOS inside the sampled candidate set, a
+    // sufficiently high temperature truncates the answer at random. The
+    // tracked driver printed one token at temp_milli=700 because <|im_end|>
+    // was in the top-40 set and the draw hit it.
+    //
+    // Every case below is emitted with the policy OFF and ON from the SAME
+    // seed, so the harness shows the candidate set and the drawn ids CHANGED
+    // rather than asserting it did.
+    //
+    //   vector 1 (EOSLOG):    5.0 4.5 [4.0] 3.5 3.0 2.0 1.0 0.0   id 2 = EOS
+    //                         -> EOS is rank 3, inside top-k=4, NOT the argmax
+    //   vector 2 (EOSARGLOG): 1.0 2.0 [6.0] 0.5 0.25 0.75 0.1 0.0  id 2 = EOS
+    //                         -> EOS IS the argmax
+    let ev = mem_alloc(8 * 8)
+    mem_store(ev + 0 * 8, f64bits(5.0))
+    mem_store(ev + 1 * 8, f64bits(4.5))
+    mem_store(ev + 2 * 8, f64bits(4.0))
+    mem_store(ev + 3 * 8, f64bits(3.5))
+    mem_store(ev + 4 * 8, f64bits(3.0))
+    mem_store(ev + 5 * 8, f64bits(2.0))
+    mem_store(ev + 6 * 8, f64bits(1.0))
+    mem_store(ev + 7 * 8, f64bits(0.0))
+    dump("EOSLOG", ev, 8)
+
+    let tv = mem_alloc(8 * 8)
+    let ei = 0
+
+    // -- policy OFF (the default, and what 0.0.240 shipped) --------------
+    sample_set_eos(0 - 1)
+    sample_set_min_len(0)
+    // (a) the policy must be a BIT-EXACT no-op on the logits when disabled
+    copy_n(tv, ev, 8)
+    sample_eos_policy(tv, 8)
+    dump("EOSOFF_LOG", tv, 8)
+    // (b) EOS is a live candidate: the kept top-4 contains id 2
+    copy_n(tv, ev, 8)
+    sample_top_k(tv, 8, 4)
+    dump_kept("EOSOFF_K_TOPK", tv, 8)
+    // (c) and the draw LANDS on it: 200 sampled ids at temp 0.8, k=4
+    prints("EOSOFF_FULL_DRAWS")
+    sample_seed(4242)
+    ei = 0
+    while ei < 200 {
+        copy_n(tv, ev, 8)
+        prints(" "); print(sample_full(tv, 8, 0.8, 4))
+        ei = ei + 1
+    }
+    newline()
+
+    // -- policy ON, EOS not the argmax: it must be excluded --------------
+    sample_set_eos(2)
+    // (d) kept top-4 becomes {0,1,3,4}: 2 is gone, 4 is pulled in
+    copy_n(tv, ev, 8)
+    sample_eos_policy(tv, 8)
+    sample_top_k(tv, 8, 4)
+    dump_kept("EOSON_K_TOPK", tv, 8)
+    // (e) probability vector: EOS carries EXACTLY zero mass
+    copy_n(tv, ev, 8)
+    sample_eos_policy(tv, 8)
+    sample_softmax(tv, 8)
+    dump("EOSON_PROB", tv, 8)
+    // (f) 200 sample_draw ids on exactly that probability vector -- the numpy
+    //     replica must reproduce every one of them
+    prints("EOSON_DRAWSEQ")
+    sample_seed(4242)
+    ei = 0
+    while ei < 200 { prints(" "); print(sample_draw(tv, 8)); ei = ei + 1 }
+    newline()
+    // (g) 200 sample_full ids at temp 0.8, k=4 -- same seed as (c)
+    prints("EOSON_FULL_DRAWS")
+    sample_seed(4242)
+    ei = 0
+    while ei < 200 {
+        copy_n(tv, ev, 8)
+        prints(" "); print(sample_full(tv, 8, 0.8, 4))
+        ei = ei + 1
+    }
+    newline()
+    // (h) greedy must be unchanged: EOS is not the argmax, so still index 0
+    copy_n(tv, ev, 8)
+    prints("EOS_GREEDY "); print(sample_full(tv, 8, 0.0, 4)); newline()
+
+    // -- policy ON, EOS IS the argmax: still returnable -------------------
+    let ev2 = mem_alloc(8 * 8)
+    mem_store(ev2 + 0 * 8, f64bits(1.0))
+    mem_store(ev2 + 1 * 8, f64bits(2.0))
+    mem_store(ev2 + 2 * 8, f64bits(6.0))
+    mem_store(ev2 + 3 * 8, f64bits(0.5))
+    mem_store(ev2 + 4 * 8, f64bits(0.25))
+    mem_store(ev2 + 5 * 8, f64bits(0.75))
+    mem_store(ev2 + 6 * 8, f64bits(0.1))
+    mem_store(ev2 + 7 * 8, f64bits(0.0))
+    dump("EOSARGLOG", ev2, 8)
+    sample_set_eos(2)
+    sample_set_min_len(0)
+    // (i) greedy returns EOS: a turn can still END, deliberately
+    copy_n(tv, ev2, 8)
+    prints("EOSARG_T0 "); print(sample_full(tv, 8, 0.0, 0)); newline()
+    // (j) EOS stays in the kept top-4
+    copy_n(tv, ev2, 8)
+    sample_eos_policy(tv, 8)
+    sample_top_k(tv, 8, 4)
+    dump_kept("EOSARG_K_TOPK", tv, 8)
+    // (k) and carries real probability mass
+    copy_n(tv, ev2, 8)
+    sample_eos_policy(tv, 8)
+    sample_softmax(tv, 8)
+    dump("EOSARG_PROB", tv, 8)
+    // (l) 200 sample_draw ids on that vector -- replica must match exactly
+    prints("EOSARG_DRAWSEQ")
+    sample_seed(1234)
+    ei = 0
+    while ei < 200 { prints(" "); print(sample_draw(tv, 8)); ei = ei + 1 }
+    newline()
+    // (m) 200 sample_full ids at temp 1.0, k=4: EOS must be DRAWN (it is the
+    //     model's clear choice), i.e. the policy does not make EOS unreachable
+    prints("EOSARG_FULL_DRAWS")
+    sample_seed(1234)
+    ei = 0
+    while ei < 200 {
+        copy_n(tv, ev2, 8)
+        prints(" "); print(sample_full(tv, 8, 1.0, 4))
+        ei = ei + 1
+    }
+    newline()
+
+    // -- minimum length: EOS is the argmax, min_len = 3 --------------------
+    // The first 3 tokens may not end the turn even though EOS is the argmax;
+    // from the 4th on, the ordinary argmax exception applies again. k = 0 and
+    // temp = 1.0 so the path is exactly policy -> softmax -> draw and the numpy
+    // replica can model it call for call.
+    sample_set_eos(2)
+    sample_set_min_len(3)
+    sample_seed(99)
+    prints("EOSMIN_DRAWS")
+    ei = 0
+    while ei < 6 {
+        copy_n(tv, ev2, 8)
+        prints(" "); print(sample_full(tv, 8, 1.0, 0))
+        ei = ei + 1
+    }
+    newline()
+    // reset to the shipped defaults for anyone else in this process
+    sample_set_eos(0 - 1)
+    sample_set_min_len(0)
 
     prints("DONE\n")
     return 0

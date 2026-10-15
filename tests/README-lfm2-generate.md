@@ -63,17 +63,73 @@ DONE            (rc=0, RSS 181612 kB = 177 MB)
 | prompt | 42 bytes -> `chat_build` **99 bytes** -> **23 ids** (= llama.cpp's id list) |
 | prefill (20 workers) | `prefill_ms=133880`, **5,820 ms/prompt-token** |
 | decode, sampled temp_milli=250, top_k=40 | `The answer is: 2` in **6 tokens**, **7,824 ms/token** |
-| decode, sampled temp_milli=700, top_k=40 | first token `str`, then EOS -> `new_tokens=1`, 7,919 ms/token |
+| decode, sampled temp_milli=700, top_k=40 | first token `str`, then EOS -> `new_tokens=1`, 7,919 ms/token (pre-EOS-policy; the A/B below reruns it) |
 | decode, argmax (temp_milli=0) | first token `<|im_end|>` — but see below, that was the mis-prompted build |
 | `sample_full` at n_vocab=128000, k=40 | **62-79 ms** (top-k is 60 ms of it) |
 | RSS | 165-181 MB (under the 8 GB cap) |
 
 Both sampled rows are REAL TEXT. The temp 0.7 row stops after one word because the
-native distribution is flatter than llama.cpp's (see the end of this file).
+native distribution is flatter than llama.cpp's (see the end of this file) — that is the
+OLD behaviour, EOS a live candidate. The A/B section below reruns the same config with the
+EOS policy on and gets 8 tokens.
 
 **Which binary produced the text: the tracked driver**, `tests/lfm2_generate.quanta`.
 The same text was reproduced by the scratch probe `stage1/bin/sp_ids_lowt` with the same
 ids/temp/seed, so the port changed no numbers.
+
+## MEASURED — the EOS policy A/B at temp_milli=700 (same binary, one conf field)
+
+`lib/std/sampling.quanta` now excludes the model's end-of-turn id from the sampled
+candidate set UNLESS it is the argmax (`sample_set_eos(id)`, opt-in; conf field 6).
+The driver hands it `bpe_eos` (124900, read from the GGUF's
+`tokenizer.ggml.eos_token_id`). The pair below is the SAME binary, SAME prompt,
+SAME seed, temp_milli=700, top_k=40 — the only difference is conf field 6. Raw
+output, 20 cores, load ~9-19:
+
+```
+# BEFORE -- conf `20 24 700 40 12345 0 0`   (policy off = 0.0.240 behaviour)
+workers=20 max_new=24 temp_milli=700 top_k=40 seed=12345 eos_policy=0 min_len=0
+prefill_ms=148042 prefill_ms_per_tok=6436
+---generated---
+eos_id=124900 eos_excluded_unless_argmax=0 min_len=0
+str<|im_end|>
+[EOS]
+new_tokens=1
+sample_ms 96 96
+tok_ms 8802 96
+gen_ms=8898  gen_ms_per_token=8898   (rc=0, 2m46s wall)
+
+# AFTER -- conf `20 24 700 40 12345 1 0`   (policy on)
+workers=20 max_new=24 temp_milli=700 top_k=40 seed=12345 eos_policy=1 min_len=0
+prefill_ms=196208 prefill_ms_per_tok=8530
+---generated---
+eos_id=124900 eos_excluded_unless_argmax=1 min_len=0
+The answer is: 2 (init<|im_end|>
+[EOS]
+new_tokens=8
+sample_ms 140 119 117 123 102 115 96 97 171
+tok_ms 16119 17063 18843 15433 14623 14442 13999 15111 171
+gen_ms=125809  gen_ms_per_token=15726   (rc=0, 5m31s wall)
+```
+
+Read the AFTER block carefully: the turn ENDS at token 9 with `[EOS]`, but this
+time EOS was **the argmax** (the policy leaves it in place), not a draw that
+happened to land on it — 8 tokens of real text where the old path stopped at 1.
+`sample_ms`/`tok_ms` are per generated token; `tok_ms` for the FINAL token is the
+short one because that iteration ends at the EOS test and runs no forward.
+`prefill_ms_per_tok` differs between the two runs only because the box's load
+differed (6.4 s vs 8.5 s per prompt token); nothing in this change touches prefill.
+
+The answer text is still `The answer is: 2` (the native model's own arithmetic is
+wrong under a flatter logit tail — unchanged by this fix, and the same text the
+0.0.240 temp 0.25 row produced). What changed is that the model is no longer CUT
+OFF by sampling noise; whether it ends a turn is now its argmax's decision.
+
+**Method check:** with the policy off the very same draw chose EOS after one token
+(so the defect is reproduced by measurement, not quoted from an earlier run), and
+`tests/sampling_eos_selfcheck.quanta` pins it numpy-free: policy off -> EOS is in
+the kept top-4 and IS drawn; policy on -> excluded, kept count still k, never
+drawn in 300 samples.
 
 ## What 0.0.240 fixed, and how it is verified
 
@@ -84,8 +140,9 @@ ids/temp/seed, so the port changed no numbers.
 **110,080 ms** at n=128000/k=40, and `sample_draw` compared `cumsum*1000` against the raw
 rng value in [0, 2^31), which is never true — so **every draw returned index 0, and token
 0 is `'Ċ'x10`, ten newlines.** That is the whitespace this driver used to print. After:
-13 reference checks pass against numpy (tol 1e-11) plus a bit-exact Python replica of the
-LCG and the draw (200/200 ids); top-k is 60 ms at n=128000/k=40 (1834x).
+33 reference checks pass against numpy (tol 1e-11) — 13 from 0.0.240 plus 20 for
+the EOS policy — plus a bit-exact Python replica of the LCG and the draw (200/200
+ids, and 200/200 again on the EOS-masked vector); top-k is 60 ms at n=128000/k=40 (1834x).
 
 **2. The prompt construction** (`lib/std/lfm2_chat.quanta` + this driver), three measured
 defects: `chat_build` wrote a literal backslash-n where the template renders a real
@@ -102,6 +159,18 @@ flatter than llama.cpp's on identical ids — only 1 of 10 top ids shared, `p("T
 native vs 0.847 llama.cpp, EOS at #2 in the native top-10 — the argmax agrees, the tail
 does not. The tied output projection is Q6_K and no Q6_K dequant has ever been checked
 against a reference.
+
+**4. The EOS policy — queued for the next promotion** (`lib/std/sampling.quanta` +
+this driver + `tests/sampling_ref.quanta`/`verify_sampling_ref.py` +
+`tests/sampling_eos_selfcheck.quanta`). The sampler put the end-of-turn id inside
+the sampled candidate set, so a draw could truncate an answer: at
+temp_milli=700/top_k=40 the tracked driver stopped after ONE token (the A/B
+above). Policy now: exclude `sampling_eos` unless it is the argmax; optional
+`sample_set_min_len(n)` floor. Both OFF by default, so no existing caller's
+behaviour moved. Signatures unchanged (`sample_full` is still 4 args); a caller
+opts in with `sample_set_eos(bpe_eos)`. Also see `tests/sampling_eos_selfcheck.quanta`
+— the numpy-free, model-free property check written to be registrable as a gate
+row, since `lib/std/sampling.quanta` has no row in either manifest today.
 
 ## Cost — and the blocker that outranks all of the above
 

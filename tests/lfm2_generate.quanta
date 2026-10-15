@@ -29,7 +29,19 @@
 // against the raw rng output (never true), so every draw returned index 0 and the
 // run emitted whitespace no matter the temperature. See tests/README-lfm2-generate.md.
 //
-// Conf file tests/lfm2_gen.conf: "<workers> <max_new_tokens> <temp_milli> <top_k>"
+// EOS POLICY (this driver's fix for the truncation defect): at temp_milli=700,
+// top_k=40 the run used to stop after ONE token -- <|im_end|> was inside the
+// top-40 candidate set and the DRAW landed on it. The driver now hands the
+// sampler the model's own EOS id (`bpe_eos`, read from the GGUF) via
+// sample_set_eos(), so EOS is excluded from the candidate set unless it is the
+// argmax: the model can still end a turn, but only when ending is its clear
+// choice. Conf fields 6 and 7 control it (see below); both default to the fixed
+// behaviour.
+//
+// Conf file tests/lfm2_gen.conf:
+//   "<workers> <max_new_tokens> <temp_milli> <top_k> [seed] [eos_policy] [min_len]"
+//   eos_policy: 1 = exclude EOS unless argmax (default), 0 = old behaviour
+//   min_len:    refuse EOS until this many tokens have been generated (default 0)
 // Prompt file tests/lfm2_prompt.txt: the user turn.
 import std/gguf
 import std/lfm2_forward
@@ -120,6 +132,8 @@ fn main() {
     let tempmilli = 0     // 0 = argmax (deterministic)
     let topk = 0
     let seed = 12345      // 5th field; sample_seed(seed) before the first draw
+    let eospol = 1        // 6th field: 1 = exclude EOS unless argmax (default), 0 = off
+    let minlen = 0        // 7th field: refuse EOS until this many tokens were made
     if cfgb != 0 {
         let nfields = parse_ints(cfgb, conf)
         if nfields >= 4 {
@@ -129,6 +143,8 @@ fn main() {
             topk = mem_load(conf + 24)
         }
         if nfields >= 5 { seed = mem_load(conf + 32) }
+        if nfields >= 6 { eospol = mem_load(conf + 40) }
+        if nfields >= 7 { minlen = mem_load(conf + 48) }
     } else {
         prints("warn: "); prints(CONF_PATH); prints(" unreadable; using defaults\n")
     }
@@ -136,7 +152,8 @@ fn main() {
     if maxnew > 256 { maxnew = 256 }
     prints("workers="); print(nw); prints(" max_new="); print(maxnew)
     prints(" temp_milli="); print(tempmilli); prints(" top_k="); print(topk)
-    prints(" seed="); print(seed); prints("\n")
+    prints(" seed="); print(seed); prints(" eos_policy="); print(eospol)
+    prints(" min_len="); print(minlen); prints("\n")
     if topk > 0 { prints("top_k=on (O(n*k) since 0.0.240)\n") }
 
     // ---- model ----
@@ -200,9 +217,25 @@ fn main() {
     let pos = n
     let k = 0
     // Fixed seed -> the whole run is reproducible. Only meaningful when sampling.
-    if tempmilli > 0 { sample_seed(seed) }
+    if tempmilli > 0 {
+        sample_seed(seed)
+        // EOS policy: hand the sampler the model's OWN end-of-turn id so a draw
+        // can no longer cut the answer short. field 6 = 0 restores the old
+        // behaviour (EOS is a live candidate), which is what makes the A/B in
+        // tests/README-lfm2-generate.md reproducible with this same binary.
+        sample_set_eos(0 - 1)
+        if eospol != 0 { sample_set_eos(bpe_eos) }
+        sample_set_min_len(minlen)
+        prints("eos_id="); print(bpe_eos)
+        prints(" eos_excluded_unless_argmax="); print(eospol)
+        prints(" min_len="); print(minlen); prints("\n")
+    }
     let g0 = clock()
+    let sdur = mem_alloc(256 * 8)   // per token: sample + detokenise
+    let tdur = mem_alloc(256 * 8)   // per token: the whole iteration (+ this token's forward)
+    let tk = 0
     while k < maxnew {
+        let ts = clock()
         let id = 0
         if tempmilli > 0 {
             id = sample_full(fc_fw_logits, fc_n_vocab, i2f(tempmilli) / 1000.0, topk)
@@ -211,16 +244,51 @@ fn main() {
         }
         let bl = bpe_decode_token(id, outbuf)
         if bl > 0 { print(outbuf, bl) }
-        if id == bpe_eos { prints("\n[EOS]\n"); break }
+        if tk < 256 { mem_store(sdur + tk * 8, clock() - ts) }
+        if id == bpe_eos {
+            prints("\n[EOS]\n")
+            if tk < 256 { mem_store(tdur + tk * 8, clock() - ts) }
+            tk = tk + 1
+            break
+        }
         k = k + 1
-        if k >= maxnew { break }
-        if fc_forward_token_ex(id, pos, 1) != 0 { prints("FAIL decode\n"); break }
+        if k >= maxnew {
+            if tk < 256 { mem_store(tdur + tk * 8, clock() - ts) }
+            tk = tk + 1
+            break
+        }
+        if fc_forward_token_ex(id, pos, 1) != 0 {
+            prints("FAIL decode\n")
+            if tk < 256 { mem_store(tdur + tk * 8, clock() - ts) }
+            tk = tk + 1
+            break
+        }
         pos = pos + 1
+        // End of the iteration: sample + detokenise + the forward that produced
+        // the logits for the NEXT token. The FINAL iteration ends at the EOS (or
+        // max_new) test and so has no forward; that is why its tok_ms entry is
+        // the short one. Both lists are printed below, tagged.
+        if tk < 256 { mem_store(tdur + tk * 8, clock() - ts) }
+        tk = tk + 1
     }
     let g1 = clock()
     mm_pool_end()
     prints("\n---end---\n")
     prints("new_tokens="); print(k); prints("\n")
+    prints("sample_ms")     // sampling + detokenise only, per token
+    let ti = 0
+    while ti < tk {
+        prints(" "); print(mem_load(sdur + ti * 8) / 1000000)
+        ti = ti + 1
+    }
+    newline()
+    prints("tok_ms")        // whole iteration, per token (last one has no forward)
+    ti = 0
+    while ti < tk {
+        prints(" "); print(mem_load(tdur + ti * 8) / 1000000)
+        ti = ti + 1
+    }
+    newline()
     prints("gen_ms="); print((g1 - g0) / 1000000); prints("\n")
     if k > 0 { prints("gen_ms_per_token="); print((g1 - g0) / 1000000 / k); prints("\n") }
     if (g1 - g0) > 0 {
