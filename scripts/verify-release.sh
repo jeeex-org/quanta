@@ -6,8 +6,14 @@
 # deciding a claim is true) stay in the checklist and are NOT done here -- this
 # script only verifies what it can measure.
 #
-#   <NEXT> = version being built, one patch above <VER>
-#   <VER>  = released stable, read from root VERSION when omitted
+#   <NEXT> = version being built, AHEAD of <VER> in the same major.minor series
+#   <VER>  = the frozen baseline, read from root VERSION when omitted
+#
+# <VER> is the PREDECESSOR, passed explicitly (arg 2) or read from VERSION --
+# it is NOT assumed to be <NEXT>-1. Committing a tree that is never promoted
+# (as compiler/0.0.242/ is here: its WIP.md says DO NOT PROMOTE and root VERSION
+# stayed 0.0.241) puts one or more versions between the baseline and the next
+# release, and "<VER> + one patch" then names a WIP, not the predecessor.
 #
 # CONVENTION: this is a PRE-PROMOTION check. Run it BEFORE the version bump,
 # while root VERSION still names the released stable <VER>, so <NEXT> can be
@@ -59,14 +65,39 @@ fi
 [[ -e compiler/VERSION ]] && bad "compiler/VERSION exists -- root VERSION must be the only pointer" \
                           || ok "no compiler/VERSION (root VERSION is the only pointer)"
 
-# --- 2. version arithmetic --------------------------------------------------
+# --- 2. version ordering (NOT "<VER> + one patch") --------------------------
+# The published convention ("<NEXT> == <VER> + 1 patch") assumes every version in
+# between was RELEASED and promoted. It stops being true the moment a tree is
+# committed but not promoted, and it then reads a perfectly healthy tree as RED.
+# Measured here: compiler/0.0.242/ is a committed WIP whose own WIP.md says DO NOT
+# PROMOTE and left root VERSION at 0.0.241, so the next promotion (0.0.243) is
+# TWO patches above the frozen baseline 0.0.241 -- and "<VER>+1" (0.0.242) is not
+# the predecessor at all, it is that unpromoted WIP. The arithmetic was the bug.
+#
+# What has to hold is that <NEXT> is a LATER patch than <VER> in the same
+# major.minor series, and that any tree in between is a non-released WIP. The
+# check that <VER> is the RIGHT seed is check 6, not this one: if an intermediate
+# version had really been promoted, the seed chain from <VER> would not close on
+# <NEXT>'s committed binary and check 6 fails loudly. So this check only rejects
+# orderings that cannot be a release of this baseline.
 NEXT_MAJ=${NEXT%%.*}; NEXT_REST=${NEXT#*.}; NEXT_MIN=${NEXT_REST%%.*}; NEXT_PAT=${NEXT_REST#*.}
 VER_MAJ=${VER%%.*};  VER_REST=${VER#*.};  VER_MIN=${VER_REST%%.*};  VER_PAT=${VER_REST#*.}
-if [[ "$NEXT_MAJ.$NEXT_MIN" == "$VER_MAJ.$VER_MIN" && "$NEXT_PAT" -eq $((VER_PAT+1)) ]]; then
-    ok "<NEXT> is exactly one patch above <VER>"
+if [[ "$NEXT_MAJ.$NEXT_MIN" == "$VER_MAJ.$VER_MIN" && "$NEXT_PAT" -gt "$VER_PAT" ]]; then
+    ok "<NEXT>=$NEXT is $((NEXT_PAT - VER_PAT)) patch(es) ahead of baseline <VER>=$VER (same series)"
 else
-    bad "<NEXT>=$NEXT is not <VER>=$VER plus one patch"
+    bad "<NEXT>=$NEXT is not a LATER patch than <VER>=$VER in the same series -- not a release of this baseline"
 fi
+# Name every committed tree strictly between <VER> and <NEXT>. Each one is why the
+# gap is > 1 and each must be an unpromoted WIP (informational, not a failure).
+for _d in compiler/*/; do
+    _bv="${_d#compiler/}"; _bv="${_bv%/}"
+    [[ "$_bv" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || continue
+    [[ "$_bv" == "$VER" || "$_bv" == "$NEXT" ]] && continue
+    _bpat="${_bv##*.}"; _brest="${_bv#*.}"; _bmin="${_brest%%.*}"; _bmaj="${_bv%%.*}"
+    if [[ "$_bmaj.$_bmin" == "$VER_MAJ.$VER_MIN" ]] && [[ "$_bpat" -gt "$VER_PAT" ]] && [[ "$_bpat" -lt "$NEXT_PAT" ]]; then
+        note "compiler/$_bv/ sits between <VER> and <NEXT> -- committed unpromoted WIP, skipped (not a release)"
+    fi
+done
 
 # --- 3. the work tree exists ------------------------------------------------
 [[ -d "compiler/$NEXT" ]] && ok "compiler/$NEXT/ exists" \
