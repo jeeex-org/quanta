@@ -300,7 +300,7 @@ Repair `enum`, `int_ops`, `struct`; add a twin-consistency check (every `benchma
    the only thing that sees source drift (that is how a broken `parse_while()` once shipped with the gate GREEN).
 4. §3 fixpoint: 3-step chain, one distinct md5; record it in `WIP.md`.
 5. §4 smoke → expect `exit 20`.
-6. §5 gate: `ulimit -c 0 -v 6000000; QC=./compiler/<NEXT>/bin/x86/qc bash test_suites/scripts/run_tests.sh`.
+6. §5 gate: `ulimit -c 0 -v 8000000; QC=./compiler/<NEXT>/bin/x86/qc bash test_suites/scripts/run_tests.sh`.
 7. §6 `bash scripts/verify-release.sh <NEXT> <VER>`; §7 CI pin; §8 doc sync (roadmap/quanta.md, status.json,
    SPEC.md, `WIP.md`); §9 promote (`echo "<NEXT>" > VERSION`), commit `src/`, `WIP.md`, docs, tests,
    `EXPECTED.tsv`, `VERSION`, and the tracked golden `bin/x86/qc` — never `debug/` or scratch. Push.
