@@ -838,6 +838,118 @@ turns the whole gate exit non-zero; green run exits 0).
 **228/228 native, 0 compile-fail, STDLIB 111/111** with the new default. No
 compiler file changed → VERSION stays 0.0.243 (prefill precedent).
 
+### A20 · FIXED here (lib/std) · the tokenizer stalled on a 10 KB prompt — an `O(id)` vocab walk at every pre-token boundary
+
+`tests/lfm2_prefill_bench.quanta` tokenizes the real SI-loop prompt (10,890 B)
+and never returned; reproduced on HEAD-lib and current binaries, so it is
+pre-existing. It was already on the record unowned — `loader-resource-politeness.md`
+§6, "*a real item for whoever owns the BPE path*".
+
+**Located exactly:** `bpe_special_match()` in `lib/std/lfm2_bpe.quanta`, called
+once per pre-token boundary by `bpe_encode_special()` (the path the bench and the
+generator use). It called `bpe_rec_at(bpe_vocab, id)` for each special's bytes,
+and `bpe_rec_at` **walks the packed vocab from index 0** (`O(id)`). The model has
+**124 CONTROL/USER_DEFINED specials whose ids sum to 15,494,358**, so every
+boundary paid ~15.5 M record-steps. The length sort in `bpe_build_specials()` did
+the same walk `O(cnt²)` times *at init*.
+
+**Which of the three it is: (b), a genuinely slow scan — not (a), not (c).** It is
+linear in size with a ~32 ms/byte constant (doubling the input doubled the time,
+×2.13 and ×1.79, not ×4), because the cost is `(#boundaries) × sum(special ids)`
+and `#boundaries ∝ bytes` whatever the content. Nothing was quadratic in size, and
+it is not one bad input (a same-length content-uniform buffer behaves the same).
+
+Measured, single shot, load ~11–12 (`powersave`; ambient `Hermes` 748 %), via the
+new tokenizer-only driver `tests/lfm2_tok_bench.quanta`
+(`tests/run_lfm2_tok_bench.sh`):
+
+| bytes | plain ms | **special ms** | special µs/byte |
+|---|---|---|---|
+| 1 024 | 1.481 | **32 619.3** | 31 854.8 |
+| 2 048 | 2.824 | **69 468.6** | 33 920.2 |
+| 4 096 | 7.367 | **124 134.5** | 30 306.3 |
+| 10 890 | 18.942 | **355 305.5** | 32 626.8 |
+| 40 960 | 51.575 | **1 332 519.2** | 32 532.2 |
+
+**Fix:** `bpe_build_specials()` now dereferences each special's bytes **once** into
+`bpe_special_len` / `bpe_special_ptr` (the same walk it already had to do to sort
+by length), and the sort moves all three arrays together; `bpe_special_match()` is
+a byte compare against those arrays with no vocab walk. Same list, same
+descending-length order, same first-match-wins ⇒ same longest match.
+
+**After** (min of 7 runs, load 9.8–11.4), prompt vs a same-length content-uniform
+input so ns/byte measures size and not content:
+
+| bytes | ids | plain ms | special ms | plain ns/B | special ns/B | speedup |
+|---|---|---|---|---|---|---|
+| 1 024 | 341 | 1.378 | 2.209 | 1 345 | 2 157 | **14 767×** |
+| 4 096 | 1 309 | 4.706 | 7.814 | 1 149 | 1 908 | **15 886×** |
+| 10 890 | 3 638 | 12.991 | 25.963 | 1 193 | 2 384 | **13 685×** |
+| 40 960 | 13 754 | 55.088 | 88.775 | 1 345 | 2 167 | **15 010×** |
+
+Sum over the five sizes **1,914.0 s → 0.129 s (14 815×)**. **Linear now**: special
+ns/byte flat in a 1.25× band across a 40× range (uniform: 1.28× band).
+
+**Byte-for-byte id equality with llama.cpp** (the standard): every prefix handed
+unchanged to upstream's own `/opt/ai/llama.cpp/build/bin/test-tokenizer-0` —
+MATCH `1024`, `2048`, `4096`, `10890` (3 638 ids), `40960` (13 754 ids) — plus the
+pre-existing 26-prompt fixture row `blocks=26 ids=183 fails=0 OK bpe rc=0`.
+
+**Row proposed, not added** (the peer owns the manifests): a
+`stdlib_lfm2_bpe_special_scale_test.quanta` row in `EXPECTED_STDLIB.tsv` (rc 0,
+model as the `SKIP_IF_MISSING` prerequisite) that tokenizes a ≥10 KB prompt with
+`bpe_encode_special` and compares the ids to a llama.cpp fixture, inside the
+per-row wall budget. PRE-fix it cannot pass (355 s at 10,890 B); POST-fix it costs
+26 ms. Its source belongs in `test_suites/codes/`, which is not this unit's.
+
+### A21 · DECIDED here (lib/std) · `fc_attn_workers`: the parallel attention body is REMOVED, and why
+
+`fc_attn_workers` was read by `fc_layer`'s attention dispatch (`> 1` →
+`fc_attention_par`) but **no code in `lib/std` ever set it**, so the path had never
+run; its only in-tree fix (per-layer norm) was verified by reading alone. Decided:
+**remove it** — not because it is useless, but because as written it cannot be
+enabled.
+
+**It is measurably faster.** Enabled through the only route that exists (an
+importing module *can* assign the global — a scratch probe compiled and printed
+`4`), a forward at `pos=1600` with 8 workers was **~1.35×** faster, three repeats
+each, same `argmax_last=35808`:
+
+| run | `fc_attn_workers=0` | `=8` | VmSize growth (3 fwd) |
+|---|---|---|---|
+| 1 | 8 832 ms/tok | 6 791 ms/tok | 43 184 vs 241 424 kB |
+| 2 | 8 886 | 6 803 | 43 184 vs 241 424 |
+| 3 | 9 226 | 6 397 | 43 184 vs 241 424 |
+
+**But it leaks 64 MB per forward token.** 241 424 − 43 184 = 198 240 kB over 3
+forwards = 66 080 kB/forward ≈ `8 attention layers × 8 threads × 1 MB` — the
+per-call `thread_create` stack leak A9 already retired from `mm_matvec`. At 8
+workers that is ~128 tokens before an 8 GB `ulimit -v` is gone; the SI prompt alone
+is 3 638 tokens. A setter that turns it on is a leak bomb, not a speedup. The fix
+is to route the body through the **persistent pool** (`pl_*` in `lfm2_mm.quanta` —
+a different file on the loader's critical path, and one lever per version), so it
+is queued, with the ~1.35× recorded so the work is not re-derived.
+
+**Removed:** `fc_attention_par`, `patt_worker`, the `patt_*` globals (268 lines),
+`let fc_attn_workers = 0`, and the dispatch's `> 1` branch (now an unconditional
+`fc_attention` call, with the reason in the comment). Behaviour-preserving by
+construction: the branch required a value nothing ever set.
+
+Full trail + the reproduction (the driver needs the pre-removal tree to set the
+global; `tests/lfm2_attn_pos_bench.quanta` is the same harness without it):
+`docs/research/fc-attn-workers-removal.md`. **Stale docs that still say
+"left as-is / dead code"** (NOT this unit's files): `loader-resource-politeness.md`
+§5, `threaded-forward-defect.md` §8.3, `lfm2-perlayer-norm-closeout.md` §3,
+`prefill-batching.md`, `plans/lfm2-native-inference-perf.md`.
+
+**Gate.** Full gate after both fixes:
+**229/229 native, 0 compile-fail, STDLIB 111/111, all 24 stages GREEN** (the row
+count is 229, not 228 — a peer added a row to `EXPECTED.tsv` this round, in
+`08f2f9c1`/`6896004a`; a rising count is not a regression). No compiler file
+changed, so VERSION is left at the peer's **0.0.244** and self-hosting is
+unaffected — the compiler does not import `std/lfm2_*` (`grep` of
+`compiler/0.0.244/src/`).
+
 ---
 
 ## Severity B — accuracy (0.0.235)

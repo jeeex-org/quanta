@@ -1,0 +1,157 @@
+// tests/lfm2_attn_pos_bench.quanta -- time one forward at a CHOSEN sequence
+// position, and sample the process's address space around it.
+//
+// WHY THIS EXISTS
+// ---------------
+// The attention body's cost is O(pos), but reaching a long pos by prefilling
+// costs hours (see docs/research/prefill-batching.md). Calling
+// fc_forward_token(tok, pos) at a large `pos` directly gives the attention body
+// its real size without the prefill: the matvec projections do NOT depend on
+// `pos`, so they are a constant offset, and the KV entries for positions
+// 0..pos-1 are simply zeroed (their VALUES are meaningless; the WORK is not).
+//
+// It was written to settle the `fc_attn_workers` question — measured there at
+// `pos=1600`, the serial scores/softmax/accumulate is ~2.6 s of an 8.9 s
+// forward, and enabling the (since REMOVED) parallel body made it 1.35x faster
+// while leaking 64 MB of address space per forward token. See
+// docs/research/fc-attn-workers-removal.md.
+//
+// To re-measure the PARALLEL arm once the attention body is routed through the
+// persistent pool, add the pool job to lib/std/lfm2_mm.quanta and set its
+// worker count here. There is no `fc_attn_workers` any more: that global had no
+// setter, was never exercised, and leaked, so it and fc_attention_par were
+// removed (A21).
+//
+// Address space is read from /proc/self/statm (field 0 = VmSize in pages;
+// x4 = kB). VmSize, not VmRSS: a leaked thread stack is mmap'd lazily and never
+// touched, so it does not show in RSS.
+//
+// Conf: tests/lfm2_attn_pos_bench.conf   "<mm_workers> <nforw> <pos>"
+// Run:  ( ulimit -c 0 -v 8000000; <bin> </dev/null )   from the repo root
+import std/gguf
+import std/lfm2_forward
+import std/lfm2_model
+import std/lfm2_mm
+import std/fs
+
+const Q4_PATH = "/opt/ai/models/quanta/QUANTA-LFM2.5-2.6Bv1-Q4_K_M.gguf"
+const CONF_PATH = "tests/lfm2_attn_pos_bench.conf"
+const NCTX = 2048
+const TOK = 35808
+
+let plen = 0
+
+fn slurp(path) {
+    let fd = open(path, 0, 0)
+    if fd < 0 { return 0 }
+    let b = mem_alloc(4096)
+    let got = read_raw(fd, b, 4096)
+    file_close(fd)
+    if got <= 0 { return 0 }
+    plen = got
+    return b
+}
+
+fn parse_ints(buf, out) {
+    let n = 0
+    let cur = 0
+    let have = 0
+    let i = 0
+    while mem_load8(buf + i) != 0 {
+        let c = mem_load8(buf + i)
+        if c >= 48 && c <= 57 {
+            cur = cur * 10 + (c - 48)
+            have = 1
+        } else {
+            if have == 1 {
+                if n < 8 { mem_store(out + n * 8, cur) }
+                n = n + 1
+                cur = 0
+                have = 0
+            }
+        }
+        i = i + 1
+    }
+    if have == 1 { if n < 8 { mem_store(out + n * 8, cur) }; n = n + 1 }
+    return n
+}
+
+// field `fld` (0 = VmSize, 1 = VmRSS) of /proc/self/statm, in kB. -1 on failure.
+let sm_buf = 0
+fn statm_kb(fld) {
+    if sm_buf == 0 { sm_buf = mem_alloc(512) }
+    let fd = open("/proc/self/statm", 0, 0)
+    if fd < 0 { return 0 - 1 }
+    let got = read_raw(fd, sm_buf, 512)
+    file_close(fd)
+    if got <= 0 { return 0 - 1 }
+    let k = 0
+    let field = 0
+    while field < fld {
+        while k < got && mem_load8(sm_buf + k) != 32 { k = k + 1 }
+        k = k + 1
+        field = field + 1
+    }
+    let v = 0
+    while k < got {
+        let c = mem_load8(sm_buf + k)
+        if c < 48 || c > 57 { break }
+        v = v * 10 + (c - 48)
+        k = k + 1
+    }
+    return v * 4
+}
+
+fn main() -> i64 {
+    let cfgb = slurp(CONF_PATH)
+    let conf = mem_alloc(64)
+    let nf = parse_ints(cfgb, conf)
+    let MW = mem_load(conf)
+    let NFORW = mem_load(conf + 8)
+    let POS = mem_load(conf + 16)
+    prints("mm_workers="); print(MW); prints(" forw="); print(NFORW)
+    prints(" pos="); print(POS); prints(" nctx="); print(NCTX); newline()
+
+    let t0 = now()
+    if gguf_load(Q4_PATH) != 0 { prints("FAIL gguf_load\n"); return 1 }
+    if fc_read_config() != 0 { prints("FAIL fc_read_config\n"); return 1 }
+    if fc_kv_init(NCTX) != 0 { prints("FAIL fc_kv_init\n"); return 1 }
+    if fc_fw_init() != 0 { prints("FAIL fc_fw_init\n"); return 1 }
+    if fc_fw_reset() != 0 { prints("FAIL fc_fw_reset\n"); return 1 }
+    mm_set_workers(MW)
+    mm_set_embed_workers(MW)
+    prints("load_ms="); print((now() - t0) / 1000000)
+    prints(" eff_mm_workers="); print(mm_get_workers()); newline()
+
+    let vsz0 = statm_kb(0)
+    prints("vm_size_kb_start="); print(vsz0)
+    prints(" vm_rss_kb_start="); print(statm_kb(1)); newline()
+
+    let t1 = now()
+    let vsz_peak = vsz0
+    mm_pool_begin()
+    let i = 0
+    while i < NFORW {
+        if fc_forward_token(TOK, POS) != 0 {
+            mm_pool_end(); prints("FAIL forward at pos "); print(POS)
+            prints(" vm_size_kb="); print(statm_kb(0)); newline()
+            return 2
+        }
+        let v = statm_kb(0)
+        if v > vsz_peak { vsz_peak = v }
+        i = i + 1
+    }
+    mm_pool_end()
+    let t2 = now()
+
+    prints("wall_ms="); print((t2 - t1) / 1000000)
+    prints(" ms_per_tok="); print((t2 - t1) / 1000000 / NFORW)
+    prints(" argmax_last="); print(fc_argmax(fc_n_vocab))
+    prints(" vm_size_kb_end="); print(statm_kb(0))
+    prints(" vm_size_kb_peak="); print(vsz_peak)
+    prints(" vsz_growth_kb="); print(vsz_peak - vsz0)
+    prints(" vm_rss_kb_end="); print(statm_kb(1))
+    newline()
+    prints("DONE\n")
+    return 0
+}

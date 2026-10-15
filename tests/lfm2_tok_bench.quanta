@@ -1,0 +1,178 @@
+// tests/lfm2_tok_bench.quanta -- tokenizer-only driver: time the BPE encode path
+// (plain and special-splitting) over a range of input sizes, in isolation from
+// the forward pass, and dump the ids so they can be compared byte-for-byte with
+// llama.cpp's own tokenizer.
+//
+// WHY THIS EXISTS
+// ---------------
+// tests/lfm2_prefill_bench.quanta tokenizes a 10,890-byte prompt and was found
+// to STALL there, before any forward work starts. The stall is inside
+// std/lfm2_bpe; this driver isolates the tokenizer so the location and the
+// growth curve can be measured without the 1.67 GB model's forward pass.
+//
+// It uses the SAME in-tree encoder the forward pass uses (std/lfm2_bpe). Two
+// entry points are timed separately because they are not the same code path:
+//   plain   = bpe_encode()          -- pre-tokenize + BPE, no special-token split
+//   special = bpe_encode_special()  -- special-token split FIRST, then BPE
+// The prefill bench uses the SPECIAL path (chat_build emits <|im_start|> etc).
+//
+// Conf file tests/lfm2_tok_bench.conf: whitespace-separated byte LENGTHS. Each
+// length is a PREFIX of tests/lfm2_tok_bench_input.txt, so the bytes handed to
+// the tokenizer are exactly reproducible (and can be handed to llama.cpp's
+// test-tokenizer-0 to check id equality).
+//
+// Output is line-oriented and machine-parseable:
+//   RESULT len=<bytes> plain_ids=<n> plain_ns=<ns> special_ids=<n> special_ns=<ns>
+//   IDS <len> <count>
+//   <one id per line>
+//   IDSEND
+//
+// Build:  compiler/<ver>/bin/x86/qc tests/lfm2_tok_bench.quanta <bin>
+// Run:    ( ulimit -c 0 -v 8000000; <bin> </dev/null )   from the repo root
+import std/gguf
+import std/lfm2_bpe
+import std/fs
+
+const MODEL = "/opt/ai/models/quanta/QUANTA-LFM2.5-2.6Bv1-Q4_K_M.gguf"
+const INPUT_PATH = "tests/lfm2_tok_bench_input.txt"
+const CONF_PATH = "tests/lfm2_tok_bench.conf"
+const CAP = 1048576
+const MAXIDS = 262144
+
+let plen = 0
+
+// NOTE the open convention. The raw `file_open(path, flags)` BUILTIN does NOT
+// understand a Quanta string expression: handed a non-literal string it passes
+// the [u64 len] HEADER as the C path, so file_open(PARAM) opens "\30" and
+// returns ENOENT. std/fs's open(path, flags, mode) wrapper does the +8 offset
+// and the NUL terminator, so use that. (Measured with a scratch probe: literal
+// -> fd 3; file_open(param) -> -2; file_open(param+8) -> 3; open(param,0,0) -> 3.)
+fn slurp(path) {
+    let fd = open(path, 0, 0)
+    if fd < 0 { return 0 }
+    let b = mem_alloc(CAP)
+    let got = read_raw(fd, b, CAP)
+    file_close(fd)
+    if got <= 0 { return 0 }
+    plen = got
+    return b
+}
+
+fn parse_ints(buf, out) {
+    let n = 0
+    let cur = 0
+    let have = 0
+    let i = 0
+    while mem_load8(buf + i) != 0 {
+        let c = mem_load8(buf + i)
+        if c >= 48 && c <= 57 {
+            cur = cur * 10 + (c - 48)
+            have = 1
+        } else {
+            if have == 1 {
+                if n < 16 { mem_store(out + n * 8, cur) }
+                n = n + 1
+                cur = 0
+                have = 0
+            }
+        }
+        i = i + 1
+    }
+    if have == 1 { if n < 16 { mem_store(out + n * 8, cur) }; n = n + 1 }
+    return n
+}
+
+fn dump_ids(ids, n, len) {
+    prints("IDS "); print(len); prints(" "); print(n); newline()
+    let k = 0
+    while k < n {
+        print(mem_load(ids + k * 8))
+        newline()
+        k = k + 1
+    }
+    prints("IDSEND\n")
+    return 0
+}
+
+// Fill `n` bytes at dst by tiling the fixed ASCII unit below. This gives a
+// CONTENT-UNIFORM input so the growth curve measures SIZE rather than content:
+// every prefix of the uniform buffer has the same character mix, which the real
+// prompt does not (SYSTEM card, LANGUAGE_CARD, neighbour and spec differ a lot).
+// Comparing the prompt's ns/byte with the uniform's says whether a rising
+// ns/byte is real superlinearity or just where the prompt's heavy sections sit.
+const UNIT = "The quick brown fox jumps over the lazy dog. "
+fn fill_uniform(dst, n) {
+    let u = len(UNIT)
+    let i = 0
+    while i < n {
+        mem_store8(dst + i, mem_load8(UNIT + 8 + (i % u)))
+        i = i + 1
+    }
+    return n
+}
+
+// Time plain + special encoding of `buf`'s first L bytes for every L in the
+// conf. `dump` = 1 writes the id sequence out for the llama.cpp comparison.
+fn run_source(tag, buf, inlen, conf, nlen, ids, dump) {
+    let k = 0
+    while k < nlen {
+        let L = mem_load(conf + k * 8)
+        if L <= 0 || L > inlen { k = k + 1; continue }
+
+        let t0 = clock()
+        let got = bpe_encode(buf, L, ids, MAXIDS)
+        let t1 = clock()
+        let t2 = clock()
+        let gots = bpe_encode_special(buf, L, ids, MAXIDS)
+        let t3 = clock()
+
+        prints("RESULT src="); prints(tag)
+        prints(" len="); print(L)
+        prints(" plain_ids="); print(got)
+        prints(" plain_ns="); print(t1 - t0)
+        prints(" special_ids="); print(gots)
+        prints(" special_ns="); print(t3 - t2)
+        newline()
+
+        if dump == 1 {
+            // Re-encode with the plain path and dump for the llama.cpp comparison.
+            let got2 = bpe_encode(buf, L, ids, MAXIDS)
+            dump_ids(ids, got2, L)
+        }
+        k = k + 1
+    }
+    return 0
+}
+
+fn main() {
+    prints("=== lfm2 tokenizer bench ===\n")
+    if gguf_load(MODEL) != 0 { prints("FAIL gguf_load\n"); return 1 }
+    if bpe_init_from_gguf() == 0 { prints("FAIL bpe_init\n"); return 1 }
+    prints("specials="); print(bpe_special_count()); newline()
+
+    let buf = slurp(INPUT_PATH)
+    if buf == 0 { prints("FAIL read input\n"); return 1 }
+    // Capture the input length NOW: slurp() writes the global plen, and the
+    // conf read below overwrites it (which silently made every length look
+    // "> input" and skip). Keep them in separate variables.
+    let inlen = plen
+    prints("input_bytes="); print(inlen); newline()
+
+    let cfgb = slurp(CONF_PATH)
+    if cfgb == 0 { prints("FAIL read conf\n"); return 1 }
+    let conf = mem_alloc(256)
+    let nlen = parse_ints(cfgb, conf)
+
+    let ids = mem_alloc(MAXIDS * 8)
+
+    // The real prompt (ids dumped for the llama.cpp id-equality check).
+    run_source("prompt", buf, inlen, conf, nlen, ids, 1)
+
+    // A same-LENGTH content-uniform input, for the linearity read.
+    let ubuf = mem_alloc(inlen + 8)
+    fill_uniform(ubuf, inlen)
+    run_source("uniform", ubuf, inlen, conf, nlen, ids, 0)
+
+    prints("TOKBENCH DONE\n")
+    return 0
+}
