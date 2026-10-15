@@ -1,0 +1,145 @@
+// Reference check for the Q6_K dequant (GGML type 14) against the REAL kernel.
+//
+// WHY THIS ROW EXISTS
+//   Q6_K is the dtype of token_embd.weight in QUANTA-LFM2.5-2.6Bv1-Q4_K_M.gguf
+//   (2048 x 128000, the tied output projection), and it was the standing prime
+//   suspect for the native engine's flatter-than-llama.cpp logits. It had NO
+//   reference check: the existing gguf_q6k_dequant_test.quanta only exercises a
+//   byte-mask on a 3-byte buffer and never calls the dequant at all, and
+//   blocks_oracle.c covers q4_0/q4_1/q5_0/q5_1/q8_0/mxfp4/nvfp4/iq4_nl/iq4_xs
+//   but NOT any of the K-quants.
+//
+// HOW THE EXPECTATIONS WERE DERIVED (not transcribed, not from memory)
+//   scripts/audit/blocks_oracle.c is the house pattern: link the installed
+//   library and call the genuine kernel, so the comparison is against upstream
+//   and not against a third hand-transcription. The same was done here with a
+//   purpose-built shim:
+//
+//     extern void dequantize_row_q6_K(const void *x, float *y, int64_t k);
+//     gcc -O2 -w -o q6k_oracle q6k_oracle.c \
+//         -I/opt/ai/llama.cpp/ggml/include \
+//         -L/home/tali/.local/lib/python3.12/site-packages/lib64 \
+//         -lggml-base -Wl,-rpath,.../lib64 -lm
+//
+//   fed the SAME 840-byte fixture this file builds in memory, printing every
+//   element at %.17g. The bit patterns committed below are that output. A
+//   re-derivation command and the full table are in compiler/0.0.241/WIP.md.
+//
+// THE FIXTURE (4 blocks x 210 bytes, built here so it reads no data file)
+//   block 0  byte[j] = (j*37+11) % 256   j in 0..207,  d = 1.0
+//   block 1  byte[j] = (j*101+200) % 256 j in 0..207,  d = -0.5
+//   block 2  ql[0]=0x21, sc[0]=2, rest 0,              d = 1.0   <- hand case
+//   block 3  all 208 payload bytes 0xFF,               d = 1.0
+//   blocks 0 and 1 sweep the full byte range so every packed field (two 4-bit
+//   halves per byte, two 2-bit fields per qh byte, signed 8-bit scales) is
+//   exercised across its whole width -- the packed-field trap where one field
+//   generated only within its own width leaves the bits it does not own at zero.
+//
+// THE HAND CASE NEEDS NO ORACLE: block 2 has ql[0]=0x21, qh[0]=0, sc[0]=2, d=1.0,
+// so for l=0, is=0:  q1 = (0x21 & 0xF) | ((0>>0)&3)<<4 = 1,  q1-32 = -31, and
+// y[0] = 1.0 * sc[0] * (-31) = -62.0 exactly.
+//
+// RESULT (measured): the Quanta dequant is BIT-EXACT against the real kernel --
+// all 16 sampled elements, min/max, and the f64 sum and sumsq over all 1024
+// elements. max |delta| = 0 ULP.
+
+import std/gguf
+
+let FAIL = 0
+
+fn chk(label, want, got) {
+    if want != got {
+        prints("FAIL ")
+        prints(label)
+        prints(": got ")
+        print(got)
+        prints(" want ")
+        print(want)
+        newline()
+        FAIL = FAIL + 1
+    }
+}
+
+fn put8(p, v) { mem_store8(p, v); return 0 }
+
+// Committed reference values (f64 bit patterns) from dequantize_row_q6_K.
+fn want_elem(i) -> i64 {
+    if i == 0    { return 0 - 4569363616851034112 }
+    if i == 1    { return 4655173902329184256 }
+    if i == 16   { return 0 - 4577064596291977216 }
+    if i == 32   { return 4642331606516760576 }
+    if i == 64   { return 0 - 4564468591084175360 }
+    if i == 96   { return 0 - 4572508220106473472 }
+    if i == 127  { return 4654311885213007872 }
+    if i == 128  { return 0 - 4578489563361574912 }
+    if i == 191  { return 0 - 4571540649874030592 }
+    if i == 224  { return 4650652710515769344 }
+    if i == 254  { return 0 - 4592545720011063296 }
+    if i == 255  { return 0 - 4589730970243956736 }
+    if i == 256  { return 0 - 4569324034432434176 }
+    if i == 511  { return 4652266793585344512 }
+    if i == 512  { return 0 - 4589449495267246080 }
+    if i == 1023 { return 0 - 4593953094894616576 }
+    return 0
+}
+
+fn main() -> i64 {
+    let raw = mem_alloc(840)
+    let b = 0
+    while b < 4 {
+        let base = b * 210
+        let j = 0
+        while j < 208 {
+            let v = 0
+            if b == 0 { v = (j * 37 + 11) % 256 }
+            if b == 1 { v = (j * 101 + 200) % 256 }
+            if b == 3 { v = 255 }
+            put8(raw + base + j, v)
+            j = j + 1
+        }
+        // d field: 1.0 = 0x00,0x3C ; -0.5 = 0x00,0xB8
+        put8(raw + base + 208, 0)
+        if b == 1 { put8(raw + base + 209, 184) } else { put8(raw + base + 209, 60) }
+        b = b + 1
+    }
+    // hand case, block 2
+    put8(raw + 2 * 210 + 0, 33)     // ql[0] = 0x21
+    put8(raw + 2 * 210 + 192, 2)    // sc[0] = 2
+
+    let out = mem_alloc(1024 * 8)
+    if read_block_f64(14, raw, 1024, out) == 0 { prints("FAIL read_block_f64 refused Q6_K\n"); return 2 }
+
+    // hand-computed element, needs no oracle
+    let h = f64of(mem_load(out + 512 * 8))
+    chk("hand elem512", 0 - 4589449495267246080, f64bits(h))   // -62.0 exactly
+
+    // sampled elements across all block boundaries
+    let idxs = [0, 1, 16, 32, 64, 96, 127, 128, 191, 224, 254, 255, 256, 511, 1023]
+    let k = 0
+    while k < 15 {
+        let i = idxs[k]
+        let got = f64of(mem_load(out + i * 8))
+        chk("elem", want_elem(i), f64bits(got))
+        k = k + 1
+    }
+
+    // whole-vector aggregates: a mismatch anywhere moves these.
+    let sum: f64 = 0.0
+    let sumsq: f64 = 0.0
+    let m = 0
+    while m < 1024 {
+        let v = f64of(mem_load(out + m * 8))
+        sum = sum + v
+        sumsq = sumsq + v * v
+        m = m + 1
+    }
+    chk("sum",   0 - 4556715934596726784, f64bits(sum))    // -9878.0
+    chk("sumsq", 4738569652051902464,     f64bits(sumsq))  // 630193196.0
+
+    prints("q6k_dequant_ref: ")
+    if FAIL == 0 { prints("PASS (bit-exact vs dequantize_row_q6_K)\n"); return 0 }
+    prints("FAIL ")
+    print(FAIL)
+    prints(" case(s)\n")
+    return 1
+}

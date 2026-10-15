@@ -439,6 +439,26 @@ fn vt_byte_to_token(b) -> i64 {
 // rather than merged into 229 + something. Three of 26 reference blocks diverge
 // without it.
 // ---------------------------------------------------------------------------
+// DISPATCHES TO bpe_encode_special, NOT bpe_encode.
+//
+// The driver hit exactly this and it cost hours: bpe_encode does NO
+// special-token matching, so a chat template's control tokens
+// (`<|im_start|>`, `<|im_end|>`, `<thinking>`) are byte-encoded and BPE-merged
+// as ordinary text instead of resolving to their single vocabulary ids. The
+// prompt then LOOKS plausible -- it is still valid ids -- while the model sees
+// a different prompt, and only a byte-exact id comparison against llama.cpp's
+// /tokenize reveals it.
+//
+// bpe_encode_special() falls back to bpe_encode() itself when the vocab carries
+// no token_type array (bpe_special_n == 0), so routing every call through it is
+// safe for a model without specials: the ids are identical in that case, which
+// is what keeps std_tokenizer_trait_test's delegation checks green.
+//
+// INTERFACE NOTE: one `vt_encode` is the right seam. Special tokens are the
+// model's own vocabulary, not a caller choice -- there is no caller for whom
+// tokenizing `<|im_start|>` as ten ordinary bytes is correct -- so the trait
+// exposes the special-aware path only rather than a pair the caller could pick
+// wrongly, which is the defect that was just removed.
 fn vt_encode(src, n, ids, max_ids) -> i64 {
     if VT_READY == 0 { return 0 }
     if vt_implemented(VT_FAMILY) == 0 { return 0 }
@@ -446,9 +466,9 @@ fn vt_encode(src, n, ids, max_ids) -> i64 {
         // upstream prepends BOS for the LLAMA3 group; BOS is the first control
         // token, and a model whose BOS the caller must supply gets one here
         // exactly as upstream does
-        if VT_BOS < 0 { return bpe_encode(src, n, ids, max_ids) }
+        if VT_BOS < 0 { return bpe_encode_special(src, n, ids, max_ids) }
     }
-    return bpe_encode(src, n, ids, max_ids)
+    return bpe_encode_special(src, n, ids, max_ids)
 }
 
 fn vt_decode(ids, count, dst) -> i64 {

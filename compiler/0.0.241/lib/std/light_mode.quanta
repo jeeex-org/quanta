@@ -1,0 +1,585 @@
+// ===========================================================================
+// Light mode -- Phase 11.4
+//
+// A model of a few billion parameters is poor at the MACHINERY of tool calls:
+// it writes a file's text inside a JSON string and gets the escaping wrong, it
+// mistypes an argument, it writes its tool list back as its reply, and every
+// step re-reads every tool description before it writes a word. The same model,
+// shown the project's files and asked to answer in plain text with each changed
+// file written out WHOLE, does the same work far more often and in a fraction of
+// the time.
+//
+// So for a small model the host does the machinery. The model is sent NO tools
+// and a short instruction. It answers with:
+//
+//   FILE: path/to/file.js
+//   ```
+//   <the complete new contents>
+//   ```
+//
+//   READ: other/file.css
+//
+//   one sentence saying what it did
+//
+// This module turns such an answer into the same writes and reads the host
+// already performs for a larger model, so every file still goes through the same
+// permission question, the same undo, and the same record of what was proven.
+//
+// From HashCortX src/js/code/light.js, read from source rather than from its
+// README:
+//   - the SYSTEM prompt and the FILE/READ shape   light.js:38-58
+//   - withoutMadeUpRuns, dropping fabricated runs light.js:180-210
+//   - looksLikeFile, refusing a bare sentence      light.js:170-178
+//   - the last write of a path winning            light.js:227-230
+//
+// WHAT IS DELIBERATELY NOT HERE
+//
+// No file IO, no permissions, no undo, no model, no network. This decides what a
+// reply MEANS: which paths to write with what whole contents, which paths to
+// read, what the model said besides, and whether it ran out of text mid-file.
+// The caller performs the writes.
+//
+// The rule that makes this worth building rather than trusting the model's own
+// tool calls: a RUN: line the model wrote, and the pass/fail it wrote under one,
+// are DISCARDED. Light mode runs the tests; a small model reporting its own tests
+// passing for a test file that does not exist is the commonest lie at this size,
+// and there is no honest way to honour it. Proof comes from the host's run.
+//
+// PURE FUNCTIONS OF STRINGS. No state between calls, so the same reply always
+// yields the same writes.
+//
+// RESULTS, returned through module globals rather than a list, because Quanta's
+// lists are typed and a record needs a string and an integer side by side:
+//
+//   LM_SAID         the prose, with fabricated runs stripped
+//   LM_CUT          1 when the reply was cut off anywhere
+//
+// and read through lm_writes(), lm_reads(), lm_write_path(i), lm_write_body(i),
+// lm_write_cut(i), lm_read_path(i). The counts are DERIVED from the vecs rather
+// than tracked separately, so they cannot disagree with what was stored.
+
+import std/str
+import std/vec
+
+// ---- results ------------------------------------------------------------
+//
+// Quanta's typed lists cannot hold a string and an integer in one record, and a
+// `: str` list global is not a form the compiler accepts. std/vec is the
+// untyped i64 vec used elsewhere in the tree (std/json), and a string IS an i64
+// pointer, so a vec holds paths and bodies exactly as it holds integers.
+//
+// Strings in these results are heap values: read them with len/byte_at/equals,
+// NOT with print, which prints the pointer.
+
+let LM_WPATHS = 0
+let LM_WBODIES = 0
+let LM_WCUT = 0
+let LM_RPATHS = 0
+let LM_SAID = ""
+let LM_CUT = 0
+
+
+// ---------------------------------------------------------------------------
+// The instruction sent to a model in light mode. Short on purpose: a small model
+// re-reads the whole system prompt at every step, so every line here costs
+// tokens at every step. Kept as a binding so a test can assert it names both
+// FILE and READ, since a reply format the prompt does not mention is a silent
+// failure at this size.
+// ---------------------------------------------------------------------------
+let LM_SYSTEM = "You are HashCoder, a coding assistant working on the person's project, which is shown below. You answer in plain text and do not call tools.\n\nTo create or change a file, write the whole file, like this:\n\nFILE: index.html\n```\n<the complete new contents of the file>\n```\n\nTo look at a file you cannot see, write a line that is only: READ: style.css\n\nRules:\n- Paths are from the project folder. A file at its top is written by its name alone, such as index.html; one in a folder with the folder, such as src/app.js. Use the paths the project already has.\n- Write only the files that must change or be created, each one in full. Keep everything in them that you were not asked to change exactly as it is.\n- Do not change test files unless asked to.\n- Do not add comments saying what you changed.\n- Answer a question in plain words and write no FILE blocks.\n- After the files, say in one sentence what you did. The tests are run for you.\n- When the work is done, answer with that one sentence and no FILE blocks."
+
+// ---------------------------------------------------------------------------
+// Whether this model should be given light mode at all.
+//
+// True for the small tier only. A mid or full model is BETTER at tool calls than
+// at whole-file rewrites -- rewriting a file whole costs tokens proportional to
+// its size, which over a long conversation is the dominant cost. A setting may
+// widen this to mid, or switch it off entirely; the caller decides, this answers
+// only the default.
+//
+// override: -1 unset (use the tier), 0 forced off, 1 forced on.
+// ---------------------------------------------------------------------------
+fn lm_enabled(size_class, override) -> i64 {
+    if override == 0 { return 0 }
+    if override == 1 { return 1 }
+    if size_class == 1 { return 1 }
+    return 0
+}
+
+// Clear the results. Call before every lm_parse.
+fn lm_reset() -> i64 {
+    LM_WPATHS = vec_new()
+    LM_WBODIES = vec_new()
+    LM_WCUT = vec_new()
+    LM_RPATHS = vec_new()
+    LM_SAID = ""
+    LM_CUT = 0
+    return 0
+}
+
+fn lm_lower(c) -> i64 {
+    if c >= 65 && c <= 90 { return c + 32 }
+    return c
+}
+
+fn lm_is_space(c) -> i64 {
+    if c == 32 || c == 9 || c == 13 { return 1 }
+    return 0
+}
+
+// ---------------------------------------------------------------------------
+// Whether `body` reads as a file's CONTENTS rather than a sentence about a
+// change.
+//
+// A `FILE:` line followed by plain prose is the commonest small-model error, and
+// writing that prose into the file destroys work. A words file (.md .txt .rst
+// .tex) is always taken as the file, because prose IS its content. Anything else
+// must contain at least one line that looks like code: one ending in a bracket or
+// semicolon, or one opening with a tag, a selector, a block, or a keyword.
+// ---------------------------------------------------------------------------
+fn lm_looks_like_file(body, path) -> i64 {
+    if lm_is_words_file(path) == 1 { return 1 }
+    return lm_has_code_line(body)
+}
+
+fn lm_is_words_file(path) -> i64 {
+    let n = len(path)
+    if n < 3 { return 0 }
+    let a = byte_at(path, n - 3)
+    if a != 46 { return 0 }          // '.'
+    let b = lm_lower(byte_at(path, n - 2))
+    let c = lm_lower(byte_at(path, n - 1))
+    if b == 109 && c == 100 { return 1 }   // md
+    if b == 116 && c == 116 { return 1 }   // txt
+    if b == 114 && c == 116 { return 1 }   // rst
+    if b == 116 && c == 120 { return 1 }   // tex
+    if b == 109 && c == 114 { return 1 }   // markdown -> .mar no; keep 'md' prefix rule below
+    if b == 116 && c == 109 { return 1 }   // .htm
+    if b == 108 && c == 109 { return 1 }   // .shtml ends 'ml' not this
+    return 0
+}
+
+// Does any line of `s` look like code rather than a sentence?
+fn lm_has_code_line(s) -> i64 {
+    let nl = len(s)
+    let a = 0
+    while a < nl {
+        let e = a
+        while e < nl && byte_at(s, e) != 10 { e = e + 1 }
+        if lm_line_is_code(s, a, e) == 1 { return 1 }
+        a = e + 1
+    }
+    return 0
+}
+
+fn lm_line_is_code(s, a, b) -> i64 {
+    let e = b
+    while e > a && lm_is_space(byte_at(s, e - 1)) == 1 { e = e - 1 }
+    if e <= a { return 0 }
+    let last = byte_at(s, e - 1)
+    if last == 123 || last == 125 || last == 40 || last == 41 { return 1 }
+    if last == 59 || last == 61 || last == 60 || last == 62 { return 1 }
+    if last == 91 || last == 93 { return 1 }
+    let f = a
+    while f < e && lm_is_space(byte_at(s, f)) == 1 { f = f + 1 }
+    if f >= e { return 0 }
+    let c0 = byte_at(s, f)
+    if c0 == 60 || c0 == 33 || c0 == 47 { return 1 }   // < ! /
+    if c0 == 46 || c0 == 35 { return 1 }               // . #
+    if lm_opens_block(s, f, e) == 1 { return 1 }
+    if lm_starts_keyword(s, f, e) == 1 { return 1 }
+    return 0
+}
+
+fn lm_opens_block(s, f, e) -> i64 {
+    let i = f
+    while i < e {
+        let c = byte_at(s, i)
+        if c == 123 { return 1 }
+        if c == 59 { return 0 }
+        i = i + 1
+    }
+    return 0
+}
+
+// Does s[f..e) BEGIN with a code keyword, followed by a word boundary?
+//
+// The keyword must be followed by a non-word character, or `letter` would match
+// `let` and `lesser` would be read as a declaration. Requiring the keyword to
+// span the WHOLE line instead is also wrong: `let x = 1` is the commonest line
+// in a written-out file and ends in a digit, not a bracket.
+fn lm_starts_keyword(s, f, e) -> i64 {
+    if lm_kw_at(s, f, e, "def") == 1 { return 1 }
+    if lm_kw_at(s, f, e, "class") == 1 { return 1 }
+    if lm_kw_at(s, f, e, "import") == 1 { return 1 }
+    if lm_kw_at(s, f, e, "from") == 1 { return 1 }
+    if lm_kw_at(s, f, e, "const") == 1 { return 1 }
+    if lm_kw_at(s, f, e, "let") == 1 { return 1 }
+    if lm_kw_at(s, f, e, "var") == 1 { return 1 }
+    if lm_kw_at(s, f, e, "function") == 1 { return 1 }
+    if lm_kw_at(s, f, e, "return") == 1 { return 1 }
+    if lm_kw_at(s, f, e, "export") == 1 { return 1 }
+    if lm_kw_at(s, f, e, "module") == 1 { return 1 }
+    return 0
+}
+
+fn lm_kw_at(s, f, e, w) -> i64 {
+    if e - f < len(w) { return 0 }
+    let i = 0
+    while i < len(w) {
+        if byte_at(s, f + i) != byte_at(w, i) { return 0 }
+        i = i + 1
+    }
+    // the character after the keyword must not continue the word
+    if f + len(w) < e {
+        let c = byte_at(s, f + len(w))
+        if lm_is_word_char(c) == 1 { return 0 }
+    }
+    return 1
+}
+
+fn lm_is_word_char(c) -> i64 {
+    if c == 95 || c == 48 || c == 57 { return 1 }            // _ 0-9
+    if c >= 65 && c <= 90 { return 1 }                        // A-Z
+    if c >= 97 && c <= 122 { return 1 }                       // a-z
+    return 0
+}
+
+// ---------------------------------------------------------------------------
+// The path on a `FILE: x` / `READ: x` line, or "" when the line is not one.
+// Leading and trailing space is trimmed. A path containing a space is not
+// supported: a small model writing `FILE: my file.js` has already gone wrong,
+// and guessing where the name ends is worse than refusing it.
+// ---------------------------------------------------------------------------
+fn lm_line_path(s, a, b, keyword) -> str {
+    let i = a
+    while i < b && lm_is_space(byte_at(s, i)) == 1 { i = i + 1 }
+    if lm_starts_ci(s, i, b, keyword) == 0 { return "" }
+    i = i + len(keyword)
+    while i < b && lm_is_space(byte_at(s, i)) == 1 { i = i + 1 }
+    let e = b
+    while e > i && lm_is_space(byte_at(s, e - 1)) == 1 { e = e - 1 }
+    if e <= i { return "" }
+    let p = substr(s, i, e - i)
+    if lm_has_space(p) == 1 { return "" }
+    return p
+}
+
+fn lm_has_space(p) -> i64 {
+    let i = 0
+    while i < len(p) {
+        if lm_is_space(byte_at(p, i)) == 1 { return 1 }
+        i = i + 1
+    }
+    return 0
+}
+
+fn lm_starts_ci(s, a, b, w) -> i64 {
+    if b - a < len(w) { return 0 }
+    let i = 0
+    while i < len(w) {
+        if lm_lower(byte_at(s, a + i)) != lm_lower(byte_at(w, i)) { return 0 }
+        i = i + 1
+    }
+    return 1
+}
+
+// Concatenate lines[a..b) with newlines. `lines` is passed for symmetry with the
+// callers above; Quanta's list indexing needs the owning list.
+fn lm_join(lines, a, b) -> str {
+    let n = lines.len()
+    if b <= a { return "" }
+    let out = ""
+    let i = a
+    while i < b && i < n {
+        if len(out) > 0 { out = concat(out, "\n") }
+        let piece = lines[i]
+        out = concat(out, piece)
+        i = i + 1
+    }
+    return out
+}
+
+// ---------------------------------------------------------------------------
+// Fabricated test results.
+//
+// A RUN: line in light mode is always made up: the host runs the tests, after the
+// change, and a small model reported its own tests passing for a test file that
+// did not exist. The line goes. So does the fenced block under it.
+//
+// For a bare paragraph, the reference removes the result lines but re-examines
+// the paragraph's LAST line rather than dropping the whole thing
+// (light.js:205-207):
+//
+//     i = e > j && e - j <= 3 && RESULT_WORDS.test(...) ? e - 1 : i;
+//
+// So for
+//
+//     RUN: pytest
+//     All tests pass.
+//     Finished.
+//
+// e stops after "Finished.", e-j is 2, the paragraph reads as a result, and
+// i = e-1 drops "All tests pass." only -- "Finished." is then processed again
+// and kept. Dropping the entire paragraph, which an earlier version here did,
+// loses real content whenever the fabricated result is not the last thing the
+// model said.
+//
+// light.js:180-210. `lines` is the reply already split on newlines.
+// ---------------------------------------------------------------------------
+fn lm_strip_runs(lines) -> str {
+    let n = lines.len()
+    let kept = []
+    let i = 0
+    while i < n {
+        let line = lines[i]
+        if lm_is_run(line) == 1 {
+            let j = i + 1
+            while j < n && lm_is_blank_line(lines[j]) == 1 { j = j + 1 }
+            if j < n && lm_is_fence_line(lines[j]) == 1 {
+                i = lm_fence_end(lines, j)
+                continue
+            }
+            // the paragraph of result-looking lines, bounded like the reference
+            let e = j
+            while e < n && lm_is_blank_line(lines[e]) == 0 {
+                let cur = lines[e]
+                if lm_is_run(cur) == 1 { break }
+                if equals(lm_line_path(cur, 0, len(cur), "FILE:"), "") == 0 { break }
+                if equals(lm_line_path(cur, 0, len(cur), "READ:"), "") == 0 { break }
+                e = e + 1
+            }
+            if e > j && e - j <= 3 {
+                let para = lm_join(lines, j, e)
+                if lm_reads_as_result(para) == 1 {
+                    i = e - 1
+                    continue
+                }
+            }
+            i = j
+            continue
+        }
+        kept.push(line)
+        i = i + 1
+    }
+    return lm_join(kept, 0, kept.len())
+}
+
+fn lm_is_blank_line(s) -> i64 {
+    let i = 0
+    while i < len(s) {
+        if lm_is_space(byte_at(s, i)) == 0 { return 0 }
+        i = i + 1
+    }
+    return 1
+}
+
+fn lm_is_run(s) -> i64 {
+    let i = lm_first_nonspace(s)
+    return lm_starts_ci(s, i, len(s), "RUN:")
+}
+
+fn lm_first_nonspace(s) -> i64 {
+    let i = 0
+    while i < len(s) && lm_is_space(byte_at(s, i)) == 1 { i = i + 1 }
+    return i
+}
+
+fn lm_is_fence_line(s) -> i64 {
+    let b = len(s)
+    let i = lm_first_nonspace(s)
+    if i >= b { return 0 }
+    let c = byte_at(s, i)
+    if c != 96 && c != 126 { return 0 }
+    let n = 0
+    while i < b && byte_at(s, i) == c { n = n + 1; i = i + 1 }
+    if n < 3 { return 0 }
+    return 1
+}
+
+// The fence character and its run length, encoded so callers can match the
+// closing fence without re-parsing: returns the run length, and sets the
+// character through LM_FENCE_CHAR.
+let LM_FENCE_CHAR = 0
+
+fn lm_fence_run(s) -> i64 {
+    let b = len(s)
+    let i = lm_first_nonspace(s)
+    if i >= b { return 0 }
+    LM_FENCE_CHAR = byte_at(s, i)
+    let n = 0
+    while i < b && byte_at(s, i) == LM_FENCE_CHAR { n = n + 1; i = i + 1 }
+    return n
+}
+
+// Index just past the closing fence of the block opened at `j`.
+fn lm_fence_end(lines, j) -> i64 {
+    let want = lm_fence_run(lines[j])
+    let c = LM_FENCE_CHAR
+    let n = lines.len()
+    let p = j + 1
+    while p < n {
+        let line = lines[p]
+        let m = lm_fence_run(line)
+        if m >= want && LM_FENCE_CHAR == c { return p + 1 }
+        p = p + 1
+    }
+    return n
+}
+
+// Index just past the closing fence, or -1 when the reply has none.
+fn lm_fence_close(lines, j) -> i64 {
+    let want = lm_fence_run(lines[j])
+    let c = LM_FENCE_CHAR
+    let n = lines.len()
+    let p = j + 1
+    while p < n {
+        let line = lines[p]
+        let m = lm_fence_run(line)
+        if m >= want && LM_FENCE_CHAR == c { return p }
+        p = p + 1
+    }
+    return -1
+}
+
+// Does `s` read as a test RESULT rather than as prose?
+//
+// The word list is deliberately narrow -- pass/fail/error/ok/success/output/
+// print/works -- because the point is to catch "tests pass" and not to eat a real
+// sentence. light.js RESULT_WORDS.
+fn lm_reads_as_result(s) -> i64 {
+    if len(s) == 0 { return 0 }
+    if lm_contains_ci(s, "pass") == 1 { return 1 }
+    if lm_contains_ci(s, "fail") == 1 { return 1 }
+    if lm_contains_ci(s, "error") == 1 { return 1 }
+    if lm_contains_ci(s, "ok") == 1 { return 1 }
+    if lm_contains_ci(s, "success") == 1 { return 1 }
+    if lm_contains_ci(s, "output") == 1 { return 1 }
+    if lm_contains_ci(s, "print") == 1 { return 1 }
+    if lm_contains_ci(s, "works") == 1 { return 1 }
+    return 0
+}
+
+fn lm_contains_ci(s, w) -> i64 {
+    let n = len(s)
+    let m = len(w)
+    if m == 0 || m > n { return 0 }
+    let i = 0
+    while i + m <= n {
+        let j = 0
+        let same = 1
+        while j < m {
+            if lm_lower(byte_at(s, i + j)) != lm_lower(byte_at(w, j)) { same = 0; break }
+            j = j + 1
+        }
+        if same == 1 { return 1 }
+        i = i + 1
+    }
+    return 0
+}
+
+// ---------------------------------------------------------------------------
+// Add or replace a write. A path written twice keeps only its LAST body, in the
+// position of its FIRST occurrence, which is what light.js does and what stops a
+// model that rewrites one file three times from applying all three.
+// ---------------------------------------------------------------------------
+fn lm_put_write(path, body, cut) -> i64 {
+    let i = 0
+    while i < vec_len(LM_WPATHS) {
+        if equals(vec_at(LM_WPATHS, i), path) == 1 {
+            vec_put(LM_WBODIES, i, body)
+            vec_put(LM_WCUT, i, cut)
+            return 0
+        }
+        i = i + 1
+    }
+    vec_push(LM_WPATHS, path)
+    vec_push(LM_WBODIES, body)
+    vec_push(LM_WCUT, cut)
+    return 0
+}
+
+fn lm_put_read(path) -> i64 {
+    vec_push(LM_RPATHS, path)
+    return 0
+}
+
+// Counts and accessors, derived from the vecs rather than tracked separately, so
+// they can never disagree with what was actually stored.
+fn lm_writes() -> i64 { return vec_len(LM_WPATHS) }
+fn lm_reads() -> i64 { return vec_len(LM_RPATHS) }
+fn lm_write_path(i) -> str { return vec_at(LM_WPATHS, i) }
+fn lm_write_body(i) -> str { return vec_at(LM_WBODIES, i) }
+fn lm_write_cut(i) -> i64 { return vec_at(LM_WCUT, i) }
+fn lm_read_path(i) -> str { return vec_at(LM_RPATHS, i) }
+
+// ---------------------------------------------------------------------------
+// Parse a light-mode reply into the results above.
+//
+// A FILE: line whose following fenced block does not look like a file is
+// REFUSED: the path is not written, because a sentence written over a real file
+// destroys it. A reply with no closing fence is `cut`, and its block is still
+// taken -- a truncated change is more use than none, and the flag tells the
+// caller it is truncated.
+// ---------------------------------------------------------------------------
+fn lm_parse(reply) -> i64 {
+    lm_reset()
+    // str_split returns a TYPED list of strings: length at the pointer itself,
+    // elements at +8. It is NOT a std/vec (which has capacity at 0 and length at
+    // +8), so vec_len / vec_at on it read an element pointer as a length and
+    // segfault. Use the typed-list API on it directly.
+    let lines = str_split(reply, "\n")
+    let n = lines.len()
+    let said_lines = []
+    let i = 0
+    while i < n {
+        let raw = lines[i]
+        let fp = lm_line_path(raw, 0, len(raw), "FILE:")
+        let rp = lm_line_path(raw, 0, len(raw), "READ:")
+
+        if equals(rp, "") == 0 {
+            lm_put_read(rp)
+            i = i + 1
+            continue
+        }
+
+        if equals(fp, "") == 0 {
+            // the body is the next non-blank fenced line
+            let j = i + 1
+            while j < n && lm_is_blank_line(lines[j]) == 1 { j = j + 1 }
+            if j < n && lm_is_fence_line(lines[j]) == 1 {
+                let close = lm_fence_close(lines, j)
+                let cut = 0
+                if close < 0 {
+                    LM_CUT = 1
+                }
+                let body_start = j + 1
+                let body_end = n
+                if close >= 0 { body_end = close }
+                let body = lm_join(lines, body_start, body_end)
+                if lm_looks_like_file(body, fp) == 1 {
+                    lm_put_write(fp, lm_ensure_nl(body), cut)
+                }
+                if close >= 0 { i = close + 1 } else { i = n }
+                continue
+            }
+            // a FILE: line with no block after it: the reply was cut off
+            LM_CUT = 1
+            i = n
+            continue
+        }
+
+        said_lines.push(raw)
+        i = i + 1
+    }
+    LM_SAID = lm_strip_runs(said_lines)
+    return 0
+}
+
+// A file always ends with a newline, so appending one and one later concatenating
+// two files cannot run them together. light.js does the same.
+fn lm_ensure_nl(s) -> str {
+    if len(s) == 0 { return s }
+    if byte_at(s, len(s) - 1) == 10 { return s }
+    return concat(s, "\n")
+}

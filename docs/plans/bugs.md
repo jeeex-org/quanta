@@ -14,7 +14,7 @@ original shape). Version numbers are allocated at release time (`cat VERSION` + 
 
 ## Severity A — crashes and wrong values on valid programs (0.0.234)
 
-### A1 · LIVE · a capturing closure invoked in a loop crashes the compiler
+### A1 · FIXED (0.0.234) · a capturing closure invoked in a loop crashes the compiler
 
 ```quanta
 fn main() { let y = 7
@@ -180,7 +180,7 @@ gets an integer-looking number with no diagnostic.
   (`is_float_vr`/`vfloat` already exist and are used by the arithmetic builtins). Add gate rows for
   `print` of f64 expression, f64 parameter, f64 return, and f64 local.
 
-### A2b · LIVE · passing an `f64` to `exit()` silently exits 0 — and the release checklist's own smoke test
+### A2b · FIXED (0.0.235) · passing an `f64` to `exit()` silently exits 0 — and the release checklist's own smoke test
 
 ```
 exit(fadd(i2f(2), i2f(3)))   // exits 0, not 5
@@ -255,26 +255,54 @@ the 33x ratio IS the frame ratio — so the depth is fully explained by the fram
   a depth both sides survive. It PASSES on 0.0.235, so it is a regression guard, not a red-first row —
   labelled that way deliberately, because rule #16 applies to rows asserting new behaviour.
 
-### A5 · NOT REPRODUCED (one shape) · `mem_alloc` in a loop body clobbered by the next iteration
+### A5 · LATENT USE-AFTER-FREE (masked by deferred reuse) · `mem_alloc` in a loop body clobbered by the next iteration
 
 Recorded in `WIP.md` "Still open" and in this project's known-gotchas list. Allocate up front is the
 workaround, but a language whose allocator returns memory that a later iteration can reuse is a
 memory-safety defect, not a style note.
 
-**Probed 0.0.235, not reproduced.** Allocate in iteration 0, store 111, allocate again in iteration 1, store
+**Status: latent use-after-free, masked by a deliberately deferred optimisation - not absent.**
+`IR_FREE = 37` frees an `mem_alloc`-owned binding at scope end (`globals.quanta:29`), emitted per
+owned vreg at `features.quanta:24` - so a loop body's allocation IS freed every iteration. What
+prevents the next iteration clobbering it is that `mem_alloc` never reuses a freed block, stated
+as a deliberate deferral: `emitter.quanta:1980` "(Deferred reuse: mem_alloc left UNCHANGED to keep
+emitted bytes stable -> fixpoint-safe.)". Holding an owned pointer past its scope exit is already
+a use-after-free that the bump allocator masks; landing the deferred reuse turns it into silent
+aliasing, and `codegen.quanta:2741` already warns of "double-free -> aliased-block". Allocate up
+front is the correct pattern, not a workaround.
+
+**Probed 0.0.235, not reproduced in the alloc-alloc shape.** Allocate in iteration 0, store 111, allocate again in iteration 1, store
 222 into the NEW pointer, then read the OLD pointer after the loop: the old block still reads 111 (`rc=0`
 from the probe). That is what the allocator's own behaviour predicts — `mem_alloc` never pops its freed
 list (recorded in `docs/AUDIT_ROADMAP.md` as "leaks every freed block"), so it bump-allocates and hands
 out fresh blocks rather than reusing a live one. Runaway *growth* is the consequence of that design, and
 it is tracked separately; silent clobbering in this shape is not happening.
 
-- **Still needs the original repro before it can be called live or stale.** One shape was tested; the WIP
-  note that raised this may describe a different pattern (e.g. interaction with scope-exit `IR_FREE`, or a
-  `mem_free` followed by re-allocation). Whoever has that shape should attach it here.
-- If a clobber IS found: decide the semantics (arena per iteration vs leak-until-function-exit) and either
-  make it safe or make it a compile error — a silent clobber is the one outcome that must not remain.
+**RECLASSIFIED 2026-10-15: latent use-after-free, not "not reproduced."** The mechanism is in the source:
 
-### A6 · ROOT CAUSE CONFIRMED · three fix mechanisms measured and rejected; fix belongs on the read/emit side
+| Evidence | Location |
+|---|---|
+| `IR_FREE = 37` — free the mem_alloc-owned binding at scope end | `globals.quanta:29` |
+| Scope exit emits `IR_FREE` for owned vregs | `features.quanta:24` |
+| `mem_alloc` leaves free-list reuse UNCHANGED (deferred) | `emitter.quanta:1980` |
+| `IR_FREE` pushes the block to the free-list via `drop()` | `codegen.quanta:2843` |
+| `codegen.quanta:2741` already worries about "double-free → aliased-block" | `codegen.quanta:2741` |
+
+A `mem_alloc`'d binding is freed at scope exit, including a loop body's scope. What prevents the next
+iteration from clobbering the previous one's block is **not** that no free happens — it is that `mem_alloc`
+never reuses a freed block. The free-list exists (`HEAP_CTRL`), `mem_free` pushes onto it, but `mem_alloc`
+never pops it. The reuse is explicitly deferred (`emitter.quanta:1980`, "Free-list recycling deferred;
+mem_alloc unchanged -> fixpoint-safe").
+
+Holding an owned pointer past its scope exit is already a use-after-free. The bump allocator just hides
+the symptom today. "Allocate up front" is not a workaround for a quirk — it is the only correct pattern,
+and programs that rely on the current behaviour are relying on undefined memory.
+
+**Forward-looking risk:** whoever lands the deferred reuse to fix memory growth turns every such program
+into silent, data-dependent aliasing corruption. That change has to land with the invariant written down
+and something that detects the alias.
+
+### A6 · SUPERSEDED (see the FIXED and PROMOTED entry below) · root cause confirmed; three fix mechanisms measured and rejected
 
 Documented at length in `docs/research/call-order-f64-defect.md` and `WIP.md`: `reduce(0.5)` is correct only
 if `qmult` was called earlier in the program; the builtin path was fixed by `as_f64_rdi()` (0d7950b6) but
@@ -416,7 +444,7 @@ parameter `k` of every top-level `name` is then marked float/string, monotone to
   the module was broken before this change. (Earlier recorded as rc=0 x3 / rc=124 x2 / rc=135 x4; the
   re-measurement is the authority.)
 
-### A7 · NOT REPRODUCED for typed paths; LIVE for an UNTYPED parameter (same family as A6)
+### A7 · FIXED (0.0.236, with A6) for the untyped case · `NOT REPRODUCED` for typed paths
 
 **Measured on 0.0.236. The typed paths are fine; an untyped parameter is not.**
 
