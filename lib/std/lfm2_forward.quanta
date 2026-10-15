@@ -514,6 +514,9 @@ let fc_at_v = 0
 let fc_at_sc = 0
 let fc_at_h = 0
 let fc_at_out = 0
+// Which layer's attn_q_norm / attn_k_norm are currently in fc_at_qn / fc_at_kn.
+// -1 = nothing loaded yet.
+let fc_at_qn_L = 0 - 1
 
 // Per-head RMSNorm over head_dim values. This is the shape attn_q_norm and
 // attn_k_norm actually have (64 elements), NOT a whole-vector norm.
@@ -580,6 +583,32 @@ fn fc_attention(L, pos, x: u64, out: u64) {
         // vector can never be longer than the number of cached positions.
         fc_at_sc = mem_alloc(nh * (fc_kv_cap + 2) * 8)
         fc_at_out = mem_alloc(nh * hd * 8)
+    }
+
+    // ---- attn_q_norm / attn_k_norm: RELOAD whenever the layer changes --------
+    //
+    // These are PER-LAYER tensors (blk.L.attn_q_norm / blk.L.attn_k_norm, 64
+    // values each) and every attention layer's pair is different. The BUFFERS are
+    // allocated once above, but the DATA must be re-read for each layer. Reading
+    // them only inside the `fc_at_q == 0` allocation block meant every attention
+    // layer reused the FIRST attention layer's weights (layer 2).
+    //
+    // Measured on the 23-id prompt (tests/lfm2_prefill_probe.quanta +
+    // tests/verify_lfm2_state_ref.py; the reference K row is reconstructed from the dumped
+    // layer input with the real ggml row kernels):
+    //   K row layer 2, pos 0: |native - correct ref|                = 9.8e-15
+    //   K row layer 5, pos 0: |native - correct ref|                = 1.60e+01
+    //   K row layer 5, pos 0: |native - ref built with LAYER 2's k_norm| = 5.3e-15
+    // i.e. the stored keys were bit-for-bit what layer 2's k_norm produces.
+    //
+    // It is INVISIBLE at position 0: the softmax is over one cached position, so
+    // the weight is 1 whatever q and k are and the attention output is just v.
+    // From position 1 on it grows, because the wrongly-normed keys accumulate in
+    // the K cache -- the "error grows with sequence position" signature.
+    if fc_at_qn_L != L {
+        read_tensor_f64(qn, fc_at_qn)
+        read_tensor_f64(kn, fc_at_kn)
+        fc_at_qn_L = L
     }
 
     // ---- projections -------------------------------------------------------
@@ -818,6 +847,14 @@ fn fc_attention_par(L, pos, x: u64, out: u64) {
         fc_at_h = mem_alloc(hd * 8)
         fc_at_sc = mem_alloc(nh * (fc_kv_cap + 2) * 8)
         fc_at_out = mem_alloc(nh * hd * 8)
+    }
+
+    // Per-layer norm weights: reload when the layer changes. See the long note in
+    // fc_attention; the same defect was here.
+    if fc_at_qn_L != L {
+        read_tensor_f64(qn, fc_at_qn)
+        read_tensor_f64(kn, fc_at_kn)
+        fc_at_qn_L = L
     }
 
     // ---- projections (already parallel via mm_matvec) -----------------------

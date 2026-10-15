@@ -120,10 +120,16 @@ short one because that iteration ends at the EOS test and runs no forward.
 `prefill_ms_per_tok` differs between the two runs only because the box's load
 differed (6.4 s vs 8.5 s per prompt token); nothing in this change touches prefill.
 
-The answer text is still `The answer is: 2` (the native model's own arithmetic is
-wrong under a flatter logit tail — unchanged by this fix, and the same text the
-0.0.240 temp 0.25 row produced). What changed is that the model is no longer CUT
-OFF by sampling noise; whether it ends a turn is now its argmax's decision.
+The answer text was `The answer is: 2` at the time of this measurement — the native model's
+own arithmetic looked wrong under a flatter logit tail. **That flat tail was a DEFECT and
+is FIXED** (the per-layer attn_q_norm/attn_k_norm were never reloaded; see
+`docs/research/lfm2-perlayer-norm-defect.md`). The generator's answer after the fix is
+recorded there, as are the before/after per-position correlations against llama.cpp
+(pos 4: 0.6881 -> 0.9991; `p("The")` at pos 22: 0.2507 -> 0.9466 vs llama.cpp's 0.9103)
+and the element-wise K-cache delta that localised it. The measurement below is kept
+verbatim as the BEFORE-the-fix evidence. What that EOS change itself accomplished stands:
+the model is no longer CUT OFF by sampling noise; whether it ends a turn is now its
+argmax's decision.
 
 **Method check:** with the policy off the very same draw chose EOS after one token
 (so the defect is reproduced by measurement, not quoted from an earlier run), and
@@ -154,11 +160,17 @@ GGUF): `chat_build()` + `bpe_encode_special()` + BOS now reproduces llama.cpp's 
 **exactly, 23 ids byte-for-byte**, and llama.cpp's argmax for that prompt (`The`) matches
 the engine's argmax.
 
-**3. Still true about the logits** (measured, left alone): the native distribution is
-flatter than llama.cpp's on identical ids — only 1 of 10 top ids shared, `p("The")` 0.251
-native vs 0.847 llama.cpp, EOS at #2 in the native top-10 — the argmax agrees, the tail
-does not. The tied output projection is Q6_K and no Q6_K dequant has ever been checked
-against a reference.
+**3. The logits** — the native distribution WAS flatter than llama.cpp's on identical ids
+(only 1 of 10 top ids shared, `p("The")` 0.2507 native vs 0.9103 llama.cpp, EOS at #2 in
+the native top-10, argmax agreeing while the tail did not) and **that was a real defect,
+fixed**: `fc_attention` read each layer's `attn_q_norm`/`attn_k_norm` only on the first
+attention layer, so layers 5/9/13/17/21/24/27 normed their q and k with layer 2's
+weights. Post-fix the per-position correlation against llama.cpp is 0.9976-0.9997
+everywhere and the top-10 overlap is 9-10/10. See
+`docs/research/lfm2-perlayer-norm-defect.md` for the element-wise K-cache proof, the
+generator's before/after answer, and `tests/lfm2_attn_perlayer_norm_test.quanta` for the
+regression guard. The tied output projection is Q6_K and its dequant is now checked
+against a reference: `test_suites/codes/q6k_dequant_ref_test.quanta` (bit-exact, 0 ULP).
 
 **4. The EOS policy — queued for the next promotion** (`lib/std/sampling.quanta` +
 this driver + `tests/sampling_ref.quanta`/`verify_sampling_ref.py` +

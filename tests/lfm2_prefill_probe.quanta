@@ -1,0 +1,208 @@
+// tests/lfm2_prefill_probe.quanta -- dump per-position logits AND carried state
+// (and the per-layer input) of the native LFM2 forward pass, so the FIRST
+// diverging carried state can be located element-wise against a reference.
+//
+// WHY: the native forward's logits diverge from llama.cpp with increasing
+// prefill position. Per-op math is proven exact (Q6_K dequant bit-exact, output
+// projection 2.7e-14), so the defect is in state carried across positions. To
+// find WHICH carried state this probe dumps ONE state trajectory (never two,
+// because a second pass would re-run the state):
+//
+//   - the logits at EVERY prefill position (the tracked driver keeps only the last)
+//   - the input to every layer (the hidden state entering fc_layer)
+//   - the final hidden state, pre-norm and post-norm
+//   - the short-conv state of every conv layer
+//   - the K and V cache rows of every attention layer, at every position so far
+//
+// The layer loop is written out here rather than calling fc_forward_token_ex so
+// the layer inputs can be captured; it is the SAME sequence of calls
+// (mm_lookup_row -> fc_layer ping-pong -> final rms_norm -> mm_embed_logits) and
+// its logits are checked against llama.cpp by tests/verify_lfm2_state_ref.py.
+//
+// UNIT DISCIPLINE: the write cursor `w` is a BYTE offset everywhere, and blit()
+// advances it by 8 per element. An earlier version mixed the two (the header and
+// ids were written with `w` as bytes, then blit treated `w` as an element index),
+// which left a 203-element hole in the dump and made every value read back shifted.
+// The output is one flat binary; layout is in tests/verify_lfm2_state_ref.py.
+//
+// Build:  compiler/<ver>/bin/x86/qc tests/lfm2_prefill_probe.quanta <bin>
+// Run:    ( ulimit -c 0 -v 8000000; <bin> </dev/null )   from the repo root
+import std/gguf
+import std/lfm2_forward
+import std/lfm2_model
+import std/lfm2_mm
+import std/lfm2_bpe
+import std/lfm2_chat
+import std/fs
+
+const Q4_PATH = "/opt/ai/models/quanta/QUANTA-LFM2.5-2.6Bv1-Q4_K_M.gguf"
+const PROMPT_PATH = "tests/lfm2_prompt.txt"
+const OUTF = "/home/tali/.hermes/cache/scratch/lfm2probe/probe.bin"
+const CAP = 16384
+const NCTX = 2048
+
+let NW = 20            // matvec workers (the tracked driver's default)
+let NSTATEPOS = 8      // how many positions of carried state + layer inputs to dump
+
+let plen = 0
+
+fn slurp(fd) {
+    if fd < 0 { return 0 }
+    let b = mem_alloc(CAP)
+    let got = read_raw(fd, b, CAP)
+    file_close(fd)
+    if got <= 0 { return 0 }
+    plen = got
+    return b
+}
+
+fn as_str(raw, n) {
+    let s = mem_alloc(n + 16)
+    mem_store(s, n)
+    let i = 0
+    while i < n { mem_store8(s + 8 + i, mem_load8(raw + i)); i = i + 1 }
+    mem_store8(s + 8 + n, 0)
+    return s
+}
+
+// copy cnt f64 from src into dst at BYTE offset off; returns the new byte offset
+fn blit(dst, off, src, cnt) {
+    let i = 0
+    while i < cnt {
+        mem_store(dst + off, f64of(mem_load(src + i * 8)))
+        i = i + 1
+        off = off + 8
+    }
+    return off
+}
+
+fn main() {
+    prints("=== lfm2 prefill probe ===\n")
+    if gguf_load(Q4_PATH) != 0 { prints("FAIL gguf_load\n"); return 1 }
+    if fc_read_config() != 0 { prints("FAIL fc_read_config\n"); return 1 }
+    if bpe_init_from_gguf() == 0 { prints("FAIL bpe_init\n"); return 1 }
+    if fc_kv_init(NCTX) != 0 { prints("FAIL fc_kv_init\n"); return 1 }
+    if fc_fw_init() != 0 { prints("FAIL fc_fw_init\n"); return 1 }
+    if fc_fw_reset() != 0 { prints("FAIL fc_fw_reset\n"); return 1 }
+    mm_set_workers(NW)
+    mm_set_embed_workers(NW)
+
+    let rawprompt = slurp(file_open(PROMPT_PATH, 0))
+    if rawprompt == 0 { prints("FAIL read prompt\n"); return 1 }
+    let user = as_str(rawprompt, plen)
+    let pb = mem_alloc(CAP)
+    let pbytes = chat_build(0, user, pb)
+    let ids = mem_alloc(8192 * 8)
+    mem_store(ids, bpe_bos)
+    let n = bpe_encode_special(pb, pbytes, ids + 8, 8000) + 1
+    prints("n_ids="); print(n); prints(" prompt_bytes="); print(pbytes); prints("\n")
+    let i = 0
+    while i < n {
+        prints("id["); print(i); prints("]="); print(mem_load(ids + i * 8)); newline()
+        i = i + 1
+    }
+
+    let dm = fc_d_model
+    let hd = fc_head_dim
+    let nl = fc_n_layers
+    let nv = fc_n_vocab
+    let eps = fc_rms_eps
+    let nsp = NSTATEPOS
+    if nsp > n { nsp = n }
+    prints("dm="); print(dm); prints(" hd="); print(hd)
+    prints(" nl="); print(nl); prints(" nv="); print(nv)
+    prints(" nsp="); print(nsp); prints("\n")
+
+    let buf = mem_alloc(96 * 1024 * 1024)
+    let nb = mem_alloc(2 * dm * 8)
+    mem_store(buf, nsp)                 // [0]  nstatpos
+    mem_store(buf + 8, n)               // [8]  n_ids
+    mem_store(buf + 16, nv)             // [16] n_vocab
+    mem_store(buf + 24, dm)             // [24] d_model
+    mem_store(buf + 32, nl)             // [32] n_layers
+    mem_store(buf + 40, hd)             // [40] head_dim
+    mem_store(buf + 48, eps)            // [48] rms eps (f64)
+    let off = 56
+    i = 0
+    while i < n { mem_store(buf + off + i * 8, mem_load(ids + i * 8)); i = i + 1 }
+
+    let t0 = clock()
+    let pos = 0
+    let ww = off + n * 8
+    // Hold the worker pool for the whole prefill; pl_depth > 0 stops mm_matvec_par
+    // from tearing the pool down and re-spawning it per matvec (the A9 leak).
+    mm_pool_begin()
+    while pos < n {
+        let tok = mem_load(ids + pos * 8)
+        if mm_lookup_row(lfm2_token_embd(), tok, dm, fc_fw_x) != 0 {
+            mm_pool_end(); prints("FAIL embed\n"); return 1
+        }
+        let src = fc_fw_x
+        let dst = fc_fw_ff
+        let L = 0
+        while L < nl {
+            if pos < nsp { ww = blit(buf, ww, src, dm) }
+            if fc_layer(L, pos, src, dst) != 0 {
+                mm_pool_end(); prints("FAIL fc_layer "); print(L); prints(" pos "); print(pos); newline(); return 1
+            }
+            let tmp = src
+            src = dst
+            dst = tmp
+            L = L + 1
+        }
+        if read_tensor_f64(lfm2_token_embd_norm(), nb) < 0 {
+            mm_pool_end(); prints("FAIL read embd_norm\n"); return 1
+        }
+        if fc_rms_norm(fc_fw_n, src, nb, dm) != 0 { mm_pool_end(); prints("FAIL final norm\n"); return 1 }
+        if mm_embed_logits(lfm2_token_embd(), fc_fw_n, 0, nv, dm, fc_fw_logits) != 0 {
+            mm_pool_end(); prints("FAIL embed_logits\n"); return 1
+        }
+        ww = blit(buf, ww, fc_fw_logits, nv)
+
+        if pos < nsp {
+            ww = blit(buf, ww, src, dm)          // final hidden, pre-norm
+            ww = blit(buf, ww, fc_fw_n, dm)      // final hidden, post-norm
+            L = 0
+            while L < nl {
+                if lfm2_layer_is_attn(L) == 0 { ww = blit(buf, ww, fc_fw_conv_state(L), 2 * dm) }
+                L = L + 1
+            }
+            L = 0
+            while L < nl {
+                if lfm2_layer_is_attn(L) != 0 {
+                    let nkv = fc_nkv_of(L)
+                    let wh = 0
+                    while wh < 2 {
+                        let pp = 0
+                        while pp <= pos {
+                            let hh = 0
+                            while hh < nkv {
+                                let j = 0
+                                while j < hd {
+                                    mem_store(buf + ww, fc_kv_get(L, wh, pp, hh, j))
+                                    ww = ww + 8
+                                    j = j + 1
+                                }
+                                hh = hh + 1
+                            }
+                            pp = pp + 1
+                        }
+                        wh = wh + 1
+                    }
+                }
+                L = L + 1
+            }
+        }
+        pos = pos + 1
+    }
+    mm_pool_end()
+    prints("prefill_ms="); print((clock() - t0) / 1000000); prints("\n")
+
+    let fd = file_open(OUTF, 577, 420)
+    if fd < 0 { prints("FAIL open out\n"); return 1 }
+    let wn = file_write(fd, buf, ww)
+    file_close(fd)
+    prints("wrote_bytes="); print(wn); prints("\n")
+    prints("DONE\n")
+    return 0
+}
