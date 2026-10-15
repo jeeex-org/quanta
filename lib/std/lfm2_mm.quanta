@@ -262,17 +262,197 @@ fn mm_matvec_par(idx: u64, x: u64, rows: i64, cols: i64, y: u64, nworkers: i64) 
 // site in the forward pass benefits at once -- there are ten of them and they
 // all funnel through here. Leaving it 0 keeps the serial path byte-identical to
 // before, which is what makes this safe to land first and tune later.
+//
+// RESOURCE POLITENESS: mm_set_workers now CLAMPS to a polite ceiling -- see the
+// block below. A caller that asks for every core gets half of them (at most 8)
+// unless it takes one of the explicit escapes. The escape for a benchmark is
+// mm_set_workers_uncapped(n) or the QUANTA_MM_* env vars; the escape for the
+// per-call row matvec is mm_matvec_par(idx,x,rows,cols,y,nw) itself, whose
+// explicit `nw` is deliberately NOT clamped (the A9 gate row depends on it).
 let mm_workers = 0
 let mm_embed_workers = 0
 
+// ===========================================================================
+// RESOURCE POLITENESS -- the loader must never saturate the box unattended
+// ===========================================================================
+// THE COMPLAINT, as a design requirement: the SI loop runs this loader with no
+// one watching. An unattended process that takes the whole machine makes it
+// unusable for everything else -- llama.cpp does not, and this loader must not.
+//
+// MEASURED FIRST (tests/park_cpu_probe.quanta): a PARKED pool does NOT spin. With
+// 8 workers spawned and no job ever submitted, every worker thread is in state S
+// with wchan=futex_do_wait (/proc/<pid>/task/*/wchan), the process has 9 threads,
+// and it costs 0.00% CPU over an 8 s park (external /proc/<pid>/stat sample: 0
+// ticks; the probe's own read agrees). So the CPU a run takes is the CPU its
+// workers SPEND, not CPU they burn waiting; the lever is the worker COUNT, not a
+// wait loop.
+//
+// THE RULE. Any worker count the loader will USE through mm_set_workers /
+// mm_set_embed_workers is capped at
+//
+//     min(cores/2, 8), floored at 1        -- the "polite ceiling"
+//
+// so an unattended caller that asks for every core gets half of them and never
+// more than eight. cores is the process's AFFINITY mask (sched_getaffinity),
+// which is right under a cpuset / taskset where /sys/devices/.../online is not.
+//
+// THE EXPLICIT ESCAPES (for a benchmark that genuinely wants the whole box):
+//     mm_set_workers_uncapped(n)          -- set exactly n, no clamp
+//     mm_set_embed_workers_uncapped(n)    -- ditto
+//     QUANTA_MM_WORKERS=<n>               -- ceiling becomes n
+//     QUANTA_MM_ALL_CORES=1               -- ceiling becomes every online core
+// The env vars are read from /proc/self/environ BY HAND: getenv() is a STUB in
+// this compiler (emitter.quanta:3879 -- "getenv is complex - for now return 0"),
+// so it always returns 0 and cannot be used (this is the same reason
+// lib/std/config.quanta reads a file instead).
+//
+// A HARD SANITY CEILING (MM_MAX_WORKERS) also guards mm_pool_ensure: no caller,
+// clamped or not, can ask the pool to spawn an absurd number of threads.
+let MM_MAX_WORKERS = 512
+
+const MM_ENV_WORKERS = "QUANTA_MM_WORKERS"
+const MM_ENV_ALL     = "QUANTA_MM_ALL_CORES"
+
+let mm_hw_cores_cache = 0
+let mm_ceiling_cache = 0
+
+// CPUs this process may run on: popcount of sched_getaffinity(0, len, mask)
+// (syscall 204). Falls back to /sys/devices/system/cpu/online, then to 8.
+fn mm_hw_cores() -> i64 {
+    if mm_hw_cores_cache > 0 { return mm_hw_cores_cache }
+    let n = 0
+    let mask = mem_alloc(128)
+    if mask != 0 {
+        let i = 0
+        while i < 128 { mem_store8(mask + i, 0); i = i + 1 }
+        if syscall(204, 0, 128, mask) > 0 {
+            i = 0
+            while i < 128 {
+                let b = mem_load8(mask + i)
+                let j = 0
+                while j < 8 { if (b & (1 << j)) != 0 { n = n + 1 }; j = j + 1 }
+                i = i + 1
+            }
+        }
+    }
+    if n < 1 {
+        let fd = file_open("/sys/devices/system/cpu/online", 0)
+        if fd >= 0 {
+            let buf = mem_alloc(256)
+            let got = read_raw(fd, buf, 256)
+            file_close(fd)
+            let hi = 0 - 1
+            let k = 0
+            while k < got {
+                if mem_load8(buf + k) >= 48 && mem_load8(buf + k) <= 57 {
+                    let v = 0
+                    while k < got && mem_load8(buf + k) >= 48 && mem_load8(buf + k) <= 57 {
+                        v = v * 10 + (mem_load8(buf + k) - 48); k = k + 1
+                    }
+                    if v > hi { hi = v }
+                } else { k = k + 1 }
+            }
+            n = hi + 1
+        }
+    }
+    if n < 1 { n = 8 }
+    mm_hw_cores_cache = n
+    return n
+}
+
+// Integer value of env var `key` (klen bytes; the string's bytes start at
+// key + 8, past the 8-byte length header), or -1 if absent/unparseable. Reads
+// /proc/self/environ directly because getenv is a stub.
+fn mm_env_int(key, klen) -> i64 {
+    let fd = file_open("/proc/self/environ", 0)
+    if fd < 0 { return 0 - 1 }
+    let buf = mem_alloc(32768)
+    if buf == 0 { file_close(fd); return 0 - 1 }
+    let got = read_raw(fd, buf, 32768)
+    file_close(fd)
+    if got <= 0 { return 0 - 1 }
+    let i = 0
+    while i + klen + 1 <= got {
+        let ok = 1
+        let j = 0
+        while j < klen {
+            if mem_load8(buf + i + j) != mem_load8(key + 8 + j) { ok = 0 }
+            j = j + 1
+        }
+        if ok == 1 && mem_load8(buf + i + klen) == 61 {   // '='
+            let p = i + klen + 1
+            let v = 0
+            let any = 0
+            while p < got && mem_load8(buf + p) >= 48 && mem_load8(buf + p) <= 57 {
+                v = v * 10 + (mem_load8(buf + p) - 48); any = 1; p = p + 1
+            }
+            if any == 1 { return v }
+            return 0 - 1
+        }
+        i = i + 1
+    }
+    return 0 - 1
+}
+
+// The ceiling mm_set_workers applies. Computed once and cached (the env does not
+// change mid-process, and the read allocates).
+fn mm_worker_ceiling() -> i64 {
+    if mm_ceiling_cache > 0 { return mm_ceiling_cache }
+    let h = 0
+    let w = mm_env_int(MM_ENV_WORKERS, 17)       // "QUANTA_MM_WORKERS" = 17 bytes
+    if w > 0 {
+        h = w
+    } else {
+        let a = mm_env_int(MM_ENV_ALL, 19)       // "QUANTA_MM_ALL_CORES" = 19 bytes
+        if a > 0 {
+            h = mm_hw_cores()
+        } else {
+            h = mm_hw_cores() / 2
+            if h > 8 { h = 8 }
+        }
+    }
+    if h < 1 { h = 1 }
+    if h > MM_MAX_WORKERS { h = MM_MAX_WORKERS }
+    mm_ceiling_cache = h
+    return h
+}
+
+// The polite ceiling, exposed for tests and for a caller that wants to enable
+// parallelism "as much as is polite": mm_set_workers(mm_polite_ceiling()).
+fn mm_polite_ceiling() -> i64 { return mm_worker_ceiling() }
+
 fn mm_set_workers(n) {
     if n < 0 { n = 0 }
+    if n > 1 {
+        let cap = mm_worker_ceiling()
+        if n > cap { n = cap }
+    }
     mm_workers = n
     return 0
 }
 
 fn mm_set_embed_workers(n) {
     if n < 0 { n = 0 }
+    if n > 1 {
+        let cap = mm_worker_ceiling()
+        if n > cap { n = cap }
+    }
+    mm_embed_workers = n
+    return 0
+}
+
+// Explicit escape: set the worker count with NO politeness clamp (still bounded
+// by the hard sanity ceiling). For a benchmark that wants the whole box.
+fn mm_set_workers_uncapped(n) {
+    if n < 0 { n = 0 }
+    if n > MM_MAX_WORKERS { n = MM_MAX_WORKERS }
+    mm_workers = n
+    return 0
+}
+
+fn mm_set_embed_workers_uncapped(n) {
+    if n < 0 { n = 0 }
+    if n > MM_MAX_WORKERS { n = MM_MAX_WORKERS }
     mm_embed_workers = n
     return 0
 }
@@ -997,6 +1177,14 @@ fn mm_pool_end() {
 // The begin/end depth is NOT touched: a rebuild keeps the caller's bracket.
 fn mm_pool_ensure(n: i64, maxcols: i64) {
     if n <= 0 { return -1 }
+    // HARD SANITY CEILING. A caller -- clamped through mm_set_workers, uncapped,
+    // or reaching the pool through a direct mm_matvec_par -- cannot make the
+    // pool spawn an absurd number of threads. This is the "take down the process,
+    // not the machine" guard: 512 threads is beyond anything this workload wants
+    // and well short of a fork bomb. (The politeness ceiling is separate and
+    // lower; it applies to the mm_set_workers path, not to an explicit per-call
+    // count the A9 gate row depends on.)
+    if n > MM_MAX_WORKERS { return -1 }
     if pl_size == n && pl_cell_cols >= maxcols { return 0 }
     pl_kill()
 
@@ -1006,6 +1194,13 @@ fn mm_pool_ensure(n: i64, maxcols: i64) {
     pl_stopp = mem_alloc(8)
     pl_donep = mem_alloc(n * 8)
     pl_slots = mem_alloc(n * 8)
+    // FAIL CLOSED on allocation failure: a NULL protocol word would make
+    // atomic_store() write to address 0 (a process kill with no diagnostic).
+    // Return -1 to the caller instead; it rebuilds on the next call.
+    if pl_genp == 0 || pl_stopp == 0 || pl_donep == 0 || pl_slots == 0 {
+        pl_size = 0
+        return -1
+    }
     atomic_store(pl_genp, 0)
     atomic_store(pl_stopp, 0)
     // the workers size their scratch from this at spawn time

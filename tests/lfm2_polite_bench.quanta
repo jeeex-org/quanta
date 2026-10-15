@@ -1,0 +1,69 @@
+// tests/lfm2_polite_bench.quanta -- a bounded, realistic-forward benchmark used
+// to measure the A16 politeness change. NO tokenizer: it feeds fixed token ids
+// straight into the forward pass (the same shape as the tracked generator's
+// decode loop), so the timed region is the LAYER STACK and nothing else.
+//
+// WHY NOT tests/lfm2_prefill_bench.quanta: that driver tokenizes the real 10,890
+// byte SI-loop prompt first, and bpe over that prompt has not returned in 240 s
+// on this box (measured) -- which is a separate performance item, not this one.
+// This probe reads no prompt.
+//
+// WHAT IT DOES: load the Q4_K_M model, init the forward, set workers to NW
+// through mm_set_workers (the CLAMPED setter), then run NFORW forward passes,
+// bracketed by mm_pool_begin/end as the real generator brackets its loop. It
+// prints the EFFECTIVE worker count so a clamped run is visible, plus the
+// timed-region wall clock.
+//
+// Run: ( ulimit -c 0 -v 8000000; <bin> </dev/null )   from the repo root.
+//      QUANTA_MM_ALL_CORES=1  raises the ceiling to every core (the escape).
+import std/gguf
+import std/lfm2_forward
+import std/lfm2_model
+import std/lfm2_mm
+import std/fs
+
+const Q4_PATH = "/opt/ai/models/quanta/QUANTA-LFM2.5-2.6Bv1-Q4_K_M.gguf"
+const NCTX = 1024
+const NW = 20        // asked for 20; the polite ceiling clamps this unless escaped
+const NFORW = 12
+
+fn main() -> i64 {
+    let t0 = now()
+    if gguf_load(Q4_PATH) != 0 { prints("FAIL gguf_load\n"); return 1 }
+    if fc_read_config() != 0 { prints("FAIL fc_read_config\n"); return 1 }
+    if fc_kv_init(NCTX) != 0 { prints("FAIL fc_kv_init\n"); return 1 }
+    if fc_fw_init() != 0 { prints("FAIL fc_fw_init\n"); return 1 }
+    if fc_fw_reset() != 0 { prints("FAIL fc_fw_reset\n"); return 1 }
+    mm_set_workers(NW)
+    mm_set_embed_workers(NW)
+    prints("asked_workers=")
+    print(NW)
+    prints(" effective_workers=")
+    print(mm_get_workers())
+    prints(" load_ms=")
+    print((now() - t0) / 1000000)
+    newline()
+
+    let t1 = now()
+    mm_pool_begin()
+    let i = 0
+    while i < NFORW {
+        if fc_forward_token(35808, i) != 0 { mm_pool_end(); prints("FAIL forward\n"); return 2 }
+        i = i + 1
+    }
+    mm_pool_end()
+    let t2 = now()
+
+    let wall = t2 - t1
+    prints("forwards=")
+    print(NFORW)
+    prints(" wall_ms=")
+    print(wall / 1000000)
+    prints(" ms_per_tok=")
+    print(wall / 1000000 / NFORW)
+    prints(" argmax_last=")
+    print(fc_argmax(fc_n_vocab))
+    newline()
+    prints("DONE\n")
+    return 0
+}

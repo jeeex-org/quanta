@@ -792,6 +792,52 @@ non-zero. **Also recorded:** `scripts/g6_selfcache.sh:13` pins its source fixtur
 with a literal `V=0.0.217` (rule #1), overriding the `V=$(cat VERSION)` on the line
 above it.
 
+### A19 · FIXED here (lib/std + gate script) · the loader could ask for every core; and the gate ignored two of its own REDs
+
+Two independent defects, both about "a resource/check that is not bounded".
+
+**A19a — resource politeness (lib/std).** The loader's worker count was whatever
+the caller passed: `mm_set_workers(20)` on a 20-core box spawned 20 workers, and
+the SI loop runs this unattended. Measured first, not assumed
+(`tests/park_cpu_probe.quanta`, `/proc/<pid>/task/*/wchan`): a **parked** pool
+does **not** spin — with 8 workers spawned and no job submitted, every worker is
+state `S` / wchan `futex_do_wait`, `num_threads=9`, and the process costs
+**0.00 % CPU over an 8 s park** (0 ticks, external and in-process). So the CPU a
+run costs is the CPU its workers *spend*; the fix is a **ceiling**, not a wait
+loop. `mm_set_workers`/`mm_set_embed_workers` now clamp to
+`min(affinity_cores/2, 8)` (floor 1), with explicit escapes
+`mm_set_workers_uncapped(n)`, `QUANTA_MM_WORKERS=n`, `QUANTA_MM_ALL_CORES=1`
+(the env is read from `/proc/self/environ` by hand — `getenv()` is a stub,
+`emitter.quanta:3879`). `mm_pool_ensure` also refuses `n > 512` and fails closed
+on a NULL protocol word. The per-call `mm_matvec_par(...,nw)` is deliberately not
+clamped (the A9 gate row's 20-way leak guard depends on it).
+
+Measured before/after (`tests/lfm2_polite_bench.quanta`, 4 `fc_forward_token`,
+`/usr/bin/time -v`, `nice 0`, governor `powersave`, ambient `Hermes` 747 %):
+BEFORE (HEAD lib, 20 workers) **831 % / 21.0 s**; AFTER default (asked 20 →
+**8** workers) **563 % / 26.95 s**; AFTER `QUANTA_MM_ALL_CORES=1` (20 workers)
+**827 % / 21.2 s**. RSS 112–115 MB. Good citizenship (`/tmp/citizen.sh`, a
+concurrent 2.3 s single-threaded task, n=6): idle median 2.334 s → **8 w 3.055 s
+(1.31×)** → **20 w 3.731 s (1.60×)** — the neighbour always made progress, and
+the polite default is ~18 % kinder to it. The loader is **bandwidth-bound**
+(20 workers use ~8.3 cores, not 20), so `% CPU` plateaus; the cap bounds it on
+smaller boxes. Full data: `docs/research/loader-resource-politeness.md`.
+
+**A19b — the gate ignored two of its own REDs (gate script).** `run_tests.sh`
+printed `gguf-corrupt` and `float-print` in the GATE SUMMARY, but `GGUF_RC` and
+`FPR_RC` were absent from the exit condition (the old line 888). Every other
+stage folds into `FUNCTIONAL_RC` at its definition or is named in the exit test;
+these two did neither, so a RED there could not fail the gate — the same
+"cannot fail" class A18 *recorded but did not fix*. Fix: name both in the exit
+condition. Red-first shown (a `QC=` shim that fails only the gguf real-probe
+turns the whole gate exit non-zero; green run exits 0).
+
+**Gate.** `tests/lfm2_polite_pool_test.quanta` +
+`tests/run_lfm2_polite_pool_test.sh` (model-free, three env cases, all PASS);
+`tests/lfm2_mm_workers_zero_test.quanta` still `WORKERS0 PASS`; full gate
+**228/228 native, 0 compile-fail, STDLIB 111/111** with the new default. No
+compiler file changed → VERSION stays 0.0.243 (prefill precedent).
+
 ---
 
 ## Severity B — accuracy (0.0.235)

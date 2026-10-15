@@ -1,0 +1,105 @@
+// tests/park_cpu_probe.quanta -- measure the CPU a PARKED worker pool costs.
+//
+// WHY THIS EXISTS (the complaint, as a design requirement)
+// --------------------------------------------------------
+// The loader's worker pool must be usable UNATTENDED (the SI loop runs it with
+// no one watching). An unattended process that saturates every core makes the
+// machine unusable for anything else -- llama.cpp does not, and this loader must
+// not either. The A9 fix made the pool spawn ONCE; the open question is whether a
+// parked worker BLOCKS (futex_wait, ~0% CPU) or SPINS (a core each). This probe
+// decides it by MEASUREMENT: park the pool with NO job in flight and stay parked
+// for a fixed window, printing the process's own CPU time before and after.
+//
+// METHOD. /proc/self/stat fields 14/15 are the PROCESS utime/stime in USER_HZ
+// ticks, summed over every thread in the process (threads are tasks, and the
+// process's utime/stime aggregate them) -- so a spinning worker shows up here.
+// HZ is 100 on Linux (USER_HZ is fixed at 100 regardless of CONFIG_HZ), so
+// ticks/100 = CPU-seconds. delta over a known wall window = %CPU (100 = one core).
+//
+// The probe prints its PID first so an external observer can sample the same
+// process independently (belt and braces: an in-process read could in principle
+// miss a thread, an external ps/`/proc/<pid>/stat` read cannot).
+//
+// Run: ( ulimit -c 0 -v 8000000; <bin> </dev/null )  from the repo root.
+import std/lfm2_mm
+
+const PARK_WORKERS = 8
+const PARK_SECS = 8
+
+// Read field `field` (1-based) of /proc/self/stat as an integer.
+// The comm field (2) is wrapped in parens and may itself contain spaces, so the
+// scan starts AFTER the LAST ')'. Fields after that are space-separated.
+fn proc_stat_field(field: i64) -> i64 {
+    let fd = file_open("/proc/self/stat", 0)
+    if fd < 0 { return 0 - 1 }
+    let buf = mem_alloc(4096)
+    let got = read_raw(fd, buf, 4095)
+    file_close(fd)
+    if got <= 0 { return 0 - 1 }
+    // find last ')'
+    let i = 0
+    let lastp = 0 - 1
+    while i < got {
+        if mem_load8(buf + i) == 41 { lastp = i }   // ')'
+        i = i + 1
+    }
+    // fields are 1-based; field 2 ends at lastp. Start counting at lastp+2.
+    // Walk: skip whitespace, each run of non-space is one field, incrementing
+    // the field index starting from 3 (the token right after ')' is field 3).
+    let cur = lastp + 1
+    let fidx = 2
+    while cur < got {
+        // skip spaces
+        while cur < got && mem_load8(buf + cur) == 32 { cur = cur + 1 }
+        if cur >= got { break }
+        fidx = fidx + 1
+        let v = 0
+        let any = 0
+        while cur < got && mem_load8(buf + cur) != 32 {
+            let c = mem_load8(buf + cur)
+            if c >= 48 && c <= 57 { v = v * 10 + (c - 48); any = 1 }
+            cur = cur + 1
+        }
+        if fidx == field { if any == 1 { return v } else { return 0 - 1 } }
+    }
+    return 0 - 1
+}
+
+fn main() -> i64 {
+    mm_set_workers(PARK_WORKERS)
+    mm_pool_begin()
+    if mm_pool_ensure(PARK_WORKERS, 2048) != 0 {
+        prints("ENSURE_FAIL\n")
+        return 1
+    }
+    prints("PID ")
+    print(getpid())
+    newline()
+
+    // Parked: no job has ever been submitted. Workers should be inside
+    // futex_wait(pl_genp, 0). Sample the process CPU over a fixed window.
+    let u0 = proc_stat_field(14)
+    let s0 = proc_stat_field(15)
+    let t0 = now()
+    sleep(PARK_SECS)
+    let t1 = now()
+    let u1 = proc_stat_field(14)
+    let s1 = proc_stat_field(15)
+
+    let cpu_ticks = (u1 - u0) + (s1 - s0)
+    let wall_ms = (t1 - t0) / 1000000
+    prints("PARK_SECS=")
+    print(PARK_SECS)
+    prints(" cpu_ticks=")
+    print(cpu_ticks)
+    prints(" wall_ms=")
+    print(wall_ms)
+    // %CPU x1000 = ticks / wall_ms * 100000  (ticks/100 = sec; /(wall_ms/1000))
+    prints(" cpu_pct_x1000=")
+    if wall_ms > 0 { print(cpu_ticks * 100000 / wall_ms) } else { print(0 - 1) }
+    newline()
+
+    mm_pool_end()
+    prints("DONE\n")
+    return 0
+}

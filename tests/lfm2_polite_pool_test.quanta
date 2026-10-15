@@ -1,0 +1,121 @@
+// tests/lfm2_polite_pool_test.quanta -- unit test for the RESOURCE POLITENESS
+// policy in lib/std/lfm2_mm.quanta (defect A16). Model-free: it exercises only
+// the worker-count setters and the pool-size guards, so it needs no gguf.
+//
+// The test is ENV-AGNOSTIC on purpose: it asserts INVARIANTS that must hold
+// whatever the ceiling is, and prints `CEILING <n>` for the runner to check
+// against the environment (default / QUANTA_MM_ALL_CORES=1 / QUANTA_MM_WORKERS=n).
+//
+// INVARIANTS ASSERTED (any `BAD=` line fails the row):
+//   1. ceiling >= 1, and ceiling <= MM_MAX_WORKERS(512).
+//   2. mm_set_workers(9999) is CLAMPED to the ceiling, not 9999.
+//   3. an ask at or below the ceiling is honoured verbatim (min(ceiling,4)).
+//   4. mm_set_workers(-7) -> 0 (serial), preserved from before.
+//   5. mm_set_workers_uncapped(9999) -> MM_MAX_WORKERS (the hard sanity ceiling):
+//      the explicit escape still cannot ask for an absurd pool.
+//   6. mm_set_workers_uncapped(13) -> 13 (the benchmark escape is honoured).
+//   7. mm_pool_ensure(0)= -1, mm_pool_ensure(-3)= -1, mm_pool_ensure(513)= -1.
+//   8. a real pool of `ceiling` workers spawns and tears down cleanly.
+//
+// affinity_cores is recomputed HERE, independently (syscall 204 + popcount), so
+// the test does not merely trust mm_hw_cores().
+//
+// Build:  compiler/<ver>/bin/x86/qc tests/lfm2_polite_pool_test.quanta <bin>
+// Run:    ( ulimit -c 0 -v 8000000; <bin> </dev/null )   from the repo root
+import std/lfm2_mm
+
+let nbad = 0
+
+fn chk(label, want, got) {
+    prints("CHECK ")
+    prints(label)
+    prints(" want=")
+    print(want)
+    prints(" got=")
+    print(got)
+    if want == got { prints(" OK\n") } else { prints(" BAD=\n"); nbad = nbad + 1 }
+    return 0
+}
+
+fn aff_ok(label, cond) {
+    prints("CHECK ")
+    prints(label)
+    if cond != 0 { prints(" OK\n") } else { prints(" BAD=\n"); nbad = nbad + 1 }
+    return 0
+}
+
+fn affinity_cores() -> i64 {
+    let mask = mem_alloc(128)
+    let i = 0
+    while i < 128 { mem_store8(mask + i, 0); i = i + 1 }
+    let n = 0
+    if syscall(204, 0, 128, mask) > 0 {
+        i = 0
+        while i < 128 {
+            let b = mem_load8(mask + i)
+            let j = 0
+            while j < 8 { if (b & (1 << j)) != 0 { n = n + 1 }; j = j + 1 }
+            i = i + 1
+        }
+    }
+    if n < 1 { n = 8 }
+    return n
+}
+
+fn min2(a, b) { if a < b { return a }; return b }
+
+fn main() -> i64 {
+    let cores = affinity_cores()
+    prints("CORES ")
+    print(cores)
+    newline()
+    let ceil = mm_polite_ceiling()
+    prints("CEILING ")
+    print(ceil)
+    newline()
+
+    // 1. bound
+    aff_ok("ceiling_ge_1", ceil >= 1)
+    aff_ok("ceiling_le_max", ceil <= 512)
+
+    // 2. clamp a huge ask down to the ceiling
+    mm_set_workers(9999)
+    chk("clamp_9999", ceil, mm_get_workers())
+
+    // 3. an ask at or below the ceiling is honoured verbatim
+    let small = min2(ceil, 4)
+    mm_set_workers(small)
+    chk("honour_small", small, mm_get_workers())
+
+    // 4. negative -> serial, unchanged
+    mm_set_workers(0 - 7)
+    chk("negative_serial", 0, mm_get_workers())
+
+    // 5. the escape is bounded by the hard ceiling, not the polite one
+    mm_set_workers_uncapped(9999)
+    chk("uncapped_bounded", 512, mm_get_workers())
+
+    // 6. the escape honours an explicit count above the polite ceiling
+    mm_set_workers_uncapped(13)
+    chk("uncapped_13", 13, mm_get_workers())
+
+    // 7. the pool-size guards
+    chk("ensure_zero", 0 - 1, mm_pool_ensure(0, 256))
+    chk("ensure_neg", 0 - 1, mm_pool_ensure(0 - 3, 256))
+    chk("ensure_absurd", 0 - 1, mm_pool_ensure(513, 256))
+
+    // 8. a real pool of `ceiling` workers spawns and tears down cleanly
+    mm_pool_begin()
+    let r = mm_pool_ensure(ceil, 256)
+    chk("ensure_ceiling", 0, r)
+    mm_pool_end()
+
+    // restore the documented serial default and leave nothing alive
+    mm_set_workers(0)
+    prints("BAD_TOTAL ")
+    print(nbad)
+    newline()
+    if nbad != 0 { return 1 }
+    prints("POLITE PASS\n")
+    return 0
+}
