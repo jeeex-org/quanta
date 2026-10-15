@@ -1,0 +1,142 @@
+// ===========================================================================
+// Context budgeting -- Phase 11.2
+//
+// How much of a long agent run the model is shown. From HashCortX,
+// src/js/agent-context.js:39-78 and the hiddenCount/inSteps functions, with the
+// reference's own assertions as the specification.
+//
+// THE RULE THAT MATTERS, and the reason this file exists
+//
+// Hiding happens in STEPS, never one message per turn.
+//
+// A per-turn change alters something near the START of the prompt every turn, so
+// the whole run is re-read every turn and prefix-cache reuse is destroyed. Here a
+// result is hidden only when the shown results exceed the budget, and then
+// ENOUGH go at once to bring the shown total down to a fraction of the budget.
+// Between steps each request is the previous one with more on the end, so the
+// common prefix is untouched and the cache still hits.
+//
+// Tier budgets (agent-context.js:39-78):
+//   small  toolBudget 12000  maxResult 10000  keepResults 4  hideStep 4  hideTo 0.4
+//   mid    toolBudget 24000  maxResult 16000  keepResults 5  hideStep 5  hideTo 0.4
+//   local  toolBudget 40000  maxResult 30000  keepResults 8  hideStep 5
+//   full   toolBudget 60000  maxResult 60000  keepResults 10 hideStep 6
+// (local/full share hideTo 0.5/0.4 from DEFAULTS; Quanta only needs three tiers,
+// so it takes small/mid/full.)
+//
+// PURE FUNCTIONS OF THE MESSAGE LIST, no state between turns
+//
+// The same conversation always produces the same prompt, and a message's hidden
+// or cut form depends only on its own content and position. That is what makes
+// the cache hit and what makes this testable with no model at all.
+//
+// WHAT IS DELIBERATELY NOT HERE
+//
+// No message objects, no roles, no provider payloads. The input is a list of
+// RESULT LENGTHS and the output is a COUNT. Building the actual prompt text
+// belongs to the caller; this decides how much.
+
+import std/model_size
+
+// ---- budgets --------------------------------------------------------------
+let QC_BUDGET_TOOL = 60000
+let QC_BUDGET_RESULT = 60000
+let QC_KEEP_RESULTS = 10
+let QC_HIDE_STEP = 6
+let QC_HIDE_TO = 0.5          // fraction of the budget to come back to
+let QC_DEFAULT_SHELL = 20000
+
+// Budget for a size class from Phase 11.1. small/mid/full map to the reference's
+// small/mid/local -- full is the "give it everything" tier in both.
+fn qctx_options(size: i64) -> i64 {
+    if size == QSIZE_SMALL {
+        QC_BUDGET_TOOL = 12000
+        QC_BUDGET_RESULT = 10000
+        QC_KEEP_RESULTS = 4
+        QC_HIDE_STEP = 4
+        QC_HIDE_TO = 0.4
+        return 0
+    }
+    if size == QSIZE_MID {
+        QC_BUDGET_TOOL = 24000
+        QC_BUDGET_RESULT = 16000
+        QC_KEEP_RESULTS = 5
+        QC_HIDE_STEP = 5
+        QC_HIDE_TO = 0.4
+        return 0
+    }
+    // full, and anything unknown -- unknown must not tighten the budget
+    QC_BUDGET_TOOL = 60000
+    QC_BUDGET_RESULT = 60000
+    QC_KEEP_RESULTS = 10
+    QC_HIDE_STEP = 6
+    QC_HIDE_TO = 0.5
+    return 0
+}
+
+fn qctx_budget_tool() -> i64 { return QC_BUDGET_TOOL }
+fn qctx_budget_result() -> i64 { return QC_BUDGET_RESULT }
+fn qctx_keep_results() -> i64 { return QC_KEEP_RESULTS }
+fn qctx_hide_step() -> i64 { return QC_HIDE_STEP }
+fn qctx_hide_to() -> f64 { return QC_HIDE_TO }
+
+// How many of the OLDEST of `n` things to set aside when the newest `keep` are
+// kept, `step` at a time: none until there are keep+step, then enough to leave
+// `keep`, and the same number again each time `step` more arrive.
+//
+// This is the whole prefix-cache argument in six lines: the count changes in
+// quanta of `step`, so most turns hide exactly what the previous turn hid.
+fn qctx_in_steps(n: i64, keep: i64, step: i64) -> i64 {
+    let s = step
+    if s < 1 { s = 1 }
+    if n < keep + s { return 0 }
+    return (n - keep) / s * s
+}
+
+// How many of the oldest results are hidden, given their lengths (oldest first).
+//
+// By count: qctx_in_steps. By size: nothing while the total fits the budget;
+// past it, hide every result that starts before a mark, where the mark advances
+// in whole steps of (budget - low) and `low` is the fraction of the budget we
+// aim to come back to. What is then shown is under the budget and a step lands
+// near `low`.
+//
+// The larger of the two wins, and the NEWEST RESULT IS NEVER HIDDEN -- it is
+// what the model is reasoning about.
+fn qctx_hidden_count(lengths: u64, n: i64) -> i64 {
+    if n < 2 { return 0 }
+
+    let by_count = qctx_in_steps(n, QC_KEEP_RESULTS, QC_HIDE_STEP)
+
+    let high = QC_BUDGET_TOOL
+    let share = QC_HIDE_TO
+    if share < 0.0 { share = 0.0 }
+    if share > 0.9 { share = 0.9 }
+    let lowf = f64of(high) * share
+    let low = f2i(lowf)
+
+    let total: i64 = 0
+    let i = 0
+    while i < n {
+        total = total + mem_load(lengths + i * 8)
+        i = i + 1
+    }
+
+    let by_size = 0
+    if total > high {
+        let stride = high - low
+        if stride < 1 { stride = 1 }
+        let mark = (total - low) / stride * stride
+        let end = 0
+        while by_size < n && end < mark {
+            end = end + mem_load(lengths + by_size * 8)
+            by_size = by_size + 1
+        }
+    }
+
+    let most = by_count
+    if by_size > most { most = by_size }
+    // never the newest
+    if most > n - 1 { return n - 1 }
+    return most
+}

@@ -51,6 +51,14 @@ ulimit -v 8000000 2>/dev/null || true
 #   frame  the FIRST `sub $0x..,%rsp` imm (the prologue; later ones are inline)
 #   mem    instructions with a (%rbp frame operand — spill/reload traffic
 #   calls  call instructions
+#   hst    home STORES function-wide  (mov %rXX,-N(%rbp...) — register -> frame)
+#   hld    home LOADS  function-wide  (mov -N(%rbp...),%rXX — frame -> register)
+#   lst    home STORES inside the hot-loop body
+#   lld    home LOADS  inside the hot-loop body
+# A home op must be a mov-family instruction with an (%rbp memory operand;
+# `lea` is an address computation, not a memory access, and is excluded.
+# Both SIB spellings objdump emits are matched: `-0x78(%rbp,%riz,1)` (the
+# store emitter's encoding) and plain `-0x50(%rbp)` (loads).
 AWKPROG='
   /^[0-9a-f]+ <.*>:/ { name=$2; gsub(/[<>:]/,"",name); infn=(name==want); seenfrm=0; next }
   infn && /^[[:space:]]*[0-9a-f]+:/ {
@@ -60,6 +68,14 @@ AWKPROG='
     instr++
     if (txt ~ /\(%rbp/) mem++
     if (txt ~ /^call/) calls++
+    ismov=(txt ~ /^(mov|movz|movs)/)
+    hs=0; hl=0
+    if (ismov && txt ~ /\(%rbp/) {
+      if (txt ~ /\(%rbp[^)]*\),%/) hl=1
+      else if (txt ~ /%[a-z0-9]+,-[x0-9a-f]*\(%rbp/) hs=1
+    }
+    hst+=hs; hld+=hl
+    hst_at[ic]=hs; hld_at[ic]=hl
     if (seenfrm==0 && txt ~ /sub[[:space:]]+\$0x[0-9a-f]+,%rsp/) {
       f=txt; sub(/.*sub[[:space:]]+\$/,"",f); sub(/,%rsp.*/,"",f); frame=strtonum(f); seenfrm=1
     }
@@ -75,15 +91,15 @@ AWKPROG='
     }
   }
   END {
-    if (loopspan>0) for (k=0;k<ic;k++) if (ord[k]>=lo && ord[k]<=hi) loop++
-    printf "%d %d %d %d %d %d", instr+0, loop+0, frame+0, mem+0, calls+0, nback+0
+    if (loopspan>0) for (k=0;k<ic;k++) if (ord[k]>=lo && ord[k]<=hi) { loop++; lst+=hst_at[k]; lld+=hld_at[k] }
+    printf "%d %d %d %d %d %d %d %d %d %d", instr+0, loop+0, frame+0, mem+0, calls+0, nback+0, hst+0, hld+0, lst+0, lld+0
   }'
 
 echo "# scripts/bench_instr.sh — load-independent codegen metrics"
 echo "# qc=$QC  fn=$FN  load: $(uptime | sed 's/.*average: //')  governor: $(cat /sys/devices/system/cpu/cpu0/cpufreq/scaling_governor 2>/dev/null)"
 echo "# resp: $(top -bn1 2>/dev/null | awk 'NR>7 && $9+0>50 {printf "%s(%s%%) ",$12,$9}' | head -c 200)"
-printf '%-24s %7s %7s %7s %7s %6s | %8s %8s %8s %8s %6s\n' case q_instr q_loop q_frame q_mem q_brs c_instr c_loop c_frame c_mem c_brs
-[ -n "$TSV" ] && printf 'case\tq_instr\tq_loop\tq_frame\tq_mem\tq_calls\tq_text\tq_brs\tc_instr\tc_loop\tc_frame\tc_mem\tc_calls\tc_brs\n' >> "$TSV"
+printf '%-24s %7s %6s %7s %5s %5s %5s %5s | %7s %6s %7s %5s %5s %5s %5s\n' case q_instr q_loop q_frame q_st q_ld q_l_st q_l_ld c_instr c_loop c_frame c_st c_ld c_l_st c_l_ld
+[ -n "$TSV" ] && printf 'case\tq_instr\tq_loop\tq_frame\tq_mem\tq_calls\tq_text\tq_brs\tq_hst\tq_hld\tq_lst\tq_lld\tc_instr\tc_loop\tc_frame\tc_mem\tc_calls\tc_brs\tc_hst\tc_hld\tc_lst\tc_lld\n' >> "$TSV"
 
 for q in "$REPO"/benchmarks/benchmark_*.quanta; do
   b=$(basename "$q" .quanta); short="${b#benchmark_}"
@@ -94,16 +110,16 @@ for q in "$REPO"/benchmarks/benchmark_*.quanta; do
     printf '%-24s %s\n' "$short" COMPILE_FAIL; continue
   fi
   qd="$OUT/$short.qd"; objdump -d --no-show-raw-insn "$qo" > "$qd" 2>/dev/null
-  read -r qi ql qf qm qc qb <<<"$(awk -v want="$FN" "$AWKPROG" "$qd")"
+  read -r qi ql qf qm qc qb qhst qhld qlst qlld <<<"$(awk -v want="$FN" "$AWKPROG" "$qd")"
   qt=$(awk '/^[[:space:]]*[0-9a-f]+:/{n++} END{print n+0}' "$qd")
   if [ -f "$c" ] && gcc -O2 -c "$c" -o "$co" 2>/dev/null; then
     cd="$OUT/$short.cd"; objdump -d --no-show-raw-insn "$co" > "$cd" 2>/dev/null
-    read -r ci cl cf cm cc cb <<<"$(awk -v want="$FN" "$AWKPROG" "$cd")"
-  else read -r ci cl cf cm cc cb <<<"- - - - - -"; fi
+    read -r ci cl cf cm cc cb chst chld clst clld <<<"$(awk -v want="$FN" "$AWKPROG" "$cd")"
+  else read -r ci cl cf cm cc cb chst chld clst clld <<<"- - - - - - - - - -"; fi
 
-  printf '%-24s %7s %7s %7s %7s %6s | %8s %8s %8s %8s %6s\n' \
-    "$short" "$qi" "$ql" "$qf" "$qm" "$qb" "$ci" "$cl" "$cf" "$cm" "$cb"
-  [ -n "$TSV" ] && printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
-    "$short" "$qi" "$ql" "$qf" "$qm" "$qc" "$qt" "$qb" "$ci" "$cl" "$cf" "$cm" "$cc" "$cb" >> "$TSV"
+  printf '%-24s %7s %6s %7s %5s %5s %5s %5s | %7s %6s %7s %5s %5s %5s %5s\n' \
+    "$short" "$qi" "$ql" "$qf" "$qhst" "$qhld" "$qlst" "$qlld" "$ci" "$cl" "$cf" "$chst" "$chld" "$clst" "$clld"
+  [ -n "$TSV" ] && printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
+    "$short" "$qi" "$ql" "$qf" "$qm" "$qc" "$qt" "$qb" "$qhst" "$qhld" "$qlst" "$qlld" "$ci" "$cl" "$cf" "$cm" "$cc" "$cb" "$chst" "$chld" "$clst" "$clld" >> "$TSV"
 done
 echo "# load after: $(uptime | sed 's/.*average: //')"
