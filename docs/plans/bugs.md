@@ -632,3 +632,19 @@ sibling-call (tail-call) elimination** (measured: gcc turns mutual tail recursio
 - A fix that changes codegen must keep the gate (819 rows / 24 stages) and `SELFHOST 7/7` green.
 - Close the stale list as fixes land — a document that still claims a fixed defect is broken is a bug of its
   own, and it costs the next session the same verification pass this one just paid for.
+
+---
+
+### Post-report findings (measured, not yet numbered above)
+
+Full trails: `compiler/0.0.239/WIP.md` and `compiler/0.0.240/WIP.md`.
+
+- **`lib/std/lfm2_chat.quanta`** - `chat_build` wrote a literal backslash-n where the template renders a
+  real newline, and mis-transcribed the thinking tag (7 bytes, token id 124901); the driver called
+  `bpe_encode` (no special-token matching) and prepended no BOS. Fixed, it reproduces llama.cpp's
+  `/tokenize` byte-for-byte (23 ids).
+- **`lib/std/rag.quanta`** - did not compile at all (`undeclared variable: config` + SIGILL), and assumed
+  `exec()` returns - it is `execve` and replaces the process image, so the capture design was impossible.
+- **Open:** a top-level `const` with a float initialiser evaluates to 0; `tokenizer_trait.quanta` still
+  calls `bpe_encode`; native logits are flatter than the reference (p('The') 0.251 vs 0.847, 1/10 top ids
+  shared, argmax agrees), with the unchecked **Q6_K** output projection as prime suspect.
