@@ -1,0 +1,241 @@
+You are the code generator inside Quanta's self-improvement loop.
+You emit ONE complete Quanta (.quanta) source file and nothing else.
+
+A COMPLETE, VERIFIED-COMPILING FILE (this exact shape compiles with qc and runs
+with return 0 -- copy its style):
+------------8<------------
+module demo;
+fn band(a, b) { return a & b }
+fn bor(a, b) { return a | b }
+fn main() {
+  if band(1, 1) != 1 { exit(1) }
+  if band(1, 0) != 0 { exit(2) }
+  if bor(0, 1) != 1 { exit(3) }
+  prints("ok\n")
+  return 0
+}
+------------8<------------
+
+QUANTA RULES (authoritative):
+- File = `module <name>;` then `fn`s. `fn` optional; no semicolons required.
+- Everything runtime is a 64-bit integer (i64). There are NO casts and NO
+  type conversions of plain integers -- a value typed i64 IS i64.
+- Control flow: `if c { } else { }`, `while c { }`, `for i = a; c; step { }`.
+- Integer ops: + - * / % & | ^ ~ << >> and comparisons < > <= >= == != .
+  Logical NOT is `!x` or `not x`; bitwise NOT is `~x`. Logical and/or: && ||.
+- Arrays: literal `[a,b,c]`; element read `a[0]` (also `a.0`); element write
+  `a[0] = v`; length `len(a)`. Iterate `for x in a { }`.
+- Memory builtins: mem_alloc(n) -> ptr, mem_load(p), mem_store(p, v), free(p).
+  mem_alloc(n) gives n usable qword slots; slot i at byte p + i*8.
+- FLOAT builtins (f64 is a BIT-PATTERN held in an i64; every float arg/return is
+  a bit-pattern):  i2f(x) -> f64bits of (double)x ;  f2i(bits) -> i64 (truncates);
+  fadd(a,b) fsub(a,b) fmul(a,b) fdiv(a,b) -> f64bits ;  sqrt(bits) -> f64bits ;
+  abs(bits) ;  fgt(a,b) flt(a,b) fge(a,b) fle(a,b) feq(a,b) -> 0/1.
+  Example: to compute (a+b)/2 as f64:  fdiv(fadd(i2f(a), i2f(b)), i2f(2)).
+  To compare:  if fgt(x, i2f(0)) { ... }.  To round to int: f2i(x).
+- OUTPUT: prints("literal text") writes a string; printi(n) writes an integer;
+  println(n) writes integer+newline; newline(). To print a label then a number:
+  prints("max = "); printi(m); newline();
+
+FORBIDDEN -- these do NOT exist in Quanta and WILL fail to compile. Never use:
+  * printlni(...)                 (use prints(...) then printi(...))
+  * i64(x) / f64(x) / (a as i64)  (no casts; use i2f/f2i for floats only)
+  * "text " + number  or  str + i64(...)   (no string concatenation with numbers)
+  * arrays of tuples like [(0,0),(1,0)] or .0/.1 field access on them
+        (use several flat int arrays, or just call the function with literals)
+  * passing a bare function name as a value and calling it as `f(a,b)`
+        (function pointers need fnptr(name)/closure_call -- AVOID function
+         pointers entirely; write the calls explicitly)
+  * `let x: i64 = ...` type annotations on locals (omit the type)
+  * `return` of a string, or comparing strings with ==
+
+DEFINITION OF DONE: define `fn main()` that runs several `if <check> != <expected>
+{ exit(N) }` checks with distinct N, prints a short ok line, and `return 0`.
+Every other function must do REAL work (a real sort, real float math) -- never
+`return 0` as a placeholder.
+
+HARD LIMITS (the file is cut off if you exceed them, and then it will not compile):
+  * The WHOLE FILE must be at most 30 lines. Be dense; no long comment blocks.
+  * Do NOT write any helper function that takes a FUNCTION as an argument.
+  * Do NOT define check_* helpers -- write all the `if ... { exit(N) }` checks
+    INLINE inside main().
+  * Implement only 3 or 4 small functions total, plus main().
+
+Output format (STRICT): a single fenced block ```quanta containing the whole file.
+No prose before or after.
+
+
+===== RETRIEVED CONTEXT 1/3: QUANTA LANGUAGE SURFACE =====
+===== QUANTA LANGUAGE CARD (retrieved verbatim 2026-10-14 for SI stage-1) =====
+
+--- docs/SYNTAX.md §3 Functions (lines 158-172) ---
+### Functions
+```quanta
+// `fn` is OPTIONAL. All of these are equivalent function definitions:
+fn add(a, b) { return a + b }      // canonical
+add(a, b) { return a + b }         // bare form (no `fn`)
+init() { print("boot") }           // bare init (runs before main if present)
+main() {                            // bare main
+    let r = add(3, 4)
+    return r
+}
+```
+- **`fn` is optional.** A top-level `name(params) { body }` is a function
+  definition with or without `fn`. Mixing is fine: `fn main() { helper() }`
+  alongside bare `helper() { ... }`.
+- **Condition parentheses are optional.** `if x > 5`, `while i < n`, `for i = 0; i < n; i = i + 1` — no parens needed (and `if (x > 5)` also works).
+
+--- docs/SYNTAX.md §4 control flow + arrays (lines 296-303) ---
+
+*Note*: Bitwise operators (`&`, `|`, `^`, `~`, `<<`, `>>`) are exposed as surface syntax (parsed to `IR_BAND`/`IR_BOR`/`IR_BXOR`/`IR_BNOT`/`IR_SHL`/`IR_SHR`).  Logical `&&`/`||` (also `and`/`or`) are short‑circuit.
+
+### Control‑Flow Expressions
+- `if cond { then } else { else }` – yields the value of the chosen branch (if both sides produce a value).
+- `loop { … }` – infinite loop; use `break` to exit with a value: `break expr`.
+- `while cond { … }`
+- `for i = start; cond; step { … }` – classic C‑style loop.
+
+--- docs/SYNTAX.md §6 Output builtins (lines 356-367) ---
+| Builtin | Signature | Description |
+|---------|-----------|-------------|
+| `print(buf, len)` | `()` | Write raw bytes to stdout |
+| `printi(val)` | `()` | Signed decimal to stdout |
+| `prints(str)` | `()` | Write string header bytes to stdout |
+| `println(val)` | `()` | Integer + newline |
+| `printsp(val)` | `()` | Integer + space |
+| `newline()` | `()` | Output `\n` |
+
+
+### Conversions & Helpers
+| Builtin | Signature | Description |
+
+--- docs/SYNTAX.md §6 Conversions/float builtins (lines 368-383) ---
+|---------|-----------|-------------|
+| `u8(x)`, `u16(x)`, `u32(x)`, `u64(x)` | `-> truncated` | Bit‑mask to width |
+| `udiv(a,b)`, `umod(a,b)` | `-> unsigned` | Unsigned division/modulo |
+| `ult(a,b)`, `ugt(a,b)`, `ulte(a,b)`, `ugte(a,b)` | `-> 0/1` | Unsigned comparisons |
+| `fadd(a,b)`, `fsub(a,b)`, `fmul(a,b)`, `fdiv(a,b)` | `-> i64` | Float arithmetic; takes **int** args, computes `(double)a OP (double)b`, returns **int** (truncated). `fadd(3,4)=7`. |
+| `i2f(x)`, `f2i(x)` | `-> f64 bit-pattern` / `-> i64` | Int↔f64 bit-pattern conversion (no rounding). `i2f(3)` is the f64 bits of `3.0`. |
+| `feq(a,b)`, `flt(a,b)`, `fgt(a,b)`, `fle(a,b)`, `fge(a,b)` | `-> 0/1` | Float comparisons; args are f64 **bit-patterns** (pass `i2f(x)`). `feq(i2f(25),i2f(10))=0`, `fgt(i2f(25),i2f(10))=1`. |
+| `fisnan(a)`, `fisinf(a)` | `-> 0/1` | Float introspection on f64 bit-pattern. |
+| `sqrt(a)`, `floor(a)`, `ceil(a)`, `abs(a)` | `-> f64 bit-pattern` | Float math on f64 bit-pattern in/out. `sqrt(i2f(144))=i2f(12)`. |
+
+| `arg(i)` | `-> i64` | i‑th variadic argument (0‑based) |
+| `len(v)` | `-> i64` | Length prefix of string/array/slice |
+| `str(a,b)` | `-> string` | Concatenate two byte buffers |
+| `push(v, e)` | `()` | Append byte to buffer |
+| `pop(v)` | `()->byte` | Remove and return last byte |
+| `mk_any(tag, val)` | `-> tuple` | Tagged tuple `(tag, payload)` |
+
+--- docs/SYNTAX.md §5 memory + example (lines 322-345) ---
+| `mem_load(ptr)` | `-> i64` | Load 8‑byte word. |
+| `mem_load8(ptr)` | `-> u8` (zero‑extended) | Load byte. |
+| `mem_store(ptr, val)` | `()` | Store 8‑byte word. |
+| `mem_store8(ptr, val)` | `()` | Store byte (skip if `ptr==0`). |
+
+### Example
+```
+fn fib(n) {
+    if n < 2 { return n }
+    return fib(n - 1) + fib(n - 2)
+}
+
+fn main() {
+    return fib(10)
+}
+```
+
+---
+
+## 6. Standard Built‑ins (intrinsics)
+
+All builtins are emitted inline; they have no call overhead.
+
+### Memory (see §5)
+
+--- REAL IDIOM: a green gate test's self-test pattern (test_suites/codes/bitops_test.quanta lines 14-24) ---
+    if !(parity(15) == 0) { exit(2) }     // 0b1111 -> 4 bits (even) -> 0
+    if !(parity(0)  == 0) { exit(3) }     // 0 -> even -> 0
+    if !(parity(255)== 0) { exit(4) }     // 0xFF -> 8 bits (even) -> 0
+
+    // bitfield(x, off, wid) = (x >> off) & ((1<<wid)-1)
+    let x = 0x12345678
+    if !(bitfield(x, 0, 8)  == 0x78)   { exit(5) }   // low byte
+    if !(bitfield(x, 8, 8)  == 0x56)   { exit(6) }
+    if !(bitfield(x, 16, 16)== 0x1234) { exit(7) }
+    if !(bitfield(x, 4, 4)  == 0x7)    { exit(8) }
+    if !(bitfield(x, 28, 4) == 0x1)    { exit(9) }
+
+--- REAL IDIOM: module header + status consts (a real lib/std module) ---
+// lib/std/linalg - NATIVE numerical linear algebra for Quanta.
+// Pure-Quanta implementation over mem_alloc; no external runtime.
+// This is Quanta's answer to NumPy's core: dense matrices with int64 and
+// f64 (IEEE-754 double) elements, matmul, transpose, determinant, inverse,
+// and vector ops - the substrate that physics solvers, ML inference, and
+// finite-field crypto all build on.
+//
+// Layout (header pointer, like vec/big):
+//   [0]  = rows
+//   [8]  = cols
+//   [16] = element (0,0)
+//   element (r,c) at  [16 + (r*cols + c)*8]
+
+--- NOTE ON SPEC.md (flagged stale) ---
+# Quanta Language Specification (v0.0.169)
+
+> **Currency:** written against `0.0.169`; the tree is now `0.0.223`.
+> Not re-verified against current source. Read `compiler/0.0.223/WIP.md`
+> for the measured current state, and treat anything below as design intent
+> rather than a description of today's compiler.
+
+
+===== RETRIEVED CONTEXT 2/3: CLOSEST EXISTING lib/std IMPLEMENTATION =====
+===== CLOSEST EXISTING REAL IMPL for computer_science_algorithms_sorting =====
+Chosen: lib/std/sampling.quanta lines 20-46 -- a REAL in-place sort loop over a
+mem_alloc'd i64 buffer (insertion/selection style with a tmp swap). Exact shape.
+
+fn sample_top_k(logits, n, k) {
+    let sorted = mem_alloc(n * 8)
+    let i = 0
+    while i < n {
+        mem_store(sorted + i * 8, mem_load(logits + i * 8))
+        i = i + 1
+    }
+    
+    i = 0
+    while i < n {
+        let j = i + 1
+        while j < n {
+            if f2i(mem_load(sorted + j * 8)) > f2i(mem_load(sorted + i * 8)) {
+                let tmp = mem_load(sorted + i * 8)
+                mem_store(sorted + i * 8, mem_load(sorted + j * 8))
+                mem_store(sorted + j * 8, tmp)
+            }
+            j = j + 1
+        }
+        i = i + 1
+    }
+    
+    let threshold = mem_load(sorted + k * 8)
+    
+    i = 0
+    while i < n {
+        if f2i(mem_load(logits + i * 8)) < f2i(threshold) {
+
+
+===== TASK 3/3: SPEC TO IMPLEMENT =====
+SPEC (planned/INDEX.tsv row + planned/lib_std/computer_science_algorithms_sorting.quanta):
+  path     : planned/lib_std/computer_science_algorithms_sorting.quanta
+  domain   : computer_science
+  category : Algorithms
+  module   : Sorting
+  status   : [?] planned
+  version  : -
+  stdlib   : -
+  notes    : QuickSort, MergeSort, HeapSort, RadixSort, TimSort -> `cs_theory` 0.180+
+TARGET: implement integer sorting over an i64 buffer (mem_alloc, mem_load/mem_store):
+insertion_sort, selection_sort, bubble_sort, and is_sorted. main() sorts a known
+input with each and returns 0 iff every result is the expected ascending order.
+
+
+Emit the complete file for module `sorting` now.

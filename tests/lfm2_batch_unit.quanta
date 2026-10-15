@@ -1,0 +1,161 @@
+// tests/lfm2_batch_unit.quanta -- unit test for mm_matmul and
+// mm_embed_logits_batch: BIT-IDENTITY against the B separate single-token calls
+// they replace, plus a timing of both, on REAL tensors.
+//
+// WHY: the batched prefill's whole safety argument is "same dequant, same dot,
+// same summation order, therefore identical bits". That argument is testable in
+// isolation, in seconds, before anything as large as a 30-layer forward is on the
+// line. This does exactly that:
+//
+//   for a Q4_K gate, a Q6_K ffn_down and a Q4_K square projection:
+//     y_sep[b][r]     = mm_matvec(W, x_b)                       repeated B times
+//     y_bat[b*rows+r] = mm_matmul(W, X, rows, cols, B, Y)
+//   and reports how many f64 BIT PATTERNS differ, plus ns for both, so the
+//   amortisation is measured rather than assumed.
+//
+// The whole suite runs TWICE: once with mm_workers = 1 (the serial path,
+// mm_matmul_ser) and once with mm_workers = 4 (the pool path, pl_run_mm), because
+// they are different code and only one of them is used by default.
+//
+// Build:  compiler/<ver>/bin/x86/qc tests/lfm2_batch_unit.quanta <bin>
+// Run:    ( ulimit -c 0 -v 8000000; <bin> </dev/null )   from the repo root
+import std/gguf
+import std/lfm2_forward
+import std/lfm2_model
+import std/lfm2_mm
+import std/fs
+
+const Q4_PATH = "/opt/ai/models/quanta/QUANTA-LFM2.5-2.6Bv1-Q4_K_M.gguf"
+const NCTX = 2048
+const B = 4
+const NC = 256      // embed-logits probe width: a multiple of 256 for K-quants
+const VC = 8        // embed-logits probe rows
+
+let sink = 0.0
+let X = 0
+let Yb = 0
+let Ys = 0
+let y1 = 0
+let one = 0
+let nbad = 0
+
+fn fill(vec, n, seed) {
+    let i = 0
+    while i < n {
+        let v: f64 = i2f((i + 1 + seed * 7) % 97) / 100.0 - 0.4
+        mem_store(vec + i * 8, v)
+        i = i + 1
+    }
+    return 0
+}
+
+fn bits_differ(pa, pb) {
+    if mem_load(pa) != mem_load(pb) { return 1 }
+    return 0
+}
+
+// mm_matmul over `rows`x`cols` vs B separate mm_matvec, bit-for-bit.
+// `tag` is an INTEGER, not a string: an untyped string parameter loses its
+// type (defect A7) and `prints` of it reads a garbage length.
+fn check(tag, W, rows, cols) {
+    let xb = X
+    let t0 = clock()
+    if mm_matmul(W, xb, rows, cols, B, Yb) != 0 { prints("FAIL matmul T"); print(tag); newline(); nbad = nbad + 1; return 0 }
+    let tb = clock() - t0
+    t0 = clock()
+    let b = 0
+    while b < B {
+        if mm_matvec(W, xb + b * cols * 8, rows, cols, y1) != 0 { prints("FAIL sep T"); print(tag); newline(); nbad = nbad + 1; return 0 }
+        let r = 0
+        while r < rows { mem_store(Ys + (b * rows + r) * 8, f64of(mem_load(y1 + r * 8))); r = r + 1 }
+        b = b + 1
+    }
+    let ts = clock() - t0
+    let bad = 0
+    b = 0
+    while b < B {
+        let r = 0
+        while r < rows {
+            bad = bad + bits_differ(Yb + (b * rows + r) * 8, Ys + (b * rows + r) * 8)
+            r = r + 1
+        }
+        b = b + 1
+    }
+    nbad = nbad + bad
+    prints("T"); print(tag); prints(" rows="); print(rows); prints(" cols="); print(cols)
+    prints(" dtype="); print(gguf_tensor_dtype(W))
+    prints(" batched_ms="); print(tb / 1000000)
+    prints(" sep_ms="); print(ts / 1000000)
+    prints(" speedup_x1000="); print(ts * 1000 / tb)
+    prints(" mismatch="); print(bad); prints("/"); print(B * rows); newline()
+    return 0
+}
+
+fn check_embed() {
+    let emb = lfm2_token_embd()
+    if mm_embed_logits_batch(emb, X, 0, VC, NC, B, Ys) != 0 {
+        prints("FAIL elog_batch\n"); nbad = nbad + 1; return 0
+    }
+    let bad = 0
+    let b = 0
+    while b < B {
+        if mm_embed_logits(emb, X + b * NC * 8, 0, VC, NC, one) != 0 {
+            prints("FAIL elog_one\n"); nbad = nbad + 1; return 0
+        }
+        let v = 0
+        while v < VC {
+            bad = bad + bits_differ(Ys + (b * VC + v) * 8, one + v * 8)
+            v = v + 1
+        }
+        b = b + 1
+    }
+    nbad = nbad + bad
+    prints("EMBED_LOGITS_BATCH mismatch="); print(bad); prints("/"); print(B * VC); newline()
+    return 0
+}
+
+fn suite(tag) {
+    prints("--- suite "); print(tag); newline()
+    check(1, lfm2_ffn_gate(0), fc_d_ff, fc_d_model)
+    check(2, lfm2_ffn_down(0), fc_d_model, fc_d_ff)
+    check(3, lfm2_conv_out_proj(0), fc_d_model, fc_d_model)
+    check_embed()
+    return 0
+}
+
+fn main() {
+    prints("=== mm_matmul unit test ===\n")
+    if gguf_load(Q4_PATH) != 0 { prints("FAIL gguf_load\n"); return 1 }
+    if fc_read_config() != 0 { prints("FAIL fc_read_config\n"); return 1 }
+    if fc_kv_init(NCTX) != 0 { prints("FAIL fc_kv_init\n"); return 1 }
+    if fc_fw_init() != 0 { prints("FAIL fc_fw_init\n"); return 1 }
+    let dm = fc_d_model
+    let dff = fc_d_ff
+
+    X = mem_alloc((dff + 64) * B * 8)
+    Yb = mem_alloc(dff * B * 8)
+    Ys = mem_alloc(dff * B * 8)
+    y1 = mem_alloc(dff * 8)
+    one = mem_alloc(64 * 8)
+    let b = 0
+    while b < B {
+        fill(X + b * dff * 8, dff, b)
+        b = b + 1
+    }
+
+    mm_set_workers(1)
+    mm_set_embed_workers(1)
+    suite(1)      // serial path
+
+    mm_pool_begin()
+    mm_set_workers(4)
+    mm_set_embed_workers(4)
+    suite(2)      // pool path
+    mm_pool_end()
+
+    prints("TOTAL_MISMATCH="); print(nbad); newline()
+    prints("SINK "); print(f2i(sink)); newline()
+    if nbad != 0 { prints("UNIT FAIL\n"); return 1 }
+    prints("UNIT PASS\n")
+    return 0
+}

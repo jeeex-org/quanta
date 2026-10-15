@@ -1,0 +1,144 @@
+// tests/lfm2_prompt_budget.quanta -- the assembled SI prompt's token cost, split
+// by SECTION, counted with the SAME BPE the forward pass uses.
+//
+// WHY: the prefill-time budget plan starts from "87% of the prompt is static
+// scaffolding". That is a claim about token counts, and a token count is only
+// meaningful if it comes from the encoder the model actually sees. This reads the
+// real assembled prompt (tests/lfm2_prefill_prompt.txt, the loop's own output for
+// the `sorting` spec) and counts each section:
+//
+//   SYSTEM card + section labels  |  LANGUAGE_CARD  |  retrieved neighbour  |  spec
+//
+// The three sections are delimited by lines of five-or-more '=' (the harness's
+// "===== RETRIEVED CONTEXT n/3 ... =====" headers), found by scanning for a run of
+// five '=' that is not preceded by '='. No marker STRING is passed through an
+// untyped parameter: an untyped string argument loses its type (defect A7), so the
+// scan is byte arithmetic.
+//
+// Build:  compiler/<ver>/bin/x86/qc tests/lfm2_prompt_budget.quanta <bin>
+// Run:    ( ulimit -c 0 -v 8000000; <bin> </dev/null )   from the repo root
+import std/gguf
+import std/lfm2_bpe
+import std/fs
+
+const PROMPT_PATH = "tests/lfm2_prefill_prompt.txt"
+const CAP = 65536
+const MAXIDS = 8192
+
+let plen = 0
+
+fn slurp(fd) {
+    if fd < 0 { return 0 }
+    let b = mem_alloc(CAP)
+    let got = read_raw(fd, b, CAP)
+    file_close(fd)
+    if got <= 0 { return 0 }
+    plen = got
+    return b
+}
+
+fn is_eq(buf, i, n) {
+    if i < 0 || i >= n { return 0 }
+    if mem_load8(buf + i) == 61 { return 1 }
+    return 0
+}
+
+// 1 if a marker line starts at buf+i: NEWLINE, then "=====", then a space, then
+// exactly the four bytes c0 c1 c2 c3.
+//
+// TWO weaker tests were tried and both gave WRONG section boundaries, measured:
+//   - "run of five '=' preceded by a non-'='" also matches the CLOSING run of the
+//     same marker line (preceded by a space)                     -> 3495/3548/3554
+//   - "...preceded by a NEWLINE" then matched a '=====' RULER LINE inside
+//     LANGUAGE_CARD.txt itself                                   -> 3495/3554/9138
+// against the true offsets 3495 / 9138 / 10173. Anchoring on the marker TEXT is
+// what makes it unambiguous; the four bytes are compared as integers because an
+// untyped string parameter loses its type (defect A7).
+fn marker_like(buf, i, n, c0, c1, c2, c3) {
+    if i < 1 || i + 9 >= n { return 0 }
+    if mem_load8(buf + i - 1) != 10 { return 0 }
+    if is_eq(buf, i, n) == 0 { return 0 }
+    if is_eq(buf, i + 1, n) == 0 { return 0 }
+    if is_eq(buf, i + 2, n) == 0 { return 0 }
+    if is_eq(buf, i + 3, n) == 0 { return 0 }
+    if is_eq(buf, i + 4, n) == 0 { return 0 }
+    if mem_load8(buf + i + 5) != 32 { return 0 }
+    if mem_load8(buf + i + 6) != c0 { return 0 }
+    if mem_load8(buf + i + 7) != c1 { return 0 }
+    if mem_load8(buf + i + 8) != c2 { return 0 }
+    if mem_load8(buf + i + 9) != c3 { return 0 }
+    return 1
+}
+
+// the `which`-th (0-based) "===== RETR..." marker line
+fn find_retr(buf, n, which) {
+    let found = 0
+    let i = 1
+    while i < n - 10 {
+        if marker_like(buf, i, n, 82, 69, 84, 82) == 1 {
+            if found == which { return i }
+            found = found + 1
+        }
+        i = i + 1
+    }
+    return 0 - 1
+}
+
+// the "===== TASK ..." marker line
+fn find_task(buf, n) {
+    let i = 1
+    while i < n - 10 {
+        if marker_like(buf, i, n, 84, 65, 83, 75) == 1 { return i }
+        i = i + 1
+    }
+    return 0 - 1
+}
+
+// tokens in the byte range [p, p+len)
+fn count_tokens(buf, p, len, ids) {
+    if len <= 0 { return 0 }
+    let n = bpe_encode(buf + p, len, ids, MAXIDS)
+    if n < 0 { return 0 - 1 }
+    return n
+}
+
+fn main() {
+    prints("=== SI prompt token budget (in-tree BPE) ===\n")
+    if gguf_load("/opt/ai/models/quanta/QUANTA-LFM2.5-2.6Bv1-Q4_K_M.gguf") != 0 {
+        prints("FAIL gguf_load\n"); return 1
+    }
+    if bpe_init_from_gguf() == 0 { prints("FAIL bpe_init\n"); return 1 }
+
+    let buf = slurp(file_open(PROMPT_PATH, 0))
+    if buf == 0 { prints("FAIL read prompt\n"); return 1 }
+    let n = plen
+    prints("prompt_bytes="); print(n); newline()
+
+    let m1 = find_retr(buf, n, 0)
+    let m2 = find_retr(buf, n, 1)
+    let m3 = find_task(buf, n)
+    prints("marker_offsets="); print(m1); prints(" "); print(m2)
+    prints(" "); print(m3); newline()
+    if m1 < 0 || m2 < 0 || m3 < 0 { prints("FAIL markers\n"); return 1 }
+
+    let ids = mem_alloc(MAXIDS * 8)
+    let sysn = count_tokens(buf, 0, m1, ids)
+    let cardn = count_tokens(buf, m1, m2 - m1, ids)
+    let neighn = count_tokens(buf, m2, m3 - m2, ids)
+    let specn = count_tokens(buf, m3, n - m3, ids)
+    let alln = count_tokens(buf, 0, n, ids)
+
+    prints("SYSTEM_card+labels\t"); print(sysn); newline()
+    prints("LANGUAGE_CARD\t"); print(cardn); newline()
+    prints("RETRIEVED_neighbour\t"); print(neighn); newline()
+    prints("SPEC\t"); print(specn); newline()
+    prints("SUM_OF_SECTIONS\t"); print(sysn + cardn + neighn + specn); newline()
+    prints("WHOLE_PROMPT_as_text\t"); print(alln); newline()
+
+    // the recommended PER-ATTEMPT prompt: everything except the static language
+    // card, which becomes a cached prefix. Counted on the real bytes.
+    prints("RECOMMENDED_per_attempt(sys+neigh+spec)\t"); print(sysn + neighn + specn); newline()
+    prints("STATIC_PREFIX_TO_CACHE(sys+card)\t"); print(sysn + cardn); newline()
+    prints("DONE\n")
+    return 0
+}

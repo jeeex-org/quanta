@@ -1,0 +1,185 @@
+// tests/lfm2_prefill_bench.quanta -- measure PREFILL throughput of the native
+// LFM2 forward over a realistic prompt, in ms per prompt token.
+//
+// WHY THIS EXISTS
+// ---------------
+// `prefill` means: embed every prompt token and run the layer stack over it,
+// advancing the KV cache and the short-conv state, WITHOUT computing the
+// 128000-way output projection at every position (only the LAST position's
+// logits are ever read). That is what fc_forward_token_ex(tok, pos, 0) does.
+// The tracked generator (tests/lfm2_generate.quanta) already uses that path, but
+// it fuses the measurement with decode + sampling, and its prompt is 23 tokens —
+// too short and too entangled to read a per-token prefill rate off.
+//
+// This driver isolates prefill: load, tokenize a REAL prompt, prefill the first
+// N tokens, print ms/token. Nothing else runs inside the timed region.
+//
+// THE PROMPT IS REAL, NOT INVENTED. tests/lfm2_prefill_prompt.txt is a copy of
+// the assembled SI-loop prompt (stage1/ctx/PROMPT_sorting.txt, 10,890 bytes):
+// SYSTEM card + LANGUAGE_CARD + one retrieved neighbour + the spec. Its FULL
+// length is what the loop actually feeds the model; this driver prefills a
+// PREFIX of it (N tokens, default 64) because a full prefill at the measured
+// rate is hours -- see docs/research/prefill-batching.md for the arithmetic.
+//
+// UNIT DISCIPLINE: prefill_ms comes from one clock() pair around the loop, so it
+// is wall clock including any stall. The caller must record the load average:
+// this is a throughput measurement and numbers taken while another unit is
+// loading the box are not measurements (a peer inflated user time 1.75x here).
+//
+// Conf file tests/lfm2_prefill_bench.conf:
+//   "<workers> <n_tokens> [batch]"
+//   batch: 0 or absent = one forward per token (the historical path)
+//          B > 1        = batched prefill in chunks of B tokens
+//
+// Build:  compiler/<ver>/bin/x86/qc tests/lfm2_prefill_bench.quanta <bin>
+// Run:    ( ulimit -c 0 -v 8000000; <bin> </dev/null )   from the repo root
+import std/gguf
+import std/lfm2_forward
+import std/lfm2_model
+import std/lfm2_mm
+import std/lfm2_bpe
+import std/lfm2_chat
+import std/fs
+
+const Q4_PATH = "/opt/ai/models/quanta/QUANTA-LFM2.5-2.6Bv1-Q4_K_M.gguf"
+const CONF_PATH = "tests/lfm2_prefill_bench.conf"
+const PROMPT_PATH = "tests/lfm2_prefill_prompt.txt"
+const CAP = 65536
+const NCTX = 2048
+
+let plen = 0
+
+fn slurp(fd) {
+    if fd < 0 { return 0 }
+    let b = mem_alloc(CAP)
+    let got = read_raw(fd, b, CAP)
+    file_close(fd)
+    if got <= 0 { return 0 }
+    plen = got
+    return b
+}
+
+fn parse_ints(buf, out) {
+    let n = 0
+    let cur = 0
+    let have = 0
+    let i = 0
+    while mem_load8(buf + i) != 0 {
+        let c = mem_load8(buf + i)
+        if c >= 48 && c <= 57 {
+            cur = cur * 10 + (c - 48)
+            have = 1
+        } else {
+            if have == 1 {
+                if n < 8 { mem_store(out + n * 8, cur) }
+                n = n + 1
+                cur = 0
+                have = 0
+            }
+        }
+        i = i + 1
+    }
+    if have == 1 { if n < 8 { mem_store(out + n * 8, cur) }; n = n + 1 }
+    return n
+}
+
+// Wrap raw file bytes in a Quanta STRING: [i64 length][bytes].
+fn as_str(raw, n) {
+    let s = mem_alloc(n + 16)
+    mem_store(s, n)
+    let i = 0
+    while i < n { mem_store8(s + 8 + i, mem_load8(raw + i)); i = i + 1 }
+    mem_store8(s + 8 + n, 0)
+    return s
+}
+
+fn main() {
+    prints("=== lfm2 prefill bench ===\n")
+
+    let cfgb = slurp(file_open(CONF_PATH, 0))
+    let conf = mem_alloc(64)
+    let nw = 20
+    let ntarget = 64
+    let bsz = 0
+    if cfgb != 0 {
+        let nf = parse_ints(cfgb, conf)
+        if nf >= 1 { nw = mem_load(conf) }
+        if nf >= 2 { ntarget = mem_load(conf + 8) }
+        if nf >= 3 { bsz = mem_load(conf + 16) }
+    } else {
+        prints("warn: conf unreadable; defaults workers=20 n=64 batch=0\n")
+    }
+    if ntarget < 2 { ntarget = 2 }
+    if ntarget > 2000 { ntarget = 2000 }
+    if bsz < 0 { bsz = 0 }
+    if bsz > 256 { bsz = 256 }
+    prints("workers="); print(nw)
+    prints(" n_target="); print(ntarget)
+    prints(" batch="); print(bsz); prints("\n")
+
+    let t0 = clock()
+    if gguf_load(Q4_PATH) != 0 { prints("FAIL gguf_load\n"); return 1 }
+    if fc_read_config() != 0 { prints("FAIL fc_read_config\n"); return 1 }
+    if bpe_init_from_gguf() == 0 { prints("FAIL bpe_init\n"); return 1 }
+    if fc_kv_init(NCTX) != 0 { prints("FAIL fc_kv_init\n"); return 1 }
+    if fc_fw_init() != 0 { prints("FAIL fc_fw_init\n"); return 1 }
+    if fc_fw_reset() != 0 { prints("FAIL fc_fw_reset\n"); return 1 }
+    mm_set_workers(nw)
+    mm_set_embed_workers(nw)
+    prints("load_ms="); print((clock() - t0) / 1000000); prints("\n")
+
+    let rawprompt = slurp(file_open(PROMPT_PATH, 0))
+    if rawprompt == 0 { prints("FAIL read prompt\n"); return 1 }
+    let user = as_str(rawprompt, plen)
+    prints("prompt_bytes="); print(plen); prints("\n")
+    let pb = mem_alloc(CAP)
+    let pbytes = chat_build(0, user, pb)
+    let ids = mem_alloc(4096 * 8)
+    mem_store(ids, bpe_bos)
+    let navail = bpe_encode_special(pb, pbytes, ids + 8, 4000) + 1
+    // n is the timed prefix length; navail is the FULL prompt's token count and
+    // is reported so the extrapolation to the whole prompt is on real numbers.
+    let n = ntarget
+    if n > navail { n = navail }
+    prints("prompt_tokens_full="); print(navail)
+    prints(" timed_tokens="); print(n); prints("\n")
+    if n < 2 { prints("FAIL encode\n"); return 1 }
+
+    prints("ids")
+    let di = 0
+    while di < n {
+        prints(" "); print(mem_load(ids + di * 8))
+        di = di + 1
+    }
+    newline()
+
+    let t1 = clock()
+    mm_pool_begin()
+    if bsz > 1 {
+        if fc_prefill_batch(ids, 0, n, bsz) != 0 {
+            mm_pool_end(); prints("FAIL fc_prefill_batch\n"); return 1
+        }
+    } else {
+        let i = 0
+        while i < n {
+            let want = 0
+            if i == n - 1 { want = 1 }
+            if fc_forward_token_ex(mem_load(ids + i * 8), i, want) != 0 {
+                mm_pool_end(); prints("FAIL prefill\n"); return 1
+            }
+            i = i + 1
+        }
+    }
+    let t2 = clock()
+    mm_pool_end()
+
+    prints("prefill_ms="); print((t2 - t1) / 1000000)
+    prints(" prefill_ms_per_tok="); print((t2 - t1) / 1000000 / n)
+    prints(" prefill_tok_per_s_x1000="); print(n * 1000000000000 / (t2 - t1))
+    newline()
+    // The last position's logits are the correctness anchor: whatever changes in
+    // the prefill path, the token the model would emit next must not move.
+    prints("argmax_last="); print(fc_argmax(fc_n_vocab)); prints("\n")
+    prints("DONE\n")
+    return 0
+}

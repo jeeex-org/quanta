@@ -1,0 +1,254 @@
+// tests/lfm2_op_profile.quanta -- WHERE does one native LFM2 token's time go?
+//
+// WHY THIS EXISTS
+// ---------------
+// "Prefill is slow because it is one unbatched forward per token" is a hypothesis
+// about the SHAPE of the work. What matters for choosing a fix is the COST of
+// each op and how many times a token calls it. This driver times every distinct
+// op the forward uses, on the model's REAL tensors, and prints a TSV row
+//
+//     NAME <TAB> ns_per_call <TAB> calls_per_token
+//
+// so the per-token budget is summed programmatically instead of argued about.
+// It runs with mm_workers = 0 -- ONE thread -- because a per-op cost is only
+// readable when nothing else runs; thread scaling is measured separately by
+// tests/run_lfm2_prefill_bench.sh.
+//
+// It times the two halves of a matvec SEPARATELY:
+//   *_DEQ = mm_load_row (pread + dequantise one row)
+//   *_DOT = mm_dot4     (the dequantised row against the activation)
+// Those are what batching can and cannot amortise: a batched pass still does one
+// dot per (row, token), but only ONE dequantise per row.
+//
+// AND it times what is NOT a matvec (rms_norm, silu, residual adds, the
+// attention score/softmax/accumulate body, the embedding lookup) -- if those are
+// a large share of a token, batching the matvecs cannot fix the token.
+//
+// Build:  compiler/<ver>/bin/x86/qc tests/lfm2_op_profile.quanta <bin>
+// Run:    ( ulimit -c 0 -v 8000000; <bin> </dev/null )   from the repo root
+import std/gguf
+import std/lfm2_forward
+import std/lfm2_model
+import std/lfm2_mm
+import std/lfm2_bpe
+import std/math
+import std/fs
+
+const Q4_PATH = "/opt/ai/models/quanta/QUANTA-LFM2.5-2.6Bv1-Q4_K_M.gguf"
+const NCTX = 2048
+
+let op_sink = 0.0
+
+// best-of-2 ns for `reps` calls of mm_matvec on one tensor
+fn mv_ns(t, x, rows, cols, y, reps) -> i64 {
+    let best = 0
+    let r = 0
+    while r < 2 {
+        let t0 = clock()
+        let k = 0
+        while k < reps { op_sink = op_sink + i2f(mm_matvec(t, x, rows, cols, y)); k = k + 1 }
+        let dt = clock() - t0
+        if best == 0 || dt < best { best = dt }
+        r = r + 1
+    }
+    return best / reps
+}
+
+// best-of-2 ns for `reps` mm_load_row calls (pread + dequant only)
+fn deq_ns(t, row_elems, reps) -> i64 {
+    let best = 0
+    let r = 0
+    while r < 2 {
+        let t0 = clock()
+        let k = 0
+        while k < reps { op_sink = op_sink + i2f(mm_load_row(t, k, row_elems)); k = k + 1 }
+        let dt = clock() - t0
+        if best == 0 || dt < best { best = dt }
+        r = r + 1
+    }
+    return best / reps
+}
+
+// best-of-2 ns for `reps` mm_dot4 calls on whatever mm_rowbuf holds
+fn dot_ns(x, cols, reps) -> i64 {
+    let best = 0
+    let r = 0
+    while r < 2 {
+        let t0 = clock()
+        let k = 0
+        while k < reps { op_sink = op_sink + mm_dot4(mm_rowbuf, x, cols); k = k + 1 }
+        let dt = clock() - t0
+        if best == 0 || dt < best { best = dt }
+        r = r + 1
+    }
+    return best / reps
+}
+
+fn main() {
+    prints("=== lfm2 op profile (serial: mm_workers=0) ===\n")
+    if gguf_load(Q4_PATH) != 0 { prints("FAIL gguf_load\n"); return 1 }
+    if fc_read_config() != 0 { prints("FAIL fc_read_config\n"); return 1 }
+    if bpe_init_from_gguf() == 0 { prints("FAIL bpe_init\n"); return 1 }
+    if fc_kv_init(NCTX) != 0 { prints("FAIL fc_kv_init\n"); return 1 }
+    if fc_fw_init() != 0 { prints("FAIL fc_fw_init\n"); return 1 }
+    if fc_fw_reset() != 0 { prints("FAIL fc_fw_reset\n"); return 1 }
+    mm_set_workers(0)
+    mm_set_embed_workers(0)
+
+    let dm = fc_d_model
+    let dff = fc_d_ff
+    let nl = fc_n_layers
+    let hd = fc_head_dim
+    let nh = fc_n_heads
+
+    let nattn = 0
+    let nconv = 0
+    let L = 0
+    while L < nl {
+        if lfm2_layer_is_attn(L) != 0 { nattn = nattn + 1 } else { nconv = nconv + 1 }
+        L = L + 1
+    }
+    prints("META\t"); print(dm); prints("\t"); print(dff)
+    prints("\t"); print(nl); prints("\t"); print(nattn)
+    prints("\t"); print(nconv); prints("\t"); print(nh)
+    prints("\t"); print(hd); prints("\t"); print(fc_nkv_max); newline()
+
+    // non-degenerate activation
+    let i = 0
+    while i < dm { mem_store(fc_fw_x + i * 8, i2f(i + 1) / i2f(dm)); i = i + 1 }
+    i = 0
+    while i < dff { mem_store(fc_fw_f + i * 8, i2f(i + 1) / i2f(dff)); i = i + 1 }
+
+    let La = -1
+    let Lc = -1
+    L = 0
+    while L < nl {
+        if lfm2_layer_is_attn(L) != 0 { if La < 0 { La = L } } else { if Lc < 0 { Lc = L } }
+        L = L + 1
+    }
+    prints("FIRST_ATTN_LAYER\t"); print(La); prints("\t"); print(Lc); newline()
+
+    // ---------- FFN matvecs (every layer) ----------
+    let gt = lfm2_ffn_gate(Lc)
+    let ut = lfm2_ffn_up(Lc)
+    let dt = lfm2_ffn_down(Lc)
+    prints("FFN_GATE_MV\t");  print(mv_ns(gt, fc_fw_x, dff, dm, fc_fw_f, 2)); prints("\t"); print(nl); newline()
+    prints("FFN_UP_MV\t");    print(mv_ns(ut, fc_fw_x, dff, dm, fc_fw_f, 2)); prints("\t"); print(nl); newline()
+    prints("FFN_DOWN_MV\t");  print(mv_ns(dt, fc_fw_f, dm, dff, fc_fw_a, 2)); prints("\t"); print(nl); newline()
+    prints("FFN_GATE_DEQ\t"); print(deq_ns(gt, dm, 16)); prints("\t"); print(nl); newline()
+    op_sink = op_sink + mm_dot4(mm_rowbuf, fc_fw_x, dm)
+    prints("FFN_GATE_DOT\t"); print(dot_ns(fc_fw_x, dm, 16)); prints("\t"); print(nl); newline()
+    prints("FFN_DOWN_DEQ\t"); print(deq_ns(dt, dff, 8)); prints("\t"); print(nl); newline()
+    prints("FFN_DOWN_DOT\t"); print(dot_ns(fc_fw_f, dff, 8)); prints("\t"); print(nl); newline()
+
+    // ---------- attention projections (attn layers only) ----------
+    let qt = lfm2_attn_q(La)
+    let kt = lfm2_attn_k(La)
+    let vt = lfm2_attn_v(La)
+    let wot = lfm2_attn_output(La)
+    let nkv = fc_nkv_of(La)
+    prints("ATTN_Q_MV\t"); print(mv_ns(qt, fc_fw_x, nh * hd, dm, fc_fw_a, 2)); prints("\t"); print(nattn); newline()
+    prints("ATTN_K_MV\t"); print(mv_ns(kt, fc_fw_x, nkv * hd, dm, fc_fw_a, 2)); prints("\t"); print(nattn); newline()
+    prints("ATTN_V_MV\t"); print(mv_ns(vt, fc_fw_x, nkv * hd, dm, fc_fw_a, 2)); prints("\t"); print(nattn); newline()
+    prints("ATTN_O_MV\t"); print(mv_ns(wot, fc_fw_x, dm, nh * hd, fc_fw_a, 2)); prints("\t"); print(nattn); newline()
+
+    // ---------- conv projections (conv layers only) ----------
+    let cin = lfm2_conv_in_proj(Lc)
+    let cout = lfm2_conv_out_proj(Lc)
+    prints("CONV_IN_MV\t");  print(mv_ns(cin, fc_fw_x, dm * 3, dm, fc_fw_a, 2)); prints("\t"); print(nconv); newline()
+    prints("CONV_OUT_MV\t"); print(mv_ns(cout, fc_fw_x, dm, dm, fc_fw_a, 2)); prints("\t"); print(nconv); newline()
+
+    // ---------- embedding row lookup (once per token) ----------
+    let t0 = clock()
+    let er = 0
+    while er < 2 {
+        op_sink = op_sink + i2f(mm_lookup_row(lfm2_token_embd(), 100 + er, dm, fc_fw_a))
+        er = er + 1
+    }
+    prints("EMBED_LOOKUP\t"); print((clock() - t0) / 2); prints("\t"); print(1); newline()
+
+    // ---------- non-matvec per-layer work ----------
+    let normbuf = mem_alloc(2 * dm * 8)
+    if read_tensor_f64(lfm2_attn_norm(Lc), normbuf) < 0 { prints("FAIL norm\n"); return 1 }
+    t0 = clock()
+    let rr = 0
+    while rr < 8 {
+        op_sink = op_sink + i2f(fc_rms_norm(fc_fw_n, fc_fw_x, normbuf, dm))
+        rr = rr + 1
+    }
+    prints("RMS_NORM_DM\t"); print((clock() - t0) / 8); prints("\t"); print(2 * nl); newline()
+
+    // silu over d_ff, per layer
+    t0 = clock()
+    rr = 0
+    while rr < 4 {
+        let j = 0
+        while j < dff {
+            let gv = f64of(mem_load(fc_fw_f + j * 8))
+            let sg: f64 = 1.0 / (1.0 + expf(0.0 - gv))
+            mem_store(fc_fw_a + j * 8, gv * sg * gv)
+            j = j + 1
+        }
+        rr = rr + 1
+    }
+    prints("SILU_DFF\t"); print((clock() - t0) / 4); prints("\t"); print(nl); newline()
+
+    // residual add over d_model (2 per layer)
+    t0 = clock()
+    rr = 0
+    while rr < 16 {
+        let j = 0
+        while j < dm {
+            let pv = f64of(mem_load(fc_fw_x + j * 8))
+            let av = f64of(mem_load(fc_fw_a + j * 8))
+            mem_store(fc_fw_n + j * 8, pv + av)
+            j = j + 1
+        }
+        rr = rr + 1
+    }
+    prints("RESIDUAL_DM\t"); print((clock() - t0) / 16); prints("\t"); print(2 * nl); newline()
+
+    // ---------- whole serial token, for the residual ----------
+    if fc_fw_reset() != 0 { prints("FAIL reset3\n"); return 1 }
+    fc_kv_reset()
+    let st = clock()
+    op_sink = op_sink + i2f(fc_forward_token_body(2000, 0, 0))
+    prints("FULL_TOKEN_NO_LOGITS_POS0\t"); print(clock() - st); prints("\t"); print(1); newline()
+    if fc_fw_reset() != 0 { prints("FAIL reset4\n"); return 1 }
+    fc_kv_reset()
+    let st2 = clock()
+    op_sink = op_sink + i2f(fc_forward_token_body(2000, 0, 1))
+    prints("FULL_TOKEN_WITH_LOGITS_POS0\t"); print(clock() - st2); prints("\t"); print(1); newline()
+
+    // ---------- attention body at pos 31 vs pos 63 ----------
+    // The ONLY part of a prefill token whose cost grows with position. The K/V
+    // cache rows are written DIRECTLY (fc_kv_put) rather than by running 63
+    // forwards: the score/softmax/accumulate loop only needs rows to EXIST, and
+    // 63 serial forwards would cost two minutes to produce 64 rows.
+    if fc_fw_reset() != 0 { prints("FAIL reset5\n"); return 1 }
+    fc_kv_reset()
+    let p = 0
+    while p < 63 {
+        let hh = 0
+        while hh < nkv {
+            let j = 0
+            while j < hd {
+                fc_kv_put(La, 0, p, hh, j, 0.01)
+                fc_kv_put(La, 1, p, hh, j, 0.02)
+                j = j + 1
+            }
+            hh = hh + 1
+        }
+        p = p + 1
+    }
+    t0 = clock()
+    op_sink = op_sink + i2f(fc_attention(La, 63, fc_fw_x, fc_fw_a))
+    prints("ATTN_BODY_POS63\t"); print(clock() - t0); prints("\t"); print(nattn); newline()
+    t0 = clock()
+    op_sink = op_sink + i2f(fc_attention(La, 31, fc_fw_x, fc_fw_a))
+    prints("ATTN_BODY_POS31\t"); print(clock() - t0); prints("\t"); print(nattn); newline()
+
+    prints("SINK\t"); print(f2i(op_sink)); prints("\t"); print(0); newline()
+    prints("DONE\n")
+    return 0
+}

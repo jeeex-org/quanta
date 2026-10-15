@@ -359,6 +359,111 @@ fn mm_embed_logits(idx: u64, x: u64, v0: i64, vcount: i64, ncols: i64, y: u64) {
     return 0
 }
 
+// ===========================================================================
+// BATCHED EMBED-LOGITS -- B normed hidden vectors against ONE embedding row
+// ===========================================================================
+//
+// Same idea as mm_matmul, and for the same reason: during prefill the tied
+// output projection is only needed at the LAST position, so a batched prefill
+// normally computes it once. A PROBE that wants the logits at EVERY position
+// (tests/lfm2_prefill_probe.quanta does, to locate divergence) would otherwise
+// pay 128000 row dequantisations per position.
+//
+// THE SUMMATION ORDER IS THE POINT. mm_embed_logits accumulates LEFT TO RIGHT
+// (`acc = acc + a*b`), NOT through mm_dot4's 4-lane reduction. A batched version
+// that used mm_dot4 would produce slightly different bits and the per-position
+// logits would no longer be comparable, element for element, to the one-token
+// path. So this keeps the scalar loop verbatim and only amortises the
+// dequantisation -- the result is BIT-IDENTICAL to B calls of mm_embed_logits.
+
+// y[(b * vcount + v)] = dot(embd_row(v0 + v), x_b)
+fn mm_embed_logits_batch_ser(idx, x, v0, vcount, ncols, B, y) -> i64 {
+    let v = 0
+    while v < vcount {
+        if mm_load_row(idx, v0 + v, ncols) != 0 { return -1 }
+        let b = 0
+        while b < B {
+            let xb = x + b * ncols * 8
+            let acc: f64 = 0.0
+            let c = 0
+            while c < ncols {
+                acc = acc + f64of(mem_load(mm_rowbuf + c * 8)) * f64of(mem_load(xb + c * 8))
+                c = c + 1
+            }
+            mem_store(y + (b * vcount + v) * 8, acc)
+            b = b + 1
+        }
+        v = v + 1
+    }
+    return 0
+}
+
+// Worker slice for the batched embed-logits: byte-identical arithmetic to
+// pl_run_embed, repeated for every activation vector in the batch.
+fn pl_run_embed_b(t: i64, cell) {
+    let per = pl_vcount / pl_nw
+    let lo = t * per
+    let hi = lo + per
+    if t == pl_nw - 1 { hi = pl_vcount }
+    if hi > pl_vcount { hi = pl_vcount }
+    let v = lo
+    while v < hi {
+        if mm_load_row_s(pl_idx, pl_v0 + v, pl_ncols, cell) != 0 { return -1 }
+        let b = 0
+        while b < pl_b {
+            let xb = pl_x + b * pl_ncols * 8
+            let acc: f64 = 0.0
+            let c = 0
+            while c < pl_ncols {
+                acc = acc + f64of(mem_load(mem_load(cell + 8) + c * 8)) * f64of(mem_load(xb + c * 8))
+                c = c + 1
+            }
+            mem_store(pl_y + (b * pl_vcount + v) * 8, acc)
+            b = b + 1
+        }
+        v = v + 1
+    }
+    return hi - lo
+}
+
+fn mm_embed_logits_batch(idx, x, v0, vcount, ncols, B, y) -> i64 {
+    if gguf_dtype_supported(gguf_tensor_dtype(idx)) == 0 { return -1 }
+    if mm_rowcap < ncols { return -1 }
+    if B <= 0 || vcount <= 0 { return -1 }
+    if B == 1 { return mm_embed_logits(idx, x, v0, vcount, ncols, y) }
+    // Same guard-before-divide as mm_matmul: mm_embed_workers == 0 divides by zero.
+    if mm_embed_workers <= 1 {
+        return mm_embed_logits_batch_ser(idx, x, v0, vcount, ncols, B, y)
+    }
+    let per = vcount / mm_embed_workers
+    if per < 1 {
+        return mm_embed_logits_batch_ser(idx, x, v0, vcount, ncols, B, y)
+    }
+
+    let v = 0
+    while v < vcount {
+        let b0 = 0
+        while b0 < B { mem_store(y + (b0 * vcount + v) * 8, 0.0); b0 = b0 + 1 }
+        v = v + 1
+    }
+
+    pl_kind = 3
+    pl_idx = idx
+    pl_x = x
+    pl_v0 = v0
+    pl_vcount = vcount
+    pl_ncols = ncols
+    pl_b = B
+    pl_y = y
+    pl_nw = mm_embed_workers
+    pl_active = mm_embed_workers
+    pl_cell_cols = ncols
+    if mm_pool_ensure(mm_embed_workers, ncols) != 0 { return -1 }
+    if pl_submit() != 0 { pl_kill(); return -1 }
+    if pl_depth == 0 { mm_pool_end() }
+    return 0
+}
+
 // y[v] = dot(embd_row(v0 + v), x) for v in [0, vcount). PARALLEL version.
 // Static row partitioning, same as mm_matvec_par. Each worker owns [lo, hi)
 // and uses its own scratch so there is no shared state.
@@ -629,6 +734,7 @@ let pl_y = 0
 let pl_v0 = 0
 let pl_vcount = 0
 let pl_ncols = 0
+let pl_b = 1              // matmul batch (tokens per row) -- pl_run_mm only
 let pl_nw = 0            // active worker count for the current job
 let pl_active = 0
 
@@ -674,8 +780,120 @@ fn pl_run_embed(t: i64, cell) {
 
 fn pl_run(t: i64, cell) {
     if pl_kind == 1 { return pl_run_embed(t, cell) }
+    if pl_kind == 2 { return pl_run_mm(t, cell) }
+    if pl_kind == 3 { return pl_run_embed_b(t, cell) }
     return pl_run_rows(t, cell)
 }
+
+// ===========================================================================
+// BATCHED MATMUL -- B activation vectors against ONE dequantised weight row
+// ===========================================================================
+//
+// `mm_matvec` does one dot per row and re-reads + re-dequantises that row for
+// every activation vector it is given. During PREFILL the activations arrive as
+// a batch of B prompt tokens that all multiply the SAME weight matrix, so that
+// row work is paid B times for nothing.
+//
+// This pays it once and then does B dots. NOTHING ELSE CHANGES: the dequant is
+// the same call on the same bytes, and each dot is mm_dot4 over the same
+// dequantised buffer with the same summation order. So for a batch laid out as
+// x + b*cols (token b's activation, `cols` apart) the result is BIT-IDENTICAL to
+// B separate mm_matvec calls against those same x pointers -- not merely close.
+// tests/lfm2_prefill_batched_probe.quanta diffs the two directly, and
+// tests/verify_lfm2_state_ref.py holds the batched dump to the llama.cpp oracle.
+//
+// WHY IT IS A WIN, MEASURED (docs/research/prefill-batching.md): a prefill token
+// costs ~16.5 ms of dequantisation over 2.43 G weight elements but only ~6.6 ms
+// of dot product. The dequant is per ROW, so it divides by B; the dot is per
+// (row, token) and does not. At B=8 the elementwise cost per token drops from
+// 23.1 s-equivalent to 8.7 s-equivalent, i.e. 2.7x.
+//
+// OUTPUT LAYOUT is token-major: y + (b * rows + r) * 8. That matches the input
+// convention (token b's vector is `cols` apart in x, `rows` apart in y), so a
+// chain of batched matvecs needs no transpose between them.
+
+// Serial path: one row read, then B dots.
+fn mm_matmul_ser(idx, x, rows, cols, B, y) -> i64 {
+    let row_elems = gguf_tensor_nelements(idx) / rows
+    let r = 0
+    while r < rows {
+        if mm_load_row(idx, r, row_elems) != 0 { return -1 }
+        let b = 0
+        while b < B {
+            mem_store(y + (b * rows + r) * 8, mm_dot4(mm_rowbuf, x + b * cols * 8, cols))
+            b = b + 1
+        }
+        r = r + 1
+    }
+    return 0
+}
+
+// Worker slice: static rows, one read per row, B dots. Same partition rule and
+// the same primitives as pl_run_rows, so the arithmetic is unchanged.
+fn pl_run_mm(t: i64, cell) {
+    let per = pl_rows / pl_nw
+    let lo = t * per
+    let hi = lo + per
+    if t == pl_nw - 1 { hi = pl_rows }
+    if hi > pl_rows { hi = pl_rows }
+    let r = lo
+    while r < hi {
+        if mm_load_row_s(pl_idx, r, pl_cols, cell) != 0 { return -1 }
+        let b = 0
+        while b < pl_b {
+            mem_store(pl_y + (b * pl_rows + r) * 8,
+                      mm_dot4_s(mem_load(cell + 8), pl_x + b * pl_cols * 8, pl_cols, mem_load(cell + 16)))
+            b = b + 1
+        }
+        r = r + 1
+    }
+    return hi - lo
+}
+
+// y[(b * rows + r)] = row_r(W) . x_b   for b in 0..B-1
+//
+// B == 1 delegates to mm_matvec, so a caller never has to branch and the
+// single-token path keeps its exact previous behaviour.
+fn mm_matmul(idx, x, rows, cols, B, y) -> i64 {
+    if gguf_dtype_supported(gguf_tensor_dtype(idx)) == 0 { return -1 }
+    if rows <= 0 || cols <= 0 || B <= 0 { return -1 }
+    if mm_rowcap < cols { return -1 }
+    let row_elems = gguf_tensor_nelements(idx) / rows
+    if row_elems != cols { return -1 }
+    if B == 1 { return mm_matvec(idx, x, rows, cols, y) }
+
+    // GUARD BEFORE DIVIDING. `rows / mm_workers` with mm_workers == 0 is an
+    // integer division by zero -> SIGFPE, and mm_workers == 0 is the documented
+    // "serial" setting that tests/lfm2_op_profile.quanta runs with. Measured:
+    // SIGFPE at `idiv %rcx` with rcx = 0 on the first batched probe run.
+    if mm_workers <= 1 { return mm_matmul_ser(idx, x, rows, cols, B, y) }
+    let per = rows / mm_workers
+    if per < 1 { return mm_matmul_ser(idx, x, rows, cols, B, y) }
+
+    // zero y so a worker that fails leaves a detectable value, as in mm_matvec_par
+    let r = 0
+    while r < rows {
+        let b0 = 0
+        while b0 < B { mem_store(y + (b0 * rows + r) * 8, 0.0); b0 = b0 + 1 }
+        r = r + 1
+    }
+
+    pl_kind = 2
+    pl_idx = idx
+    pl_x = x
+    pl_rows = rows
+    pl_cols = cols
+    pl_b = B
+    pl_y = y
+    pl_nw = mm_workers
+    pl_active = mm_workers
+    pl_cell_cols = cols
+    if mm_pool_ensure(mm_workers, cols) != 0 { return -1 }
+    if pl_submit() != 0 { pl_kill(); return -1 }
+    if pl_depth == 0 { mm_pool_end() }
+    return 0
+}
+
 
 // One pool worker. Scratch is allocated ONCE here and reused for every job.
 // The worker function name is resolved at compile time by thread_create, and

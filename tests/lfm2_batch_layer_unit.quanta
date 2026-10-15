@@ -1,0 +1,146 @@
+// tests/lfm2_batch_layer_unit.quanta -- does ONE batched layer, on its own,
+// produce the same bits as B single-token layers -- and how long does it take?
+//
+// WHY: mm_matmul is proven bit-identical and 1.8-3.3x faster by
+// tests/lfm2_batch_unit.quanta. The batched PREFILL also chains norms, the conv
+// window, RoPE, the KV append, the causal softmax loop, silu and the residuals
+// across B tokens at once. Any of those can be wrong independently, and a
+// 30-layer forward is a bad place to find out.
+//
+// So this compares ONE layer:
+//   1. reset the recurrent state
+//   2. Ybatch[b]           = fc_layer_batch(L, 0, B, Xbatch)
+//   3. reset again
+//   4. Ysep[b]             = fc_layer(L, b, Xbatch[b])   for b in 0..B-1
+//   5. count differing f64 BIT PATTERNS
+// and times both. The two runs share no buffer, so a match is a real match.
+//
+// Build:  compiler/<ver>/bin/x86/qc tests/lfm2_batch_layer_unit.quanta <bin>
+// Run:    ( ulimit -c 0 -v 8000000; <bin> </dev/null )   from the repo root
+import std/gguf
+import std/lfm2_forward
+import std/lfm2_model
+import std/lfm2_mm
+import std/fs
+
+const Q4_PATH = "/opt/ai/models/quanta/QUANTA-LFM2.5-2.6Bv1-Q4_K_M.gguf"
+const NCTX = 2048
+const B = 4
+
+let nbad = 0
+
+fn fill(vec, n, seed) {
+    let i = 0
+    while i < n {
+        let v: f64 = i2f((i + 1 + seed * 7) % 97) / 100.0 - 0.4
+        mem_store(vec + i * 8, v)
+        i = i + 1
+    }
+    return 0
+}
+
+// Compare ONE layer batched vs serial. tag is an INTEGER (an untyped string
+// parameter loses its type, defect A7).
+fn one_layer(tag, L, Xb, Yb, Ys, ytmp) {
+    let dm = fc_d_model
+    if fc_fw_reset() != 0 { prints("FAIL reset\n"); nbad = nbad + 1; return 0 }
+    let t0 = clock()
+    if fc_layer_batch(L, 0, B, Xb, Yb) != 0 { prints("FAIL batch L"); print(L); newline(); nbad = nbad + 1; return 0 }
+    let tb = clock() - t0
+    if fc_fw_reset() != 0 { prints("FAIL reset2\n"); nbad = nbad + 1; return 0 }
+    t0 = clock()
+    let b = 0
+    while b < B {
+        if fc_layer(L, b, Xb + b * dm * 8, ytmp) != 0 { prints("FAIL sep L"); print(L); newline(); nbad = nbad + 1; return 0 }
+        let r = 0
+        while r < dm { mem_store(Ys + (b * dm + r) * 8, f64of(mem_load(ytmp + r * 8))); r = r + 1 }
+        b = b + 1
+    }
+    let ts = clock() - t0
+    let bad = 0
+    b = 0
+    while b < B {
+        let r = 0
+        while r < dm {
+            if mem_load(Yb + (b * dm + r) * 8) != mem_load(Ys + (b * dm + r) * 8) { bad = bad + 1 }
+            r = r + 1
+        }
+        b = b + 1
+    }
+    nbad = nbad + bad
+    prints("T"); print(tag); prints(" L="); print(L)
+    prints(" attn="); print(lfm2_layer_is_attn(L))
+    prints(" batched_ms="); print(tb / 1000000)
+    prints(" sep_ms="); print(ts / 1000000)
+    prints(" mismatch="); print(bad); prints("/"); print(B * dm); newline()
+    return 0
+}
+
+fn main() {
+    prints("=== batched layer unit test ===\n")
+    if gguf_load(Q4_PATH) != 0 { prints("FAIL gguf_load\n"); return 1 }
+    if fc_read_config() != 0 { prints("FAIL fc_read_config\n"); return 1 }
+    if fc_kv_init(NCTX) != 0 { prints("FAIL fc_kv_init\n"); return 1 }
+    if fc_fw_init() != 0 { prints("FAIL fc_fw_init\n"); return 1 }
+    // The batch buffers are allocated by fc_pf_init, which fc_prefill_batch_lg
+    // calls. A test that drives fc_layer_batch directly must call it first --
+    // otherwise every fc_pf_* pointer is NULL. (Measured: SIGSEGV at address 0.)
+    if fc_pf_init(B) != 0 { prints("FAIL fc_pf_init\n"); return 1 }
+    // Pointers, so a NULL batch buffer is a printed fact and not a fault address.
+    prints("PTR src="); print(fc_pf_src)
+    prints(" dst="); print(fc_pf_dst)
+    prints(" r="); print(fc_pf_r)
+    prints(" n="); print(fc_pf_n)
+    prints(" a="); print(fc_pf_a)
+    prints(" o="); print(fc_pf_o)
+    prints(" g="); print(fc_pf_g)
+    prints(" q="); print(fc_pf_q)
+    prints(" k="); print(fc_pf_k)
+    prints(" bcx="); print(fc_pf_bcx)
+    prints(" sg="); print(fc_pf_sg)
+    prints(" sk="); print(fc_pf_sk)
+    prints(" sbx="); print(fc_pf_sbx)
+    prints(" skw="); print(fc_pf_skw)
+    prints(" sc="); print(fc_pf_sc)
+    prints(" normbuf="); print(fc_fw_normbuf)
+    prints(" fwconv="); print(fc_fw_conv)
+    prints(" kvbuf="); print(fc_kvbuf)
+    prints(" rowbuf="); print(mm_rowbuf)
+    prints(" cap="); print(fc_pf_cap); prints(" nconv="); print(fc_pf_nconv); newline()
+    let dm = fc_d_model
+    let nw = 1
+    // conf-free: use the number of workers the caller asked for via the
+    // environment-free default of 1 (serial), then 4 (pool).
+    mm_set_workers(nw)
+    mm_set_embed_workers(nw)
+
+    let Xb = mem_alloc(dm * B * 8)
+    let Yb = mem_alloc(dm * B * 8)
+    let Ys = mem_alloc(dm * B * 8)
+    let ytmp = mem_alloc(dm * 8)
+    let b = 0
+    while b < B {
+        fill(Xb + b * dm * 8, dm, b + 1)
+        b = b + 1
+    }
+
+    prints("workers="); print(nw); newline()
+    one_layer(1, 0, Xb, Yb, Ys, ytmp)     // conv layer
+    one_layer(2, 2, Xb, Yb, Ys, ytmp)     // attention layer
+    one_layer(3, 5, Xb, Yb, Ys, ytmp)     // attention layer (different norms)
+
+    // and the pool path
+    mm_pool_begin()
+    mm_set_workers(4)
+    mm_set_embed_workers(4)
+    if fc_fw_reset() != 0 { prints("FAIL reset3\n"); return 1 }
+    prints("workers=4\n")
+    one_layer(4, 0, Xb, Yb, Ys, ytmp)
+    one_layer(5, 2, Xb, Yb, Ys, ytmp)
+    mm_pool_end()
+
+    prints("TOTAL_MISMATCH="); print(nbad); newline()
+    if nbad != 0 { prints("UNIT FAIL\n"); return 1 }
+    prints("UNIT PASS\n")
+    return 0
+}

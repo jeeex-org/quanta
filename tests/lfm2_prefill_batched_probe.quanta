@@ -1,0 +1,210 @@
+// tests/lfm2_prefill_batched_probe.quanta -- the SAME state dump as
+// tests/lfm2_prefill_probe.quanta, produced by the BATCHED prefill path, in the
+// SAME byte layout, so the two can be diffed element-wise and the batched dump
+// can also be held to the llama.cpp oracle by tests/verify_lfm2_state_ref.py.
+//
+// WHY BOTH:
+//   - the diff (tests/diff_lfm2_probe.py) proves batched == unbatched, which is
+//     the claim the batching rests on (same dequant, same dot, same order);
+//   - the oracle proves that the shared computation is still RIGHT, so a bug
+//     present in both paths cannot pass by agreeing with itself.
+//
+// THE DUMP LAYOUT IS THE PROBE'S, byte for byte (see verify_lfm2_state_ref.py):
+//   i64[0..6) nsp,n,nv,dm,nl,hd   f64[6] rms_eps   i64[7..7+n) ids
+//   then per position p:
+//     if p < nsp: layer inputs L=0..nl-1
+//     logits (nv)
+//     if p < nsp: final hidden pre-norm, post-norm, conv states, KV rows
+//
+// THREE HOOKS make this possible without re-implementing the forward:
+//   fc_pf_trace_enable(buf, nsp)  -> per-layer input for positions < nsp
+//   fc_pf_ctrace_enable(buf)      -> conv state after each traced token
+//   fc_prefill_batch_lg(..., logits_all) -> logits at EVERY position
+//
+// WORKERS: NW=0 (serial). The batched path is bit-identical at any worker count,
+// but the parallel pool's futex handshake makes the run slow and load-sensitive
+// on this box, and the arithmetic is what is being checked.
+//
+// Build:  compiler/<ver>/bin/x86/qc tests/lfm2_prefill_batched_probe.quanta <bin>
+// Run:    ( ulimit -c 0 -v 8000000; <bin> </dev/null )   from the repo root
+import std/gguf
+import std/lfm2_forward
+import std/lfm2_model
+import std/lfm2_mm
+import std/lfm2_bpe
+import std/lfm2_chat
+import std/fs
+
+const Q4_PATH = "/opt/ai/models/quanta/QUANTA-LFM2.5-2.6Bv1-Q4_K_M.gguf"
+const PROMPT_PATH = "tests/lfm2_prompt.txt"
+const OUTF = "/home/tali/.hermes/cache/scratch/lfm2probe/probe_batched.bin"
+const CAP = 16384
+const NCTX = 2048
+
+let NW = 0             // serial
+let NSTATEPOS = 8
+let BATCH = 23         // one chunk for the 23-token prompt
+
+let plen = 0
+
+fn slurp(fd) {
+    if fd < 0 { return 0 }
+    let b = mem_alloc(CAP)
+    let got = read_raw(fd, b, CAP)
+    file_close(fd)
+    if got <= 0 { return 0 }
+    plen = got
+    return b
+}
+
+fn as_str(raw, n) {
+    let s = mem_alloc(n + 16)
+    mem_store(s, n)
+    let i = 0
+    while i < n { mem_store8(s + 8 + i, mem_load8(raw + i)); i = i + 1 }
+    mem_store8(s + 8 + n, 0)
+    return s
+}
+
+// copy cnt f64 from src into dst at BYTE offset off; returns the new byte offset
+fn blit(dst, off, src, cnt) {
+    let i = 0
+    while i < cnt {
+        mem_store(dst + off, f64of(mem_load(src + i * 8)))
+        i = i + 1
+        off = off + 8
+    }
+    return off
+}
+
+fn main() {
+    prints("=== lfm2 BATCHED prefill probe ===\n")
+    if gguf_load(Q4_PATH) != 0 { prints("FAIL gguf_load\n"); return 1 }
+    if fc_read_config() != 0 { prints("FAIL fc_read_config\n"); return 1 }
+    if bpe_init_from_gguf() == 0 { prints("FAIL bpe_init\n"); return 1 }
+    if fc_kv_init(NCTX) != 0 { prints("FAIL fc_kv_init\n"); return 1 }
+    if fc_fw_init() != 0 { prints("FAIL fc_fw_init\n"); return 1 }
+    if fc_fw_reset() != 0 { prints("FAIL fc_fw_reset\n"); return 1 }
+    // fc_pf_init allocates the batch buffers AND counts the conv layers, so it
+    // must run before fc_pf_nconv is read. Measured: reading it first gave ncv=0,
+    // a 0-byte conv-state trace, and an early exit.
+    if fc_pf_init(BATCH) != 0 { prints("FAIL fc_pf_init\n"); return 1 }
+    mm_set_workers(NW)
+    mm_set_embed_workers(NW)
+
+    let rawprompt = slurp(file_open(PROMPT_PATH, 0))
+    if rawprompt == 0 { prints("FAIL read prompt\n"); return 1 }
+    let user = as_str(rawprompt, plen)
+    let pb = mem_alloc(CAP)
+    let pbytes = chat_build(0, user, pb)
+    let ids = mem_alloc(8192 * 8)
+    mem_store(ids, bpe_bos)
+    let n = bpe_encode_special(pb, pbytes, ids + 8, 8000) + 1
+    prints("n_ids="); print(n); prints(" prompt_bytes="); print(pbytes); prints("\n")
+    let i = 0
+    while i < n {
+        prints("id["); print(i); prints("]="); print(mem_load(ids + i * 8)); newline()
+        i = i + 1
+    }
+
+    let dm = fc_d_model
+    let hd = fc_head_dim
+    let nl = fc_n_layers
+    let nv = fc_n_vocab
+    let eps = fc_rms_eps
+    let nsp = NSTATEPOS
+    if nsp > n { nsp = n }
+    let ncv = fc_pf_nconv
+    prints("dm="); print(dm); prints(" hd="); print(hd)
+    prints(" nl="); print(nl); prints(" nv="); print(nv)
+    prints(" nsp="); print(nsp); prints(" ncv="); print(ncv)
+    prints(" batch="); print(BATCH); prints("\n")
+
+    let buf = mem_alloc(96 * 1024 * 1024)
+    let nb = mem_alloc(2 * dm * 8)
+    mem_store(buf, nsp)
+    mem_store(buf + 8, n)
+    mem_store(buf + 16, nv)
+    mem_store(buf + 24, dm)
+    mem_store(buf + 32, nl)
+    mem_store(buf + 40, hd)
+    mem_store(buf + 48, eps)
+    let off = 56
+    i = 0
+    while i < n { mem_store(buf + off + i * 8, mem_load(ids + i * 8)); i = i + 1 }
+
+    // ---- hooks + the batched prefill ----
+    let trace = mem_alloc(nsp * nl * dm * 8)
+    let ctrace = mem_alloc(nsp * ncv * 2 * dm * 8)
+    let lall = mem_alloc(n * nv * 8)
+    fc_pf_trace_enable(trace, nsp)
+    fc_pf_ctrace_enable(ctrace)
+
+    let t0 = clock()
+    if fc_prefill_batch_lg(ids, 0, n, BATCH, lall) != 0 { prints("FAIL prefill\n"); return 1 }
+    prints("prefill_ms="); print((clock() - t0) / 1000000); prints("\n")
+    prints("last_b="); print(fc_pf_last_b); prints("\n")
+
+    // BYTE cursor, and it must start where the header ends. Measured: starting it
+    // at 0 made the first blit overwrite the header and ids that had just been
+    // written, which produced a dump exactly 7+n f64 short and unparseable.
+    let cur = off + n * 8
+
+    let p = 0
+    while p < n {
+        if p < nsp {
+            let L = 0
+            while L < nl {
+                cur = blit(buf, cur, trace + (p * nl + L) * dm * 8, dm)
+                L = L + 1
+            }
+        }
+        cur = blit(buf, cur, lall + p * nv * 8, nv)
+        if p < nsp {
+            // final hidden, pre-norm (the last chunk's output for this position)
+            cur = blit(buf, cur, fc_pf_last + p * dm * 8, dm)
+            if read_tensor_f64(lfm2_token_embd_norm(), nb) < 0 {
+                prints("FAIL read embd_norm\n"); return 1
+            }
+            if fc_rms_norm(fc_fw_n, fc_pf_last + p * dm * 8, nb, dm) != 0 {
+                prints("FAIL final norm\n"); return 1
+            }
+            cur = blit(buf, cur, fc_fw_n, dm)
+            cur = blit(buf, cur, ctrace + p * ncv * 2 * dm * 8, ncv * 2 * dm)
+            let L = 0
+            while L < nl {
+                if lfm2_layer_is_attn(L) != 0 {
+                    let nkv = fc_nkv_of(L)
+                    let wh = 0
+                    while wh < 2 {
+                        let pp = 0
+                        while pp <= p {
+                            let hh = 0
+                            while hh < nkv {
+                                let j = 0
+                                while j < hd {
+                                    mem_store(buf + cur, fc_kv_get(L, wh, pp, hh, j))
+                                    cur = cur + 8
+                                    j = j + 1
+                                }
+                                hh = hh + 1
+                            }
+                            pp = pp + 1
+                        }
+                        wh = wh + 1
+                    }
+                }
+                L = L + 1
+            }
+        }
+        p = p + 1
+    }
+
+    let fd = file_open(OUTF, 577, 420)
+    if fd < 0 { prints("FAIL open out\n"); return 1 }
+    let wn = file_write(fd, buf, cur)
+    file_close(fd)
+    prints("wrote_bytes="); print(wn); prints("\n")
+    prints("DONE\n")
+    return 0
+}

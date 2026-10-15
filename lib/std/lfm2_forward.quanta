@@ -1236,6 +1236,552 @@ fn fc_forward_token_ex(tok: i64, pos: i64, want_logits: i64) -> i64 {
 fn fc_forward_token(tok: i64, pos: i64) -> i64 {
     return fc_forward_token_ex(tok, pos, 1)
 }
+
+// ===========================================================================
+// BATCHED PREFILL
+// ===========================================================================
+//
+// WHY: prefill -- embed every prompt token, run the layer stack over it, advance
+// the KV/conv state -- historically ran ONE forward per token. Every weight row
+// was therefore read AND dequantised once per prompt token, which is the single
+// largest avoidable cost. Measured, per serial prefill token
+// (docs/research/prefill-batching.md, tests/lfm2_op_profile.quanta):
+//
+//   2,122 M Q4_K elements x 4.1 ns dequant = 8.7 s      (38%)
+//     313 M Q6_K elements x 25  ns dequant = 7.8 s      (34%)
+//   2,434 M elements    x 2.73 ns dot     = 6.6 s      (29%)
+//   non-matvec (norms, silu, residuals)   = 0.07 s      (0.3%)
+//
+// The dequant is per ROW, so batching B tokens divides it by B; the dot is per
+// (row, token) and does not change. At B=8 the elementwise cost per token falls
+// from 23.1 s-equivalent to 8.7 s-equivalent -- 2.7x -- and the batch also
+// widens each pool dispatch, so the parallel efficiency improves too.
+//
+// THE ARITHMETIC IS DELIBERATELY UNCHANGED. Every projection is the same
+// dequantisation of the same bytes, and every dot is the same mm_dot4 (or the
+// same left-to-right mm_embed_logits scalar loop) in the same summation order.
+// So the batched result is BIT-IDENTICAL to the one-token-at-a-time result --
+// not merely close. tests/lfm2_prefill_batched_probe.quanta proves that by
+// dumping the same state both ways and diffing (tests/diff_lfm2_probe.py), and
+// tests/run_lfm2_prefill_probe.sh then holds the batched dump to the llama.cpp
+// reference so a shared bug cannot pass the self-diff.
+//
+// `B` is the chunk size; positions pos0 .. pos0+n-1 are processed in chunks of B.
+// Positions inside a chunk MUST be contiguous and ascending: the causal score
+// loop and the KV append depend on it.
+let fc_pf_ready = 0
+let fc_pf_cap = 0          // tokens the buffers below are sized for
+let fc_pf_src = 0          // [dm, cap]  hidden state, token-major
+let fc_pf_dst = 0          // [dm, cap]  ping-pong partner
+let fc_pf_r = 0            // [dm, cap]  residual (the serial path's fc_fw_x)
+let fc_pf_n = 0            // [dm, cap]  normed
+let fc_pf_a = 0            // [dm, cap]  branch output
+let fc_pf_o = 0            // [dm, cap]  generic projection output
+let fc_pf_g = 0            // [dff, cap]
+let fc_pf_u = 0            // [dff, cap]
+let fc_pf_f = 0            // [dff, cap]
+let fc_pf_q = 0            // [nh*hd, cap]
+let fc_pf_k = 0            // [nkv_max*hd, cap]
+let fc_pf_v = 0            // [nkv_max*hd, cap]
+let fc_pf_bcx = 0          // [3*dm, cap]
+let fc_pf_sc = 0           // scores for one head, [kv_cap + 2]
+let fc_pf_h = 0            // one head, [hd]
+let fc_pf_qn = 0           // this layer's attn_q_norm, [hd]
+let fc_pf_kn = 0           // this layer's attn_k_norm, [hd]
+let fc_pf_qn_L = 0 - 1     // which layer's norms are loaded
+let fc_pf_sg = 0           // conv: b*x            [dm]
+let fc_pf_sk = 0           // conv: convolution out [dm]
+let fc_pf_sbx = 0          // conv: causal window  [kw*dm]
+let fc_pf_skw = 0          // conv: kernel         [kw*dm]
+// optional TRACE, off by default: writes the input to every layer for the first
+// fc_pf_trace_nsp positions, layout [(pos * n_layers + L) * dm]. It exists so
+// the probe can dump per-layer inputs without the batched layer becoming
+// untestable; it costs one branch per layer when off.
+let fc_pf_trace = 0
+let fc_pf_trace_nsp = 0
+// The last chunk's final hidden state ([dm, B] token-major) and its batch size,
+// published so a probe can read every position's pre-norm hidden state. The
+// parity of the layer count decides WHICH ping-pong buffer holds it, so the
+// pointer is recorded rather than assumed.
+let fc_pf_last = 0
+let fc_pf_last_b = 0
+// optional TRACE of the short-conv state after each traced token, layout
+// [(pos * nconv_layers + j) * 2 * dm] where j counts CONV layers in ascending
+// order (the same order tests/lfm2_prefill_probe.quanta dumps them in).
+let fc_pf_ctrace = 0
+
+// How many CONV layers come before layer L (its index among conv layers).
+fn fc_conv_index(L) {
+    let n = 0
+    let i2 = 0
+    while i2 < L {
+        if lfm2_layer_is_attn(i2) == 0 { n = n + 1 }
+        i2 = i2 + 1
+    }
+    return n
+}
+
+// Cap on the batch a caller may ask for. Sized so every batch buffer above fits
+// in a few tens of MB (6 * dm*cap*8 + 3 * dff*cap*8 + ... ~ 27 MB at 64).
+let fc_pf_maxb = 64
+let fc_pf_nconv = 0
+
+fn fc_pf_max_batch() { return fc_pf_maxb }
+
+// Allocate the batch buffers. MUST be called after fc_read_config() and
+// fc_kv_init() (it sizes the score scratch from fc_kv_cap).
+fn fc_pf_init(cap) -> i64 {
+    let dm = fc_d_model
+    let dff = fc_d_ff
+    let hd = fc_head_dim
+    if dm <= 0 || dff <= 0 || hd <= 0 { return -1 }
+    if cap < 1 { return -1 }
+    if fc_pf_ready != 0 && fc_pf_cap >= cap { return 0 }
+    let kw = fc_conv_width
+    let nkvd = fc_nkv_max * hd
+    fc_pf_cap = cap
+    let b = dm * cap * 8
+    fc_pf_src = mem_alloc(b)
+    fc_pf_dst = mem_alloc(b)
+    fc_pf_r = mem_alloc(b)
+    fc_pf_n = mem_alloc(b)
+    fc_pf_a = mem_alloc(b)
+    fc_pf_o = mem_alloc(b)
+    fc_pf_g = mem_alloc(dff * cap * 8)
+    fc_pf_u = mem_alloc(dff * cap * 8)
+    fc_pf_f = mem_alloc(dff * cap * 8)
+    fc_pf_q = mem_alloc(fc_n_heads * hd * cap * 8)
+    fc_pf_k = mem_alloc(nkvd * cap * 8)
+    fc_pf_v = mem_alloc(nkvd * cap * 8)
+    fc_pf_bcx = mem_alloc(dm * 3 * cap * 8)
+    fc_pf_sc = mem_alloc((fc_kv_cap + 2) * 8)
+    fc_pf_h = mem_alloc(hd * 8)
+    fc_pf_qn = mem_alloc(hd * 8)
+    fc_pf_kn = mem_alloc(hd * 8)
+    fc_pf_sg = mem_alloc(dm * 8)
+    fc_pf_sk = mem_alloc(dm * 8)
+    fc_pf_sbx = mem_alloc(kw * dm * 8)
+    fc_pf_skw = mem_alloc(kw * dm * 8)
+    if fc_pf_src == 0 || fc_pf_f == 0 || fc_pf_sc == 0 { return -1 }
+    let nc = 0
+    let j = 0
+    while j < fc_n_layers {
+        if lfm2_layer_is_attn(j) == 0 { nc = nc + 1 }
+        j = j + 1
+    }
+    fc_pf_nconv = nc
+    fc_pf_qn_L = 0 - 1
+    fc_pf_ready = 1
+    return 0
+}
+
+fn fc_pf_trace_enable(buf, nsp) {
+    fc_pf_trace = buf
+    fc_pf_trace_nsp = nsp
+    return 0
+}
+fn fc_pf_ctrace_enable(buf) {
+    fc_pf_ctrace = buf
+    return 0
+}
+
+// One GQA attention layer over B tokens. x/out are [d_model, B] token-major.
+// Mirrors fc_attention call for call; see that function for why each step is
+// ordered the way it is.
+fn fc_attn_batch(L, pos0, B, x: u64, out: u64) -> i64 {
+    let dm = fc_d_model
+    let nh = fc_n_heads
+    let nkv = fc_nkv_of(L)
+    let hd = fc_head_dim
+    if nkv <= 0 || hd <= 0 { return -1 }
+    let qt = lfm2_attn_q(L)
+    let kt = lfm2_attn_k(L)
+    let vt = lfm2_attn_v(L)
+    let qn = lfm2_attn_q_norm(L)
+    let kn = lfm2_attn_k_norm(L)
+    let wo = lfm2_attn_output(L)
+    if qt < 0 || kt < 0 || vt < 0 || qn < 0 || kn < 0 || wo < 0 { return -1 }
+
+    // The q_norm/k_norm BUFFERS are allocated once, but the DATA is per layer --
+    // reading it only when the buffers were allocated is the per-layer-norm
+    // defect that cost layers 5+ their own weights. Same guard as fc_attention.
+    if fc_pf_qn_L != L {
+        read_tensor_f64(qn, fc_pf_qn)
+        read_tensor_f64(kn, fc_pf_kn)
+        fc_pf_qn_L = L
+    }
+
+    let nhd = nh * hd
+    let nkvd = nkv * hd
+    if mm_matmul(qt, x, nhd, dm, B, fc_pf_q) != 0 { return -1 }
+    if mm_matmul(kt, x, nkvd, dm, B, fc_pf_k) != 0 { return -1 }
+    if mm_matmul(vt, x, nkvd, dm, B, fc_pf_v) != 0 { return -1 }
+
+    let b = 0
+    while b < B {
+        let pos = pos0 + b
+        let qb = fc_pf_q + b * nhd * 8
+        let kb = fc_pf_k + b * nkvd * 8
+        let vb = fc_pf_v + b * nkvd * 8
+        let h = 0
+        while h < nh {
+            if fc_rms_norm_head(fc_pf_h, qb + h * hd * 8, fc_pf_qn, hd) != 0 { return -1 }
+            let c = 0
+            while c < hd {
+                mem_store(qb + (h * hd + c) * 8, f64of(mem_load(fc_pf_h + c * 8)))
+                c = c + 1
+            }
+            h = h + 1
+        }
+        h = 0
+        while h < nkv {
+            if fc_rms_norm_head(fc_pf_h, kb + h * hd * 8, fc_pf_kn, hd) != 0 { return -1 }
+            let c = 0
+            while c < hd {
+                mem_store(kb + (h * hd + c) * 8, f64of(mem_load(fc_pf_h + c * 8)))
+                c = c + 1
+            }
+            h = h + 1
+        }
+        fc_rope_cache(pos)
+        h = 0
+        while h < nh { fc_rope_apply(qb + h * hd * 8); h = h + 1 }
+        h = 0
+        while h < nkv { fc_rope_apply(kb + h * hd * 8); h = h + 1 }
+        h = 0
+        while h < nkv {
+            let c = 0
+            while c < hd {
+                fc_kv_put(L, 0, pos, h, c, f64of(mem_load(kb + (h * hd + c) * 8)))
+                fc_kv_put(L, 1, pos, h, c, f64of(mem_load(vb + (h * hd + c) * 8)))
+                c = c + 1
+            }
+            h = h + 1
+        }
+        b = b + 1
+    }
+
+    let scale: f64 = 1.0 / sqrt(i2f(hd))
+    b = 0
+    while b < B {
+        let pos = pos0 + b
+        let qb = fc_pf_q + b * nhd * 8
+        let ob = fc_pf_o + b * dm * 8
+        let i = 0
+        while i < nhd { mem_store(ob + i * 8, 0.0); i = i + 1 }
+        let h = 0
+        while h < nh {
+            let kvh = h / (nh / nkv)
+            let qhb = qb + h * hd * 8
+            let t = 0
+            let mx: f64 = 0.0 - 1e300
+            while t <= pos {
+                let acc: f64 = 0.0
+                let c = 0
+                while c < hd {
+                    acc = acc + f64of(mem_load(qhb + c * 8)) * fc_kv_get(L, 0, t, kvh, c)
+                    c = c + 1
+                }
+                let sc = acc * scale
+                mem_store(fc_pf_sc + t * 8, sc)
+                if sc > mx { mx = sc }
+                t = t + 1
+            }
+            let sum: f64 = 0.0
+            t = 0
+            while t <= pos {
+                let e = expf(f64of(mem_load(fc_pf_sc + t * 8)) - mx)
+                mem_store(fc_pf_sc + t * 8, e)
+                sum = sum + e
+                t = t + 1
+            }
+            if sum == 0.0 { return -1 }
+            t = 0
+            while t <= pos {
+                let w = f64of(mem_load(fc_pf_sc + t * 8)) / sum
+                let c = 0
+                while c < hd {
+                    let cur = f64of(mem_load(ob + (h * hd + c) * 8))
+                    mem_store(ob + (h * hd + c) * 8, cur + w * fc_kv_get(L, 1, t, kvh, c))
+                    c = c + 1
+                }
+                t = t + 1
+            }
+            h = h + 1
+        }
+        b = b + 1
+    }
+    return mm_matmul(wo, fc_pf_o, dm, nhd, B, out)
+}
+
+// One short-conv layer over B tokens, in POSITION ORDER: the state is updated
+// once per token exactly as the serial path does across positions. Mirrors
+// fc_short_conv step for step, including the prepend-not-append window and the
+// kernel's tap-major indexing.
+fn fc_conv_batch(L, pos0, B, x: u64, out: u64) -> i64 {
+    let dm = fc_d_model
+    let dc = fc_conv_width - 1
+    let kw = fc_conv_width
+    let cin = lfm2_conv_in_proj(L)
+    let cwt = lfm2_conv_conv(L)
+    let cout = lfm2_conv_out_proj(L)
+    if cin < 0 || cwt < 0 || cout < 0 { return -1 }
+
+    if mm_matmul(cin, x, dm * 3, dm, B, fc_pf_bcx) != 0 { return -1 }
+    if mm_load_small(cwt, kw * dm, fc_pf_skw) != kw * dm { return -1 }
+
+    let state = fc_fw_conv_state(L)
+    let cs = dm
+    let b = 0
+    while b < B {
+        let bcx = fc_pf_bcx + b * (3 * dm) * 8
+        let yb = fc_pf_o + b * dm * 8
+        let t = 0
+        while t < dm {
+            // ONE mem_load per statement. Two f64of(mem_load(...)) operands inside a
+            // single arithmetic expression mis-evaluate here: the second operand's
+            // address comes out 0 and the load faults. See the note above
+            // fc_conv_batch. This is the idiom fc_short_conv already uses.
+            let bv = f64of(mem_load(bcx + t * 8))
+            let xv = f64of(mem_load(bcx + (2 * cs + t) * 8))
+            mem_store(fc_pf_sg + t * 8, bv * xv)
+            t = t + 1
+        }
+        t = 0
+        while t < dc {
+            let c = 0
+            while c < dm {
+                mem_store(fc_pf_sbx + (t * dm + c) * 8, f64of(mem_load(state + (t * dm + c) * 8)))
+                c = c + 1
+            }
+            t = t + 1
+        }
+        t = 0
+        while t < dm {
+            mem_store(fc_pf_sbx + (dc * dm + t) * 8, f64of(mem_load(fc_pf_sg + t * 8)))
+            t = t + 1
+        }
+        let c2 = 0
+        while c2 < dm {
+            let acc: f64 = 0.0
+            let k2 = 0
+            while k2 < kw {
+                let wv = f64of(mem_load(fc_pf_skw + (c2 * kw + k2) * 8))
+                acc = acc + wv * f64of(mem_load(fc_pf_sbx + (k2 * dm + c2) * 8))
+                k2 = k2 + 1
+            }
+            mem_store(fc_pf_sk + c2 * 8, acc)
+            c2 = c2 + 1
+        }
+        t = 0
+        while t < dc {
+            let c3 = 0
+            while c3 < dm {
+                mem_store(state + (t * dm + c3) * 8,
+                          f64of(mem_load(fc_pf_sbx + ((dc - 1 + t) * dm + c3) * 8)))
+                c3 = c3 + 1
+            }
+            t = t + 1
+        }
+        t = 0
+        while t < dm {
+            let cv = f64of(mem_load(bcx + (cs + t) * 8))
+            let gv = f64of(mem_load(fc_pf_sk + t * 8))
+            mem_store(yb + t * 8, cv * gv)
+            t = t + 1
+        }
+        if fc_pf_ctrace != 0 {
+            let pos = pos0 + b
+            if pos < fc_pf_trace_nsp {
+                let slot = (pos * fc_pf_nconv + fc_conv_index(L)) * 2 * dm
+                let c4 = 0
+                while c4 < 2 * dm {
+                    mem_store(fc_pf_ctrace + (slot + c4) * 8, f64of(mem_load(state + c4 * 8)))
+                    c4 = c4 + 1
+                }
+            }
+        }
+        b = b + 1
+    }
+    return mm_matmul(cout, fc_pf_o, dm, dm, B, out)
+}
+
+// One layer over B tokens. inp/out are [d_model, B] token-major.
+fn fc_layer_batch(L, pos0, B, inp: u64, out: u64) -> i64 {
+    let dm = fc_d_model
+    let dff = fc_d_ff
+
+    // fc_fw_normbuf is allocated LAZILY by fc_layer (it is not part of
+    // fc_fw_init), so a batched run that never calls fc_layer would pass a NULL
+    // pointer to read_tensor_f64 and fault at address 0. Measured: that was a
+    // SIGSEGV (rc=139) on the first batched prefill. Same allocation, same
+    // guard, stated here because the batched path is a second entry point.
+    if fc_fw_normbuf == 0 { fc_fw_normbuf = mem_alloc(2 * dm * 8) }
+
+    if fc_pf_trace != 0 {
+        let b2 = 0
+        while b2 < B {
+            let pos = pos0 + b2
+            if pos < fc_pf_trace_nsp {
+                let dsto = fc_pf_trace + (pos * fc_n_layers + L) * dm * 8
+                let c2 = 0
+                while c2 < dm {
+                    mem_store(dsto + c2 * 8, f64of(mem_load(inp + (b2 * dm + c2) * 8)))
+                    c2 = c2 + 1
+                }
+            }
+            b2 = b2 + 1
+        }
+    }
+
+    // ---- pre-norm ----
+    let an = lfm2_attn_norm(L)
+    if an < 0 { return -1 }
+    if read_tensor_f64(an, fc_fw_normbuf) < 0 { return -1 }
+    let b = 0
+    while b < B {
+        if fc_rms_norm(fc_pf_n + b * dm * 8, inp + b * dm * 8, fc_fw_normbuf, dm) != 0 { return -1 }
+        b = b + 1
+    }
+
+    // ---- branch ----
+    if lfm2_layer_is_attn(L) != 0 {
+        if fc_attn_batch(L, pos0, B, fc_pf_n, fc_pf_a) != 0 { return -1 }
+    } else {
+        if fc_conv_batch(L, pos0, B, fc_pf_n, fc_pf_a) != 0 { return -1 }
+    }
+
+    // ---- residual ----
+    let i = 0
+    while i < dm * B {
+        let pv = f64of(mem_load(inp + i * 8))
+        let av = f64of(mem_load(fc_pf_a + i * 8))
+        mem_store(fc_pf_r + i * 8, pv + av)
+        i = i + 1
+    }
+
+    // ---- ffn pre-norm ----
+    let fnt = lfm2_ffn_norm(L)
+    if fnt < 0 { return -1 }
+    if read_tensor_f64(fnt, fc_fw_normbuf) < 0 { return -1 }
+    b = 0
+    while b < B {
+        if fc_rms_norm(fc_pf_n + b * dm * 8, fc_pf_r + b * dm * 8, fc_fw_normbuf, dm) != 0 { return -1 }
+        b = b + 1
+    }
+
+    // ---- ffn: down(silu(gate(x)) * up(x)) ----
+    let gt = lfm2_ffn_gate(L)
+    let ut = lfm2_ffn_up(L)
+    let dt = lfm2_ffn_down(L)
+    if gt < 0 || ut < 0 || dt < 0 { return -1 }
+    if mm_matmul(gt, fc_pf_n, dff, dm, B, fc_pf_g) != 0 { return -1 }
+    if mm_matmul(ut, fc_pf_n, dff, dm, B, fc_pf_u) != 0 { return -1 }
+    i = 0
+    while i < dff * B {
+        let g = f64of(mem_load(fc_pf_g + i * 8))
+        let sg: f64 = 1.0 / (1.0 + expf(0.0 - g))
+        let uv = f64of(mem_load(fc_pf_u + i * 8))
+        mem_store(fc_pf_f + i * 8, g * sg * uv)
+        i = i + 1
+    }
+    if mm_matmul(dt, fc_pf_f, dm, dff, B, fc_pf_o) != 0 { return -1 }
+
+    // ---- second residual ----
+    i = 0
+    while i < dm * B {
+        let rv = f64of(mem_load(fc_pf_r + i * 8))
+        let ov = f64of(mem_load(fc_pf_o + i * 8))
+        mem_store(out + i * 8, rv + ov)
+        i = i + 1
+    }
+    return 0
+}
+
+// Batched prefill of `n` ids starting at position pos0, chunked by B.
+//
+// LOGITS. When `logits_all` is 0 (the normal prefill case) only the LAST
+// position's logits are computed, into fc_fw_logits, exactly as
+// fc_forward_token_ex(tok, pos, 0) does for every position but the last. When
+// `logits_all` is non-0 it receives n * n_vocab values, position-major
+// (position p's logits at logits_all + p * n_vocab); that is what the probe
+// needs, and it is CHEAPER batched than one position at a time.
+//
+// Returns 0 on success.
+fn fc_prefill_batch_lg(ids, pos0, n, B, logits_all) -> i64 {
+    if n <= 0 { return 0 }
+    if B < 1 { return -1 }
+    if fc_fw_init() != 0 { return -1 }
+    let mb = B
+    if mb > fc_pf_max_batch() { mb = fc_pf_max_batch() }
+    if fc_pf_init(mb) != 0 { return -1 }
+    let dm = fc_d_model
+    let nv = fc_n_vocab
+    let emb = lfm2_token_embd()
+    if emb < 0 { return -1 }
+
+    mm_pool_begin()
+    let done = 0
+    while done < n {
+        let bb0 = n - done
+        let bb = mb
+        if bb0 < bb { bb = bb0 }
+        let p0 = pos0 + done
+        let b = 0
+        while b < bb {
+            if mm_lookup_row(emb, mem_load(ids + (done + b) * 8), dm, fc_pf_src + b * dm * 8) != 0 {
+                mm_pool_end(); return -1
+            }
+            b = b + 1
+        }
+        let src = fc_pf_src
+        let dst = fc_pf_dst
+        let L = 0
+        while L < fc_n_layers {
+            if fc_layer_batch(L, p0, bb, src, dst) != 0 { mm_pool_end(); return -1 }
+            let t = src
+            src = dst
+            dst = t
+            L = L + 1
+        }
+        // final norm (token_embd_norm, NOT output_norm -- see fc_forward_token_body)
+        let on = lfm2_token_embd_norm()
+        if on < 0 { mm_pool_end(); return -1 }
+        if read_tensor_f64(on, fc_fw_normbuf) < 0 { mm_pool_end(); return -1 }
+        if logits_all != 0 {
+            b = 0
+            while b < bb {
+                if fc_rms_norm(fc_pf_n + b * dm * 8, src + b * dm * 8, fc_fw_normbuf, dm) != 0 {
+                    mm_pool_end(); return -1
+                }
+                b = b + 1
+            }
+            if mm_embed_logits_batch(emb, fc_pf_n, 0, nv, dm, bb, logits_all + done * nv * 8) != 0 {
+                mm_pool_end(); return -1
+            }
+        }
+        if done + bb >= n {
+            if fc_rms_norm(fc_fw_n, src + (bb - 1) * dm * 8, fc_fw_normbuf, dm) != 0 {
+                mm_pool_end(); return -1
+            }
+            if mm_embed_logits(emb, fc_fw_n, 0, nv, dm, fc_fw_logits) != 0 {
+                mm_pool_end(); return -1
+            }
+            fc_fw_last = fc_fw_n
+        }
+        fc_pf_last = src
+        fc_pf_last_b = bb
+        done = done + bb
+    }
+    mm_pool_end()
+    return 0
+}
+
+fn fc_prefill_batch(ids, pos0, n, B) -> i64 {
+    return fc_prefill_batch_lg(ids, pos0, n, B, 0)
+}
+
+
 // Argmax over the first `n` logits. Returns the winning index.
 fn fc_argmax(n: i64) -> i64 {
     let best = 0
