@@ -1,0 +1,62 @@
+import std/json
+import std/str
+// 0.0.132 json stdlib gate.
+// Parse a JSON doc, verify node kinds + values, then stringify and re-parse.
+fn main() {
+  let ok = 0
+  // {"name":"Quanta","ver":132,"flag":true,"nums":[1,2,3],"meta":{"k":"v"}}
+  let doc = json_parse("{\"name\":\"Quanta\",\"ver\":132,\"flag\":true,\"nums\":[1,2,3],\"meta\":{\"k\":\"v\"}}")
+  if json_kind(doc) != 5 { return 1 }                 // object
+  if json_obj(doc) == 0 { return 2 }
+  let m = json_obj(doc)
+  // name
+  let nameNode = map_get(m, "name")
+  if nameNode == 0 { return 3 }
+  if json_kind(nameNode) != 3 { return 4 }            // string
+  if equals(json_str(nameNode), "Quanta") == 0 { return 5 }
+  // ver
+  let verNode = map_get(m, "ver")
+  if verNode == 0 { return 6 }
+  if json_num(verNode) != 132 { return 7 }
+  // flag
+  let flagNode = map_get(m, "flag")
+  if json_bool(flagNode) != 1 { return 8 }
+  // nums array
+  let numsNode = map_get(m, "nums")
+  if json_kind(numsNode) != 4 { return 9 }           // array
+  let av = json_arr(numsNode)
+  if vec_len(av) != 3 { return 10 }
+  if json_num(vec_at(av, 0)) != 1 { return 11 }
+  if json_num(vec_at(av, 2)) != 3 { return 12 }
+  // nested meta
+  let metaNode = map_get(m, "meta")
+  if json_kind(metaNode) != 5 { return 13 }
+  let mv = json_obj(metaNode)
+  let kNode = map_get(mv, "k")
+  if equals(json_str(kNode), "v") == 0 { return 14 }
+
+  // stringify round-trip: emit, re-parse, re-check a value
+  let s = json_stringify(doc)
+  let doc2 = json_parse(s)
+  if json_num(map_get(json_obj(doc2), "ver")) != 132 { return 15 }
+
+  // scalar parse (number) + stringify
+  let n = json_parse("42")
+  if json_num(n) != 42 { return 16 }
+  if equals(json_stringify(n), "42") == 0 { return 17 }
+
+  // true/false/null
+  if json_bool(json_parse("true")) != 1 { return 18 }
+  if json_bool(json_parse("false")) != 0 { return 19 }
+  if json_kind(json_parse("null")) != 0 { return 20 }
+
+  // escapes in string
+  let esc = json_parse("\"a\\nb\"")
+  let es = json_str(esc)
+  if len(es) != 3 { return 21 }
+  if byte_at(es, 0) != 97 { return 22 }   // 'a'
+  if byte_at(es, 1) != 10 { return 23 }    // '\n'
+  if byte_at(es, 2) != 98 { return 24 }    // 'b'
+
+  return 0
+}

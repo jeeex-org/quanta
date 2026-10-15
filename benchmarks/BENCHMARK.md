@@ -2,7 +2,13 @@
 
 **Run:** `bash scripts/bench.sh` — `--md` for a markdown table, `--runs N` for more repetitions.
 Both sides are compiled fresh each run and executed through `scripts/qcrun.sh` (hard memory cap, nice,
-timeout), alternating, best-of-N. Current VERSION: **0.0.238**.
+timeout), alternating, best-of-N. Current VERSION: **0.0.244**.
+
+**Load-independent metrics:** `bash scripts/bench_instr.sh <qc> [--only a,b] [--fn name] [--tsv FILE]`
+compiles every Quanta twin with `--emit-obj` (which carries a symbol table) and every C twin with
+`gcc -O2`, then reports per function: instruction count, **hot-loop body size**, **frame bytes** and
+**frame-relative memory operations**. On a throttled, contended box this is the only instrument that
+resolves a 5 % codegen change — see table 5 and §"The metric that can actually see a codegen change".
 
 **A/B between two compilers:** `bash scripts/bench_ab.sh <qcA> <qcB> [--runs N]` compiles every case
 with BOTH compilers and runs the two *Quanta* binaries interleaved. It removes the gcc denominator and
@@ -279,8 +285,94 @@ also what makes constant-divisor strength reduction simple: a power-of-two divis
 `divmod_const_strength_test` (literal divisors, i.e. the strength-reduction path) — and both are
 **red-first**: compiled with the floor corrections removed they return rc 101 / 105 instead of 42.
 
+## Table 5 — 0.0.243 re-baseline (load-independent), and the A4 / next-use-eviction lever in 0.0.244
+
+Tables 1-3 last moved at 0.0.238 and **five levers have landed since** (A1b block scoping, the
+float-`const` fix, the per-layer attention-norm fix, the Q6_K SIMD dequant, tooling). Re-baselined on
+the 0.0.243 golden, `scripts/bench_instr.sh`, all 38 cases (the 37 below plus `regpressure`).
+
+| case | main instr | loop instr | frame B | home mem-ops | | case | main instr | loop instr | frame B | home mem-ops |
+|---|---:|---:|---:|---:|---|---|---:|---:|---:|---:|
+| arith | 219 | 111 | 1120 | 79 | | match | 378 | 174 | 1168 | 178 |
+| div_const | 206 | 98 | 1120 | 84 | | mem | 495 | 72 | 1136 | 221 |
+| heavy_int | 198 | 75 | 1136 | 71 | | mem_ops | 310 | 72 | 1136 | 132 |
+| heavy_int2 | 198 | 75 | 1136 | 71 | | mem/others | — | — | 1104-1232 | — |
+| heavy_div | 185 | 62 | 1136 | 69 | | q4k | 433 | 74 | 1120 | 197 |
+| heavy_div2 | 185 | 62 | 1136 | 69 | | q4k_matmul | 577 | 67 | 1184 | 268 |
+| float | 284 | 155 | 1120 | 144 | | string | 86 | 0 | 1152 | 32 |
+| heavy_float | 224 | 80 | 1136 | 99 | | struct | 167 | 10 | 1136 | 53 |
+| fileio | 482 | 123 | 1184 | 254 | | **regpressure** | **524** | **401** | 1136 | **259** |
+
+gcc's twin, same function, same run: `arith` 56 instructions / 27 in the loop / **0** frame bytes;
+`heavy_int` 43 / 17 / 0; `regpressure` 24 / 9 / 8. **gcc's hot loops contain zero frame-relative memory
+operands.** Every number above is emitted-code, not executed-code, so it does not move with load.
+
+### A4 / next-use eviction landed in 0.0.244 — and it does not close the gap
+
+`afree()` and `afree_x()` evicted the LAST allocator-map entry (LIFO = the most recently allocated
+value). In 0.0.244 the victim is the vreg whose **next use is farthest away**, with a dead vreg the best
+victim of all. Measured, all 38 cases:
+
+* **37 of 38 cases emit byte-identical code**; 36 of 39 `bench_ab.sh` rows report `IDENTICAL-CODE`.
+* Changed: `file_io`, `params8` and `regpressure` — and `file_io`/`params8` are **exactly the two cases**
+  an instrumented build counts evictions in (2 and 3 respectively, over the whole suite).
+* `regpressure`: loop body **401 -> 381 instructions (-5.0 %)**, home mem-ops **259 -> 239 (-7.7 %)**.
+* **No parity case regressed**; all 12 are `IDENTICAL-CODE` with identical counters.
+* **Frame bytes unchanged on every case.**
+
+The lever is correct and it is real. It is also nearly irrelevant to the 6-32x cases, because
+**the register pool is never full**: `arith`'s `main` maps at most 3 of the 13 registers at once and
+evicts **zero** times; the whole suite evicts 5 times. The compiler's own 427-function self-build evicts
+462 times, so the pathology exists — it is just 0.3 % of that build's ~151 000 home accesses.
+
+### The metric that can actually see a codegen change
+
+A/B 0.0.243 vs 0.0.244, best-of-8 interleaved, load 11.35/11.80/11.99, `Hermes` at 400-1300 % CPU.
+**36 rows are `IDENTICAL-CODE`, i.e. byte-identical binaries, and their wall-time deltas range from
+-12.5 % to +20.0 %** (`fib` -20 %, `string` +20 %, `int_ops`/`match`/`mem_ops`/`struct` +16.7 %). Those
+are noise by definition. `regpressure` timed -1.1 % best / -3.8 % median while its loop body lost 5.0 %
+of its instructions.
+
+The same binary measured against gcc twice, minutes apart, different load:
+`heavy_div2` **32.85x** (load 17.0-20.2) and **21.68x** (load 11.9-12.0); `arith` **17.82x** and
+**13.79x**. A 34 % swing on unchanged code. **No wall-clock claim about a codegen change on this box is
+defensible** — quote instructions, frame bytes and memory operations, and label anything timed as
+derived.
+
+### The real root cause, measured (queued, not fixed here)
+
+Classification of the golden compiler's hot-loop bodies by instruction class:
+
+| case | loop instr | home **loads** | home **stores** | arith/cmp |
+|---|---:|---:|---:|---:|
+| arith | 111 | 13 | **39** | 39 |
+| div_const | 98 | 14 | **43** | 23 |
+| heavy_int | 75 | 9 | **28** | 23 |
+| mem | 72 | 9 | **32** | 17 |
+| fileio | 123 | 21 | **55** | 23 |
+| float | 155 | 30 | **71** | 8 |
+| match | 174 | 15 | **59** | 35 |
+
+**Home stores dominate every case** — 28-71 per loop body, more than the arithmetic itself, against 8-30
+loads and zero on the C side. `sdef()` stores the home slot on every definition
+(`emitter.quanta:1102`) and `flush_all()` stores every live value again at every block boundary and every
+`IR_CALL`, even when the value is consumed in the same block and the store is never read. **The next
+lever is home-store elimination / write-back-on-demand**, with the obstacle (direct `spill_home()`
+readers that rely on "home is always current") and a first measurable step named in
+`docs/research/a4-next-use-eviction-measurements.md` §9.
+
 ## History
 
+- **0.0.244 — A4 / next-use eviction** (`compiler/0.0.244/`). `afree()`/`afree_x()` victim selection:
+  farthest-next-use instead of LIFO, dead values first. **37 of 38 cases emit byte-identical code**;
+  the exceptions (`file_io`, `params8`) are the only two the whole suite evicts in. Effect is real but
+  aimed at a target that is not there: the 13-register pool never fills on this suite (`arith` peaks at
+  3 registers, 0 evictions), and the loop cost is **home stores**, not eviction. Loop body on the new
+  `regpressure` row: 401 → 381 instructions, 259 → 239 frame memory ops. Frames unchanged.
+  Evidence: `docs/research/a4-next-use-eviction-measurements.md`.
+- **0.0.238-0.0.243 — five levers landed without a suite re-baseline.** A1b block scoping (0.0.237),
+  the float-`const` fix, the per-layer attention-norm fix, the Q6_K SIMD dequant (0.0.243). Tables 1-3
+  above are therefore 0.0.237/0.0.238 history; **table 5 is the current baseline.**
 - **0.0.211 — loop flush hoisting.** `flush_all()` ran before every IR operation (38 locations); moved to
   loop entry/exit only → **25×** on integer loops (0.33 s → 0.013 s).
 - **0.0.212 — loop register pinning.** Loop-carried vregs pinned to callee-saved registers; marginal.
@@ -300,6 +392,10 @@ also what makes constant-divisor strength reduction simple: a power-of-two divis
 
 ## Coverage notes
 
+- **Register pressure is now covered:** `benchmark_regpressure` (16 live temporaries against the
+  13-register pool, definition order opposed to consumption order) is the only row that forces
+  evictions, and it is the row that moves under a victim-selection change. Its gate twin is
+  `test_suites/codes/regpressure_eviction_test.quanta`.
 - **Function shapes** are covered: `closure_call`, `closure_capture`, `fnptr_indirect`, `higher_order`,
   `generic_call`, `params8`, `mutual_recursion`, `heavy_recursion`, `nested_calls`, `recursion`,
   `fib_recursive`.

@@ -1,0 +1,84 @@
+// boot32_bytes.quanta -- GENERATED. DO NOT EDIT BY HAND.
+//
+// Source of truth: scripts/boot/boot32.S
+// Regenerate:      python3 scripts/boot/gen_boot32.py <verdir>
+// Verified by:     scripts/boot/verify_boot32.py (validates the
+//                  prefix back out of a built ELF and diffs boot32.S)
+//
+// This is the 32-bit PVH entry stub: the only non-Quanta code in the
+// image. QEMU enters STUB_BASE in 32-bit protected mode (paging off)
+// after reading the Xen PHYS32_ENTRY note below; the stub builds the
+// 1 GiB identity map and jumps to ENTRY_BASE in long mode.
+
+let boot32_note_len = 20
+let boot32_stub_len = 208
+let boot32_prefix_len = 232
+let boot32_stub_base = 4194672       // 0x400170
+let boot32_note_off = 344             // file offset of the note (== ht)
+let boot32_pad_len = 4
+let boot32_entry_base = 4194880       // 0x400240
+
+// emit_boot32_prefix(): append [Xen note][32-bit stub] to the code
+// buffer. Callers must have already verified boot32_stub_base matches
+// BASE + ht + boot32_note_len for the ELF being written (the compiler
+// asserts this and fails closed otherwise).
+fn emit_boot32_prefix() {
+    // ---- Xen ELF note: XEN_ELFNOTE_PHYS32_ENTRY (type 18) ----
+    eb(4); eb(0); eb(0); eb(0)      // namesz  = 4
+    eb(4); eb(0); eb(0); eb(0)      // descsz  = 4
+    eb(18); eb(0); eb(0); eb(0)     // type    = XEN_ELFNOTE_PHYS32_ENTRY
+    eb(88); eb(101); eb(110); eb(0) // name    = "Xen" + NUL
+    eb(112)      // desc    = STUB_BASE (32-bit phys entry)
+    eb(1)
+    eb(64)
+    eb(0)
+    // ---- 4 pad bytes: place the 16-aligned stub at ht+24 ----
+    eb(0); eb(0); eb(0); eb(0)
+    // ---- 32-bit stub (from scripts/boot/boot32.S) ----
+    eb(250)   //    0  cli
+    eb(184); eb(48); eb(2); eb(64); eb(0)   //    1  mov    $0x400230,%eax
+    eb(15); eb(1); eb(16)   //    6  lgdtl  (%eax)
+    eb(191); eb(0); eb(0); eb(32); eb(0)   //    9  mov    $0x200000,%edi
+    eb(49); eb(192)   //   14  xor    %eax,%eax
+    eb(185); eb(0); eb(12); eb(0); eb(0)   //   16  mov    $0xc00,%ecx
+    eb(243); eb(171)   //   21  rep stos %eax,%es:(%edi)
+    eb(184); eb(3); eb(16); eb(32); eb(0)   //   23  mov    $0x201003,%eax
+    eb(163); eb(0); eb(0); eb(32); eb(0)   //   28  mov    %eax,0x200000
+    eb(199); eb(5); eb(0); eb(16); eb(32); eb(0); eb(131); eb(0); eb(0); eb(0)   //   33  movl   $0x83,0x201000
+    eb(199); eb(5); eb(4); eb(16); eb(32); eb(0); eb(0); eb(0); eb(0); eb(0)   //   43  movl   $0x0,0x201004
+    eb(199); eb(5); eb(8); eb(16); eb(32); eb(0); eb(131); eb(0); eb(0); eb(64)   //   53  movl   $0x40000083,0x201008
+    eb(199); eb(5); eb(12); eb(16); eb(32); eb(0); eb(0); eb(0); eb(0); eb(0)   //   63  movl   $0x0,0x20100c
+    eb(199); eb(5); eb(16); eb(16); eb(32); eb(0); eb(131); eb(0); eb(0); eb(128)   //   73  movl   $0x80000083,0x201010
+    eb(199); eb(5); eb(20); eb(16); eb(32); eb(0); eb(0); eb(0); eb(0); eb(0)   //   83  movl   $0x0,0x201014
+    eb(199); eb(5); eb(24); eb(16); eb(32); eb(0); eb(131); eb(0); eb(0); eb(192)   //   93  movl   $0xc0000083,0x201018
+    eb(199); eb(5); eb(28); eb(16); eb(32); eb(0); eb(0); eb(0); eb(0); eb(0)   //  103  movl   $0x0,0x20101c
+    eb(15); eb(32); eb(224)   //  113  mov    %cr4,%eax
+    eb(131); eb(200); eb(32)   //  116  or     $0x20,%eax
+    eb(15); eb(34); eb(224)   //  119  mov    %eax,%cr4
+    eb(184); eb(0); eb(0); eb(32); eb(0)   //  122  mov    $0x200000,%eax
+    eb(15); eb(34); eb(216)   //  127  mov    %eax,%cr3
+    eb(185); eb(128); eb(0); eb(0); eb(192)   //  130  mov    $0xc0000080,%ecx
+    eb(15); eb(50)   //  135  rdmsr
+    eb(13); eb(0); eb(1); eb(0); eb(0)   //  137  or     $0x100,%eax
+    eb(15); eb(48)   //  142  wrmsr
+    eb(15); eb(32); eb(192)   //  144  mov    %cr0,%eax
+    eb(13); eb(1); eb(0); eb(0); eb(128)   //  147  or     $0x80000001,%eax
+    eb(15); eb(34); eb(192)   //  152  mov    %eax,%cr0
+    eb(234); eb(64); eb(2); eb(64); eb(0); eb(8); eb(0)   //  155  ljmp   $0x8,$0x400240
+    eb(102); eb(15); eb(31); eb(68); eb(0); eb(0)   //  162  nopw   0x0(%eax,%eax,1)
+    eb(0); eb(0); eb(0); eb(0); eb(0); eb(0); eb(0); eb(0)   //  168  undecoded
+    eb(255)   //  176  (bad)
+    eb(255); eb(0)   //  177  incl   (%eax)
+    eb(0); eb(0)   //  179  add    %al,(%eax)
+    eb(154); eb(175); eb(0); eb(255); eb(255); eb(0); eb(0)   //  181  lcall  $0x0,$0xffff00af
+    eb(0)   //  188  .byte 0
+    eb(146)   //  189  xchg   %eax,%edx
+    eb(207)   //  190  iret
+    eb(0)   //  191  undecoded
+    eb(23)   //  192  pop    %ss
+    eb(0); eb(24)   //  193  add    %bl,(%eax)
+    eb(2); eb(64); eb(0)   //  195  add    0x0(%eax),%al
+    eb(0); eb(0)   //  198  add    %al,(%eax)
+    eb(144)   //  200  nop
+    eb(15); eb(31); eb(128); eb(0); eb(0); eb(0); eb(0)   //  201  nopl   0x0(%eax)
+}

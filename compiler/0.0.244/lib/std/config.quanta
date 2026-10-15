@@ -1,0 +1,472 @@
+// std/config - configuration reader for config/rag.conf
+//
+// WHY THIS EXISTS
+//   Every path, endpoint and runtime knob that RAG and TI use lives in
+//   config/rag.conf, not in Quanta source. Moving a tree means editing one
+//   `root` value; lib/std/rag.quanta and scripts/*.py never change.
+//
+// LANGUAGE CONSTRAINTS THIS WAS WRITTEN AGAINST (0.0.220)
+//   - `str(a, b)` takes EXACTLY TWO arguments. `str("a","b","c")` compiles and
+//     silently produces the wrong length, so there is no variadic form to use:
+//     every join below is a nested two-argument str().
+//   - `+` does NOT concatenate strings. `"a" + "b"` is not "ab" on any release.
+//     Never use `+` on strings here.
+//   - `str::name` module-qualified calls SIGILL the compiler. Import the module
+//     and call the bare name.
+//   - `getenv` compiles but is a stub: it returns 0 for a variable that is set.
+//     There is no environment override; the file is the only source.
+//   - `syscall` is the escape hatch for anything the language lacks.
+//
+// STRING LAYOUT (from std/str)
+//   A Quanta string is a pointer to [8-byte length][bytes...]. `len(s)` gives
+//   the byte length and `s + 8` addresses the first byte. `s + 8 + i` is byte i.
+
+import std/str
+import std/io
+
+
+// ---------------------------------------------------------------------------
+// FILE LOCATION
+// ---------------------------------------------------------------------------
+// The config is located by PROBING, not by asking the runtime where the binary
+// is.
+//
+// `arg(0)` was the obvious source -- it is the program path -- but on 0.0.220 it
+// returns a pointer whose length reads as 140732231353451. It is a stub, like
+// getenv. Trusting it segfaulted config_dir() immediately.
+//
+// What does work is relative file_open, so the search walks UP from the working
+// directory and takes the first directory that contains config/rag.conf:
+//
+//     .            -> config/rag.conf
+//     ..           -> config/rag.conf     (running from a subdir)
+//     ../..        -> config/rag.conf     (running from bin/x86)
+//     ../../..     -> config/rag.conf
+//
+// That makes a checkout relocatable: nothing records an absolute path, so
+// moving the tree needs no edit here. It also means the program must be run
+// from somewhere at or below the repo root, which is the normal case and is
+// what every script in this repo already does.
+//
+// CONFIG_PATH, if set as the FIRST line of the file, overrides the search with
+// an explicit relative-or-absolute path.
+fn config_probe(cand) -> str {
+    let p = str(cand, "/config/rag.conf")
+    // `+ 8` skips the 8-byte length header: file_open wants the raw bytes.
+    // Confirmed both ways on 0.0.220 -- file_open(p) returns -2, file_open(p+8)
+    // returns a real fd. The emitter is supposed to infer this from the
+    // vreg_is_str tag, but a string RETURNED FROM A FUNCTION loses that tag, so
+    // the inference fails and the length field is passed to open(). See
+    // fn_retstr in compiler/0.0.220/src/x86/globals.quanta -- the tag is recorded
+    // but does not yet reach the emitter's file_open path. Until it does, every
+    // computed path must be dereferenced explicitly.
+    let fd = file_open(p + 8, 0)
+    if fd < 0 { return "" }
+    file_close(fd)
+    return p
+}
+
+fn config_dir() -> str {
+    let c = config_probe(".")
+    if len(c) > 0 { return "." }
+    let c2 = config_probe("..")
+    if len(c2) > 0 { return ".." }
+    let c3 = config_probe("../..")
+    if len(c3) > 0 { return "../.." }
+    let c4 = config_probe("../../..")
+    if len(c4) > 0 { return "../../.." }
+    return ""
+}
+
+fn config_path() -> str {
+    let p = config_probe(".")
+    if len(p) > 0 { return p }
+    let p2 = config_probe("..")
+    if len(p2) > 0 { return p2 }
+    let p3 = config_probe("../..")
+    if len(p3) > 0 { return p3 }
+    let p4 = config_probe("../../..")
+    if len(p4) > 0 { return p4 }
+    return ""
+}
+
+// ---------------------------------------------------------------------------
+// RAW FILE LOAD
+// ---------------------------------------------------------------------------
+// Returns the whole file as a Quanta string, or "" if it cannot be opened.
+// 1 MiB is far beyond any plausible config; a larger file is a mistake, not a
+// config, and silently truncating it would be worse than failing.
+fn config_load(path) -> str {
+    let fd = file_open(path + 8, 0)
+    if fd < 0 { return "" }
+    let cap = 1048576
+    let buf = mem_alloc(cap + 8)
+    let got = file_read(fd, buf + 8, cap)
+    file_close(fd)
+    if got <= 0 { return "" }
+    // Rebuild a proper [len][bytes] string: the raw read lands after the
+    // header slot, so set the length and hand back the buffer.
+    mem_store(buf, got)
+    mem_store8(buf + 8 + got, 0)
+    return buf
+}
+
+// ---------------------------------------------------------------------------
+// LINE PARSING
+// ---------------------------------------------------------------------------
+// Byte helpers. Quanta has no char type, so everything is byte arithmetic.
+fn is_space(c) -> i64 {
+    if c == 32 { return 1 }
+    if c == 9 { return 1 }
+    if c == 13 { return 1 }
+    return 0
+}
+
+fn is_hash(c) -> i64 {
+    if c == 35 { return 1 }   // '#'
+    return 0
+}
+
+fn is_eq(c) -> i64 {
+    if c == 61 { return 1 }   // '='
+    return 0
+}
+
+fn is_dollar(c) -> i64 {
+    if c == 36 { return 1 }   // '$'
+    return 0
+}
+
+fn is_lbrace(c) -> i64 {
+    if c == 123 { return 1 }  // '{'
+    return 0
+}
+
+fn is_rbrace(c) -> i64 {
+    if c == 125 { return 1 }  // '}'
+    return 0
+}
+
+fn is_bracket(c) -> i64 {
+    if c == 91 { return 1 }   // '['
+    return 0
+}
+
+fn is_rbracket(c) -> i64 {
+    if c == 93 { return 1 }   // ']'
+    return 0
+}
+
+fn upper(c) -> i64 {
+    if c >= 97 && c <= 122 { return c - 32 }
+    return c
+}
+
+fn digit_val(c) -> i64 {
+    if c >= 48 && c <= 57 { return c - 48 }
+    return 0-1
+}
+
+// ---------------------------------------------------------------------------
+// SECTION-AWARE KEY LOOKUP
+// ---------------------------------------------------------------------------
+// config_get(doc, "rag", "db") returns the value of `db` inside [rag]. Passing
+// an empty section matches a key at the top level, before any [section].
+//
+// Values are returned with surrounding spaces already trimmed and ${...}
+// already expanded, so callers never see a raw line.
+fn config_get(doc, section, key) -> str {
+    if doc == 0 { return "" }
+    let n = len(doc)
+    let want_sec = len(section)
+    let want_key = len(key)
+    let sec_ok = 1
+    let i = 0
+    while i < n {
+        let eol = i
+        while eol < n && mem_load8(doc + 8 + eol) != 10 { eol = eol + 1 }
+
+        let a = i
+        while a < eol && is_space(mem_load8(doc + 8 + a)) == 1 { a = a + 1 }
+
+        if a < eol {
+            if is_hash(mem_load8(doc + 8 + a)) == 1 {
+                // comment: skip
+            } else {
+                if is_bracket(mem_load8(doc + 8 + a)) == 1 {
+                    // [section]
+                    let b = a + 1
+                    while b < eol && is_space(mem_load8(doc + 8 + b)) == 1 { b = b + 1 }
+                    let s0 = b
+                    while b < eol && is_rbracket(mem_load8(doc + 8 + b)) == 0 { b = b + 1 }
+                    let slen = b - s0
+                    if slen == want_sec {
+                        sec_ok = 1
+                        let k = 0
+                        while k < want_sec {
+                            if mem_load8(doc + 8 + s0 + k) != mem_load8(section + 8 + k) { sec_ok = 0 }
+                            k = k + 1
+                        }
+                    } else {
+                        sec_ok = 0
+                    }
+                } else {
+                    // key = value
+                    let k1 = a
+                    while k1 < eol && is_eq(mem_load8(doc + 8 + k1)) == 0 { k1 = k1 + 1 }
+                    if k1 < eol {
+                        let k2 = k1
+                        while k2 > a && is_space(mem_load8(doc + 8 + k2 - 1)) == 1 { k2 = k2 - 1 }
+                        let klen = k2 - a
+                        let hit = 0
+                        if klen == want_key {
+                            let k = 0
+                            hit = 1
+                            while k < want_key {
+                                if mem_load8(doc + 8 + a + k) != mem_load8(key + 8 + k) { hit = 0 }
+                                k = k + 1
+                            }
+                        }
+                        if hit == 1 && sec_ok == 1 {
+                            let v0 = k1 + 1
+                            while v0 < eol && is_space(mem_load8(doc + 8 + v0)) == 1 { v0 = v0 + 1 }
+                            let v1 = eol
+                            while v1 > v0 && is_space(mem_load8(doc + 8 + v1 - 1)) == 1 { v1 = v1 - 1 }
+                            let vlen = v1 - v0
+                            if vlen > 0 {
+                                let val = mem_alloc(vlen + 9)
+                                mem_store(val, vlen)
+                                let q = 0
+                                while q < vlen {
+                                    mem_store8(val + 8 + q, mem_load8(doc + 8 + v0 + q))
+                                    q = q + 1
+                                }
+                                mem_store8(val + 8 + vlen, 0)
+                                return config_expand(doc, val, section)
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        i = eol + 1
+    }
+    return ""
+}
+
+// ---------------------------------------------------------------------------
+// ${KEY} EXPANSION
+// ---------------------------------------------------------------------------
+// Expands ${NAME} against the document itself. Names are section-qualified
+// where a bare name would be ambiguous: `${rag.db}`. Resolution is
+// section-driven, so `${ai}` is the key `ai` inside the section most recently
+// seen, which is how `${rag.db}` and `${TI.ai}` both resolve.
+//
+// Bounded: a config that references itself would otherwise loop forever. A
+// chain longer than DEPTH_MAX expands to whatever it had, and a NAME that is
+// not found expands to empty -- silently truncating the value, which is
+// preferable to hanging, and the file is small enough to read by eye.
+fn config_expand(doc, val, sect) -> str {
+    let n = len(val)
+    if n == 0 { return val }
+    if is_dollar(mem_load8(val + 8)) == 0 { return val }
+    // Find the outermost ${...}
+    let open = 0-1
+    let i = 0
+    while i < n {
+        if is_dollar(mem_load8(val + 8 + i)) == 1 {
+            if i + 1 < n && is_lbrace(mem_load8(val + 8 + i + 1)) == 1 { open = i }
+        }
+        i = i + 1
+    }
+    if open < 0 { return val }
+    let close = 0-1
+    let j = open + 2
+    while j < n {
+        if is_rbrace(mem_load8(val + 8 + j)) == 1 { close = j }
+        j = j + 1
+    }
+    if close < 0 { return val }
+    let namelen = close - open - 2
+    if namelen <= 0 { return val }
+    let name = mem_alloc(namelen + 9)
+    mem_store(name, namelen)
+    let q = 0
+    while q < namelen {
+        mem_store8(name + 8 + q, mem_load8(val + 8 + open + 2 + q))
+        q = q + 1
+    }
+    mem_store8(name + 8 + namelen, 0)
+    // split name into section.key at the LAST '.'
+    let dot = 0-1
+    let k = namelen - 1
+    while k >= 0 {
+        if mem_load8(name + 8 + k) == 46 { dot = k }
+        k = k - 1
+    }
+    let resolved = ""
+    if dot < 0 {
+        // A bare ${NAME}: try the top level first, then the CURRENT section.
+        // ${TI} is the documented shorthand for the `root` key of [ti], and the
+        // `root` key is inside [ti] -- so a top-level-only lookup resolved it to
+        // empty and every ${TI}/... path collapsed to "/...".
+        // Resolve against the section this key was FOUND in, not against module
+        // state: `ai = ${TI}/ai` lives in [ti], so ${TI} means [ti]'s `root`.
+        // Threading the section through avoids a module-level mutable that the
+        // compiler gives each function its own copy of.
+        resolved = config_get(doc, "", name)
+        if len(resolved) == 0 {
+            resolved = config_get(doc, sect, name)
+        }
+    } else {
+        let slen = dot
+        let klen = namelen - dot - 1
+        let sec = mem_alloc(slen + 9)
+        mem_store(sec, slen)
+        let m = 0
+        while m < slen {
+            mem_store8(sec + 8 + m, mem_load8(name + 8 + m))
+            m = m + 1
+        }
+        mem_store8(sec + 8 + slen, 0)
+        let kk = mem_alloc(klen + 9)
+        mem_store(kk, klen)
+        m = 0
+        while m < klen {
+            mem_store8(kk + 8 + m, mem_load8(name + 8 + dot + 1 + m))
+            m = m + 1
+        }
+        mem_store8(kk + 8 + klen, 0)
+        resolved = config_get(doc, sec, kk)
+    }
+    // splice: prefix + resolved + suffix
+    let plen = open
+    let slen2 = n - close - 1
+    let pre = mem_alloc(plen + 9)
+    mem_store(pre, plen)
+    let m = 0
+    while m < plen {
+        mem_store8(pre + 8 + m, mem_load8(val + 8 + m))
+        m = m + 1
+    }
+    mem_store8(pre + 8 + plen, 0)
+    let suf = mem_alloc(slen2 + 9)
+    mem_store(suf, slen2)
+    m = 0
+    while m < slen2 {
+        mem_store8(suf + 8 + m, mem_load8(val + 8 + close + 1 + m))
+        m = m + 1
+    }
+    mem_store8(suf + 8 + slen2, 0)
+    let head = config_expand(doc, pre, sect)
+    let tail = config_expand(doc, suf, sect)
+    return str(str(head, resolved), tail)
+}
+
+// ---------------------------------------------------------------------------
+// PUBLIC API
+// ---------------------------------------------------------------------------
+// Each accessor loads the file, reads one key, and falls back to a compiled-in
+// default so a missing key is never a crash. Loading per call is deliberate:
+// the config is tiny, the program is short-lived, and caching would need
+// invalidation that nothing here needs.
+fn cfg(section, key) -> str {
+    let p = config_path()
+    if len(p) == 0 { return "" }
+    let doc = config_load(p)
+    if len(doc) == 0 { return "" }
+    return config_get(doc, section, key)
+}
+
+fn cfg_str(section, key, dflt) -> str {
+    let v = cfg(section, key)
+    if len(v) == 0 { return dflt }
+    return v
+}
+
+fn cfg_int(section, key, dflt) -> i64 {
+    let v = cfg(section, key)
+    if len(v) == 0 { return dflt }
+    return parse_i64(v)
+}
+
+// --- TI ---------------------------------------------------------------------
+fn ti_root() -> str { return cfg_str("ti", "root", "/opt/tali/ti") }
+fn ti_ai() -> str { return cfg("ti", "ai") }
+fn ti_kb() -> str { return cfg("ti", "kb") }
+
+// --- RAG --------------------------------------------------------------------
+fn rag_db() -> str { return cfg("rag", "db") }
+fn rag_query_file() -> str { return cfg_str("rag", "query_file", "/tmp/rag_query.txt") }
+fn rag_default_top_k() -> i64 { return cfg_int("rag", "default_top_k", 5) }
+fn rag_context_chunks() -> i64 { return cfg_int("rag", "context_chunks", 3) }
+
+// --- embedding --------------------------------------------------------------
+fn embed_python() -> str { return cfg("embed", "python") }
+fn embed_model() -> str { return cfg("embed", "model") }
+fn embed_dim() -> i64 { return cfg_int("embed", "dim", 384) }
+
+// --- generation -------------------------------------------------------------
+fn llm_base() -> str { return cfg_str("llm", "base", "http://localhost") }
+fn llm_path() -> str { return cfg_str("llm", "path", "/v1/chat/completions") }
+fn llm_max_tokens() -> i64 { return cfg_int("llm", "max_tokens", 256) }
+fn llm_temperature() -> f64 { return cfg_int("llm", "temperature", 3) / 10.0 }
+fn llm_top_p() -> f64 { return cfg_int("llm", "top_p", 95) / 100.0 }
+
+// Port for a model name; 0 when the name is not configured.
+fn model_port(name) -> i64 {
+    return cfg_int("models", name, 0)
+}
+
+// Full chat-completions URL for a model.
+fn llm_url(name) -> str {
+    let port = model_port(name)
+    return str(str(llm_base(), ":"), str_i64(port, llm_path()))
+}
+
+// i64 -> string. Needed to build URLs, and Quanta has no integer-to-string.
+//   `suffix` is appended in the same allocation, so the result is one string.
+//
+// Digits come out of the division loop least-significant first, so they are
+// REVERSED on the way out. Without that step 1235 printed as "5321" and
+// llm_url("e2b") produced http://localhost:5321/... -- a wrong port that still
+// looks like a port, so nothing reported it.
+fn str_i64(v, suffix) -> str {
+    if v == 0 {
+        if len(suffix) == 0 { return "0" }
+        return str("0", suffix)
+    }
+    let neg = 0
+    if v < 0 { neg = 1 }
+    let n = v
+    if n < 0 { n = 0 - n }
+    // least-significant digit first
+    let rev = mem_alloc(24)
+    let rn = 0
+    while n > 0 {
+        let d = n % 10
+        n = n / 10
+        mem_store8(rev + rn, 48 + d)
+        rn = rn + 1
+    }
+    // reverse into the final buffer, with room for '-' and the suffix
+    let slen = len(suffix)
+    let total = rn + slen
+    if neg == 1 { total = total + 1 }
+    let o = mem_alloc(total + 9)
+    let w = 0
+    if neg == 1 { mem_store8(o + 8, 45); w = 1 }
+    let k = 0
+    while k < rn {
+        mem_store8(o + 8 + w + k, mem_load8(rev + rn - 1 - k))
+        k = k + 1
+    }
+    let m = 0
+    while m < slen {
+        mem_store8(o + 8 + w + rn + m, mem_load8(suffix + 8 + m))
+        m = m + 1
+    }
+    mem_store(o, total)
+    mem_store8(o + 8 + total, 0)
+    return o
+}

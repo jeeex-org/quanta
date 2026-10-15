@@ -1,0 +1,50 @@
+// Register-pressure benchmark — the A4 / next-use eviction twin.
+//
+// 16 temporaries are DEFINED in order t0..t15 and then CONSUMED IN REVERSE order
+// (t15 first, t0 last), inside a hot loop. The pool is 13 physical registers, so
+// 14..18 simultaneously-live values force evictions on every iteration, and the
+// definition order is deliberately opposed to the consumption order:
+//
+//   * LIFO eviction (the policy before 0.0.244) always throws away the MOST
+//     RECENTLY ALLOCATED value — which here is exactly the one consumed first.
+//   * next-use eviction (A4) throws away the value whose next use is FARTHEST
+//     away — here t0, which is consumed last.
+//
+// Both policies are value-correct (every definition writes its home slot, so an
+// evicted value is always reloadable) — the row therefore prints the SAME value
+// under either compiler, and the red-first evidence for A4 is a codegen metric,
+// not a runtime one: `scripts/bench_instr.sh` reports fewer frame-relative
+// memory operations in main's loop body under 0.0.244 than under 0.0.243.
+//
+// The C twin is the same computation and is checked output-equal by bench.sh.
+const N = 2000000
+
+fn main() {
+    let sum = 0
+    let i = 0
+    while i < N {
+        let t0 = i + 1
+        let t1 = i + 2
+        let t2 = i + 3
+        let t3 = i + 4
+        let t4 = i + 5
+        let t5 = i + 6
+        let t6 = i + 7
+        let t7 = i + 8
+        let t8 = i + 9
+        let t9 = i + 10
+        let t10 = i + 11
+        let t11 = i + 12
+        let t12 = i + 13
+        let t13 = i + 14
+        let t14 = i + 15
+        let t15 = i + 16
+        sum = sum + t15 + t14 + t13 + t12 + t11 + t10 + t9 + t8
+        sum = sum + t7 + t6 + t5 + t4 + t3 + t2 + t1 + t0
+        i = i + 1
+    }
+    print("sum=")
+    print(sum)
+    print("\n")
+    return 0
+}

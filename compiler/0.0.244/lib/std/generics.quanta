@@ -1,0 +1,554 @@
+// Generics System - Parametric Polymorphism
+// Pure Quanta implementation, zero external dependencies
+// Built on top of compiler type system
+
+// ============================================================================
+// Type Parameter Representation
+// ============================================================================
+
+struct gen_type_param {
+    name: u8[64],           // Type parameter name (e.g., "T", "U")
+    id: i64,                // Unique ID for this type parameter
+    constraints: i64[16],   // Trait constraint IDs
+    constraint_count: i64,
+    variance: i64,          // 0=invariant, 1=covariant, 2=contravariant
+    default_type: i64       // Type ID for default (0 = none)
+}
+
+// Constraints / Traits
+fn gen_constraint_eq(): i64 { return 1 }
+fn gen_constraint_ord(): i64 { return 2 }
+fn gen_constraint_hash(): i64 { return 3 }
+fn gen_constraint_clone(): i64 { return 4 }
+fn gen_constraint_copy(): i64 { return 5 }
+fn gen_constraint_default(): i64 { return 6 }
+fn gen_constraint_debug(): i64 { return 7 }
+fn gen_constraint_display(): i64 { return 8 }
+fn gen_constraint_add(): i64 { return 9 }
+fn gen_constraint_sub(): i64 { return 10 }
+fn gen_constraint_mul(): i64 { return 11 }
+fn gen_constraint_div(): i64 { return 12 }
+fn gen_constraint_neg(): i64 { return 13 }
+fn gen_constraint_not(): i64 { return 14 }
+fn gen_constraint_deref(): i64 { return 15 }
+fn gen_constraint_index(): i64 { return 16 }
+fn gen_constraint_iterator(): i64 { return 17 }
+fn gen_constraint_future(): i64 { return 18 }
+fn gen_constraint_send(): i64 { return 19 }
+fn gen_constraint_sync(): i64 { return 20 }
+fn gen_constraint_sized(): i64 { return 21 }
+fn gen_constraint_unsized(): i64 { return 22 }
+
+// Type IDs (built-in)
+fn gen_type_i8(): i64 { return 1 }
+fn gen_type_i16(): i64 { return 2 }
+fn gen_type_i32(): i64 { return 3 }
+fn gen_type_i64(): i64 { return 4 }
+fn gen_type_u8(): i64 { return 5 }
+fn gen_type_u16(): i64 { return 6 }
+fn gen_type_u32(): i64 { return 7 }
+fn gen_type_u64(): i64 { return 8 }
+fn gen_type_f32(): i64 { return 9 }
+fn gen_type_f64(): i64 { return 10 }
+fn gen_type_bool(): i64 { return 11 }
+fn gen_type_char(): i64 { return 12 }
+fn gen_type_str(): i64 { return 13 }
+fn gen_type_never(): i64 { return 14 }
+fn gen_type_unit(): i64 { return 15 }
+
+// Type kinds
+fn gen_kind_concrete(): i64 { return 0 }
+fn gen_kind_param(): i64 { return 1 }      // Type parameter (T)
+fn gen_kind_array(): i64 { return 2 }      // [T; N]
+fn gen_kind_slice(): i64 { return 3 }      // &[T]
+fn gen_kind_ptr(): i64 { return 4 }        // *const T / *mut T
+fn gen_kind_ref(): i64 { return 5 }        // &T / &mut T
+fn gen_kind_fn(): i64 { return 6 }         // fn(...) -> ...
+fn gen_kind_tuple(): i64 { return 7 }      // (T1, T2, ...)
+fn gen_kind_struct(): i64 { return 8 }     // Struct<T, U>
+fn gen_kind_enum(): i64 { return 9 }       // Enum<T>
+fn gen_kind_trait_object(): i64 { return 10 }  // dyn Trait
+fn gen_kind_impl_trait(): i64 { return 11 }    // impl Trait
+fn gen_kind_assoc(): i64 { return 12 }     // Associated type
+
+// Type representation
+struct gen_type {
+    kind: i64,
+    type_id: i64,           // For concrete types
+    param_id: i64,          // For type parameters
+    args: gen_type[16],     // Type arguments (for generic types)
+    arg_count: i64,
+    is_mut: i64,            // For references
+    is_const: i64,          // For const generics
+    const_val: i64          // Const generic value
+}
+
+// ============================================================================
+// Generic Function/Struct/Enum Definition
+// ============================================================================
+
+struct gen_generic_def {
+    name: u8[64],
+    params: gen_type_param[16],
+    param_count: i64,
+    where_clauses: gen_where_clause[32],
+    where_count: i64,
+    kind: i64,  // 0=fn, 1=struct, 2=enum, 3=impl, 4=trait
+    body: i64   // Pointer to AST/function body
+}
+
+struct gen_where_clause {
+    lhs: gen_type,
+    bounds: i64[16],
+    bound_count: i64
+}
+
+// ============================================================================
+// Monomorphization
+// ============================================================================
+
+struct gen_mono_instance {
+    def: gen_generic_def,
+    type_args: gen_type[16],
+    arg_count: i64,
+    mangled_name: u8[256],
+    instantiated: i64,
+    code_ptr: i64
+}
+
+struct gen_mono_context {
+    instances: gen_mono_instance[1024],
+    instance_count: i64,
+    pending: gen_mono_instance[1024],
+    pending_count: i64
+}
+
+fn gen_mono_context_init(ctx: gen_mono_context[]): i64 {
+    ctx[0].instance_count = 0
+    ctx[0].pending_count = 0
+    return 0
+}
+
+// Mangle name for monomorphized instance
+fn gen_mangle_name(def_name: u8[], type_args: gen_type[], arg_count: i64, out: u8[]): i64 {
+    // Format: name$T1$T2$...
+    let i: i64 = 0
+    while def_name[i] != 0 {
+        out[i] = def_name[i]
+        i = i + 1
+    }
+    
+    let j: i64 = 0
+    while j < arg_count {
+        out[i] = 36  // '$'
+        i = i + 1
+        // Encode type argument
+        let t: gen_type = type_args[j]
+        if t.kind == gen_kind_param() {
+            // Type parameter - use its ID
+            out[i] = 80  // 'P'
+            i = i + 1
+            // Write param ID as base36
+            // Simplified
+        } else if t.kind == gen_kind_concrete() {
+            out[i] = 67  // 'C'
+            i = i + 1
+            // Write type ID
+        }
+        j = j + 1
+    }
+    out[i] = 0
+    return 0
+}
+
+// Request monomorphization
+fn gen_mono_request(ctx: gen_mono_context[], def: gen_generic_def[], type_args: gen_type[], arg_count: i64): i64 {
+    // Check if already instantiated
+    let i: i64 = 0
+    while i < ctx[0].instance_count {
+        // Compare def name and type args
+        i = i + 1
+    }
+    
+    // Add to pending
+    let idx: i64 = ctx[0].pending_count
+    ctx[0].pending[idx].def = def[0]
+    let j: i64 = 0
+    while j < arg_count {
+        ctx[0].pending[idx].type_args[j] = type_args[j]
+        j = j + 1
+    }
+    ctx[0].pending[idx].arg_count = arg_count
+    gen_mangle_name(def[0].name, type_args, arg_count, ctx[0].pending[idx].mangled_name)
+    ctx[0].pending_count = ctx[0].pending_count + 1
+    return idx
+}
+
+// Process pending monomorphizations
+fn gen_mono_process_pending(ctx: gen_mono_context[]): i64 {
+    while ctx[0].pending_count > 0 {
+        ctx[0].pending_count = ctx[0].pending_count - 1
+        let inst: gen_mono_instance = ctx[0].pending[ctx[0].pending_count]
+        
+        // Perform actual monomorphization (type substitution in AST)
+        // This would walk the AST and replace type parameters with concrete types
+        
+        inst.instantiated = 1
+        ctx[0].instances[ctx[0].instance_count] = inst
+        ctx[0].instance_count = ctx[0].instance_count + 1
+    }
+    return 0
+}
+
+// ============================================================================
+// Type Substitution
+// ============================================================================
+
+// Substitute type parameters in a type
+fn gen_substitute_type(ty: gen_type[], subst: gen_type[], subst_count: i64, out: gen_type[]): i64 {
+    if ty[0].kind == gen_kind_param() {
+        // Find substitution
+        let i: i64 = 0
+        while i < subst_count {
+            if subst[i].param_id == ty[0].param_id {
+                out[0] = subst[i]
+                return 0
+            }
+            i = i + 1
+        }
+        // No substitution found - keep as is
+        out[0] = ty[0]
+        return 0
+    }
+    
+    // Recursively substitute in arguments
+    out[0].kind = ty[0].kind
+    out[0].type_id = ty[0].type_id
+    out[0].param_id = ty[0].param_id
+    out[0].is_mut = ty[0].is_mut
+    out[0].is_const = ty[0].is_const
+    out[0].const_val = ty[0].const_val
+    out[0].arg_count = ty[0].arg_count
+    
+    let i: i64 = 0
+    while i < ty[0].arg_count {
+        gen_substitute_type(ty[0].args + i, subst, subst_count, out[0].args + i)
+        i = i + 1
+    }
+    return 0
+}
+
+// Substitute in where clauses
+fn gen_substitute_where(clauses: gen_where_clause[], count: i64, subst: gen_type[], subst_count: i64, out: gen_where_clause[]): i64 {
+    let i: i64 = 0
+    while i < count {
+        out[i].bound_count = clauses[i].bound_count
+        let j: i64 = 0
+        while j < clauses[i].bound_count {
+            out[i].bounds[j] = clauses[i].bounds[j]
+            j = j + 1
+        }
+        gen_substitute_type(clauses[i].lhs, subst, subst_count, out[i].lhs)
+        i = i + 1
+    }
+    return 0
+}
+
+// ============================================================================
+// Trait System
+// ============================================================================
+
+struct gen_trait {
+    name: u8[64],
+    methods: gen_trait_method[64],
+    method_count: i64,
+    supertraits: i64[16],
+    supertrait_count: i64,
+    is_auto: i64,       // Auto trait (Send, Sync)
+    is_marker: i64      // Marker trait (Copy, Sized)
+}
+
+struct gen_trait_method {
+    name: u8[64],
+    sig: gen_fn_sig,
+    has_default: i64,
+    default_body: i64
+}
+
+struct gen_fn_sig {
+    params: gen_type[16],
+    param_count: i64,
+    ret: gen_type,
+    is_async: i64,
+    is_const: i64,
+    abi: i64
+}
+
+// Trait implementation
+struct gen_impl {
+    trait_id: i64,        // 0 = inherent impl
+    for_type: gen_type,
+    methods: gen_impl_method[64],
+    method_count: i64,
+    generics: gen_generic_def,
+    where_clauses: gen_where_clause[32],
+    where_count: i64
+}
+
+struct gen_impl_method {
+    name: u8[64],
+    sig: gen_fn_sig,
+    body: i64
+}
+
+// Trait resolution
+fn gen_resolve_trait(trait_id: i64, for_type: gen_type[], ctx: gen_mono_context[]): i64 {
+    // Search impl blocks for matching trait + type
+    // Consider generics and where clauses
+    return 0  // Returns impl ID or 0 if not found
+}
+
+// ============================================================================
+// Const Generics
+// ============================================================================
+
+struct gen_const_param {
+    name: u8[64],
+    id: i64,
+    ty: gen_type,
+    default_val: i64
+}
+
+fn gen_const_param_new(name: u8[], ty: gen_type[], default_val: i64): gen_const_param {
+    let p: gen_const_param
+    // Copy name
+    let i: i64 = 0
+    while i < 64 && name[i] != 0 {
+        p.name[i] = name[i]
+        i = i + 1
+    }
+    p.name[i] = 0
+    p.ty = ty[0]
+    p.default_val = default_val
+    return p
+}
+
+// ============================================================================
+// Generic Inference
+// ============================================================================
+
+struct gen_inference_ctx {
+    vars: gen_infer_var[64],
+    var_count: i64,
+    obligations: gen_obligation[128],
+    obligation_count: i64
+}
+
+struct gen_infer_var {
+    id: i64,
+    kind: i64,        // 0=type, 1=const, 2=lifetime
+    lower_bound: gen_type,
+    upper_bound: gen_type,
+    resolved: gen_type,
+    is_resolved: i64
+}
+
+struct gen_obligation {
+    predicate: i64,   // 0=trait, 1=projection, 2=well-formed
+    trait_id: i64,
+    self_ty: gen_type,
+    args: gen_type[16],
+    arg_count: i64
+}
+
+// Unify two types
+fn gen_unify(ctx: gen_inference_ctx[], a: gen_type[], b: gen_type[]): i64 {
+    if a[0].kind == gen_kind_param() && b[0].kind == gen_kind_param() {
+        if a[0].param_id == b[0].param_id { return 0 }
+        // Unify type variables
+        return gen_unify_vars(ctx, a[0].param_id, b[0].param_id)
+    }
+    if a[0].kind == gen_kind_param() {
+        return gen_instantiate_var(ctx, a[0].param_id, b)
+    }
+    if b[0].kind == gen_kind_param() {
+        return gen_instantiate_var(ctx, b[0].param_id, a)
+    }
+    
+    // Both concrete - must match
+    if a[0].kind != b[0].kind { return -1 }
+    if a[0].kind == gen_kind_concrete() {
+        if a[0].type_id != b[0].type_id { return -1 }
+        return 0
+    }
+    
+    // Composite types - unify arguments
+    if a[0].arg_count != b[0].arg_count { return -1 }
+    let i: i64 = 0
+    while i < a[0].arg_count {
+        if gen_unify(ctx, a[0].args + i, b[0].args + i) != 0 { return -1 }
+        i = i + 1
+    }
+    return 0
+}
+
+fn gen_unify_vars(ctx: gen_inference_ctx[], var_a: i64, var_b: i64): i64 {
+    // Merge two inference variables
+    return 0
+}
+
+fn gen_instantiate_var(ctx: gen_inference_ctx[], var_id: i64, ty: gen_type[]): i64 {
+    // Check occurs check
+    // Check bounds
+    // Set resolved type
+    return 0
+}
+
+// ============================================================================
+// Variance
+// ============================================================================
+
+fn gen_compute_variance(def: gen_generic_def[]): i64 {
+    // Analyze usage of type parameters in definition
+    // Positive position -> covariant
+    // Negative position -> contravariant
+    // Both -> invariant
+    return 0
+}
+
+// ============================================================================
+// Code Generation for Monomorphized Instances
+// ============================================================================
+
+fn gen_codegen_instance(inst: gen_mono_instance[]): i64 {
+    // Generate LLVM IR / assembly for monomorphized instance
+    // Type parameters replaced with concrete types
+    return 0
+}
+
+// ============================================================================
+// Standard Library Generic Types
+// ============================================================================
+
+// Option<T>
+fn gen_option_some(t: gen_type[]): gen_type {
+    let opt: gen_type
+    opt.kind = gen_kind_enum()
+    opt.type_id = 100  // Option type ID
+    opt.args[0] = t[0]
+    opt.arg_count = 1
+    return opt
+}
+
+fn gen_option_none(t: gen_type[]): gen_type {
+    return gen_option_some(t)
+}
+
+// Result<T, E>
+fn gen_result_ok(t: gen_type[], e: gen_type[]): gen_type {
+    let res: gen_type
+    res.kind = gen_kind_enum()
+    res.type_id = 101  // Result type ID
+    res.args[0] = t[0]
+    res.args[1] = e[0]
+    res.arg_count = 2
+    return res
+}
+
+fn gen_result_err(t: gen_type[], e: gen_type[]): gen_type {
+    return gen_result_ok(t, e)
+}
+
+// Vec<T>
+fn gen_vec_new(t: gen_type[]): gen_type {
+    let vec: gen_type
+    vec.kind = gen_kind_struct()
+    vec.type_id = 102  // Vec type ID
+    vec.args[0] = t[0]
+    vec.arg_count = 1
+    return vec
+}
+
+// Box<T>
+fn gen_box_new(t: gen_type[]): gen_type {
+    let box_t: gen_type
+    box_t.kind = gen_kind_ptr()
+    box_t.args[0] = t[0]
+    box_t.arg_count = 1
+    return box_t
+}
+
+// Rc<T> / Arc<T>
+fn gen_rc_new(t: gen_type[]): gen_type {
+    let rc: gen_type
+    rc.kind = gen_kind_struct()
+    rc.type_id = 103  // Rc type ID
+    rc.args[0] = t[0]
+    rc.arg_count = 1
+    return rc
+}
+
+// HashMap<K, V>
+fn gen_hashmap_new(k: gen_type[], v: gen_type[]): gen_type {
+    let hm: gen_type
+    hm.kind = gen_kind_struct()
+    hm.type_id = 104  // HashMap type ID
+    hm.args[0] = k[0]
+    hm.args[1] = v[0]
+    hm.arg_count = 2
+    return hm
+}
+
+// Iterator<Item>
+fn gen_iterator_item(item_ty: gen_type[]): gen_type {
+    let iter: gen_type
+    iter.kind = gen_kind_trait_object()
+    iter.type_id = 200  // Iterator trait ID
+    iter.args[0] = item_ty[0]
+    iter.arg_count = 1
+    return iter
+}
+
+// Future<Output>
+fn gen_future_output(output_ty: gen_type[]): gen_type {
+    let fut: gen_type
+    fut.kind = gen_kind_trait_object()
+    fut.type_id = 201  // Future trait ID
+    fut.args[0] = output_ty[0]
+    fut.arg_count = 1
+    return fut
+}
+
+// ============================================================================
+// Generic Functions (stdlib)
+// ============================================================================
+
+// fn id<T>(x: T) -> T
+fn gen_id(x: i64): i64 { return x }
+
+// fn clone<T: Clone>(x: &T) -> T
+fn gen_clone(x: i64): i64 { return x }
+
+// fn swap<T>(a: &mut T, b: &mut T)
+fn gen_swap(a: i64, b: i64): i64 { return 0 }
+
+// fn min<T: Ord>(a: T, b: T) -> T
+fn gen_min(a: i64, b: i64): i64 { return a }
+
+// fn max<T: Ord>(a: T, b: T) -> T
+fn gen_max(a: i64, b: i64): i64 { return a }
+
+// ============================================================================
+// Test Constants
+// ============================================================================
+
+fn gen_constraint_eq_test(): i64 { return gen_constraint_eq() }
+fn gen_constraint_ord_test(): i64 { return gen_constraint_ord() }
+fn gen_constraint_hash_test(): i64 { return gen_constraint_hash() }
+fn gen_constraint_clone_test(): i64 { return gen_constraint_clone() }
+fn gen_type_i32_test(): i64 { return gen_type_i32() }
+fn gen_type_i64_test(): i64 { return gen_type_i64() }
+fn gen_kind_concrete_test(): i64 { return gen_kind_concrete() }
+fn gen_kind_param_test(): i64 { return gen_kind_param() }
+fn gen_kind_array_test(): i64 { return gen_kind_array() }
+fn gen_kind_ref_test(): i64 { return gen_kind_ref() }

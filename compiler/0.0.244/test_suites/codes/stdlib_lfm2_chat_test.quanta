@@ -1,0 +1,109 @@
+// stdlib_lfm2_chat_test -- the chat template must match the GGUF's Jinja2
+// template byte-for-byte on the single-turn path.
+//
+// The model carries a 5443-byte Jinja2 template. std/lfm2_chat.quanta implements
+// only the single-turn subset, so the thing to prove is that the subset it does
+// implement is EXACT -- one wrong byte and the model sees a malformed turn and
+// answers with end_of_turn.
+//
+// The two places the template is not what it looks like, both read out of the
+// GGUF as raw bytes:
+//   "<|im_start|>system\n"           -- literal backslash + n
+//   "<|im_start|>assistant\n<think"  -- literal backslash + n, then " thinking"
+// Every other separator is a REAL newline (byte 10), e.g. the user opener is
+// "<|im_start|>" + "user" + newline.
+//
+// SOURCE NOTE: in Quanta a "\n" inside a string literal IS a real newline
+// (byte 10); there is no escape for a literal backslash. The expected strings
+// below therefore stop short of the assistant opener and the three trap bytes
+// are asserted individually. Writing them into a literal would silently compare
+// against a newline and the test would fail against correct code.
+
+import std/lfm2_chat
+
+// Compare `n` bytes at `dst` against `want`. Returns mismatch count, or -1 on a
+// length difference.
+fn cmp_bytes(dst, n, want) {
+    if n != len(want) { return 0 - 1 }
+    let i = 0
+    let bad = 0
+    while i < n {
+        if mem_load8(dst + i) != mem_load8(want + 8 + i) { bad = bad + 1 }
+        i = i + 1
+    }
+    return bad
+}
+
+// Compare the first len(want) bytes at dst against want.
+fn cmp_prefix(dst, want) {
+    let i = 0
+    let bad = 0
+    while i < len(want) {
+        if mem_load8(dst + i) != mem_load8(want + 8 + i) { bad = bad + 1 }
+        i = i + 1
+    }
+    return bad
+}
+
+// Compare n bytes at (dst+start) against want.
+fn cmp_at(dst, start, want) {
+    let i = 0
+    let bad = 0
+    while i < len(want) {
+        if mem_load8(dst + start + i) != mem_load8(want + 8 + i) { bad = bad + 1 }
+        i = i + 1
+    }
+    return bad
+}
+
+fn main() {
+    let dst = mem_alloc(8192)
+
+    // ---- user turn only, no system ----
+    let n1 = chat_build(0, "Hi", dst)
+    let p1 = "<|im_start|>user\nHi<|im_end|>\n<|im_start|>assistant"
+    if n1 != len(p1) + 2 + len(" thinking") { print("FAIL: user-only length"); print(n1); return 1 }
+    if cmp_prefix(dst, p1) != 0 { print("FAIL: user-only prefix"); return 1 }
+    let aoff = len(p1)
+    if mem_load8(dst + aoff) != 92 { print("FAIL: assistant opener lost the literal backslash"); return 1 }
+    if mem_load8(dst + aoff + 1) != 110 { print("FAIL: assistant opener lost the 'n'"); return 1 }
+    if cmp_at(dst, aoff + 2, " thinking") != 0 { print("FAIL: missing think prefix"); return 1 }
+    // the user opener must use a REAL newline (10), not a backslash
+    let uoff = len("<|im_start|>user")
+    if mem_load8(dst + uoff) != 10 { print("FAIL: user opener should use a real newline"); return 1 }
+
+    // ---- with a system message ----
+    let n2 = chat_build("Be brief.", "Hi", dst)
+    let p2 = "<|im_start|>system"
+    if cmp_prefix(dst, p2) != 0 { print("FAIL: system prefix"); return 1 }
+    let soff = len(p2)
+    if mem_load8(dst + soff) != 92 { print("FAIL: system opener lost the literal backslash"); return 1 }
+    if mem_load8(dst + soff + 1) != 110 { print("FAIL: system opener lost the 'n'"); return 1 }
+    if cmp_at(dst, soff + 2, "Be brief.<|im_end|>\n<|im_start|>user\nHi<|im_end|>\n<|im_start|>assistant") != 0 {
+        print("FAIL: system + user body"); return 1
+    }
+
+    // ---- an empty system string must be OMITTED, not emitted empty ----
+    let n3 = chat_build("", "Hi", dst)
+    if n3 != n1 { print("FAIL: empty system changed the length"); return 1 }
+    if cmp_prefix(dst, p1) != 0 { print("FAIL: empty system not omitted"); return 1 }
+
+    // ---- a long user turn must not truncate or overflow ----
+    let big = mem_alloc(4096)
+    let k = 0
+    while k < 2000 { mem_store8(big + 8 + k, 65); k = k + 1 }
+    mem_store(big, 2000)
+    let n5 = chat_build(0, big, dst)
+    if n5 != n1 - 2 + 2000 { print("FAIL: long user turn length"); print(n5); return 1 }
+    let coff = len("<|im_start|>user\n")
+    let bad = 0
+    k = 0
+    while k < 2000 {
+        if mem_load8(dst + coff + k) != 65 { bad = bad + 1 }
+        k = k + 1
+    }
+    if bad != 0 { print("FAIL: long user turn content mangled"); return 1 }
+
+    print("OK lfm2_chat")
+    return 0
+}
