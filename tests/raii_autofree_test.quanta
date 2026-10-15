@@ -1,0 +1,59 @@
+// known-fail: on the shipping compiler (0.0.241) this exits 3 -- the A5 RAII
+// auto-free is dead code. It exits 0 on the 0.0.242 WIP build (detector fixed).
+// Not a gate row yet: enabling the auto-free breaks 26 EXPECTED rows (see
+// compiler/0.0.242/WIP.md), so it must not enter test_suites/EXPECTED.tsv until
+// escape detection lands.
+//
+// Run manually:
+//   compiler/<VER>/bin/x86/qc -O tests/raii_autofree_test.quanta /tmp/raii && \
+//     ./scripts/quanta_run.sh /tmp/raii < /dev/null ; echo rc=$?
+//   -> 0.0.241: rc=3 (blocks never freed)     0.0.242 WIP: rc=0
+//
+// raii_autofree_test.quanta - A5 (0.0.242): the P2 RAII auto-free for a
+// block-scoped `mem_alloc` binding must actually run at scope exit.
+//
+// RED-FIRST: on the pre-fix compiler this row exits 3. The detector at
+// parse.quanta was DEAD CODE (it read the IR_MOV record at irc-1 instead of the
+// IR_CALL at irc-2, and read the arg COUNT / arg-start INDEX as the callee name
+// offset / length), so `vreg_owned` was never set and IR_FREE was never
+// emitted: the blocks below were never pushed onto the free list.
+//
+// The assertions pin the EXACT free-list behaviour, not just "no crash":
+//   * a correct free leaves the block's length header [p] = n UNTOUCHED and
+//     writes [p+8] = the OLD free-list head, then sets the head to p;
+//   * two sequential frees therefore CHAIN: [p2+8] == p1 and [p1+8] == 0.
+// That chain also proves HEAP_CTRL itself was written (p2's link value could
+// only be p1 if p1's free stored it as the head).
+//
+// It also discriminates the two ways a fix can be wrong:
+//   * no free at all            -> [p1+8] stays 111, [p2+8] stays 222  -> exit 3
+//   * free with a mis-encoded store (the pre-fix IR_FREE handler wrote rbx
+//     into [rbx] and [rbx+8], clobbering the length header)              -> exit 1
+//   * correct free                                                       -> exit 0
+//
+// Relying on the block being readable after its scope closed is safe here for a
+// stated reason: free-list REUSE is deferred (mem_alloc ignores the free list,
+// emitter.quanta), so the mapping is never unmapped or handed out again; we are
+// reading a still-live mapping, deterministically.
+fn main() {
+    let s1 = 0
+    let s2 = 0
+    {
+        let p1 = mem_alloc(4)
+        mem_store(p1 + 8, 111)
+        s1 = p1                 // escape the pointer value (not the binding)
+    }                           // scope exit: p1 must be auto-freed here
+    {
+        let p2 = mem_alloc(4)
+        mem_store(p2 + 8, 222)
+        s2 = p2
+    }                           // scope exit: p2 must be auto-freed here
+
+    // Header must survive: a correct free does NOT write [p].
+    if mem_load(s1) != 4 { exit(1) }
+    if mem_load(s2) != 4 { exit(2) }
+    // The free-list chain: head=p2, [p2+8]=p1, [p1+8]=0.
+    if mem_load(s2 + 8) != s1 { exit(3) }
+    if mem_load(s1 + 8) != 0 { exit(4) }
+    exit(0)
+}

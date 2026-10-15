@@ -1,0 +1,203 @@
+// stdlib_lfm2_rope_test -- RoPE must match the reference convention exactly.
+//
+// LFM2 uses NEOX-style RoPE with HALF-SPLIT pairing, not adjacent pairs. From
+// ggml's rotate_pairs() and ggml_rope_cache_init():
+//
+//   for i0 in 0..n step 2:  ic = i0/2
+//     x0 = src[ic],  x1 = src[ic + head_dim/2]
+//     dst[ic]              = x0*cos - x1*sin
+//     dst[ic + head_dim/2] = x0*sin + x1*cos
+//
+//   theta starts at 1.0 and is multiplied ONCE PER PAIR by
+//   theta_scale = base^(-2/head_dim), so pair i uses theta = base^(-2i/head_dim)
+//
+// Pairing element 0 with element 32 rather than element 0 with element 1 is the
+// difference between a correct rotation and one that looks plausible but
+// scrambles every head.
+//
+// The model carries no lfm2.rope.scaling.* keys and no lfm2.rope.dimension_count,
+// so n_rot is the full head_dim and freq_base = 1e7 is the only parameter.
+//
+// The compiler needs one thing spelled out here: the frequency base must be read
+// with f64of(). A module-level float global is moved with a plain mov that pow
+// then reads as an integer, giving 1e7^(-2/64) = 0.260893 instead of 0.604296 --
+// a `: f64` annotation on the local does not fix it, only the explicit conversion
+// does. See fc_rope_cache.
+//
+// Reference values are Python's math.cos/math.sin at f64 precision; the tolerance
+// is 1e-5, which is pf64's display resolution rather than a real slack.
+
+import std/fs
+import std/gguf
+import std/lfm2_forward
+import std/lfm2_model
+import std/math
+
+let MODEL = "/opt/ai/models/quanta/QUANTA-LFM2.5-2.6Bv1-Q4_K_M.gguf"
+
+// The tolerance is written inline as f64of(0.00001) rather than held in a module
+// global. See fc_rope_cache: a module-level float global reaches an arithmetic
+// operand through a plain mov, so the comparison runs integer-style over bit
+// patterns.
+
+// The reference walks the pairs ONCE, accumulating theta exactly as the
+// definition says, and checks each pair as it goes.
+//
+// An earlier version recomputed `pow(10000000.0, -2/64)` on every call, from
+// inside ref_cos/ref_sin. Recomputing a scale 64 times per position accumulated
+// enough drift to fail one pair of 256 -- a failure in the TEST, not in the code
+// under test: the same values checked against a single-pass walk agree exactly.
+// A reference has to be as simple as the thing it checks, or it checks itself.
+fn ref_check(pos) {
+    let scale = pow(10000000.0, 0.0 - 2.0 / i2f(64))
+    let th: f64 = i2f(pos)
+    let pair = 0
+    while pair < 32 {
+        let gc = f64of(mem_load(fc_cos + pair * 8))
+        let gs = f64of(mem_load(fc_sin + pair * 8))
+        let wc = cos(th)
+        let ws = sin(th)
+        let dc = gc - wc
+        if dc < 0.0 { dc = 0.0 - dc }
+        let ds = gs - ws
+        if ds < 0.0 { ds = 0.0 - ds }
+        let eps: f64 = f64of(0.00001)
+    if dc >= eps || ds >= eps { print("FAIL rope pair"); return 1 }
+        th = th * scale
+        pair = pair + 1
+    }
+    return 0
+}
+
+// Named f64_close, NOT close: lib/std/fs.quanta already exports `fn close(fd)`, and
+// a user-defined function of the same name SHADOWS the stdlib one for every module
+// in scope -- the identical trap that math.quanta's ipow documents for pow.
+//
+// This cost real time. A helper called `close(a,b)` that returned `-> i64` was
+// silently calling the file-descriptor version, and it returned 0 for
+// close(0.0, 0.0) and -9 for close(1.0, 1.0): not wrong answers, but a
+// file-descriptor close's return value. Because every test imports std/fs, any
+// test helper may not be called close.
+fn f64_close(a: f64, b: f64) -> i64 {
+    let eps: f64 = f64of(0.00001)
+    let d: f64 = a - b
+    if d < 0.0 { d = 0.0 - d }
+    if d < eps { return 1 }
+    return 0
+}
+
+fn main() {
+    if gguf_load(MODEL) != 0 { print("FAIL gguf_load"); return 1 }
+    if fc_read_config() != 0 { print("FAIL fc_read_config"); return 1 }
+    if fc_head_dim != 64 { prints("FAIL head_dim="); print(fc_head_dim); return 1 }
+
+    // pos 0 is exactly the identity -- cos 1, sin 0 for every pair. This is the
+    // check that catches a cache left uninitialised or written with the wrong
+    // stride.
+    fc_rope_cache(0)
+    let i = 0
+    while i < fc_head_dim / 2 {
+        let c = f64of(mem_load(fc_cos + i * 8))
+        let s = f64of(mem_load(fc_sin + i * 8))
+        if c != 1.0 { prints("FAIL pos0 cos pair "); print(i); return 1 }
+        if s != 0.0 { prints("FAIL pos0 sin pair "); print(i); return 1 }
+        i = i + 1
+    }
+
+    // Four positions, all 32 pairs each, against the independently accumulated
+    // reference. Positions 1 and 2 are small so an off-by-one in the position is
+    // caught; 100 exercises several wraps of the theta progression.
+    let positions = [0, 1, 2, 100]
+    let p = 0
+    while p < 4 {
+        let pos = positions[p]
+        fc_rope_cache(pos)
+        if ref_check(pos) != 0 { return 1 }
+        p = p + 1
+    }
+
+    // theta_scale must be the real value, not the near-miss a broken read gives.
+    // 0.260893 is what an integer-interpreted base produces; 0.604296 is correct.
+    // Pair 0 at pos 1 has theta = 1, so cos is cos(1) regardless of the scale --
+    // pair 1 is the first that actually depends on it.
+    fc_rope_cache(1)
+    let c0 = f64of(mem_load(fc_cos))
+    if f64_close(c0, cos(1.0)) == 0 { print("FAIL pair0"); return 1 }
+
+    // ---- the APPLY step, which the cache checks above do not touch ----
+    //
+    // The pairing rule lives in fc_rope_apply, not in the cache: element p is
+    // paired with element p + head_dim/2 (half-split), never with p + 1. A test
+    // that only inspects the cos/sin cache cannot see that difference at all --
+    // verified: mutating the pairing to adjacent pairs left this test passing.
+    //
+    // The vector is v[0..32) = 0, v[32..64) = 1, so every output element is
+    // determined by exactly one cos/sin pair:
+    //
+    //     out[p]      = 0*cos - 1*sin = -sin(theta_p)
+    //     out[p + 32] = 0*sin + 1*cos =  cos(theta_p)
+    //
+    // Those expected values are read out of the reference cache below, NOT
+    // hand-written. Writing them by hand is what produced a wrong expectation
+    // here first time -- and the Python cross-check showed why it is wrong:
+    // adjacent-pairing on this vector gives out[0] = 0.000000, while half-split
+    // gives -0.656987. A hand-written constant that happened to match neither
+    // would have made the test fail for the right reason by accident.
+    let v = mem_alloc(64 * 8)
+    let j = 0
+    while j < 32 {
+        mem_store(v + j * 8, 0.0)
+        mem_store(v + (j + 32) * 8, 1.0)
+        j = j + 1
+    }
+
+    // pos 0 is the identity: nothing may move.
+    fc_rope_cache(0)
+    fc_rope_apply(v)
+    j = 0
+    while j < 64 {
+        let got = f64of(mem_load(v + j * 8))
+        let want = 0.0
+        if j >= 32 { want = 1.0 }
+        if f64_close(got, want) == 0 {
+            prints("FAIL apply pos0 j=")
+            print(j)
+            print(" got=")
+            pf64(got)
+            print(" want=")
+            pf64(want)
+            print(" ")
+            return 1
+        }
+        j = j + 1
+    }
+
+    // pos 7 against the reference cache, element by element.
+    fc_rope_cache(7)
+    let rc7 = mem_alloc(32 * 8)
+    let rs7 = mem_alloc(32 * 8)
+    j = 0
+    while j < 32 {
+        mem_store(rc7 + j * 8, f64of(mem_load(fc_cos + j * 8)))
+        mem_store(rs7 + j * 8, f64of(mem_load(fc_sin + j * 8)))
+        j = j + 1
+    }
+    fc_rope_apply(v)
+    j = 0
+    while j < 32 {
+        let lo = f64of(mem_load(v + j * 8))
+        let hi = f64of(mem_load(v + (j + 32) * 8))
+        let wc = f64of(mem_load(rc7 + j * 8))
+        let ws = f64of(mem_load(rs7 + j * 8))
+        // out[p] = -sin, out[p+32] = cos for the zero/one vector
+        if f64_close(lo, 0.0 - ws) == 0 { prints("FAIL apply lo "); print(j); return 1 }
+        if f64_close(hi, wc) == 0 { prints("FAIL apply hi "); print(j); return 1 }
+        // and the rotation preserves the pair's norm
+        let n2 = lo * lo + hi * hi
+        if f64_close(n2, 1.0) == 0 { prints("FAIL norm "); print(j); return 1 }
+        j = j + 1
+    }
+
+    print("OK rope")
+    return 0
+}

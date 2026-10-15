@@ -1,0 +1,36 @@
+// trig_test.quanta — 0.0.116 gate: sin/cos/tan x87 builtins (FIX-0.0.37 wiring).
+// Implemented since 0.0.103 but never gated. sin/cos/tan take and return the
+// f64 BIT-PATTERN as i64 (NOT int-in-int-out like fadd/fmul). We compare the
+// returned bit-pattern against libm reference values with a small ULP tolerance.
+// Any failure returns a distinct nonzero exit code identifying the check.
+
+// absolute difference of two i64 (safe for same-sign bit patterns = ULP distance)
+fn adiff(a, b) {
+  if a > b { return a - b }
+  return b - a
+}
+
+fn main() {
+  let TOL = 8   // allow up to 8 ULPs (x87 64-bit precision vs libm)
+
+  // sin(0) = 0.0 -> bits 0
+  if adiff(sin(i2f(0)), 0) > TOL { return 1 }
+  // cos(0) = 1.0 -> bits 4607182418800017408
+  if adiff(cos(i2f(0)), 4607182418800017408) > TOL { return 2 }
+  // tan(0) = 0.0 -> bits 0
+  if adiff(tan(i2f(0)), 0) > TOL { return 3 }
+
+  // sin(1) = 0.8414709848078965 -> bits 4605754516372524270
+  if adiff(sin(i2f(1)), 4605754516372524270) > TOL { return 4 }
+  // cos(1) = 0.5403023058681398 -> bits 4603041830072026764
+  if adiff(cos(i2f(1)), 4603041830072026764) > TOL { return 5 }
+  // tan(1) = 1.5574077246549023 -> bits 4609692760021066662
+  if adiff(tan(i2f(1)), 4609692760021066662) > TOL { return 6 }
+
+  // sin(2) = 0.9092974268256817 -> bits 4606365442650518598
+  if adiff(sin(i2f(2)), 4606365442650518598) > TOL { return 7 }
+  // cos(2) = -0.4161468365471424 -> bits -4622203781984849403
+  if adiff(cos(i2f(2)), 0 - 4622203781984849403) > TOL { return 8 }
+
+  return 0
+}

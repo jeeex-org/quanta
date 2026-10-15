@@ -1,0 +1,43 @@
+// 0.0.89 regression: bool / char / byte as type annotations.
+// - char and byte are byte-width (0..255) and must wrap on arithmetic,
+//   including when the result lands in an extended register (r8-r15).
+// - bool is a logical 0/1 type; arithmetic on bools is plain integer
+//   (true + true == 2), NOT width-masked to 0/1.
+fn main() {
+  // byte wrap
+  let b0: byte = 200
+  let b1: byte = 100
+  let bs = b0 + b1
+  if bs != 44 { exit(101) }            // 300 -> 44
+
+  // char wrap (same byte width as byte)
+  let c0: char = 200
+  let c1: char = 100
+  let cs = c0 + c1
+  if cs != 44 { exit(102) }            // 300 -> 44
+
+  // bool stored + compared
+  let t0: bool = 1
+  if t0 != 1 { exit(103) }
+
+  // bool arithmetic is integer (true + true == 2)
+  let t1: bool = 1
+  let t2: bool = 1
+  let ts = t1 + t2
+  if ts != 2 { exit(104) }
+
+  // bool wrap-class: mix a byte then a bool add (forces extended-register
+  // allocation so the byte mask must use REX.B)
+  let x: byte = 250
+  let y: byte = 10
+  let zs = x + y
+  if zs != 4 { exit(105) }             // 260 -> 4
+
+  // bool after the byte block (mixed-width, the originally-buggy layout)
+  let p: bool = 0
+  let q: bool = 1
+  let pq = p + q
+  if pq != 1 { exit(106) }
+
+  exit(7)                              // all correct
+}

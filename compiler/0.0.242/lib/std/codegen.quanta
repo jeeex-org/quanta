@@ -1,0 +1,61 @@
+// std/codegen.quanta - Code synthesizer for Quanta
+// Generates IR from patterns + spec
+
+module std_codegen;
+
+import std.ir;
+import std.types;
+import std.patterns;
+
+fn synthesize_function(spec) {
+    let ir = [];
+    
+    // Check spec type
+    let kind = spec["kind"];
+    
+    if kind == "const_fn" {
+        ir = pattern_const_fn(spec["name"], spec["value"]);
+    } else if kind == "identity" {
+        ir = pattern_identity_fn();
+    } else if kind == "binop" {
+        ir = pattern_binop(spec["op"], spec["a"], spec["b"], spec["result"]);
+    } else if kind == "compare" {
+        ir = pattern_compare(spec["cmp_op"], spec["a"], spec["b"], spec["result"]);
+    } else if kind == "call" {
+        ir = pattern_call(spec["fn"], spec["args"], spec["result"]);
+    } else if kind == "string" {
+        ir = pattern_string(spec["value"], spec["result"]);
+    } else if kind == "if_else" {
+        ir = pattern_if(spec["cond"], spec["then"], spec["else"], spec["result"]);
+    } else if kind == "loop" {
+        ir = pattern_loop(spec["body"], spec["cond"]);
+    } else if kind == "struct_field" {
+        ir = pattern_struct_field(spec["base"], spec["offset"], spec["result"]);
+    } else if kind == "array_index" {
+        ir = pattern_array_index(spec["base"], spec["index"], spec["elem_size"], spec["result"]);
+    } else if kind == "alloc" {
+        ir = pattern_alloc(spec["size"], spec["result"]);
+    } else if kind == "free" {
+        ir = pattern_free(spec["ptr"]);
+    } else {
+        // Unknown pattern - return empty
+        ir = [];
+    }
+    
+    return ir;
+}
+
+fn synthesize_module(specs) {
+    let module_ir = [];
+    let i = 0;
+    while i < specs.len() {
+        let fn_ir = synthesize_function(specs[i]);
+        module_ir.extend(fn_ir);
+        i = i + 1;
+    }
+    return module_ir;
+}
+
+fn init() -> i64 {
+    return 0;
+}

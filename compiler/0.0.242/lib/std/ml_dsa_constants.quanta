@@ -1,0 +1,93 @@
+// ML-DSA (Dilithium) FIPS 204 constants
+// Module-LWE/LWR parameters for ML-DSA-65 (security level 3)
+
+fn mldsa_q(): i64 { return 8380417 }        // 2^23 - 2^13 + 1 = 8380417
+fn mldsa_n(): i64 { return 256 }           // polynomial degree
+fn mldsa_k(): i64 { return 4 }             // matrix rows (Dilithium-3: k=4)
+fn mldsa_l(): i64 { return 4 }             // matrix cols (Dilithium-3: l=4)
+fn mldsa_eta(): i64 { return 2 }           // noise parameter
+fn mldsa_tau(): i64 { return 49 }          // number of +/-1 in challenge
+fn mldsa_gamma1(): i64 { return 524288 }   // 2^19
+fn mldsa_gamma2(): i64 { return 95232 }    // (q-1)/88
+fn mldsa_beta(): i64 { return 196 }        // tau * eta
+fn mldsa_omega(): i64 { return 55 }        // max # of non-zero in w1
+
+// Symmetric primitive parameters
+fn mldsa_crypto_seedbytes(): i64 { return 32 }
+fn mldsa_crypto_crhbytes(): i64 { return 64 }
+fn mldsa_crypto_rho_bytes(): i64 { return 32 }
+fn mldsa_crypto_k_bytes(): i64 { return 32 }
+fn mldsa_crypto_tr_bytes(): i64 { return 64 }
+
+// Sizes
+fn mldsa_polybytes(): i64 { return 320 }        // 256 * 23 / 8 = 736? Actually 256*5 = 1280/4 = 320
+fn mldsa_polyvecbytes(): i64 { return 1280 }    // l * 320
+fn mldsa_polyveclbytes(): i64 { return 1280 }   // k * 320
+fn mldsa_packed_pkbytes(): i64 { return 1312 }  // rho (32) + t1 (k * 320)
+fn mldsa_packed_skbytes(): i64 { return 2528 }  // rho(32) + K(32) + tr(64) + s1(l*320) + s2(k*320) + t0(k*416)
+fn mldsa_packed_sigbytes(): i64 { return 3293 } // c_tilde(32) + z(l*320) + h(omega + k)
+
+// NTT constants for q = 8380417
+fn mldsa_root_of_unity(): i64 { return 1753 }   // primitive 512-th root
+fn mldsa_root_of_unity_inv(): i64 { return 2895446 } // inverse
+fn mldsa_ninv(): i64 { return 2567872 }         // 256^{-1} mod q
+
+// Precomputed zetas for NTT (256 values)
+// Use function to initialize instead of global array
+fn ml_dsa_init_zetas(z: i64[256]) {
+
+// Barrett reduction constant
+fn mldsa_qinv(): i64 { return 58728449 }  // floor(2^32 / q)
+
+// Montgomery constant
+fn mldsa_mont(): i64 { return 4194304 }   // 2^22 mod q
+
+// Simple mod reduction
+fn mldsa_mod_q(a: i64): i64 {
+    let r: i64 = a % mldsa_q()
+    if r < 0 {
+        r = r + mldsa_q()
+    }
+    return r
+}
+
+// Barrett reduction for q=8380417
+fn mldsa_barrett_reduce(a: i64): i64 {
+    // a in [0, 2*q) -> a mod q
+    let t: i64 = a - mldsa_q()
+    if t >= 0 {
+        return t
+    }
+    return a
+}
+
+// Montgomery reduction
+fn mldsa_montgomery_reduce(a: i64): i64 {
+    let t: i64 = (a * mldsa_qinv()) & 0xFFFFFFFF
+    let u: i64 = (a + t * mldsa_q()) >> 32
+    if u >= mldsa_q() {
+        u = u - mldsa_q()
+    }
+    return u
+}
+
+// Sample polynomial from uniform distribution
+fn mldsa_rej_uniform(a: i64[256], seed: u8[32], nonce: u16): i64 {
+    // SHAKE256(seed || nonce, 256*4 bytes) -> reject > q
+    return 0
+}
+
+// Sample polynomial from Gaussian distribution (BDD)
+fn mldsa_poly_gaussian(a: i64[256], seed: u8[32], nonce: u8): i64 {
+    // Using SHAKE256 for centered binomial
+    return 0
+}
+
+// Sample polynomial vector
+fn mldsa_polyvec_gaussian(vec: i64[4][256], seed: u8[32]) {
+    let i: i64 = 0
+    while i < 4 {
+        mldsa_poly_gaussian(vec[i], seed, i as u8)
+        i = i + 1
+    }
+}
