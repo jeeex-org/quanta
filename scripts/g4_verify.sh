@@ -13,6 +13,15 @@ ulimit -c 0
 # "command not found" (rc 127) rather than the cache behaviour.
 Q=${QC:-/tmp/g4d/qc}
 case $Q in /*) ;; *) Q=$(cd "$(dirname "$Q")" 2>/dev/null && pwd)/$(basename "$Q") ;; esac
+# The qobj format version below is read from the SOURCE TREE OF THE COMPILER
+# UNDER TEST, not from whatever `cat VERSION` names. The gate hands a WIP
+# compiler via QC while root VERSION still names the previous stable, so reading
+# the VERSION tree compared the freshly written cache against a DIFFERENT
+# compiler's writer -- the same "tested a compiler nobody asked for" shape as
+# gguf_corrupt_gate.sh. Falls back to the VERSION tree when the handed compiler
+# has no source tree beside it (e.g. the /tmp default above).
+QROOT="${Q%/bin/x86/qc}"
+[ -f "$QROOT/src/x86/qobj_write.quanta" ] || QROOT="$REPO/compiler/$(cat "$REPO/VERSION")"
 W=/tmp/g4t
 PASS=0; FAIL=0
 chk(){ if [ "$2" = "$3" ]; then echo "  PASS $1 (=$3)"; PASS=$((PASS+1)); else echo "  FAIL $1 (want $2 got $3)"; FAIL=$((FAIL+1)); fi; }
@@ -39,7 +48,7 @@ chk "3 caches written" 3 "$(ls lib/std/*.qobj 2>/dev/null | wc -l)"
 # module taking an f64 param -- fails loudly here.
 # Take the number AFTER the comma -- grepping all digits would match the 4 in
 # "hdr + 4" first and yield 4, not the version.
-WVER=$(grep -oE 'w32\(hdr \+ 4, [0-9]+\)' "$REPO/compiler/$(cat "$REPO/VERSION")/src/x86/qobj_write.quanta" | head -1 | grep -oE '[0-9]+\)$' | tr -d ')')
+WVER=$(grep -oE 'w32\(hdr \+ 4, [0-9]+\)' "$QROOT/src/x86/qobj_write.quanta" | head -1 | grep -oE '[0-9]+\)$' | tr -d ')')
 CVER=$(python3 -c "
 import struct;d=open('lib/std/agg.qobj','rb').read();print(struct.unpack_from('<i',d,4)[0])")
 chk "cache version matches writer" "$WVER" "$CVER"

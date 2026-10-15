@@ -68,7 +68,7 @@ echo ""
 echo "--- GUARD 1: x86 self-host fixed-point ---"
 STAGE1="/tmp/promo_stage1_$$.bin"
 STAGE2="/tmp/promo_stage2_$$.bin"
-STABLE_QC="./compiler/$(cat VERSION)/bin/x86/qc"
+STABLE_QC="${QC:-./compiler/$(cat VERSION)/bin/x86/qc}"
 
 echo "Building stage1 from current stable ($(cat VERSION))..."
 run_cmd "$STABLE_QC $WIP_SRC $STAGE1 2>/dev/null" || fail "stage1 build failed"
@@ -90,7 +90,7 @@ COMPILE_FAIL=0
 while IFS=$'\t' read -r name expected; do
     src="test_suites/codes/$name"
     out="$PROMO_RT_DIR/bin/${name%.quanta}"
-    if ! ./compiler/$(cat VERSION)/bin/x86/qc "$WIP_SRC" "$out" --target=arm64 2>/dev/null; then
+    if ! $STABLE_QC "$WIP_SRC" "$out" --target=arm64 2>/dev/null; then
         echo "FAILCOMPILE $name"
         COMPILE_FAIL=$((COMPILE_FAIL + 1))
     fi
@@ -153,7 +153,7 @@ echo "--- Build fresh binaries from promoted source ---"
 mv "$WIP_SRC" "$PROMO_SRC"
 
 # Build x86 using stable
-run_cmd "./compiler/$(cat VERSION)/bin/x86/qc $PROMO_SRC $X86_BIN 2>/dev/null" || fail "x86 final build failed"
+run_cmd "$STABLE_QC $PROMO_SRC $X86_BIN 2>/dev/null" || fail "x86 final build failed"
 # Build ARM using fresh x86 (cross)
 run_cmd "./$X86_BIN $PROMO_SRC $ARM_BIN --target=arm64 2>/dev/null" || fail "ARM cross build failed"
 

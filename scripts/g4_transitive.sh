@@ -7,6 +7,11 @@ V=$(cat "$REPO/VERSION")
 ulimit -c 0
 Q=${QC:-}
 case $Q in /*) ;; *) Q=$(cd "$(dirname "$Q")" 2>/dev/null && pwd)/$(basename "$Q") ;; esac
+# Same rule as g4_verify.sh: read the qobj writer's declared version from the
+# SOURCE TREE OF THE COMPILER UNDER TEST (QC), not from `cat VERSION` -- a WIP
+# gate hands a compiler that VERSION does not name yet.
+QROOT="${Q%/bin/x86/qc}"
+[ -f "$QROOT/src/x86/qobj_write.quanta" ] || QROOT="$REPO/compiler/$(cat "$REPO/VERSION")"
 W=/tmp/g4trans
 PASS=0; FAIL=0
 chk(){ if [ "$2" = "$3" ]; then echo "  PASS $1 (=$3)"; PASS=$((PASS+1)); else echo "  FAIL $1 (want $2 got $3)"; FAIL=$((FAIL+1)); fi; }
@@ -25,7 +30,7 @@ chk "cache written" 0 "$([ -f lib/std/top.qobj ] && echo 0 || echo 1)"
 # rather than a literal, so a format bump is not a false failure.
 # Take the number AFTER the comma -- grepping all digits would match the 4 in
 # "hdr + 4" first and yield 4, not the version.
-WVER=$(grep -oE 'w32\(hdr \+ 4, [0-9]+\)' "$REPO/compiler/$(cat "$REPO/VERSION")/src/x86/qobj_write.quanta" | head -1 | grep -oE '[0-9]+\)$' | tr -d ')')
+WVER=$(grep -oE 'w32\(hdr \+ 4, [0-9]+\)' "$QROOT/src/x86/qobj_write.quanta" | head -1 | grep -oE '[0-9]+\)$' | tr -d ')')
 CVER=$(python3 -c "
 import struct;print(struct.unpack_from('<i',open('lib/std/top.qobj','rb').read(),4)[0])")
 chk "version matches writer" "$WVER" "$CVER"

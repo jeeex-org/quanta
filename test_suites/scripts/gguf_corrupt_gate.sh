@@ -19,7 +19,17 @@ set -u
 
 # scripts/ lives two levels below the repo root, not one.
 REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
-QC="$REPO/compiler/$(cat "$REPO/VERSION")/bin/x86/qc"
+# Honour the compiler this script is HANDED (the gate passes QC=...), and fall
+# back to the VERSION tree only when none is given.
+#
+# WHY (the defect): resolving from `cat VERSION` unconditionally means the gate
+# got a compiler nobody asked for. A WIP gate runs with QC=compiler/<NEXT>/...
+# while root VERSION still names the previous stable <VER>, so the probe below
+# was compiled by the OLD qc -- a qc that predates the std/gguf change under
+# test -- and the stage went RED with `undeclared function: dq6` until VERSION
+# was bumped. Same bug class as every other stage in run_tests.sh, which all do
+# QC="${QC:-...}"; this was the one that did not.
+QC="${QC:-$REPO/compiler/$(cat "$REPO/VERSION")/bin/x86/qc}"
 MODEL="/opt/ai/models/quanta/QUANTA-LFM2.5-2.6Bv1-Q4_K_M.gguf"
 OUT=/tmp/quanta_corrupt
 GEN="$REPO/scripts/audit/gen_corrupt_gguf.py"
