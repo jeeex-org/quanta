@@ -244,3 +244,43 @@ Next-use eviction policy (phase 3 of `docs/plans/performance.md`). Not started.
 | `docs/research/let-scope-inventory.md` | A1b migration inventory |
 | `benchmarks/` | 37 benchmark twins (Quanta + C) |
 | `benchmarks/BENCHMARK.md` | Benchmark results tables |
+
+---
+
+## 6. Findings after this table (added on review)
+
+**A5 is latent, not absent.** `IR_FREE = 37` frees an `mem_alloc`-owned binding at scope end
+(`globals.quanta:29`, emitted per owned vreg at `features.quanta:24`), so a loop body's allocation IS
+freed each iteration. What prevents the next iteration clobbering it is that `mem_alloc` never reuses
+a freed block - and the emitter says so as a deliberate deferral: `emitter.quanta:1980`
+"(Deferred reuse: mem_alloc left UNCHANGED to keep emitted bytes stable -> fixpoint-safe.)". So the
+0.0.235 probe read 111 back because reuse does not exist yet, not because the hazard does not.
+Holding an owned pointer past its scope exit is already a use-after-free that the bump allocator
+masks; landing the deferred reuse turns it into silent aliasing. `codegen.quanta:2741` already warns
+of "double-free -> aliased-block". Allocate-up-front is the correct pattern, not a workaround.
+
+**Defects found after this report was written** (all measured, all in `docs/plans/bugs.md` or the
+version WIPs):
+
+- **A9** - per-matvec thread spawn leaked a 1 MiB child stack per call (2329 clones/forward = 2.33 GB);
+  ENOMEM on the main thread, `exit(1)` not `exit_group`, so the process reported **rc=0**. Fixed 0.0.239.
+- **`lib/std/sampling.quanta`** - the "softmax" was `1+(v-max)` (a one-hot), and `sample_draw`
+  compared `cumsum*1000` against an rng in [0,2^31) - never true, always index 0, and token 0 is ten
+  newlines. That is where the whitespace output came from. Top-k went from O(n^2) (110,080 ms at
+  n=128000) to 60 ms. Fixed 0.0.240.
+- **`lib/std/lfm2_chat.quanta`** - `chat_build` wrote a literal backslash-n and a mis-transcribed
+  thinking tag; the driver used `bpe_encode` (no special-token matching) and no BOS. With those fixed
+  it reproduces llama.cpp's `/tokenize` byte-for-byte (23 ids). Fixed 0.0.240.
+- **`lib/std/rag.quanta`** - did not compile at all (`undeclared variable: config` + SIGILL), used a
+  non-existent `sqlite3` CLI, and assumed `exec()` returns (it is `execve` and replaces the image).
+- **Open:** a top-level `const` with a float initialiser evaluates to 0; `tokenizer_trait.quanta`
+  still calls `bpe_encode`; native logits are flatter than the reference (p('The') 0.251 vs 0.847,
+  1/10 top ids shared, argmax agrees) with the unchecked Q6_K output projection as prime suspect.
+
+**Native inference measurements (the half this report was missing)**, all measured at 0.0.239/0.240:
+decode **0.126 tok/s** at 20 workers (16.20 -> 10.10 s/token at 8 workers, 12.29 -> 7.70 at 20, a
+~1.6x gain from routing `dequant_q4k` through SIMD `dq32lo`/`dq32hi`, with the full 128,000-element
+logits vector **byte-identical** to before); prefill **5,968 ms per prompt token** (one unbatched
+forward per token - the binding constraint for the SI loop); RSS 141-180 MB under a 4 GiB cap;
+fixpoint `6f83fe08a7f8819a725fe50c81680ef1`; `verify-release.sh` 14 passed / 0 failed. For scale,
+llama-server on a LARGER 7.5B model measured 8.24 tok/s on this CPU: the native path is ~65x off.
