@@ -68,10 +68,18 @@ DONE            (rc=0, RSS 181612 kB = 177 MB)
 | `sample_full` at n_vocab=128000, k=40 | **62-79 ms** (top-k is 60 ms of it) |
 | RSS | 165-181 MB (under the 8 GB cap) |
 
-Both sampled rows are REAL TEXT. The temp 0.7 row stops after one word because the
-native distribution is flatter than llama.cpp's (see the end of this file) — that is the
-OLD behaviour, EOS a live candidate. The A/B section below reruns the same config with the
-EOS policy on and gets 8 tokens.
+Both sampled rows are REAL TEXT. The temp 0.7 row stopped after one word because the
+native distribution was flatter than llama.cpp's — and that flatness was itself a DEFECT,
+now FIXED (the per-layer attn_q_norm/attn_k_norm were never reloaded; see
+`docs/research/lfm2-perlayer-norm-defect.md`). So this table is OLD behaviour, EOS a live
+candidate.
+
+**Post-fix the same conf no longer stops at EOS: it runs the full max_new=24.** Measured on
+0.0.241 post-fix, `bash tests/run_lfm2_generate.sh`, conf `20 24 700 40 12345 1 0`:
+`The user asks: "What is 2+2? Answer with the number only." The user wants a specific format`,
+`new_tokens=24` (no EOS), `prefill_ms_per_tok=5577`, `gen_ms_per_token=7352`, `DONE rc=0`.
+The A/B block below is that same conf's PRE-fix run (8 tokens, ended at EOS), kept as
+before-the-fix evidence.
 
 **Which binary produced the text: the tracked driver**, `tests/lfm2_generate.quanta`.
 The same text was reproduced by the scratch probe `stage1/bin/sp_ids_lowt` with the same
