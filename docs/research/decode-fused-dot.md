@@ -4,7 +4,7 @@ Status: in progress, 0.0.245, lib/std + tests ownership only (compiler/** untouc
 Goal handed down: decode at >= 15 tok/s (<= 66 ms/token) on
 QUANTA-LFM2.5-2.6Bv1-Q4_K_M.gguf, validated by large-scale end-to-end runs.
 
-## 0. The verified premise (bytes/element arithmetic, from the file itself)
+## 0. The verified premise -- CORRECTED (the 36 GB/s envelope was invalid)
 
 Parsed straight from the GGUF header (266 tensors, GGUF v3):
 
@@ -13,16 +13,22 @@ Parsed straight from the GGUF header (266 tensors, GGUF v3):
   2.4351G elements = 1.4512 GB of weight bytes read per token**
 - dtype split of that per-token work: Q4_K 1.766G elems (72.5%),
   Q6_K 669M elems (27.5%), F32 norm/conv tails ~10M
-- token_embd (Q6_K, 262.1M) is looked up once per token (1 row), not matvec'd
 
-Arithmetic of the target:
+**RETRACTION (owner-confirmed):** the original premise anchored "15 tok/s is
+inside the demonstrated ~36 GB/s envelope" on llama.cpp serving GG4-E4B -- a
+7.5B MoE whose per-token streaming touches only its active experts (~4B of
+7.5B), so total-file-size x tok/s does NOT measure its streaming rate. The
+sound reference is llama.cpp on THIS exact model, measured here:
 
-- 15 tok/s => 66 ms/token => weight streaming 1.4512 GB / 0.066 s = **22.0 GB/s**
-  (plus KV reads), against the llama.cpp-proven envelope of ~36 GB/s on this box
-  (7.5B model at 8.24 tok/s). The bandwidth premise HOLDS.
-- compute side: 2.4351G element-ops / 0.066 s = **36.9 G elem/s**. Across 20 cores
-  that is 1.84 G elem/s/core = **0.66-0.84 cycles/element** at the powersave clock
-  (2.2-2.8 GHz). That is llama.cpp-class hand-written-AVX2 territory.
+> **llama.cpp, QUANTA-LFM2.5-2.6Bv1-Q4_K_M.gguf, this box, CPU-only, 20
+> threads, greedy, 300 generated tokens: 17.32 tok/s sustained decode**
+> (prompt eval 59.6 tok/s; load 1.57 -> 4.55, governor powersave;
+> /opt/ai/llama.cpp/build/bin/llama-server, /completion, ignore_eos).
+
+The 15 tok/s target therefore sits just BELOW the same-model llama.cpp rate
+(87% of it). The native loader measured 0.286 tok/s (20 workers) -> the honest
+gap to close is **60x**, and the campaign deliverable is the measured absolute
+rate plus per-lever relative gains, with 17.3 tok/s as the reference point.
 
 ## 1. The measured wall (why lib/std alone cannot reach 15)
 
@@ -129,6 +135,45 @@ inside a single 20-worker run's reach (projected 15-25 tok/s including KV and
 attention). Verification requirements are the ones q6k-simd-dequant.md
 established: objdump cross-check of every byte, bit-identity against the
 scalar row for the DEQUANTISED VALUES, and the argmax oracle end-to-end.
+
+## 3b. The measured end-to-end results and the pool-scaling ceiling
+
+All numbers from tests/lfm2_decode_bench.quanta / tests/lfm2_dispatch_bench.quanta,
+argmax temp=0, 20 workers except where stated, load 8-12, governor powersave,
+the `Hermes` desktop holding ~580-750% CPU throughout (baseline condition):
+
+| configuration | s/token | tok/s | first argmax | VmPeak/token |
+|---|---:|---:|---:|---:|
+| old pread path, 1 worker (serial truth) | 17.9 | 0.056 | 597 | -- |
+| old pread path, 20 workers | 3.83 | 0.261 | 597 | +12.8 MB |
+| mmap + norm cache, 20 workers (this campaign) | **3.49** | **0.286** | **597** (identical) | +1.47 MB |
+| llama.cpp same model/box, 20 threads | 0.058 | **17.32** | -- | -- |
+
+- Argmax and generated text are IDENTICAL between old and mmap paths
+  (`The answer is 4 ... 4<|im_end|>` on the current reference prompt; the
+  first-token argmax on this prompt is 597 on both paths -- the 5922 figure in
+  older docs predates the current prompt file).
+- The old pread path SIGBUSes (rc=136) on the third reset/prefill cycle in one
+  process; the mmap path survived all cycles. VmPeak leaks 12.8 MB/token on
+  the old path (reproduces peer commit e0d766f6) vs 1.47 MB/token with mmap --
+  better but still growing; open item, allocator-side.
+
+**The pool-scaling ceiling** (tests/lfm2_dispatch_bench, attn_k [512x2048]
+per call): serial 8.54 ms -> nw=2 4.75 -> nw=4 3.18 -> nw=8 1.93 -> nw=12
+1.82 -> nw=16 1.61 -> nw=20 1.6-2.1 ms. Parallel scaling SATURATES at ~5.3x;
+going from 8 to 20 workers gains ~nothing. Per shape at nw=20: gate
+[10752x2048] 25.4 ms, down [2048x10752] 18.7 ms -- in-situ slices run ~2.3x
+slower than the isolated microbench rates (20-way concurrent weight
+streaming), plus ~1.2-1.7 ms fixed dispatch cost per matvec. The complete
+model (sum of measured per-dispatch times: 30 layers x (25.4+25.4+18.7+~12+
+~5.2 ms) + 8 attention branches + embed ~175 ms) predicts 3.0-3.2 s/token
+against 3.49 measured. 18 core-seconds of serial work at a 5.3x scaling cap
+= 3.4 s/token: **the pool scaling cap, not the op rates alone, is the second
+wall** (the first is the per-element dequant+dot cost, section 1). Reaching
+15 tok/s needs BOTH the fused register-resident builtin AND a dispatch
+rework (fewer, larger work units -- e.g. fusing the independent gate+up
+matvecs into one job, or a per-layer mega-job), which is compiler/lib design
+work beyond this unit's ownership.
 
 ## 4. Measurement contract (this campaign)
 
