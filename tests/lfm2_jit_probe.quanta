@@ -1,0 +1,136 @@
+// tests/lfm2_jit_probe.quanta -- IS A JIT FUSED KERNEL REACHABLE FROM lib/std?
+//
+// The blocking question for the whole campaign: mmap_file supports arbitrary
+// PROT bits (lib/std/fs.quanta:137), so bytes can in principle be made
+// executable -- but only useful if they can be CALLED. There is no
+// `call_ptr(a,n)` builtin, so the only indirect-call mechanism in the language
+// is CLOSURE_CALL: codegen.quanta:2577 emits
+//
+//     mov rdx,[rax]      ; rdx = tuple[0] = codeptr (64-bit load)
+//     mov r10,[rax+8]    ; r10 = tuple[1] = env
+//     mov r11, rdx
+//     <args -> rdi,rsi,rdx,rcx,r8,r9>
+//     call r11
+//
+// That is EXACTLY an indirect call through a runtime address. So if we can
+// build, in ordinary memory, a 16-byte "tuple" whose [0] is the address of
+// freshly emitted bytes, then closure_call(tuple, args...) executes them.
+//
+// Three sub-questions, each answered by a RUNNING PROGRAM, not by reading the
+// compiler (author's rule: verify, never assume):
+//
+//   Q1. Does closure_call through a HAND-BUILT tuple work at all?
+//       Build tuple = [fnptr(mm_row_bytes) codeptr, 0] by hand and compare the
+//       result to the direct call. Isolates the tuple mechanism from mmap.
+//   Q2. Does a writable+executable mapping succeed and accept stubs?
+//       Writing bytes into it and reading them back must agree, or the mapping
+//       is not what we asked for.
+//   Q3. Do our OWN newly emitted bytes actually EXECUTE?
+//       `mov eax,imm32; ret` returning a distinctive value. That value can only
+//       be produced by the CPU fetching from the fresh page.
+//
+// A yes to all three means the fused dequant-dot kernel can be assembled
+// byte-by-byte at runtime and called -- WITHOUT touching compiler/**.
+import std/fs
+import std/lfm2_mm
+
+// Build a closure tuple [codeptr, env] pointing at `dst`, then call it.
+// Tuple is 2 qwords. Returns the callee's rax.
+fn jit_call(dst: i64, a0: i64, a1: i64) -> i64 {
+    let t = mem_alloc(2)
+    mem_store(t, dst)
+    mem_store(t + 8, 0)
+    return closure_call(t, a0, a1)
+}
+
+fn main() -> i64 {
+    prints("=== JIT reachability probe (0.0.245) ===\n")
+
+    // ---- Q1: hand-built closure tuple over a REAL function -----------------
+    // mm_row_bytes(dtype, ncols) is the row-stride helper that the whole
+    // matvec path depends on. Pure, no globals, 2 args: a perfect oracle.
+    let fp = fnptr(mm_row_bytes)
+    let cptr = mem_load(fp)
+    prints("Q1 fnptr tuple ptr = "); print(fp); prints("  [0]=code="); print(cptr)
+    prints("  [1]=env="); print(mem_load(fp + 8)); newline()
+    if cptr == 0 { prints("Q1 FAIL: fnptr produced a null code pointer\n"); return 1 }
+
+    let direct = mm_row_bytes(12, 2048)
+    let indirect = jit_call(cptr, 12, 2048)
+    prints("Q1 direct   mm_row_bytes(12,2048) = "); print(direct); newline()
+    prints("Q1 via tuple closure_call(...)    = "); print(indirect); newline()
+    if direct != indirect {
+        prints("Q1 FAIL: indirect call disagrees with direct -- no JIT route\n")
+        return 1
+    }
+    prints("Q1 PASS: hand-built tuple indirect call works and agrees\n")
+
+    // ---- Q2: writable + executable mapping ---------------------------------
+    let sz = 65536
+    // prot request is done inside mmap_file via our own wrapper; request RWX.
+let rx = mmap_file(0, sz, 7, 34, 0 - 1, 0)
+    prints("Q2 mmap RWX(7) anon -> "); print(rx); newline()
+    if rx <= 0 {
+        prints("Q2 NOTE: RWX anon gave "); print(rx); prints("; trying RW then mprotect\n")
+    }
+    let have = 0
+    if rx > 0 { have = 1 }
+    if have == 0 {
+        prints("Q2 FAIL: no usable mapping\n")
+        return 1
+    }
+
+    // Writable? Store distinctive bytes at four offsets and read them back.
+    let off = 0
+    while off < 64 {
+        mem_store8(rx + off, 0x90 + (off - (off / 16) * 16))
+        off = off + 1
+    }
+    let bad = 0
+    off = 0
+    while off < 64 {
+        let got = mem_load8(rx + off)
+        let want = 0x90 + (off - (off / 16) * 16)
+        if got != want { bad = bad + 1 }
+        off = off + 1
+    }
+    prints("Q2 byte mismatches over 64 bytes = "); print(bad); newline()
+    if bad != 0 { prints("Q2 FAIL: mapping is not writable\n"); return 1 }
+    prints("Q2 PASS: mapping is writable\n")
+
+    // ---- Q3: do our own emitted bytes execute? ------------------------------
+    // mov eax, imm32 (B8) ; ret (C3)  -> returns imm32, sign-extended to i64.
+    // Emit 8 stubs, each returning a different distinctive value.
+    let v = 0
+    while v < 8 {
+        let at = rx + 256 + v * 16
+        let want = 1000000 + v
+        // B8 <imm32>
+        mem_store8(at, 184)
+        // four immediate bytes, little-endian, written one byte at a time
+        let k = 0
+        while k < 4 {
+            let sh = k * 8
+            // want >> (k*8) & 0xff : use div/mod since shifts may trap
+            let dv = want
+            let m = 0
+            while m < k {
+                dv = dv / 256
+                m = m + 1
+            }
+            let bv = dv - (dv / 256) * 256
+            mem_store8(at + 1 + k, bv)
+            k = k + 1
+        }
+        mem_store8(at + 5, 195)
+        let got = jit_call(at, 0, 0)
+        prints("Q3 stub "); print(v); prints(" -> "); print(got)
+        prints(" (want "); print(want); prints(")")
+        if got != want { prints("  FAIL\n"); return 1 }
+        prints("  ok\n")
+        v = v + 1
+    }
+    prints("Q3 PASS: 8 runtime-emitted stubs executed with correct returns\n")
+    prints("RESULT: JIT REACHABLE -- rows fused as emitted bytes are callable\n")
+    return 0
+}
