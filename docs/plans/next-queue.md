@@ -133,3 +133,20 @@ spill counts. 37 of 38 cases emit **byte-identical code** under 0.0.243 vs 0.0.2
 `regpressure` (one of the three that changed) went 401 -> 381 instructions (-5.0 %) and 259 -> 239 home mem-ops.
 Meanwhile 36 byte-identical rows swung **-12.5 % to +20.0 %** in wall time, and the same binary gave `heavy_div2`
 32.85x at load 17-20 and 21.68x at load 12 — so instruction/frame/spill counts are the evidence and ratios are not.
+
+## Port debt — never re-do shipped work
+
+Rule (author directive, 2026-10-16): finished, proven work must never live only in an
+unpromoted WIP tree. When a version is held back as WIP, its proven changes are PORT
+DEBT: record them here, port them into the next promoted version, and delete the entry
+when ported. Every session start checks for unpromoted WIP trees under compiler/.
+
+Outstanding:
+- compiler/0.0.242/ (WIP, commit f40e37da): A5 P2 auto-free — the FIXED detector
+  (parse-side, ~:1430-1443), corrected IR_FREE handler/encoding, and parse_ret ordering
+  are implemented and proven by disassembly, but NOT in the promoted line (0.0.243,
+  0.0.244 and 0.0.245 were all cut from 0.0.241). ACTION: port into the next compiler
+  version (0.0.246) and reconcile against the 365 emitter lines changed since (Q6_K
+  SIMD, A4 eviction, 0.0.245 store-on-use). Acceptance evidence:
+  docs/research/a22-mem-alloc-escape-audit.md + a22-escape-audit.py (the analyzer is
+  the spec; 564-row lib/std table).
