@@ -263,12 +263,21 @@ fn fc_short_conv(L, x: u64, state: u64, out: u64) {
     // Reading it as (k*dm + c) -- channel-major, stride 2048 -- gives the right
     // answer only for channel 0 and the wrong tap for every other channel, which
     // flattens the logits and changes the argmax.
+    // With the cache active the kernel comes straight from fc_nc_conv (same
+    // read_tensor_f64 bytes, read once); otherwise it is re-read per call.
+    let kwptr = 0
+    if fc_nc_ready != 0 {
+        kwptr = fc_nc_conv + L * kw * dm * 8
+    } else {
+        if mm_load_small(cwt, kw * dm, fc_sc_kw) != kw * dm { return -1 }
+        kwptr = fc_sc_kw
+    }
     let c = 0
     while c < dm {
         let acc: f64 = 0.0
         let k = 0
         while k < kw {
-            let w = f64of(mem_load(fc_sc_kw + (c * kw + k) * 8))
+            let w = f64of(mem_load(kwptr + (c * kw + k) * 8))
             acc = acc + w * f64of(mem_load(fc_sc_bx + (k * dm + c) * 8))
             k = k + 1
         }
@@ -820,6 +829,54 @@ fn fc_fw_reset() {
 }
 
 // One layer. `pos` is the sequence position (drives RoPE and the KV append).
+// ---- opt-in static caches: norms + conv kernels ----------------------------
+//
+// fc_layer re-reads attn_norm and ffn_norm and fc_short_conv re-reads the conv
+// kernel on EVERY layer of EVERY token: 30*2 + 22 = 82 read_tensor_f64 calls
+// (pread + convert) per decode token for values that never change. fc_cache_norms()
+// materialises all of them once (~2.5 MB). Opt-in: until a caller invokes it,
+// every path below behaves exactly as before (bit-identical by construction --
+// same tensors, same read_tensor_f64, just earlier).
+let fc_nc_ready = 0
+let fc_nc_attn = 0    // attn_norm per layer:  fc_nc_attn + L * dm * 8
+let fc_nc_ffn = 0     // ffn_norm per layer:   fc_nc_ffn  + L * dm * 8
+let fc_nc_embd = 0    // token_embd_norm
+let fc_nc_conv = 0    // conv kernel per layer: fc_nc_conv + L * kw * dm * 8
+
+fn fc_cache_norms() -> i64 {
+    if fc_nc_ready != 0 { return 0 }
+    if fc_ready == 0 { return -1 }
+    let dm = fc_d_model
+    let kw = fc_conv_width
+    let nl = fc_n_layers
+    if dm <= 0 || kw <= 0 || nl <= 0 { return -1 }
+    let base = mem_alloc((2 * nl + 1) * dm * 8 + nl * kw * dm * 8 + 64)
+    if base == 0 { return -1 }
+    fc_nc_attn = base
+    fc_nc_ffn = base + nl * dm * 8
+    fc_nc_embd = base + 2 * nl * dm * 8
+    fc_nc_conv = base + (2 * nl + 1) * dm * 8
+    let L = 0
+    while L < nl {
+        let an = lfm2_attn_norm(L)
+        let fnt = lfm2_ffn_norm(L)
+        if an < 0 || fnt < 0 { return -1 }
+        if read_tensor_f64(an, fc_nc_attn + L * dm * 8) < 0 { return -1 }
+        if read_tensor_f64(fnt, fc_nc_ffn + L * dm * 8) < 0 { return -1 }
+        if lfm2_layer_is_attn(L) == 0 {
+            let cwt = lfm2_conv_conv(L)
+            if cwt < 0 { return -1 }
+            if read_tensor_f64(cwt, fc_nc_conv + L * kw * dm * 8) < 0 { return -1 }
+        }
+        L = L + 1
+    }
+    let on = lfm2_token_embd_norm()
+    if on < 0 { return -1 }
+    if read_tensor_f64(on, fc_nc_embd) < 0 { return -1 }
+    fc_nc_ready = 1
+    return 0
+}
+
 fn fc_layer(L, pos, inp: u64, out: u64) -> i64 {
     let dm = fc_d_model
     let dff = fc_d_ff
@@ -829,10 +886,17 @@ fn fc_layer(L, pos, inp: u64, out: u64) -> i64 {
     if an < 0 { return -1 }
     // lfm2_attn_norm returns a TENSOR INDEX; fc_rms_norm wants a POINTER.
     // Passing the index straight through dereferences a low address and faults.
-    // read_tensor_f64 materialises it once, into the shared scratch.
+    // read_tensor_f64 materialises it once, into the shared scratch -- or, when
+    // fc_cache_norms() has run, the pointer is the cached copy itself.
     if fc_fw_normbuf == 0 { fc_fw_normbuf = mem_alloc(2 * dm * 8) }
-    if read_tensor_f64(an, fc_fw_normbuf) < 0 { return -1 }
-    if fc_rms_norm(fc_fw_n, inp, fc_fw_normbuf, dm) != 0 { return -1 }
+    let nrm = 0
+    if fc_nc_ready != 0 {
+        nrm = fc_nc_attn + L * dm * 8
+    } else {
+        if read_tensor_f64(an, fc_fw_normbuf) < 0 { return -1 }
+        nrm = fc_fw_normbuf
+    }
+    if fc_rms_norm(fc_fw_n, inp, nrm, dm) != 0 { return -1 }
 
     // ---- branch: short conv or attention ----
     //
@@ -864,8 +928,14 @@ fn fc_layer(L, pos, inp: u64, out: u64) -> i64 {
     // ---- ffn pre-norm ----
     let fnt = lfm2_ffn_norm(L)
     if fnt < 0 { return -1 }
-    if read_tensor_f64(fnt, fc_fw_normbuf) < 0 { return -1 }
-    if fc_rms_norm(fc_fw_n, fc_fw_x, fc_fw_normbuf, dm) != 0 { return -1 }
+    let fnrm = 0
+    if fc_nc_ready != 0 {
+        fnrm = fc_nc_ffn + L * dm * 8
+    } else {
+        if read_tensor_f64(fnt, fc_fw_normbuf) < 0 { return -1 }
+        fnrm = fc_fw_normbuf
+    }
+    if fc_rms_norm(fc_fw_n, fc_fw_x, fnrm, dm) != 0 { return -1 }
 
     // ---- ffn: down(silu(gate(x)) * up(x)) ----
     let gt = lfm2_ffn_gate(L)
@@ -948,8 +1018,14 @@ fn fc_forward_token_body(tok: i64, pos: i64, want_logits: i64) -> i64 {
     // final norm: token_embd_norm (NOT output_norm -- see the note above)
     let on = lfm2_token_embd_norm()
     if on < 0 { return -1 }
-    if read_tensor_f64(on, fc_fw_normbuf) < 0 { return -1 }
-    if fc_rms_norm(fc_fw_n, src, fc_fw_normbuf, dm) != 0 { return -1 }
+    let onrm = 0
+    if fc_nc_ready != 0 {
+        onrm = fc_nc_embd
+    } else {
+        if read_tensor_f64(on, fc_fw_normbuf) < 0 { return -1 }
+        onrm = fc_fw_normbuf
+    }
+    if fc_rms_norm(fc_fw_n, src, onrm, dm) != 0 { return -1 }
 
     // TIED output projection: logits = token_embd @ normed. Over the full
     // vocabulary this is 128000 rows per token, which dominates generation, so

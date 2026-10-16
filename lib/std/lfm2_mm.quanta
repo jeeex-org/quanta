@@ -237,7 +237,11 @@ fn mm_matvec_par(idx: u64, x: u64, rows: i64, cols: i64, y: u64, nworkers: i64) 
     let r = 0
     while r < rows { mem_store(y + r * 8, 0.0); r = r + 1 }
 
-    pl_kind = 0
+    // kind 4 = the mmap row path (bit-identical to kind 0, no pread): used only
+    // when mm_attach_mmap() has mapped the file and the dtype is one the raw
+    // dequantiser supports (Q4_K / Q6_K -- the only matvec dtypes in this model).
+    let mmdt = gguf_tensor_dtype(idx)
+    if mm_map_base != 0 && (mmdt == 12 || mmdt == 14) { pl_kind = 4 } else { pl_kind = 0 }
     pl_idx = idx
     pl_x = x
     pl_rows = rows
@@ -665,7 +669,9 @@ fn mm_embed_logits_par(idx: u64, x: u64, v0: i64, vcount: i64, ncols: i64, y: u6
 
     // job descriptor for the shared pool worker (module-level; the driver fills
     // it BEFORE the generation bump, and the fence in pl_submit orders the two)
-    pl_kind = 1
+    // kind 5 = mmap embed path: same left-to-right scalar dot (bit-identical),
+    // rows read straight from the mapping.
+    if mm_map_base != 0 && gguf_tensor_dtype(idx) == 14 { pl_kind = 5 } else { pl_kind = 1 }
     pl_idx = idx
     pl_x = x
     pl_v0 = v0
@@ -768,8 +774,10 @@ fn mm_scratch_new(maxcols) {
     while c < maxcols { c = c * 2 }
     let raw = mem_alloc(c * 2 + 4096)
     let f64b = mem_alloc(c * 8)
-    // dot needs 32 bytes: 4 accumulator lanes + 1 temporary
-    let acc = mem_alloc(64)
+    // 512 bytes: mm_dot4_s needs 64 (4 lanes + tmp at +32); mm_dot8_s needs 128
+    // (8 lanes at +0..63, 8 temps at +64..127). One region serves both -- only
+    // one dot runs at a time per cell.
+    let acc = mem_alloc(512)
     let cell = mem_alloc(24)
     mem_store(cell, raw)
     mem_store(cell + 8, f64b)
@@ -962,6 +970,8 @@ fn pl_run(t: i64, cell) {
     if pl_kind == 1 { return pl_run_embed(t, cell) }
     if pl_kind == 2 { return pl_run_mm(t, cell) }
     if pl_kind == 3 { return pl_run_embed_b(t, cell) }
+    if pl_kind == 4 { return pl_run_rows_map(t, cell) }
+    if pl_kind == 5 { return pl_run_embed_map(t, cell) }
     return pl_run_rows(t, cell)
 }
 
@@ -1214,4 +1224,244 @@ fn mm_pool_ensure(n: i64, maxcols: i64) {
     }
     pl_size = n
     return 0
+}
+
+// ===========================================================================
+// FULL-FILE WEIGHT MMAP + RAW-ROW PATHS (kind 4 / kind 5)
+// ===========================================================================
+//
+// WHY: the pread path costs a syscall + a page-cache copy per row -- ~300k
+// preads per decode token at ~0.5 ns/element (measured, tests/lfm2_op_profile).
+// One full-file mapping at offset 0 (page-aligned by definition, unlike
+// gguf_data_start) turns every row into a pointer read. Bit-exactness: the
+// bytes are the same bytes, the dequant calls below are the SAME dq32lo/dq32hi
+// and dq6 calls with the SAME scale association as gguf.quanta's
+// dequant_q4k / dequant_q6k, and the dot stays mm_dot4_s -- so the output is
+// bit-identical to the pread path, which the dot bench asserts row by row.
+//
+// gguf_tensor_offset(idx) is a PUBLIC fn in gguf.quanta (used by
+// gguf_read_tensor_bytes_at for its pread), so the raw address of row r of
+// tensor idx is mm_map_base + gguf_tensor_offset(idx) + r * row_bytes.
+let mm_map_base = 0
+let mm_map_size = 0
+let mm_map_fd = 0 - 1
+
+// Map the whole GGUF at offset 0, PROT_READ | MAP_PRIVATE, then prefault it
+// with MADV_POPULATE_READ (22) so the first token does not eat 400k page
+// faults. TAKES AN FD, NOT A PATH: an untyped path parameter loses its string
+// type in transit (defect A7, measured in tests/lfm2_generate.quanta) and
+// file_open would return -1 for a file that plainly exists. The caller opens
+// with the const STRAIGHT at the call site: mm_attach_mmap_fd(file_open(PATH, 0)).
+// Idempotent. 0 on success, -1 on failure (callers fall back to pread).
+fn mm_attach_mmap_fd(fd: i64) -> i64 {
+    if mm_map_base != 0 { return 0 }
+    if fd < 0 { return -1 }
+    let sz = file_size(fd)
+    if sz <= 0 { return -1 }
+    let base = mmap_file(0, sz, 1, 2, fd, 0)
+    if base <= 0 { return -1 }
+    syscall(28, base, sz, 22, 0, 0, 0)
+    mm_map_base = base
+    mm_map_size = sz
+    mm_map_fd = fd
+    return 0
+}
+
+fn mm_detach_mmap() {
+    if mm_map_base != 0 { munmap_file(mm_map_base, mm_map_size) }
+    if mm_map_fd >= 0 { file_close(mm_map_fd) }
+    mm_map_base = 0
+    mm_map_size = 0
+    mm_map_fd = 0 - 1
+    return 0
+}
+
+// Dequantise one row straight from raw bytes into dst, BIT-IDENTICAL to
+// read_block_f64 for dtype 12 (Q4_K) and 14 (Q6_K). The code shape is copied
+// from gguf.quanta's dequant_q4k / dequant_q6k (which are what
+// read_block_f64 dispatches to): same f16 loads, same q4k_sc/q4k_min unpack,
+// same d1/mm1 association, same dq32lo/dq32hi / dq6 calls.
+// Returns 0 on success, -1 on an unsupported dtype or a non-multiple block.
+fn mm_deq_row_raw(dtype, raw: u64, elems: i64, dst: u64) -> i64 {
+    if dtype == 12 {
+        if elems <= 0 || elems - (elems / 256) * 256 != 0 { return -1 }
+        let nb = elems / 256
+        let bi = 0
+        while bi < nb {
+            let bo = bi * 144
+            let d = f16_to_f64(raw + bo)
+            let dmin = f16_to_f64(raw + bo + 2)
+            let sc = raw + bo + 4
+            let q = raw + bo + 16
+            let chunk = 0
+            let is = 0
+            while chunk < 4 {
+                let s0 = q4k_sc(is, sc)
+                let m0 = q4k_min(is, sc)
+                let s1 = q4k_sc(is + 1, sc)
+                let m1 = q4k_min(is + 1, sc)
+                let d1 = fmul(d, i2f(s0))
+                let mm1 = fmul(dmin, i2f(m0))
+                let d2 = fmul(d, i2f(s1))
+                let mm2 = fmul(dmin, i2f(m1))
+                let op = dst + (bi * 256 + chunk * 64) * 8
+                dq32lo(op, q, f64bits(d1), f64bits(mm1))
+                dq32hi(op + 256, q, f64bits(d2), f64bits(mm2))
+                q = q + 32
+                is = is + 2
+                chunk = chunk + 1
+            }
+            bi = bi + 1
+        }
+        return 0
+    }
+    if dtype == 14 {
+        if elems <= 0 || elems - (elems / 256) * 256 != 0 { return -1 }
+        let nb = elems / 256
+        let bi = 0
+        while bi < nb {
+            let bo = bi * 210
+            let d = f16_to_f64(raw + bo + 208)
+            let dbits = f64bits(d)
+            let n = 0
+            while n < 2 {
+                dq6(dst + (bi * 256 + n * 128) * 8, raw + bo + n * 64, raw + bo + 128 + n * 32, dbits, raw + bo + 192 + n * 8)
+                n = n + 1
+            }
+            bi = bi + 1
+        }
+        return 0
+    }
+    return -1
+}
+
+// Pool kind 4 worker: static row slice, raw pointer per row, NO pread, NO
+// shared rowbuf. Same partition rule, same dequant, same mm_dot4_s (or
+// mm_dot8_s when mm_dot_multi is set -- NOT bit-identical, opt-in) as kind 0.
+fn pl_run_rows_map(t: i64, cell) {
+    let per = pl_rows / pl_nw
+    let lo = t * per
+    let hi = lo + per
+    if t == pl_nw - 1 { hi = pl_rows }
+    if hi > pl_rows { hi = pl_rows }
+    let dtype = gguf_tensor_dtype(pl_idx)
+    let rb = mm_row_bytes(dtype, pl_cols)
+    if rb <= 0 { return -1 }
+    let toff = gguf_tensor_offset(pl_idx)
+    let f64b = mem_load(cell + 8)
+    let acc = mem_load(cell + 16)
+    let r = lo
+    while r < hi {
+        let raw = mm_map_base + toff + r * rb
+        if mm_deq_row_raw(dtype, raw, pl_cols, f64b) != 0 { return -1 }
+        if mm_dot_multi != 0 {
+            mem_store(pl_y + r * 8, mm_dot8_s(f64b, pl_x, pl_cols, acc))
+        } else {
+            mem_store(pl_y + r * 8, mm_dot4_s(f64b, pl_x, pl_cols, acc))
+        }
+        r = r + 1
+    }
+    return hi - lo
+}
+
+// Pool kind 5 worker: the tied output projection (embed logits) from the
+// mapping. The dot is the SAME left-to-right scalar accumulation as
+// pl_run_embed -- bit-identical by construction. When mm_dot_multi is set it
+// uses mm_dot8_s instead, which CHANGES THE LOGIT BITS and is therefore
+// opt-in and argmax-validated (see docs/research/decode-fused-dot.md).
+fn pl_run_embed_map(t: i64, cell) {
+    let per = pl_vcount / pl_nw
+    let lo = t * per
+    let hi = lo + per
+    if t == pl_nw - 1 { hi = pl_vcount }
+    if hi > pl_vcount { hi = pl_vcount }
+    let dtype = gguf_tensor_dtype(pl_idx)
+    let rb = mm_row_bytes(dtype, pl_ncols)
+    if rb <= 0 { return -1 }
+    let toff = gguf_tensor_offset(pl_idx)
+    let f64b = mem_load(cell + 8)
+    let v = lo
+    while v < hi {
+        let raw = mm_map_base + toff + (pl_v0 + v) * rb
+        if mm_deq_row_raw(dtype, raw, pl_ncols, f64b) != 0 { return -1 }
+        let acc: f64 = 0.0
+        let c = 0
+        if mm_dot_multi != 0 {
+            mem_store(pl_y + (pl_v0 + v) * 8, mm_dot8_s(f64b, pl_x, pl_ncols, mem_load(cell + 16)))
+        } else {
+            while c < pl_ncols {
+                acc = acc + f64of(mem_load(f64b + c * 8)) * f64of(mem_load(pl_x + c * 8))
+                c = c + 1
+            }
+            mem_store(pl_y + (pl_v0 + v) * 8, acc)
+        }
+        v = v + 1
+    }
+    return hi - lo
+}
+
+// ---- 8-lane interleaved dot -----------------------------------------------
+//
+// mm_dot4_s is ONE store-to-load-forward chain: every iteration's faddf stores
+// the accumulator and the next iteration loads it back (~6 cycles of latency
+// per 4 elements, fully serial). Measured 2.73 ns/element. Eight independent
+// accumulator lanes break the chain: each lane's next dependency is 8
+// iterations away, so the add/mul pipeline drains instead of stalling. The g
+// chain is written STRAIGHT-LINE (no inner loop) because a Quanta-level loop
+// costs more in interpreter-loop overhead than the 2 builtin calls it wraps.
+//
+// THIS IS NOT BIT-IDENTICAL to mm_dot4_s: a different summation order (8
+// partial lanes vs 4). Gated behind mm_dot_multi (default 0 = old bits) and
+// validated against the argmax oracle before any measured run enables it.
+let mm_dot_multi = 0
+
+fn mm_set_dot_multi(n) {
+    mm_dot_multi = n
+    return 0
+}
+
+// acc layout: 8 lanes at acc+0..63, 8 temps at acc+64..127 (inside the 512 B
+// scratch region mm_scratch_new allocates).
+fn mm_dot8_s(a: u64, b: u64, n: i64, acc) -> f64 {
+    mem_store(acc, 0.0)
+    mem_store(acc + 8, 0.0)
+    mem_store(acc + 16, 0.0)
+    mem_store(acc + 24, 0.0)
+    mem_store(acc + 32, 0.0)
+    mem_store(acc + 40, 0.0)
+    mem_store(acc + 48, 0.0)
+    mem_store(acc + 56, 0.0)
+
+    let c = 0
+    while c + 32 <= n {
+        fmulf_avx2(acc + 64, a + c * 8, b + c * 8)
+        faddf_avx2(acc, acc, acc + 64)
+        fmulf_avx2(acc + 72, a + (c + 4) * 8, b + (c + 4) * 8)
+        faddf_avx2(acc + 8, acc + 8, acc + 72)
+        fmulf_avx2(acc + 80, a + (c + 8) * 8, b + (c + 8) * 8)
+        faddf_avx2(acc + 16, acc + 16, acc + 80)
+        fmulf_avx2(acc + 88, a + (c + 12) * 8, b + (c + 12) * 8)
+        faddf_avx2(acc + 24, acc + 24, acc + 88)
+        fmulf_avx2(acc + 96, a + (c + 16) * 8, b + (c + 16) * 8)
+        faddf_avx2(acc + 32, acc + 32, acc + 96)
+        fmulf_avx2(acc + 104, a + (c + 20) * 8, b + (c + 20) * 8)
+        faddf_avx2(acc + 40, acc + 40, acc + 104)
+        fmulf_avx2(acc + 112, a + (c + 24) * 8, b + (c + 24) * 8)
+        faddf_avx2(acc + 48, acc + 48, acc + 112)
+        fmulf_avx2(acc + 120, a + (c + 28) * 8, b + (c + 28) * 8)
+        faddf_avx2(acc + 56, acc + 56, acc + 120)
+        c = c + 32
+    }
+    // pairwise reduction of the 8 lanes
+    let s0: f64 = f64of(mem_load(acc)) + f64of(mem_load(acc + 8))
+    let s1: f64 = f64of(mem_load(acc + 16)) + f64of(mem_load(acc + 24))
+    let s2: f64 = f64of(mem_load(acc + 32)) + f64of(mem_load(acc + 40))
+    let s3: f64 = f64of(mem_load(acc + 48)) + f64of(mem_load(acc + 56))
+    let total: f64 = (s0 + s1) + (s2 + s3)
+    let t: f64 = total
+    while c < n {
+        t = t + f64of(mem_load(a + c * 8)) * f64of(mem_load(b + c * 8))
+        c = c + 1
+    }
+    return t
 }

@@ -1,0 +1,346 @@
+// tests/lfm2_decode_bench.quanta -- LARGE-SCALE end-to-end decode bench.
+//
+// WHY THIS EXISTS: the metric that matters is tokens/second over LONG
+// generations, not per-op microbenches. This driver runs the full
+// prefill -> KV-cached decode -> argmax pipeline at several generation
+// lengths in ONE process, reporting per-run tok/s, ms/token (min/median/max),
+// RSS (total + anonymous) at run start and end, and the generated token ids +
+// text so the argmax oracle can be diffed mechanically between builds.
+//
+// It is the measurement contract of docs/research/decode-fused-dot.md:
+//   - run lengths default 128 / 512 / 1024 (conf fields 2-4)
+//   - temp = 0 ALWAYS (argmax, deterministic, the oracle path)
+//   - RSS from /proc/self/statm (total) and /proc/self/smaps_rollup (Rss/Anon);
+//     anon RSS must be flat across 100+ tokens (the A9/A21 leak class)
+//   - the tied output projection and every matvec go through whatever the
+//     lib/std flags select; the flags are conf fields so ONE binary measures
+//     before AND after:
+//       field 5 use_mmap      (mm_attach_mmap + pool kinds 4/5)
+//       field 6 cache_norms   (fc_cache_norms)
+//       field 7 dot_multi     (mm_dot8_s -- NOT bit-identical, argmax-validated)
+//   - workers use mm_set_workers_uncapped: this is an attended benchmark that
+//     deliberately takes more than the polite 8-worker ceiling; the run script
+//     refuses to start while a peer model process is alive.
+//
+// Conf tests/lfm2_decode_bench.conf:
+//   "<workers> <len1> <len2> <len3> <use_mmap> <cache_norms> <dot_multi>"
+// Prompt: tests/lfm2_prompt.txt (the reference oracle prompt: first-token
+// argmax must be 5922; the known-good generation is `The answer is: 2<|im_end|>`).
+import std/gguf
+import std/lfm2_forward
+import std/lfm2_model
+import std/lfm2_mm
+import std/lfm2_bpe
+import std/lfm2_chat
+import std/fs
+
+const Q4_PATH = "/opt/ai/models/quanta/QUANTA-LFM2.5-2.6Bv1-Q4_K_M.gguf"
+const CONF_PATH = "tests/lfm2_decode_bench.conf"
+const PROMPT_PATH = "tests/lfm2_prompt.txt"
+const CAP = 16384
+const NCTX = 2048
+const MAXTOK = 1200
+
+let plen = 0
+
+fn slurp(fd) {
+    if fd < 0 { return 0 }
+    let b = mem_alloc(CAP)
+    let got = read_raw(fd, b, CAP)
+    file_close(fd)
+    if got <= 0 { return 0 }
+    plen = got
+    return b
+}
+
+fn parse_ints(buf, out) {
+    let n = 0
+    let cur = 0
+    let have = 0
+    let i = 0
+    while mem_load8(buf + i) != 0 {
+        let c = mem_load8(buf + i)
+        if c >= 48 && c <= 57 {
+            cur = cur * 10 + (c - 48)
+            have = 1
+        } else {
+            if have == 1 {
+                if n < 8 { mem_store(out + n * 8, cur) }
+                n = n + 1
+                cur = 0
+                have = 0
+            }
+        }
+        i = i + 1
+    }
+    if have == 1 { if n < 8 { mem_store(out + n * 8, cur) }; n = n + 1 }
+    return n
+}
+
+fn as_str(raw, n) {
+    let s = mem_alloc(n + 16)
+    mem_store(s, n)
+    let i = 0
+    while i < n { mem_store8(s + 8 + i, mem_load8(raw + i)); i = i + 1 }
+    mem_store8(s + 8 + n, 0)
+    return s
+}
+
+// ---- RSS ------------------------------------------------------------------
+// Total resident set from /proc/self/statm (field 2, pages), returned in kB.
+fn rss_total_kb() -> i64 {
+    let fd = file_open("/proc/self/statm", 0)
+    if fd < 0 { return 0 - 1 }
+    let b = mem_alloc(256)
+    let got = read_raw(fd, b, 255)
+    file_close(fd)
+    if got <= 0 { return 0 - 1 }
+    mem_store8(b + got, 0)
+    // skip field 1 (size), parse field 2 (resident)
+    let i = 0
+    while i < got && mem_load8(b + i) != 32 { i = i + 1 }
+    while i < got && mem_load8(b + i) == 32 { i = i + 1 }
+    let v = 0
+    while i < got && mem_load8(b + i) >= 48 && mem_load8(b + i) <= 57 {
+        v = v * 10 + (mem_load8(b + i) - 48)
+        i = i + 1
+    }
+    return v * 4
+}
+
+// One kB figure out of /proc/self/smaps_rollup by 4-char tag ("Rss:" / "Anon").
+fn rollup_kb(c0, c1, c2, c3) -> i64 {
+    let fd = file_open("/proc/self/smaps_rollup", 0)
+    if fd < 0 { return 0 - 1 }
+    let b = mem_alloc(4096)
+    let got = read_raw(fd, b, 4095)
+    file_close(fd)
+    if got <= 0 { return 0 - 1 }
+    let i = 0
+    while i + 4 < got {
+        if mem_load8(b + i) == c0 && mem_load8(b + i + 1) == c1 && mem_load8(b + i + 2) == c2 && mem_load8(b + i + 3) == c3 {
+            let j = i + 4
+            while j < got && mem_load8(b + j) != 0 && (mem_load8(b + j) < 48 || mem_load8(b + j) > 57) { j = j + 1 }
+            let v = 0
+            while j < got && mem_load8(b + j) >= 48 && mem_load8(b + j) <= 57 {
+                v = v * 10 + (mem_load8(b + j) - 48)
+                j = j + 1
+            }
+            return v
+        }
+        i = i + 1
+    }
+    return 0 - 1
+}
+
+// insertion sort of the first n entries of buf (i64 ms values), in place
+fn sort_i64(buf, n) {
+    let i = 1
+    while i < n {
+        let v = mem_load(buf + i * 8)
+        let j = i - 1
+        while j >= 0 {
+            let u = mem_load(buf + j * 8)
+            if u > v {
+                mem_store(buf + (j + 1) * 8, u)
+                j = j - 1
+            } else {
+                break
+            }
+        }
+        mem_store(buf + (j + 1) * 8, v)
+        i = i + 1
+    }
+    return 0
+}
+
+fn main() {
+    prints("=== lfm2 decode bench ===\n")
+    let cfgb = slurp(file_open(CONF_PATH, 0))
+    let conf = mem_alloc(64)
+    let nw = 20
+    let len1 = 128
+    let len2 = 512
+    let len3 = 1024
+    let usemap = 1
+    let cachen = 1
+    let dmulti = 0
+    if cfgb != 0 {
+        let nf = parse_ints(cfgb, conf)
+        if nf >= 1 { nw = mem_load(conf) }
+        if nf >= 2 { len1 = mem_load(conf + 8) }
+        if nf >= 3 { len2 = mem_load(conf + 16) }
+        if nf >= 4 { len3 = mem_load(conf + 24) }
+        if nf >= 5 { usemap = mem_load(conf + 32) }
+        if nf >= 6 { cachen = mem_load(conf + 40) }
+        if nf >= 7 { dmulti = mem_load(conf + 48) }
+    } else {
+        prints("warn: conf unreadable; defaults\n")
+    }
+    prints("conf: workers="); print(nw)
+    prints(" lens="); print(len1); prints("/"); print(len2); prints("/"); print(len3)
+    prints(" mmap="); print(usemap)
+    prints(" cache_norms="); print(cachen)
+    prints(" dot_multi="); print(dmulti)
+    prints(" (argmax temp=0)\n")
+
+    let t0 = clock()
+    if gguf_load(Q4_PATH) != 0 { prints("FAIL gguf_load\n"); return 1 }
+    if fc_read_config() != 0 { prints("FAIL fc_read_config\n"); return 1 }
+    if bpe_init_from_gguf() == 0 { prints("FAIL bpe_init\n"); return 1 }
+    if fc_kv_init(NCTX) != 0 { prints("FAIL fc_kv_init\n"); return 1 }
+    if fc_fw_init() != 0 { prints("FAIL fc_fw_init\n"); return 1 }
+    mm_set_workers_uncapped(nw)
+    mm_set_embed_workers_uncapped(nw)
+    if usemap != 0 {
+        if mm_attach_mmap_fd(file_open(Q4_PATH, 0)) != 0 { prints("FAIL mm_attach_mmap (continuing on pread)\n") }
+    }
+    if cachen != 0 {
+        if fc_cache_norms() != 0 { prints("FAIL fc_cache_norms\n"); return 1 }
+    }
+    mm_set_dot_multi(dmulti)
+    prints("load_ms="); print((clock() - t0) / 1000000)
+    prints(" mmap_base="); print(mm_map_base); newline()
+
+    // ---- prompt (identical construction to tests/lfm2_generate.quanta) ----
+    let rawprompt = slurp(file_open(PROMPT_PATH, 0))
+    if rawprompt == 0 { prints("FAIL read prompt\n"); return 1 }
+    let user = as_str(rawprompt, plen)
+    let pb = mem_alloc(CAP)
+    let pbytes = chat_build(0, user, pb)
+    let ids = mem_alloc(8192 * 8)
+    mem_store(ids, bpe_bos)
+    let n = bpe_encode_special(pb, pbytes, ids + 8, 8000) + 1
+    prints("prompt_ids="); print(n)
+    prints(" (bos="); print(bpe_bos); prints(")\n")
+    if n <= 1 { prints("FAIL encode\n"); return 1 }
+    if n + len3 + 8 >= NCTX { prints("FAIL prompt+gen exceeds NCTX\n"); return 1 }
+
+    let outbuf = mem_alloc(4096)
+    let prbuf = mem_alloc(16384)     // text print buffer (outbuf is only 4 KB)
+    let text = mem_alloc(262144)     // generated text, printed AFTER timing
+    let tlen = 0
+    let idbuf = mem_alloc((MAXTOK + 16) * 8)
+    let nid = 0
+    let dur = mem_alloc((MAXTOK + 16) * 8)
+    let srt = mem_alloc((MAXTOK + 16) * 8)
+
+    // Hold the worker pool across ALL runs: fc_forward_token_ex brackets each
+    // call with begin/end, so without this outer bracket the pool would be torn
+    // down and respawned for every token (the A9 leak class, paid per token).
+    mm_pool_begin()
+
+    // ---- three runs, reset between ----
+    let run = 1
+    while run <= 3 {
+        let gl = len1
+        if run == 2 { gl = len2 }
+        if run == 3 { gl = len3 }
+        if fc_fw_reset() != 0 { prints("FAIL reset\n"); return 1 }
+
+        let tp0 = clock()
+        let i = 0
+        while i < n {
+            let want = 0
+            if i == n - 1 { want = 1 }
+            if fc_forward_token_ex(mem_load(ids + i * 8), i, want) != 0 { prints("FAIL prefill\n"); return 1 }
+            i = i + 1
+        }
+        let tp1 = clock()
+
+        let rss0 = rss_total_kb()
+        let anon0 = rollup_kb(65, 110, 111, 110)    // "Anon"
+        let g0 = clock()
+        let pos = n
+        let k = 0
+        let tk = 0
+        let lastid = 0 - 1
+        while k < gl {
+            let ts = clock()
+            let id = fc_argmax(fc_n_vocab)
+            if tk == 0 { lastid = id }
+            // detokenise into the text buffer; NO terminal IO inside the loop
+            let bl = bpe_decode_token(id, outbuf)
+            let b = 0
+            while b < bl {
+                mem_store8(text + tlen, mem_load8(outbuf + b))
+                tlen = tlen + 1
+                b = b + 1
+            }
+            if tk < gl + 16 { mem_store(idbuf + nid * 8, id); nid = nid + 1 }
+            if tk < gl + 16 { mem_store(dur + tk * 8, clock() - ts) }
+            tk = tk + 1
+            if id == bpe_eos {
+                mem_store8(text + tlen, 10)
+                tlen = tlen + 1
+                break
+            }
+            k = k + 1
+            if k >= gl { break }
+            if fc_forward_token_ex(id, pos, 1) != 0 { prints("FAIL decode\n"); break }
+            pos = pos + 1
+            if tk % 128 == 0 {
+                let a = rollup_kb(65, 110, 111, 110)
+                prints("rss@"); print(tk); prints(" anon_kb="); print(a); newline()
+            }
+        }
+        let g1 = clock()
+        let rss1 = rss_total_kb()
+        let anon1 = rollup_kb(65, 110, 111, 110)
+
+        // ---- report ----
+        prints("---run"); print(run); prints("---\n")
+        prints("gen_tokens="); print(k)
+        prints(" iters="); print(tk)
+        prints(" first_argmax_id="); print(lastid)
+        prints(" eos_id="); print(bpe_eos); newline()
+        prints("prefill_ms="); print((tp1 - tp0) / 1000000)
+        prints(" prefill_ms_per_tok="); print((tp1 - tp0) / 1000000 / n); newline()
+        prints("gen_ms="); print((g1 - g0) / 1000000); newline()
+        if (g1 - g0) > 0 {
+            prints("tok_per_s_x1000="); print(k * 1000000000000 / (g1 - g0)); newline()
+            prints("ms_per_token_x100="); print((g1 - g0) / (k * 10000)); newline()
+        }
+        // per-token distribution over the FULL iterations (exclude none: the
+        // last iteration has no forward, as in tests/lfm2_generate.quanta)
+        let m = 0
+        while m < tk && m < gl + 16 {
+            mem_store(srt + m * 8, mem_load(dur + m * 8) / 1000000)
+            m = m + 1
+        }
+        sort_i64(srt, m)
+        if m > 0 {
+            prints("tok_ms_min="); print(mem_load(srt))
+            prints(" med="); print(mem_load(srt + (m / 2) * 8))
+            prints(" max="); print(mem_load(srt + (m - 1) * 8)); newline()
+        }
+        prints("rss_kb_start="); print(rss0)
+        prints(" end="); print(rss1)
+        prints(" delta_kb="); print(rss1 - rss0); newline()
+        prints("anon_kb_start="); print(anon0)
+        prints(" end="); print(anon1)
+        prints(" delta_kb="); print(anon1 - anon0); newline()
+        run = run + 1
+    }
+
+    mm_pool_end()
+    mm_detach_mmap()
+    prints("---generated ids (first 24)---\n")
+    let q = 0
+    while q < nid && q < 24 {
+        print(mem_load(idbuf + q * 8)); prints(" ")
+        q = q + 1
+    }
+    newline()
+    prints("---generated text---\n")
+    let w = 0
+    while w < tlen && w < 16383 {
+        mem_store8(prbuf + w, mem_load8(text + w))
+        w = w + 1
+    }
+    mem_store8(prbuf + w, 0)
+    print(prbuf, w)
+    newline()
+    prints("DONE\n")
+    return 0
+}

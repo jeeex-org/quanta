@@ -1,0 +1,367 @@
+// tests/lfm2_dot_bench.quanta -- per-op microbench for the decode levers.
+//
+// Measures, on the model's REAL tensors, in ONE serial process (mm_workers=0,
+// so a number is one core's truth and is unaffected by pool scheduling):
+//
+//   DEQ_PREAD  mm_load_row        (syscall + page-cache copy + dequant)
+//   DEQ_MMAP   mm_deq_row_raw     (pointer read + dequant, same dq32/dq6 calls)
+//   DOT4       mm_dot4_s          (the current 4-lane single-chain dot)
+//   DOT8       mm_dot8_s          (8 interleaved lanes -- different summation
+//                                  order, so its numeric delta is also reported)
+//   MATVEC     full serial matvec, old path vs mmap+DOT4 vs mmap+DOT8
+//   EMBED      output-projection window: serial scalar dot vs mmap+DOT8
+//
+// AND asserts the bit-identity the whole campaign rests on: the mmap dequant
+// must produce f64-bit-identical rows to the pread path (mm_load_row), row for
+// row, on both dtypes. If that ever fails, nothing built on kind 4/5 is valid.
+//
+// Build:  qc tests/lfm2_dot_bench.quanta <bin>
+// Run:    ( ulimit -c 0 -v 8000000; <bin> </dev/null )   from the repo root
+import std/gguf
+import std/lfm2_forward
+import std/lfm2_model
+import std/lfm2_mm
+import std/lfm2_bpe
+import std/fs
+
+const Q4_PATH = "/opt/ai/models/quanta/QUANTA-LFM2.5-2.6Bv1-Q4_K_M.gguf"
+const NCTX = 2048
+
+let sink = 0.0
+
+// best-of-3 wall ns for `reps` calls of fn-shaped work is expressed inline at
+// each site (Quanta has no closures); every site below follows the same shape.
+
+fn main() {
+    prints("=== lfm2 dot bench (serial) ===\n")
+    if gguf_load(Q4_PATH) != 0 { prints("FAIL gguf_load\n"); return 1 }
+    if fc_read_config() != 0 { prints("FAIL fc_read_config\n"); return 1 }
+    if bpe_init_from_gguf() == 0 { prints("FAIL bpe_init\n"); return 1 }
+    if fc_kv_init(NCTX) != 0 { prints("FAIL fc_kv_init\n"); return 1 }
+    if fc_fw_init() != 0 { prints("FAIL fc_fw_init\n"); return 1 }
+    if fc_fw_reset() != 0 { prints("FAIL fc_fw_reset\n"); return 1 }
+    mm_set_workers(0)
+    mm_set_embed_workers(0)
+    if mm_attach_mmap_fd(file_open(Q4_PATH, 0)) != 0 { prints("FAIL mm_attach_mmap\n"); return 1 }
+
+    let dm = fc_d_model
+    let dff = fc_d_ff
+    let tg = lfm2_ffn_gate(0)      // [2048, 10752] Q4_K -> rows 10752, cols 2048
+    let td = lfm2_ffn_down(0)      // [10752, 2048] Q6_K -> rows 2048, cols 10752
+    let te = lfm2_token_embd()     // [128000, 2048] Q6_K
+    if tg < 0 || td < 0 || te < 0 { prints("FAIL tensor idx\n"); return 1 }
+    prints("gate_idx="); print(tg); prints(" down_idx="); print(td)
+    prints(" embd_idx="); print(te); newline()
+
+    // activation vectors
+    let x_dm = mem_alloc(dm * 8)
+    let x_dff = mem_alloc(dff * 8)
+    let i = 0
+    while i < dm { mem_store(x_dm + i * 8, i2f((i * 37) % 101 - 50) / i2f(71)); i = i + 1 }
+    i = 0
+    while i < dff { mem_store(x_dff + i * 8, i2f((i * 53) % 127 - 63) / i2f(91)); i = i + 1 }
+
+    let rowq4 = mem_alloc(16384)    // dequantised row scratch, Q4_K side
+    let rowq6 = mem_alloc(65536)    // dequantised row scratch, Q6_K side
+    let rowalt = mem_alloc(65536)
+    let acc = mem_alloc(512)
+    let y = mem_alloc(10752 * 8)
+    let y2 = mem_alloc(10752 * 8)
+
+    // ---- 1. bit-identity: mmap dequant vs pread dequant --------------------
+    let mism = 0
+    let checked = 0
+    i = 0
+    while i < 64 {
+        if mm_load_row(tg, i, dm) != 0 { prints("FAIL pread row\n"); return 1 }
+        let rawp = mm_map_base + gguf_tensor_offset(tg) + i * mm_row_bytes(12, dm)
+        if mm_deq_row_raw(12, rawp, dm, rowalt) != 0 { prints("FAIL raw deq\n"); return 1 }
+        let c = 0
+        while c < dm {
+            if mem_load(mm_rowbuf + c * 8) != mem_load(rowalt + c * 8) { mism = mism + 1 }
+            checked = checked + 1
+            c = c + 1
+        }
+        i = i + 1
+    }
+    prints("BITIDENT_Q4K pread_vs_mmap: mismatches="); print(mism)
+    prints(" / "); print(checked); newline()
+
+    mism = 0
+    checked = 0
+    i = 0
+    while i < 32 {
+        if mm_load_row(td, i, dff) != 0 { prints("FAIL pread row q6\n"); return 1 }
+        let rawp = mm_map_base + gguf_tensor_offset(td) + i * mm_row_bytes(14, dff)
+        if mm_deq_row_raw(14, rawp, dff, rowalt) != 0 { prints("FAIL raw deq q6\n"); return 1 }
+        let c = 0
+        while c < dff {
+            if mem_load(mm_rowbuf + c * 8) != mem_load(rowalt + c * 8) { mism = mism + 1 }
+            checked = checked + 1
+            c = c + 1
+        }
+        i = i + 1
+    }
+    prints("BITIDENT_Q6K pread_vs_mmap: mismatches="); print(mism)
+    prints(" / "); print(checked); newline()
+
+    // ---- 2. per-row dequant cost: pread vs mmap ----------------------------
+    // Q4_K row (2048 elems)
+    let best = 0
+    let rep = 0
+    while rep < 3 {
+        let t0 = clock()
+        let k = 0
+        while k < 512 { sink = sink + i2f(mm_load_row(tg, k, dm)); k = k + 1 }
+        let dt = clock() - t0
+        if best == 0 || dt < best { best = dt }
+        rep = rep + 1
+    }
+    prints("DEQ_PREAD_Q4K_2048: ns_per_row="); print(best / 512)
+    prints(" ns_per_elem_x100="); print(best / (512 * dm) * 100); newline()
+
+    best = 0
+    rep = 0
+    while rep < 3 {
+        let t0 = clock()
+        let k = 0
+        while k < 512 {
+            let rawp = mm_map_base + gguf_tensor_offset(tg) + k * mm_row_bytes(12, dm)
+            sink = sink + i2f(mm_deq_row_raw(12, rawp, dm, rowq4))
+            k = k + 1
+        }
+        let dt = clock() - t0
+        if best == 0 || dt < best { best = dt }
+        rep = rep + 1
+    }
+    prints("DEQ_MMAP_Q4K_2048:  ns_per_row="); print(best / 512)
+    prints(" ns_per_elem_x100="); print(best / (512 * dm) * 100); newline()
+
+    // Q6_K row (10752 elems)
+    best = 0
+    rep = 0
+    while rep < 3 {
+        let t0 = clock()
+        let k = 0
+        while k < 128 { sink = sink + i2f(mm_load_row(td, k, dff)); k = k + 1 }
+        let dt = clock() - t0
+        if best == 0 || dt < best { best = dt }
+        rep = rep + 1
+    }
+    prints("DEQ_PREAD_Q6K_10752: ns_per_row="); print(best / 128)
+    prints(" ns_per_elem_x100="); print(best / (128 * dff) * 100); newline()
+
+    best = 0
+    rep = 0
+    while rep < 3 {
+        let t0 = clock()
+        let k = 0
+        while k < 128 {
+            let rawp = mm_map_base + gguf_tensor_offset(td) + k * mm_row_bytes(14, dff)
+            sink = sink + i2f(mm_deq_row_raw(14, rawp, dff, rowq6))
+            k = k + 1
+        }
+        let dt = clock() - t0
+        if best == 0 || dt < best { best = dt }
+        rep = rep + 1
+    }
+    prints("DEQ_MMAP_Q6K_10752:  ns_per_row="); print(best / 128)
+    prints(" ns_per_elem_x100="); print(best / (128 * dff) * 100); newline()
+
+    // ---- 3. dot cost: DOT4 vs DOT8 (same dequantised rows) -----------------
+    if mm_load_row(td, 4, dff) != 0 { prints("FAIL row\n"); return 1 }
+    // copy the row so both dots read identical bytes
+    let c = 0
+    while c < dff { mem_store(rowq6 + c * 8, mem_load(mm_rowbuf + c * 8)); c = c + 1 }
+
+    best = 0
+    rep = 0
+    while rep < 3 {
+        let t0 = clock()
+        let k = 0
+        while k < 256 { sink = sink + mm_dot4_s(rowq6, x_dff, dff, acc); k = k + 1 }
+        let dt = clock() - t0
+        if best == 0 || dt < best { best = dt }
+        rep = rep + 1
+    }
+    prints("DOT4_Q6K_10752: ns_per_row="); print(best / 256)
+    prints(" ns_per_elem_x100="); print(best / (256 * dff) * 100); newline()
+
+    best = 0
+    rep = 0
+    while rep < 3 {
+        let t0 = clock()
+        let k = 0
+        while k < 256 { sink = sink + mm_dot8_s(rowq6, x_dff, dff, acc); k = k + 1 }
+        let dt = clock() - t0
+        if best == 0 || dt < best { best = dt }
+        rep = rep + 1
+    }
+    prints("DOT8_Q6K_10752: ns_per_row="); print(best / 256)
+    prints(" ns_per_elem_x100="); print(best / (256 * dff) * 100); newline()
+
+    if mm_load_row(tg, 4, dm) != 0 { prints("FAIL row q4\n"); return 1 }
+    c = 0
+    while c < dm { mem_store(rowq4 + c * 8, mem_load(mm_rowbuf + c * 8)); c = c + 1 }
+
+    best = 0
+    rep = 0
+    while rep < 3 {
+        let t0 = clock()
+        let k = 0
+        while k < 1024 { sink = sink + mm_dot4_s(rowq4, x_dm, dm, acc); k = k + 1 }
+        let dt = clock() - t0
+        if best == 0 || dt < best { best = dt }
+        rep = rep + 1
+    }
+    prints("DOT4_Q4K_2048: ns_per_row="); print(best / 1024)
+    prints(" ns_per_elem_x100="); print(best / (1024 * dm) * 100); newline()
+
+    best = 0
+    rep = 0
+    while rep < 3 {
+        let t0 = clock()
+        let k = 0
+        while k < 1024 { sink = sink + mm_dot8_s(rowq4, x_dm, dm, acc); k = k + 1 }
+        let dt = clock() - t0
+        if best == 0 || dt < best { best = dt }
+        rep = rep + 1
+    }
+    prints("DOT8_Q4K_2048: ns_per_row="); print(best / 1024)
+    prints(" ns_per_elem_x100="); print(best / (1024 * dm) * 100); newline()
+
+    // ---- 4. DOT8 numeric delta vs DOT4 on real rows ------------------------
+    let maxrel: f64 = 0.0
+    i = 0
+    while i < 64 {
+        if mm_load_row(tg, i, dm) != 0 { prints("FAIL row\n"); return 1 }
+        let a: f64 = mm_dot4_s(mm_rowbuf, x_dm, dm, acc)
+        let b: f64 = mm_dot8_s(mm_rowbuf, x_dm, dm, acc)
+        let d: f64 = a - b
+        if d < 0.0 { d = 0.0 - d }
+        let mag: f64 = a
+        if mag < 0.0 { mag = 0.0 - mag }
+        let rel: f64 = d / (1e-12 + mag)
+        if rel > maxrel { maxrel = rel }
+        i = i + 1
+    }
+    prints("DOT8_VS_DOT4 max_rel_diff_x1e9="); print_f(maxrel * 1e9); newline()
+
+    // ---- 5. full serial matvec, three ways ---------------------------------
+    // old path (pread + dequant + DOT4), workers = 0
+    best = 0
+    rep = 0
+    while rep < 2 {
+        let t0 = clock()
+        sink = sink + i2f(mm_matvec(tg, x_dm, dff, dm, y))
+        let dt = clock() - t0
+        if best == 0 || dt < best { best = dt }
+        rep = rep + 1
+    }
+    prints("MATVEC_SER_OLD gate[10752x2048]Q4K: ns="); print(best)
+    prints(" ns_per_elem_x100="); print(best / (dff * dm) * 100); newline()
+
+    // mmap + DOT4
+    best = 0
+    rep = 0
+    while rep < 2 {
+        let t0 = clock()
+        let r = 0
+        while r < dff {
+            let rawp = mm_map_base + gguf_tensor_offset(tg) + r * mm_row_bytes(12, dm)
+            if mm_deq_row_raw(12, rawp, dm, rowq4) != 0 { prints("FAIL deq\n"); return 1 }
+            mem_store(y2 + r * 8, mm_dot4_s(rowq4, x_dm, dm, acc))
+            r = r + 1
+        }
+        let dt = clock() - t0
+        if best == 0 || dt < best { best = dt }
+        rep = rep + 1
+    }
+    prints("MATVEC_SER_MMAP_DOT4 gate:        ns="); print(best)
+    prints(" ns_per_elem_x100="); print(best / (dff * dm) * 100); newline()
+
+    // mmap + DOT8
+    best = 0
+    rep = 0
+    while rep < 2 {
+        let t0 = clock()
+        let r = 0
+        while r < dff {
+            let rawp = mm_map_base + gguf_tensor_offset(tg) + r * mm_row_bytes(12, dm)
+            if mm_deq_row_raw(12, rawp, dm, rowq4) != 0 { prints("FAIL deq\n"); return 1 }
+            mem_store(y2 + r * 8, mm_dot8_s(rowq4, x_dm, dm, acc))
+            r = r + 1
+        }
+        let dt = clock() - t0
+        if best == 0 || dt < best { best = dt }
+        rep = rep + 1
+    }
+    prints("MATVEC_SER_MMAP_DOT8 gate:        ns="); print(best)
+    prints(" ns_per_elem_x100="); print(best / (dff * dm) * 100); newline()
+
+    // ffn_down (Q6_K): old vs mmap+DOT8
+    best = 0
+    rep = 0
+    while rep < 2 {
+        let t0 = clock()
+        sink = sink + i2f(mm_matvec(td, x_dff, dm, dff, y))
+        let dt = clock() - t0
+        if best == 0 || dt < best { best = dt }
+        rep = rep + 1
+    }
+    prints("MATVEC_SER_OLD down[2048x10752]Q6K: ns="); print(best)
+    prints(" ns_per_elem_x100="); print(best / (dm * dff) * 100); newline()
+
+    best = 0
+    rep = 0
+    while rep < 2 {
+        let t0 = clock()
+        let r = 0
+        while r < dm {
+            let rawp = mm_map_base + gguf_tensor_offset(td) + r * mm_row_bytes(14, dff)
+            if mm_deq_row_raw(14, rawp, dff, rowq6) != 0 { prints("FAIL deq\n"); return 1 }
+            mem_store(y2 + r * 8, mm_dot8_s(rowq6, x_dff, dff, acc))
+            r = r + 1
+        }
+        let dt = clock() - t0
+        if best == 0 || dt < best { best = dt }
+        rep = rep + 1
+    }
+    prints("MATVEC_SER_MMAP_DOT8 down:          ns="); print(best)
+    prints(" ns_per_elem_x100="); print(best / (dm * dff) * 100); newline()
+
+    // ---- 6. output projection window: scalar vs mmap+DOT8 ------------------
+    let vwin = 4096
+    best = 0
+    rep = 0
+    while rep < 2 {
+        let t0 = clock()
+        sink = sink + i2f(mm_embed_logits(te, x_dm, 0, vwin, dm, y))
+        let dt = clock() - t0
+        if best == 0 || dt < best { best = dt }
+        rep = rep + 1
+    }
+    prints("EMBED_SER_SCALAR 4096x2048 Q6K: ns="); print(best)
+    prints(" ns_per_elem_x100="); print(best / (vwin * dm) * 100); newline()
+
+    best = 0
+    rep = 0
+    while rep < 2 {
+        let t0 = clock()
+        let v = 0
+        while v < vwin {
+            let rawp = mm_map_base + gguf_tensor_offset(te) + v * mm_row_bytes(14, dm)
+            if mm_deq_row_raw(14, rawp, dm, rowq4) != 0 { prints("FAIL deq\n"); return 1 }
+            mem_store(y2 + v * 8, mm_dot8_s(rowq4, x_dm, dm, acc))
+            v = v + 1
+        }
+        let dt = clock() - t0
+        if best == 0 || dt < best { best = dt }
+        rep = rep + 1
+    }
+    prints("EMBED_SER_MMAP_DOT8 4096x2048:  ns="); print(best)
+    prints(" ns_per_elem_x100="); print(best / (vwin * dm) * 100); newline()
+
+    prints("DONE\n")
+    return 0
+}
