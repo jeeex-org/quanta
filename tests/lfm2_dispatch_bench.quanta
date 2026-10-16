@@ -1,0 +1,137 @@
+// tests/lfm2_dispatch_bench.quanta -- pool DISPATCH cost per matvec.
+//
+// WHY: e2e decode sits ~3x above the per-worker-slice model (18.1 core-s/token
+// serial work measured; 3.49 s/token wall at 20 workers = 26% parallel
+// efficiency). Two candidate sinks: (a) a fixed cost per pl_submit (wake N
+// futexes + wait N stamps), (b) in-situ dequant slowdown (cold weight pages).
+// This bench isolates (a): attn_k of layer 2 is 512 rows x 2048 cols Q4_K --
+// per-worker work is ~25 rows ~= 0.3-0.5 ms at 20 workers. If the measured
+// per-call time is far above that, dispatch dominates; the 8-vs-20 comparison
+// shows how it scales with worker count.
+import std/gguf
+import std/lfm2_forward
+import std/lfm2_model
+import std/lfm2_mm
+import std/lfm2_bpe
+import std/fs
+
+const Q4_PATH = "/opt/ai/models/quanta/QUANTA-LFM2.5-2.6Bv1-Q4_K_M.gguf"
+const NCTX = 2048
+
+let sink = 0.0
+
+fn par_ns(idx, x, rows, cols, y, nw, reps) -> i64 {
+    mm_set_workers_uncapped(nw)
+    let best = 0
+    let r = 0
+    while r < 3 {
+        let t0 = clock()
+        let k = 0
+        while k < reps { sink = sink + i2f(mm_matvec(idx, x, rows, cols, y)); k = k + 1 }
+        let dt = clock() - t0
+        if best == 0 || dt < best { best = dt }
+        r = r + 1
+    }
+    return best / reps
+}
+
+fn main() {
+    prints("=== lfm2 dispatch bench ===\n")
+    if gguf_load(Q4_PATH) != 0 { prints("FAIL gguf_load\n"); return 1 }
+    if fc_read_config() != 0 { prints("FAIL fc_read_config\n"); return 1 }
+    if bpe_init_from_gguf() == 0 { prints("FAIL bpe_init\n"); return 1 }
+    if fc_kv_init(NCTX) != 0 { prints("FAIL fc_kv_init\n"); return 1 }
+    if fc_fw_init() != 0 { prints("FAIL fc_fw_init\n"); return 1 }
+    if mm_attach_mmap_fd(file_open(Q4_PATH, 0)) != 0 { prints("FAIL mmap\n"); return 1 }
+
+    let dm = fc_d_model
+    let tk_idx = lfm2_attn_k(2)
+    if tk_idx < 0 { prints("FAIL attn_k idx\n"); return 1 }
+    let x = mem_alloc(dm * 8)
+    let y = mem_alloc(2048 * 8)
+    // HOLD the pool for the whole probe: without the begin bracket,
+    // mm_matvec_par tears the pool down after EVERY call (pl_depth == 0) and
+    // the probe would measure 20 thread_create/join round trips per matvec.
+    mm_pool_begin()
+    let i = 0
+    while i < dm { mem_store(x + i * 8, i2f((i * 37) % 101 - 50) / i2f(71)); i = i + 1 }
+
+    let rows = fc_nkv_max * fc_head_dim
+    prints("attn_k idx="); print(tk_idx)
+    prints(" rows="); print(rows)
+    prints(" cols="); print(dm); newline()
+
+    // serial reference for the same tensor
+    mm_set_workers_uncapped(0)
+    let t0 = clock()
+    let k = 0
+    while k < 50 { sink = sink + i2f(mm_matvec(tk_idx, x, rows, dm, y)); k = k + 1 }
+    prints("SERIAL ns_per_call="); print((clock() - t0) / 50); newline()
+
+    // shape sweep at nw=20: does the fixed per-call cost amortize on big
+    // matvecs (gate 10752x2048, down 2048x10752, in_proj 6144x2048, out 2048x2048)?
+    mm_set_workers_uncapped(20)
+    let tg = lfm2_ffn_gate(0)
+    let td = lfm2_ffn_down(0)
+    let tsc = lfm2_conv_in_proj(0)
+    let tsc2 = lfm2_conv_out_proj(0)
+    let tq = lfm2_attn_q(2)
+    let x_dff2 = mem_alloc(fc_d_ff * 8)
+    let y2 = mem_alloc(10752 * 8)
+    i = 0
+    while i < fc_d_ff { mem_store(x_dff2 + i * 8, i2f((i * 53) % 127 - 63) / i2f(91)); i = i + 1 }
+    best = 0
+    r = 0
+    while r < 3 {
+        t0 = clock()
+        k = 0
+        while k < 30 { sink = sink + i2f(mm_matvec(tg, x, fc_d_ff, dm, y2)); k = k + 1 }
+        let dt = clock() - t0
+        if best == 0 || dt < best { best = dt }
+        r = r + 1
+    }
+    prints("PAR20 gate[10752x2048] ns_per_call="); print(best / 30); newline()
+    best = 0
+    r = 0
+    while r < 3 {
+        t0 = clock()
+        k = 0
+        while k < 30 { sink = sink + i2f(mm_matvec(td, x_dff2, dm, fc_d_ff, y)); k = k + 1 }
+        let dt = clock() - t0
+        if best == 0 || dt < best { best = dt }
+        r = r + 1
+    }
+    prints("PAR20 down[2048x10752] ns_per_call="); print(best / 30); newline()
+    best = 0
+    r = 0
+    while r < 3 {
+        t0 = clock()
+        k = 0
+        while k < 30 { sink = sink + i2f(mm_matvec(tsc, x, fc_d_ff, dm, y2)); k = k + 1 }
+        let dt = clock() - t0
+        if best == 0 || dt < best { best = dt }
+        r = r + 1
+    }
+    prints("PAR20 inproj[6144x2048] ns_per_call="); print(best / 30); newline()
+    best = 0
+    r = 0
+    while r < 3 {
+        t0 = clock()
+        k = 0
+        while k < 30 { sink = sink + i2f(mm_matvec(tsc2, x, dm, dm, y)); k = k + 1 }
+        let dt = clock() - t0
+        if best == 0 || dt < best { best = dt }
+        r = r + 1
+    }
+    prints("PAR20 outproj[2048x2048] ns_per_call="); print(best / 30); newline()
+
+    let nw = 2
+    while nw <= 20 {
+        let ns = par_ns(tk_idx, x, rows, dm, y, nw, 300)
+        prints("PAR ns_per_call nw="); print(nw)
+        prints(" ns="); print(ns); newline()
+        if nw == 2 { nw = 4 } else { if nw == 4 { nw = 8 } else { if nw == 8 { nw = 12 } else { if nw == 12 { nw = 16 } else { nw = 20 } } } }
+    }
+    prints("DONE\n")
+    return 0
+}

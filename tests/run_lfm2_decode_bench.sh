@@ -38,9 +38,9 @@ echo "top_cpu: $(ps -eo pcpu,comm --sort=-pcpu | sed -n '2p')"
 echo "compile: $QC $SRC"
 ( ulimit -c 0 -v 8000000; "$QC" "$SRC" "$BIN" ) || { echo "COMPILE FAIL rc=$?"; exit 2; }
 
-echo "run: ulimit -v $CAP ; nice 0 $BIN (timeout ${TMO}s)"
+echo "run: ulimit -v $CAP ; nice -n 0 $BIN (timeout ${TMO}s)"
 echo "run_start: $(date '+%F %T')"
-( ulimit -c 0 -v "$CAP"; timeout "$TMO" nice 0 "$BIN" </dev/null )
+( ulimit -c 0 -v "$CAP"; timeout "$TMO" nice -n 0 "$BIN" </dev/null )
 rc=$?
 echo "run_end: $(date '+%F %T')"
 echo "env_after: load=$(cut -d' ' -f1-3 /proc/loadavg)"

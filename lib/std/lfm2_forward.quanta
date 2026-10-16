@@ -1054,6 +1054,30 @@ fn fc_forward_token(tok: i64, pos: i64) -> i64 {
     return fc_forward_token_ex(tok, pos, 1)
 }
 
+// Argmax with one token index masked out (pass a negative index for none).
+// This is the --ignore-eos lever for LONG benchmark generations: the reference
+// prompt deterministically emits EOS at token 43, so a 500- or 1024-token run
+// needs EOS suppressed while the budget is still open. Same scan as fc_argmax
+// (left-to-right, strict >), so with mask < 0 the result is identical.
+fn fc_argmax_masked(n: i64, masked: i64) -> i64 {
+    let bi = 0
+    let bv: f64 = 0.0
+    let have = 0
+    let i = 0
+    while i < n {
+        if masked < 0 || i != masked {
+            let v = f64of(mem_load(fc_fw_logits + i * 8))
+            if have == 0 || v > bv {
+                bv = v
+                bi = i
+                have = 1
+            }
+        }
+        i = i + 1
+    }
+    return bi
+}
+
 // ===========================================================================
 // BATCHED PREFILL
 // ===========================================================================
