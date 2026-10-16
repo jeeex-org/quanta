@@ -1011,3 +1011,51 @@ Full trails: `compiler/0.0.239/WIP.md` and `compiler/0.0.240/WIP.md`.
 - **Open:** a top-level `const` with a float initialiser evaluates to 0; `tokenizer_trait.quanta` still
   calls `bpe_encode`; native logits are flatter than the reference (p('The') 0.251 vs 0.847, 1/10 top ids
   shared, argmax agrees), with the unchecked **Q6_K** output projection as prime suspect.
+
+---
+
+### A22 · MEASURED here (audit, no code change) · the P2 auto-free blocker is now enumerated: 115 of 406 let-bound `lib/std` `mem_alloc` sites escape, 199 of 329 free sites double-push — ship needs the bounded interprocedural escape analysis, not a simple rule
+
+Full trail: `docs/research/a22-mem-alloc-escape-audit.md` + the analyser
+`docs/research/a22-escape-audit.py` (static, text-level, re-runs in ~2.6 s, no compilation — every
+number regenerable). Answered the question A5 left open ("escape/alias detection does not exist"):
+**how many `mem_alloc` sites let the pointer escape its scope?**
+
+- The rule audited is the one the **0.0.242 WIP detector** fires on: `let x = mem_alloc(...)` direct
+  initialisers, any block depth, freed at every block exit (loop bodies per iteration) and on every
+  `return`. The **0.0.245 shipping line still has the old dead detector**
+  (`parse.quanta:1460-1471`, the A5 field bug) — nothing auto-frees today; enabling means porting
+  the 0.0.242 fix forward.
+- `lib/std`: 564 sites / 49 files. Let-bound (P2's reach): **406 — 185 L (46 %), 221 (54 %) escape
+  or double-free**: R 44 (returned as the function's value — `big`, `sha3`, `json`, `gguf`, `str`
+  value modules), S 51 (41 written into caller-owned out-params via `w64`/`mem_store` — the
+  SPIFFE/TLS/HSM out-param idiom; 12 into global-backed holders), Pr 15 (6 retainer fns:
+  `config_expand` + 5 `gguf_ctx_set_*` that store the param into the long-lived ctx), G 6 (verified
+  store lines: `keystore_master_key = master_key` x2, `keystore_entries = new_entries`,
+  `mt_key/mt_val`, `mtls_ctx = ctx`), F 106 (explicit frees). 13 non-L sites sit inside loop bodies
+  (per-iteration UAF). Corpus-wide let-bound: 1780 sites, 285 escape-or-double-free.
+- **A simple escape rule ("in a return / assigned to a global") is unsound**: it covers 50 of 115
+  and misses the 41 out-param stores and 15 retainer passes — the classes that broke the 26 gate
+  rows in 0.0.242 §5b.
+- `mem_free`/`drop`/`free` audit (329 sites, 13+7 files, encoding correct since 0.0.243): **0
+  same-path double-frees, 0 use-after-frees today** (the raw MULTI-FREE/UAF hits dissolved under
+  path analysis — exclusive error paths and re-bindings). But **199 sites free a let-bound alloc**
+  (each = double free-list push under auto-free), **23 free a PARAM** (callee-frees contract —
+  needs caller ownership cancellation too), and **11 `free()` sites are munmap**
+  (`emitter.quanta:1235-1241`; `fmt.quanta:13` under auto-free would push an unmapped pointer onto
+  the free list — SIGSEGV or silent corruption). Note `w64(p,v)` ≡ `mem_store(p,v)`
+  (`helpers.quanta:8`) — every `w64(holder, ptr)` is a pointer escape the eye skips.
+- **Recommendation:** implement the bounded interprocedural escape analysis before shipping —
+  (a) direct-return analysis (arg-passes to readers are fine; the 0.0.242 return-ordering fix),
+  (b) store-into-longer-lived-holder detection (`mem_store`/`w64` into param/global holders),
+  (c) position-sensitive retention summaries to a fixpoint (6 retainer fns cover all std Pr sites),
+  (d) explicit free cancels ownership, locally and via callee-frees, (e) loop-body sites checked
+  per iteration (13). Anything not provably owned keeps today's leak behaviour (safe). The 26 gate
+  rows of 0.0.242 §5b are exactly these classes; `tests/raii_autofree_test.quanta` stays out of
+  EXPECTED.tsv until this lands. Not "keep parked": the blocker A5 named is now specified to the
+  site, and the analysis is small enough to be a compiler pass (the Python prototype is the spec).
+- Verified by reading: all 6 G stores, all 15 Pr sites + their retainer bodies, the 3 munmap sites,
+  the R+F pair in `log_leaf_hash`, the L shape of `fs.open` (the case 0.0.242 §4 proved sound), and
+  both SEQ-DOUBLE-FREE candidates (false positives — re-assignment between frees). Unverified and
+  labelled so in the report: the 1495 L sites are spot-checked shapes, not one-by-one reads; the 1
+  top-level site (`big.quanta:763`) is excluded (detector reach at top level unknown).
