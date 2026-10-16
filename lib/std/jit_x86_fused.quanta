@@ -115,6 +115,14 @@ fn j_f_add_r10_32() -> i64 { return femit("4983c220", 4) }
 fn j_f_add_r10_256() -> i64 { return femit("4981c200010000", 7) }
 // add rdx, 16                    48 83 c2 10   one (scale,min) pair
 fn j_f_add_rdx_16() -> i64 { return femit("4883c210", 4) }
+// add rdx, 32                    48 83 c2 20   one (scale,min) pair = 32 quant bytes
+fn j_f_add_rdx_32() -> i64 { return femit("4883c220", 4) }
+// sub r9, 32                     49 83 e9 20   rewind the quant cursor one half-chunk
+fn j_f_rewind_r9_32() -> i64 { return femit("4983e920", 4) }
+// vbroadcastsd ymm6, [rdx+16]    c4 e2 7d 19 72 10   high-half d*Kn
+fn j_f_vbcastsd_y6_rdx16() -> i64 { return femit("c4e27d197210", 6) }
+// vbroadcastsd ymm7, [rdx+24]    c4 e2 7d 19 7a 18   high-half dmin*Mn
+fn j_f_vbcastsd_y7_rdx24() -> i64 { return femit("c4e27d197a18", 6) }
 // add rdx, 128                   48 81 c2 80 00 00 00   skip one super-block row
 fn j_f_add_rdx_128() -> i64 { return femit("4881c280000000", 7) }
 
@@ -141,30 +149,15 @@ fn j_f_ret() -> i64 { return femit("c3", 1) }
 // the DMD table applies to exactly 4 weights, so each 4-byte group needs TWO
 // entries and advances rdx by 16 bytes. The (scale,min) pair is read from rdx;
 // rdx is advanced by the caller after every group.
-fn j_f_group() -> i64 {
-    j_f_vpmovzxbd_x1_r9()      // 4 bytes -> 4 dwords, each holding 2 nibbles
-    j_f_vbcastsd_y6_rdx()      // d*Kn     (for the LOW nibbles)
-    j_f_vbcastsd_y7_rdx8()     // dmin*Mn  (for the LOW nibbles)
-
-    // -- low nibbles: isolate b&15 by shifting left 28 then right 28 --
+// One 4-byte step of the LOW-nibble pass: bytes -> weights [i..i+3] of the
+// 32-weight low half, using the (scale,min) pair at [rdx].
+// Advances r9 by 4 quant bytes and r10 by 4 doubles (32 bytes).
+fn j_f_low() -> i64 {
+    j_f_vpmovzxbd_x1_r9()
+    j_f_vbcastsd_y6_rdx()      // d*Kn
+    j_f_vbcastsd_y7_rdx8()     // dmin*Mn
     j_f_vpslld_28()
-    j_f_vpsrld_28()
-    j_f_vcvtdq2pd_y1_x1()      // low 2 dwords -> ymm1[0:1]
-    j_f_vpsrldq_x2_x1_8()      // bring high 2 dwords down
-    j_f_vcvtdq2pd_y2_x2()
-    j_f_vinsertf128_y1_y1_x2_1()  // -> 4 doubles
-    j_f_vmulpd_y1_y6()
-    j_f_vsubpd_y1_y7()
-    j_f_vmulpd_y1_r10()        // * x[I]
-    j_f_vaddpd_y0_y1()         // accumulate
-    j_f_add_r10_32()           // 4 doubles consumed
-    j_f_add_rdx_16()           // next (scale,min) pair
-
-    // -- high nibbles: the same 4 bytes, b>>4 --
-    j_f_vbcastsd_y6_rdx()      // reload factors for the HIGH nibbles (rdx has advanced 16)
-    j_f_vbcastsd_y7_rdx8()
-    j_f_vpmovzxbd_x1_r9()      // reload: xmm1 was clobbered above
-    j_f_vpsrld_4()
+    j_f_vpsrld_28()            // low nibbles
     j_f_vcvtdq2pd_y1_x1()
     j_f_vpsrldq_x2_x1_8()
     j_f_vcvtdq2pd_y2_x2()
@@ -173,10 +166,28 @@ fn j_f_group() -> i64 {
     j_f_vsubpd_y1_y7()
     j_f_vmulpd_y1_r10()
     j_f_vaddpd_y0_y1()
-
-    j_f_add_r9_4()             // 4 quant bytes consumed
+    j_f_add_r9_4()
     j_f_add_r10_32()
-    j_f_add_rdx_16()
+    return 0
+}
+
+// One 4-byte step of the HIGH-nibble pass: the SAME quant bytes, >>4, mapping
+// to weights [32+i..35+i] of the chunk, using the pair at [rdx+16].
+fn j_f_high() -> i64 {
+    j_f_vpmovzxbd_x1_r9()
+    j_f_vbcastsd_y6_rdx16()    // d*Kn  for the high half
+    j_f_vbcastsd_y7_rdx24()    // dmin*Mn
+    j_f_vpsrld_4()             // high nibbles
+    j_f_vcvtdq2pd_y1_x1()
+    j_f_vpsrldq_x2_x1_8()
+    j_f_vcvtdq2pd_y2_x2()
+    j_f_vinsertf128_y1_y1_x2_1()
+    j_f_vmulpd_y1_y6()
+    j_f_vsubpd_y1_y7()
+    j_f_vmulpd_y1_r10()
+    j_f_vaddpd_y0_y1()
+    j_f_add_r9_4()
+    j_f_add_r10_32()
     return 0
 }
 
@@ -204,25 +215,40 @@ fn jit_f_build() -> i64 {
     // 8 groups * 32 bytes = 128 bytes == exactly one DMD row, which is the
     // stride jit_f_dmd_alloc reserves. The old code emitted 32 groups of 8,
     // which read 1024 bytes per super-block -- 8x past the allocated row.
-    let g = 0
-    while g < 8 {
-        // j_f_group consumes 4 quant bytes (8 weights: 4 low + 4 high nibbles)
-        // and 32 bytes of DMD. A group of 32 weights therefore needs 4 of them.
+    // Layout per lib/std/matmul_q4k.quanta q4k_block_dot (the bit-truth):
+    //   144-byte super-block = d, dmin, 12 scale bytes, 128 quant bytes
+    //   4 chunks; chunk c uses pair 2c for the LOW 32 weights and pair 2c+1 for
+    //   the HIGH 32 weights. Each pair covers 32 quant bytes.
+    //   Within a chunk: 8 low steps (4 bytes each) walk x by 32 doubles, then r9
+    //   rewinds 32 bytes and 8 high steps walk the NEXT 32 doubles. That is the
+    //   only way to express Q4_K's layout: low nibbles are weights [i], high
+    //   nibbles are weights [32+i] -- one linear cursor cannot do both.
+    let chunk = 0
+    while chunk < 4 {
         let b = 0
-        while b < 4 {
-            j_f_group()
+        while b < 8 {
+            j_f_low()
             b = b + 1
         }
-        g = g + 1
+        j_f_rewind_r9_32()          // re-read the same 32 quant bytes
+        b = 0
+        while b < 8 {
+            j_f_high()
+            b = b + 1
+        }
+        j_f_add_rdx_32()            // both pairs of this chunk consumed
+        chunk = chunk + 1
     }
 
-    // sub rcx,1 ; jne rel8 -> back to bodytop.
+    // sub rcx,1 ; jne rel32 -> back to bodytop.
+    // rel32, not rel8: the corrected Q4_K cadence (4 chunks x 8 groups) makes
+    // the body ~4 KB, far outside the +-127-byte window a rel8 branch reaches.
     jbytes(3, "4883e901")            // sub rcx, 1
-    jb(117)                          // 0x75 = jne rel8; displacement is next
-    let disp_at = ja_pos()           // address OF the displacement byte
-    jb(0)                            // placeholder
-    // rel8 is relative to the END of this instruction, which is disp_at+1.
-    if j_patch8(disp_at, bodytop) != 0 { return 0 - 1 }
+    j_jne32()                        // 0F 85, displacement follows
+    let disp_at = ja_pos()           // address OF the displacement (4 bytes)
+    jbytes(4, "00000000")            // placeholder
+    // rel32 is relative to the END of this instruction, which is disp_at+4.
+    if j_patch32(disp_at, bodytop) != 0 { return 0 - 1 }
 
     // Horizontal reduce + return.
     j_f_vextracti128_x2_y0()

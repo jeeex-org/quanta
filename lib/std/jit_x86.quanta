@@ -150,6 +150,20 @@ fn j_patch8(at: i64, target: i64) -> i64 {
     return 0
 }
 
+// rel32 patching. `at` is the address OF THE DISPLACEMENT (4 bytes); x86 rel32
+// is relative to the end of the instruction, which is at+4. Needed because the
+// fused kernel's super-block body exceeds the +-127-byte rel8 window: with the
+// Q4_K cadence corrected to 4 chunks x 8 groups the body is ~4 KB, so the
+// backward branch must be a 6-byte `jne rel32` (0F 85) rather than 75.
+fn j_patch32(at: i64, target: i64) -> i64 {
+    let disp = target - (at + 4)
+    mem_store32(at, disp)
+    return 0
+}
+
+// jne rel32                          0f 85 <disp32>
+fn j_jne32() -> i64 { return jbytes(2, "0f85") }
+
 fn j_ret() -> i64 { jb(195); return 0 }
 
 // ---- verified move / arithmetic (bytes pasted from objdump) ------------------

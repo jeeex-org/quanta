@@ -1,0 +1,103 @@
+// tests/jit_fused_exact_test.quanta
+//
+// IS THE EMITTED FUSED KERNEL BIT-EXACT WITH THE SCALAR REFERENCE?
+//
+// The JIT route is proven reachable (tests/lfm2_jit_probe.quanta, Q1-Q3 PASS).
+// This test answers the next question with BITS, not tolerance:
+//
+//   q4k_block_dot(raw, x, 1, 0)   <- scalar truth, lib/std/matmul_q4k.quanta
+//   jit_call(entry, AS, 0)        <- the runtime-emitted kernel
+//
+// over one synthetic 144-byte Q4_K super-block and a deterministic x vector.
+// Both results are compared as raw f64 bit patterns: any difference at all is
+// a failure, because a fused matvec that is merely close will corrupt logits.
+import std/gguf
+import std/matmul_q4k
+import std/jit_x86
+import std/jit_x86_fused
+
+fn jit_call(dst: i64, a0: i64, a1: i64) -> i64 {
+    let t = mem_alloc(2)
+    mem_store(t, dst)
+    mem_store(t + 8, 0)
+    return closure_call(t, a0, a1)
+}
+
+fn main() -> i64 {
+    prints("=== jit fused Q4_K vs scalar: BIT-EXACTNESS ===\n")
+
+    // ---- build the kernel ------------------------------------------------
+    // jit_f_build() emits into the CURRENT emit region, so the RWX region must
+    // be mapped and ja_init'd first. 64 KiB is ample: the kernel is ~32 groups
+    // x ~25 instructions and grows with the super-block loop, not with nsuper.
+    let region = jit_f_alloc(65536)
+    if region <= 0 { prints("UNSUPPORTED: box refuses PROT_EXEC anon\n"); return 2 }
+    let code = jit_f_build()
+    if code <= 0 { prints("FAIL: jit_f_build\n"); return 1 }
+    let tbl = jit_f_code(code)
+    if tbl <= 0 { prints("FAIL: no code table\n"); return 1 }
+    let entry = mem_load(tbl)
+    if entry == 0 { prints("FAIL: null entry\n"); return 1 }
+    prints("kernel emitted at "); print(entry); newline()
+
+    // ---- one synthetic super-block (144 bytes) ---------------------------
+    let raw = mem_alloc(160)
+    // d (f16) = 1.0 ; dmin (f16) = 0.5  (little-endian halves)
+    mem_store8(raw + 0, 0)      // f16 1.0 low byte
+    mem_store8(raw + 1, 60)     // f16 1.0 high byte (0x3C00)
+    mem_store8(raw + 2, 0)      // f16 0.5 low byte
+    mem_store8(raw + 3, 56)     // f16 0.5 high byte (0x3800)
+    // 12 scale bytes: small deterministic values so q4k_sc/q4k_min are exercised
+    let i = 0
+    while i < 12 {
+        mem_store8(raw + 4 + i, 1 + i)
+        i = i + 1
+    }
+    // 128 quant bytes
+    i = 0
+    while i < 128 {
+        mem_store8(raw + 16 + i, (i * 7 + 3) - ((i * 7 + 3) / 256) * 256)
+        i = i + 1
+    }
+
+    // ---- x: deterministic f64 activations, 256 elements -------------------
+    let x = mem_alloc(256 * 8 + 64)
+    i = 0
+    while i < 256 {
+        mem_store(x + i * 8, (i % 13) * 0.5 + 0.25)
+        i = i + 1
+    }
+
+    // ---- DMD table for exactly one super-block ---------------------------
+    let dmd = jit_f_dmd_alloc(1)
+    if dmd <= 0 { prints("FAIL: dmd alloc\n"); return 1 }
+    let d  = f16_to_f64(raw + 0)
+    let dm = f16_to_f64(raw + 2)
+    jit_f_dmd_fill(raw, raw + 4, d, dm, dmd)
+
+    // ---- argument area ---------------------------------------------------
+    let asz = mem_alloc(32)
+    mem_store(asz + 0,  raw)
+    mem_store(asz + 8,  x)
+    mem_store(asz + 16, dmd)
+    mem_store(asz + 24, 1)
+
+    // ---- the two results -------------------------------------------------
+    let scalar_f = q4k_block_dot(raw, x, 1, 0)
+    let jit_bits = jit_call(entry, asz, 0)
+
+    // scalar -> bits via memory
+    let sbuf = mem_alloc(8)
+    mem_store(sbuf, scalar_f)
+    let scalar_bits = mem_load(sbuf)
+
+    prints("scalar bits  = "); print(scalar_bits); newline()
+    prints("jit    bits  = "); print(jit_bits); newline()
+
+    if scalar_bits == jit_bits {
+        prints("RESULT: BIT-EXACT (scalar == jit)\n")
+        return 0
+    }
+    prints("RESULT: MISMATCH -- kernel is not bit-exact\n")
+    return 1
+}
