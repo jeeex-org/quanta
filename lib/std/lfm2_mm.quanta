@@ -1207,10 +1207,21 @@ fn mm_pool_ensure(n: i64, maxcols: i64) {
     // FAIL CLOSED on allocation failure: a NULL protocol word would make
     // atomic_store() write to address 0 (a process kill with no diagnostic).
     // Return -1 to the caller instead; it rebuilds on the next call.
+    // LOUD, not silent: the emitter's own MAP_FAILED guard (inside
+    // thread_create's 1 MB stack mmap) exits(1) with ZERO output -- measured
+    // by the SI-loop peer (commit e0d766f6), it cost a whole generation run.
+    // Whatever CAN be diagnosed here is printed here: the last line before a
+    // silent death should name the pool size and the failed cell.
     if pl_genp == 0 || pl_stopp == 0 || pl_donep == 0 || pl_slots == 0 {
+        prints("mm_pool_ensure: ALLOC FAIL n="); print(n)
+        prints(" (protocol cells 8+8+"); print(n * 8); prints("+"); print(n * 8)
+        prints(" bytes; next step would be "); print(n)
+        prints(" thread stacks of ~1 MB each -- VmPeak suspect)\n")
         pl_size = 0
         return -1
     }
+    prints("mm_pool: spawn n="); print(n)
+    prints(" cell_cols="); print(pl_cell_cols); newline()
     atomic_store(pl_genp, 0)
     atomic_store(pl_stopp, 0)
     // the workers size their scratch from this at spawn time
@@ -1336,8 +1347,26 @@ fn mm_deq_row_raw(dtype, raw: u64, elems: i64, dst: u64) -> i64 {
 }
 
 // Pool kind 4 worker: static row slice, raw pointer per row, NO pread, NO
-// shared rowbuf. Same partition rule, same dequant, same mm_dot4_s (or
-// mm_dot8_s when mm_dot_multi is set -- NOT bit-identical, opt-in) as kind 0.
+// shared rowbuf. Same partition rule, same dequant, same mm_dot4_s as kind 0
+// -- bit-identical by construction (verified: tests/lfm2_dot_bench.quanta,
+// 0 mismatches over 131072 Q4_K + 344064 Q6_K elements).
+//
+// NOTE ON A MULTI-CELL DOT: an 8-cell interleaved variant (mm_dot8_s) was
+// built here and DELETED after measurement. Two findings, both in
+// tests/lfm2_avx2_call_chain_bench.quanta and docs/research/decode-fused-dot.md:
+//   1. CELL SPACING: fmulf_avx2/faddf_avx2 store 32 bytes (4 f64 lanes) per
+//      call, so accumulator cells must be 32 bytes apart. Cells spaced 8
+//      bytes apart SELF-ALIAS (each store clobbers the next three cells) and
+//      produce exactly the "dropped elements / wrong slices" signature that
+//      looks like a codegen defect. The compiler is innocent; the emitted
+//      bytes are identical for every call.
+//   2. NO YIELD: with the corrected 32-byte layout the 8-cell form is EXACT
+//      but 1.8x SLOWER than mm_dot4_s on equal work (192.6 vs 106.0 ms for
+//      128 elements x 200k reps): the Quanta-level g-loop overhead per 4
+//      elements exceeds what extra chains save, and mm_dot4_s's own 4 vector
+//      lanes already interleave the dependency chain. The lever that actually
+//      reaches <= 1 cycle/element is the fused register-resident builtin
+//      spec'd in docs/research/decode-fused-dot.md section 3.
 fn pl_run_rows_map(t: i64, cell) {
     let per = pl_rows / pl_nw
     let lo = t * per
@@ -1354,11 +1383,7 @@ fn pl_run_rows_map(t: i64, cell) {
     while r < hi {
         let raw = mm_map_base + toff + r * rb
         if mm_deq_row_raw(dtype, raw, pl_cols, f64b) != 0 { return -1 }
-        if mm_dot_multi != 0 {
-            mem_store(pl_y + r * 8, mm_dot8_s(f64b, pl_x, pl_cols, acc))
-        } else {
-            mem_store(pl_y + r * 8, mm_dot4_s(f64b, pl_x, pl_cols, acc))
-        }
+        mem_store(pl_y + r * 8, mm_dot4_s(f64b, pl_x, pl_cols, acc))
         r = r + 1
     }
     return hi - lo
@@ -1366,9 +1391,8 @@ fn pl_run_rows_map(t: i64, cell) {
 
 // Pool kind 5 worker: the tied output projection (embed logits) from the
 // mapping. The dot is the SAME left-to-right scalar accumulation as
-// pl_run_embed -- bit-identical by construction. When mm_dot_multi is set it
-// uses mm_dot8_s instead, which CHANGES THE LOGIT BITS and is therefore
-// opt-in and argmax-validated (see docs/research/decode-fused-dot.md).
+// pl_run_embed -- bit-identical by construction. (The multi-lane dot is NOT
+// an option here either -- see the note on pl_run_rows_map.)
 fn pl_run_embed_map(t: i64, cell) {
     let per = pl_vcount / pl_nw
     let lo = t * per
@@ -1386,82 +1410,38 @@ fn pl_run_embed_map(t: i64, cell) {
         if mm_deq_row_raw(dtype, raw, pl_ncols, f64b) != 0 { return -1 }
         let acc: f64 = 0.0
         let c = 0
-        if mm_dot_multi != 0 {
-            mem_store(pl_y + (pl_v0 + v) * 8, mm_dot8_s(f64b, pl_x, pl_ncols, mem_load(cell + 16)))
-        } else {
-            while c < pl_ncols {
-                acc = acc + f64of(mem_load(f64b + c * 8)) * f64of(mem_load(pl_x + c * 8))
-                c = c + 1
-            }
-            mem_store(pl_y + (pl_v0 + v) * 8, acc)
+        while c < pl_ncols {
+            acc = acc + f64of(mem_load(f64b + c * 8)) * f64of(mem_load(pl_x + c * 8))
+            c = c + 1
         }
+        mem_store(pl_y + (pl_v0 + v) * 8, acc)
         v = v + 1
     }
     return hi - lo
 }
 
-// ---- 8-lane interleaved dot -----------------------------------------------
+// ---- the multi-cell dot: built, measured, DELETED --------------------------
 //
-// mm_dot4_s is ONE store-to-load-forward chain: every iteration's faddf stores
-// the accumulator and the next iteration loads it back (~6 cycles of latency
-// per 4 elements, fully serial). Measured 2.73 ns/element. Eight independent
-// accumulator lanes break the chain: each lane's next dependency is 8
-// iterations away, so the add/mul pipeline drains instead of stalling. The g
-// chain is written STRAIGHT-LINE (no inner loop) because a Quanta-level loop
-// costs more in interpreter-loop overhead than the 2 builtin calls it wraps.
+// An 8-cell interleaved mm_dot8_s (8 independent accumulator chains behind the
+// through-memory AVX2 builtins) was written here to beat mm_dot4_s. Removed
+// after measurement; the full evidence is tests/lfm2_avx2_call_chain_bench.quanta:
 //
-// THIS IS NOT BIT-IDENTICAL to mm_dot4_s: a different summation order (8
-// partial lanes vs 4). Gated behind mm_dot_multi (default 0 = old bits) and
-// validated against the argmax oracle before any measured run enables it.
-let mm_dot_multi = 0
+// 1. CELL SPACING. fmulf_avx2/faddf_avx2 store 32 bytes (4 f64 lanes) per
+//    call. Cells spaced 8 bytes apart SELF-ALIAS: every faddf store clobbers
+//    the next three cells, producing exactly the "dropped elements / one call
+//    read another call's address" signature that looks like a codegen defect.
+//    It is not one: the emitted bytes are identical for every call, and with
+//    cells 32 bytes apart every sum is exact (V2 of the bench). The first
+//    version of this dot (and its first "fix") both used 8-byte cells, which
+//    is why the failure survived two rewrites.
+// 2. NO YIELD. With the corrected layout, equal-work timing over 128
+//    elements x 200k reps: 8-cell form 192.6 ms vs mm_dot4_s 106.0 ms -- the
+//    8-cell form is 1.8x SLOWER. The Quanta-level group loop costs more per
+//    4 elements than the extra chains save, and mm_dot4_s's own 4 vector
+//    lanes already interleave the store-forward chains. mm_dot4_s stands.
+//    The lever that reaches <= 1 cycle/element is the fused register-resident
+//    builtin spec'd in docs/research/decode-fused-dot.md section 3.
 
-fn mm_set_dot_multi(n) {
-    mm_dot_multi = n
-    return 0
-}
-
-// acc layout: 8 lanes at acc+0..63, 8 temps at acc+64..127 (inside the 512 B
-// scratch region mm_scratch_new allocates).
-fn mm_dot8_s(a: u64, b: u64, n: i64, acc) -> f64 {
-    mem_store(acc, 0.0)
-    mem_store(acc + 8, 0.0)
-    mem_store(acc + 16, 0.0)
-    mem_store(acc + 24, 0.0)
-    mem_store(acc + 32, 0.0)
-    mem_store(acc + 40, 0.0)
-    mem_store(acc + 48, 0.0)
-    mem_store(acc + 56, 0.0)
-
-    let c = 0
-    while c + 32 <= n {
-        fmulf_avx2(acc + 64, a + c * 8, b + c * 8)
-        faddf_avx2(acc, acc, acc + 64)
-        fmulf_avx2(acc + 72, a + (c + 4) * 8, b + (c + 4) * 8)
-        faddf_avx2(acc + 8, acc + 8, acc + 72)
-        fmulf_avx2(acc + 80, a + (c + 8) * 8, b + (c + 8) * 8)
-        faddf_avx2(acc + 16, acc + 16, acc + 80)
-        fmulf_avx2(acc + 88, a + (c + 12) * 8, b + (c + 12) * 8)
-        faddf_avx2(acc + 24, acc + 24, acc + 88)
-        fmulf_avx2(acc + 96, a + (c + 16) * 8, b + (c + 16) * 8)
-        faddf_avx2(acc + 32, acc + 32, acc + 96)
-        fmulf_avx2(acc + 104, a + (c + 20) * 8, b + (c + 20) * 8)
-        faddf_avx2(acc + 40, acc + 40, acc + 104)
-        fmulf_avx2(acc + 112, a + (c + 24) * 8, b + (c + 24) * 8)
-        faddf_avx2(acc + 48, acc + 48, acc + 112)
-        fmulf_avx2(acc + 120, a + (c + 28) * 8, b + (c + 28) * 8)
-        faddf_avx2(acc + 56, acc + 56, acc + 120)
-        c = c + 32
-    }
-    // pairwise reduction of the 8 lanes
-    let s0: f64 = f64of(mem_load(acc)) + f64of(mem_load(acc + 8))
-    let s1: f64 = f64of(mem_load(acc + 16)) + f64of(mem_load(acc + 24))
-    let s2: f64 = f64of(mem_load(acc + 32)) + f64of(mem_load(acc + 40))
-    let s3: f64 = f64of(mem_load(acc + 48)) + f64of(mem_load(acc + 56))
-    let total: f64 = (s0 + s1) + (s2 + s3)
-    let t: f64 = total
-    while c < n {
-        t = t + f64of(mem_load(a + c * 8)) * f64of(mem_load(b + c * 8))
-        c = c + 1
-    }
-    return t
-}
+// acc layout: mm_dot4_s uses 4 lanes at acc+0..31 and a temp at acc+32..63
+// (64 bytes). The scratch region stays 512 B so a future register-resident
+// dot builtin has room without a cell-layout change.

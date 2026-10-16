@@ -17,13 +17,12 @@
 //     before AND after:
 //       field 5 use_mmap      (mm_attach_mmap + pool kinds 4/5)
 //       field 6 cache_norms   (fc_cache_norms)
-//       field 7 dot_multi     (mm_dot8_s -- NOT bit-identical, argmax-validated)
 //   - workers use mm_set_workers_uncapped: this is an attended benchmark that
 //     deliberately takes more than the polite 8-worker ceiling; the run script
 //     refuses to start while a peer model process is alive.
 //
 // Conf tests/lfm2_decode_bench.conf:
-//   "<workers> <len1> <len2> <len3> <use_mmap> <cache_norms> <dot_multi>"
+//   "<workers> <len1> <len2> <len3> <use_mmap> <cache_norms>"
 // Prompt: tests/lfm2_prompt.txt (the reference oracle prompt: first-token
 // argmax must be 5922; the known-good generation is `The answer is: 2<|im_end|>`).
 import std/gguf
@@ -133,6 +132,36 @@ fn rollup_kb(c0, c1, c2, c3) -> i64 {
     return 0 - 1
 }
 
+// VmPeak / VmSize out of /proc/self/status, in kB. VmPeak is the SIZING
+// INSTRUMENT, not RSS: measured by the SI-loop peer (commit e0d766f6), decode
+// leaks ~11 MB/token of VIRTUAL space (13.1 GB VmPeak by token ~1000) while
+// RSS grows only 0.35 MB/token -- an 8 GB ulimit -v run dies mid-generation
+// with zero output long before RSS looks wrong. The stability contract is
+// therefore: anon-RSS flat AND VmPeak flat over 100+ tokens.
+fn status_kb(tag0, tag1, tag2) -> i64 {
+    let fd = file_open("/proc/self/status", 0)
+    if fd < 0 { return 0 - 1 }
+    let b = mem_alloc(4096)
+    let got = read_raw(fd, b, 4095)
+    file_close(fd)
+    if got <= 0 { return 0 - 1 }
+    let i = 0
+    while i + 3 < got {
+        if mem_load8(b + i) == tag0 && mem_load8(b + i + 1) == tag1 && mem_load8(b + i + 2) == tag2 {
+            let j = i + 3
+            while j < got && mem_load8(b + j) != 0 && (mem_load8(b + j) < 48 || mem_load8(b + j) > 57) { j = j + 1 }
+            let v = 0
+            while j < got && mem_load8(b + j) >= 48 && mem_load8(b + j) <= 57 {
+                v = v * 10 + (mem_load8(b + j) - 48)
+                j = j + 1
+            }
+            return v
+        }
+        i = i + 1
+    }
+    return 0 - 1
+}
+
 // insertion sort of the first n entries of buf (i64 ms values), in place
 fn sort_i64(buf, n) {
     let i = 1
@@ -164,7 +193,6 @@ fn main() {
     let len3 = 1024
     let usemap = 1
     let cachen = 1
-    let dmulti = 0
     if cfgb != 0 {
         let nf = parse_ints(cfgb, conf)
         if nf >= 1 { nw = mem_load(conf) }
@@ -173,7 +201,6 @@ fn main() {
         if nf >= 4 { len3 = mem_load(conf + 24) }
         if nf >= 5 { usemap = mem_load(conf + 32) }
         if nf >= 6 { cachen = mem_load(conf + 40) }
-        if nf >= 7 { dmulti = mem_load(conf + 48) }
     } else {
         prints("warn: conf unreadable; defaults\n")
     }
@@ -181,7 +208,6 @@ fn main() {
     prints(" lens="); print(len1); prints("/"); print(len2); prints("/"); print(len3)
     prints(" mmap="); print(usemap)
     prints(" cache_norms="); print(cachen)
-    prints(" dot_multi="); print(dmulti)
     prints(" (argmax temp=0)\n")
 
     let t0 = clock()
@@ -198,7 +224,6 @@ fn main() {
     if cachen != 0 {
         if fc_cache_norms() != 0 { prints("FAIL fc_cache_norms\n"); return 1 }
     }
-    mm_set_dot_multi(dmulti)
     prints("load_ms="); print((clock() - t0) / 1000000)
     prints(" mmap_base="); print(mm_map_base); newline()
 
@@ -250,6 +275,8 @@ fn main() {
 
         let rss0 = rss_total_kb()
         let anon0 = rollup_kb(65, 110, 111, 110)    // "Anon"
+        let vmpeak0 = status_kb(86, 109, 80)        // "VmP" -> VmPeak (first match)
+        let vmsize0 = status_kb(86, 109, 83)        // "VmS" -> VmSize
         let g0 = clock()
         let pos = n
         let k = 0
@@ -281,7 +308,9 @@ fn main() {
             pos = pos + 1
             if tk % 128 == 0 {
                 let a = rollup_kb(65, 110, 111, 110)
-                prints("rss@"); print(tk); prints(" anon_kb="); print(a); newline()
+                let vp = status_kb(86, 109, 80)
+                prints("rss@"); print(tk); prints(" anon_kb="); print(a)
+                prints(" vmpeak_kb="); print(vp); newline()
             }
         }
         let g1 = clock()
@@ -320,6 +349,16 @@ fn main() {
         prints("anon_kb_start="); print(anon0)
         prints(" end="); print(anon1)
         prints(" delta_kb="); print(anon1 - anon0); newline()
+        // VmPeak is the sizing instrument (see status_kb above): a rising
+        // VmPeak across a run is the A9-class leak signature even when RSS
+        // looks flat.
+        let vmpeak1 = status_kb(86, 109, 80)
+        let vmsize1 = status_kb(86, 109, 83)
+        prints("vmpeak_kb_start="); print(vmpeak0)
+        prints(" end="); print(vmpeak1)
+        prints(" delta_kb="); print(vmpeak1 - vmpeak0); newline()
+        prints("vmsize_kb_start="); print(vmsize0)
+        prints(" end="); print(vmsize1); newline()
         run = run + 1
     }
 

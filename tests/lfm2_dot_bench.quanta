@@ -6,8 +6,6 @@
 //   DEQ_PREAD  mm_load_row        (syscall + page-cache copy + dequant)
 //   DEQ_MMAP   mm_deq_row_raw     (pointer read + dequant, same dq32/dq6 calls)
 //   DOT4       mm_dot4_s          (the current 4-lane single-chain dot)
-//   DOT8       mm_dot8_s          (8 interleaved lanes -- different summation
-//                                  order, so its numeric delta is also reported)
 //   MATVEC     full serial matvec, old path vs mmap+DOT4 vs mmap+DOT8
 //   EMBED      output-projection window: serial scalar dot vs mmap+DOT8
 //
@@ -168,9 +166,12 @@ fn main() {
     prints("DEQ_MMAP_Q6K_10752:  ns_per_row="); print(best / 128)
     prints(" ns_per_elem_x100="); print(best / (128 * dff) * 100); newline()
 
-    // ---- 3. dot cost: DOT4 vs DOT8 (same dequantised rows) -----------------
+    // ---- 3. dot cost: mm_dot4_s on the same dequantised rows ----------------
+    // (An 8-cell interleaved dot was measured here and DELETED -- it self-
+    // aliased its accumulator cells and, corrected, still lost to mm_dot4_s
+    // by 1.8x on equal work. Evidence: tests/lfm2_avx2_call_chain_bench.quanta.)
     if mm_load_row(td, 4, dff) != 0 { prints("FAIL row\n"); return 1 }
-    // copy the row so both dots read identical bytes
+    // copy the row so the dot reads stable bytes
     let c = 0
     while c < dff { mem_store(rowq6 + c * 8, mem_load(mm_rowbuf + c * 8)); c = c + 1 }
 
@@ -185,19 +186,6 @@ fn main() {
         rep = rep + 1
     }
     prints("DOT4_Q6K_10752: ns_per_row="); print(best / 256)
-    prints(" ns_per_elem_x100="); print(best / (256 * dff) * 100); newline()
-
-    best = 0
-    rep = 0
-    while rep < 3 {
-        let t0 = clock()
-        let k = 0
-        while k < 256 { sink = sink + mm_dot8_s(rowq6, x_dff, dff, acc); k = k + 1 }
-        let dt = clock() - t0
-        if best == 0 || dt < best { best = dt }
-        rep = rep + 1
-    }
-    prints("DOT8_Q6K_10752: ns_per_row="); print(best / 256)
     prints(" ns_per_elem_x100="); print(best / (256 * dff) * 100); newline()
 
     if mm_load_row(tg, 4, dm) != 0 { prints("FAIL row q4\n"); return 1 }
@@ -217,35 +205,29 @@ fn main() {
     prints("DOT4_Q4K_2048: ns_per_row="); print(best / 1024)
     prints(" ns_per_elem_x100="); print(best / (1024 * dm) * 100); newline()
 
-    best = 0
-    rep = 0
-    while rep < 3 {
-        let t0 = clock()
-        let k = 0
-        while k < 1024 { sink = sink + mm_dot8_s(rowq4, x_dm, dm, acc); k = k + 1 }
-        let dt = clock() - t0
-        if best == 0 || dt < best { best = dt }
-        rep = rep + 1
-    }
-    prints("DOT8_Q4K_2048: ns_per_row="); print(best / 1024)
-    prints(" ns_per_elem_x100="); print(best / (1024 * dm) * 100); newline()
-
-    // ---- 4. DOT8 numeric delta vs DOT4 on real rows ------------------------
-    let maxrel: f64 = 0.0
+    // ---- 4. mm_dot4_s exactness on a CONTROLLED row ------------------------
+    // row[k] = (k%7)-3, x[k] = 1.0 -> exact dot = the scalar sum. mm_dot4_s
+    // must match it to the last bit for integer-valued data (its 4 vector
+    // lanes hold exact small integers; the horizontal reduction of exact
+    // integers is exact).
     i = 0
-    while i < 64 {
-        if mm_load_row(tg, i, dm) != 0 { prints("FAIL row\n"); return 1 }
-        let a: f64 = mm_dot4_s(mm_rowbuf, x_dm, dm, acc)
-        let b: f64 = mm_dot8_s(mm_rowbuf, x_dm, dm, acc)
-        let d: f64 = a - b
-        if d < 0.0 { d = 0.0 - d }
-        let mag: f64 = a
-        if mag < 0.0 { mag = 0.0 - mag }
-        let rel: f64 = d / (1e-12 + mag)
-        if rel > maxrel { maxrel = rel }
+    while i < dm {
+        mem_store(rowq4 + i * 8, i2f(i - (i / 7) * 7 - 3))
+        mem_store(x_dm + i * 8, 1.0)
         i = i + 1
     }
-    prints("DOT8_VS_DOT4 max_rel_diff_x1e9="); print_f(maxrel * 1e9); newline()
+    let sref: f64 = 0.0
+    i = 0
+    while i < dm { sref = sref + f64of(mem_load(rowq4 + i * 8)); i = i + 1 }
+    let d4: f64 = mm_dot4_s(rowq4, x_dm, dm, acc)
+    let e4: f64 = d4 - sref
+    if e4 < 0.0 { e4 = 0.0 - e4 }
+    prints("DOT_CONTROLLED sum="); print_f(sref)
+    prints(" dot4_err="); print_f(e4)
+    prints(" (must be 0 for integer data)\n")
+    // restore the synthetic activations used below
+    i = 0
+    while i < dm { mem_store(x_dm + i * 8, i2f((i * 37) % 101 - 50) / i2f(71)); i = i + 1 }
 
     // ---- 5. full serial matvec, three ways ---------------------------------
     // old path (pread + dequant + DOT4), workers = 0
@@ -289,14 +271,14 @@ fn main() {
         while r < dff {
             let rawp = mm_map_base + gguf_tensor_offset(tg) + r * mm_row_bytes(12, dm)
             if mm_deq_row_raw(12, rawp, dm, rowq4) != 0 { prints("FAIL deq\n"); return 1 }
-            mem_store(y2 + r * 8, mm_dot8_s(rowq4, x_dm, dm, acc))
+            mem_store(y2 + r * 8, mm_dot4_s(rowq4, x_dm, dm, acc))
             r = r + 1
         }
         let dt = clock() - t0
         if best == 0 || dt < best { best = dt }
         rep = rep + 1
     }
-    prints("MATVEC_SER_MMAP_DOT8 gate:        ns="); print(best)
+    prints("MATVEC_SER_MMAP_DOT4 gate:        ns="); print(best)
     prints(" ns_per_elem_x100="); print(best / (dff * dm) * 100); newline()
 
     // ffn_down (Q6_K): old vs mmap+DOT8
@@ -320,14 +302,14 @@ fn main() {
         while r < dm {
             let rawp = mm_map_base + gguf_tensor_offset(td) + r * mm_row_bytes(14, dff)
             if mm_deq_row_raw(14, rawp, dff, rowq6) != 0 { prints("FAIL deq\n"); return 1 }
-            mem_store(y2 + r * 8, mm_dot8_s(rowq6, x_dff, dff, acc))
+            mem_store(y2 + r * 8, mm_dot4_s(rowq6, x_dff, dff, acc))
             r = r + 1
         }
         let dt = clock() - t0
         if best == 0 || dt < best { best = dt }
         rep = rep + 1
     }
-    prints("MATVEC_SER_MMAP_DOT8 down:          ns="); print(best)
+    prints("MATVEC_SER_MMAP_DOT4 down:          ns="); print(best)
     prints(" ns_per_elem_x100="); print(best / (dm * dff) * 100); newline()
 
     // ---- 6. output projection window: scalar vs mmap+DOT8 ------------------
@@ -352,14 +334,14 @@ fn main() {
         while v < vwin {
             let rawp = mm_map_base + gguf_tensor_offset(te) + v * mm_row_bytes(14, dm)
             if mm_deq_row_raw(14, rawp, dm, rowq4) != 0 { prints("FAIL deq\n"); return 1 }
-            mem_store(y2 + v * 8, mm_dot8_s(rowq4, x_dm, dm, acc))
+            mem_store(y2 + v * 8, mm_dot4_s(rowq4, x_dm, dm, acc))
             v = v + 1
         }
         let dt = clock() - t0
         if best == 0 || dt < best { best = dt }
         rep = rep + 1
     }
-    prints("EMBED_SER_MMAP_DOT8 4096x2048:  ns="); print(best)
+    prints("EMBED_SER_MMAP_DOT4 4096x2048:  ns="); print(best)
     prints(" ns_per_elem_x100="); print(best / (vwin * dm) * 100); newline()
 
     prints("DONE\n")

@@ -1,0 +1,155 @@
+// tests/lfm2_avx2_call_chain_bench.quanta -- why multi-lane dots alias, and
+// what the correct cell layout is.
+//
+// THE LESSON (learned the expensive way, 2026-10-16): fmulf_avx2 / faddf_avx2
+// each load, operate on, and store FOUR f64s -- 32 bytes -- per call. A
+// "multi-lane accumulator" built from cells spaced 8 bytes apart is therefore
+// SELF-ALIASING: every faddf_avx2(acc + 8*g, ...) store clobbers cells g+1,
+// g+2, g+3. The symptoms look exactly like a codegen defect -- unit-vector
+// probes "drop" elements, per-group diagnostics show one call "reading"
+// another call's address -- but the emitted instruction bytes are identical
+// for every call and the compiler is innocent. This bench pins both sides:
+//
+//   V1: 8 cells at 8-byte spacing  -> aliasing signature (wrong sums, and the
+//       first double of each cell equals row[4g] when x is all ones)
+//   V2: 8 cells at 32-BYTE spacing -> exact sums (the only correct layout)
+//   V3: timing, correct 8-cell dot vs mm_dot4_s (4 vector lanes = 4 chains)
+//
+// Rule for any future multi-chain dot in this codebase: each independent
+// accumulator cell owns 32 bytes. 8 cells need 256 bytes of lanes + 256 bytes
+// of temps = the 512-byte scratch region mm_scratch_new already allocates.
+import std/fs
+import std/lfm2_mm
+
+fn main() {
+    let row = mem_alloc(4096 * 8)
+    let x = mem_alloc(4096 * 8)
+    let lanes8 = mem_alloc(512)     // room for the correct layout
+    let tmp = mem_alloc(512)
+
+    let k = 0
+    while k < 256 {
+        mem_store(row + k * 8, i2f(k + 1))     // distinct: sums identify slices
+        mem_store(x + k * 8, 1.0)
+        k = k + 1
+    }
+
+    // ---- V1: 8 cells at 8-byte spacing (BROKEN -- documented, not fixed) ---
+    k = 0
+    while k < 8 { mem_store(lanes8 + k * 8, 0.0); k = k + 1 }
+    fmulf_avx2(tmp, row, x)
+    faddf_avx2(lanes8, lanes8, tmp)
+    fmulf_avx2(tmp + 8, row + 32, x + 32)
+    faddf_avx2(lanes8 + 8, lanes8 + 8, tmp + 8)
+    fmulf_avx2(tmp + 16, row + 64, x + 64)
+    faddf_avx2(lanes8 + 16, lanes8 + 16, tmp + 16)
+    fmulf_avx2(tmp + 24, row + 96, x + 96)
+    faddf_avx2(lanes8 + 24, lanes8 + 24, tmp + 24)
+    fmulf_avx2(tmp + 32, row + 128, x + 128)
+    faddf_avx2(lanes8 + 32, lanes8 + 32, tmp + 32)
+    fmulf_avx2(tmp + 40, row + 160, x + 160)
+    faddf_avx2(lanes8 + 40, lanes8 + 40, tmp + 40)
+    fmulf_avx2(tmp + 48, row + 192, x + 192)
+    faddf_avx2(lanes8 + 48, lanes8 + 48, tmp + 48)
+    fmulf_avx2(tmp + 56, row + 224, x + 224)
+    faddf_avx2(lanes8 + 56, lanes8 + 56, tmp + 56)
+    prints("V1 8-byte-spaced cells (BROKEN): lane[0] per group g should be 4g+1\n")
+    let g = 0
+    while g < 8 {
+        let got: f64 = f64of(mem_load(lanes8 + g * 8))
+        prints("  g="); print(g)
+        prints(" cell[0]="); print_f(got)
+        prints(" (a correct 32-byte layout would put group sums here)\n")
+        g = g + 1
+    }
+
+    // ---- V2: 8 cells at 32-BYTE spacing (correct) ---------------------------
+    // cell g owns bytes 32g..32g+31; sum of its 4 doubles = group sum.
+    k = 0
+    while k < 8 { mem_store(lanes8 + k * 32, 0.0); mem_store(lanes8 + k * 32 + 8, 0.0); mem_store(lanes8 + k * 32 + 16, 0.0); mem_store(lanes8 + k * 32 + 24, 0.0); k = k + 1 }
+    fmulf_avx2(tmp, row, x)
+    faddf_avx2(lanes8, lanes8, tmp)
+    fmulf_avx2(tmp + 32, row + 32, x + 32)
+    faddf_avx2(lanes8 + 32, lanes8 + 32, tmp + 32)
+    fmulf_avx2(tmp + 64, row + 64, x + 64)
+    faddf_avx2(lanes8 + 64, lanes8 + 64, tmp + 64)
+    fmulf_avx2(tmp + 96, row + 96, x + 96)
+    faddf_avx2(lanes8 + 96, lanes8 + 96, tmp + 96)
+    fmulf_avx2(tmp + 128, row + 128, x + 128)
+    faddf_avx2(lanes8 + 128, lanes8 + 128, tmp + 128)
+    fmulf_avx2(tmp + 160, row + 160, x + 160)
+    faddf_avx2(lanes8 + 160, lanes8 + 160, tmp + 160)
+    fmulf_avx2(tmp + 192, row + 192, x + 192)
+    faddf_avx2(lanes8 + 192, lanes8 + 192, tmp + 192)
+    fmulf_avx2(tmp + 224, row + 224, x + 224)
+    faddf_avx2(lanes8 + 224, lanes8 + 224, tmp + 224)
+    prints("V2 32-byte-spaced cells (want 10/26/42/58/74/90/106/122):")
+    g = 0
+    while g < 8 {
+        let s: f64 = f64of(mem_load(lanes8 + g * 32)) + f64of(mem_load(lanes8 + g * 32 + 8)) + f64of(mem_load(lanes8 + g * 32 + 16)) + f64of(mem_load(lanes8 + g * 32 + 24))
+        prints("  g="); print(g)
+        prints(" sum="); print_f(s)
+        if s != i2f(10 + g * 16) { prints("  << WRONG") }
+        g = g + 1
+    }
+    newline()
+
+    // ---- V3: timing, correct 8-cell dot vs mm_dot4_s over 128 elements -----
+    // Equal work: both forms consume all 128 elements per rep. The 8-cell
+    // form: outer iteration c steps 32 ELEMENTS; group g (0..7) multiplies
+    // elements c+4g..c+4g+3 into its own 32-byte cell.
+    let reps = 200000
+    let sink = 0.0
+    let t0 = clock()
+    let r = 0
+    while r < reps {
+        k = 0
+        while k < 8 {
+            mem_store(lanes8 + k * 32, 0.0)
+            mem_store(lanes8 + k * 32 + 8, 0.0)
+            mem_store(lanes8 + k * 32 + 16, 0.0)
+            mem_store(lanes8 + k * 32 + 24, 0.0)
+            k = k + 1
+        }
+        let c = 0
+        while c < 128 {
+            let g8 = 0
+            while g8 < 8 {
+                fmulf_avx2(tmp + g8 * 32, row + (c + g8 * 4) * 8, x + (c + g8 * 4) * 8)
+                faddf_avx2(lanes8 + g8 * 32, lanes8 + g8 * 32, tmp + g8 * 32)
+                g8 = g8 + 1
+            }
+            c = c + 32
+        }
+        let s8: f64 = 0.0
+        k = 0
+        while k < 8 {
+            s8 = s8 + f64of(mem_load(lanes8 + k * 32)) + f64of(mem_load(lanes8 + k * 32 + 8)) + f64of(mem_load(lanes8 + k * 32 + 16)) + f64of(mem_load(lanes8 + k * 32 + 24))
+            k = k + 1
+        }
+        sink = sink + s8
+        r = r + 1
+    }
+    let t8 = clock() - t0
+
+    let acc4 = mem_alloc(512)
+    t0 = clock()
+    r = 0
+    while r < reps {
+        sink = sink + mm_dot4_s(row, x, 128, acc4)
+        r = r + 1
+    }
+    let t4 = clock() - t0
+
+    prints("V3 timing 128 elems x ")
+    print(reps)
+    prints(" reps: 8cell_ns="); print(t8)
+    prints(" mm_dot4_ns="); print(t4)
+    prints(" dot4/dot8_ratio_x100="); print(t4 * 100 / t8)
+    prints("  (sink/1000="); print_f(sink / 1000.0)
+    prints(" want ")
+    print(reps * 8256 / 1000)
+    prints(")\n")
+    prints("DONE\n")
+    return 0
+}

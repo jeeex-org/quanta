@@ -16,7 +16,7 @@ REPO="$PWD"
 QC="${QC:-$REPO/compiler/$(cat "$REPO/VERSION")/bin/x86/qc}"
 SRC="$REPO/tests/lfm2_decode_bench.quanta"
 BIN="${TMPDIR:-/tmp}/lfm2_decode_bench.bin"
-CAP="${1:-8000000}"
+CAP="${1:-32000000}"
 TMO="${2:-14400}"
 
 if [ ! -f /opt/ai/models/quanta/QUANTA-LFM2.5-2.6Bv1-Q4_K_M.gguf ]; then
