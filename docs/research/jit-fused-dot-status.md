@@ -228,3 +228,24 @@ number to quote for integration purposes is 8.73x.)
 - The dispatch ceiling (811% CPU vs the 1,600-1,900% target) remains open, and the
   earlier campaign named it as jointly required with fusion for 15 tok/s.
 - llama.cpp reference on the same model and CPU: 17.32 tok/s. Native loader: 0.281.
+
+## CORRECTION: the 8.73x is one sample of a load-sensitive ratio
+
+Two runs of the SAME test (`tests/jit_vs_prod_test.quanta`, 2048 weights, 200 reps,
+bit-equality asserted in both) produced materially different numbers:
+
+    run 1: production 14,040,377   fused 1,141,098   ratio 12.30x
+    run 2: production  5,200,572   fused   595,426   ratio  8.73x
+
+The production figure itself moved 2.7x between runs. This box carries `Hermes` at
+~750% CPU permanently and load has been 9.4-10, so BOTH the absolute times and the
+ratio are load-sensitive. The honest statement is:
+
+  **the fused kernel is roughly 9-12x faster than the production matvec on this
+  box, measured at 12.30x and 8.73x in two runs, with bit-equality to
+  `q4k_matvec_real` in both.**
+
+Quoting a single figure (8.73x or 14.47x) as if it were a stable constant
+overstates the precision. The direction and magnitude of the win are robust; the
+second decimal place is not. Any e2e tok/s number must carry the same caveat until
+it is taken on a quiet box.
