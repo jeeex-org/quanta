@@ -1,0 +1,74 @@
+// tests/jit_oracle_test.quanta
+//
+// A HAND-COMPUTABLE ORACLE for the JIT fused Q4_K dot.
+//
+// Degenerate inputs make the correct answer arithmetically predictable, so a
+// mismatch points at structure rather than at rounding:
+//   d = 1.0, dmin = 0.5, scale bytes 1..12 (as in the exactness test)
+//   every quant byte = 0x11  -> every nibble = 1
+//   every x element  = 1.0
+//
+// Then each weight is (scale_k) - (0.5*min_k) and the total is
+//   32 * sum over the 8 pairs of (scale_k - 0.5*min_k)
+// With the pairs this test builds (1,5) (2,6) (3,7) (4,8) (9,0) (10,0) (11,0) (12,0)
+// as raw bytes 1..12 in the 12-byte scale area, q4k_sc/q4k_min decode to
+//   scales 1,2,3,4,9,10,11,12   mins 5,6,7,8,0,0,0,0
+// so the expected total is
+//   32 * [ (1-2.5) + (2-3) + (3-3.5) + (4-4) + (9-0) + (10-0) + (11-0) + (12-0) ]
+// = 32 * [ -1.5 -1 -0.5 + 0 + 9 + 10 + 11 + 12 ] = 32 * 39 = 1248
+import std/gguf
+import std/matmul_q4k
+import std/jit_x86
+import std/jit_x86_fused
+
+fn jit_call(dst: i64, a0: i64, a1: i64) -> i64 {
+    let t = mem_alloc(2)
+    mem_store(t, dst)
+    mem_store(t + 8, 0)
+    return closure_call(t, a0, a1)
+}
+
+fn main() -> i64 {
+    prints("=== jit fused Q4_K: hand-computable oracle (expect 1248) ===\n")
+
+    let region = jit_f_alloc(65536)
+    if region <= 0 { prints("UNSUPPORTED\n"); return 2 }
+    let tbl = jit_f_code(jit_f_build())
+    if tbl <= 0 { prints("BUILD FAILED\n"); return 1 }
+    let entry = mem_load(tbl)
+
+    let raw = mem_alloc(160)
+    mem_store8(raw + 0, 0)      // d  = 1.0
+    mem_store8(raw + 1, 60)
+    mem_store8(raw + 2, 0)      // dmin = 0.5
+    mem_store8(raw + 3, 56)
+    let i = 0
+    while i < 12 { mem_store8(raw + 4 + i, 1 + i) ; i = i + 1 }
+    i = 0
+    while i < 128 { mem_store8(raw + 16 + i, 17) ; i = i + 1 }   // 0x11
+
+    let x = mem_alloc(256 * 8 + 64)
+    i = 0
+    while i < 256 { mem_store(x + i * 8, 1.0) ; i = i + 1 }
+
+    let dmd = jit_f_dmd_alloc(1)
+    jit_f_dmd_fill(raw, raw + 4, f16_to_f64(raw + 0), f16_to_f64(raw + 2), dmd)
+
+    let asz = mem_alloc(32)
+    mem_store(asz + 0,  raw)
+    mem_store(asz + 8,  x)
+    mem_store(asz + 16, dmd)
+    mem_store(asz + 24, 1)
+
+    let scalar_f = q4k_block_dot(raw, x, 1, 0)
+    let sbuf = mem_alloc(8)
+    mem_store(sbuf, scalar_f)
+    let scalar_bits = mem_load(sbuf)
+    let jit_bits = jit_call(entry, asz, 0)
+
+    prints("scalar bits = "); print(scalar_bits); newline()
+    prints("jit    bits = "); print(jit_bits); newline()
+    if scalar_bits == jit_bits { prints("RESULT: BIT-EXACT\n"); return 0 }
+    prints("RESULT: MISMATCH\n")
+    return 1
+}

@@ -1,0 +1,59 @@
+// tests/jit_plumb_test.quanta
+//
+// DOES THE EMITTED KERNEL SEE THE SAME POINTERS WE SET UP?
+//
+// With d=0 the fused kernel returns ~0, and with real factors it returns ~1e12
+// while the scalar returns the hand-verified 1248. That pattern says the kernel
+// is reading SOME memory correctly enough to multiply, but not OUR table. So
+// check the plumbing itself: emit one tiny stub per slot of the argument area
+// and print what it actually loads.
+import std/gguf
+import std/jit_x86
+import std/jit_x86_fused
+
+fn jit_call(dst: i64, a0: i64, a1: i64) -> i64 {
+    let t = mem_alloc(2)
+    mem_store(t, dst)
+    mem_store(t + 8, 0)
+    return closure_call(t, a0, a1)
+}
+
+// emit `mov rax, [rdi+off] ; ret` and call it
+fn probe_slot(off: i64) -> i64 {
+    let e = ja_pos()
+    jbytes(3, "488b4700")           // mov rax,[rdi+0]  (offset patched below)
+    mem_store8(e + 3, off)          // modrm disp8
+    jbytes(1, "c3")                 // ret
+    return e
+}
+
+fn main() -> i64 {
+    prints("=== emitted-kernel pointer plumbing ===\n")
+    let region = jit_f_alloc(4096)
+    if region <= 0 { prints("UNSUPPORTED\n"); return 2 }
+
+    let raw = mem_alloc(160)
+    let x   = mem_alloc(4096)
+    let dmd = jit_f_dmd_alloc(1)
+    let asz = mem_alloc(32)
+    mem_store(asz + 0,  raw)
+    mem_store(asz + 8,  x)
+    mem_store(asz + 16, dmd)
+    mem_store(asz + 24, 1)
+
+    prints("expected raw  = "); print(raw); newline()
+    prints("expected x    = "); print(x); newline()
+    prints("expected dmd  = "); print(dmd); newline()
+    prints("expected nsup = 1"); newline()
+
+    let p0 = probe_slot(0)
+    let p8 = probe_slot(8)
+    let p16 = probe_slot(16)
+    let p24 = probe_slot(24)
+
+    prints("slot 0  -> "); print(jit_call(p0, asz, 0)); newline()
+    prints("slot 8  -> "); print(jit_call(p8, asz, 0)); newline()
+    prints("slot 16 -> "); print(jit_call(p16, asz, 0)); newline()
+    prints("slot 24 -> "); print(jit_call(p24, asz, 0)); newline()
+    return 0
+}

@@ -1,0 +1,137 @@
+// tests/jit_diag_test.quanta
+//
+// WHERE does the fused kernel's value come from? Three configurations whose
+// correct answers are known independently, so the fault can be LOCALISED
+// instead of guessed:
+//
+//   (A) x = 0 for every element     -> every term is 0  -> MUST be 0
+//       If (A) is non-zero, the accumulation or the return path is broken.
+//   (B) d = 0 and dmin = 0          -> every weight is 0 -> MUST be 0
+//       If (B) is non-zero, the factors or the quant decode are broken.
+//   (C) the oracle case             -> MUST be 1248 (hand-computed)
+//       If (C) is wrong while (A) and (B) are right, the fault is a scaling or
+//       indexing error that only shows up with real data.
+import std/gguf
+import std/matmul_q4k
+import std/jit_x86
+import std/jit_x86_fused
+
+fn jit_call(dst: i64, a0: i64, a1: i64) -> i64 {
+    let t = mem_alloc(2)
+    mem_store(t, dst)
+    mem_store(t + 8, 0)
+    return closure_call(t, a0, a1)
+}
+
+// NOTE the argument order: f16 is little-endian, so (lo, hi) pairs. An earlier
+// version of this harness wrote only the low byte and silently made d = 0.0,
+// producing "matches" between two near-zero numbers -- a false positive worth
+// recording so it is not repeated.
+fn mkraw(d_lo: i64, d_hi: i64, dm_lo: i64, dm_hi: i64, qbyte: i64) -> i64 {
+    let raw = mem_alloc(160)
+    mem_store8(raw + 0, d_lo)
+    mem_store8(raw + 1, d_hi)
+    mem_store8(raw + 2, dm_lo)
+    mem_store8(raw + 3, dm_hi)
+    let i = 0
+    while i < 12 { mem_store8(raw + 4 + i, 1 + i) ; i = i + 1 }
+    i = 0
+    while i < 128 { mem_store8(raw + 16 + i, qbyte) ; i = i + 1 }
+    return raw
+}
+
+fn mkx(val: f64) -> i64 {
+    let x = mem_alloc(256 * 8 + 64)
+    let i = 0
+    while i < 256 { mem_store(x + i * 8, val) ; i = i + 1 }
+    return x
+}
+
+fn run(entry, raw, x: i64) -> i64 {
+    let dmd = jit_f_dmd_alloc(1)
+    jit_f_dmd_fill(raw, raw + 4, f16_to_f64(raw + 0), f16_to_f64(raw + 2), dmd)
+    let asz = mem_alloc(32)
+    mem_store(asz + 0, raw)
+    mem_store(asz + 8, x)
+    mem_store(asz + 16, dmd)
+    mem_store(asz + 24, 1)
+    return jit_call(entry, asz, 0)
+}
+
+fn main() -> i64 {
+    prints("=== jit fused Q4_K: localisation ===\n")
+    let region = jit_f_alloc(65536)
+    if region <= 0 { prints("UNSUPPORTED\n"); return 2 }
+    let tbl = jit_f_code(jit_f_build())
+    if tbl <= 0 { prints("BUILD FAILED\n"); return 1 }
+    let entry = mem_load(tbl)
+
+    // (A) x = 0  ->  expect 0
+    let ra = mkraw(0, 60, 0, 56, 17)
+    let xa = mkx(0.0)
+    prints("(A) x=0        jit bits = "); print(run(entry, ra, xa)); newline()
+
+    // (B) d = 0, dmin = 0  ->  expect 0
+    let rb = mkraw(0, 0, 0, 0, 17)
+    let xb = mkx(1.0)
+    prints("(B) d=0,dmin=0 jit bits = "); print(run(entry, rb, xb)); newline()
+
+    // (D) varied x, CONSTANT bytes -> isolates the x-position mapping.
+    //     If this mismatches, bytes are paired with the wrong x positions.
+    let rd = mkraw(0, 60, 0, 56, 17)
+    let xd = mem_alloc(256 * 8 + 64)
+    let di = 0
+    while di < 256 { mem_store(xd + di * 8, (di % 13) * 0.5 + 0.25) ; di = di + 1 }
+    let jit_d = run(entry, rd, xd)
+    let sd = q4k_block_dot(rd, xd, 1, 0)
+    let sdb = mem_alloc(8)
+    mem_store(sdb, sd)
+    prints("(D) varied x    jit = "); print(jit_d); prints("  scalar = "); print(mem_load(sdb)); newline()
+
+    // (E) constant x, VARIED bytes -> isolates the byte-position mapping.
+    let re = mkraw(0, 60, 0, 56, 17)
+    let ei = 0
+    while ei < 128 { mem_store8(re + 16 + ei, (ei * 7 + 3) - ((ei * 7 + 3) / 256) * 256) ; ei = ei + 1 }
+    let xe = mkx(1.0)
+    let jit_e = run(entry, re, xe)
+    let se = q4k_block_dot(re, xe, 1, 0)
+    let seb = mem_alloc(8)
+    mem_store(seb, se)
+    prints("(E) varied byt  jit = "); print(jit_e); prints("  scalar = "); print(mem_load(seb)); newline()
+
+    // (F) x[i] = i, constant bytes -> hand-computable, reveals a permutation.
+    //  reference: pair p covers positions 32p..32p+31 with weight w_p, and
+    //  w = -1.5, -1, -0.5, 0, 9, 10, 11, 12, so the expected total is 258960.
+    let rf = mkraw(0, 60, 0, 56, 17)
+    let xf = mem_alloc(256 * 8 + 64)
+    let fi = 0
+    while fi < 256 { mem_store(xf + fi * 8, i2f(fi)) ; fi = fi + 1 }
+    let jit_f2 = run(entry, rf, xf)
+    let sf = q4k_block_dot(rf, xf, 1, 0)
+    let sfb = mem_alloc(8)
+    mem_store(sfb, sf)
+    prints("(F) x=i         jit = "); print(jit_f2); prints("  scalar = "); print(mem_load(sfb)); newline()
+
+    // (G) BOTH varied -> the case that actually fails
+    let rg = mkraw(0, 60, 0, 56, 17)
+    let gi = 0
+    while gi < 128 { mem_store8(rg + 16 + gi, (gi * 7 + 3) - ((gi * 7 + 3) / 256) * 256) ; gi = gi + 1 }
+    let xg = mem_alloc(256 * 8 + 64)
+    gi = 0
+    while gi < 256 { mem_store(xg + gi * 8, (gi % 13) * 0.5 + 0.25) ; gi = gi + 1 }
+    let jit_g = run(entry, rg, xg)
+    let sg = q4k_block_dot(rg, xg, 1, 0)
+    let sgb = mem_alloc(8)
+    mem_store(sgb, sg)
+    prints("(G) both varied jit = "); print(jit_g); prints("  scalar = "); print(mem_load(sgb)); newline()
+
+    // (C) oracle  ->  expect 1248
+    let rc = mkraw(0, 60, 0, 56, 17)
+    let xc = mkx(1.0)
+    prints("(C) oracle     jit bits = "); print(run(entry, rc, xc)); newline()
+    let sc = q4k_block_dot(rc, xc, 1, 0)
+    let sb = mem_alloc(8)
+    mem_store(sb, sc)
+    prints("(C) oracle    scalar bits = "); print(mem_load(sb)); newline()
+    return 0
+}

@@ -119,6 +119,10 @@ fn j_f_add_rdx_16() -> i64 { return femit("4883c210", 4) }
 fn j_f_add_rdx_32() -> i64 { return femit("4883c220", 4) }
 // sub r9, 32                     49 83 e9 20   rewind the quant cursor one half-chunk
 fn j_f_rewind_r9_32() -> i64 { return femit("4983e920", 4) }
+// add r9, 16                     49 83 c1 10   skip the 144-byte super-block
+// header (f16 d, f16 dmin, 12 scale bytes) to reach the 128 quant bytes.
+// lib/std/matmul_q4k.quanta q4k_block_dot does exactly this with `q = raw+bo+16`.
+fn j_f_skip_header() -> i64 { return femit("4983c110", 4) }
 // vbroadcastsd ymm6, [rdx+16]    c4 e2 7d 19 72 10   high-half d*Kn
 fn j_f_vbcastsd_y6_rdx16() -> i64 { return femit("c4e27d197210", 6) }
 // vbroadcastsd ymm7, [rdx+24]    c4 e2 7d 19 7a 18   high-half dmin*Mn
@@ -199,6 +203,7 @@ fn j_f_high() -> i64 {
 fn jit_f_build() -> i64 {
     let entry = ja_pos()
     j_f_load_w()
+    j_f_skip_header()          // r9 now points at the quant bytes, not the header
     j_f_load_x()
     j_f_load_dmd()
     j_f_load_n()
@@ -239,11 +244,12 @@ fn jit_f_build() -> i64 {
         j_f_add_rdx_32()            // both pairs of this chunk consumed
         chunk = chunk + 1
     }
+    j_f_skip_header()               // 128 quant bytes + 16 header = 144 stride
 
     // sub rcx,1 ; jne rel32 -> back to bodytop.
     // rel32, not rel8: the corrected Q4_K cadence (4 chunks x 8 groups) makes
     // the body ~4 KB, far outside the +-127-byte window a rel8 branch reaches.
-    jbytes(3, "4883e901")            // sub rcx, 1
+    jbytes(4, "4883e901")            // sub rcx, 1
     j_jne32()                        // 0F 85, displacement follows
     let disp_at = ja_pos()           // address OF the displacement (4 bytes)
     jbytes(4, "00000000")            // placeholder

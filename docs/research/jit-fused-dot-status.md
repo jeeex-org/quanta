@@ -47,3 +47,67 @@ Next diagnostic (cheapest first):
    name the bad register or the address that is out of range.
 3. Verify at nsuper=1 with x/raw/dmd allocated as ONE mmap'd block, so an
    overrun is a contiguous read rather than an unmapped fault.
+
+## Second pass — the crash is FIXED, the arithmetic is not
+
+### Root cause of the segfault: `jbytes(n, hex)` silently truncates
+
+`lib/std/jit_x86.quanta jbytes(n, hexstr)` writes exactly the FIRST n bytes of the
+hex string. The loop counter decrement was written as
+
+    jbytes(3, "4883e901")     // sub rcx,1 -- a FOUR-byte instruction
+
+so the trailing `01` was DROPPED and the kernel executed `sub rcx,15` followed by
+garbage (`test %edx,%edi`, `out %al,(%dx)`) and a mis-aimed branch. Found by
+dumping the emitted bytes, converting to a binary, and reading the disassembly --
+the source hex strings each looked correct in isolation; only the SEQUENCE showed
+the fault.
+
+An audit of every `jbytes` call in both JIT modules found **9 mismatches**:
+this one plus 8 in `j_push`/`j_pop` (REX-prefixed push/pop declared as 1 byte when
+they are 2). All 9 are now fixed and a re-audit reports 0 remaining.
+
+### Other real bugs fixed
+
+- 8x DMD overrun (32 groups of 8 vs 8 pairs of 128 bytes per row)
+- pair ownership: rdx is advanced by the chunk, not by each 4-byte group
+- per-half factor broadcast: low nibbles and high nibbles need different pairs
+- backward branch widened to `jne rel32` (the corrected body is ~4.4 KB)
+- **super-block header skip**: the kernel started reading quant bytes at `W+0`,
+  i.e. it treated the f16 d, f16 dmin and 12 scale bytes as quant data.
+  `q4k_block_dot` uses `q = raw + bo + 16`. Fixed in the prologue and per
+  iteration (128 quant bytes + 16 header = the 144-byte stride).
+- addressing model: 8 low steps + `sub r9,32` rewind + 8 high steps per chunk,
+  because Q4_K maps low nibbles to weights [i] and high nibbles to [32+i]
+
+### Test infrastructure that now exists
+
+- `tests/jit_oracle_test.quanta` — degenerate inputs, hand-computable answer
+- `tests/jit_diag_test.quanta` — (A) x=0, (B) d=0, (C) constant, (D) varied x,
+  (E) varied bytes, (F) x=i, (G) both varied
+- `tests/jit_dump_kernel.quanta` — prints the emitted bytes so objdump can read
+  them; this is what found the truncation bug
+- `tests/jit_plumb_test.quanta` — pointer plumbing probe (WIP, currently faults)
+- `tests/jit_argconv_test.quanta` — CONFIRMED: `closure_call` delivers a0 in rdi
+
+The scalar reference is now independently verified against theory: case (C)
+computes 1248.0 and case (F) computes 258960.0, both exactly as hand-derived.
+
+### OPEN: the kernel returns ~1e12 where the scalar returns 1248
+
+- with d = 0 the kernel returns ~0 (correct)
+- with real factors it returns huge values in EVERY case, (C) included
+- the DMD table contents are verified correct by read-back
+  (1.0/2.5, 2.0/3.0, 3.0/3.5, 4.0/4.0, 9/0, 10/0, 11/0, 12/0)
+- so the kernel is applying factors that are not the table's
+
+Next: fix the plumbing probe (it currently faults on its own emitted bytes) to
+print what the kernel actually loads from each argument slot. That is the one
+measurement that separates "wrong pointer" from "wrong offset".
+
+### Harness false positive worth remembering
+
+The first version of `tests/jit_diag_test.quanta` wrote the f16 scale's low byte
+and left the high byte 0, silently making d = 0.0. Every case then compared two
+near-zero numbers and "matched". A test that agrees because both sides are zero
+proves nothing.

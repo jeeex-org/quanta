@@ -1,0 +1,41 @@
+// tests/jit_argconv_test.quanta
+//
+// WHICH REGISTER DOES closure_call PUT a0 IN?
+//
+// tests/lfm2_jit_probe.quanta proved runtime-emitted bytes are callable, but its
+// stubs IGNORED their arguments. The fused kernel's very first instruction is
+// `mov r9,[rdi]`, so if closure_call does not deliver a0 in rdi the kernel
+// faults immediately -- which is exactly the symptom.
+//
+// This emits `mov rax, rdi ; ret` and calls it with a known sentinel. If rax
+// comes back as the sentinel, rdi is a0. If not, we try rsi and the rest.
+import std/jit_x86
+import std/jit_x86_fused
+
+fn jit_call(dst: i64, a0: i64, a1: i64) -> i64 {
+    let t = mem_alloc(2)
+    mem_store(t, dst)
+    mem_store(t + 8, 0)
+    return closure_call(t, a0, a1)
+}
+
+fn main() -> i64 {
+    prints("=== closure_call argument-register probe ===\n")
+
+    let region = jit_f_alloc(4096)
+    if region <= 0 { prints("UNSUPPORTED: no PROT_EXEC\n"); return 2 }
+    let entry = ja_pos()
+
+    // mov rax, rdi   48 89 f8
+    jbytes(3, "4889f8")
+    // ret            c3
+    jbytes(1, "c3")
+
+    let SENT = 1234567
+    let got = jit_call(entry, SENT, 0)
+    prints("sentinel = "); print(SENT); newline()
+    prints("rax after `mov rax,rdi` = "); print(got); newline()
+    if got == SENT { prints("CONFIRMED: a0 arrives in rdi\n"); return 0 }
+    prints("MISMATCH: a0 is NOT in rdi\n")
+    return 1
+}

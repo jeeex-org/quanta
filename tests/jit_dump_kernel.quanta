@@ -1,0 +1,24 @@
+// tests/jit_dump_kernel.quanta -- print the emitted kernel's bytes as decimal
+// values so the shell can rebuild the binary and objdump can show the ACTUAL
+// instruction stream. Reading hex strings in the source proves each opcode in
+// isolation; only a disassembly proves the SEQUENCE is what was intended.
+import std/jit_x86
+import std/jit_x86_fused
+
+fn main() -> i64 {
+    let region = jit_f_alloc(65536)
+    if region <= 0 { prints("UNSUPPORTED\n"); return 2 }
+    let entry = jit_f_build()
+    if entry <= 0 { prints("BUILD FAILED\n"); return 1 }
+    let nbytes = ja_pos() - entry
+    prints("NBYTES="); print(nbytes); newline()
+
+    let i = 0
+    while i < nbytes {
+        print(mem_load8(entry + i))
+        prints(",")
+        i = i + 1
+    }
+    newline()
+    return 0
+}
