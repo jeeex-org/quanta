@@ -1,0 +1,112 @@
+// tests/jit_vs_prod_test.quanta
+//
+// FUSED JIT KERNEL vs THE PRODUCTION PATH (dequant_q4k + mm_dot4_s)
+//
+// The earlier 14.47x was against q4k_block_dot -- a naive scalar reference, not
+// what the loader actually runs. lib/std/lfm2_forward.quanta reaches its dots
+// through mm_matvec, which dequantizes a row and then calls mm_dot4_s. The whole
+// point of fusing is to do both in one pass, so THAT is the comparison that
+// decides whether this kernel is worth integrating.
+//
+// Both sides compute the same 256-weight Q4_K dot on the same bytes and the same
+// x, and correctness is asserted before any timing.
+import std/gguf
+import std/matmul_q4k
+import std/jit_x86
+import std/jit_x86_fused
+
+const NSUPER = 8
+const N      = NSUPER * 256
+const REPS   = 200
+
+fn jit_call(dst: i64, a0: i64, a1: i64) -> i64 {
+    let t = mem_alloc(2)
+    mem_store(t, dst)
+    mem_store(t + 8, 0)
+    return closure_call(t, a0, a1)
+}
+
+fn main() -> i64 {
+    prints("=== fused JIT vs production (dequant + mm_dot4_s) ===\n")
+
+    let region = jit_f_alloc(65536)
+    if region <= 0 { prints("UNSUPPORTED\n"); return 2 }
+    let tbl = jit_f_code(jit_f_build())
+    if tbl <= 0 { prints("BUILD FAILED\n"); return 1 }
+    let entry = mem_load(tbl)
+
+    let raw = mem_alloc(NSUPER * 144 + 64)
+    let i = 0
+    while i < NSUPER * 144 {
+        mem_store8(raw + i, (i * 37 + 11) - ((i * 37 + 11) / 256) * 256)
+        i = i + 1
+    }
+    let b = 0
+    while b < NSUPER {
+        mem_store8(raw + b * 144 + 0, 0)
+        mem_store8(raw + b * 144 + 1, 60)
+        mem_store8(raw + b * 144 + 2, 0)
+        mem_store8(raw + b * 144 + 3, 56)
+        b = b + 1
+    }
+
+    let x = mem_alloc(N * 8 + 256)
+    i = 0
+    while i < N { mem_store(x + i * 8, i2f(i % 29) * 0.25 + 0.125) ; i = i + 1 }
+
+    let dmd = jit_f_dmd_alloc(NSUPER)
+    b = 0
+    while b < NSUPER {
+        jit_f_dmd_fill(raw + b * 144, raw + b * 144 + 4,
+                       f16_to_f64(raw + b * 144 + 0), f16_to_f64(raw + b * 144 + 2),
+                       dmd + b * 128)
+        b = b + 1
+    }
+    let asz = mem_alloc(32)
+    mem_store(asz + 0, raw)
+    mem_store(asz + 8, x)
+    mem_store(asz + 16, dmd)
+    mem_store(asz + 24, NSUPER)
+
+    // ---- production side: the REAL row-wise matvec (dequant + dot) --------
+    let yout = mem_alloc(8)
+
+    // ---- correctness first ------------------------------------------------
+    let y_jit = jit_call(entry, asz, 0)
+    q4k_matvec_real(raw, x, 1, N, yout)
+    let prod_bits = mem_load(yout)
+    prints("jit  bits = "); print(y_jit); newline()
+    prints("prod bits = "); print(prod_bits); newline()
+    if y_jit != prod_bits {
+        prints("NOT EQUAL -- timing would be meaningless\n")
+        return 1
+    }
+    prints("equal: OK\n")
+
+    // ---- timing: production path (real matvec = dequant + dot) ------------
+    let t0 = clock()
+    let r1 = 0
+    while r1 < REPS {
+        q4k_matvec_real(raw, x, 1, N, yout)
+        r1 = r1 + 1
+    }
+    let t1 = clock()
+
+    // ---- timing: fused JIT ------------------------------------------------
+    let r2 = 0
+    while r2 < REPS {
+        let v2 = jit_call(entry, asz, 0)
+        if v2 == 0 { prints("") }
+        r2 = r2 + 1
+    }
+    let t2 = clock()
+
+    let prod_t = t1 - t0
+    let jit_t  = t2 - t1
+    prints("production (dequant+dot): "); print(prod_t); newline()
+    prints("fused jit               : "); print(jit_t); newline()
+    if jit_t > 0 {
+        prints("ratio x100 (prod/jit)   : "); print((prod_t * 100) / jit_t); newline()
+    }
+    return 0
+}

@@ -200,3 +200,31 @@ and `j_f_high`.
   (811% CPU vs the 1,600-1,900% target) that the earlier campaign named as the
   other joint requirement for 15 tok/s.
 - Load context: governor powersave, Hermes holding ~750% CPU.
+
+## Measured against the REAL production path (not the naive scalar)
+
+The earlier 14.47x was against `q4k_block_dot`, a naive scalar reference. The
+comparison that decides integration is against `q4k_matvec_real` -- the matvec
+that `lfm2_forward` actually reaches through `mm_matvec`, which dequantizes the
+row and then dots it.
+
+`tests/jit_vs_prod_test.quanta`, 2048 weights, 200 reps, same bytes and same x:
+
+    jit  bits = 4700186342854754304
+    prod bits = 4700186342854754304      <- BIT-EQUAL to the production matvec
+    production (dequant + dot): 5,200,572
+    fused jit                 :   595,426
+    ratio                     : 8.73x
+
+So the fused kernel is **bit-identical to the production matvec and 8.73x faster**
+on the same work. (Against the naive scalar reference it is 14.47x; the honest
+number to quote for integration purposes is 8.73x.)
+
+### Still true, still caveats
+
+- This is a MICRObenchmark of the dot, not an end-to-end tok/s figure.
+- `clock()`'s absolute unit is unverified; only the ratios are trustworthy.
+- The kernel is NOT yet wired into `lfm2_forward`; integration is the next step.
+- The dispatch ceiling (811% CPU vs the 1,600-1,900% target) remains open, and the
+  earlier campaign named it as jointly required with fusion for 15 tok/s.
+- llama.cpp reference on the same model and CPU: 17.32 tok/s. Native loader: 0.281.
