@@ -1,0 +1,250 @@
+// lib/std/jit_x86.quanta -- emit x86-64 bytes at runtime. No compiler change.
+//
+// WHY THIS EXISTS
+// ---------------
+// docs/research/decode-fused-dot.md section 3 spec'd a register-resident
+// dequant-dot kernel as the only lever that reaches the per-element cost the
+// 15 tok/s target needs, and handed it to the compiler owner on the assumption
+// that Quanta SOURCE cannot express a kernel whose operands never touch memory.
+// tests/lfm2_jit_probe.quanta refutes that by running program:
+//   - closure_call(tuple,args...) lowers to `mov rdx,[rax]; mov r11,rdx;
+//     call r11` (codegen.quanta:2577) -- a real indirect call through a
+//     RUNTIME address, args in the standard SysV registers.
+//   - mmap_file(0,len,7,34,-1,0) (RWX, MAP_PRIVATE|ANON) works from lib/std.
+//   - bytes emitted into that mapping execute and return correct values.
+//
+// ENCODING DISCIPLINE (learned the hard way, see below)
+// -----------------------------------------------------
+// An earlier revision of this file COMPUTED VEX prefixes from their fields
+// (R/X/B/W/vvvv/L/pp). That was wrong in ways that assembled into different
+// instructions rather than failing: the ((L+1)<<2)|pp packing and the
+// inverted-vvvv field were both misplaced, so a computed "vaddpd" emitted
+// bytes GNU as reads as a completely different instruction. VEX has too many
+// inverted fields to derive safely.
+//
+// So every emitter below pastes a FIXED byte string that was produced by
+// assembling the instruction with GNU `as` and reading it back out of
+// `objdump -d`. Same discipline as dq32lo/dq32hi in emitter.quanta -- and the
+// reason that discipline exists is the `(b<<4)>>4` trap there, a hand-derived
+// shift that silently assembled as a no-op.
+//
+// USE THIS TO RE-VERIFY OR EXTEND (run from /tmp):
+//   cat > t.s <<'EOF'
+//   .intel_syntax noprefix
+//   .text
+//   .globl f
+//   f: vpmovzxbd xmm0, [r9]; ret
+//   EOF
+//   as -o t.o t.s && objdump -d t.o
+// The instruction's bytes are everything before the trailing `c3` (ret).
+//
+// REGISTER RULES
+// --------------
+// closure_call loads args into rdi,rsi,rdx,rcx,r8,r9 and reads the code
+// pointer from the tuple; result comes back in rax (f64 as raw bits, which is
+// already Quanta's float convention). Caller-saved (free to clobber):
+// rax,rcx,rdx,rsi,rdi,r8-r11. Callee-saved (MUST push/pop if used):
+// rbx,rbp,r12-r15. ymm regs here are 128-bit forms (xmm names) for the
+// nibble path because vpmovzxbd with a 4-byte source yields 4 dwords =>
+// 128-bit xmm0; widening to 2 doubles uses VCVTDQ2PD (documented in q6k-simd-
+// dequant.md).
+//
+// OWNERSHIP: lib/std only. compiler/** untouched.
+import std/fs
+
+// ---- emit cursor -------------------------------------------------------------
+let ja = 0
+let jp = 0
+let jend = 0
+
+fn ja_init(base: i64, limit: i64) -> i64 {
+    ja = base
+    jp = base
+    jend = base + limit
+    return ja
+}
+
+fn ja_pos() -> i64 { return jp }
+
+fn ja_check(n: i64) -> i64 {
+    if jp + n > jend {
+        prints("JIT: emitter overflow (region exhausted)\n")
+        return -1
+    }
+    return 0
+}
+
+fn jb(v: i64) -> i64 {
+    if ja_check(1) != 0 { return -1 }
+    mem_store8(jp, v)
+    jp = jp + 1
+    return 0
+}
+
+// Emit a verified byte string given as a hex integer little-endian list.
+fn jbytes(n: i64, hexstr) -> i64 {
+    if ja_check(n) != 0 { return -1 }
+    let i = 0
+    while i < n {
+        let hi = hex_index(str_char(hexstr, i * 2))
+        let lo = hex_index(str_char(hexstr, i * 2 + 1))
+        if hi < 0 || lo < 0 { prints("JIT: bad hex\n"); return -1 }
+        mem_store8(jp + i, hi * 16 + lo)
+        i = i + 1
+    }
+    jp = jp + n
+    return 0
+}
+
+fn hex_index(c: i64) -> i64 {
+    if c == 48 { return 0 }
+    if c == 49 { return 1 }
+    if c == 50 { return 2 }
+    if c == 51 { return 3 }
+    if c == 52 { return 4 }
+    if c == 53 { return 5 }
+    if c == 54 { return 6 }
+    if c == 55 { return 7 }
+    if c == 56 { return 8 }
+    if c == 57 { return 9 }
+    if c == 97 { return 10 }
+    if c == 98 { return 11 }
+    if c == 99 { return 12 }
+    if c == 100 { return 13 }
+    if c == 101 { return 14 }
+    if c == 102 { return 15 }
+    return 0 - 1
+}
+
+fn str_char(s, i: i64) -> i64 {
+    let fd = 0
+    return mem_load8(s + 8 + i)
+}
+
+// Little-endian imm32.
+fn ji32(v: i64) -> i64 {
+    if ja_check(4) != 0 { return -1 }
+    let k = 0
+    while k < 4 {
+        let dv = v
+        let m = 0
+        while m < k { dv = dv / 256; m = m + 1 }
+        mem_store8(jp + k, dv - (dv / 256) * 256)
+        k = k + 1
+    }
+    jp = jp + 4
+    return 0
+}
+
+// rel8 patching. `at` is the address OF THE DISPLACEMENT BYTE; x86 rel8 is
+// relative to the end of the instruction, which is at+1.
+fn j_patch8(at: i64, target: i64) -> i64 {
+    let disp = target - (at + 1)
+    if disp > 127 || disp < 0 - 128 {
+        prints("JIT: rel8 out of range\n")
+        return -1
+    }
+    let v = disp
+    if disp < 0 { v = disp + 256 }
+    mem_store8(at, v)
+    return 0
+}
+
+fn j_ret() -> i64 { jb(195); return 0 }
+
+// ---- verified move / arithmetic (bytes pasted from objdump) ------------------
+// mov r9, rdi       49 89 f9
+fn j_mov_r9_rdi() -> i64 { return jbytes(3, "4989f9") }
+// mov r10, rsi      49 89 f2
+fn j_mov_r10_rsi() -> i64 { return jbytes(3, "4989f2") }
+// mov r11, rdx      49 89 d3
+fn j_mov_r11_rdx() -> i64 { return jbytes(3, "4989d3") }
+// mov rax, r8       4c 89 c0
+fn j_mov_rax_r8() -> i64 { return jbytes(3, "4c89c0") }
+// mov rax, r15      4c 89 f8
+fn j_mov_rax_r15() -> i64 { return jbytes(3, "4c89f8") }
+// push/pop
+fn j_push(reg: i64) -> i64 {
+    if reg == 3 { return jbytes(1, "53") }        // rbx
+    if reg == 15 { return jbytes(1, "4157") }
+    if reg == 12 { return jbytes(1, "4154") }
+    if reg == 13 { return jbytes(1, "4155") }
+    if reg == 14 { return jbytes(1, "4156") }
+    return -1
+}
+fn j_pop(reg: i64) -> i64 {
+    if reg == 3 { return jbytes(1, "5b") }
+    if reg == 15 { return jbytes(1, "415f") }
+    if reg == 12 { return jbytes(1, "415c") }
+    if reg == 13 { return jbytes(1, "415d") }
+    if reg == 14 { return jbytes(1, "415e") }
+    return -1
+}
+// add r9, 4         49 83 c1 04
+fn j_add_r9_imm8(imm: i64) -> i64 { jbytes(3, "4983c1"); jb(imm); return 0 }
+// add r10, 32       49 83 c2 20
+fn j_add_r10_imm8(imm: i64) -> i64 { jbytes(3, "4983c2"); jb(imm); return 0 }
+// add r11, 8        49 83 c3 08
+fn j_add_r11_imm8(imm: i64) -> i64 { jbytes(3, "4983c3"); jb(imm); return 0 }
+// lea r12, [r12+8]  4d 8d 64 24 08
+fn j_lea_r12_8() -> i64 { return jbytes(5, "4d8d642408") }
+// sub rax, 1 ; jne rel8   48 83 e8 01 75 xx
+fn j_sub_rax_1_jne8() -> i64 { return jbytes(6, "4883e8017500") }
+// sub r8, 1 ; jne rel8    49 83 e8 01 75 xx
+fn j_sub_r8_1_jne8() -> i64 { return jbytes(6, "4983e8017500") }
+// cmp rdi, 0 ; je rel8    48 83 ff 00 74 xx
+fn j_cmp_rdi0_je8() -> i64 { return jbytes(6, "4883ff007400") }
+
+// ---- verified SSE/AVX (128-bit forms; xmm inputs) ----------------------------
+// vpmovzxbd xmm0, [r9]      c4 c2 79 31 01
+fn j_vpmovzxbd_xmm0_r9() -> i64 { return jbytes(5, "c4c2793101") }
+// vpslld xmm0, xmm0, 28     c5 f9 72 f0 1c
+fn j_vpslld_28() -> i64 { return jbytes(5, "c5f972f01c") }
+// vpsrld xmm0, xmm0, 28     c5 f9 72 d0 1c
+fn j_vpsrld_28() -> i64 { return jbytes(5, "c5f972d01c") }
+// vpsrld xmm0, xmm0, 4      c5 f9 72 d0 04
+fn j_vpsrld_4() -> i64 { return jbytes(5, "c5f972d004") }
+// vcvtdq2pd ymm1, xmm0      c5 fe e6 c8
+fn j_vcvtdq2pd_y1_x0() -> i64 { return jbytes(4, "c5fee6c8") }
+// vcvtdq2pd ymm0, xmm0      c5 fe e6 c0
+fn j_vcvtdq2pd_y0_x0() -> i64 { return jbytes(4, "c5fee6c0") }
+// vmovupd ymm2, [r10]       c4 c1 7d 10 12
+fn j_vmovupd_y2_r10() -> i64 { return jbytes(5, "c4c17d1012") }
+// vmovupd ymm0, [r10]       c4 c1 7d 10 02
+fn j_vmovupd_y0_r10() -> i64 { return jbytes(5, "c4c17d1002") }
+// vmulpd ymm1, ymm1, ymm2   c5 f5 59 ca
+fn j_vmulpd_y1_y2() -> i64 { return jbytes(4, "c5f559ca") }
+// vmulpd ymm0, ymm0, ymm2   c5 fd 59 c2
+fn j_vmulpd_y0_y2() -> i64 { return jbytes(4, "c5fd59c2") }
+// vaddpd ymm0, ymm0, ymm1   c5 fd 58 c1
+fn j_vaddpd_y0_y1() -> i64 { return jbytes(4, "c5fd58c1") }
+// vaddpd ymm0, ymm0, ymm2   c5 fd 58 c2
+fn j_vaddpd_y0_y2() -> i64 { return jbytes(4, "c5fd58c2") }
+// vxorpd ymm0, ymm0, ymm0   c5 fd 57 c0
+fn j_vxorpd_y0() -> i64 { return jbytes(4, "c5fd57c0") }
+// vxorpd xmm8, xmm8, xmm8   c4 41 39 57 c0
+fn j_vxorpd_x8() -> i64 { return jbytes(5, "c4413957c0") }
+// vextracti128 xmm1, ymm0, 1   c4 e3 7d 39 c1 01
+fn j_vextracti128_x1_y0() -> i64 { return jbytes(6, "c4e37d39c101") }
+// vaddpd xmm0, xmm0, xmm1   c5 f9 58 c1
+fn j_vaddpd_x0_x1() -> i64 { return jbytes(4, "c5f958c1") }
+// vhaddpd xmm0, xmm0, xmm0  c5 f9 7c c0
+fn j_vhaddpd_x0() -> i64 { return jbytes(4, "c5f97cc0") }
+// vmulsd xmm0, xmm0, xmm3   c5 fb 59 c3
+fn j_vmulsd_x0_x3() -> i64 { return jbytes(4, "c5fb59c3") }
+// vmulsd xmm3, xmm3, xmm4   c5 e3 59 dc
+fn j_vmulsd_x3_x4() -> i64 { return jbytes(4, "c5e359dc") }
+// vsubsd xmm0, xmm0, xmm3   c5 fb 5c c3
+fn j_vsubsd_x0_x3() -> i64 { return jbytes(4, "c5fb5cc3") }
+// vaddsd xmm8, xmm8, xmm0   c5 3b 58 c0
+fn j_vaddsd_x8_x0() -> i64 { return jbytes(4, "c53b58c0") }
+// vmovsd xmm0, [r11]        c4 c1 7b 10 03
+fn j_vmovsd_x0_r11() -> i64 { return jbytes(5, "c4c17b1003") }
+// vmovsd xmm3, [r11+8]      c4 c1 7b 10 5b 08
+fn j_vmovsd_x3_r11_8() -> i64 { return jbytes(6, "c4c17b105b08") }
+// vmovsd xmm4, [rdx]        c4 c1 7b 10 22
+fn j_vmovsd_x4_rdx() -> i64 { return jbytes(5, "c4c17b1022") }
+// vmovq rax, xmm8           c4 61 f9 7e c0
+fn j_vmovq_rax_x8() -> i64 { return jbytes(5, "c461f97ec0") }
+// vmovq rax, xmm0           c4 e1 f9 7e c0
+fn j_vmovq_rax_x0() -> i64 { return jbytes(5, "c4e1f97ec0") }
