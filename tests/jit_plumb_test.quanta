@@ -21,8 +21,12 @@ fn jit_call(dst: i64, a0: i64, a1: i64) -> i64 {
 // emit `mov rax, [rdi+off] ; ret` and call it
 fn probe_slot(off: i64) -> i64 {
     let e = ja_pos()
-    jbytes(3, "488b4700")           // mov rax,[rdi+0]  (offset patched below)
-    mem_store8(e + 3, off)          // modrm disp8
+    // Emit the FULL 4-byte instruction with a placeholder displacement so the
+    // emit cursor advances over it, THEN patch the byte. The earlier version
+    // wrote the byte without advancing jp, so every stub clobbered the previous
+    // stub's displacement -- which is why this probe faulted.
+    jbytes(4, "488b4700")           // mov rax,[rdi+0]
+    mem_store8(e + 3, off)          // patch the disp8
     jbytes(1, "c3")                 // ret
     return e
 }

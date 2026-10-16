@@ -1,0 +1,74 @@
+// tests/jit_scale_test.quanta
+//
+// IS THE KERNEL INTERPRETING x AS INTEGERS INSTEAD OF DOUBLES?
+//
+// Observed: the kernel returns ~1e9x the scalar value. 1.0 as an IEEE double is
+// 0x3FF0000000000000, whose HIGH 32-bit half is 1072693248 -- i.e. about 1.07e9.
+// That is exactly the observed factor, and it is what you get if the data is fed
+// through vcvtdq2pd (int32 -> double) instead of being used as f64.
+//
+// DISCRIMINATOR: run the same block with x = 1.0, 2.0 and 4.0.
+//   If x is used as f64   -> the result scales 1x, 2x, 4x (as the scalar does)
+//   If x is taken as int32 -> the results barely move, because the high dword of
+//     1.0/2.0/4.0 are 1072693248 / 1073741824 / 1074790400 (within 0.2%)
+import std/gguf
+import std/matmul_q4k
+import std/jit_x86
+import std/jit_x86_fused
+
+fn jit_call(dst: i64, a0: i64, a1: i64) -> i64 {
+    let t = mem_alloc(2)
+    mem_store(t, dst)
+    mem_store(t + 8, 0)
+    return closure_call(t, a0, a1)
+}
+
+fn main() -> i64 {
+    prints("=== does x scale linearly? ===\n")
+    let region = jit_f_alloc(65536)
+    if region <= 0 { prints("UNSUPPORTED\n"); return 2 }
+    let tbl = jit_f_code(jit_f_build())
+    if tbl <= 0 { prints("BUILD FAILED\n"); return 1 }
+    let entry = mem_load(tbl)
+
+    let raw = mem_alloc(160)
+    mem_store8(raw + 0, 0)      // d    = 1.0   (0x3C00)
+    mem_store8(raw + 1, 60)
+    mem_store8(raw + 2, 0)      // dmin = 0.5   (0x3800)
+    mem_store8(raw + 3, 56)
+    let i = 0
+    while i < 12 { mem_store8(raw + 4 + i, 1 + i) ; i = i + 1 }
+    i = 0
+    while i < 128 { mem_store8(raw + 16 + i, 17) ; i = i + 1 }
+
+    let x = mem_alloc(256 * 8 + 64)
+    let dmd = jit_f_dmd_alloc(1)
+    jit_f_dmd_fill(raw, raw + 4, f16_to_f64(raw + 0), f16_to_f64(raw + 2), dmd)
+    let asz = mem_alloc(32)
+    mem_store(asz + 0, raw)
+    mem_store(asz + 8, x)
+    mem_store(asz + 16, dmd)
+    mem_store(asz + 24, 1)
+
+    let vals = mem_alloc(4 * 8)
+    mem_store(vals + 0, 1.0)
+    mem_store(vals + 8, 2.0)
+    mem_store(vals + 16, 4.0)
+
+    let v = 0
+    while v < 3 {
+        let xv = f64_load(vals + v * 8)
+        i = 0
+        while i < 256 { mem_store(x + i * 8, xv) ; i = i + 1 }
+        let jb = jit_call(entry, asz, 0)
+        let sc = q4k_block_dot(raw, x, 1, 0)
+        let sb = mem_alloc(8)
+        mem_store(sb, sc)
+        prints("x="); print_f(xv)
+        prints("  jit bits="); print(jb)
+        prints("  scalar bits="); print(mem_load(sb))
+        newline()
+        v = v + 1
+    }
+    return 0
+}

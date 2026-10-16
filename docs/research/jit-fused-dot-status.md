@@ -111,3 +111,51 @@ The first version of `tests/jit_diag_test.quanta` wrote the f16 scale's low byte
 and left the high byte 0, silently making d = 0.0. Every case then compared two
 near-zero numbers and "matched". A test that agrees because both sides are zero
 proves nothing.
+
+## Third pass — the bug is now PINNED to one instruction class
+
+### Everything upstream is verified correct
+
+- **Pointer plumbing** (`tests/jit_plumb_test.quanta`, fixed): the emitted kernel
+  loads exactly the addresses we set up -- slot 0 -> raw, 8 -> x, 16 -> dmd,
+  24 -> 1. All four match.
+- **DMD contents**: read back as 1.0/2.5, 2.0/3.0, 3.0/3.5, 4.0/4.0, 9/0, 10/0,
+  11/0, 12/0 -- correct.
+- **x is used as f64**: with constant x, the kernel scales EXACTLY linearly
+  (x=1.0 -> 4.4624e11, x=2.0 -> 8.9248e11, x=4.0 -> 1.7850e12; ratios 2.0000 and
+  2.0000), matching the scalar's ratios. So the data is not being mis-typed in
+  the multiply itself.
+- **Disassembly** of the emitted bytes reads correctly instruction by instruction.
+
+### The smoking gun: a single step returns a double's HIGH DWORD as an integer
+
+`tests/jit_onestep_test.quanta` emits ONE fused step (no loop, no accumulation)
+with d=1.0, dmin=0.5, scale[0]=1, min[0]=5, all quant bytes 0x11, all x = 1.0.
+
+    correct answer:  weight = 1.0*1 - 0.5*5 = -1.5, four lanes -> -6.0
+    measured answer: 1072693240.0
+
+`1072693248` is DECIMAL FOR `0x3FF00000`, which is the **high 32-bit half of the
+double 1.0** (`0x3FF0000000000000`). The measured value is that integer minus 8 --
+i.e. the correctly-computed -6 term (rounded) sitting on top of an int32
+reinterpretation of an x value.
+
+This also explains the full kernel's error precisely: its result is the correct
+value multiplied by ~(1072693248/3) for x=1.0, and the multiplier tracks the same
+int32-of-a-double quantity.
+
+### Conclusion for the next attempt
+
+The fault is in ONE of the conversions in the chain -- `vpmovzxbd`,
+`vpslld/vpsrld $28`, `vcvtdq2pd`, or `vpsrldq`/`vinsertf128` -- where a *double*
+is being fed through the int->double path (or the reverse). The byte encodings
+were each checked by hand against the Intel manual and by objdump and appeared
+correct, so the next step is to single-step the emitted kernel under gdb at the
+entry address and watch ymm1 after each instruction. That will name the exact
+instruction rather than inferring it.
+
+### Verification status
+
+`tests/jit_plumb_test.quanta` and `tests/jit_onestep_test.quanta` are committed.
+The gate passes with all `lib/std` changes in place (229/229 native, 24/24
+stages, GATE_EXIT=0).

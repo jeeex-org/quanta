@@ -1,0 +1,77 @@
+// tests/jit_onestep_test.quanta
+//
+// IS A SINGLE FUSED STEP CORRECT? Hand-computable answer: -6.0
+//
+// The full kernel returns a constant ~3.575e8 x the correct value while scaling
+// perfectly linearly in x, which means some value in the chain is being read or
+// converted wrongly by a fixed factor. Emitting exactly ONE low step (no loop,
+// no accumulation across steps) removes the loop and the accumulator from the
+// picture.
+//
+// Setup: d = 1.0, dmin = 0.5, scale[0] = 1, min[0] = 5, every quant byte = 0x11
+//        (low nibble = 1), every x element = 1.0
+//   weight      = d*scale - dmin*min = 1.0*1 - 0.5*5 = -1.5
+//   contribution per element = -1.5 * 1.0 = -1.5
+//   4 elements in the 4 accumulator lanes -> sum = -6.0
+import std/gguf
+import std/matmul_q4k
+import std/jit_x86
+import std/jit_x86_fused
+
+fn jit_call(dst: i64, a0: i64, a1: i64) -> i64 {
+    let t = mem_alloc(2)
+    mem_store(t, dst)
+    mem_store(t + 8, 0)
+    return closure_call(t, a0, a1)
+}
+
+fn main() -> i64 {
+    prints("=== single fused step (expect -6.0) ===\n")
+    let region = jit_f_alloc(4096)
+    if region <= 0 { prints("UNSUPPORTED\n"); return 2 }
+
+    // prologue + ONE low step + the standard reduce
+    let entry = ja_pos()
+    j_f_load_w()
+    j_f_load_x()
+    j_f_load_dmd()
+    j_f_load_n()
+    j_f_skip_header()
+    j_f_vxorpd_y0()
+    j_f_low()
+    j_f_vextracti128_x2_y0()
+    j_f_vhaddpd_x3_x0()
+    j_f_vhaddpd_x4_x2()
+    j_f_vaddsd_x3_x4()
+    j_f_vmovq_rax_x3()
+    j_f_ret()
+
+    let raw = mem_alloc(160)
+    mem_store8(raw + 0, 0)
+    mem_store8(raw + 1, 60)     // d    = 1.0
+    mem_store8(raw + 2, 0)
+    mem_store8(raw + 3, 56)     // dmin = 0.5
+    let i = 0
+    while i < 12 { mem_store8(raw + 4 + i, 1 + i) ; i = i + 1 }
+    i = 0
+    while i < 128 { mem_store8(raw + 16 + i, 17) ; i = i + 1 }
+
+    let x = mem_alloc(256 * 8 + 64)
+    i = 0
+    while i < 256 { mem_store(x + i * 8, 1.0) ; i = i + 1 }
+
+    let dmd = jit_f_dmd_alloc(1)
+    jit_f_dmd_fill(raw, raw + 4, f16_to_f64(raw + 0), f16_to_f64(raw + 2), dmd)
+
+    let asz = mem_alloc(32)
+    mem_store(asz + 0, raw)
+    mem_store(asz + 8, x)
+    mem_store(asz + 16, dmd)
+    mem_store(asz + 24, 1)
+
+    prints("dmd[0] scale bits = "); print(mem_load(dmd)); newline()
+    prints("dmd[0] min   bits = "); print(mem_load(dmd + 8)); newline()
+    prints("x[0] bits         = "); print(mem_load(x)); newline()
+    prints("one-step result   = "); print(jit_call(entry, asz, 0)); newline()
+    return 0
+}
