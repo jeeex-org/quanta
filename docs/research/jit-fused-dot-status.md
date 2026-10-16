@@ -159,3 +159,44 @@ instruction rather than inferring it.
 `tests/jit_plumb_test.quanta` and `tests/jit_onestep_test.quanta` are committed.
 The gate passes with all `lib/std` changes in place (229/229 native, 24/24
 stages, GATE_EXIT=0).
+
+## RESOLVED — the fused kernel is bit-exact and 14.5x faster than the scalar path
+
+### The actual root cause
+
+`vcvtdq2pd %xmm1,%ymm1` writes **ymm1, whose low 128 bits ARE xmm1**. So it
+destroys the very dwords it is converting. The old order then ran
+`vpsrldq $8,%xmm1,%xmm2` to fetch dwords 2,3 -- but by then xmm1 held converted
+DOUBLES, so psrldq sliced the high half of a double (0x3FF00000 out of 1.0) and
+`vcvtdq2pd` re-converted it as int32, giving exactly 1072693248.
+
+That single misordering explains every observation:
+- a one-step kernel returned 1072693240.0 instead of -6.0 (= 0x3FF00000 - 8)
+- the full kernel returned a constant ~3.575e8x the correct value
+- the result scaled perfectly linearly in x (the corrupted term is still
+  multiplied by x downstream)
+- with d = 0 the result was 0 (the factor multiply zeroes it regardless)
+
+Fix: capture dwords 2,3 into xmm2 BEFORE the first conversion, in both `j_f_low`
+and `j_f_high`.
+
+### Verification (all bit-exact, no tolerance)
+
+- one-step kernel: **-6.0** exactly (hand-derived)
+- `tests/jit_diag_test.quanta`: (D) varied x 4033.25, (E) varied bytes 11776,
+  (F) x=i **258960** (hand-derived), (G) both varied 37796.2 -- jit == scalar in
+  every case
+- `tests/jit_fused_exact_test.quanta`: BIT-EXACT on varied data
+- `tests/jit_perf_test.quanta` at NSUPER=8: bit-exact, and **14.47x faster** than
+  the scalar path over 409,600 elements
+
+### Caveats before this becomes a tok/s number
+
+- The speedup is a MICRObenchmark of the dot kernel. It is not an end-to-end
+  tok/s figure and must not be reported as one.
+- `clock()`'s absolute unit is unverified, so only the RATIO is trustworthy.
+- The kernel is not yet wired into `lfm2_forward`; the integration and the
+  128/512/1024-token e2e table are still to do, along with the dispatch ceiling
+  (811% CPU vs the 1,600-1,900% target) that the earlier campaign named as the
+  other joint requirement for 15 tok/s.
+- Load context: governor powersave, Hermes holding ~750% CPU.

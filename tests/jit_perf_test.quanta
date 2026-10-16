@@ -1,0 +1,129 @@
+// tests/jit_perf_test.quanta
+//
+// IS THE FUSED KERNEL FASTER THAN THE SCALAR PATH?
+//
+// The kernel is now bit-exact. That establishes correctness; it says nothing
+// about speed. This times both paths over the SAME work:
+//   scalar : q4k_block_dot over nsuper super-blocks, repeated R times
+//   jit    : one call of the emitted kernel over nsuper super-blocks
+// and reports ns per weight element for each.
+//
+// Correctness is asserted first: if the two disagree the timing is meaningless.
+import std/gguf
+import std/matmul_q4k
+import std/jit_x86
+import std/jit_x86_fused
+
+const NSUPER = 8          // 2048 weights
+const N      = NSUPER * 256
+const REPS   = 200
+
+fn jit_call(dst: i64, a0: i64, a1: i64) -> i64 {
+    let t = mem_alloc(2)
+    mem_store(t, dst)
+    mem_store(t + 8, 0)
+    return closure_call(t, a0, a1)
+}
+
+fn main() -> i64 {
+    prints("=== fused vs scalar: correctness then speed ===\n")
+
+    let region = jit_f_alloc(65536)
+    if region <= 0 { prints("UNSUPPORTED\n"); return 2 }
+    let tbl = jit_f_code(jit_f_build())
+    if tbl <= 0 { prints("BUILD FAILED\n"); return 1 }
+    let entry = mem_load(tbl)
+
+    // NSUPER synthetic super-blocks, walked in 144-byte strides
+    let raw = mem_alloc(NSUPER * 144 + 64)
+    let i = 0
+    while i < NSUPER * 144 {
+        mem_store8(raw + i, (i * 37 + 11) - ((i * 37 + 11) / 256) * 256)
+        i = i + 1
+    }
+    // make d/dmin well-formed (f16 1.0 / 0.5) at every 144-byte boundary
+    let b = 0
+    while b < NSUPER {
+        mem_store8(raw + b * 144 + 0, 0)
+        mem_store8(raw + b * 144 + 1, 60)
+        mem_store8(raw + b * 144 + 2, 0)
+        mem_store8(raw + b * 144 + 3, 56)
+        b = b + 1
+    }
+
+    let x = mem_alloc(N * 8 + 256)
+    i = 0
+    while i < N { mem_store(x + i * 8, i2f(i % 29) * 0.25 + 0.125) ; i = i + 1 }
+
+    let dmd = jit_f_dmd_alloc(NSUPER)
+    b = 0
+    while b < NSUPER {
+        jit_f_dmd_fill(raw + b * 144, raw + b * 144 + 4,
+                       f16_to_f64(raw + b * 144 + 0), f16_to_f64(raw + b * 144 + 2),
+                       dmd + b * 128)
+        b = b + 1
+    }
+
+    let asz = mem_alloc(32)
+    mem_store(asz + 0, raw)
+    mem_store(asz + 8, x)
+    mem_store(asz + 16, dmd)
+    mem_store(asz + 24, NSUPER)
+
+    // ---- correctness first ------------------------------------------------
+    let y_jit = jit_call(entry, asz, 0)
+    let y_sbuf = mem_alloc(8)
+    let sacc = 0.0
+    b = 0
+    while b < NSUPER {
+        let bo = b * 144
+        let dd  = f16_to_f64(raw + bo)
+        let dmm = f16_to_f64(raw + bo + 2)
+        let part = q4k_block_dot(raw, x, b + 1, b)
+        sacc = sacc + part
+        b = b + 1
+    }
+    mem_store(y_sbuf, sacc)
+    let y_sbits = mem_load(y_sbuf)
+    prints("jit bits    = "); print(y_jit); newline()
+    prints("scalar bits = "); print(y_sbits); newline()
+    if y_jit != y_sbits {
+        prints("NOT BIT-EXACT -- timing would be meaningless, stopping\n")
+        return 1
+    }
+    prints("bit-exact: OK\n")
+
+    // ---- timing ----------------------------------------------------------
+    let t0 = clock()
+    let rsc = 0
+    while rsc < REPS {
+        let acc2 = 0.0
+        b = 0
+        while b < NSUPER {
+            acc2 = acc2 + q4k_block_dot(raw, x, b + 1, b)
+            b = b + 1
+        }
+        if acc2 == 0.0 { prints("") }        // keep the work from being elided
+        rsc = rsc + 1
+    }
+    let t1 = clock()
+
+    let rj = 0
+    while rj < REPS {
+        let v = jit_call(entry, asz, 0)
+        if v == 0 { prints("") }
+        rj = rj + 1
+    }
+    let t2 = clock()
+
+    let sc_ms = t1 - t0
+    let jt_ms = t2 - t1
+    prints("scalar: "); print(sc_ms); prints(" ms for "); print(REPS * N)
+    prints(" elements -> ns/elem x1000 = "); print((sc_ms * 1000000) / (REPS * N)); newline()
+    prints("jit   : "); print(jt_ms); prints(" ms for "); print(REPS * N)
+    prints(" elements -> ns/elem x1000 = "); print((jt_ms * 1000000) / (REPS * N)); newline()
+    if jt_ms > 0 {
+        prints("speedup x100 = "); print((sc_ms * 100) / jt_ms); newline()
+    }
+    return 0
+}
