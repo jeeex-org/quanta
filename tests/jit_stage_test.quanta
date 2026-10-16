@@ -1,0 +1,185 @@
+// tests/jit_stage_test.quanta
+//
+// WHICH INSTRUCTION REINTERPRETS A DOUBLE AS AN INT?
+//
+// The one-step kernel returns (double)0x3FF00000 -- the high dword of the double
+// 1.0 -- instead of -6.0. Every instruction's encoding checks out by hand, so
+// measure instead of inferring: emit a stub that stops after each stage of the
+// byte->double chain and returns the working register with `movq rax, xmm1`.
+//
+// With quant bytes = 0x11 and x = 1.0, the chain should read:
+//   A) vpmovzxbd            4 bytes -> 4 dwords   low 64 = 0x0000001100000011
+//   B) + vpslld/vpsrld $28  low nibbles isolated  low 64 = 0x0000000100000001
+//   C) + vcvtdq2pd          -> doubles in ymm1    low 64 = 0x3FF0000000000000
+//
+// Whichever stage first returns something unexpected is the broken instruction.
+import std/gguf
+import std/jit_x86
+import std/jit_x86_fused
+
+fn jit_call(dst: i64, a0: i64, a1: i64) -> i64 {
+    let t = mem_alloc(2)
+    mem_store(t, dst)
+    mem_store(t + 8, 0)
+    return closure_call(t, a0, a1)
+}
+
+// movq rax, xmm1   c4 e1 f9 7e c8   (modrm c8 = reg 1)
+fn j_movq_rax_xmm1() -> i64 { return jbytes(5, "c4e1f97ec8") }
+// movq rax, xmm6   c4 e1 f9 7e f0   (modrm f0 = reg 6)
+fn j_movq_rax_xmm6() -> i64 { return jbytes(5, "c4e1f97ef0") }
+// movq rax, xmm7   c4 e1 f9 7e f8   (modrm f8 = reg 7)
+fn j_movq_rax_xmm7() -> i64 { return jbytes(5, "c4e1f97ef8") }
+
+fn prologue() -> i64 {
+    j_f_load_w()
+    j_f_skip_header()
+    j_f_load_x()
+    j_f_load_dmd()
+    j_f_load_n()
+    return 0
+}
+
+fn main() -> i64 {
+    prints("=== staged conversion probe ===\n")
+    let region = jit_f_alloc(4096)
+    if region <= 0 { prints("UNSUPPORTED\n"); return 2 }
+
+    // ---- A: just the byte load
+    let a = ja_pos()
+    prologue()
+    j_f_vpmovzxbd_x1_r9()
+    j_movq_rax_xmm1()
+    j_f_ret()
+
+    // ---- B: + nibble isolation
+    let b = ja_pos()
+    prologue()
+    j_f_vpmovzxbd_x1_r9()
+    j_f_vpslld_28()
+    j_f_vpsrld_28()
+    j_movq_rax_xmm1()
+    j_f_ret()
+
+    // ---- C: + int->double conversion
+    let c = ja_pos()
+    prologue()
+    j_f_vpmovzxbd_x1_r9()
+    j_f_vpslld_28()
+    j_f_vpsrld_28()
+    j_f_vcvtdq2pd_y1_x1()
+    j_movq_rax_xmm1()
+    j_f_ret()
+
+    // ---- D: the factor broadcast
+    let d = ja_pos()
+    prologue()
+    j_f_vbcastsd_y6_rdx()
+    j_movq_rax_xmm6()
+    j_f_ret()
+
+    // ---- E: quant double * factor double
+    let e = ja_pos()
+    prologue()
+    j_f_vpmovzxbd_x1_r9()
+    j_f_vpslld_28()
+    j_f_vpsrld_28()
+    j_f_vcvtdq2pd_y1_x1()
+    j_f_vbcastsd_y6_rdx()
+    j_f_vmulpd_y1_y6()
+    j_movq_rax_xmm1()
+    j_f_ret()
+
+    // ---- F: ... minus the min term (expect -1.5 = 0xBFF8000000000000)
+    let f = ja_pos()
+    prologue()
+    j_f_vpmovzxbd_x1_r9()
+    j_f_vpslld_28()
+    j_f_vpsrld_28()
+    j_f_vcvtdq2pd_y1_x1()
+    j_f_vbcastsd_y6_rdx()
+    j_f_vbcastsd_y7_rdx8()
+    j_f_vmulpd_y1_y6()
+    j_f_vsubpd_y1_y7()
+    j_movq_rax_xmm1()
+    j_f_ret()
+
+    // ---- G: ... times x (expect the same -1.5, since x = 1.0)
+    let g = ja_pos()
+    prologue()
+    j_f_vpmovzxbd_x1_r9()
+    j_f_vpslld_28()
+    j_f_vpsrld_28()
+    j_f_vcvtdq2pd_y1_x1()
+    j_f_vbcastsd_y6_rdx()
+    j_f_vbcastsd_y7_rdx8()
+    j_f_vmulpd_y1_y6()
+    j_f_vsubpd_y1_y7()
+    j_f_vmulpd_y1_r10()
+    j_movq_rax_xmm1()
+    j_f_ret()
+
+    // ---- H: what does the MIN broadcast actually load? expect 2.5
+    let h = ja_pos()
+    prologue()
+    j_f_vbcastsd_y7_rdx8()
+    j_movq_rax_xmm7()
+    j_f_ret()
+
+    // ---- I: and the +24 form, for comparison (expect 3.0)
+    let i2 = ja_pos()
+    prologue()
+    j_f_vbcastsd_y7_rdx24()
+    j_movq_rax_xmm7()
+    j_f_ret()
+
+    // ---- R: the REDUCTION alone. ymm0 = [1,1,1,1] must reduce to 4.0.
+    // vaddpd ymm0,ymm0,ymm6 == c5 fd 58 c6 (modrm c6: reg 0, rm 6)
+    let r = ja_pos()
+    prologue()
+    j_f_vxorpd_y0()
+    j_f_vbcastsd_y6_rdx()
+    jbytes(4, "c5fd58c6")
+    j_f_vextracti128_x2_y0()
+    j_f_vhaddpd_x3_x0()
+    j_f_vhaddpd_x4_x2()
+    j_f_vaddsd_x3_x4()
+    j_f_vmovq_rax_x3()
+    j_f_ret()
+
+    let raw = mem_alloc(160)
+    mem_store8(raw + 0, 0)
+    mem_store8(raw + 1, 60)
+    mem_store8(raw + 2, 0)
+    mem_store8(raw + 3, 56)
+    let i = 0
+    while i < 12 { mem_store8(raw + 4 + i, 1 + i) ; i = i + 1 }
+    i = 0
+    while i < 128 { mem_store8(raw + 16 + i, 17) ; i = i + 1 }
+
+    let x = mem_alloc(256 * 8 + 64)
+    i = 0
+    while i < 256 { mem_store(x + i * 8, 1.0) ; i = i + 1 }
+
+    let dmd = jit_f_dmd_alloc(1)
+    jit_f_dmd_fill(raw, raw + 4, f16_to_f64(raw + 0), f16_to_f64(raw + 2), dmd)
+    let asz = mem_alloc(32)
+    mem_store(asz + 0, raw)
+    mem_store(asz + 8, x)
+    mem_store(asz + 16, dmd)
+    mem_store(asz + 24, 1)
+
+    prints("A after vpmovzxbd        = "); print(jit_call(a, asz, 0)); newline()
+    prints("B after nibble isolate   = "); print(jit_call(b, asz, 0)); newline()
+    prints("C after vcvtdq2pd        = "); print(jit_call(c, asz, 0)); newline()
+    prints("R reduce([1,1,1,1])     = "); print(jit_call(r, asz, 0)); newline()
+    prints("H y7 from [rdx+8]       = "); print(jit_call(h, asz, 0)); newline()
+    prints("I y7 from [rdx+24]      = "); print(jit_call(i2, asz, 0)); newline()
+    prints("D after vbroadcastsd    = "); print(jit_call(d, asz, 0)); newline()
+    prints("E after vmulpd factor   = "); print(jit_call(e, asz, 0)); newline()
+    prints("F after vsubpd min      = "); print(jit_call(f, asz, 0)); newline()
+    prints("G after vmulpd x        = "); print(jit_call(g, asz, 0)); newline()
+    prints("expected A=0x0000001100000011 B=0x0000000100000001 C=0x3FF0000000000000"); newline()
+    prints("expected D=0x3FF0000000000000 E=0x3FF0000000000000 F/G=0xBFF8000000000000"); newline()
+    return 0
+}
