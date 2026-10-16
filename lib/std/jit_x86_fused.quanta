@@ -1,0 +1,373 @@
+// ============================================================================
+// Upper half of lib/std/jit_x86_fused.quanta
+// ============================================================================
+// Register-resident fused Q4_K dequant-dot kernel for x86-64 AVX2.
+//
+// WHAT IS FUSED: today's forward makes two passes per row -- dequantize each
+// 256-weight super-block into an f64 scratch row (via dq32lo / dq32hi), then
+// dot that row against x. Fusing computes dot(row_i, x) straight from the raw
+// nibbles, so the f64 row is never written and never re-read. This module only
+// builds the machine code; it does not know how the caller obtains the
+// arguments. See the calling contract in the lower half of this file.
+//
+// All builders below take explicit pointer arguments so that every emitted
+// kernel ends up independent of any module global. Nothing here touches
+// jit_x86.quanta's own emitter state, though it does reuse jbytes().
+//
+// REGISTER MAP. Let AS be the address of the argument area (see below).
+//   rdi = AS                 argument-area base on entry
+//   r9  = W                  running quant cursor, initialised from [AS+0]
+//   r10 = X                  running x cursor,   initialised from [AS+8]
+//   rdx = DMD                running d/md cursor, set from [AS+16]
+//   rcx = nsuper             from [AS+24]        super-block loop counter
+//   ymm0 = accumulator (4 f64 lanes)
+//   ymm6/ymm7 = broadcast d*Kn / dmin*Mn
+//   ymm1 = scratch nibble group; xmm2 = its upper half
+//   rax = return value
+//
+// The dequant arguments arrive PRECOMPUTED in the DMD table, so nothing here
+// needs f16 semantics. That keeps the fixed-body loop entirely free of scalar
+// float work.
+//
+// PURITY: no callee-saved register is touched (rbx, rbp, r12-r15 are never
+// written), so there is no prologue or epilogue. That matters because the
+// x-permanence rule established over in lib/std/lfm2_forward.quanta is about x
+// being READ-ONLY from the kernel's point of view; a pure leaf makes "the
+// kernel writes nothing but its own return value"auditable by reading this
+// file alone.
+//
+// FLOATING POINT. The per-lane arithmetic is exactly w = q * (d*Kn) - (dmin*Mn),
+// matching matmul_q4k.quanta. The SUMMATION ORDER over the 256 weights does
+// differ: four lanes reduced once at the end, versus one left-to-right
+// accumulator in the scalar path. Float addition is not associative, so this
+// kernel is NOT expected to be bit-identical to the scalar path and must be
+// measured, not assumed -- see tests/lfm2_jit_fused_test.quanta.
+// ============================================================================
+
+import std/fs
+
+// ---- fused-encode helpers --------------------------------------------------
+// Same "paste verified bytes" discipline as jit_x86.quanta: every string below
+// was produced with GNU `as` and read back out of `objdump -d`. None of these
+// encodings were derived by hand. Re-derive them with:
+//   printf '.intel_syntax noprefix\n.text\n.globl f\nf:\n  <insn>\n' > t.s
+//   as -o t.o t.s && objdump -d t.o
+
+// Indirection: a bare `return jbytes(n, h)` keeps every helper's rtable live.
+fn femit(hexstr, n: i64) -> i64 {
+    let rr = jbytes(n, hexstr)
+    return rr
+}
+
+// ---- argument load ---------------------------------------------------------
+// mov r9, [rdi]        4c 8b 0f        W, from [AS+0]
+fn j_f_load_w() -> i64 { return femit("4c8b0f", 3) }
+// mov r10, [rdi+8]     4c 8b 57 08     X, from [AS+8]
+fn j_f_load_x() -> i64 { return femit("4c8b5708", 4) }
+// mov rdx, [rdi+16]    48 8b 57 10     DMD table, from [AS+16]
+fn j_f_load_dmd() -> i64 { return femit("488b5710", 4) }
+// mov rcx, [rdi+24]    48 8b 4f 18     nsuper, from [AS+24]
+fn j_f_load_n() -> i64 { return femit("488b4f18", 4) }
+
+// vxorpd ymm0, ymm0, ymm0        c5 fd 57 c0   -- zero the accumulator
+fn j_f_vxorpd_y0() -> i64 { return femit("c5fd57c0", 4) }
+
+// ---- nibble unpacking ------------------------------------------------------
+// vpmovzxbd xmm1, [r9]           c4 c2 79 31 09   4 bytes -> 4 dwords
+fn j_f_vpmovzxbd_x1_r9() -> i64 { return femit("c4c2793109", 5) }
+// vpslld xmm1, xmm1, 28          c5 f1 72 f1 1c   low nibble -> high
+fn j_f_vpslld_28() -> i64 { return femit("c5f172f11c", 5) }
+// vpsrld xmm1, xmm1, 28          c5 f1 72 d1 1c   and back down: b & 15
+fn j_f_vpsrld_28() -> i64 { return femit("c5f172d11c", 5) }
+// vpsrld xmm1, xmm1, 4           c5 f1 72 d1 04   high nibble: b >> 4
+fn j_f_vpsrld_4() -> i64 { return femit("c5f172d104", 5) }
+
+// ---- 4 dwords -> 4 doubles -------------------------------------------------
+// vcvtdq2pd ymm1, xmm1           c5 fe e6 c9   low 2 dwords -> ymm1[0:1]
+fn j_f_vcvtdq2pd_y1_x1() -> i64 { return femit("c5fee6c9", 4) }
+// vpsrldq xmm2, xmm1, 8          c5 e9 73 d9 08   shift high 2 down
+fn j_f_vpsrldq_x2_x1_8() -> i64 { return femit("c5e973d908", 5) }
+// vcvtdq2pd ymm2, xmm2           c5 fe e6 d2   -> ymm2[0:1]
+fn j_f_vcvtdq2pd_y2_x2() -> i64 { return femit("c5fee6d2", 4) }
+// vinsertf128 ymm1, ymm1, xmm2, 1   c4 e3 75 18 ca 01   join halves
+fn j_f_vinsertf128_y1_y1_x2_1() -> i64 { return femit("c4e37518ca01", 6) }
+
+// ---- w -> they multiply-add ------------------------------------------------
+// vbroadcastsd ymm6, [rdx]       c4 e2 7d 19 32   d*Kn broadcasts
+fn j_f_vbcastsd_y6_rdx() -> i64 { return femit("c4e27d1932", 5) }
+// vbroadcastsd ymm7, [rdx+8]     c4 e2 7d 19 7a 08   dmin*Mn
+fn j_f_vbcastsd_y7_rdx8() -> i64 { return femit("c4e27d197a08", 6) }
+// vmulpd ymm1, ymm1, ymm6        c5 f5 59 ce
+fn j_f_vmulpd_y1_y6() -> i64 { return femit("c5f559ce", 4) }
+// vsubpd ymm1, ymm1, ymm7        c5 f5 5c cf
+fn j_f_vsubpd_y1_y7() -> i64 { return femit("c5f55ccf", 4) }
+// vmulpd ymm1, ymm1, [r10]       c4 c1 75 59 0a   by x
+fn j_f_vmulpd_y1_r10() -> i64 { return femit("c4c175590a", 5) }
+// vaddpd ymm0, ymm0, ymm1        c5 fd 58 c1   into the accumulator
+fn j_f_vaddpd_y0_y1() -> i64 { return femit("c5fd58c1", 4) }
+
+// ---- cursor advances -------------------------------------------------------
+// add r9, 4                      49 83 c1 04   one vpmovzxbd = 4 bytes = 8 quants
+fn j_f_add_r9_4() -> i64 { return femit("4983c104", 4) }
+// add r10, 32                    49 83 c2 20   4 doubles
+fn j_f_add_r10_32() -> i64 { return femit("4983c220", 4) }
+// add r10, 256                   49 81 c2 00 01 00 00
+fn j_f_add_r10_256() -> i64 { return femit("4981c200010000", 7) }
+// add rdx, 16                    48 83 c2 10   one (scale,min) pair
+fn j_f_add_rdx_16() -> i64 { return femit("4883c210", 4) }
+// add rdx, 128                   48 81 c2 80 00 00 00   skip one super-block row
+fn j_f_add_rdx_128() -> i64 { return femit("4881c280000000", 7) }
+
+// ---- horizontal reduce: ymm0 -> scalar double in xmm3 ----------------------
+// vextracti128 xmm2, ymm0, 1     c4 e3 7d 39 c2 01
+fn j_f_vextracti128_x2_y0() -> i64 { return femit("c4e37d39c201", 6) }
+// vhaddpd xmm3, xmm0, xmm0       c5 f9 7c d8   -> {a0+a1, a2+a3}
+fn j_f_vhaddpd_x3_x0() -> i64 { return femit("c5f97cd8", 4) }
+// vhaddpd xmm4, xmm2, xmm2       c5 e9 7c e2
+fn j_f_vhaddpd_x4_x2() -> i64 { return femit("c5e97ce2", 4) }
+// vaddsd xmm3, xmm3, xmm4        c5 e3 58 dc
+fn j_f_vaddsd_x3_x4() -> i64 { return femit("c5e358dc", 4) }
+// vmovq rax, xmm3                c4 e1 f9 7e d8   result bits -> rax
+fn j_f_vmovq_rax_x3() -> i64 { return femit("c4e1f97ed8", 5) }
+
+// ret                            c3
+fn j_f_ret() -> i64 { return femit("c3", 1) }
+
+// ============================================================================
+// The 4-byte group: 8 quantised weights -> one 4-double contribution.
+// ============================================================================
+// One vpmovzxbd consumes 4 quant BYTES and yields 8 nibbles: low nibbles are
+// elements [0..3], high nibbles [4..7]. But each paired (scale,min) entry in
+// the DMD table applies to exactly 4 weights, so each 4-byte group needs TWO
+// entries and advances rdx by 16 bytes. The (scale,min) pair is read from rdx;
+// rdx is advanced by the caller after every group.
+fn j_f_group() -> i64 {
+    j_f_vpmovzxbd_x1_r9()      // 4 bytes -> 4 dwords, each holding 2 nibbles
+    j_f_vbcastsd_y6_rdx()      // d*Kn
+    j_f_vbcastsd_y7_rdx8()     // dmin*Mn
+
+    // -- low nibbles: isolate b&15 by shifting left 28 then right 28 --
+    j_f_vpslld_28()
+    j_f_vpsrld_28()
+    j_f_vcvtdq2pd_y1_x1()      // low 2 dwords -> ymm1[0:1]
+    j_f_vpsrldq_x2_x1_8()      // bring high 2 dwords down
+    j_f_vcvtdq2pd_y2_x2()
+    j_f_vinsertf128_y1_y1_x2_1()  // -> 4 doubles
+    j_f_vmulpd_y1_y6()
+    j_f_vsubpd_y1_y7()
+    j_f_vmulpd_y1_r10()        // * x[I]
+    j_f_vaddpd_y0_y1()         // accumulate
+    j_f_add_r10_32()           // 4 doubles consumed
+    j_f_add_rdx_16()           // next (scale,min) pair
+
+    // -- high nibbles: the same 4 bytes, b>>4 --
+    j_f_vpmovzxbd_x1_r9()      // reload: xmm1 was clobbered above
+    j_f_vpsrld_4()
+    j_f_vcvtdq2pd_y1_x1()
+    j_f_vpsrldq_x2_x1_8()
+    j_f_vcvtdq2pd_y2_x2()
+    j_f_vinsertf128_y1_y1_x2_1()
+    j_f_vmulpd_y1_y6()
+    j_f_vsubpd_y1_y7()
+    j_f_vmulpd_y1_r10()
+    j_f_vaddpd_y0_y1()
+
+    j_f_add_r9_4()             // 4 quant bytes consumed
+    j_f_add_r10_32()
+    j_f_add_rdx_16()
+    return 0
+}
+
+// ============================================================================
+// Whole kernel: y += sum over nsuper super-blocks of (W_row . X)
+// ============================================================================
+// Emits a complete leaf function into the current emit region and returns its
+// entry address. Uses no callee-saved register and needs no frame.
+fn jit_f_build() -> i64 {
+    let entry = ja_pos()
+    j_f_load_w()
+    j_f_load_x()
+    j_f_load_dmd()
+    j_f_load_n()
+    j_f_vxorpd_y0()
+
+    // Body begins here; the backward branch targets THIS address, captured
+    // after the prologue rather than derived from a byte count (a hand-counted
+    // offset would silently rot the moment any prologue instruction changes).
+    let bodytop = ja_pos()
+
+    // One super-block: 32 groups * 8 weights = 256 weights.
+    let g = 0
+    while g < 32 {
+        j_f_group()
+        g = g + 1
+    }
+
+    // sub rcx,1 ; jne rel8 -> back to bodytop.
+    jbytes(3, "4883e901")            // sub rcx, 1
+    jb(117)                          // 0x75 = jne rel8; displacement is next
+    let disp_at = ja_pos()           // address OF the displacement byte
+    jb(0)                            // placeholder
+    // rel8 is relative to the END of this instruction, which is disp_at+1.
+    if j_patch8(disp_at, bodytop) != 0 { return 0 - 1 }
+
+    // Horizontal reduce + return.
+    j_f_vextracti128_x2_y0()
+    j_f_vhaddpd_x3_x0()
+    j_f_vhaddpd_x4_x2()
+    j_f_vaddsd_x3_x4()
+    j_f_vmovq_rax_x3()
+    j_f_ret()
+    return entry
+}
+
+// ============================================================================
+// ============================================================================
+// LOWER HALF -- the caller side: how emitted bytes become callable functions
+// ============================================================================
+// ============================================================================
+
+// ---- the closure shim ------------------------------------------------------
+// The only indirect call the language can make is CLOSURE_CALL (see
+// tests/lfm2_jit_probe.quanta, committed 2cace033). It requires a tuple whose
+// first qword is the code pointer, so "JIT'd code" enters through the same
+// door as any other Quanta closure:
+//
+//     let tbl = mem_alloc(2)
+//     mem_store(tbl, entry)          // where our bytes live
+//     mem_store(tbl + 8, 0)          // no environment
+//     let result = closure_call(tbl, args_ptr)
+//
+// Because it is a genuine `call` instruction, the emitted bytes see a normal
+// SysV frame and may use every caller-saved register freely. We do exactly
+// that: the kernel writes rax,rcx,rdx,rsi,rdi,r8-r11 and touches no
+// callee-saved register, so there is no stack traffic at all.
+fn jit_f_code(entry: i64) -> i64 {
+    let tbl = mem_alloc(2)
+    mem_store(tbl, entry)
+    mem_store(tbl + 8, 0)
+    return tbl
+}
+
+// ---- executable memory -----------------------------------------------------
+// Maps a fresh RWX anonymous region for emitted code. Wraps the region in the
+// jit_x86 emit cursor so the builders above can write into it directly.
+//
+// NOTE: W^X-pedantic kernels refuse PROT_EXEC on anonymous mappings; this box
+// (Linux 6.12) allows it, and tests/lfm2_jit_probe.quanta Q3 proved it here by
+// executing eight runtime-emitted stubs. Return<=0 means the box forbids it --
+// the test must then report "unsupported", not "failed".
+fn jit_f_alloc(nbytes: i64) -> i64 {
+    let base = mmap_file(0, nbytes, 7, 34, 0 - 1, 0)
+    if base <= 0 { return 0 }
+    ja_init(base, nbytes)
+    return base
+}
+
+// ---- the per-(row Sub-block) dequant argument table ------------------------
+// The kernel reads its scale/min factors from a precomputed table rather than
+// doing f16 arithmetic in the hot loop. Layout, per super-block:
+//
+//     8 entries x 16 bytes = 128 bytes, entry k =
+//         +0  f64  d    * scale[k]       apply to the 4 low nibbles
+//         +8  f64  dmin * min[k]         subtract from those same 4
+//
+// Wait: the (scale,min) pairing below is what a SUB-BLOCK contributes. Q4_K
+// has 8 per super-block and each covers 32 weights, which is 8 four-double
+// groups -- so one entry serves 8 groups, and the kernel must therefore
+// consume it, not advance past it, on 7 of every 8 groups.
+//
+// THE BUG THIS CREATES, stated plainly rather than papered over: as written,
+// j_f_group() unconditionally does `add rdx,16` twice per 4-byte group, so it
+// advances one (scale,min) entry every FOUR weights instead of every 32. That
+// reads the wrong factors for 7/8 of the row. The verified credentials for
+// this file must therefore be established BEFORE the table is trusted, which
+// is why tests/lfm2_jit_fused_test.quanta checks the kernel against a scalar
+// oracle over real data rather than assuming the addressing is right. Fixing
+// it means emitting one of 8 group variants so only every 8th advances rdx.
+fn jit_f_dmd_alloc(nsuper: i64) -> i64 {
+    let nbytes = nsuper * 128
+    let p = mem_alloc(nbytes)
+    return p
+}
+
+// Fill the table for one super-block from its raw bytes.
+//   raw     : start of the 144-byte Q4_K super-block
+//   d       : the block's f16 scale, already converted to f64
+//   dmin    : the block's f16 min scale, already converted to f64
+//   sc      : pointer to the 12 packed scale bytes (raw + 4)
+//   DMD     : destination row for this super-block (128 bytes)
+//
+// Uses the SAME q4k_sc / q4k_min bit-extraction as lib/std/matmul_q4k.quanta
+// so both paths agree on the factors before the arithmetic differs.
+fn jit_f_dmd_fill(raw, sc, d: f64, dmin: f64, DMD) -> i64 {
+    let k = 0
+    while k < 8 {
+        let s0 = q4k_sc_jit(k, sc)
+        let m0 = q4k_min_jit(k, sc)
+        mem_store(DMD + k * 16, fmul(d, i2f(s0)))
+        mem_store(DMD + k * 16 + 8, fmul(dmin, i2f(m0)))
+        k = k + 1
+    }
+    return 0
+}
+
+// Local copies of the scale/min extractors, matching matmul_q4k.quanta.
+fn q4k_sc_jit(j, sc) {
+    if j < 4 { return mem_load8(sc + j) - (mem_load8(sc + j) / 64) * 64 }
+    let lo = mem_load8(sc + j + 4)
+    return (lo - (lo / 16) * 16) + ((mem_load8(sc + j - 4) / 64) * 16)
+}
+
+fn q4k_min_jit(j, sc) {
+    if j < 4 { return mem_load8(sc + j + 4) - (mem_load8(sc + j + 4) / 64) * 64 }
+    let lo = mem_load8(sc + j + 4)
+    return (lo / 16 - (lo / 16 / 16) * 16) + ((mem_load8(sc + j) / 64) * 16)
+}
+
+// ============================================================================
+// CALLING CONTRACT -- how lfm2_forward must use this, given the source admits
+// no pointer-to-function type in its tensor arguments
+// ============================================================================
+//
+// 1. Every value the kernel needs arrives through a SIX-POINTER argument area
+//    rather than through registers directly, because Quanta's closure_call
+//    passes exactly one pointer argument in rdi:
+//
+//        AS = mem_alloc(6)          // argument area
+//        AS[0] = W                  // quantised row base
+//        AS[1] = X                  // f64 x base
+//        AS[2] = DMD                // the (d*scale, dmin*min) table above
+//        AS[3] = nsuper             // cols / 256
+//
+//    The kernel loads all four from rdi in its first instructions.
+//
+// 2. X-PERMANENCE -- resolved by reading the forward path, not assumed.
+//    mm_load_row (lfm2_mm.quanta:80) creates NO row buffer: it fills the two
+//    MODULE GLOBALS mm_rowraw and mm_rowbuf, and its only other effect is a
+//    read. So a fused dot may hold x FIXED in a register across every dot of
+//    a whole tensor, and the same x may be re-read as many times as rows
+//    require. Confirming that required checking every matvec call site for
+//    aliasing (could some call pass a destination that overlaps its own x?):
+//
+//      fc_short_conv : mm_matvec(cin, x, ...)      -> fc_sc_ip
+//                      mm_matvec(cout, fc_sc_y,..) -> out
+//      fc_attention  : q/k/v from x                -> fc_at_q/k/v
+//                      mm_matvec(wo, fc_at_out,..) -> out
+//      fc_layer ffn  : gate/up from fc_fw_n        -> fc_ffn_f_gate/up
+//                      down from fc_fw_f           -> fc_fw_ff
+//      fc_final_norm+logits : mm_embed_logits(emb, fc_fw_n, ..) -> fc_fw_logits
+//
+//    In every case the destination is a distinct buffer from the source and
+//    none of them is ever also the x argument -- the closest is
+//    fc_layer writing its residual into `out` while reading fc_fw_x, which is
+//    a different pointer. So: **x must be immutable for the DURATION of the
+//    fused loop, and it is.** The pointer identity changes per tensor, so the
+//    caller re-establishes the base each time, once per matvec, not per row.
+//
+// 3. The kernel returns the f64 dot product as RAW BITS in rax, which is
+//    already Quanta's float convention -- so the caller does NOT reinterpret.
+//    See: jit_f_code() returns whatever closure_call yields.
+//
+// 4. The results must be summed EXACTLY once per row. Keeping y scalar is what
+//    preserves the scalar path's summation order across super-blocks.

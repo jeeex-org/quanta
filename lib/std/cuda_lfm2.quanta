@@ -1,0 +1,390 @@
+// lib/std/cuda_lfm2.quanta -- GPU offload for the LFM2 forward pass.
+//
+// WHAT THIS IS
+// ------------
+// The daemon (lib/std/cuda_daemon.quanta) and the kernels
+// (scripts/audit/quanta_gpu_kernels.cu) are proven: an existing test dequantizes
+// a synthetic Q4_K tensor on the GPU and gets 0 bit-differing elements against
+// the CPU dequant. What did not exist before this file was a path from the REAL
+// loader to those kernels. This module is that path.
+//
+// It is OPT IN. `gpu_lfm2_enable()` is the only switch; until something calls it
+// every lfm2_forward call site takes exactly the branch it took before, so the
+// CPU path stays the default and stays byte-identical.
+//
+// TRANSPORT, AND WHY IT IS FILES
+// ------------------------------
+// Every device-side operation goes through the daemon as a line appended to
+// /tmp/quanta_cuda/queue. That means every payload this module sends has to be
+// IN A FILE first (`h2d <dp> <file> <n>` reads the file), and every result comes
+// back as a file (`d2h <dp> <file> <n>` writes one).
+//
+// The staging here is a plain write() to /tmp, not the daemon's pinned host
+// allocator. host_alloc() would be faster, but nothing in cuda_daemon.quanta
+// exposes a way to WRITE into pinned host memory from Quanta -- there is no
+// "poke bytes into this host pointer" command -- so the pinned route is a dead
+// end until the protocol grows one. See PROTOCOL below.
+//
+// SCOPE OF THIS SLICE
+// -------------------
+// One layer's worth of tensors resident on the device, one Q4_K matvec computed
+// there, compared bitwise against the CPU path. Not all 30 layers, not an
+// end-to-end token rate: those are the next slice and are called out in
+// docs/research/.
+//
+// NUMERICS -- read this before comparing anything
+// -----------------------------------------------
+// The CPU matvec accumulates in f64 with mm_dot4's 4-lane reduction. The GPU
+// kernel accumulates in f32 with a different tree. THOSE ARE NOT THE SAME
+// FUNCTION. Values that agree to ~1e-6 relative are the expected outcome, and
+// reported differences here are NOT evidence of a wrong kernel.
+//
+// The Q4_K DEQUANT is a different claim: it is arithmetic identical to
+// lib/std/gguf.quanta on both sides, so its output IS expected to be bit-exact
+// once each side is expressed in its own width (CPU f64 -> f32 is exact when the
+// f64 came from an f32 rounding, which is what the device holds).
+//
+// Measured is a measured number; anything labelled derived was computed from one.
+
+import std/fs
+import std/gguf
+import std/cuda_daemon
+import std/lfm2_mm
+
+// ---- the opt-in switch ----------------------------------------------------
+//
+// 0 = CPU. Every guard in this file and in the lfm2_forward call sites tests
+// it, so leaving it alone changes nothing anywhere.
+let gpu_lfm2_on = 0
+
+fn gpu_lfm2_enable() {
+    gpu_lfm2_on = 1
+}
+
+fn gpu_lfm2_disable() {
+    gpu_lfm2_on = 0
+}
+
+fn gpu_lfm2_enabled() -> i64 {
+    return gpu_lfm2_on
+}
+
+// A job number, so each operation gets its OWN staging file. Sharing one path
+// across two operations is safe only while they are strictly ordered, and it
+// makes a stale result indistinguishable from a fresh one when debugging.
+let gpu_lfm2_serial = 0
+
+fn gpu_stage_path(prefix) -> u64 {
+    let p = mem_alloc(256)
+    let n = cuda_cat(p, 0, "/tmp/quanta_cuda_lfm2_")
+    n = cuda_cat(p, n, prefix)
+    n = cuda_cat(p, n, ".bin")
+    return p
+}
+
+// Write `bytes` from host address `src` into /tmp and return its path.
+// The caller frees the returned buffer.
+fn gpu_stage(src: u64, bytes: i64, prefix) -> u64 {
+    gpu_lfm2_serial = gpu_lfm2_serial + 1
+    let path = gpu_stage_path(prefix)
+    let fd = open(path, 577, 420)          // O_WRONLY|O_CREAT|O_TRUNC
+    if fd < 0 {
+        mem_free(path)
+        return 0
+    }
+    let w = write_raw(fd, src, bytes)
+    close(fd)
+    if w != bytes {
+        mem_free(path)
+        return 0
+    }
+    return path
+}
+
+// Read a file into a host buffer. Returns bytes read, or negative.
+fn gpu_unstage(dst: u64, path, bytes: i64) -> i64 {
+    let fd = open(path, 0, 0)
+    if fd < 0 { return -1 }
+    let n = read_raw(fd, dst, bytes)
+    close(fd)
+    return n
+}
+
+// ===========================================================================
+// Residence: putting a real tensor on the device
+// ===========================================================================
+//
+// A resident tensor is described by a flat 4-word cell:
+//
+//   [0]  device pointer
+//   [8]  bytes resident
+//   [16] dtype
+//   [24] element count
+//
+// Only Q4_K (12) and F32 (0) are accepted: those are the two the kernel
+// implements. Anything else returns 0 rather than silently uploading bytes the
+// device cannot interpret.
+//
+// A whole tensor at once, not one row: the point of residence is that the
+// transfer is paid once and every subsequent matvec reads device memory.
+// ffn_gate at 10752x2048 Q4_K is ~11.8 MB, which is nothing against 8188 MiB.
+
+fn gpu_resident_new(idx: u64, rows: i64, cols: i64) -> u64 {
+    let dtype = gguf_tensor_dtype(idx)
+    if dtype != 12 && dtype != 0 { return 0 }
+
+    let nelem = rows * cols
+    // Derived from the same (elements, bytes) pairs mm_row_bytes uses. Doing it
+    // per ROW and multiplying is what keeps the Q4_K block count exact.
+    let nbytes = 0
+    if dtype == 12 { nbytes = (nelem / 256) * 144 }
+    else { nbytes = nelem * 4 }
+    if nbytes <= 0 { return 0 }
+
+    // Read the tensor's raw bytes from the file. gguf_read_tensor_bytes reads
+    // from the tensor's own offset, so this is the whole tensor in one call.
+    let host = mem_alloc(nbytes)
+    let nr = gguf_read_tensor_bytes(idx, host, nbytes)
+    if nr != nbytes {
+        mem_free(host)
+        return 0
+    }
+
+    let stage = gpu_stage(host, nbytes, "res")
+    if stage == 0 {
+        mem_free(host)
+        return 0
+    }
+
+    let dp = gpu_malloc(nbytes)
+    if dp == 0 {
+        mem_free(host)
+        mem_free(stage)
+        return 0
+    }
+    // h2d is issued on the default stream and the daemon does not synchronise
+    // before replying, so the copy may still be in flight here. Fill the cell
+    // with a marker evaluation: correctness does not depend on when it lands,
+    // only that it has landed before the first read. gpu_resident_sync covers
+    // that; see its note on why it is not called here.
+    if memcpy_h2d_async(stage, dp, nbytes) != 0 {
+        gpu_free(dp)
+        mem_free(host)
+        mem_free(stage)
+        return 0
+    }
+
+    mem_free(stage)
+    mem_free(host)
+
+    let cell = mem_alloc(32)
+    mem_store(cell, dp)
+    mem_store(cell + 8, nbytes)
+    mem_store(cell + 16, dtype)
+    mem_store(cell + 24, nelem)
+    mem_store(cell + 32, rows)
+    mem_store(cell + 40, cols)
+    return cell
+}
+
+fn gpu_resident_dp(cell: u64) -> u64 { return mem_load(cell) }
+fn gpu_resident_bytes(cell: u64) -> i64 { return mem_load(cell + 8) }
+fn gpu_resident_dtype(cell: u64) -> i64 { return mem_load(cell + 16) }
+fn gpu_resident_nelem(cell: u64) -> i64 { return mem_load(cell + 24) }
+fn gpu_resident_rows(cell: u64) -> i64 { return mem_load(cell + 32) }
+fn gpu_resident_cols(cell: u64) -> i64 { return mem_load(cell + 40) }
+
+fn gpu_resident_free(cell: u64) {
+    if cell == 0 { return }
+    gpu_free(mem_load(cell))
+    mem_free(cell)
+}
+
+// Barrier. Deliberately NOT called inside gpu_resident_new: a caller uploading
+// several tensors wants one barrier after the last, not one per tensor, and a
+// sync inside the constructor would serialise transfers that could overlap.
+fn gpu_resident_sync() {
+    stream_sync(0)
+}
+
+// ===========================================================================
+// Tensors for ONE layer
+// ===========================================================================
+//
+// A layer's FFN is three matvecs. All three are resident together so a full
+// GPU layer needs no host round trip between them.
+//
+//   [0]  ffn_gate    [dff, dm]
+//   [8]  ffn_up      [dff, dm]
+//   [16] ffn_down    [dm, dff]
+//
+// Attention-side projections are NOT here yet. Their numerics (RoPE, per-head
+// norms) are a separate correctness problem, and getting Q4_K matvec right
+// first isolates it.
+
+let gpu_layer_cells = 0
+let gpu_layer_ready = 0
+let gpu_layer_L = 0 - 1
+
+// Upload one layer's FFN tensors. `dff` and `dm` come from the caller because
+// this module does not depend on lfm2_forward's config globals.
+fn gpu_layer_init(gt: u64, ut: u64, dt: u64, dff: i64, dm: i64) -> i64 {
+    if gpu_lfm2_on == 0 { return -1 }
+    if gpu_layer_ready != 0 { return 0 }
+
+    let cg = gpu_resident_new(gt, dff, dm)
+    if cg == 0 { return -1 }
+    let cu = gpu_resident_new(ut, dff, dm)
+    if cu == 0 { gpu_resident_free(cg); return -1 }
+    let cd = gpu_resident_new(dt, dm, dff)
+    if cd == 0 { gpu_resident_free(cg); gpu_resident_free(cu); return -1 }
+
+    gpu_layer_cells = mem_alloc(24)
+    mem_store(gpu_layer_cells, cg)
+    mem_store(gpu_layer_cells + 8, cu)
+    mem_store(gpu_layer_cells + 16, cd)
+    gpu_resident_sync()
+    gpu_layer_ready = 1
+    return 0
+}
+
+fn gpu_layer_free() {
+    if gpu_layer_ready == 0 { return }
+    gpu_resident_free(mem_load(gpu_layer_cells))
+    gpu_resident_free(mem_load(gpu_layer_cells + 8))
+    gpu_resident_free(mem_load(gpu_layer_cells + 16))
+    mem_free(gpu_layer_cells)
+    gpu_layer_cells = 0
+    gpu_layer_ready = 0
+}
+
+fn gpu_layer_gate() -> u64 { return mem_load(gpu_layer_cells) }
+fn gpu_layer_up() -> u64 { return mem_load(gpu_layer_cells + 8) }
+fn gpu_layer_down() -> u64 { return mem_load(gpu_layer_cells + 16) }
+
+// ===========================================================================
+// Device scratch: the activation vectors
+// ===========================================================================
+//
+// Three f32 device vectors plus one scratch used for the width bridge:
+//
+//   gpu_dx      [cols]  f32  the input activation
+//   gpu_dy      [rows]  f32  a matvec result
+//   gpu_d64_in  [n]     f64  staging for vector widths
+//   gpu_d64_out [n]     f64  staging for vector widths
+//
+// Sized once for the WIDER of (dm, dff) so all three FFN matvecs reuse them.
+
+let gpu_dx = 0
+let gpu_dy = 0
+let gpu_dbuff = 0
+let gpu_dout = 0
+let gpu_scratch_max = 0
+
+fn gpu_layer_scratch(maxn: i64) -> i64 {
+    if gpu_scratch_max >= maxn && gpu_dx != 0 { return 0 }
+    if gpu_dx != 0 {
+        gpu_free(gpu_dx)
+        gpu_free(gpu_dy)
+        gpu_free(gpu_dbuff)
+        gpu_free(gpu_dout)
+    }
+    gpu_dx = gpu_malloc(maxn * 4)
+    gpu_dy = gpu_malloc(maxn * 4)
+    gpu_dbuff = gpu_malloc(maxn * 8)
+    gpu_dout = gpu_malloc(maxn * 8)
+    if gpu_dx == 0 || gpu_dy == 0 || gpu_dbuff == 0 || gpu_dout == 0 { return -1 }
+    gpu_scratch_max = maxn
+    return 0
+}
+
+fn gpu_layer_scratch_free() {
+    if gpu_dx == 0 { return }
+    gpu_free(gpu_dx)
+    gpu_free(gpu_dy)
+    gpu_free(gpu_dbuff)
+    gpu_free(gpu_dout)
+    gpu_dx = 0
+    gpu_dy = 0
+    gpu_dbuff = 0
+    gpu_dout = 0
+    gpu_scratch_max = 0
+}
+
+// Push a host f64 vector to gpu_dx as device f32.
+//
+// Two steps because there is a WIDTH change, not just a transfer: the loader
+// holds f64, the kernel wants f32. Narrowing on the host is not available
+// (there is no host f64->f32 builtin in Quanta), so the f64 goes up as-is and
+// the device does the narrowing with gpu_f64_to_f32.
+fn gpu_push_x(x: u64, n: i64) -> i64 {
+    let stage = gpu_stage(x, n * 8, "x")
+    if stage == 0 { return -1 }
+    if memcpy_h2d_async(stage, gpu_dbuff, n * 8) != 0 {
+        mem_free(stage)
+        return -1
+    }
+    mem_free(stage)
+    return gpu_f64_to_f32(gpu_dbuff, gpu_dx, n)
+}
+
+// Pull gpu_dy back as host f64 in `out`.
+fn gpu_pull_y(out: u64, n: i64) -> i64 {
+    if gpu_f32_to_f64(gpu_dy, gpu_dout, n) != 0 { return -1 }
+    gpu_lfm2_serial = gpu_lfm2_serial + 1
+    let path = gpu_stage_path("y")
+    if memcpy_d2h_async(gpu_dout, path, n * 8) != 0 {
+        mem_free(path)
+        return -1
+    }
+    let got = gpu_unstage(out, path, n * 8)
+    mem_free(path)
+    if got != n * 8 { return -1 }
+    return 0
+}
+
+// ===========================================================================
+// The matvec itself
+// ===========================================================================
+
+// y_host[0..rows) = W(cell) @ x_host[0..cols), computed entirely on the device.
+//
+// Returns 0 on success. `out` receives f64 values.
+//
+// NOTE ON WHAT THIS MEASURES: the D2H of the result is inside the timed region
+// for the caller that wants an honest end-to-end per-op figure, but the three
+// FFN calls in a layer would in a real pipeline keep their intermediates on the
+// device. So treat a single gpu_layer_matvec number as "one op including its
+// result transfer", not as "steady-state cost".
+fn gpu_layer_matvec(cell: u64, x: u64, rows: i64, cols: i64, out: u64) -> i64 {
+    if gpu_lfm2_on == 0 { return -1 }
+    if cell == 0 { return -1 }
+    if gpu_push_x(x, cols) != 0 { return -1 }
+    if gpu_matvec(mem_load(cell + 16), mem_load(cell), gpu_dx, gpu_dy, rows, cols) != 0 {
+        return -1
+    }
+    return gpu_pull_y(out, rows)
+}
+
+// ===========================================================================
+// PROTOCOL NOTES -- what this module needs that cuda_daemon does not expose
+// ===========================================================================
+//
+// 1. No host-side write into pinned memory. host_alloc() returns a pinned
+//    pointer, but every payable command takes a FILE, so pinned staging is
+//    unreachable from Quanta. Consequence: each upload is write() + read() by
+//    the daemon, i.e. two page-cache round trips per transfer.
+//
+// 2. No device-to-device copy command. elementwise(out, op, n) covers element
+//    ops but not a raw memcpy, so a device buffer cannot be duplicated without
+//    going through the host.
+//
+// 3. No allocation query. Nothing reports free VRAM, so a caller cannot size a
+//    residency plan against what is actually available.
+//
+// 4. Every `h2d` of a STAGED file re-reads it from disk. For weights that are
+//    uploaded once this is irrelevant; for a per-token activation vector it is
+//    a real cost, and item 1 is what would remove it.
+//
+// None of these blocks the single-layer deliverable. All of them matter for the
+// 30-layer version.

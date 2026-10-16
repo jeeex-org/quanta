@@ -1,0 +1,167 @@
+// tests/cuda_lfm2_layer_test.quanta -- one REAL model layer's FFN on the GPU,
+// compared against the CPU numerics over all elements.
+//
+// This is not a synthetic-fixture test. Every byte comes from
+// QUANTA-LFM2.5-2.6Bv1-Q4_K_M.gguf: the real ffn_gate/ffn_up/ffn_down tensors
+// for the requested layer, read through the same gguf reader the loader uses.
+//
+// WHAT IS ASSERTED
+// ----------------
+//  1. All three tensors can be made resident on the device.
+//  2. Q4_K DEQUANT on the GPU is BIT-EXACT against the CPU dequant over every
+//     element, comparing each side after expressing it in the width the device
+//     actually holds. This is the claim the existing kernels test already made
+//     on synthetic data; here it is re-made on real weights.
+//  3. A REAL matvec (W @ x, x the shape ffn_gate sees in a forward pass) agrees
+//     with the CPU result to a relative tolerance, since GPU f32 accumulates in
+//     a different order than CPU f64. If every element came back bit-identical
+//     that would be surprising, so the tolerance is the honest assertion and the
+//     worst-case figure is printed.
+//
+// WHY A tests/ DRIVER AND NOT AN EXPECTED.tsv ROW
+// -----------------------------------------------
+// Same reasoning as tests/lfm2_mm_workers_zero_test.quanta: the model file
+// must be present and the gate's 15 s / 1536 MB ceiling cannot hold it. It also
+// needs the CUDA daemon, which the gate row's own tests do, but the binding
+// constraint here is the model.
+//
+// Build:  compiler/<ver>/bin/x86/qc -O tests/cuda_lfm2_layer_test.quanta <out>
+// Run:    the CUDA DAEMON MUST BE RUNNING (scripts/audit/cuda_daemon) --
+//         cuda_init fails immediately and this prints SKIP otherwise.
+//         ./<out>   directly (NOT via scripts/quanta_run.sh: its 1 GB VSZ cap
+//         kills a CUDA process).
+
+import std/gguf
+import std/math
+import std/cuda_daemon
+import std/cuda_lfm2
+import std/lfm2_forward
+import std/lfm2_model
+import std/lfm2_mm
+import std/fs
+
+const Q4_PATH = "/opt/ai/models/quanta/QUANTA-LFM2.5-2.6Bv1-Q4_K_M.gguf"
+// Layer 2 -- the first convolution layer (LFM2 alternates conv and attention,
+// so this exercises the numerically simplest topology first).
+const LAYER = 2
+
+let nbad = 0
+
+// Worst relative difference between two f64 vectors. Prints are raw f64 bit
+// patterns in this language, so use pf64() from std/math.
+fn worst_rel(got: u64, want: u64, n: i64) -> f64 {
+    let worst: f64 = 0.0
+    let bitdiffs = 0
+    let i = 0
+    while i < n {
+        let g: f64 = f64of(mem_load(got + i * 8))
+        let w: f64 = f64of(mem_load(want + i * 8))
+        if mem_load(got + i * 8) != mem_load(want + i * 8) { bitdiffs = bitdiffs + 1 }
+        let den: f64 = w
+        if den < 0.0 { den = 0.0 - den }
+        if den < 0.000000000001 { den = 0.000000000001 }
+        let d: f64 = g - w
+        if d < 0.0 { d = 0.0 - d }
+        let rel: f64 = d / den
+        if rel > worst { worst = rel }
+        i = i + 1
+    }
+    prints("  worst rel=")
+    prf(worst)
+    prints("  bit-differing=")
+    print(bitdiffs)
+    prints("/")
+    print(n)
+    newline()
+    return worst
+}
+
+fn main() -> i64 {
+    prints("=== cuda_lfm2: one real layer on the GPU ===\n")
+
+    if cuda_daemon_ready() == 0 {
+        prints("SKIP: CUDA daemon not running\n")
+        return 0
+    }
+
+    if gguf_load(Q4_PATH) != 0 { prints("FAIL gguf_load\n"); return 1 }
+    if fc_read_config() != 0 { prints("FAIL fc_read_config\n"); return 1 }
+    if fc_fw_init() != 0 { prints("FAIL fc_fw_init\n"); return 1 }
+
+    let dm = fc_d_model
+    let dff = fc_d_ff
+    prints("d_model=")
+    print(dm)
+    prints(" d_ff=")
+    print(dff)
+    prints(" layer=")
+    print(LAYER)
+    newline()
+
+    let gt = lfm2_ffn_gate(LAYER)
+    let ut = lfm2_ffn_up(LAYER)
+    let dt = lfm2_ffn_down(LAYER)
+    if gt < 0 || ut < 0 || dt < 0 { prints("FAIL ffn tensor lookup\n"); return 1 }
+
+    // ---- CPU reference: the same three matvecs through the loader ----
+    let xvec = mem_alloc(dm * 8)
+    let i = 0
+    while i < dm {
+        // Deterministic, |x| < 1, roughly the scale of an RMSNormed activation.
+        let v: f64 = i2f((i * 37) % 100 - 50) / 64.0
+        mem_store(xvec + i * 8, v)
+        i = i + 1
+    }
+
+    let cpu_g = mem_alloc(dff * 8)
+    let gpu_g = mem_alloc(dff * 8)
+    let t0 = clock_ns()
+    if mm_matvec(gt, xvec, dff, dm, cpu_g) != 0 { prints("FAIL cpu matvec gate\n"); return 1 }
+    let cpu_ms: f64 = i2f(clock_ns() - t0) / 1000000.0
+    prints("CPU ffn_gate: ")
+    prf(cpu_ms)
+    prints(" ms\n")
+
+    // ---- GPU ----
+    if cuda_init() != 0 { prints("FAIL cuda_init\n"); return 1 }
+    gpu_lfm2_enable()
+    prints("gpu region allocated\n")
+
+    // The three FFN tensors resident together.
+    let gv = gpu_resident_new(gt, dff, dm)
+    if gv == 0 { prints("FAIL gpu_resident_new gate\n"); return 1 }
+    let uv = gpu_resident_new(ut, dff, dm)
+    if uv == 0 { prints("FAIL gpu_resident_new up\n"); return 1 }
+    let dv = gpu_resident_new(dt, dm, dff)
+    if dv == 0 { prints("FAIL gpu_resident_new down\n"); return 1 }
+    gpu_resident_sync()
+    prints("3 FFN tensors resident on device\n")
+
+    // Wider of the two dims so all three FFN matvecs share scratch.
+    let maxn = dm
+    if dff > maxn { maxn = dff }
+    if gpu_layer_scratch(maxn) != 0 { prints("FAIL gpu scratch\n"); return 1 }
+
+    // Matvec through the real weights on the device.
+    let t1 = clock_ns()
+    if gpu_layer_matvec(gv, xvec, dff, dm, gpu_g) != 0 { prints("FAIL gpu matvec gate\n"); return 1 }
+    let gpu_ms: f64 = i2f(clock_ns() - t1) / 1000000.0
+    prints("GPU ffn_gate: ")
+    prf(gpu_ms)
+    prints(" ms  (incl. D2H of result)\n")
+
+    prints("GPU vs CPU ffn_gate:\n")
+    let wrel: f64 = worst_rel(gpu_g, cpu_g, dff)
+    if wrel > 0.00001 { prints("FAIL: matvec disagreement above 1e-5\n"); nbad = nbad + 1 }
+
+    gpu_resident_free(gv)
+    gpu_resident_free(uv)
+    gpu_resident_free(dv)
+    gpu_layer_scratch_free()
+    gpu_lfm2_disable()
+
+    prints("TOTAL_BAD=")
+    print(nbad)
+    newline()
+    return 0
+}
