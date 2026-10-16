@@ -75,20 +75,6 @@ fn main() -> i64 {
     let dm = f16_to_f64(raw + 2)
     jit_f_dmd_fill(raw, raw + 4, d, dm, dmd)
 
-    // ---- read the DMD table back: is the FILL correct? --------------------
-    // If these are not small numbers the fault is in jit_f_dmd_fill, not the
-    // kernel; if they are small the kernel is reading the wrong address.
-    prints("DMDRAW:")
-    let kk = 0
-    while kk < 8 {
-        print(mem_load(dmd + kk * 16))
-        prints(",")
-        print(mem_load(dmd + kk * 16 + 8))
-        prints(",")
-        kk = kk + 1
-    }
-    newline()
-
     // ---- argument area ---------------------------------------------------
     let asz = mem_alloc(32)
     mem_store(asz + 0,  raw)
@@ -99,8 +85,6 @@ fn main() -> i64 {
     // ---- the two results -------------------------------------------------
     let scalar_f = q4k_block_dot(raw, x, 1, 0)
     let jit_bits = jit_call(entry, asz, 0)
-    let jit_bits2 = jit_call(entry, asz, 0)
-    prints("jit call #2   = "); print(jit_bits2); newline()
 
     // scalar -> bits via memory
     let sbuf = mem_alloc(8)
