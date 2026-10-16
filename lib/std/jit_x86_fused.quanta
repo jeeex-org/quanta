@@ -162,8 +162,13 @@ fn j_f_low() -> i64 {
     j_f_vbcastsd_y7_rdx8()     // dmin*Mn
     j_f_vpslld_28()
     j_f_vpsrld_28()            // low nibbles
-    j_f_vcvtdq2pd_y1_x1()
+    // ORDER MATTERS: vcvtdq2pd ymm1,xmm1 writes ymm1, whose LOW half IS xmm1, so
+    // it destroys the source dwords. Capture dwords 2,3 into xmm2 FIRST, then
+    // convert both halves. The old order read the high half of an already
+    // converted DOUBLE and re-converted it as int32, which produced exactly
+    // 1072693248 == 0x3FF00000 out of an x of 1.0.
     j_f_vpsrldq_x2_x1_8()
+    j_f_vcvtdq2pd_y1_x1()
     j_f_vcvtdq2pd_y2_x2()
     j_f_vinsertf128_y1_y1_x2_1()
     j_f_vmulpd_y1_y6()
@@ -182,8 +187,8 @@ fn j_f_high() -> i64 {
     j_f_vbcastsd_y6_rdx16()    // d*Kn  for the high half
     j_f_vbcastsd_y7_rdx24()    // dmin*Mn
     j_f_vpsrld_4()             // high nibbles
+    j_f_vpsrldq_x2_x1_8()      // capture dwords 2,3 before the cvt clobbers xmm1
     j_f_vcvtdq2pd_y1_x1()
-    j_f_vpsrldq_x2_x1_8()
     j_f_vcvtdq2pd_y2_x2()
     j_f_vinsertf128_y1_y1_x2_1()
     j_f_vmulpd_y1_y6()
