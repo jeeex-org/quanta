@@ -152,7 +152,19 @@ the `Hermes` desktop holding ~580-750% CPU throughout (baseline condition):
 | old pread path, 1 worker (serial truth) | 17.9 | 0.056 | 597 | -- |
 | old pread path, 20 workers | 3.83 | 0.261 | 597 | +12.8 MB |
 | mmap + norm cache, 20 workers (this campaign) | **3.49** | **0.286** | **597** (identical) | +1.47 MB |
+| ... long generations (ignore_eos, same build): 128 tok | 3.69 | 0.271 | 597 | +4.34 MB |
+| ... 512 tok | 3.69 | 0.271 | 597 | +4.37 MB |
+| ... 1024 tok | launched; ~63 min wall, not harvested in this unit's window | | | |
 | llama.cpp same model/box, 20 threads | 0.058 | **17.32** | -- | -- |
+
+- Rate is context-independent across 128-512 generated tokens (0.271 tok/s
+  both) -- the decode cost is weights-dominated at these context lengths, as
+  expected while attention stays short.
+- Memory, measured over the long runs: anon +0.59-0.65 MB/token and VmPeak
+  +4.34-4.37 MB/token on the mmap path (vs 12.8 MB/token VmPeak on the old
+  path). NOT flat: a ~4.4 MB/token virtual + ~0.6 MB/token anonymous growth
+  remains open, allocator-side (the pool is held across the whole run, so it
+  is not the A9 thread-stack class).
 
 - Argmax and generated text are IDENTICAL between old and mmap paths
   (`The answer is 4 ... 4<|im_end|>` on the current reference prompt; the
