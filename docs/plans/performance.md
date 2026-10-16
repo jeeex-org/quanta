@@ -385,3 +385,34 @@ after this boundary?) is the next lever; the divmod floor-semantics row that cau
 0.0.245's development is the existing red-first guard for the whole home-store invariant.
 Also note: the gate command documented in this file ran with `ulimit -v 6000000`, which is below the
 compiler's ~6.2 GB floor and once produced 229 spurious compile-fails; it is 8000000 now. Use 8 GB.
+
+## Fused JIT Q4_K dequant-dot — landed and measured (2026-10-17)
+
+The decode campaign's lever 1 (fused register-resident dequant-dot) is now
+IMPLEMENTED and VERIFIED, via a runtime x86 JIT rather than compiler intrinsics:
+`lib/std/jit_x86_fused.quanta` emits the kernel into an RWX mmap and calls it
+through `closure_call` (proved reachable by `tests/lfm2_jit_probe.quanta`).
+
+Measured, on the same bytes and the same x, 2048 weights, 200 reps:
+
+    jit  bits = 4700186342854754304
+    prod bits = 4700186342854754304      <- bit-equal to q4k_matvec_real
+    production (dequant + dot): 5,200,572
+    fused jit                 :   595,426
+    ratio                     : 8.73x
+
+So: **bit-identical to the production matvec and 8.73x faster on the dot**. Against
+the naive scalar `q4k_block_dot` it is 14.47x; quote 8.73x, because that is the
+comparison against what the loader actually runs.
+
+Seven defects had to be fixed to get there, all recorded in
+`docs/research/jit-fused-dot-status.md`: the `jbytes(n,hex)` truncation class
+(9 call sites; it silently dropped bytes and caused a segfault), the missing
+super-block header skip, an 8x DMD-table overrun, pair ownership by chunk,
+a rel8 branch that could not reach (widened to rel32), the low/rewind/high
+addressing model for Q4_K's nibble layout, and the VEX dest/src overlap in
+`vcvtdq2pd %xmm1,%ymm1` which clobbered the dwords it was converting.
+
+NOT yet an end-to-end tok/s number: the microbenchmark above is of the dot only.
+Integration into `lfm2_forward` and the 128/512/1024-token table are in flight.
+`clock()`'s absolute unit is unverified, so only ratios are trustworthy here.
