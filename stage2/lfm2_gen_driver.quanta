@@ -1,0 +1,241 @@
+// stage2/lfm2_gen_driver.quanta -- the SI loop's native generation driver.
+//
+// This is tests/lfm2_generate.quanta (the tracked, measured driver) with
+// EXACTLY THREE deltas, all required by the stage2 wiring and all confined to
+// this stage2/ copy -- the tracked tests/ file is untouched:
+//
+//   DELTA 1 (paths): CONF_PATH and PROMPT_PATH point at stage2/gen.conf and
+//     stage2/prompt.txt so a stage2 run never races the tracked smoke-test
+//     files. Same file format, same fields.
+//
+//   DELTA 2 (headroom): the max_new clamp is 256 -> 1024 and the per-token
+//     timing arrays are 256 -> 1024 slots. stage1 measured the one passing
+//     spec at 575 completion tokens; the tracked clamp could never hold a
+//     compiling module. 578 prompt ids + 1024 new tokens < NCTX 2048.
+//
+//   DELTA 3 (prefill): the per-token fc_forward_token_ex prefill loop is
+//     replaced by ONE fc_prefill_batch_lg(ids, 0, n, BATCH, 0) call -- the
+//     batched prefill measured at 2.57x serial (bit-identical logits,
+//     docs/research/prefill-batching.md). With logits_all = 0 it leaves the
+//     LAST position's logits in fc_fw_logits exactly like the serial path, so
+//     the decode loop below is unchanged. BATCH is clamped by fc_pf_max_batch()
+//     inside the call. Decode is untouched (one fc_forward_token_ex per token,
+//     whole loop inside one mm_pool_begin/end bracket -- defect A9).
+//
+// Everything else -- the four wiring traps (fc_kv_init before the first
+// forward; pool across the whole loop; bpe_encode_special for the chat-
+// templated prompt; const-passed-directly to file_open and as_str for
+// chat_build), the EOS policy, the sampler, the timing prints -- is the
+// tracked driver's code, verbatim.
+//
+// Conf stage2/gen.conf:
+//   "<workers> <max_new_tokens> <temp_milli> <top_k> [seed] [eos_policy] [min_len]"
+// Prompt stage2/prompt.txt: the user turn (the assembled compact prompt).
+
+import std/gguf
+import std/lfm2_forward
+import std/lfm2_model
+import std/lfm2_mm
+import std/lfm2_bpe
+import std/lfm2_chat
+import std/sampling
+import std/fs
+
+const Q4_PATH = "/opt/ai/models/quanta/QUANTA-LFM2.5-2.6Bv1-Q4_K_M.gguf"
+const CONF_PATH = "stage2/gen.conf"
+const PROMPT_PATH = "stage2/prompt.txt"
+const CAP = 16384
+const NCTX = 2048
+const BATCH = 64
+const MAXNEW_CAP = 1024
+
+let plen = 0
+
+fn slurp(fd) {
+    if fd < 0 { return 0 }
+    let b = mem_alloc(CAP)
+    let got = read_raw(fd, b, CAP)
+    file_close(fd)
+    if got <= 0 { return 0 }
+    plen = got
+    return b
+}
+
+fn parse_ints(buf, out) {
+    let n = 0
+    let cur = 0
+    let have = 0
+    let i = 0
+    while mem_load8(buf + i) != 0 {
+        let c = mem_load8(buf + i)
+        if c >= 48 && c <= 57 {
+            cur = cur * 10 + (c - 48)
+            have = 1
+        } else {
+            if have == 1 {
+                if n < 8 { mem_store(out + n * 8, cur) }
+                n = n + 1
+                cur = 0
+                have = 0
+            }
+        }
+        i = i + 1
+    }
+    if have == 1 { if n < 8 { mem_store(out + n * 8, cur) }; n = n + 1 }
+    return n
+}
+
+fn as_str(raw, n) {
+    let s = mem_alloc(n + 16)
+    mem_store(s, n)
+    let i = 0
+    while i < n { mem_store8(s + 8 + i, mem_load8(raw + i)); i = i + 1 }
+    mem_store8(s + 8 + n, 0)
+    return s
+}
+
+fn main() {
+    prints("=== stage2 native LFM2 generate (batched prefill) ===\n")
+    newline()
+
+    // ---- conf ----
+    let cfgb = slurp(file_open(CONF_PATH, 0))
+    let conf = mem_alloc(64)
+    let nw = 0
+    let maxnew = 8
+    let tempmilli = 0
+    let topk = 0
+    let seed = 12345
+    let eospol = 1
+    let minlen = 0
+    if cfgb != 0 {
+        let nfields = parse_ints(cfgb, conf)
+        if nfields >= 4 {
+            nw = mem_load(conf)
+            maxnew = mem_load(conf + 8)
+            tempmilli = mem_load(conf + 16)
+            topk = mem_load(conf + 24)
+        }
+        if nfields >= 5 { seed = mem_load(conf + 32) }
+        if nfields >= 6 { eospol = mem_load(conf + 40) }
+        if nfields >= 7 { minlen = mem_load(conf + 48) }
+    } else {
+        prints("warn: "); prints(CONF_PATH); prints(" unreadable; using defaults\n")
+    }
+    if maxnew < 1 { maxnew = 1 }
+    if maxnew > MAXNEW_CAP { maxnew = MAXNEW_CAP }
+    prints("workers="); print(nw); prints(" max_new="); print(maxnew)
+    prints(" temp_milli="); print(tempmilli); prints(" top_k="); print(topk)
+    prints(" seed="); print(seed); prints(" eos_policy="); print(eospol)
+    prints(" min_len="); print(minlen); prints("\n")
+    if topk > 0 { prints("top_k=on (O(n*k) since 0.0.240)\n") }
+
+    // ---- model ----
+    let t0 = clock()
+    if gguf_load(Q4_PATH) != 0 { prints("FAIL gguf_load\n"); return 1 }
+    if fc_read_config() != 0 { prints("FAIL fc_read_config\n"); return 1 }
+    if bpe_init_from_gguf() == 0 { prints("FAIL bpe_init\n"); return 1 }
+    // TRAP 1: without this the first forward SIGSEGVs.
+    if fc_kv_init(NCTX) != 0 { prints("FAIL fc_kv_init\n"); return 1 }
+    if fc_fw_init() != 0 { prints("FAIL fc_fw_init\n"); return 1 }
+    if fc_fw_reset() != 0 { prints("FAIL fc_fw_reset\n"); return 1 }
+    mm_set_workers(nw)
+    mm_set_embed_workers(nw)
+    prints("load_ms="); print((clock() - t0) / 1000000); prints("\n")
+
+    // ---- prompt ----
+    let rawprompt = slurp(file_open(PROMPT_PATH, 0))
+    if rawprompt == 0 { prints("FAIL read prompt\n"); return 1 }
+    let user = as_str(rawprompt, plen)
+    prints("user_bytes="); print(plen); prints("\n")
+    let pb = mem_alloc(CAP)
+    let pbytes = chat_build(0, user, pb)
+    prints("prompt_bytes="); print(pbytes); prints("\n")
+
+    let ids = mem_alloc(8192 * 8)
+    mem_store(ids, bpe_bos)
+    let n = bpe_encode_special(pb, pbytes, ids + 8, 8000) + 1
+    prints("prompt_ids="); print(n)
+    prints(" (bos="); print(bpe_bos); prints(")\n")
+    if n <= 1 { prints("FAIL encode\n"); return 1 }
+    if n >= NCTX { prints("FAIL prompt longer than context\n"); return 1 }
+
+    // ---- prefill: ONE batched call (DELTA 3). fc_prefill_batch_lg brackets
+    // its own worker pool and, with logits_all=0, leaves the LAST position's
+    // logits in fc_fw_logits exactly as fc_forward_token_ex(...,1) does. ----
+    let tp0 = clock()
+    if fc_prefill_batch_lg(ids, 0, n, BATCH, 0) != 0 { prints("FAIL prefill\n"); return 1 }
+    let tp1 = clock()
+    prints("prefill_ms="); print((tp1 - tp0) / 1000000)
+    prints(" prefill_ms_per_tok="); print((tp1 - tp0) / 1000000 / n)
+    prints(" batch="); print(BATCH); prints("\n")
+
+    // ---- decode (unchanged from the tracked driver, own pool bracket) ----
+    prints("---generated---\n")
+    mm_pool_begin()
+    let outbuf = mem_alloc(4096)
+    let pos = n
+    let k = 0
+    if tempmilli > 0 {
+        sample_seed(seed)
+        sample_set_eos(0 - 1)
+        if eospol != 0 { sample_set_eos(bpe_eos) }
+        sample_set_min_len(minlen)
+        prints("eos_id="); print(bpe_eos)
+        prints(" eos_excluded_unless_argmax="); print(eospol)
+        prints(" min_len="); print(minlen); prints("\n")
+    }
+    let g0 = clock()
+    let sdur = mem_alloc(MAXNEW_CAP * 8)
+    let tdur = mem_alloc(MAXNEW_CAP * 8)
+    let tk = 0
+    while k < maxnew {
+        let ts = clock()
+        let id = 0
+        if tempmilli > 0 {
+            id = sample_full(fc_fw_logits, fc_n_vocab, i2f(tempmilli) / 1000.0, topk)
+        } else {
+            id = fc_argmax(fc_n_vocab)
+        }
+        let bl = bpe_decode_token(id, outbuf)
+        if bl > 0 { print(outbuf, bl) }
+        if tk < MAXNEW_CAP { mem_store(sdur + tk * 8, clock() - ts) }
+        if id == bpe_eos {
+            prints("\n[EOS]\n")
+            if tk < MAXNEW_CAP { mem_store(tdur + tk * 8, clock() - ts) }
+            tk = tk + 1
+            break
+        }
+        k = k + 1
+        if k >= maxnew {
+            if tk < MAXNEW_CAP { mem_store(tdur + tk * 8, clock() - ts) }
+            tk = tk + 1
+            break
+        }
+        // stage2 heartbeat: the allocator's MAP_FAILED guard is a SILENT
+        // exit(1) (lib/std/lfm2_mm.quanta line ~865), so a crash mid-decode
+        // leaves no marker. One line every 32 tokens localises the death;
+        // wire.py's extract_code strips these from the emitted file.
+        if k - (k / 32) * 32 == 0 { prints("[hb "); print(k); prints("]\n") }
+        if fc_forward_token_ex(id, pos, 1) != 0 {
+            prints("FAIL decode\n")
+            if tk < MAXNEW_CAP { mem_store(tdur + tk * 8, clock() - ts) }
+            tk = tk + 1
+            break
+        }
+        pos = pos + 1
+        if tk < MAXNEW_CAP { mem_store(tdur + tk * 8, clock() - ts) }
+        tk = tk + 1
+    }
+    let g1 = clock()
+    mm_pool_end()
+    prints("\n---end---\n")
+    prints("new_tokens="); print(k); prints("\n")
+    prints("gen_ms="); print((g1 - g0) / 1000000); prints("\n")
+    if k > 0 { prints("gen_ms_per_token="); print((g1 - g0) / 1000000 / k); prints("\n") }
+    if (g1 - g0) > 0 {
+        prints("decode_tok_per_s_x1000="); print(k * 1000000000000 / (g1 - g0)); prints("\n")
+    }
+    prints("DONE\n")
+    return 0
+}

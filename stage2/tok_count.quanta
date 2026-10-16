@@ -1,0 +1,60 @@
+// stage2/tok_count.quanta -- count the assembled stage2 prompt with the SAME
+// in-tree BPE the forward pass uses (bpe_init_from_gguf / bpe_encode_special),
+// BEFORE committing to the multi-hour generation. No forward pass, no workers:
+// gguf_load + tokenizer init + chat_build + encode, then print the id count.
+//
+// This is the ground-truth pre-flight number; the driver's own prompt_ids=
+// line reproduces it at generation time. A token count is only a fact about a
+// prompt if it comes from the encoder the model sees.
+//
+// Build: <qc> stage2/tok_count.quanta <bin>; run from the repo root.
+
+import std/gguf
+import std/lfm2_bpe
+import std/lfm2_chat
+import std/fs
+
+const Q4_PATH = "/opt/ai/models/quanta/QUANTA-LFM2.5-2.6Bv1-Q4_K_M.gguf"
+const PROMPT_PATH = "stage2/prompt.txt"
+const CAP = 16384
+const NCTX = 2048
+
+let plen = 0
+
+fn slurp(fd) {
+    if fd < 0 { return 0 }
+    let b = mem_alloc(CAP)
+    let got = read_raw(fd, b, CAP)
+    file_close(fd)
+    if got <= 0 { return 0 }
+    plen = got
+    return b
+}
+
+fn as_str(raw, n) {
+    let s = mem_alloc(n + 16)
+    mem_store(s, n)
+    let i = 0
+    while i < n { mem_store8(s + 8 + i, mem_load8(raw + i)); i = i + 1 }
+    mem_store8(s + 8 + n, 0)
+    return s
+}
+
+fn main() {
+    if gguf_load(Q4_PATH) != 0 { prints("FAIL gguf_load\n"); return 1 }
+    if bpe_init_from_gguf() == 0 { prints("FAIL bpe_init\n"); return 1 }
+    let rawprompt = slurp(file_open(PROMPT_PATH, 0))
+    if rawprompt == 0 { prints("FAIL read prompt\n"); return 1 }
+    let user = as_str(rawprompt, plen)
+    let pb = mem_alloc(CAP)
+    let pbytes = chat_build(0, user, pb)
+    let ids = mem_alloc(8192 * 8)
+    mem_store(ids, bpe_bos)
+    let n = bpe_encode_special(pb, pbytes, ids + 8, 8000) + 1
+    prints("tok_count user_bytes="); print(plen)
+    prints(" prompt_bytes="); print(pbytes)
+    prints(" prompt_ids="); print(n)
+    prints(" (bos="); print(bpe_bos); prints(")\n")
+    if n >= NCTX { prints("WARN prompt longer than context\n") }
+    return 0
+}
