@@ -30,6 +30,11 @@ The 15 tok/s target therefore sits just BELOW the same-model llama.cpp rate
 gap to close is **60x**, and the campaign deliverable is the measured absolute
 rate plus per-lever relative gains, with 17.3 tok/s as the reference point.
 
+**Strategy confirmed by the author: CPU-first, then GPU** ("with CPU more
+devices can run it") -- GPU is QUEUED NEXT, not dropped: a separate unit does
+the GPU/CUDA path once the CPU path is production. For that unit, the pieces
+of this campaign that port directly are recorded in section 5.
+
 ## 1. The measured wall (why lib/std alone cannot reach 15)
 
 Authoritative serial per-op costs, all measured on this box
@@ -192,4 +197,31 @@ work beyond this unit's ownership.
   script refuses). Load-inflated numbers are labelled. Reference baseline from
   the SI-loop peer (commit e0d766f6, nice -n 19, load 10-18): 7,385-8,570
   ms/token decode; batched prefill 2,428-2,555 ms/prompt-token at B=64.
-- The gate (229 native + 112 stdlib) green before any lib/std push.
+- The gate (229 native + 112 stdlib) green before any lib/std push. Gate
+  result this campaign: 229/229 native + stdlib GREEN (GATE_RC=0), pushed at
+  387b868f.
+
+## 5. What a GPU/CUDA follow-up unit can reuse (recorded per the author's sequencing: CPU first, then GPU)
+
+- **The fused dequant-dot kernel shape** (section 3) maps 1:1 onto CUDA: one
+  warp per 32-element Q4_K sub-block, scales unpacked exactly as q4k_sc/q4k_min
+  (the bit-packing table is in matmul_q4k.quanta and verified against the real
+  tensor), x-sub-block sums precomputed per matvec to keep the -min term out of
+  the inner loop. The xsub[] trick and the exact scale association are the
+  portable content; the AVX2 byte encodings are not.
+- **Layout decisions that carry over**: full-file weight mapping (the GPU path
+  should cudaMalloc-load each tensor once and address raw quantized bytes, the
+  same no-pread principle as mm_attach_mmap_fd); per-worker (per-SM) scratch
+  cells of 512 B; row-major matvec with static row partitioning (no atomics --
+  Quanta has none and the static-slice rule is also the warp-assignment rule).
+- **The benchmark harness** (tests/lfm2_decode_bench.quanta + run script +
+  conf) is device-agnostic in shape: three run lengths, ignore_eos for real
+  generations, argmax + token-id prefix oracle, Rss/Anon/VmPeak sampling. A GPU
+  unit adds VRAM sampling and reuses the same oracle rows.
+- **The correctness bar carries over**: bit-identity at the dequantised-value
+  level (0-mismatch row diffs vs the scalar path) plus the argmax oracle; the
+  llama.cpp same-model CPU (17.32 tok/s) and GPU (~65-95 tok/s) numbers are the
+  two reference points the GPU unit should cite rather than re-derive.
+- **Do NOT port**: the multi-cell accumulator dot (section 1b -- it loses to
+  mm_dot4_s on CPU because of source-level loop overhead; on CUDA the fused
+  kernel makes the whole question moot), and the pread row path.
