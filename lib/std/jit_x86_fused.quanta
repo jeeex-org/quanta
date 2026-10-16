@@ -143,8 +143,8 @@ fn j_f_ret() -> i64 { return femit("c3", 1) }
 // rdx is advanced by the caller after every group.
 fn j_f_group() -> i64 {
     j_f_vpmovzxbd_x1_r9()      // 4 bytes -> 4 dwords, each holding 2 nibbles
-    j_f_vbcastsd_y6_rdx()      // d*Kn
-    j_f_vbcastsd_y7_rdx8()     // dmin*Mn
+    j_f_vbcastsd_y6_rdx()      // d*Kn     (for the LOW nibbles)
+    j_f_vbcastsd_y7_rdx8()     // dmin*Mn  (for the LOW nibbles)
 
     // -- low nibbles: isolate b&15 by shifting left 28 then right 28 --
     j_f_vpslld_28()
@@ -161,6 +161,8 @@ fn j_f_group() -> i64 {
     j_f_add_rdx_16()           // next (scale,min) pair
 
     // -- high nibbles: the same 4 bytes, b>>4 --
+    j_f_vbcastsd_y6_rdx()      // reload factors for the HIGH nibbles (rdx has advanced 16)
+    j_f_vbcastsd_y7_rdx8()
     j_f_vpmovzxbd_x1_r9()      // reload: xmm1 was clobbered above
     j_f_vpsrld_4()
     j_f_vcvtdq2pd_y1_x1()
@@ -196,10 +198,21 @@ fn jit_f_build() -> i64 {
     // offset would silently rot the moment any prologue instruction changes).
     let bodytop = ja_pos()
 
-    // One super-block: 32 groups * 8 weights = 256 weights.
+    // One Q4_K super-block = 256 weights = 8 groups of 32 weights each.
+    // Each group consumes 32 bytes of DMD: two (scale,min) pairs, one per
+    // 16-weight half (the low nibbles and the high nibbles of its 16 bytes).
+    // 8 groups * 32 bytes = 128 bytes == exactly one DMD row, which is the
+    // stride jit_f_dmd_alloc reserves. The old code emitted 32 groups of 8,
+    // which read 1024 bytes per super-block -- 8x past the allocated row.
     let g = 0
-    while g < 32 {
-        j_f_group()
+    while g < 8 {
+        // j_f_group consumes 4 quant bytes (8 weights: 4 low + 4 high nibbles)
+        // and 32 bytes of DMD. A group of 32 weights therefore needs 4 of them.
+        let b = 0
+        while b < 4 {
+            j_f_group()
+            b = b + 1
+        }
         g = g + 1
     }
 
