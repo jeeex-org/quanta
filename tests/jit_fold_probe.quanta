@@ -1,0 +1,123 @@
+// tests/jit_fold_probe.quanta
+//
+// DIAGNOSTIC for the folded-factor kernel: dump the four factor vectors the
+// emitted prologue computes and the four perm-broadcast lanes, as raw f64 bit
+// patterns, next to the values q4k_sc/q4k_min + f16_to_f64 say they must be.
+//
+// This is the "measure, do not assume" step: an earlier hand-derived
+// vpermilpd was never verified against the ISA, and the f16->f32->f64 route
+// was assumed exact. This test names whichever of the two is wrong.
+//
+// Build: ./compiler/0.0.245/bin/x86/qc -O tests/jit_fold_probe.quanta <bin>
+// Run:   ( ulimit -c 0 -v 8000000; ./scripts/quanta_run.sh <bin> </dev/null )
+import std/gguf
+import std/jit_x86
+import std/jit_x86_fused
+
+fn bits(v: f64) -> i64 {
+    let p = mem_alloc(8)
+    mem_store(p, v)
+    return mem_load(p)
+}
+
+fn main() {
+    prints("=== fold-factor probe: emitted factors vs q4k_sc/q4k_min ===\n")
+    let region = jit_f_alloc(65536)
+    if region <= 0 { prints("UNSUPPORTED\n"); return 2 }
+
+    // raw 144-byte block: bytes 0..143 = index, then distinct header values
+    let raw = mem_alloc(160)
+    let i = 0
+    while i < 144 { mem_store8(raw + i, i); i = i + 1 }
+    // f16 d = 0x3C00 (1.0), f16 dmin = 0x3800 (0.5)
+    mem_store8(raw + 0, 0x00); mem_store8(raw + 1, 0x3C)
+    mem_store8(raw + 2, 0x00); mem_store8(raw + 3, 0x38)
+    // 12 scale bytes with all the bit-field edges set
+    mem_store8(raw + 4, 0xFF); mem_store8(raw + 5, 0x80); mem_store8(raw + 6, 0x3F); mem_store8(raw + 7, 0x01)
+    mem_store8(raw + 8, 0xAA); mem_store8(raw + 9, 0x55); mem_store8(raw + 10, 0x0F); mem_store8(raw + 11, 0xF0)
+    mem_store8(raw + 12, 0x12); mem_store8(raw + 13, 0x34); mem_store8(raw + 14, 0x56); mem_store8(raw + 15, 0x78)
+
+    // ---- emit: load args, then the production prologue, then dump ---------
+    let entry = ja_pos()
+    jbytes(3, "4c8b0f")          // mov r9, [rdi]        raw base
+    jbytes(4, "4983c110")        // add r9, 16           header now at r9-16
+    jbytes(4, "488b5708")        // mov rdx, [rdi+8]     dump buffer
+    j_f_fold_factors()
+    jbytes(4, "c57d1122")        // vmovupd [rdx+0],   ymm12
+    jbytes(5, "c57d116a20")      // vmovupd [rdx+32],  ymm13
+    jbytes(5, "c57d117240")      // vmovupd [rdx+64],  ymm14
+    jbytes(5, "c57d117a60")      // vmovupd [rdx+96],  ymm15
+    j_f_perm6_lo(0); jbytes(8, "c5fd11b280000000")   // [rdx+128]
+    j_f_perm6_lo(1); jbytes(8, "c5fd11b2a0000000")   // [rdx+160]
+    j_f_perm6_lo(2); jbytes(8, "c5fd11b2c0000000")   // [rdx+192]
+    j_f_perm6_lo(3); jbytes(8, "c5fd11b2e0000000")   // [rdx+224]
+    j_f_perm6_hi(0); jbytes(8, "c5fd11b200010000")   // [rdx+256]
+    j_f_perm6_hi(1); jbytes(8, "c5fd11b220010000")   // [rdx+288]
+    j_f_perm6_hi(2); jbytes(8, "c5fd11b240010000")   // [rdx+320]
+    j_f_perm6_hi(3); jbytes(8, "c5fd11b260010000")   // [rdx+352]
+    j_f_ret()
+
+    let tbl = jit_f_code(entry)
+    if tbl <= 0 { prints("BUILD FAILED\n"); return 1 }
+    let dump = mem_alloc(512)
+    let asz = mem_alloc(32)
+    mem_store(asz + 0, raw)
+    mem_store(asz + 8, dump)
+    closure_call(tbl, asz, 0)
+
+    let d = f16_to_f64(raw)
+    let dmin = f16_to_f64(raw + 2)
+    let sc = raw + 4
+    prints("d_bits="); print(bits(d)); prints(" dmin_bits="); print(bits(dmin)); newline()
+
+    // dump layout: ymm12 -> +0, ymm13 -> +32, ymm14 -> +64, ymm15 -> +96
+    //               ymm12 lanes = d*scales[0..3]   ymm13 = d*scales[4..7]
+    //               ymm14 lanes = dmin*mins[0..3]  ymm15 = dmin*mins[4..7]
+    let bad = 0
+    let k = 0
+    while k < 4 {
+        let want_s_lo = bits(fmul(d, i2f(q4k_sc(k, sc))))
+        let want_s_hi = bits(fmul(d, i2f(q4k_sc(k + 4, sc))))
+        let want_m_lo = bits(fmul(dmin, i2f(q4k_min(k, sc))))
+        let want_m_hi = bits(fmul(dmin, i2f(q4k_min(k + 4, sc))))
+        let got_s_lo = mem_load(dump + k * 8)
+        let got_s_hi = mem_load(dump + 32 + k * 8)
+        let got_m_lo = mem_load(dump + 64 + k * 8)
+        let got_m_hi = mem_load(dump + 96 + k * 8)
+        prints("lane "); print(k)
+        prints(" sc_lo w="); print(want_s_lo); prints(" g="); print(got_s_lo)
+        prints(" sc_hi w="); print(want_s_hi); prints(" g="); print(got_s_hi)
+        prints(" mn_lo w="); print(want_m_lo); prints(" g="); print(got_m_lo)
+        prints(" mn_hi w="); print(want_m_hi); prints(" g="); print(got_m_hi)
+        if want_s_lo != got_s_lo || want_s_hi != got_s_hi { bad = bad + 1; prints(" SC_MISMATCH") }
+        if want_m_lo != got_m_lo || want_m_hi != got_m_hi { bad = bad + 1; prints(" MN_MISMATCH") }
+        newline()
+        k = k + 1
+    }
+    prints("factor mismatch lanes="); print(bad); newline()
+
+    // ---- perm lane check: which source lane each imm selects ---------------
+    prints("--- perm6_lo(c): chunk c low should be lane sc[2c] ---\n")
+    let c = 0
+    while c < 4 {
+        prints("c="); print(c); prints(" lo="); print(mem_load(dump + 128 + c * 32))
+        prints(" hi="); print(mem_load(dump + 256 + c * 32)); newline()
+        c = c + 1
+    }
+    prints("expected lo lanes (d*sc[2c]) : ");
+    c = 0
+    while c < 4 {
+        prints(" "); print(bits(fmul(d, i2f(q4k_sc(2 * c, sc)))))
+        c = c + 1
+    }
+    newline()
+    prints("expected hi lanes (d*sc[2c+1]): ");
+    c = 0
+    while c < 4 {
+        prints(" "); print(bits(fmul(d, i2f(q4k_sc(2 * c + 1, sc)))))
+        c = c + 1
+    }
+    newline()
+    prints("DONE\n")
+    return 0
+}

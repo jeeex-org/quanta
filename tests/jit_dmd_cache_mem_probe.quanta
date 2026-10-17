@@ -1,0 +1,50 @@
+// tests/jit_dmd_cache_mem_probe.quanta
+//
+// MEMORY VERDICT for the losing option: a persistent per-tensor DMD cache.
+//
+// The cache is 128 bytes per 256 weights, i.e. q4k_elems/2 bytes -- computed
+// here from the model's OWN metadata, not assumed. This probe loads the model
+// the way the loader does (gguf_load + full-file mmap), allocates the cache,
+// touches every page so it becomes resident, and prints milestones so the
+// harness can read Maximum-RSS off /usr/bin/time -v and the exit status off a
+// VA-capped run.
+//
+// Build: ./compiler/0.0.245/bin/x86/qc -O tests/jit_dmd_cache_mem_probe.quanta <bin>
+// Run:   ( ulimit -c 0 -v <cap>; /usr/bin/time -v nice -n 19 <bin> </dev/null )
+import std/gguf
+import std/gguf_mm
+import std/gguf_bpe
+import std/lfm2_model
+import std/lfm2_forward
+import std/fs
+
+const Q4_PATH = "/opt/ai/models/quanta/QUANTA-LFM2.5-2.6Bv1-Q4_K_M.gguf"
+
+fn main() {
+    prints("phase=start\n")
+    if gguf_load(Q4_PATH) != 0 { prints("FAIL gguf_load\n"); return 1 }
+    let nt = gguf_num_tensors()
+    let q4 = 0
+    let ti = 0
+    while ti < nt {
+        if gguf_tensor_dtype(ti) == 12 { q4 = q4 + gguf_tensor_nelements(ti) }
+        ti = ti + 1
+    }
+    let need = (q4 / 256) * 128
+    prints("q4k_elems="); print(q4); prints(" cache_bytes="); print(need)
+    prints(" cache_MB="); print(need / 1048576); newline()
+
+    if mm_attach_mmap_fd(file_open(Q4_PATH, 0)) != 0 { prints("FAIL mmap\n"); return 1 }
+    prints("phase=model-mapped\n")
+
+    let p = mem_alloc(need)
+    prints("phase=allocated ptr="); print(p); newline()
+    if p <= 0 { prints("ALLOC-FAIL\n"); return 3 }
+
+    // touch every 4096th byte: forces a resident page per 4 KiB
+    let i = 0
+    while i < need { mem_store8(p + i, 1); i = i + 4096 }
+    prints("phase=touched\n")
+    prints("OK\n")
+    return 0
+}

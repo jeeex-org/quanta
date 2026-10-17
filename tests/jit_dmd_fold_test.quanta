@@ -1,0 +1,340 @@
+// tests/jit_dmd_fold_test.quanta
+//
+// THE DMD-BUILD LEVER: fold the Q4_K factor extraction INTO the kernel.
+//
+// The premise (measured, docs/research/jit-fused-dot-status.md): the table
+// variant's per-row DMD build is 70-84% of the fused path on real rows, so the
+// INTEGRATED fused win is ~2.8-3.1x while the KERNEL ALONE is ~10.9-11.1x.
+// The build is scalar Quanta source -- 8 iterations per super-block of
+// q4k_sc/q4k_min bit extraction (integer divisions) plus 16 i2f/fmul/mem_store
+// builtin calls -- i.e. O(weights) scalar work inside the loop that fusion was
+// supposed to make cheaper.
+//
+// This test measures the two candidate fixes against the SAME real FFN-gate
+// rows, in one process, interleaved:
+//
+//   option 1  jit_f_build_folded()  -- the kernel reads the 144-byte
+//             super-block header at r9-16 itself, converts f16 d/dmin, unpacks
+//             the 16 six-bit fields as dwords, scales them in SIMD, and
+//             broadcasts one lane per chunk with vpermilpd. No DMD table, no
+//             per-row scalar build, and it removes the 8-redundant-broadcast
+//             per half that the table kernel emits.
+//   option 2  a persistent PER-TENSOR DMD cache -- build the table once per
+//             tensor instead of once per row per token and reuse it.
+//             Measured here as section F (prefill every row's DMD once, then
+//             time the kernel-only sweep). Its cost is memory: 128 bytes per
+//             256 weights = elems/2 bytes. Section 0 measures the real Q4_K
+//             element total from the model's own metadata.
+//
+// CORRECTNESS IS ASSERTED FIRST, in every configuration: the folded kernel must
+// be bit-identical to mm_deq_row_raw + mm_dot4_s (the shape lfm2_forward
+// executes) and to the table kernel.
+//
+// Build: ./compiler/0.0.245/bin/x86/qc -O tests/jit_dmd_fold_test.quanta <bin>
+// Run (the model is 1.67 GB, so the VA cap must exceed it):
+//   ( ulimit -c 0 -v 32000000; nice -n 19 <bin> </dev/null )
+import std/gguf
+import std/lfm2_forward
+import std/lfm2_model
+import std/gguf_mm
+import std/gguf_bpe
+import std/fs
+import std/jit_x86
+import std/jit_x86_fused
+
+const Q4_PATH = "/opt/ai/models/quanta/QUANTA-LFM2.5-2.6Bv1-Q4_K_M.gguf"
+const NCTX = 2048
+const NROWS = 64
+const REPS = 4
+const REPS2 = 3
+
+let sink = 0.0
+
+fn row_bits(prod_out, v: f64) -> i64 {
+    mem_store(prod_out, v)
+    return mem_load(prod_out)
+}
+
+fn main() {
+    prints("=== DMD-build lever: folded factors in-kernel vs a persistent cache ===\n")
+    if gguf_load(Q4_PATH) != 0 { prints("FAIL gguf_load\n"); return 1 }
+    if fc_read_config() != 0 { prints("FAIL fc_read_config\n"); return 1 }
+    if bpe_init_from_gguf() == 0 { prints("FAIL bpe_init\n"); return 1 }
+    if fc_kv_init(NCTX) != 0 { prints("FAIL fc_kv_init\n"); return 1 }
+    if fc_fw_init() != 0 { prints("FAIL fc_fw_init\n"); return 1 }
+    if fc_fw_reset() != 0 { prints("FAIL fc_fw_reset\n"); return 1 }
+    mm_set_workers(0)
+    mm_set_embed_workers(0)
+    if mm_attach_mmap_fd(file_open(Q4_PATH, 0)) != 0 { prints("FAIL mm_attach_mmap\n"); return 1 }
+
+    // ---- 0. the cache arithmetic, from the model's own metadata -----------
+    let nt = gguf_num_tensors()
+    let q4elems = 0
+    let q6elems = 0
+    let ti = 0
+    while ti < nt {
+        let dt = gguf_tensor_dtype(ti)
+        if dt == 12 { q4elems = q4elems + gguf_tensor_nelements(ti) }
+        if dt == 14 { q6elems = q6elems + gguf_tensor_nelements(ti) }
+        ti = ti + 1
+    }
+    prints("tensors="); print(nt)
+    prints(" q4k_elems="); print(q4elems)
+    prints(" q6k_elems="); print(q6elems); newline()
+    prints("DMD cache bytes if per-tensor (q4k_elems/256*128) = "); print((q4elems / 256) * 128)
+    prints("  ("); print(((q4elems / 256) * 128) / 1048576); prints(" MB)\n")
+
+    let tg = lfm2_ffn_gate(0)
+    if tg < 0 { prints("FAIL tensor\n"); return 1 }
+    let dm = fc_d_model
+    let rb = mm_row_bytes(12, dm)
+    let nsuper = dm / 256
+    prints("gate_idx="); print(tg)
+    prints(" dtype="); print(gguf_tensor_dtype(tg))
+    prints(" cols="); print(dm)
+    prints(" row_bytes="); print(rb)
+    prints(" nsuper="); print(nsuper); newline()
+    if gguf_tensor_dtype(tg) != 12 { prints("NOT Q4_K -- test premise broken\n"); return 1 }
+    if rb != nsuper * 144 { prints("row_bytes != nsuper*144 -- premise broken\n"); return 1 }
+
+    // ---- both kernels in one region --------------------------------------
+    let region = jit_f_alloc(65536)
+    if region <= 0 { prints("UNSUPPORTED: no RWX mmap on this box\n"); return 2 }
+    let tbl_tab = jit_f_code(jit_f_build())
+    if tbl_tab <= 0 { prints("BUILD FAILED (table)\n"); return 1 }
+    let tbl_fold = jit_f_code(jit_f_build_folded())
+    if tbl_fold <= 0 { prints("BUILD FAILED (folded)\n"); return 1 }
+    prints("table_entry="); print(mem_load(tbl_tab))
+    prints(" folded_entry="); print(mem_load(tbl_fold)); newline()
+
+    let x = mem_alloc(dm * 8)
+    let i = 0
+    while i < dm { mem_store(x + i * 8, i2f((i * 37) % 101 - 50) / i2f(71)); i = i + 1 }
+
+    let acc = mem_alloc(512)
+    let f64b = mem_alloc(dm * 8)
+    let prod_out = mem_alloc(8)
+    let dmd = jit_f_dmd_alloc(nsuper)
+    let asz = mem_alloc(32)
+    let toff = gguf_tensor_offset(tg)
+
+    // ---- 1. BIT-IDENTITY over real rows: folded vs mm shape, folded vs table
+    let mism_fold = 0
+    let mism_tab = 0
+    let checked = 0
+    let r = 0
+    while r < NROWS {
+        let raw = mm_map_base + toff + r * rb
+        if mm_deq_row_raw(12, raw, dm, f64b) != 0 { prints("FAIL deq\n"); return 1 }
+        let prod = mm_dot4_s(f64b, x, dm, acc)
+        let pb = row_bits(prod_out, prod)
+
+        let b = 0
+        while b < nsuper {
+            jit_f_dmd_fill(raw + b * 144, raw + b * 144 + 4,
+                           f16_to_f64(raw + b * 144), f16_to_f64(raw + b * 144 + 2),
+                           dmd + b * 128)
+            b = b + 1
+        }
+        mem_store(asz + 0, raw)
+        mem_store(asz + 8, x)
+        mem_store(asz + 16, dmd)
+        mem_store(asz + 24, nsuper)
+        let tb = closure_call(tbl_tab, asz, 0)
+
+        mem_store(asz + 16, 0)          // folded kernel must NOT need a DMD
+        let fb = closure_call(tbl_fold, asz, 0)
+
+        if tb != pb { mism_tab = mism_tab + 1 }
+        if fb != pb { mism_fold = mism_fold + 1 }
+        checked = checked + 1
+        r = r + 1
+    }
+    prints("BITIDENT table_vs_mm   : mismatches="); print(mism_tab); prints(" / "); print(checked); newline()
+    prints("BITIDENT folded_vs_mm  : mismatches="); print(mism_fold); prints(" / "); print(checked); newline()
+    if mism_tab != 0 || mism_fold != 0 { prints("STOP: bit-identity FAILED\n"); return 1 }
+    prints("bit-identical (both kernels, DMD slot zeroed for folded): OK\n")
+
+    // ---- 2. the cost split, two run lengths, interleaved best-of-REPS -----
+    let pass = 0
+    while pass < 2 {
+        let RN = NROWS
+        let RP = REPS
+        if pass == 1 { RN = 256; RP = REPS2 }
+        if RN * rb > 100000000 { RN = NROWS }         // keep the mapping honest
+        let rmax = RN
+        prints("--- rows="); print(rmax); prints(" best of "); print(RP); prints(" ---\n")
+
+        // A = production per row: mm_deq_row_raw + mm_dot4_s
+        let bestA = 0
+        let rep = 0
+        while rep < RP {
+            let t0 = clock()
+            let k = 0
+            while k < rmax {
+                let raw = mm_map_base + toff + k * rb
+                if mm_deq_row_raw(12, raw, dm, f64b) != 0 { prints("FAIL deq\n"); return 1 }
+                sink = sink + mm_dot4_s(f64b, x, dm, acc)
+                k = k + 1
+            }
+            let dt = clock() - t0
+            if bestA == 0 || dt < bestA { bestA = dt }
+            rep = rep + 1
+        }
+
+        // B = the per-row scalar DMD build alone (option-1's eliminated cost)
+        let bestB = 0
+        rep = 0
+        while rep < RP {
+            let t0 = clock()
+            let k = 0
+            while k < rmax {
+                let raw = mm_map_base + toff + k * rb
+                let bb = 0
+                while bb < nsuper {
+                    jit_f_dmd_fill(raw + bb * 144, raw + bb * 144 + 4,
+                                   f16_to_f64(raw + bb * 144), f16_to_f64(raw + bb * 144 + 2),
+                                   dmd + bb * 128)
+                    bb = bb + 1
+                }
+                k = k + 1
+            }
+            let dt = clock() - t0
+            if bestB == 0 || dt < bestB { bestB = dt }
+            rep = rep + 1
+        }
+
+        // C = table kernel ALONE (DMD pre-filled for row 0)
+        let raw0 = mm_map_base + toff
+        let b0 = 0
+        while b0 < nsuper {
+            jit_f_dmd_fill(raw0 + b0 * 144, raw0 + b0 * 144 + 4,
+                           f16_to_f64(raw0 + b0 * 144), f16_to_f64(raw0 + b0 * 144 + 2),
+                           dmd + b0 * 128)
+            b0 = b0 + 1
+        }
+        mem_store(asz + 0, raw0)
+        mem_store(asz + 8, x)
+        mem_store(asz + 16, dmd)
+        mem_store(asz + 24, nsuper)
+        let bestC = 0
+        rep = 0
+        while rep < RP {
+            let t0 = clock()
+            let k = 0
+            while k < rmax {
+                let v = closure_call(tbl_tab, asz, 0)
+                mem_store(prod_out, v)
+                sink = sink + f64of(mem_load(prod_out))
+                k = k + 1
+            }
+            let dt = clock() - t0
+            if bestC == 0 || dt < bestC { bestC = dt }
+            rep = rep + 1
+        }
+
+        // D = table path INTEGRATED: rebuild DMD per row, then call
+        let bestD = 0
+        rep = 0
+        while rep < RP {
+            let t0 = clock()
+            let k = 0
+            while k < rmax {
+                let raw = mm_map_base + toff + k * rb
+                let bb = 0
+                while bb < nsuper {
+                    jit_f_dmd_fill(raw + bb * 144, raw + bb * 144 + 4,
+                                   f16_to_f64(raw + bb * 144), f16_to_f64(raw + bb * 144 + 2),
+                                   dmd + bb * 128)
+                    bb = bb + 1
+                }
+                mem_store(asz + 0, raw)
+                mem_store(asz + 8, x)
+                mem_store(asz + 16, dmd)
+                mem_store(asz + 24, nsuper)
+                let v = closure_call(tbl_tab, asz, 0)
+                mem_store(prod_out, v)
+                sink = sink + f64of(mem_load(prod_out))
+                k = k + 1
+            }
+            let dt = clock() - t0
+            if bestD == 0 || dt < bestD { bestD = dt }
+            rep = rep + 1
+        }
+
+        // E = FOLDED path INTEGRATED: the kernel derives its own factors
+        let bestE = 0
+        rep = 0
+        while rep < RP {
+            let t0 = clock()
+            let k = 0
+            while k < rmax {
+                let raw = mm_map_base + toff + k * rb
+                mem_store(asz + 0, raw)
+                mem_store(asz + 8, x)
+                mem_store(asz + 16, 0)
+                mem_store(asz + 24, nsuper)
+                let v = closure_call(tbl_fold, asz, 0)
+                mem_store(prod_out, v)
+                sink = sink + f64of(mem_load(prod_out))
+                k = k + 1
+            }
+            let dt = clock() - t0
+            if bestE == 0 || dt < bestE { bestE = dt }
+            rep = rep + 1
+        }
+
+        // F = option 2: persistent per-tensor cache, AMORTISED.
+        //     Build every row's DMD once into a row-sized table, then sweep the
+        //     table kernel over all rows with no build inside the timed loop --
+        //     the shape a per-tensor cache gives across decode tokens.
+        let dmd_all = jit_f_dmd_alloc(nsuper * rmax)
+        let kk = 0
+        while kk < rmax {
+            let raw = mm_map_base + toff + kk * rb
+            let bb = 0
+            while bb < nsuper {
+                jit_f_dmd_fill(raw + bb * 144, raw + bb * 144 + 4,
+                               f16_to_f64(raw + bb * 144), f16_to_f64(raw + bb * 144 + 2),
+                               dmd_all + (kk * nsuper + bb) * 128)
+                bb = bb + 1
+            }
+            kk = kk + 1
+        }
+        let bestF = 0
+        rep = 0
+        while rep < RP {
+            let t0 = clock()
+            let k = 0
+            while k < rmax {
+                mem_store(asz + 0, mm_map_base + toff + k * rb)
+                mem_store(asz + 8, x)
+                mem_store(asz + 16, dmd_all + (k * nsuper) * 128)
+                mem_store(asz + 24, nsuper)
+                let v = closure_call(tbl_tab, asz, 0)
+                mem_store(prod_out, v)
+                sink = sink + f64of(mem_load(prod_out))
+                k = k + 1
+            }
+            let dt = clock() - t0
+            if bestF == 0 || dt < bestF { bestF = dt }
+            rep = rep + 1
+        }
+
+        prints("A prod (deq+dot4)      : "); print(bestA); newline()
+        prints("B dmd_build_only       : "); print(bestB); newline()
+        prints("C table_kernel_only    : "); print(bestC); newline()
+        prints("D table build+kernel   : "); print(bestD); newline()
+        prints("E FOLDED integrated    : "); print(bestE); newline()
+        prints("F cached-DMD amortised : "); print(bestF); newline()
+        if bestD > 0 { prints("ratio x100 A/D (table integrated) : "); print((bestA * 100) / bestD); newline() }
+        if bestC > 0 { prints("ratio x100 A/C (kernel alone)     : "); print((bestA * 100) / bestC); newline() }
+        if bestE > 0 { prints("ratio x100 A/E (FOLDED integrated): "); print((bestA * 100) / bestE); newline() }
+        if bestF > 0 { prints("ratio x100 A/F (cache amortised)  : "); print((bestA * 100) / bestF); newline() }
+        if bestD > 0 && bestB > 0 { prints("dmd_share_x100 of D               : "); print((bestB * 100) / bestD); newline() }
+        pass = pass + 1
+    }
+    prints("sink="); print_f(sink); prints(" (consumer, keeps loops live)\n")
+    prints("DONE\n")
+    return 0
+}

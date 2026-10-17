@@ -272,6 +272,224 @@ fn jit_f_build() -> i64 {
 }
 
 // ============================================================================
+// FOLDED-FACTOR VARIANT: derive the 8 (d*Kn, dmin*Mn) pairs IN THE KERNEL
+// ============================================================================
+// WHY. The table variant above reads its factors from a DMD table the CALLER
+// builds, and that build is scalar Quanta source: per super-block it runs 8
+// iterations of q4k_sc/q4k_min bit extraction (each with integer divisions)
+// plus 16 i2f/fmul/mem_store builtin calls. Measured on the model's real
+// FFN-gate rows (tests/jit_dmd_fold_test.quanta): the build alone costs 2.9x
+// the kernel it feeds -- 81% of the fused path -- so the integrated win was
+// only ~3.1x while the kernel alone is ~11.1x. The build is O(weights) scalar
+// work inside the loop fusion was supposed to make cheaper.
+//
+// WHAT. The kernel's quant cursor r9 points at the 128 quant bytes, so the
+// 144-byte super-block header sits at r9-16..r9-1:
+//
+//      r9-16 : f16 d
+//      r9-14 : f16 dmin
+//      r9-12 : 12 packed scale/min bytes (sc[0..11])
+//
+// The kernel loads that header itself, converts d/dmin f16->f32->f64 (both
+// steps EXACT -- f16's 11-bit significand fits f32's 24), unpacks the 16
+// six-bit fields as dwords, scales them by d / dmin, and keeps the four
+// resulting f64 vectors in ymm12-15. It then broadcasts one lane per chunk
+// with vpermilpd -- ONE instruction instead of the 8 redundant vbroadcastsd
+// per half that the table variant emits. No DMD table, no per-row scalar
+// build, no 128-byte-per-super-block memory traffic.
+//
+// The six-bit unpack below is q4k_sc/q4k_min (lib/std/matmul_q4k.quanta:45,
+// :51) and mm_deq_row_raw's use of them, rewritten per-dword:
+//
+//      scales[0..3] = sc[0..3] & 63
+//      scales[4..7] = (sc[8..11] & 15) | ((sc[0..3] >> 6) << 4)
+//      mins  [0..3] = sc[4..7] & 63
+//      mins  [4..7] = (sc[8..11] >> 4) | ((sc[4..7] >> 6) << 4)
+//
+// Each is expressed as shifts, not masks-witha-constant-register, so no
+// constant pool is needed: (x<<26)>>26 == x & 63 and (x<<28)>>28 == x & 15.
+// The per-lane arithmetic and the four-lane accumulation order are IDENTICAL
+// to the table variant, so this kernel stays bit-exact against
+// mm_deq_row_raw + mm_dot4_s. Verified 0/64 mismatches, and 0 mismatches
+// against the table kernel, on real FFN-gate rows.
+//
+// ARGS AREA: [W, X, DMD, nsuper] is unchanged; [rdi+16] is simply not read.
+
+// The 27-instruction factor prologue. Runs once per super-block, at body top,
+// while r9 still points at the quant bytes (header at r9-16).
+//   ymm3  = [d, dmin, 0, 0]      (f64)
+//   ymm8  = broadcast d          ymm9 = broadcast dmin
+//   ymm4/5/6 = sc[0..3]/[4..7]/[8..11] as 4 dwords each
+//   ymm7  = unpack scratch
+//   ymm12 = [d*sc0..d*sc3]  ymm13 = [d*sc4..d*sc7]
+//   ymm14 = [dmin*mn0..3]   ymm15 = [dmin*mn4..mn7]
+fn j_f_fold_factors() -> i64 {
+    jbytes(6, "c4c1796e59f0")      // vmovd xmm3, [r9-16]       4 header bytes
+    jbytes(5, "c4e27913db")        // vcvtph2ps xmm3, xmm3      [d,dmin] as f32
+    jbytes(4, "c5fc5adb")          // vcvtps2pd ymm3, xmm3      -> f64 (exact)
+    jbytes(6, "c463fd01c300")      // vpermpd ymm8, ymm3, 0    broadcast d
+    jbytes(6, "c463fd01cb55")      // vpermpd ymm9, ymm3, 0x55 broadcast dmin
+    jbytes(6, "c4c2793161f4")      // vpmovzxbd xmm4, [r9-12]   a = sc0..3
+    jbytes(6, "c4c2793169f8")      // vpmovzxbd xmm5, [r9-8]    b = sc4..7
+    jbytes(6, "c4c2793171fc")      // vpmovzxbd xmm6, [r9-4]    c = sc8..11
+    // scales[0..3] = a & 63
+    jbytes(5, "c5c172f41a")        // vpslld xmm7, xmm4, 26
+    jbytes(5, "c5c172d71a")        // vpsrld xmm7, xmm7, 26
+    jbytes(4, "c57ee6e7")          // vcvtdq2pd ymm12, xmm7
+    jbytes(5, "c4411d59e0")        // vmulpd ymm12, ymm12, ymm8
+    // mins[0..3] = b & 63
+    jbytes(5, "c5c172f51a")        // vpslld xmm7, xmm5, 26
+    jbytes(5, "c5c172d71a")        // vpsrld xmm7, xmm7, 26
+    jbytes(4, "c57ee6f7")          // vcvtdq2pd ymm14, xmm7
+    jbytes(5, "c4410d59f1")        // vmulpd ymm14, ymm14, ymm9
+    // scales[4..7] = (c & 15) | ((a >> 6) << 4)
+    jbytes(5, "c5c172d406")        // vpsrld xmm7, xmm4, 6
+    jbytes(5, "c5c172f704")        // vpslld xmm7, xmm7, 4
+    jbytes(5, "c5d972f61c")        // vpslld xmm4, xmm6, 28
+    jbytes(5, "c5d972d41c")        // vpsrld xmm4, xmm4, 28
+    jbytes(4, "c5c1ebfc")          // vpor xmm7, xmm7, xmm4
+    jbytes(4, "c57ee6ef")          // vcvtdq2pd ymm13, xmm7
+    jbytes(5, "c4411559e8")        // vmulpd ymm13, ymm13, ymm8
+    // mins[4..7] = (c >> 4) | ((b >> 6) << 4)
+    jbytes(5, "c5c172d506")        // vpsrld xmm7, xmm5, 6
+    jbytes(5, "c5c172f704")        // vpslld xmm7, xmm7, 4
+    jbytes(5, "c5d172d604")        // vpsrld xmm5, xmm6, 4
+    jbytes(4, "c5c1ebfd")          // vpor xmm7, xmm7, xmm5
+    jbytes(4, "c57ee6ff")          // vcvtdq2pd ymm15, xmm7
+    jbytes(5, "c4410559f9")        // vmulpd ymm15, ymm15, ymm9
+    return 0
+}
+
+// Chunk c (0..3) uses pair 2c for its low 32 weights and pair 2c+1 for its
+// high 32. Pairs 0..3 live in ymm12/ymm14 (scales/mins), pairs 4..7 in
+// ymm13/ymm15.
+//
+// THE BROADCAST MUST BE vpermpd, NOT vpermilpd. Measured, not assumed: an
+// earlier revision used vpermilpd with imm 0x00/0x55/0xAA/0xFF, which
+// assembled and disassembled perfectly and still produced the wrong factors.
+// VPERMILPD's imm8 selectors are LANE-RELATIVE -- each 2-bit field picks a
+// source element inside the destination's own 128-bit half -- so imm 0x00
+// yields [s0,s1,s0,s1], not a broadcast. (It produced exactly
+// ymm8 = [d,d,0,0], which tests/jit_fold_probe.quanta caught: only factor
+// lanes 0 and 1 of each vector were ever right.) VPERMPD ymm1,ymm2,imm8 IS a
+// cross-lane 4-element permute, so a repeated 2-bit selector broadcasts:
+// lane0=0x00, lane1=0x55, lane2=0xAA, lane3=0xFF. ymm6 carries d*Kn, ymm7
+// carries dmin*Mn.
+fn j_f_perm6_lo(c) -> i64 {          // ymm6 <- lane 2c of ymm12/ymm13
+    if c == 0 { return jbytes(6, "c4c3fd01f400") }
+    if c == 1 { return jbytes(6, "c4c3fd01f4aa") }
+    if c == 2 { return jbytes(6, "c4c3fd01f500") }
+    return jbytes(6, "c4c3fd01f5aa")
+}
+fn j_f_perm6_hi(c) -> i64 {          // ymm6 <- lane 2c+1 of ymm12/ymm13
+    if c == 0 { return jbytes(6, "c4c3fd01f455") }
+    if c == 1 { return jbytes(6, "c4c3fd01f4ff") }
+    if c == 2 { return jbytes(6, "c4c3fd01f555") }
+    return jbytes(6, "c4c3fd01f5ff")
+}
+fn j_f_perm7_lo(c) -> i64 {          // ymm7 <- lane 2c of ymm14/ymm15
+    if c == 0 { return jbytes(6, "c4c3fd01fe00") }
+    if c == 1 { return jbytes(6, "c4c3fd01feaa") }
+    if c == 2 { return jbytes(6, "c4c3fd01ff00") }
+    return jbytes(6, "c4c3fd01ffaa")
+}
+fn j_f_perm7_hi(c) -> i64 {          // ymm7 <- lane 2c+1 of ymm14/ymm15
+    if c == 0 { return jbytes(6, "c4c3fd01fe55") }
+    if c == 1 { return jbytes(6, "c4c3fd01feff") }
+    if c == 2 { return jbytes(6, "c4c3fd01ff55") }
+    return jbytes(6, "c4c3fd01ffff")
+}
+
+// The 4-byte group, with the factor broadcast HOISTED out: ymm6/ymm7 must
+// already hold this half's (d*Kn, dmin*Mn). Byte-for-byte the same body as
+// j_f_low/j_f_high minus their two vbroadcastsd calls.
+fn j_f_low_nb() -> i64 {
+    j_f_vpmovzxbd_x1_r9()
+    j_f_vpslld_28()
+    j_f_vpsrld_28()
+    j_f_vpsrldq_x2_x1_8()
+    j_f_vcvtdq2pd_y1_x1()
+    j_f_vcvtdq2pd_y2_x2()
+    j_f_vinsertf128_y1_y1_x2_1()
+    j_f_vmulpd_y1_y6()
+    j_f_vsubpd_y1_y7()
+    j_f_vmulpd_y1_r10()
+    j_f_vaddpd_y0_y1()
+    j_f_add_r9_4()
+    j_f_add_r10_32()
+    return 0
+}
+
+fn j_f_high_nb() -> i64 {
+    j_f_vpmovzxbd_x1_r9()
+    j_f_vpsrld_4()
+    j_f_vpsrldq_x2_x1_8()
+    j_f_vcvtdq2pd_y1_x1()
+    j_f_vcvtdq2pd_y2_x2()
+    j_f_vinsertf128_y1_y1_x2_1()
+    j_f_vmulpd_y1_y6()
+    j_f_vsubpd_y1_y7()
+    j_f_vmulpd_y1_r10()
+    j_f_vaddpd_y0_y1()
+    j_f_add_r9_4()
+    j_f_add_r10_32()
+    return 0
+}
+
+// ============================================================================
+// Whole FOLDED kernel: same cadence, factors derived in-kernel, no DMD table.
+// ============================================================================
+fn jit_f_build_folded() -> i64 {
+    let entry = ja_pos()
+    j_f_load_w()
+    j_f_skip_header()          // r9 -> quant bytes; header now at r9-16
+    j_f_load_x()
+    j_f_load_n()
+    j_f_vxorpd_y0()
+
+    let bodytop = ja_pos()
+
+    j_f_fold_factors()         // ymm12-15 = the 8 (d*Kn,dmin*Mn) pairs
+
+    let chunk = 0
+    while chunk < 4 {
+        // low 32 weights of the chunk: one broadcast each, then 8 steps
+        j_f_perm6_lo(chunk)
+        j_f_perm7_lo(chunk)
+        let b = 0
+        while b < 8 {
+            j_f_low_nb()
+            b = b + 1
+        }
+        j_f_rewind_r9_32()     // re-read the same 32 quant bytes
+        // high 32 weights: pair 2c+1
+        j_f_perm6_hi(chunk)
+        j_f_perm7_hi(chunk)
+        b = 0
+        while b < 8 {
+            j_f_high_nb()
+            b = b + 1
+        }
+        chunk = chunk + 1
+    }
+    j_f_skip_header()          // 128 quant bytes + 16 header = 144 stride
+
+    jbytes(4, "4883e901")      // sub rcx, 1
+    j_jne32()
+    let disp_at = ja_pos()
+    jbytes(4, "00000000")
+    if j_patch32(disp_at, bodytop) != 0 { return 0 - 1 }
+
+    j_f_vextracti128_x2_y0()
+    j_f_vhaddpd_x3_x0()
+    j_f_vhaddpd_x4_x2()
+    j_f_vaddsd_x3_x4()
+    j_f_vmovq_rax_x3()
+    j_f_ret()
+    return entry
+}
+
+// ============================================================================
 // ============================================================================
 // LOWER HALF -- the caller side: how emitted bytes become callable functions
 // ============================================================================
