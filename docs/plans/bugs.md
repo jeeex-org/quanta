@@ -1059,3 +1059,62 @@ number regenerable). Answered the question A5 left open ("escape/alias detection
   both SEQ-DOUBLE-FREE candidates (false positives — re-assignment between frees). Unverified and
   labelled so in the report: the 1495 L sites are spot-checked shapes, not one-by-one reads; the 1
   top-level site (`big.quanta:763`) is excluded (detector reach at top level unknown).
+
+### A23 · FIXED in 0.0.246 (compiler) · a parameter whose name lexes as a reserved keyword was SILENTLY DROPPED — and it was misdiagnosed as a `closure_call` codegen fault
+
+Found while chasing why the loader's JIT kernel could not be dispatched from an imported module.
+
+The handed-down diagnosis was wrong. `closure_call` codegen is correct: the emitted byte
+sequence is byte-identical at both sites (inline `main` @`0x40ab75`, `jit_f_apply` @`0x40c973`) —
+`48 8b 10 / 4c 8b 50 08 / 4c 8b da / mov -0x60(%rbp),%rdi / mov -0x68(%rbp),%rsi / 41 ff d3`.
+The module boundary was a red herring. gdb at the fault: `rax=0x7ffff7fe6000`, **`rdi=(nil)`**,
+`RIP` = the JIT entry, whose first instruction is `mov (%rdi),%r9` — the kernel was entered with a
+**null argument pointer**.
+
+Root cause: `jit_f_apply(as)` — `as` lexes to `TT_AS`, not `TT_ID`. `funcscan.quanta:265` recorded a
+parameter only `if tk == TT_ID`, so the parameter was dropped: the function was registered with
+**zero** parameters, no prologue store for the incoming `rdi` was emitted, and the body's `as`
+(no `parse_primary` atom branch) compiled to the constant **0**.
+
+Reduced to ONE import-free file, which is how it should have been filed:
+- `fn f(as) -> i64 { return as }` with `f(41)` -> **0**
+- `fn f(as,b) { return b*100+as }` with `f(41,42)` -> **41** (every later parameter shifts by one)
+- `fn f(type) { return type }` -> **compiler SIGILL, rc=132**
+
+The reported "SIGILL on larger TUs" was the SAME root cause, not a second defect.
+
+Fix (0.0.246, 3 files): `is_param_name_tok(tk)` = `TT_ID|TT_AS|TT_TYPE|TT_IMPL|TT_IN`
+(`helpers.quanta`); `funcscan.quanta` scans with it; `method.quanta parse_primary` rewrites a keyword
+token that `vfind()` says names a bound param/local to `TT_ID` and falls through to the identifier
+path — the `vfind` guard is what leaves every existing keyword path untouched (verified identical on
+both versions: `(x as u8)` rc=44, `type MyInt = i64` rc=42, `for x in a[0:3]` rc=13).
+
+Red-first rows, verified independently on both versions:
+| row | 0.0.245 | 0.0.246 |
+|---|---|---|
+| `param_kwid_name_test.quanta` | run rc=**1** (wrong values) | rc=0 |
+| `param_kwid_type_test.quanta` | **compile rc=132 (qc SIGILL)** | rc=0 |
+| `stdlib_jit_dispatch_test.quanta` | run rc=**139** (SIGSEGV) | rc=0 |
+
+Gate 231/231 native + 113/113 stdlib, 24/24 stages GREEN; self-host 4 generations identical
+(md5 `094020ff498e993d4888c41965584fe4`); `verify-release` 14/0. `jit_f_setup/ready/apply` now work
+from an imported module, which unblocks the loader's JIT dispatch route.
+
+### A24 · OPEN (compiler) · a string-keyed brace literal traps the compiler (rc=132)
+
+Minimal: `fn f() { return { "a": 1 } }` -> **compiler SIGILL, rc=132**, on BOTH 0.0.245 and 0.0.246.
+
+Consequence: `lib/std/ast.quanta` does not build. That file also has `type` parameters, which is how
+it was reached while testing A23 — fixing A23 does not make it compile. Runtime consequence: none
+observed (the compiler dies before emitting), so this is a compiler-crash defect, not a miscompile.
+
+Note the escape hatch: the compiler dies with SIGILL and no diagnostic, so the fault is currently
+indistinguishable from an out-of-resources kill by exit status alone. A located error would be
+strictly better even before the crash is fixed.
+
+### A25 · OPEN (compiler, diagnostic quality) · an UNBOUND keyword token in expression position traps instead of erroring
+
+`return type` with no binding named `type` in scope traps the compiler the same way. A23's fix
+deliberately handles only keyword tokens that `vfind()` resolves to a bound name; the unbound case
+falls through to a path with no atom branch and no error. Out of scope for A23, recorded so the
+diagnostic gap is not lost. Expected behaviour: a located "undeclared name" error.
