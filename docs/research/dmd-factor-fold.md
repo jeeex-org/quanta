@@ -1,12 +1,15 @@
 # DMD factor fold: the fused JIT dot's integrated win, 2.99x -> ~11.4-15.6x
 
-Status: **DONE and committed** (`42134f2e`, doc `a6581fa5`), lib/std + tests + this
-doc only, `compiler/**` untouched. 0.0.245. Gate GREEN on every row except the
-peer's in-flight RED-first trio (section 5).
+Status: **DONE, committed and pushed** (`42134f2e`, `a6581fa5`, `e617d082`,
+`eda70c4b` on `main`), lib/std + tests + this doc only, `compiler/**` untouched.
+Started on 0.0.245; the 0.0.246 the peer unit landed mid-flight is in use for the
+final gate and unblocked the dispatch (section 6).
 
 Supersedes the "the DMD build is 70-84% of the fused cost" section of
 `docs/research/jit-fused-dot-status.md`: this reproduces its *premise* and
 overturns its *conclusion* (that a per-tensor cache is the natural next lever).
+That doc's *blocker* section (the imported-module `closure_call` fault) is also
+now resolved -- see section 6.
 
 ## 0. The lever, in one line
 
@@ -215,47 +218,69 @@ that wants the last few percent -- not as a plan.
 
 ## 5. Gate
 
-`bash test_suites/scripts/run_tests.sh`, run twice:
+`bash test_suites/scripts/run_tests.sh`, run four times. The final state:
 
-- **First run (11:2x): GATE_RC=0, 0 FAIL, all sections GREEN** -- the state of
-  the tree when this unit's commits were made.
-- Second run (11:4x): `GATE_RC=1` with **3 FAILs, all three of them the peer
-  unit's own in-flight RED-first rows** added at 11:32, after the clean run:
+- **Final run (12:5x, VERSION 0.0.246): GATE_RC=0, 391 PASS, 0 FAIL, 26
+  sections, NO RED.** This is the tree as pushed.
+- Run 1 (11:2x, 0.0.245): **GATE_RC=0, 0 FAIL, all sections GREEN** -- the state
+  when this unit's first two commits were made.
+- Run 2 (11:4x): `GATE_RC=1` with **3 FAILs -- all three of them the peer unit's
+  own in-flight RED-first rows**, added at 11:32 after the clean run:
   `param_kwid_type_test` (compile `rc=132`), `param_kwid_name_test` (`rc=1`) and
   `stdlib_jit_dispatch_test` (`rc=139`), together with the peer's unstaged edits
-  to the shared `test_suites/EXPECTED.tsv` / `EXPECTED_STDLIB.tsv`. The peer's
-  `compiler/0.0.246/` (the fix those rows are RED against) is untracked and not
-  in use.
+  to the shared `test_suites/EXPECTED.tsv` / `EXPECTED_STDLIB.tsv`.
 
-  **This was verified, not assumed:** a pre-change tree built with
-  `git archive fdd6be9a` (confirmed to contain no folded kernel) plus those same
-  three rows fails **identically** -- `rc=139` / `rc=1` / compile `rc=132`. So
-  the trio is the peer's, not a regression from this change, and it is exactly
-  the class `parallel-agent-workstreams` warns about: a peer's RED-first row
-  whose source is in the tree while its fix is not committed.
+  **Verified, not assumed:** a pre-change tree built with `git archive fdd6be9a`
+  (confirmed to contain no folded kernel) plus those same three rows fails
+  **identically** -- `rc=139` / `rc=1` / compile `rc=132`. So the trio was the
+  peer's, not a regression from this change, and it is exactly the class
+  `parallel-agent-workstreams` warns about: a peer's RED-first row whose source
+  is in the tree while its fix is not committed. That trio is now all PASS
+  (`stdlib_jit_dispatch_test` rc=0) in the final run.
 
 - The new tests are **NOT** wired into the gate manifest, deliberately and
   consistently: no `tests/jit_*` file is a manifest row (nor is
   `tests/lfm2_jit_mm_test.quanta`), they need the 1.67 GB model and a 32 GB VA
-  cap, and the manifest is a single-writer shared file that the peer is
-  currently editing. They are run by hand; the exact commands are in each
-  file's header.
+  cap, and the manifest is a single-writer shared file that another unit was
+  editing. They are run by hand; the exact commands are in each file's header.
+  The one exception is the peer's own `stdlib_jit_dispatch_test.quanta`, which
+  is a manifest row and which this unit relied on to confirm the unblock.
 
-Pushed as `fdd6be9a..a6581fa5` on `main` (fast-forward, 0 behind).
+Pushed as `fdd6be9a..e617d082` then `998e2abf..eda70c4b` on `main` (both
+fast-forwards, 0 behind at push time).
 
 ## 6. Honest remaining gap and the next lever
 
 - **This is a microbenchmark of the dot. It is not a tok/s number and must not
   be reported as one.** `clock()`'s absolute unit is still UNVERIFIED -- only
   ratios are trustworthy.
-- The fused kernel **still cannot be dispatched from an imported module**;
-  `jit_f_apply` faults there. That is the peer unit's `closure_call` fix (whose
-  root cause its own new row names: the parameter NAME `as` scanning as
-  `TT_AS` not `TT_ID`, so the kernel is entered with `rdi=0`).
-  `jit_f_setup` / `jit_f_ready` / `jit_f_apply` in `jit_x86_fused.quanta` are
-  still marked BLOCKED and were deliberately not touched. **Every number here
-  was taken by dispatching inline in `main`**, the only shape the defect
-  permits, so no end-to-end tok/s claim is possible yet.
+- **The dispatch blocker is GONE, and this is the new top of the list.** Every
+  measurement in this doc was taken by dispatching inline in `main`, because on
+  0.0.245 reaching `closure_call` through a function in an imported module
+  SIGSEGV'd. The peer unit fixed that in 0.0.246 (root cause: a parameter named
+  with a keyword token was dropped by `funcscan`, so the kernel was entered with
+  `rdi=0` -- NOT a `closure_call` emitter bug, which is why `jit_x86_fused`
+  needed no emitter change). Verified first-hand here:
+
+  - the gate row `test_suites/codes/stdlib_jit_dispatch_test.quanta` now PASSES
+    (rc=0, was rc=139);
+  - `tests/jit_fold_dispatch_test.quanta` (NEW) dispatches the **folded** kernel
+    both ways on 64 real FFN-gate rows -- inline `closure_call`, and
+    `jit_f_apply_folded()` through the imported module -- and gets 0 and 0
+    mismatches against `mm_deq_row_raw + mm_dot4_s`.
+
+  So the fused dot CAN now be wired into `gguf_mm`. That wiring is a separate
+  lever and is the immediate next unit, not a footnote. It was deliberately NOT
+  started here, and the reason is concrete rather than budgetary caution:
+  `mm_matvec` (gguf_mm:466) runs `mm_load_row` -> `gguf_read_tensor_bytes_at`
+  (a `pread`), while the decode path the campaign measures is the **mmap**
+  route; `mm_matvec_par` and the embed path are separate call sites; and the
+  kernel takes a 4-qword argument area per call, so a parallel worker needs its
+  **own** area (one shared `asz` is exactly the cross-worker scratch class the
+  `quanta-cpu-perf` notes already name). A follow-up needs to answer those three
+  questions before it touches the model's hot path, then hold bit-identity
+  end-to-end, not just per row. The route itself is now proven; the plumbing is
+  the work.
 - Q4_K is only part of the per-token work: the tied **Q6_K** output projection
   and the Q6_K down-projection are not covered by this kernel. There is no
   `q6k` folded twin; that is a separate lever of the same shape (and worth
