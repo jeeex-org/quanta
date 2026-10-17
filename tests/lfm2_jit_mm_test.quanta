@@ -1,0 +1,246 @@
+// tests/lfm2_jit_mm_test.quanta
+//
+// TWO QUESTIONS, both answered on the model's REAL Q4_K rows.
+//
+// 1. CORRECTNESS AGAINST THE SHAPE THE LOADER ACTUALLY RUNS.
+//    The earlier 8.73x compared the fused kernel against q4k_matvec_real, which
+//    lives in matmul_q4k.quanta and is the SCALAR q4k_block_dot path -- NOT what
+//    lfm2_forward executes. lfm2_forward reaches its dots through mm_matvec,
+//    which dequantises a row (mm_deq_row_raw / mm_load_row -> dq32lo/dq32hi)
+//    and then calls mm_dot4_s. THAT is the comparison that decides integration,
+//    so this test diffs the fused kernel against it, bit for bit, over real rows
+//    of the FFN gate tensor.
+//
+// 2. THE COST SPLIT. tests/jit_vs_prod_test.quanta filled the DMD factor table
+//    ONCE, OUTSIDE its timing loop, so its ratio EXCLUDES the DMD build. In the
+//    real path the table must be rebuilt per row (it is derived from that row's
+//    raw bytes), so the honest integrated cost is (DMD build + kernel). This
+//    test times each piece separately on the same rows, interleaved.
+//
+// Build: ./compiler/0.0.245/bin/x86/qc -O tests/lfm2_jit_mm_test.quanta <bin>
+// Run:   ( ulimit -c 0 -v 8000000; ./scripts/quanta_run.sh <bin> </dev/null )
+//        from the repo root
+import std/gguf
+import std/lfm2_forward
+import std/lfm2_model
+import std/lfm2_mm
+import std/lfm2_bpe
+import std/fs
+import std/jit_x86
+import std/jit_x86_fused
+
+const Q4_PATH = "/opt/ai/models/quanta/QUANTA-LFM2.5-2.6Bv1-Q4_K_M.gguf"
+const NCTX = 2048
+const NROWS = 64
+const REPS = 4
+
+let sink = 0.0
+
+// provenance-stamped per-row result so nothing is dead-code eliminated
+fn row_bits(prod_out, v: f64) -> i64 {
+    mem_store(prod_out, v)
+    return mem_load(prod_out)
+}
+
+fn main() {
+    prints("=== fused JIT vs the REAL mm matvec shape (Q4_K) ===\n")
+    if gguf_load(Q4_PATH) != 0 { prints("FAIL gguf_load\n"); return 1 }
+    if fc_read_config() != 0 { prints("FAIL fc_read_config\n"); return 1 }
+    if bpe_init_from_gguf() == 0 { prints("FAIL bpe_init\n"); return 1 }
+    if fc_kv_init(NCTX) != 0 { prints("FAIL fc_kv_init\n"); return 1 }
+    if fc_fw_init() != 0 { prints("FAIL fc_fw_init\n"); return 1 }
+    if fc_fw_reset() != 0 { prints("FAIL fc_fw_reset\n"); return 1 }
+    mm_set_workers(0)
+    mm_set_embed_workers(0)
+    if mm_attach_mmap_fd(file_open(Q4_PATH, 0)) != 0 { prints("FAIL mm_attach_mmap\n"); return 1 }
+
+    let tg = lfm2_ffn_gate(0)
+    if tg < 0 { prints("FAIL tensor\n"); return 1 }
+    let dm = fc_d_model
+    let rb = mm_row_bytes(12, dm)
+    let nsuper = dm / 256
+    prints("gate_idx="); print(tg)
+    prints(" dtype="); print(gguf_tensor_dtype(tg))
+    prints(" cols="); print(dm)
+    prints(" row_bytes="); print(rb)
+    prints(" nsuper="); print(nsuper); newline()
+    if gguf_tensor_dtype(tg) != 12 { prints("NOT Q4_K -- test premise broken\n"); return 1 }
+    if rb != nsuper * 144 { prints("row_bytes != nsuper*144 -- premise broken\n"); return 1 }
+
+    let region = jit_f_alloc(65536)
+    if region <= 0 { prints("UNSUPPORTED: no RWX mmap on this box\n"); return 2 }
+    let tbl = jit_f_code(jit_f_build())
+    if tbl <= 0 { prints("BUILD FAILED\n"); return 1 }
+    let entry = mem_load(tbl)
+    prints("jit_entry="); print(entry); newline()
+
+    let x = mem_alloc(dm * 8)
+    let i = 0
+    while i < dm { mem_store(x + i * 8, i2f((i * 37) % 101 - 50) / i2f(71)); i = i + 1 }
+
+    let acc = mem_alloc(512)
+    let f64b = mem_alloc(dm * 8)
+    let prod_out = mem_alloc(8)
+    let dmd = jit_f_dmd_alloc(nsuper)
+    let asz = mem_alloc(32)
+    let toff = gguf_tensor_offset(tg)
+
+    // ---- 1. BIT-IDENTITY over real rows -----------------------------------
+    let mism = 0
+    let checked = 0
+    let r = 0
+    while r < NROWS {
+        let raw = mm_map_base + toff + r * rb
+        if mm_deq_row_raw(12, raw, dm, f64b) != 0 { prints("FAIL deq\n"); return 1 }
+        let prod = mm_dot4_s(f64b, x, dm, acc)
+        let pb = row_bits(prod_out, prod)
+
+        let b = 0
+        while b < nsuper {
+            jit_f_dmd_fill(raw + b * 144, raw + b * 144 + 4,
+                           f16_to_f64(raw + b * 144), f16_to_f64(raw + b * 144 + 2),
+                           dmd + b * 128)
+            b = b + 1
+        }
+        mem_store(asz + 0, raw)
+        mem_store(asz + 8, x)
+        mem_store(asz + 16, dmd)
+        mem_store(asz + 24, nsuper)
+        let jb = closure_call(tbl, asz, 0)
+
+        if jb != pb { mism = mism + 1 }
+        checked = checked + 1
+        r = r + 1
+    }
+    prints("BITIDENT fused_vs_mm_deq+dot4: mismatches="); print(mism)
+    prints(" / "); print(checked); newline()
+    if mism != 0 { prints("STOP: the fused path is NOT bit-identical to the mm shape\n"); return 1 }
+    prints("bit-identical: OK\n")
+
+    // ---- 2. COST SPLIT, interleaved, best-of-REPS -------------------------
+    // A = production per row: mm_deq_row_raw (raw read + dq32 dequant into f64) + mm_dot4_s
+    let bestA = 0
+    let rep = 0
+    while rep < REPS {
+        let t0 = clock()
+        let k = 0
+        while k < NROWS {
+            let raw = mm_map_base + toff + k * rb
+            if mm_deq_row_raw(12, raw, dm, f64b) != 0 { prints("FAIL deq\n"); return 1 }
+            sink = sink + mm_dot4_s(f64b, x, dm, acc)
+            k = k + 1
+        }
+        let dt = clock() - t0
+        if bestA == 0 || dt < bestA { bestA = dt }
+        rep = rep + 1
+    }
+
+    // B = DMD build alone (per row, over the same rows)
+    let bestB = 0
+    rep = 0
+    while rep < REPS {
+        let t0 = clock()
+        let k = 0
+        while k < NROWS {
+            let raw = mm_map_base + toff + k * rb
+            let b = 0
+            while b < nsuper {
+                jit_f_dmd_fill(raw + b * 144, raw + b * 144 + 4,
+                               f16_to_f64(raw + b * 144), f16_to_f64(raw + b * 144 + 2),
+                               dmd + b * 128)
+                b = b + 1
+            }
+            k = k + 1
+        }
+        let dt = clock() - t0
+        if bestB == 0 || dt < bestB { bestB = dt }
+        rep = rep + 1
+    }
+
+    // C = kernel call ALONE (DMD pre-filled for row 0, x fixed)
+    let raw0 = mm_map_base + toff
+    let b0 = 0
+    while b0 < nsuper {
+        jit_f_dmd_fill(raw0 + b0 * 144, raw0 + b0 * 144 + 4,
+                       f16_to_f64(raw0 + b0 * 144), f16_to_f64(raw0 + b0 * 144 + 2),
+                       dmd + b0 * 128)
+        b0 = b0 + 1
+    }
+    mem_store(asz + 0, raw0)
+    mem_store(asz + 8, x)
+    mem_store(asz + 16, dmd)
+    mem_store(asz + 24, nsuper)
+    let bestC = 0
+    rep = 0
+    while rep < REPS {
+        let t0 = clock()
+        let k = 0
+        while k < NROWS {
+            let v = closure_call(tbl, asz, 0)
+            mem_store(prod_out, v)
+            sink = sink + f64of(mem_load(prod_out))
+            k = k + 1
+        }
+        let dt = clock() - t0
+        if bestC == 0 || dt < bestC { bestC = dt }
+        rep = rep + 1
+    }
+
+    // D = DMD build + kernel (the real integrated shape), per row
+    let bestD = 0
+    rep = 0
+    while rep < REPS {
+        let t0 = clock()
+        let k = 0
+        while k < NROWS {
+            let raw = mm_map_base + toff + k * rb
+            let b = 0
+            while b < nsuper {
+                jit_f_dmd_fill(raw + b * 144, raw + b * 144 + 4,
+                               f16_to_f64(raw + b * 144), f16_to_f64(raw + b * 144 + 2),
+                               dmd + b * 128)
+                b = b + 1
+            }
+            mem_store(asz + 0, raw)
+            mem_store(asz + 8, x)
+            mem_store(asz + 16, dmd)
+            mem_store(asz + 24, nsuper)
+            let v = closure_call(tbl, asz, 0)
+            mem_store(prod_out, v)
+            sink = sink + f64of(mem_load(prod_out))
+            k = k + 1
+        }
+        let dt = clock() - t0
+        if bestD == 0 || dt < bestD { bestD = dt }
+        rep = rep + 1
+    }
+
+    prints("rows="); print(NROWS); prints(" x cols="); print(dm)
+    prints(" (best of "); print(REPS); prints(")\n")
+    prints("A prod (deq+dot4)      : "); print(bestA); newline()
+    prints("B dmd_build_only       : "); print(bestB); newline()
+    prints("C kernel_only          : "); print(bestC); newline()
+    prints("D dmd_build+kernel     : "); print(bestD); newline()
+    if bestD > 0 {
+        prints("ratio x100 A/D         : "); print((bestA * 100) / bestD); newline()
+    }
+    if bestC > 0 {
+        prints("ratio x100 A/C         : "); print((bestA * 100) / bestC); newline()
+    }
+    if bestB > 0 && bestD > 0 {
+        prints("dmd_share_x100 of D    : "); print((bestB * 100) / bestD); newline()
+    }
+    prints("sink="); print_f(sink)
+    prints(" (consumer, keeps loops live)\n")
+
+    // ---- 3. INTEGRATION THROUGH mm_matvec: NOT MEASURABLE HERE -------
+    // The flag-guarded wiring (mm_set_jit_q4k / mm_matvec) cannot run: qc
+    // 0.0.245 miscompiles closure_call when it is reached from a function in an
+    // IMPORTED module, so any dispatch from lfm2_mm faults. Minimal repro and
+    // the full bisection are in docs/research/jit-fused-dot-status.md and
+    // tests/lfm2_jit_cc_probe.quanta. lfm2_mm was therefore left PRISTINE.
+    prints("integration: BLOCKED (imported-module closure_call defect) - see docs\n")
+
+    prints("DONE\n")
+    return 0
+}

@@ -1,0 +1,86 @@
+// tests/lfm2_jit_cc_probe.quanta
+//
+// REPRODUCER for the defect that blocks wiring the fused JIT kernel into
+// lfm2_forward: closure_call works inline in the program's top-level module and
+// faults when it is reached from a function inside an IMPORTED module.
+//
+// This file runs the WORKING half (case a) so it exits 0, and prints the exact
+// bytes of the two functions involved. The broken half (case c) is recorded,
+// not executed, because a SIGSEGV cannot be caught in-process; the 6-line
+// reproducer is reproduced verbatim below and in
+// docs/research/jit-fused-dot-status.md:
+//
+//   --- s1.quanta (a 2-module TU; import the JIT library only) --------------
+//   import std/jit_x86
+//   import std/jit_x86_fused
+//   fn main() -> i64 {
+//       if jit_f_alloc(65536) <= 0 { return 2 }
+//       let tbl = jit_f_code(jit_f_build())
+//       ... build raw/x/dmd, fill `asz` = [W, X, DMD, nsuper] ...
+//       let va = closure_call(tbl, asz, 0)   // inline: 4700186342854754304  OK
+//       let vc = jit_f_apply(asz)            // helper in the imported module:
+//       return 0                             //   SIGSEGV, rc=139
+//   }
+//
+// Variants that ALL fault identically: tuple as a module global, tuple as a
+// parameter, tuple built locally, with and without mem_store around the call,
+// one caller or five, and from lib/std/lfm2_mm.quanta. In larger translation
+// units the same construct traps the COMPILER instead (SIGILL, rc=132).
+//
+// Build: ./compiler/0.0.245/bin/x86/qc -O tests/lfm2_jit_cc_probe.quanta <bin>
+// Run:   ( ulimit -c 0 -v 32000000; <bin> </dev/null )
+import std/jit_x86
+import std/jit_x86_fused
+
+const NSUPER = 8
+const N = NSUPER * 256
+
+fn main() -> i64 {
+    prints("=== closure_call: inline in the top-level module ===\n")
+    if jit_f_alloc(65536) <= 0 { prints("UNSUPPORTED\n"); return 2 }
+    let tbl = jit_f_code(jit_f_build())
+    if tbl <= 0 { prints("BUILD FAILED\n"); return 1 }
+
+    let raw = mem_alloc(NSUPER * 144 + 64)
+    let i = 0
+    while i < NSUPER * 144 {
+        mem_store8(raw + i, (i * 37 + 11) - ((i * 37 + 11) / 256) * 256)
+        i = i + 1
+    }
+    let b = 0
+    while b < NSUPER {
+        mem_store8(raw + b * 144 + 0, 0)
+        mem_store8(raw + b * 144 + 1, 60)
+        mem_store8(raw + b * 144 + 2, 0)
+        mem_store8(raw + b * 144 + 3, 56)
+        b = b + 1
+    }
+    let x = mem_alloc(N * 8 + 256)
+    i = 0
+    while i < N { mem_store(x + i * 8, i2f(i % 29) * 0.25 + 0.125); i = i + 1 }
+
+    let dmd = jit_f_dmd_alloc(NSUPER)
+    b = 0
+    while b < NSUPER {
+        jit_f_dmd_fill(raw + b * 144, raw + b * 144 + 4,
+                       f16_to_f64(raw + b * 144), f16_to_f64(raw + b * 144 + 2),
+                       dmd + b * 128)
+        b = b + 1
+    }
+    let asz = mem_alloc(32)
+    mem_store(asz + 0, raw)
+    mem_store(asz + 8, x)
+    mem_store(asz + 16, dmd)
+    mem_store(asz + 24, NSUPER)
+
+    let va = closure_call(tbl, asz, 0)
+    prints("inline closure_call   = "); print(va); newline()
+    prints("expected value        = 4700186342854754304\n")
+    if va != 4700186342854754304 {
+        prints("UNEXPECTED: inline call disagrees with the recorded value\n")
+        return 1
+    }
+    prints("inline dispatch OK; imported-module dispatch is BROKEN (see header)\n")
+    prints("DONE\n")
+    return 0
+}
