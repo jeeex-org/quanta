@@ -249,3 +249,170 @@ Quoting a single figure (8.73x or 14.47x) as if it were a stable constant
 overstates the precision. The direction and magnitude of the win are robust; the
 second decimal place is not. Any e2e tok/s number must carry the same caveat until
 it is taken on a quiet box.
+
+## INTEGRATION ATTEMPT — the numbers above compare against the WRONG path
+
+### The premise in the sections above is wrong (source is the authority)
+
+`mm_matvec` does **not** call `q4k_matvec_real`. Read `lib/std/lfm2_mm.quanta`:
+the row loop calls `mm_load_row` / `mm_deq_row_raw` (which dispatch to
+`read_block_f64` -> `dq32lo`/`dq32hi`) and then `mm_dot4_s`. `q4k_matvec_real`
+lives in `lib/std/matmul_q4k.quanta` and is the **scalar** `q4k_block_dot` path.
+So "8.73x / 12.30x faster than the production matvec" is a comparison against a
+path the loader does not execute.
+
+Measured against the shape it DOES execute — 64 real Q4_K rows of the model's
+FFN-gate tensor (idx 4, dtype 12, cols 2048, 1152-byte rows, nsuper 8), in
+`tests/lfm2_jit_mm_test.quanta`:
+
+    BITIDENT fused_vs_mm_deq+dot4: mismatches=0 / 64
+
+Bit-identical to `mm_deq_row_raw + mm_dot4_s` too, and for a real reason rather
+than luck: the per-element `w = q*(d*Kn) - (dmin*Mn)` is the same expression and
+the 4-lane summation order matches (`(l0+l1)+(l2+l3)` both sides). So the fused
+kernel IS safe to substitute for the production dot.
+
+### The DMD table build is 70-84% of the fused cost — the 8.73x does not survive contact
+
+`tests/jit_vs_prod_test.quanta` fills the DMD factor table ONCE, **outside** its
+timing loop, so its ratio EXCLUDES the table build. In the real path the table
+must be rebuilt for every row (it is derived from that row's raw bytes). Timed
+separately and interleaved, 64 real rows, best of 4 (`tests/lfm2_jit_mm_test.quanta`):
+
+| run | A prod (deq+dot4) | B dmd build only | C kernel only | D = build+kernel | A/D | A/C | B/D |
+|---|---|---|---|---|---|---|---|
+| quiet-ish | 1,261,621 | 338,336 | 115,982 | 450,664 | 2.79x | 10.87x | 75% |
+| mid load  | 1,121,472 | 294,582 | 99,904 | 417,543 | 2.68x | 11.22x | 70% |
+| loaded    | 772,876 | 204,989 | 58,159 | 258,586 | 2.98x | 13.28x | 79% |
+| loaded    | 906,137 | 245,376 | 66,281 | 303,449 | 2.98x | 13.67x | 80% |
+| loaded    | 1,135,857 | 601,430 | 131,259 | 714,011 | 1.59x | 8.65x | 84% |
+
+Read it as: **the kernel alone is 8.7-13.7x, but the per-row DMD build is bigger
+than the kernel it feeds, so the integrated win on the Q4_K dot is only ~2.7x
+(1.6-3.0x across load states).** This is the number that belongs in any e2e
+projection, and it is the reason a per-tensor (cached) DMD table is the natural
+next lever rather than a kernel change. (A `level 2` cached-DMD design was
+implemented and measured-compilable but could not be exercised — see below.)
+
+### Blocked: `closure_call` cannot be reached from an imported module
+
+Wiring the kernel into `lfm2_forward`'s dot path requires the dispatch to happen
+inside a library module (`lfm2_mm` / `lfm2_forward`), and that is exactly what
+qc 0.0.245 miscompiles. Minimal 2-module reproducer (imports `std/jit_x86` and
+`std/jit_x86_fused` only), identical tuple, argument area and bytes:
+
+    let va = closure_call(tbl, asz, 0)   // inline in main
+                                         //   -> 4700186342854754304   OK
+    let vc = jit_f_apply(asz)            // helper in the imported module
+                                         //   -> SIGSEGV, rc=139
+
+Every formulation of the imported-module call faulted: tuple as a module global,
+tuple as a parameter, tuple built locally, with and without surrounding
+`mem_store`, one caller or five, and from `lib/std/lfm2_mm.quanta`. In **larger**
+translation units the same construct traps the **compiler** instead (SIGILL,
+rc=132) — `qc -O tests/lfm2_generate.quanta` dies, where pristine `lfm2_mm`
+compiles. Bisection of the trap: it needs `mem_store` through a parameter AND
+`closure_call` in one body; a local alias makes it compile but the emitted code
+still faults; stores through a module global compile (`probe B`). Every splt
+shape was tried (stores/call in separate functions, small module, `jit_x86_fused`
+instead of `lfm2_mm`) — all fault or trap.
+
+Also worth recording: `mm_matvec`'s dispatch site is a *matrix of modules* (the
+decoder bench, `lfm2_forward`, `lfm2_mm`, `jit_x86_fused`), so the workaround
+of "dispatch from the top-level module" is not available — the per-row dot is
+four frames below `main`.
+
+**Status: the integration is blocked on a compiler fix outside this unit's
+scope (`compiler/**`).** A one-line `call r11` emitter bug or a missing
+`r11` save in the CLOSURE_CALL lowering would be the thing to look at; the
+reproducer above is 12 lines and deterministic.
+
+### What was shipped, and what was deliberately NOT shipped
+
+- `lib/std/lfm2_mm.quanta` — **left PRISTINE** (`git checkout`). The fused
+  dispatch was written, compiled and exercised, but every reachable shape faults,
+  so shipping it would ship a path that crashes. The flag-guarded branches were
+  reverted rather than left dead-and-crashing.
+- `lib/std/jit_x86_fused.quanta` — adds `jit_f_setup()` / `jit_f_ready()` and
+  `jit_f_apply(as)`, the high-level entry the wiring needs, marked
+  **BLOCKED** in place. They compile in every TU that imports them (verified:
+  `jit_vs_prod_test`, `jit_diag_test`, `stdlib_lfm2_mm_test`) and are never
+  called, so they cannot change behaviour. They exist so the eventual fix has
+  one obvious place to land.
+- `tests/lfm2_jit_mm_test.quanta` — NEW. Bit-identity against the real mm shape
+  (section 1) and the DMD/kernel cost split (section 2), both on real Q4_K rows.
+  Section 3 records that the integration measurement is blocked.
+- `tests/lfm2_jit_cc_probe.quanta` — NEW. Runs the WORKING half of the
+  `closure_call` reproducer (inline dispatch, records the expected bits
+  4700186342854754304) and carries the exact broken half in its header, because a
+  SIGSEGV cannot be caught in-process.
+
+## END-TO-END — the flag-OFF baseline, 128/512/1024 in one process
+
+`tests/lfm2_decode_bench.quanta` run through `tests/run_lfm2_decode_bench.sh`
+(20 workers, `mm_set_workers_uncapped`, mmap path, norm cache on, `ignore_eos=1`),
+conf `20 128 512 1024 1 1 1`, temp 0, one process, all three lengths. Environment:
+governor `powersave`; load 12.4 at start rising to 20-25 during the run; `Hermes`
+holds ~756% CPU permanently and peer `python`/`python3` processes added ~190%
+during the run, so these numbers are LOAD-INFLATED — the same build read 3.49-3.69
+s/token at load 8-12 in the earlier campaign (section 3b of
+`docs/research/decode-fused-dot.md`) against 3.61/3.82/4.15 s/token here.
+
+Flag ON was NOT measurable: the fused dispatch cannot compile or run from
+`lfm2_mm` (see the blocker section above). Every row below is therefore the
+UNCHANGED baseline, which is also the control the ON side would have been
+compared against.
+
+| len | gen_ms | ms/tok avg* | ms/tok med | ms/tok max | tok/s | CPU% | anon MB/tok* | VmPeak MB/tok* | first argmax |
+|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| 128 | 461,731 | 3607.3 | 3648 | 3901 | 0.277 | ~774 | 1.03 | 4.34 | 597 |
+| 512 | 1,954,669 | 3817.7 | 3816 | 4378 | 0.261 | ~774 | 1.09 | 4.37 | 597 |
+| 1024 | 4,247,062 | 4147.5 | 4131 | 5257 | 0.241 | ~774 | 0.63 | 4.37 | 597 |
+
+- `*` = DERIVED (arithmetic on the measured deltas); everything else is measured
+  and printed by the bench. `ms/tok avg` = gen_ms / gen_tokens.
+- `tok_ms_min` is printed as **2 ms** in every run and is an artifact, not a fast
+  token: the final loop iteration has no forward pass (same convention as
+  `tests/lfm2_generate.quanta`), so `med`/`max` are the meaningful statistics.
+- CPU% is a `ps` lifetime average sampled mid-run3 — the bench does not report
+  CPU itself. It is far below the 1,600-1,900% target and slightly below the
+  811% previously recorded; under 20 workers on a 20-core box sharing ~950% with
+  `Hermes` and peers, that ceiling is the dispatch/bandwidth wall the earlier
+  campaign named, and it is untouched here.
+- Memory is NOT flat, and this is the BASELINE (no fused code in the path):
+  anon grows 0.63-1.09 MB/token and VmPeak 4.34-4.37 MB/token. The 1024-token
+  rate (0.626 / 4.37 MB per token) reproduces the recorded 0.59-0.65 / 4.34-4.37
+  exactly. So the stability contract FAILS on the baseline build, before any of
+  this unit's work — the 1,024-token row is a fresh data point (the earlier
+  campaign launched it and never harvested it) and it confirms the leak is
+  linear to 13.5 GB VmPeak, not a startup artifact.
+- The 1024-token run survived: VmPeak 13.54 GB of the 32 GB `run_lfm2_decode_bench.sh`
+  cap.
+- Rate is nearly context-independent (0.277 -> 0.241 tok/s across 128 -> 1024
+  tokens): decode is weights-dominated at these lengths, so a faster dot path
+  would show up almost linearly. That is what makes the fused path worth
+  unblocking.
+- Oracle: first-token argmax **597** in all three runs, identical to the recorded
+  baseline (decode-fused-dot.md section 3b). The `5922` / `The answer is: 2`
+  oracle quoted in the integration brief is STALE — the current
+  `tests/lfm2_prompt.txt` yields 597 and `The answer is 4`, as that doc already
+  records ("the 5922 figure in older docs predates the current prompt file").
+  Generated ids begin `597 4695 20589 34 496 2992 355 229 ...` and the text opens
+  `The user asks: "What is 2+2? Answer with the number only." ... The answer is 4.`
+
+### The honest gap
+
+    llama.cpp, same model / same box / 20 threads : 17.32 tok/s
+    native loader, this session, 512 tokens       :  0.261 tok/s   -> 66x
+    native loader, this session, 1024 tokens      :  0.241 tok/s   -> 72x
+
+The fused kernel, IF it could be dispatched, is worth ~2.7x on the Q4_K dot
+(measured, section above) — and Q4_K is only part of the per-token work (the tied
+Q6_K output projection and the Q6_K down-projection are not fused by this kernel).
+Composing honestly: even a perfect, free-dispatch integration of a 2.7x Q4_K dot
+lands near 0.4-0.5 tok/s, i.e. ~35-40x from llama.cpp, with the pool-scaling cap
+(~5.3x, measured in section 3b) and the 774% CPU ceiling still in the way. The
+1,024-token measurement also shows the baseline degrading with the leak, so any
+future e2e claim must be quoted WITH its token length.
+
+

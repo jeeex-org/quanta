@@ -314,6 +314,52 @@ fn jit_f_alloc(nbytes: i64) -> i64 {
     return base
 }
 
+// ============================================================================
+// HIGH-LEVEL ENTRY: one Q4_K row dot, ready to call from a model module
+// ============================================================================
+//
+// STATUS: BLOCKED BY A COMPILER DEFECT -- NOT USABLE YET. Do not wire this into
+// lfm2_forward/mm until the defect is fixed; jit_f_apply faults at run time.
+//
+// qc 0.0.245 miscompiles closure_call when it is reached from a function inside
+// an IMPORTED module. Measured, minimal 2-module TU (imports jit_x86 +
+// jit_x86_fused only), identical tuple / argument area / bytes:
+//
+//     let va = closure_call(tbl, asz, 0)   // inline in main -> 4700186342854754304
+//     let vc = jit_f_apply(asz)            // via this module -> SIGSEGV (rc=139)
+//
+// The same fault appears with the tuple passed as a parameter, with a local
+// tuple, with/without accompanying mem_store, and from lfm2_mm.quanta; the call
+// also traps the COMPILER (SIGILL, rc=132) in larger translation units. Inline
+// in the program's top-level module it always works, which is why every existing
+// test dispatches the kernel that way. Full evidence:
+// docs/research/jit-fused-dot-status.md and tests/lfm2_jit_cc_probe.quanta.
+//
+// jit_f_setup() emits the kernel ONCE and keeps the closure tuple here, so the
+// callers only have to supply the argument area once the defect is fixed.
+let jf_tbl = 0
+
+fn jit_f_setup() -> i64 {
+    if jf_tbl != 0 { return 0 }
+    if jit_f_alloc(65536) <= 0 { return -1 }
+    let t = jit_f_code(jit_f_build())
+    if t <= 0 { return -2 }
+    jf_tbl = t
+    return 0
+}
+
+fn jit_f_ready() { return jf_tbl }
+
+// Call the emitted kernel with the argument area at `as` (4 qwords:
+// W, X, DMD, nsuper). Returns the dot as raw f64 bits.
+//
+// BLOCKED: faults when reached from here (an imported module) -- see the STATUS
+// note above. Kept because it is the interface the wiring needs, and because it
+// is the smallest reproducer of the defect.
+fn jit_f_apply(as) -> i64 {
+    return closure_call(jf_tbl, as, 0)
+}
+
 // ---- the per-(row Sub-block) dequant argument table ------------------------
 // The kernel reads its scale/min factors from a precomputed table rather than
 // doing f16 arithmetic in the hot loop. Layout, per super-block:
