@@ -52,6 +52,49 @@ const NCTX = 2048
 const MAXTOK = 1200
 
 let plen = 0
+// sampling/argmax+detok ns accumulated over the current decode run (conf field
+// 10, the opt-in profile). Part of the per-token wall time that is NOT in the
+// forward, so the phase table is reported beside it rather than instead of it.
+let pr_arg_ns = 0
+
+// ---- opt-in per-stage profile dump (conf field 10) -------------------------
+// The LABELS come from the library (fc_prof_label / mm_prof_label), never from a
+// copy in this file: a drifted hand-copied index table prints the right name over
+// the wrong phase and reads as a finding. fc_* rows are ns accumulated over the
+// whole run, printed as a total and per token; mm_* labels carry their own unit.
+fn prof_line(tag, slot, ns, toks) {
+    prints("prof "); prints(tag); prints(" "); prints(fc_prof_label(slot))
+    prints(" us_tot="); print(ns / 1000)
+    prints(" us_tok=")
+    if toks > 0 { print(ns / toks / 1000) } else { print(0) }
+    newline()
+}
+
+fn prof_dump(tag, toks, glen) {
+    prints("prof "); prints(tag); prints(" len="); print(glen)
+    prints(" toks="); print(toks)
+    prints(" clock_ns="); print(fc_prof_cal_ns())
+    prints(" slots="); print(fc_prof_nslot()); newline()
+    let i = 0
+    while i < fc_prof_nslot() {
+        prof_line(tag, i, fc_prof_ns(i), toks)
+        i = i + 1
+    }
+    i = 0
+    while i < mm_prof_nslot() {
+        prints("prof "); prints(tag); prints(" pool_"); prints(mm_prof_label(i))
+        prints("="); print(mm_prof_ns(i)); newline()
+        i = i + 1
+    }
+    prints("prof "); prints(tag); prints(" pool_worker_busy_ns=")
+    print(mm_prof_work_ns()); newline()
+    prints("prof "); prints(tag); prints(" pool_concurrency_x100=")
+    print(mm_prof_concurrency_x100()); newline()
+    prints("prof "); prints(tag); prints(" sampling_ns="); print(pr_arg_ns)
+    prints(" sampling_us_tok=")
+    if toks > 0 { print(pr_arg_ns / toks / 1000) } else { print(0) }
+    newline()
+}
 
 fn slurp(fd) {
     if fd < 0 { return 0 }
@@ -207,6 +250,7 @@ fn main() {
     let igneos = 0
     let fused = 0
     let fused6 = 0
+    let prof = 0
     if cfgb != 0 {
         let nf = parse_ints(cfgb, conf)
         if nf >= 1 { nw = mem_load(conf) }
@@ -218,6 +262,7 @@ fn main() {
         if nf >= 7 { igneos = mem_load(conf + 48) }
         if nf >= 8 { fused = mem_load(conf + 56) }
         if nf >= 9 { fused6 = mem_load(conf + 64) }
+        if nf >= 10 { prof = mem_load(conf + 72) }
     } else {
         prints("warn: conf unreadable; defaults\n")
     }
@@ -228,6 +273,7 @@ fn main() {
     prints(" ignore_eos="); print(igneos)
     prints(" fused_q4k="); print(fused)
     prints(" fused_q6k="); print(fused6)
+    prints(" prof="); print(prof)
     prints(" (argmax temp=0)\n")
 
     let t0 = clock()
@@ -281,6 +327,15 @@ fn main() {
     // down and respawned for every token (the A9 leak class, paid per token).
     mm_pool_begin()
 
+    // Opt-in per-stage profile (conf field 10). Enabled AFTER load/config so
+    // the calibration sample is not polluted by the mmap prefault, and it stays
+    // on for the whole run set. fc_prof_cal_ns() is in every profile dump so the
+    // mark cost is reported rather than assumed away.
+    if prof != 0 {
+        fc_prof_enable()
+        mm_prof_enable()
+    }
+
     // ---- three runs, reset between ----
     let run = 1
     while run <= 3 {
@@ -298,6 +353,14 @@ fn main() {
             i = i + 1
         }
         let tp1 = clock()
+        if prof != 0 {
+            // prefill profile: one dump, then a reset so the decode table below
+            // covers only the decode loop.
+            prof_dump("prefill", n, n)
+            fc_prof_reset()
+            mm_prof_reset()
+        }
+        pr_arg_ns = 0
 
         let rss0 = rss_total_kb()
         let anon0 = rollup_kb(65, 110, 111, 110)    // "Anon"
@@ -326,6 +389,10 @@ fn main() {
                 b = b + 1
             }
             if tk < gl + 16 { mem_store(idbuf + nid * 8, id); nid = nid + 1 }
+            // sampling = argmax over the full 128000-vocab logits + detok. Part
+            // of the per-token wall time that is NOT in the forward, so it is
+            // accumulated separately (conf field 10).
+            pr_arg_ns = pr_arg_ns + (clock() - ts)
             tk = tk + 1
             if id == bpe_eos {
                 mem_store8(text + tlen, 10)
@@ -357,6 +424,7 @@ fn main() {
         let g1 = clock()
         let rss1 = rss_total_kb()
         let anon1 = rollup_kb(65, 110, 111, 110)
+        if prof != 0 { prof_dump("decode", k, gl) }
 
         // ---- report ----
         prints("---run"); print(run); prints("---\n")

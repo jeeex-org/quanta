@@ -1,0 +1,55 @@
+// tests/prof_label_probe.quanta -- does a string literal survive being RETURNED
+// from a function declared `-> i64`? The per-stage profile hands its row labels
+// out through fc_prof_label()/mm_prof_label() so a driver cannot mislabel a row
+// (the positional-conf failure class), and that only works if the literal is
+// still a valid pointer on the other side. Probe the mechanism in isolation
+// before trusting a 10-minute model run to it.
+//
+// Build: compiler/<ver>/bin/x86/qc tests/prof_label_probe.quanta <bin>
+import std/lfm2_forward
+import std/gguf_mm
+
+fn lab(s) -> i64 {
+    if s == 0 { return "alpha" }
+    if s == 1 { return "beta" }
+    return "?"
+}
+
+fn main() {
+    prints("direct_literal: hello\n")
+    prints("func_i64_0: ")
+    prints(lab(0))
+    newline()
+    prints("func_i64_1: ")
+    prints(lab(1))
+    newline()
+    prints("func_i64_2: ")
+    prints(lab(2))
+    newline()
+
+    let i = 0
+    while i < fc_prof_nslot() {
+        prints("fc[")
+        print(i)
+        prints("]=")
+        prints(fc_prof_label(i))
+        newline()
+        i = i + 1
+    }
+    i = 0
+    while i < mm_prof_nslot() {
+        prints("mm[")
+        print(i)
+        prints("]=")
+        prints(mm_prof_label(i))
+        newline()
+        i = i + 1
+    }
+    prints("nslot_fc=")
+    print(fc_prof_nslot())
+    prints(" nslot_mm=")
+    print(mm_prof_nslot())
+    newline()
+    prints("DONE\n")
+    return 0
+}
