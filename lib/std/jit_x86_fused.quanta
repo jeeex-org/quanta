@@ -306,12 +306,13 @@ fn jit_f_build() -> i64 {
 //      mins  [0..3] = sc[4..7] & 63
 //      mins  [4..7] = (sc[8..11] >> 4) | ((sc[4..7] >> 6) << 4)
 //
-// Each is expressed as shifts, not masks-witha-constant-register, so no
+// Each is expressed as shifts, not mask-with-a-constant-register, so no
 // constant pool is needed: (x<<26)>>26 == x & 63 and (x<<28)>>28 == x & 15.
 // The per-lane arithmetic and the four-lane accumulation order are IDENTICAL
 // to the table variant, so this kernel stays bit-exact against
-// mm_deq_row_raw + mm_dot4_s. Verified 0/64 mismatches, and 0 mismatches
-// against the table kernel, on real FFN-gate rows.
+// mm_deq_row_raw + mm_dot4_s. Verified 0/512 mismatches on the FFN-gate rows
+// and 0/128 on a 10752-column, 42-super-block row (this tensor and one other
+// distinct shape), for BOTH this kernel and the table kernel.
 //
 // ARGS AREA: [W, X, DMD, nsuper] is unchanged; [rdi+16] is simply not read.
 

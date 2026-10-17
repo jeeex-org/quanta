@@ -119,41 +119,91 @@ fn main() {
     let asz = mem_alloc(32)
     let toff = gguf_tensor_offset(tg)
 
-    // ---- 1. BIT-IDENTITY over real rows: folded vs mm shape, folded vs table
-    let mism_fold = 0
-    let mism_tab = 0
-    let checked = 0
-    let r = 0
-    while r < NID {
-        let raw = mm_map_base + toff + r * rb
-        if mm_deq_row_raw(12, raw, dm, f64b) != 0 { prints("FAIL deq\n"); return 1 }
-        let prod = mm_dot4_s(f64b, x, dm, acc)
-        let pb = row_bits(prod_out, prod)
-
-        let b = 0
-        while b < nsuper {
-            jit_f_dmd_fill(raw + b * 144, raw + b * 144 + 4,
-                           f16_to_f64(raw + b * 144), f16_to_f64(raw + b * 144 + 2),
-                           dmd + b * 128)
-            b = b + 1
+    // ---- 1. BIT-IDENTITY on real rows of SEVERAL Q4_K tensors --------------
+    // One tensor would only prove the gate matrix. The folded kernel is pure
+    // arithmetic on (d, dmin, 12 scale bytes, nibbles), but the model's Q4_K
+    // tensors have different shapes, so this scans ALL tensors and tests the
+    // first Q4_K tensor for each DISTINCT super-block count (cols/256) -- so
+    // shape diversity is guaranteed rather than hoped for -- each with a
+    // DIFFERENT x, because an all-zero x "matches" trivially on both sides.
+    let big_dmd = jit_f_dmd_alloc(160)          // 160 super-blocks = 20480 B
+    let seen = mem_alloc(64)                    // up to 8 distinct cols values
+    let nseen = 0
+    let tot_tab = 0
+    let tot_fold = 0
+    let tot_checked = 0
+    let nall = gguf_num_tensors()
+    let ti2 = 0
+    while ti2 < nall {
+        if nseen < 8 {
+            let dt2 = gguf_tensor_dtype(ti2)
+            let cols2 = gguf_tensor_dim(ti2, 0)
+            let nsup2 = cols2 / 256
+            let rb2 = mm_row_bytes(dt2, cols2)
+            if dt2 == 12 && nsup2 > 0 && nsup2 * 256 == cols2 && nsup2 <= 160
+               && cols2 <= 32768 && rb2 == nsup2 * 144 {
+                let dup = 0
+                let q = 0
+                while q < nseen {
+                    if mem_load(seen + q * 8) == cols2 { dup = 1 }
+                    q = q + 1
+                }
+                if dup == 0 {
+                    mem_store(seen + nseen * 8, cols2)
+                    nseen = nseen + 1
+                    let avail = gguf_tensor_nelements(ti2) / cols2
+                    let nrows = 96
+                    if cols2 > 4096 { nrows = 32 }
+                    if nrows > avail { nrows = avail }
+                    let x2 = mem_alloc(cols2 * 8)
+                    let j = 0
+                    while j < cols2 {
+                        mem_store(x2 + j * 8, i2f((j * (13 + ti2)) % 97 - 48) / i2f(53))
+                        j = j + 1
+                    }
+                    let f2 = mem_alloc(cols2 * 8)
+                    let a2 = mem_alloc(64)
+                    let to2 = gguf_tensor_offset(ti2)
+                    let mf = 0
+                    let mt = 0
+                    let rr = 0
+                    while rr < nrows {
+                        let raw = mm_map_base + to2 + rr * rb2
+                        if mm_deq_row_raw(12, raw, cols2, f2) != 0 { prints("FAIL deq\n"); return 1 }
+                        let prod = mm_dot4_s(f2, x2, cols2, a2)
+                        let pb = row_bits(prod_out, prod)
+                        let bb = 0
+                        while bb < nsup2 {
+                            jit_f_dmd_fill(raw + bb * 144, raw + bb * 144 + 4,
+                                           f16_to_f64(raw + bb * 144), f16_to_f64(raw + bb * 144 + 2),
+                                           big_dmd + bb * 128)
+                            bb = bb + 1
+                        }
+                        mem_store(asz + 0, raw)
+                        mem_store(asz + 8, x2)
+                        mem_store(asz + 16, big_dmd)
+                        mem_store(asz + 24, nsup2)
+                        if closure_call(tbl_tab, asz, 0) != pb { mt = mt + 1 }
+                        mem_store(asz + 16, 0)      // folded must NOT need a DMD
+                        if closure_call(tbl_fold, asz, 0) != pb { mf = mf + 1 }
+                        rr = rr + 1
+                    }
+                    prints("  idx="); print(ti2)
+                    prints(" cols="); print(cols2); prints(" nsuper="); print(nsup2)
+                    prints(" rows="); print(nrows)
+                    prints(" table_mism="); print(mt); prints(" folded_mism="); print(mf); newline()
+                    tot_tab = tot_tab + mt
+                    tot_fold = tot_fold + mf
+                    tot_checked = tot_checked + nrows
+                }
+            }
         }
-        mem_store(asz + 0, raw)
-        mem_store(asz + 8, x)
-        mem_store(asz + 16, dmd)
-        mem_store(asz + 24, nsuper)
-        let tb = closure_call(tbl_tab, asz, 0)
-
-        mem_store(asz + 16, 0)          // folded kernel must NOT need a DMD
-        let fb = closure_call(tbl_fold, asz, 0)
-
-        if tb != pb { mism_tab = mism_tab + 1 }
-        if fb != pb { mism_fold = mism_fold + 1 }
-        checked = checked + 1
-        r = r + 1
+        ti2 = ti2 + 1
     }
-    prints("BITIDENT table_vs_mm   : mismatches="); print(mism_tab); prints(" / "); print(checked); newline()
-    prints("BITIDENT folded_vs_mm  : mismatches="); print(mism_fold); prints(" / "); print(checked); newline()
-    if mism_tab != 0 || mism_fold != 0 { prints("STOP: bit-identity FAILED\n"); return 1 }
+    prints("distinct Q4_K shapes tested="); print(nseen)
+    prints("  BITIDENT total: table_mism="); print(tot_tab)
+    prints(" folded_mism="); print(tot_fold); prints(" / "); print(tot_checked); newline()
+    if tot_tab != 0 || tot_fold != 0 { prints("STOP: bit-identity FAILED\n"); return 1 }
     prints("bit-identical (both kernels, DMD slot zeroed for folded): OK\n")
 
     // ---- 2. the cost split, two run lengths, interleaved best-of-REPS -----
