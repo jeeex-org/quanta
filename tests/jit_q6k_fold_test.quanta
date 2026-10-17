@@ -1,0 +1,152 @@
+// tests/jit_q6k_fold_test.quanta
+//
+// ELEMENT-LEVEL BIT-IDENTITY of the folded Q6_K dequant-dot kernel
+// (jit_f_apply_folded_q6k) against the shape pl_run_rows_map executes on its
+// un-fused branch: mm_deq_row_raw(dtype 14) + mm_dot4_s.
+//
+// WHY THIS ROW EXISTS. The 128,000-logit test (tests/lfm2_fused_logits_test)
+// is the integration bar, but when it goes red it says only "some logit moved".
+// This row isolates the kernel: it walks EVERY Q6_K tensor in the model (19 of
+// them: 14 ffn_down [10752,2048], 4 attn_v [2048,512], 1 token_embd
+// [2048,128000]), takes real rows straight from the mmap, and diffs the kernel's
+// f64 result against the dequant+dot pair BIT FOR BIT -- not to a tolerance.
+//
+// The three properties that make identity hold (per-element rounding, lane
+// assignment, accumulation order) are argued in the kernel header in
+// lib/std/jit_x86_fused.quanta. Two x vectors are used so a bug that cancels on
+// one input cannot pass: (a) the model's REAL activation fc_fw_f / fc_fw_n after
+// one forward, (b) a synthetic vector with a wide magnitude range and both
+// signs. The kernel never reads the length of x, so the same 10752-long buffer
+// serves every tensor.
+//
+// Build: ./compiler/0.0.246/bin/x86/qc -O tests/jit_q6k_fold_test.quanta <bin>
+// Run (model is 1.67 GB; the VA cap must exceed it):
+//   ( ulimit -c 0 -v 32000000; nice -n 0 <bin> </dev/null )
+// Exit 0 + PASS when every tensor is 0-mismatch on both x vectors.
+
+import std/gguf
+import std/lfm2_forward
+import std/lfm2_model
+import std/gguf_mm
+import std/gguf_bpe
+import std/fs
+import std/jit_x86
+import std/jit_x86_fused
+
+const Q4_PATH = "/opt/ai/models/quanta/QUANTA-LFM2.5-2.6Bv1-Q4_K_M.gguf"
+const NCTX = 2048
+const NROWS = 8           // rows per tensor
+const MAXCOLS = 16384
+
+fn main() {
+    prints("=== folded Q6_K kernel: element-level bit-identity ===\n")
+
+    if jit_f_setup_folded_q6k() != 0 { prints("FAIL jit_f_setup_folded_q6k\n"); return 10 }
+    let tbl = jit_f_ready_folded_q6k()
+    if tbl <= 0 { prints("FAIL q6k tuple\n"); return 11 }
+    prints("q6k_entry="); print(mem_load(tbl)); newline()
+
+    if gguf_load(Q4_PATH) != 0 { prints("FAIL gguf_load\n"); return 1 }
+    if fc_read_config() != 0 { prints("FAIL fc_read_config\n"); return 1 }
+    if bpe_init_from_gguf() == 0 { prints("FAIL bpe_init\n"); return 1 }
+    if fc_kv_init(NCTX) != 0 { prints("FAIL fc_kv_init\n"); return 1 }
+    if fc_fw_init() != 0 { prints("FAIL fc_fw_init\n"); return 1 }
+    mm_set_workers(0)
+    mm_set_embed_workers(0)
+    if mm_attach_mmap_fd(file_open(Q4_PATH, 0)) != 0 { prints("FAIL mm_attach_mmap\n"); return 1 }
+    prints("mmap_base="); print(mm_map_base); newline()
+
+    // one real forward so fc_fw_f holds a real d_ff activation (ffn_down's input)
+    // and fc_fw_n a real d_model activation.
+    if fc_fw_reset() != 0 { prints("FAIL fc_fw_reset\n"); return 1 }
+    if fc_forward_token_ex(124894, 0, 1) != 0 { prints("FAIL forward\n"); return 1 }
+
+    let xreal = mem_alloc(MAXCOLS * 8)
+    let xsynt = mem_alloc(MAXCOLS * 8)
+    let c = 0
+    while c < MAXCOLS {
+        // real: copy fc_fw_f (d_ff) then wrap; magnitudes and signs are the model's
+        mem_store(xreal + c * 8, mem_load(fc_fw_f + (c - (c / fc_d_ff) * fc_d_ff) * 8))
+        // synthetic: mixed magnitudes, both signs, wide exponent range
+        let u = i2f(c - (c / 1024) * 1024)              // 0..1023
+        let t = i2f((c - (c / 3) * 3) - 1)              // -1,0,1
+        let v: f64 = (u - 511.5) * 0.000244140625 + t * 0.0009765625
+        mem_store(xsynt + c * 8, v)
+        c = c + 1
+    }
+
+    let f64b = mem_alloc(MAXCOLS * 8)
+    let acc = mem_alloc(64)
+    let argp = mem_alloc(32)
+    let wb = mem_alloc(8)
+
+    let nten = gguf_num_tensors()
+    prints("tensors="); print(nten); newline()
+
+    let nq6 = 0
+    let tot_a = 0
+    let tot_b = 0
+    let nz = 0
+    let idx = 0
+    while idx < nten {
+        if gguf_tensor_dtype(idx) == 14 {
+            let cols = gguf_tensor_dim(idx, 0)
+            let ne = gguf_tensor_nelements(idx)
+            let rows = ne / cols
+            let rb = mm_row_bytes(14, cols)
+            if cols - (cols / 256) * 256 != 0 { prints("BAD cols not multiple of 256\n"); return 20 }
+            if rb != (cols / 256) * 210 { prints("BAD row bytes\n"); return 21 }
+            let toff = gguf_tensor_offset(idx)
+            let nr = NROWS
+            if nr > rows { nr = rows }
+
+            let pass = 0
+            while pass < 2 {
+                let x = xreal
+                if pass == 1 { x = xsynt }
+                let mism = 0
+                let r = 0
+                while r < nr {
+                    let raw = mm_map_base + toff + r * rb
+                    mem_store(argp, raw)
+                    mem_store(argp + 8, x)
+                    mem_store(argp + 16, 0)
+                    mem_store(argp + 24, cols / 256)
+                    let got = jit_f_apply_folded_q6k(argp)
+                    if mm_deq_row_raw(14, raw, cols, f64b) != 0 { prints("FAIL mm_deq_row_raw\n"); return 22 }
+                    let want = mm_dot4_s(f64b, x, cols, acc)
+                    mem_store(wb, want)
+                    if mem_load(wb) != got { mism = mism + 1 }
+                    if got != 0 { nz = nz + 1 }
+                    r = r + 1
+                }
+                if pass == 0 { tot_a = tot_a + mism } else { tot_b = tot_b + mism }
+                pass = pass + 1
+            }
+            prints("q6k idx="); print(idx)
+            prints(" rows="); print(rows); prints(" cols="); print(cols)
+            prints(" real_mism="); print(tot_a); prints(" synth_mism="); print(tot_b)
+            newline()
+            nq6 = nq6 + 1
+        }
+        idx = idx + 1
+    }
+
+    prints("---\n")
+    prints("q6k_tensors="); print(nq6); newline()
+    prints("REAL-X  total mismatches over "); print(nq6 * NROWS); prints(" rows: "); print(tot_a); newline()
+    prints("SYNTH-X total mismatches over "); print(nq6 * NROWS); prints(" rows: "); print(tot_b); newline()
+    prints("nonzero_results="); print(nz); prints(" of "); print(nq6 * NROWS * 2); newline()
+    if nq6 != 19 { prints("FAIL: expected 19 Q6_K tensors\n"); return 30 }
+    if nz != nq6 * NROWS * 2 {
+        prints("FAIL: some kernel result was exactly zero -- the comparison is vacuous\n")
+        return 31
+    }
+    if tot_a != 0 || tot_b != 0 {
+        prints("FAIL: the folded Q6_K kernel is NOT bit-identical to mm_deq_row_raw+mm_dot4_s\n")
+        return 1
+    }
+    prints("PASS: folded Q6_K kernel bit-identical on every Q6_K tensor (both x vectors)\n")
+    prints("DONE\n")
+    return 0
+}

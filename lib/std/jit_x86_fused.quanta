@@ -491,6 +491,211 @@ fn jit_f_build_folded() -> i64 {
 }
 
 // ============================================================================
+// FOLDED Q6_K DEQUANT-DOT KERNEL (dtype 14) -- the twin of the Q4_K kernel
+// ============================================================================
+// WHY. Q4_K is 78.69% of the model's per-token matvec elements and its folded
+// kernel landed first. The remaining 21.30% (574,619,648 elements, from the
+// model's own header) is Q6_K and had NO folded twin, so those rows kept the
+// two-pass shape: dequantise 256 weights into an f64 row (dq6, SIMD since
+// 0.0.243) and then dot that row (mm_dot4_s). Q6_K covers NINETEEN tensors:
+//   14 x blk.N.ffn_down.weight  [10752, 2048]  (22020096 elems each)
+//    4 x blk.N.attn_v.weight    [ 2048,  512]
+//    1 x token_embd.weight      [ 2048,128000]   <- the tied output projection
+// The first eighteen go through the SAME pool kind 4 route Q4_K uses
+// (mm_matvec -> mm_matvec_par -> pl_run_rows_map), so one branch there fuses
+// them. token_embd does NOT: it is pool kind 5 (pl_run_embed_map) with a
+// DIFFERENT reference dot -- a strict left-to-right scalar chain, not
+// mm_dot4_s's four lanes -- so it is deliberately left un-fused here (see the
+// COVERAGE note in gguf_mm.quanta). 
+//
+// WHAT IS FUSED. dot(row, x) is computed straight from the raw block, so the
+// f64 row is never written and never re-read, and the (d*sc) factors are
+// derived in-kernel from the block header rather than from a caller-built
+// table. This is the exact structural twin of jit_f_build_folded() above; only
+// the block format and the per-element unpack differ.
+//
+// Q6_K BLOCK (210 bytes -> 256 weights), transcribed from ggml-quants.c and
+// from lib/std/gguf.quanta's dequant_q6k / mm_deq_row_raw dtype 14:
+//
+//    +0    u8  ql[128]   low 4 bits of every quant
+//    +128  u8  qh[64]    high 2 bits of every quant
+//    +192  i8  sc[16]    one signed scale per 16 weights
+//    +208  f16 d         super-block scale
+//
+//   For a 128-element half (n = 0,1; ql at +n*64, qh at +128+n*32, sc at
+//   +192+n*8) and a section s = 0..3:
+//     s=0  y[ 0.. 31]  ql[ 0..31] &15, qh>>0, sc[0] sc[1]
+//     s=1  y[32.. 63]  ql[32..63] &15, qh>>2, sc[2] sc[3]
+//     s=2  y[64.. 95]  ql[ 0..31] >>4, qh>>4, sc[4] sc[5]
+//     s=3  y[96..127]  ql[32..63] >>4, qh>>6, sc[6] sc[7]
+//   each section = two 16-element halves (one scale each) = four 4-element
+//   groups. Per element:
+//     q = (ql & 15 | ((qh >> 2s & 3) << 4)) - 32           in [-32,31]
+//     value = d * (sc * q)          sc*q EXACT, only the *d rounds
+//
+// BIT-EXACTNESS. The bar is the 128,000-logit test, and it demands identity
+// against mm_deq_row_raw(14) + mm_dot4_s, which is what pl_run_rows_map runs
+// on the un-fused branch. Three properties make that hold exactly:
+//   1. PER-ELEMENT ARITHMETIC. sc (i8) times q (int in [-32,31]) is an integer
+//      in [-4064,4064], exactly representable in binary64, so the vector form
+//      q -> vcvtdq2pd -> *sc -> *d rounds exactly where the scalar fmul(d,
+//      fmul(sc, q)) rounds (once, at *d), and then *x rounds once, same as
+//      mm_dot4_s's element product. d is decoded f16->f32->f64, both steps
+//      exact (f16's 11-bit significand fits f32's 24), matching f16_to_f64.
+//   2. LANE ASSIGNMENT. Groups are 4 consecutive elements and element k of a
+//      group lands in ymm0 lane k, so lane k accumulates the elements k, k+4,
+//      k+8, ... -- exactly mm_dot4_s's lane k.
+//   3. ORDER. mm_dot4_s walks c = 0,4,8,... in INCREASING element index, so
+//      lane k sees its elements in increasing order. This kernel walks
+//      n(0,1) -> s(0,1,2,3) -> h(0,1) -> g(0,1,2,3), whose destination index
+//      32s+16h+4g+k is itself increasing with the loop nesting. So every lane
+//      accumulates in the same order on both sides, and the final reduce
+//      ((l0+l1)+(l2+l3)) is byte-for-byte the same as mm_dot4_s's s0+s1.
+//   Float addition is not associative, so ALL THREE must hold; (2) and (3) are
+//   the ones that are easy to get subtly wrong, and the header comments here
+//   exist because the Q4_K kernel lost a day to exactly that class.
+//
+// REGISTER MAP
+//   rdi = AS entry pointer          r9  = W block cursor (advance 210/block)
+//   r10 = X cursor (advance 32/group)  rcx = nsuper   rax = return value
+//   ymm0 = 4-lane accumulator       ymm1 = d broadcast (f64)
+//   ymm2 = sc broadcast (f64, reloaded per 16-half)
+//   xmm3 = -32   xmm4 = 15   xmm5 = 3   (dword masks, built with vpcmpeqd)
+//   ymm6 = q/group scratch          ymm7 = qh scratch
+//   No callee-saved register is touched, so there is no prologue/epilogue.
+
+// ---- verified emit helpers (bytes pasted from `as` + `objdump -d`) ----------
+// vpmovzxbd xmm6, [r9+disp8]     c4 c2 79 31 71 <disp8>   (4 ql bytes -> 4 dwords)
+fn q6_ld_ql(d) -> i64 {
+    jbytes(5, "c4c2793171")
+    jb(d)
+    return 0
+}
+// vpmovzxbd xmm7, [r9+disp32]    c4 c2 79 31 b9 <disp32>  (4 qh bytes -> 4 dwords)
+// disp32 because the qh plane starts at +128, past the disp8 window.
+fn q6_ld_qh(d) -> i64 {
+    jbytes(5, "c4c27931b9")
+    ji32(d)
+    return 0
+}
+// vpbroadcastb xmm2, [r9+disp32] c4 c2 79 78 91 <disp32>
+fn q6_ld_sc(d) -> i64 {
+    jbytes(5, "c4c2797891")
+    ji32(d)
+    return 0
+}
+// vpmovsxbd xmm2, xmm2           c4 e2 79 21 d2   (sign-extend the i8 scale)
+fn q6_sc_sext() -> i64 { return jbytes(5, "c4e27921d2") }
+// vcvtdq2pd ymm2, xmm2           c5 fe e6 d2
+fn q6_sc_tod() -> i64 { return jbytes(4, "c5fee6d2") }
+// vpsrld xmm7, xmm7, sh          c5 c1 72 d7 <sh>
+fn q6_qh_shr(sh) -> i64 { jbytes(4, "c5c172d7"); jb(sh); return 0 }
+
+// The fastest safe load of the f16 d at [r9+208]. `vmovd xmm1,[r9+208]` would
+// read 4 bytes, i.e. 2 bytes PAST the end of the last block of the tensor; the
+// movzx word form reads exactly the 2 bytes the format promises.
+fn q6_d_load() -> i64 {
+    jbytes(8, "410fb781d0000000")   // movzx eax, word ptr [r9+208]
+    jbytes(4, "c5f96ec8")           // vmovd xmm1, eax
+    jbytes(5, "c4e27913c9")         // vcvtph2ps xmm1, xmm1   (f16 -> f32, exact)
+    jbytes(4, "c5fc5ac9")           // vcvtps2pd ymm1, xmm1   (f32 -> f64, exact)
+    jbytes(5, "c4e27d19c9")         // vbroadcastsd ymm1, xmm1 (lane 0 = d)
+    return 0
+}
+
+// The constant masks -32 / 15 / 3, built from vpcmpeqd (all-ones) plus shifts,
+// so no GPR and no constant pool is needed. Identical to the dq6 builtin.
+fn q6_consts() -> i64 {
+    jbytes(4, "c5e176db")           // vpcmpeqd xmm3,xmm3,xmm3
+    jbytes(5, "c5e172f305")         // vpslld xmm3,xmm3,5    -> -32
+    jbytes(4, "c5d976e4")           // vpcmpeqd xmm4,xmm4,xmm4
+    jbytes(5, "c5d972d41c")         // vpsrld xmm4,xmm4,28   -> 15
+    jbytes(4, "c5d176ed")           // vpcmpeqd xmm5,xmm5,xmm5
+    jbytes(5, "c5d172d51e")         // vpsrld xmm5,xmm5,30   -> 3
+    return 0
+}
+
+// One 4-element group -> one 4-double contribution into ymm0.
+//  ql offset : n*64 + (s&1)*32 + h*16 + g*4   (max 124 -> disp8)
+//  qh offset : 128 + n*32 + h*16 + g*4        (min 128 -> disp32)
+// ymm2 must already hold (double)sc for this 16-half; ymm1 holds d.
+fn q6_group(s, qlo, qho) -> i64 {
+    q6_ld_ql(qlo)
+    if s >= 2 { jbytes(5, "c5c972d604") }        // vpsrld xmm6,xmm6,4  high nibble
+    else { jbytes(4, "c5c9dbf4") }               // vpand xmm6,xmm6,xmm4  low nibble
+    q6_ld_qh(qho)
+    if s > 0 { q6_qh_shr(s * 2) }                // vpsrld xmm7,xmm7,2s
+    jbytes(4, "c5c1dbfd")                        // vpand xmm7,xmm7,xmm5  (&3)
+    jbytes(5, "c5c172f704")                      // vpslld xmm7,xmm7,4
+    jbytes(4, "c5c9ebf7")                        // vpor xmm6,xmm6,xmm7
+    jbytes(4, "c5c9fef3")                        // vpaddd xmm6,xmm6,xmm3  (-32)
+    jbytes(4, "c5fee6f6")                        // vcvtdq2pd ymm6,xmm6   (exact)
+    jbytes(4, "c5cd59f2")                        // vmulpd ymm6,ymm6,ymm2 (*sc, exact)
+    jbytes(4, "c5cd59f1")                        // vmulpd ymm6,ymm6,ymm1 (*d, rounds)
+    jbytes(5, "c4c14d5932")                      // vmulpd ymm6,ymm6,[r10] (*x, rounds)
+    jbytes(4, "c5fd58c6")                        // vaddpd ymm0,ymm0,ymm6 (lane k += elem k)
+    jbytes(4, "4983c220")                        // add r10, 32   (4 doubles)
+    return 0
+}
+
+// ============================================================================
+// jit_f_build_folded_q6k(): the whole leaf function, factor-free (d and the 16
+// scales are read from the block header in-kernel), same cadence as dq6.
+// ============================================================================
+fn jit_f_build_folded_q6k() -> i64 {
+    let entry = ja_pos()
+    j_f_load_w()               // r9  = W  (block cursor)
+    j_f_load_x()               // r10 = X
+    j_f_load_n()               // rcx = nsuper
+    j_f_vxorpd_y0()            // ymm0 = 0
+
+    let bodytop = ja_pos()     // the backward branch targets THIS address
+
+    q6_d_load()                // ymm1 = broadcast d
+    q6_consts()                // xmm3/4/5 = -32 / 15 / 3
+
+    // 256 weights = 2 halves x 4 sections x 2 sixteen-element halves x 4 groups.
+    let n = 0
+    while n < 2 {
+        let s = 0
+        while s < 4 {
+            let h = 0
+            while h < 2 {
+                // one scale per 16 weights: sc byte 192 + n*8 + 2s + h
+                q6_ld_sc(192 + n * 8 + s * 2 + h)
+                q6_sc_sext()
+                q6_sc_tod()
+                let g = 0
+                while g < 4 {
+                    q6_group(s, n * 64 + (s - (s / 2) * 2) * 32 + h * 16 + g * 4, 128 + n * 32 + h * 16 + g * 4)
+                    g = g + 1
+                }
+                h = h + 1
+            }
+            s = s + 1
+        }
+        n = n + 1
+    }
+    jbytes(7, "4981c1d2000000")    // add r9, 210   (one Q6_K super-block)
+
+    // sub rcx,1 ; jne rel32 -> bodytop. rel32 because the body is ~4 KB.
+    jbytes(4, "4883e901")
+    j_jne32()
+    let disp_at = ja_pos()
+    jbytes(4, "00000000")
+    if j_patch32(disp_at, bodytop) != 0 { return 0 - 1 }
+
+    // horizontal reduce: ((l0+l1)+(l2+l3)), identical to mm_dot4_s's s0+s1.
+    jbytes(6, "c4e37d39c201")      // vextracti128 xmm2, ymm0, 1
+    jbytes(4, "c5f97cd8")          // vhaddpd xmm3, xmm0, xmm0
+    jbytes(4, "c5e97ce2")          // vhaddpd xmm4, xmm2, xmm2
+    jbytes(4, "c5e358dc")          // vaddsd xmm3, xmm3, xmm4
+    jbytes(5, "c4e1f97ed8")        // vmovq rax, xmm3   (f64 bits)
+    jbytes(1, "c3")                // ret
+    return entry
+}
+
+// ============================================================================
 // ============================================================================
 // LOWER HALF -- the caller side: how emitted bytes become callable functions
 // ============================================================================
@@ -592,6 +797,27 @@ fn jit_f_ready_folded() { return jf_tbl_folded }
 
 fn jit_f_apply_folded(as) -> i64 {
     return closure_call(jf_tbl_folded, as, 0)
+}
+
+// ---- the FOLDED Q6_K kernel, same entry shape ------------------------------
+// Its own RWX region again, so the Q4_K kernels above stay byte-identical. Same
+// argument area ([W, X, DMD, nsuper], [AS+16] unread) and the same
+// closure_call door, so callers only choose which kernel to dispatch.
+let jf_tbl_q6k = 0
+
+fn jit_f_setup_folded_q6k() -> i64 {
+    if jf_tbl_q6k != 0 { return 0 }
+    if jit_f_alloc(65536) <= 0 { return -1 }
+    let t = jit_f_code(jit_f_build_folded_q6k())
+    if t <= 0 { return -2 }
+    jf_tbl_q6k = t
+    return 0
+}
+
+fn jit_f_ready_folded_q6k() { return jf_tbl_q6k }
+
+fn jit_f_apply_folded_q6k(as) -> i64 {
+    return closure_call(jf_tbl_q6k, as, 0)
 }
 
 // ---- the per-super-block dequant argument table (the TABLE kernel's input) --
