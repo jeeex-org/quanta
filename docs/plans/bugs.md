@@ -1118,3 +1118,33 @@ strictly better even before the crash is fixed.
 deliberately handles only keyword tokens that `vfind()` resolves to a bound name; the unbound case
 falls through to a path with no atom branch and no error. Out of scope for A23, recorded so the
 diagnostic gap is not lost. Expected behaviour: a located "undeclared name" error.
+
+### A26 · OPEN (compiler 0.0.247) · f16/f32 parameter and return annotations are SILENTLY IGNORED — every function boundary re-widens to f64
+
+Same failure class as A23: a declared type is dropped without an error, and the divergence is
+invisible at the call site.
+
+Evidence: `compiler/0.0.247/src/x86/globals.quanta:500-501` allocate `fn_parft` and `fn_retft` as
+2 MB tables that **nothing reads or writes** — grep finds only the declarations and their comment.
+
+Probe against 0.0.247, with the language's own f32 storage as the oracle (no hand-computed
+constants, so a bug in the probe's arithmetic cannot fake a pass):
+
+    fn id32(x: f32) -> f64 { return x }
+    fn ret32() -> f32 { return 1.0000001 }
+    let w: f32[2] = mem_alloc(2)
+    w[0] = 1.0000001                              // the f32-ROUNDED value
+    f64bits(id32(1.0000001)) != f64bits(w[0])     // fires -> the param is NOT narrowed
+    f64bits(ret32())         != f64bits(w[0])     // fires -> the return is NOT narrowed
+
+- control `fn id64(x: f64) -> f64 { return x }` does not change the value, so the harness is sound.
+- Measured: param drop `exit=4`, return drop `exit=5`. `ret16()` was not reached in either
+  ordering — untested rather than assumed.
+- Both probes compiled with **rc=0**: this is a silent semantic divergence, not a compile error.
+
+Impact: "binary32 precision" holds for buffers and inline code and is lost the moment a value
+crosses a function boundary — the callee computes in f64. The loader's f32 kernels would diverge
+from ggml's f32 path with no visible cause. Blocks adopting f16/f32 across any call boundary, which
+is every real use (e.g. a KV writer taking an `f16` value).
+
+Completion is tracked as `docs/plans/language-capabilities.md` #11; scoped into 0.0.248.
