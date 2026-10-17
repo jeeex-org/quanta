@@ -45,6 +45,7 @@ import std/jit_x86_fused
 const Q4_PATH = "/opt/ai/models/quanta/QUANTA-LFM2.5-2.6Bv1-Q4_K_M.gguf"
 const NCTX = 2048
 const NROWS = 64
+const NID = 512
 const REPS = 4
 const REPS2 = 3
 
@@ -123,7 +124,7 @@ fn main() {
     let mism_tab = 0
     let checked = 0
     let r = 0
-    while r < NROWS {
+    while r < NID {
         let raw = mm_map_base + toff + r * rb
         if mm_deq_row_raw(12, raw, dm, f64b) != 0 { prints("FAIL deq\n"); return 1 }
         let prod = mm_dot4_s(f64b, x, dm, acc)
@@ -157,11 +158,11 @@ fn main() {
 
     // ---- 2. the cost split, two run lengths, interleaved best-of-REPS -----
     let pass = 0
-    while pass < 2 {
+    while pass < 3 {
         let RN = NROWS
         let RP = REPS
         if pass == 1 { RN = 256; RP = REPS2 }
-        if RN * rb > 100000000 { RN = NROWS }         // keep the mapping honest
+        if pass == 2 { RN = NID; RP = REPS2 }
         let rmax = RN
         prints("--- rows="); print(rmax); prints(" best of "); print(RP); prints(" ---\n")
 
