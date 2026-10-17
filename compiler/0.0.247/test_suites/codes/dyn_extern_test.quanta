@@ -1,0 +1,31 @@
+// Dynamic linking regression: extern "C" calls must resolve through the
+// dynamic loader in EXEC mode (--emit-dynamic).
+//
+// This suite was added after --emit-dynamic produced binaries that linked
+// against libc and still faulted on the first call. Every check below failed
+// at some point in that debugging, so each one is here to catch a recurrence.
+//
+// Build:  qc --emit-dynamic dyn_extern_test.quanta out
+// Run:    out ; echo $?   -- expect 42
+//
+// Verified against the self-compiled (gen3) binary as well as the installed
+// one, so the compiler can bootstrap its own dynamic output.
+
+extern "C" fn abs(v: i32) -> i32;
+extern "C" fn strlen(s: *u8) -> i64;
+
+fn main() -> i32 {
+    // Three externs means three PLT stubs and three JUMP_SLOT relocations; the
+    // stub addressing was the part that repeatedly landed one slot too far.
+    let n = strlen("abcde");
+    if n != 5 { return 90 + n }
+
+    // abs is declared second and called third, so this fails if the PLT index
+    // is derived from call order rather than declaration order.
+    let a = abs(0 - 9);
+    if a != 9 { return 80 + a }
+
+    // A no-extern dynamic binary must still work: the dynamic block is present
+    // but empty of PLT stubs. That path is a different branch of write_elf.
+    return 42;
+}

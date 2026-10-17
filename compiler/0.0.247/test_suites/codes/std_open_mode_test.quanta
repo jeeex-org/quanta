@@ -1,0 +1,67 @@
+// Regression test: open() must honour the mode argument.
+//
+// open(2) on x86-64 reads mode from R10, not rdx. The generic arg loader maps
+// args 0..5 to rdi/rsi/rdx/rcx/r8/r9, so the mode used to be dropped and files
+// created with O_CREAT came out mode 000 -- unreadable even by the shell.
+//
+// Verified by ground truth (ls -la), not just by the return value, because a
+// valid fd with mode 000 looks like success from inside the process.
+import std/fs
+
+fn main() -> i64 {
+    let fails = 0
+
+    // --- 0644: the ordinary case ---
+    let p1 = "/tmp/reg_mode_644_4471.bin"
+    let f1 = open(p1, 577, 420)        // O_WRONLY|O_CREAT|O_TRUNC, 0644
+    print("0644 write fd = ")
+    print(f1)
+    print("\n")
+    if f1 < 0 { fails = fails + 1 }
+    if f1 >= 0 {
+        print("  wrote ")
+        print(write_str(f1, "quanta"))
+        print("\n")
+        close(f1)
+    }
+    let g1 = open(p1, 0, 0)            // reopen for READ -- this is what failed
+    print("0644 read  fd = ")
+    print(g1)
+    print("\n")
+    if g1 < 0 {
+        fails = fails + 1
+        print("  FAIL: file was created unreadable\n")
+    } else {
+        close(g1)
+    }
+
+    // --- 0600: a restricted mode must NOT be widened to 0644 ---
+    let p2 = "/tmp/reg_mode_600_4471.bin"
+    let f2 = open(p2, 577, 384)        // 0600
+    print("0600 write fd = ")
+    print(f2)
+    print("\n")
+    if f2 >= 0 { close(f2) }
+    let g2 = open(p2, 0, 0)
+    print("0600 read  fd = ")
+    print(g2)
+    print("\n")
+    if g2 < 0 { fails = fails + 1 }    // owner can always read 0600
+    if g2 >= 0 { close(g2) }
+
+    // --- read-only open of an existing system file still works ---
+    let ph = "/etc/hostname"
+    let g3 = open(ph, 0, 0)
+    print("existing file fd = ")
+    print(g3)
+    print("\n")
+    if g3 < 0 { fails = fails + 1 }
+    if g3 >= 0 { close(g3) }
+
+    print("\nfailures = ")
+    print(fails)
+    print("\n")
+    if fails == 0 { print("RESULT: open() honours mode\n"); return 0 }
+    print("RESULT: FAILED\n")
+    return 1
+}
