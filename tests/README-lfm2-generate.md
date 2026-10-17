@@ -2,7 +2,7 @@
 
 `tests/lfm2_generate.quanta` + `tests/run_lfm2_generate.sh`: prefill -> KV-cached
 decode -> sample -> print, using `lib/std/lfm2_chat.chat_build`,
-`lib/std/lfm2_bpe.bpe_encode_special` and `lib/std/sampling.sample_full`, on
+`lib/std/gguf_bpe.bpe_encode_special` and `lib/std/sampling.sample_full`, on
 `QUANTA-LFM2.5-2.6Bv1-Q4_K_M.gguf`.
 
 It lives in `tests/` and not in `test_suites/EXPECTED.tsv` because one token costs
