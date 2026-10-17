@@ -505,10 +505,15 @@ fn fc_short_conv(L, x: u64, state: u64, out: u64) {
         t = t + 1
     }
     fc_prof_stop(FCP_C_GATE)
+    // NOTE the shape: compare the call IN PLACE, never bind it to an untyped
+    // `let`. Binding it propagates a float tag into this function's return value
+    // (measured: the gate row stdlib_lfm2_conv_test.quanta then failed to COMPILE
+    // with "print on an f64 would write its raw bit pattern"), i.e. adding a timer
+    // changed a type. The marks add no binding, so no tag moves.
     fc_prof_begin(FCP_C_OUT)
-    let rc = mm_matvec(cout, fc_sc_y, dm, dm, out)
+    if mm_matvec(cout, fc_sc_y, dm, dm, out) != 0 { fc_prof_stop(FCP_C_OUT); return -1 }
     fc_prof_stop(FCP_C_OUT)
-    return rc
+    return 0
 }
 
 // ===========================================================================
@@ -970,9 +975,9 @@ fn fc_attention(L, pos, x: u64, out: u64) {
 
     // ---- out projection -----------------------------------------------------
     fc_prof_begin(FCP_A_OUT)
-    let ra = mm_matvec(wo, fc_at_out, dm, nh * hd, out)
+    if mm_matvec(wo, fc_at_out, dm, nh * hd, out) != 0 { fc_prof_stop(FCP_A_OUT); return -1 }
     fc_prof_stop(FCP_A_OUT)
-    return ra
+    return 0
 }
 
 // ===========================================================================
@@ -1135,14 +1140,12 @@ fn fc_layer(L, pos, inp: u64, out: u64) -> i64 {
     // inside one call would also have no clear guard against the pool.
     if lfm2_layer_is_attn(L) != 0 {
         fc_prof_begin(FCP_ATTN)
-        let ra = fc_attention(L, pos, fc_fw_n, fc_fw_a)
+        if fc_attention(L, pos, fc_fw_n, fc_fw_a) != 0 { fc_prof_stop(FCP_ATTN); return -1 }
         fc_prof_stop(FCP_ATTN)
-        if ra != 0 { return -1 }
     } else {
         fc_prof_begin(FCP_CONV)
-        let rcv = fc_short_conv(L, fc_fw_n, fc_fw_conv_state(L), fc_fw_a)
+        if fc_short_conv(L, fc_fw_n, fc_fw_conv_state(L), fc_fw_a) != 0 { fc_prof_stop(FCP_CONV); return -1 }
         fc_prof_stop(FCP_CONV)
-        if rcv != 0 { return -1 }
     }
 
     // ---- residual ----
