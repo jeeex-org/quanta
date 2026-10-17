@@ -22,12 +22,17 @@
 //     refuses to start while a peer model process is alive.
 //
 // Conf tests/lfm2_decode_bench.conf:
-//   "<workers> <len1> <len2> <len3> <use_mmap> <cache_norms> [ignore_eos]"
+//   "<workers> <len1> <len2> <len3> <use_mmap> <cache_norms> [ignore_eos] [fused_q4k]"
 //   ignore_eos=1: fc_argmax_masked suppresses EOS so a run always reaches its
 //   length (the reference prompt deterministically emits EOS at token 43;
 //   llama.cpp's --ignore-eos is the same lever for long perf runs).
-// Prompt: tests/lfm2_prompt.txt (the reference oracle prompt: first-token
-// argmax must be 5922; the known-good generation is `The answer is: 2<|im_end|>`).
+//   fused_q4k=1 (field 8, default 0): opt in to the fused Q4_K dequant-dot on
+//   the mmap row-workers (mm_set_fused_q4k). The flag is OFF unless a conf asks
+//   for it, so one binary measures BEFORE and AFTER in the same session.
+// Prompt: tests/lfm2_prompt.txt ("What is 2+2? Answer with the number only.").
+// ORACLE (current, re-pinned 0.0.246): first-token argmax 597 and the
+// generation starts `The answer is 4.` The older 5922 / `The answer is: 2`
+// values in some docs are STALE -- do not use them.
 import std/gguf
 import std/lfm2_forward
 import std/lfm2_model
@@ -197,6 +202,7 @@ fn main() {
     let usemap = 1
     let cachen = 1
     let igneos = 0
+    let fused = 0
     if cfgb != 0 {
         let nf = parse_ints(cfgb, conf)
         if nf >= 1 { nw = mem_load(conf) }
@@ -206,6 +212,7 @@ fn main() {
         if nf >= 5 { usemap = mem_load(conf + 32) }
         if nf >= 6 { cachen = mem_load(conf + 40) }
         if nf >= 7 { igneos = mem_load(conf + 48) }
+        if nf >= 8 { fused = mem_load(conf + 56) }
     } else {
         prints("warn: conf unreadable; defaults\n")
     }
@@ -214,6 +221,7 @@ fn main() {
     prints(" mmap="); print(usemap)
     prints(" cache_norms="); print(cachen)
     prints(" ignore_eos="); print(igneos)
+    prints(" fused_q4k="); print(fused)
     prints(" (argmax temp=0)\n")
 
     let t0 = clock()
@@ -224,6 +232,9 @@ fn main() {
     if fc_fw_init() != 0 { prints("FAIL fc_fw_init\n"); return 1 }
     mm_set_workers_uncapped(nw)
     mm_set_embed_workers_uncapped(nw)
+    // the fused Q4_K route is opt-in: only a conf field asks for it. Set BEFORE
+    // any forward runs; mm_matvec_par emits the kernel and fail-closes the flag.
+    mm_set_fused_q4k(fused)
     if usemap != 0 {
         if mm_attach_mmap_fd(file_open(Q4_PATH, 0)) != 0 { prints("FAIL mm_attach_mmap (continuing on pread)\n") }
     }
@@ -231,7 +242,8 @@ fn main() {
         if fc_cache_norms() != 0 { prints("FAIL fc_cache_norms\n"); return 1 }
     }
     prints("load_ms="); print((clock() - t0) / 1000000)
-    prints(" mmap_base="); print(mm_map_base); newline()
+    prints(" mmap_base="); print(mm_map_base)
+    prints(" fused_q4k_active="); print(mm_get_fused_q4k()); newline()
 
     // ---- prompt (identical construction to tests/lfm2_generate.quanta) ----
     let rawprompt = slurp(file_open(PROMPT_PATH, 0))

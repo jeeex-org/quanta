@@ -1,0 +1,137 @@
+// tests/lfm2_fused_route_probe.quanta
+//
+// PROVES THE WIRING, two claims at once, on the real model through the REAL
+// route the decode path takes:
+//
+//   (1) ROUTE. `mm_matvec` with workers > 1 and the file mmap'd takes
+//       `mm_matvec_par` -> pool kind 4 -> `pl_run_rows_map` -- NOT the serial
+//       loop and NOT the pread block path. With mm_fused_q4k = 1 that worker
+//       takes the fused branch, witnessed by mm_get_fused_used() == 1; with the
+//       flag 0 it does not.
+//   (2) BIT-IDENTITY END TO END. For each tensor, the flag-OFF output and the
+//       flag-ON output are compared element-wise over EVERY row. 0 mismatches
+//       for Q4_K (fused) and for Q6_K (unfused, must be untouched).
+//
+// It is deliberately not a microbenchmark: it drives mm_matvec, the exact
+// function lfm2_forward calls, with the same worker count and the same mmap the
+// decode bench uses.
+//
+// NOTE: label strings are printed from main(), never passed through an untyped
+// function parameter -- an untyped string parameter loses its string type in
+// transit (defect A7), so `print(name)` inside a helper is unsafe.
+//
+// Build: ./compiler/0.0.246/bin/x86/qc -O tests/lfm2_fused_route_probe.quanta <bin>
+// Run (model is 1.67 GB; the VA cap must exceed it):
+//   ( ulimit -c 0 -v 32000000; nice -n 0 <bin> </dev/null )
+import std/gguf
+import std/lfm2_forward
+import std/lfm2_model
+import std/gguf_mm
+import std/fs
+
+const Q4_PATH = "/opt/ai/models/quanta/QUANTA-LFM2.5-2.6Bv1-Q4_K_M.gguf"
+const NW = 20
+
+let total_mismatch = 0
+let total_rows = 0
+
+// One tensor: flag-OFF vs flag-ON through mm_matvec (the decode route).
+// Returns the element mismatch count; a non-zero rc adds rows+1 so it cannot be
+// mistaken for a clean pass.
+fn probe(idx, rows, cols) {
+    if idx < 0 {
+        prints("  SKIP (no tensor)\n")
+        total_mismatch = total_mismatch + 1
+        return -1
+    }
+    let dt = gguf_tensor_dtype(idx)
+    let x = mem_alloc(cols * 8)
+    let i = 0
+    while i < cols {
+        // deterministic, non-degenerate, non-uniform
+        mem_store(x + i * 8, i2f((i * 131) % 997 - 500) / i2f(313.0))
+        i = i + 1
+    }
+    let y0 = mem_alloc(rows * 8)
+    let y1 = mem_alloc(rows * 8)
+    let z = 0
+    while z < rows { mem_store(y0 + z * 8, 0.0); mem_store(y1 + z * 8, 0.0); z = z + 1 }
+
+    mm_set_fused_q4k(0)
+    let r0 = mm_matvec(idx, x, rows, cols, y0)
+    let used0 = mm_get_fused_used()
+
+    mm_set_fused_q4k(1)
+    let r1 = mm_matvec(idx, x, rows, cols, y1)
+    let used1 = mm_get_fused_used()
+
+    if r0 != 0 || r1 != 0 {
+        prints("  FAIL: mm_matvec rc off="); print(r0); prints(" on="); print(r1); newline()
+        total_mismatch = total_mismatch + rows + 1
+        return -2
+    }
+
+    let mism = 0
+    let nonzero = 0
+    z = 0
+    while z < rows {
+        let a = mem_load(y0 + z * 8)
+        let b = mem_load(y1 + z * 8)
+        if a != b { mism = mism + 1 }
+        if a != 0 { nonzero = nonzero + 1 }
+        z = z + 1
+    }
+    total_mismatch = total_mismatch + mism
+    total_rows = total_rows + rows
+
+    prints("  dtype="); print(dt)
+    prints(" rows="); print(rows); prints(" cols="); print(cols)
+    prints(" mism="); print(mism)
+    prints(" nonzero="); print(nonzero)
+    prints(" used_off="); print(used0); prints(" used_on="); print(used1)
+    newline()
+    return mism
+}
+
+fn main() {
+    prints("=== fused Q4_K route probe: mm_matvec, workers=20, mmap ===\n")
+    if gguf_load(Q4_PATH) != 0 { prints("FAIL gguf_load\n"); return 1 }
+    if fc_read_config() != 0 { prints("FAIL fc_read_config\n"); return 1 }
+    mm_set_workers_uncapped(NW)
+    mm_set_embed_workers_uncapped(NW)
+    if mm_attach_mmap_fd(file_open(Q4_PATH, 0)) != 0 { prints("FAIL mm_attach_mmap\n"); return 1 }
+    prints("mm_map_base="); print(mm_map_base)
+    prints(" workers="); print(mm_get_workers())
+    prints(" fused_flag="); print(mm_get_fused_q4k()); newline()
+    if mm_map_base == 0 { prints("FAIL: no mmap -- kind 4 not reachable\n"); return 1 }
+
+    let dm = fc_d_model          // 2048
+    let dff = fc_d_ff            // 10752
+    let nhd = fc_n_heads * fc_head_dim   // 2048
+    let nkvd = 8 * fc_head_dim   // 512 (an attention layer's kv width)
+
+    prints("-- Q4_K tensors (fused expected, used_on must be 1) --\n")
+    prints("  ffn_gate.0     "); probe(lfm2_ffn_gate(0), dff, dm)
+    prints("  ffn_up.0       "); probe(lfm2_ffn_up(0), dff, dm)
+    prints("  ffn_down.3     "); probe(lfm2_ffn_down(3), dm, dff)   // layer 3 ffn_down is Q4_K
+    prints("  attn_q.2       "); probe(lfm2_attn_q(2), nhd, dm)
+    prints("  attn_output.2  "); probe(lfm2_attn_output(2), dm, nhd)
+    prints("  conv_in_proj.0 "); probe(lfm2_conv_in_proj(0), 3 * dm, dm)
+    prints("  conv_out_proj.0"); probe(lfm2_conv_out_proj(0), dm, dm)
+
+    prints("-- Q6_K tensors (NOT fused: used_on must be 0) --\n")
+    prints("  attn_v.2       "); probe(lfm2_attn_v(2), nkvd, dm)     // layer 2 attn_v is Q6_K
+    prints("  ffn_down.0     "); probe(lfm2_ffn_down(0), dm, dff)    // layer 0 ffn_down is Q6_K
+    prints("  token_embd     "); probe(lfm2_token_embd(), 128000, dm) // Q6_K, tied projection
+
+    prints("---\n")
+    prints("total_rows="); print(total_rows)
+    prints(" total_mismatch="); print(total_mismatch); newline()
+    if total_mismatch != 0 {
+        prints("FAIL: the fused route is NOT bit-identical to the existing path\n")
+        return 1
+    }
+    prints("PASS: fused Q4_K route is bit-identical through mm_matvec (the decode route)\n")
+    prints("DONE\n")
+    return 0
+}

@@ -233,13 +233,18 @@ fn main() {
     prints("sink="); print_f(sink)
     prints(" (consumer, keeps loops live)\n")
 
-    // ---- 3. INTEGRATION THROUGH mm_matvec: NOT MEASURABLE HERE -------
-    // The flag-guarded wiring (mm_set_jit_q4k / mm_matvec) cannot run: qc
-    // 0.0.245 miscompiles closure_call when it is reached from a function in an
-    // IMPORTED module, so any dispatch from lfm2_mm faults. Minimal repro and
-    // the full bisection are in docs/research/jit-fused-dot-status.md and
-    // tests/lfm2_jit_cc_probe.quanta. lfm2_mm was therefore left PRISTINE.
-    prints("integration: BLOCKED (imported-module closure_call defect) - see docs\n")
+    // ---- 3. INTEGRATION THROUGH mm_matvec: WIRED, PROVEN ELSEWHERE -------
+    // The dispatch blocker is GONE (0.0.246): a parameter named with a reserved
+    // keyword token (`as`) was dropped by funcscan, so the kernel was entered
+    // with rdi=0 -- NOT a closure_call defect. `jit_f_apply_folded()` is now
+    // dispatched from an imported module with 0 mismatches
+    // (tests/jit_fold_dispatch_test.quanta), and the folded kernel is WIRED into
+    // the live decode route behind `mm_set_fused_q4k(1)` (default OFF) in
+    // lib/std/gguf_mm.quanta's pl_run_rows_map (pool kind 4), diffed element-wise
+    // over every row of 7 Q4_K + 3 Q6_K tensors in
+    // tests/lfm2_fused_route_probe.quanta. This microbench stays scoped to the
+    // per-row cost split; the end-to-end numbers are in the decode bench.
+    prints("integration: WIRED (mm_set_fused_q4k); see tests/lfm2_fused_route_probe.quanta\n")
 
     prints("DONE\n")
     return 0
