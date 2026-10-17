@@ -1,0 +1,118 @@
+// tests/jit_q6k_perf_test.quanta
+//
+// KERNEL-LEVEL attribution for the folded Q6_K dequant-dot: the JIT'd kernel
+// alone vs the pair it replaces (mm_deq_row_raw + mm_dot4_s), on REAL Q6_K rows,
+// INTERLEAVED in ONE process.
+//
+// WHY interleaved-and-in-one-process: this box's run-to-run spread is wider than
+// most single-lever effects, so two sequential benchmark processes cannot resolve
+// them. Alternating A and B inside one loop is the only fair comparison; the
+// ratio is the number to read, never the absolute clock unit (which is UNVERIFIED
+// repo-wide).
+//
+// This row is NOT the end-to-end result (that is tests/lfm2_decode_bench with
+// conf field 9). It answers the narrower question the end-to-end number cannot:
+// how much faster is the kernel than the pair, on the covered rows.
+//
+// Build: ./compiler/0.0.246/bin/x86/qc -O tests/jit_q6k_perf_test.quanta <bin>
+// Run (model is 1.67 GB): ( ulimit -c 0 -v 32000000; nice -n 0 <bin> </dev/null )
+
+import std/gguf
+import std/lfm2_forward
+import std/lfm2_model
+import std/gguf_mm
+import std/gguf_bpe
+import std/fs
+import std/jit_x86
+import std/jit_x86_fused
+
+const Q4_PATH = "/opt/ai/models/quanta/QUANTA-LFM2.5-2.6Bv1-Q4_K_M.gguf"
+const NCTX = 2048
+const NROWS = 256        // rows per timed sweep
+const NCYC = 5           // interleaved cycles; best-of taken
+
+// time one sweep of `which` (0 = fused kernel, 1 = deq+dot) over NROWS rows.
+fn sweep(which, toff, rb, cols, x, f64b, acc, argp) -> i64 {
+    let t0 = clock()
+    let r = 0
+    while r < NROWS {
+        let raw = mm_map_base + toff + r * rb
+        if which == 0 {
+            mem_store(argp, raw)
+            mem_store(argp + 8, x)
+            mem_store(argp + 16, 0)
+            mem_store(argp + 24, cols / 256)
+            mem_store(argp + 0, raw)
+            let v = jit_f_apply_folded_q6k(argp)
+            mem_store(argp + 0, v)
+        } else {
+            mm_deq_row_raw(14, raw, cols, f64b)
+            let v = mm_dot4_s(f64b, x, cols, acc)
+            mem_store(argp + 0, v)
+        }
+        r = r + 1
+    }
+    return clock() - t0
+}
+
+fn bench(label, idx) {
+    let cols = gguf_tensor_dim(idx, 0)
+    let rows = gguf_tensor_nelements(idx) / cols
+    let rb = mm_row_bytes(14, cols)
+    let toff = gguf_tensor_offset(idx)
+    let x = mem_alloc(cols * 8)
+    let f64b = mem_alloc(cols * 8)
+    let acc = mem_alloc(64)
+    let argp = mem_alloc(32)
+    let c = 0
+    while c < cols {
+        let u = i2f(c - (c / 128) * 128)
+        mem_store(x + c * 8, (u - 63.5) * 0.001953125)
+        c = c + 1
+    }
+    if NROWS > rows { prints("rows<NROWS\n"); return -1 }
+    let bestA = 0 - 1
+    let bestB = 0 - 1
+    let cyc = 0
+    while cyc < NCYC {
+        let ta = sweep(0, toff, rb, cols, x, f64b, acc, argp)
+        let tb = sweep(1, toff, rb, cols, x, f64b, acc, argp)
+        if bestA < 0 || ta < bestA { bestA = ta }
+        if bestB < 0 || tb < bestB { bestB = tb }
+        cyc = cyc + 1
+    }
+    let elems = NROWS * cols
+    prints(label)
+    prints("  cols="); print(cols); prints(" rows="); print(NROWS)
+    prints("  fused_best="); print(bestA)
+    prints("  pair_best="); print(bestB)
+    prints("  ratio_x100="); print(bestB * 100 / bestA)
+    prints("  fused_ns_per_elem_x1000="); print(bestA / (elems / 1000))
+    prints("  pair_ns_per_elem_x1000="); print(bestB / (elems / 1000))
+    newline()
+    return 0
+}
+
+fn main() {
+    prints("=== folded Q6_K kernel vs mm_deq_row_raw+mm_dot4_s (interleaved, one process) ===\n")
+    if jit_f_setup_folded_q6k() != 0 { prints("FAIL setup\n"); return 10 }
+
+    if gguf_load(Q4_PATH) != 0 { prints("FAIL gguf_load\n"); return 1 }
+    if fc_read_config() != 0 { prints("FAIL fc_read_config\n"); return 1 }
+    if bpe_init_from_gguf() == 0 { prints("FAIL bpe_init\n"); return 1 }
+    if fc_kv_init(NCTX) != 0 { prints("FAIL fc_kv_init\n"); return 1 }
+    if fc_fw_init() != 0 { prints("FAIL fc_fw_init\n"); return 1 }
+    mm_set_workers(0)
+    mm_set_embed_workers(0)
+    if mm_attach_mmap_fd(file_open(Q4_PATH, 0)) != 0 { prints("FAIL mm_attach_mmap\n"); return 1 }
+
+    prints("(interleaved A/B; the RATIO is the measurement, the clock unit is not)\n")
+    bench("ffn_down.3 (cols 10752, the widest Q6_K row): ", lfm2_ffn_down(3))
+    bench("attn_v.2   (cols 2048,  the narrow Q6_K row): ", lfm2_attn_v(2))
+    bench("token_embd (cols 2048,  the tied projection): ", lfm2_token_embd())
+
+    prints("NOTE: absolute clock() unit is UNVERIFIED; read ratio_x100 and the\n")
+    prints("      ns-per-element pair only as a within-process comparison.\n")
+    prints("DONE\n")
+    return 0
+}
