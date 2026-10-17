@@ -696,6 +696,122 @@ fn jit_f_build_folded_q6k() -> i64 {
 }
 
 // ============================================================================
+// jit_f_build_chain_q6k(): the SCALAR-CHAIN twin of the folded Q6_K kernel.
+//
+// WHY A SECOND KERNEL. The tied output projection (token_embd.weight, Q6_K,
+// [2048, 128000] = 262,144,000 elements, the single largest matvec in the model)
+// is the one matvec the 4-lane folded route CANNOT take. Its reference dot is
+// pl_run_embed_map's strict LEFT-TO-RIGHT scalar chain
+//     acc = acc + row[c]*x[c]     for c = 0..ncols-1
+// not mm_dot4_s's four lanes, so the 4-lane kernel would change every product's
+// summation order. Changing the REFERENCE to make a kernel reusable was already
+// rejected once (blast radius); this kernel instead keeps the chain and deletes
+// the overhead the chain pays.
+//
+// THE SHAPE. The dequant is byte-for-byte the same encodings as
+// jit_f_build_folded_q6k (register-resident, factor-free). The only difference is
+// the fold: instead of `vaddpd ymm0, ymm0, ymm6` (lane k accumulates element
+// k%4, reduced horizontally at the end -- the 4-lane order), the four products of
+// each group are folded into ONE scalar accumulator with FOUR SERIAL vaddsd, in
+// element order:
+//     acc += p[4i+0] ; acc += p[4i+1] ; acc += p[4i+2] ; acc += p[4i+3]
+// which is exactly `acc = acc + row[c]*x[c]` in order. Groups are consumed in
+// ascending element order and r10 walks x 4 doubles at a time, so the sequence is
+// c = 0,1,2,...,ncols-1 with nothing reordered, reassociated, or vectorised.
+//
+// COST MODEL. The chain is LATENCY-bound: four dependent vaddsd (4 cycles each)
+// per 4 elements = ~4 cycles/element, and the independent multiplies and the
+// dequant issue underneath it. That is the price of the reference order -- it
+// cannot be broken without breaking bit-exactness -- and it is still an order of
+// magnitude below the scalar path, which pays ~4 Quanta builtin calls (each a
+// call + home-slot round trip) per element.
+//
+// xmm7 is the shuffle scratch. q6_group_chain leaves it dead after the
+// multiplies, so no extra register is needed; ymm0 is zeroed once and only its
+// low lane (xmm0) is ever the accumulator.
+// ============================================================================
+
+// One 4-element group -> four SERIAL vaddsd into the scalar accumulator xmm0.
+// Dequant encodings identical to q6_group; the fold is the only change.
+fn q6_group_chain(s, qlo, qho) -> i64 {
+    q6_ld_ql(qlo)
+    if s >= 2 { jbytes(5, "c5c972d604") }        // vpsrld xmm6,xmm6,4  high nibble
+    else { jbytes(4, "c5c9dbf4") }               // vpand xmm6,xmm6,xmm4  low nibble
+    q6_ld_qh(qho)
+    if s > 0 { q6_qh_shr(s * 2) }                // vpsrld xmm7,xmm7,2s
+    jbytes(4, "c5c1dbfd")                        // vpand xmm7,xmm7,xmm5  (&3)
+    jbytes(5, "c5c172f704")                      // vpslld xmm7,xmm7,4
+    jbytes(4, "c5c9ebf7")                        // vpor xmm6,xmm6,xmm7
+    jbytes(4, "c5c9fef3")                        // vpaddd xmm6,xmm6,xmm3  (-32)
+    jbytes(4, "c5fee6f6")                        // vcvtdq2pd ymm6,xmm6   (exact)
+    jbytes(4, "c5cd59f2")                        // vmulpd ymm6,ymm6,ymm2 (*sc, exact)
+    jbytes(4, "c5cd59f1")                        // vmulpd ymm6,ymm6,ymm1 (*d, rounds)
+    jbytes(5, "c4c14d5932")                      // vmulpd ymm6,ymm6,[r10] (*x, rounds)
+    // ---- the chain: acc += p0, p1, p2, p3 IN ELEMENT ORDER -----------------
+    jbytes(4, "c5fb58c6")            // vaddsd xmm0, xmm0, xmm6       acc += p0
+    jbytes(4, "c5c915fe")            // vunpckhpd xmm7, xmm6, xmm6    [p1,p1]
+    jbytes(4, "c5fb58c7")            // vaddsd xmm0, xmm0, xmm7       acc += p1
+    jbytes(6, "c4e37d19f701")        // vextractf128 xmm7, ymm6, 1    [p2,p3]
+    jbytes(4, "c5fb58c7")            // vaddsd xmm0, xmm0, xmm7       acc += p2
+    jbytes(4, "c5c115ff")            // vunpckhpd xmm7, xmm7, xmm7    [p3,p3]
+    jbytes(4, "c5fb58c7")            // vaddsd xmm0, xmm0, xmm7       acc += p3
+    jbytes(4, "4983c220")                        // add r10, 32   (4 doubles)
+    return 0
+}
+
+fn jit_f_build_chain_q6k() -> i64 {
+    let entry = ja_pos()
+    j_f_load_w()               // r9  = W  (block cursor)
+    j_f_load_x()               // r10 = X
+    j_f_load_n()               // rcx = nsuper
+    j_f_vxorpd_y0()            // ymm0 = 0 -> xmm0 lane0 is the scalar accumulator
+
+    let bodytop = ja_pos()
+
+    q6_d_load()                // ymm1 = broadcast d
+    q6_consts()                // xmm3/4/5 = -32 / 15 / 3
+
+    let n = 0
+    while n < 2 {
+        let s = 0
+        while s < 4 {
+            let h = 0
+            while h < 2 {
+                q6_ld_sc(192 + n * 8 + s * 2 + h)
+                q6_sc_sext()
+                q6_sc_tod()
+                let g = 0
+                while g < 4 {
+                    q6_group_chain(s, n * 64 + (s - (s / 2) * 2) * 32 + h * 16 + g * 4, 128 + n * 32 + h * 16 + g * 4)
+                    g = g + 1
+                }
+                h = h + 1
+            }
+            s = s + 1
+        }
+        n = n + 1
+    }
+    jbytes(7, "4981c1d2000000")    // add r9, 210   (one Q6_K super-block)
+
+    jbytes(4, "4883e901")          // sub rcx,1
+    j_jne32()
+    let disp_at = ja_pos()
+    jbytes(4, "00000000")
+    if j_patch32(disp_at, bodytop) != 0 { return 0 - 1 }
+
+    // NO horizontal reduce: the whole chain is already in xmm0 lane 0.
+    // FIVE bytes: jbytes(n,f) writes only the first n bytes of the hex string, and
+    // a 5-byte instruction declared as 4 drops the ModRM byte -- the following
+    // `c3` (ret) then lands as that instruction's ModRM (vmovq %xmm0,%rbx) and the
+    // kernel runs off the end of the emitted region into zero padding (measured:
+    // SIGSEGV at `add %al,(%rax)` with rax=0xbc). tests/lfm2_jbytes_len_check.py
+    // now checks every jbytes call in lib/std/jit_x86*.quanta mechanically.
+    jbytes(5, "c4e1f97ec0")        // vmovq rax, xmm0   (f64 bits of the chain sum)
+    jbytes(1, "c3")                // ret
+    return entry
+}
+
+// ============================================================================
 // ============================================================================
 // LOWER HALF -- the caller side: how emitted bytes become callable functions
 // ============================================================================
@@ -818,6 +934,27 @@ fn jit_f_ready_folded_q6k() { return jf_tbl_q6k }
 
 fn jit_f_apply_folded_q6k(as) -> i64 {
     return closure_call(jf_tbl_q6k, as, 0)
+}
+
+// ---- the SCALAR-CHAIN Q6_K kernel (the tied output projection) --------------
+// Same entry shape again ([W, X, DMD, nsuper], and the chain kernel reads only
+// [W], [X] and [nsuper] like the folded twins), its OWN RWX region so the other
+// kernels stay byte-identical, and its own fail-closed flag.
+let jf_tbl_chain = 0
+
+fn jit_f_setup_chain() -> i64 {
+    if jf_tbl_chain != 0 { return 0 }
+    if jit_f_alloc(65536) <= 0 { return -1 }
+    let t = jit_f_code(jit_f_build_chain_q6k())
+    if t <= 0 { return -2 }
+    jf_tbl_chain = t
+    return 0
+}
+
+fn jit_f_ready_chain() { return jf_tbl_chain }
+
+fn jit_f_apply_chain(as) -> i64 {
+    return closure_call(jf_tbl_chain, as, 0)
 }
 
 // ---- the per-super-block dequant argument table (the TABLE kernel's input) --

@@ -73,7 +73,8 @@ fn prof_line(tag, slot, ns, toks) {
 fn prof_dump(tag, toks, glen) {
     prints("prof "); prints(tag); prints(" len="); print(glen)
     prints(" toks="); print(toks)
-    prints(" clock_ns="); print(fc_prof_cal_ns())
+    prints(" mark_ns="); print(fc_prof_cal_ns())
+    prints(" mark_ns_old_clock()="); print(fc_prof_cal_clock_ns())
     prints(" slots="); print(fc_prof_nslot()); newline()
     let i = 0
     while i < fc_prof_nslot() {
@@ -88,8 +89,17 @@ fn prof_dump(tag, toks, glen) {
     }
     prints("prof "); prints(tag); prints(" pool_worker_busy_ns=")
     print(mm_prof_work_ns()); newline()
-    prints("prof "); prints(tag); prints(" pool_concurrency_x100=")
-    print(mm_prof_concurrency_x100()); newline()
+    prints("prof "); prints(tag); prints(" pool_work_timing=")
+    print(mm_prof_work_enabled())
+    prints(" pool_concurrency_x100=")
+    if mm_prof_work_enabled() != 0 {
+        print(mm_prof_concurrency_x100())
+    } else {
+        // work timing OFF: worker_busy is 0 by construction, so the ratio would
+        // read as "0% concurrency" -- a number, and a wrong one. Print NA.
+        prints("NA")
+    }
+    newline()
     prints("prof "); prints(tag); prints(" sampling_ns="); print(pr_arg_ns)
     prints(" sampling_us_tok=")
     if toks > 0 { print(pr_arg_ns / toks / 1000) } else { print(0) }
@@ -251,6 +261,8 @@ fn main() {
     let fused = 0
     let fused6 = 0
     let prof = 0
+    let profw = 0
+    let chain = 0
     if cfgb != 0 {
         let nf = parse_ints(cfgb, conf)
         if nf >= 1 { nw = mem_load(conf) }
@@ -263,6 +275,8 @@ fn main() {
         if nf >= 8 { fused = mem_load(conf + 56) }
         if nf >= 9 { fused6 = mem_load(conf + 64) }
         if nf >= 10 { prof = mem_load(conf + 72) }
+        if nf >= 11 { profw = mem_load(conf + 80) }
+        if nf >= 12 { chain = mem_load(conf + 88) }
     } else {
         prints("warn: conf unreadable; defaults\n")
     }
@@ -274,6 +288,8 @@ fn main() {
     prints(" fused_q4k="); print(fused)
     prints(" fused_q6k="); print(fused6)
     prints(" prof="); print(prof)
+    prints(" prof_work="); print(profw)
+    prints(" fused_chain="); print(chain)
     prints(" (argmax temp=0)\n")
 
     let t0 = clock()
@@ -288,6 +304,7 @@ fn main() {
     // any forward runs; mm_matvec_par emits each kernel and fail-closes its flag.
     mm_set_fused_q4k(fused)
     mm_set_fused_q6k(fused6)
+    mm_set_fused_chain(chain)
     if usemap != 0 {
         if mm_attach_mmap_fd(file_open(Q4_PATH, 0)) != 0 { prints("FAIL mm_attach_mmap (continuing on pread)\n") }
     }
@@ -297,7 +314,8 @@ fn main() {
     prints("load_ms="); print((clock() - t0) / 1000000)
     prints(" mmap_base="); print(mm_map_base)
     prints(" fused_q4k_active="); print(mm_get_fused_q4k())
-    prints(" fused_q6k_active="); print(mm_get_fused_q6k()); newline()
+    prints(" fused_q6k_active="); print(mm_get_fused_q6k())
+    prints(" fused_chain_active="); print(mm_get_fused_chain()); newline()
 
     // ---- prompt (identical construction to tests/lfm2_generate.quanta) ----
     let rawprompt = slurp(file_open(PROMPT_PATH, 0))
@@ -334,6 +352,7 @@ fn main() {
     if prof != 0 {
         fc_prof_enable()
         mm_prof_enable()
+        mm_set_prof_work(profw)
     }
 
     // ---- three runs, reset between ----
@@ -343,6 +362,9 @@ fn main() {
         if run == 2 { gl = len2 }
         if run == 3 { gl = len3 }
         if fc_fw_reset() != 0 { prints("FAIL reset\n"); return 1 }
+        // reset the opt-in dispatch witness so this run reports whether THIS run
+        // dispatched the chain kernel, not whether an earlier one did.
+        if chain != 0 { mm_set_fused_chain(1) }
 
         let tp0 = clock()
         let i = 0
@@ -431,7 +453,8 @@ fn main() {
         prints("gen_tokens="); print(k)
         prints(" iters="); print(tk)
         prints(" first_argmax_id="); print(lastid)
-        prints(" eos_id="); print(bpe_eos); newline()
+        prints(" eos_id="); print(bpe_eos)
+        prints(" fused_chain_used="); print(mm_get_fused_chain_used()); newline()
         prints("prefill_ms="); print((tp1 - tp0) / 1000000)
         prints(" prefill_ms_per_tok="); print((tp1 - tp0) / 1000000 / n); newline()
         prints("gen_ms="); print((g1 - g0) / 1000000); newline()

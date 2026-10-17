@@ -91,7 +91,41 @@ let fc_sc_kw = 0
 // unless the prof conf field is set, and the driver says which.
 let fc_prof_on = 0
 let fc_prof_acc = 0        // [0..FCP_NSLOT) accumulated ns; [FCP_NSLOT..) start stamps
-let fc_prof_cal = 0        // measured ns per clock() call
+let fc_prof_cal = 0        // measured ns per mark
+let fc_prof_ts = 0         // 16-byte timespec reused by every mark
+let fc_prof_cal_clock = 0  // ns per mark measured with the OLD clock() builtin
+
+// THE MARK PRIMITIVE, AND WHY IT IS NOT clock().
+//
+// clock() in this emitter is mmap(16) + clock_gettime + munmap(16) PER CALL
+// (emitter.quanta:3142-3168). MEASURED with a standalone probe (a loop that DOES
+// increment its counter): 5148 ns per call single-threaded, i.e. ~1000x a plain
+// clock_gettime, and every call creates and destroys a VMA -- which forces a TLB
+// shootdown to every core running a worker thread. At this profiler's ~2000
+// marks per decode token that is 10 ms/token of pure mark cost before any
+// collateral, on a token that costs ~1200 ms.
+//
+// RETRACTED CLAIM, kept so it is not re-derived: an earlier version of this note
+// said the marks cost ~5 ms of TOKEN time each, inferred from a prof run that
+// took 12 s/token. That run was not measuring anything -- its calibration loop
+// had no incrementer and never terminated, so the process was spinning, not
+// profiling. The 5148 ns/call figure stands (it is a direct measurement); the
+// "5 ms per mark" figure does NOT and is withdrawn.
+//
+// So the marks read CLOCK_MONOTONIC with ONE raw syscall into a timespec buffer
+// allocated once (fc_prof_ts): syscall(228, 1, buf, 0,0,0) = clock_gettime(
+// CLOCK_MONOTONIC, buf). Same clock, same unit, no VMA churn, no shootdown.
+// fc_prof_enable() calibrates BOTH primitives side by side, so the cost of each
+// is a measurement printed with the table rather than an assertion.
+//
+// This is also a COMPILER-LEVEL defect worth filing, not a lib/std workaround:
+// `clock()` is the language's only monotonic time builtin and it is unusable at
+// any real sampling rate. The fix belongs in the emitter (a vDSO read, or a
+// reusable caller-owned timespec), and compiler/** is not this unit's to change.
+fn fc_prof_now() -> i64 {
+    syscall(228, 1, fc_prof_ts, 0, 0, 0)
+    return mem_load(fc_prof_ts) * 1000000000 + mem_load(fc_prof_ts + 8)
+}
 
 const FCP_NSLOT = 32
 const FCP_TOKEN    = 0   // whole fc_forward_token_body
@@ -124,17 +158,29 @@ const FCP_C_KERN   = 26  // conv kernel dequant + correlation
 const FCP_C_OUT    = 27  // shortconv out_proj matvec
 
 fn fc_prof_enable() -> i64 {
-    if fc_prof_acc == 0 { fc_prof_acc = mem_alloc(2 * FCP_NSLOT * 8) }
+    if fc_prof_acc == 0 {
+        fc_prof_acc = mem_alloc(2 * FCP_NSLOT * 8)
+        fc_prof_ts = mem_alloc(16)
+    }
     let i = 0
     while i < 2 * FCP_NSLOT { mem_store(fc_prof_acc + i * 8, 0); i = i + 1 }
-    // calibrate: 2000 clock() calls, so the mark cost is a measurement, not a
-    // guess. (Divisor is a compile-time constant; no idiv in the hot path.)
+    // Calibrate BOTH primitives, so the claim that clock() is unusable as a mark
+    // is a measurement in the same run as the table it accompanies. 2000 calls
+    // each; the two bracketing calls are included, hence 2001.
+    // NOTE the explicit incrementer on BOTH lines. A calibration loop written as
+    // `while j < 2000 { clock() }` has no incrementer and never terminates: it
+    // cost two 20-minute runs that looked exactly like "the timer serialises the
+    // pool" before the real cause was found. Always two statements in a body.
     let t0 = clock()
     let j = 0
-    while j < 2000 { clock() }
+    while j < 2000 { clock(); j = j + 1 }
     let t1 = clock()
-    // t1 - t0 covers 2001 calls (the two bracketing ones included)
-    fc_prof_cal = (t1 - t0) / 2001
+    fc_prof_cal_clock = (t1 - t0) / 2001
+    let t2 = fc_prof_now()
+    j = 0
+    while j < 2000 { fc_prof_now(); j = j + 1 }
+    let t3 = fc_prof_now()
+    fc_prof_cal = (t3 - t2) / 2001
     fc_prof_on = 1
     return 0
 }
@@ -142,6 +188,7 @@ fn fc_prof_enable() -> i64 {
 fn fc_prof_disable() -> i64 { fc_prof_on = 0; return 0 }
 fn fc_prof_is_on() -> i64 { return fc_prof_on }
 fn fc_prof_cal_ns() -> i64 { return fc_prof_cal }
+fn fc_prof_cal_clock_ns() -> i64 { return fc_prof_cal_clock }
 
 fn fc_prof_reset() -> i64 {
     if fc_prof_acc == 0 { return -1 }
@@ -152,13 +199,13 @@ fn fc_prof_reset() -> i64 {
 
 fn fc_prof_begin(slot) -> i64 {
     if fc_prof_on == 0 { return 0 }
-    mem_store(fc_prof_acc + (FCP_NSLOT + slot) * 8, clock())
+    mem_store(fc_prof_acc + (FCP_NSLOT + slot) * 8, fc_prof_now())
     return 0
 }
 
 fn fc_prof_stop(slot) -> i64 {
     if fc_prof_on == 0 { return 0 }
-    let d = clock() - mem_load(fc_prof_acc + (FCP_NSLOT + slot) * 8)
+    let d = fc_prof_now() - mem_load(fc_prof_acc + (FCP_NSLOT + slot) * 8)
     mem_store(fc_prof_acc + slot * 8, mem_load(fc_prof_acc + slot * 8) + d)
     return 0
 }

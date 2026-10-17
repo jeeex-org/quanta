@@ -9,30 +9,39 @@
 #
 # Conf fields (tests/lfm2_decode_bench.quanta):
 #   1 workers  2 len1  3 len2  4 len3  5 use_mmap  6 cache_norms
-#   7 ignore_eos  8 fused_q4k  9 fused_q6k  10 prof
-# Field 10 is NEW and optional: a 9-field conf still works (prof defaults 0), so
-# the peer A/B driver is unaffected.
+#   7 ignore_eos  8 fused_q4k  9 fused_q6k  10 prof  11 prof_work  12 (change)
+# Fields 10+ are NEW and optional: a 9-field conf still works (both default 0),
+# so the peer A/B driver tests/run_q6k_fused_ab.sh is unaffected.
+#
+# prof=1 turns on the phase table. prof_work=1 ALSO turns on the worker-side
+# marks, which serialise the pool (clock() is mmap+clock_gettime+munmap here, so
+# 20 workers x 2 marks per matvec contend on mmap_lock): use it only for the
+# short `conc` run that answers the pool-concurrency question.
 #
 # Stages:
-#   exact  bit-exactness gate (tests/lfm2_fused_logits_test.quanta). ALWAYS RUN
-#          FIRST -- correctness before any timing.
-#   prof   decode bench with the opt-in per-stage timer ON (conf field 10 = 1).
-#          The timer build is THIS build of the bench; a rate measured with
-#          prof=1 contains the clock() marks and is NOT a speed measurement.
-#   ab     two arms in one script, no prof: A = both fused (baseline),
-#          B = both fused + the change under test (conf field 11).
+#   exact     bit-exactness gate (tests/lfm2_fused_logits_test.quanta). RUN FIRST.
+#   baseline  clean rate, timer OFF, canonical lengths.
+#   prof      phase table, timer ON (prof_work OFF). NOT a rate measurement.
+#   conc      SHORT run with prof_work=1 -- pool concurrency only, times void.
+#   ab        baseline vs the change under test (conf field 12), timer OFF.
 #
-# Usage: bash tests/lfm2_prof_ab.sh exact|prof|ab
+# Usage: bash tests/lfm2_prof_ab.sh exact|baseline|prof|conc|ab
 set -u
 cd "$(dirname "$0")/.." || exit 2
 REPO="$PWD"
-QC="$REPO/compiler/$(cat "$REPO/VERSION")/bin/x86/qc"
+# COMPILER IS PINNED, NOT DERIVED FROM VERSION. A second unit is adding f16/f32
+# float types in a new compiler/0.0.247 tree and will eventually bump VERSION;
+# deriving QC from that file would swap the compiler underneath a running
+# measurement without a word. Pin it, print it in every run, and report it.
+# Override with QC=... only deliberately.
+QC="${QC:-$PWD/compiler/0.0.246/bin/x86/qc}"
 CONF=tests/lfm2_decode_bench.conf
 SCRATCH="${TMPDIR:-/tmp}"
 BENCH="$SCRATCH/lfm2_decode_bench.bin"
 EXBIN="$SCRATCH/lfm2_fused_logits.bin"
 CONF_CANON="20 128 512 1024 1 1 1 0 0"
-LENS="${PROF_LENS:-128 1024 128}"
+LENS="${LENS:-128 1024 128}"
+CONC_LENS="${CONC_LENS:-32 32 32}"
 
 peer_gate () {
     local peers
@@ -52,6 +61,8 @@ env_report () {
     echo "top_cpu : $(ps -eo pcpu,comm --sort=-pcpu | sed -n '2p')"
     echo "user    : $(id -un)  box: $(hostname)"
     echo "head    : $(git rev-parse --short HEAD)  dirty=$(git status --short | wc -l)"
+    echo "qc      : $QC"
+    echo "qc_md5  : $(md5sum "$QC" 2>/dev/null | cut -d' ' -f1)"
 }
 
 stage_exact () {
@@ -78,7 +89,8 @@ run_arm () {
     local tag="$1"; local line="$2"; local log="$3"
     printf '%s\n' "$line" > "$CONF"
     echo "=== $tag ==="
-    echo "conf    : $(cat $CONF)   (fields: workers len1 len2 len3 mmap cache_norms ignore_eos fused_q4k fused_q6k [prof] [change])"
+    echo "conf    : $(cat $CONF)"
+    echo "          fields: workers len1 len2 len3 mmap cache_norms ignore_eos fused_q4k fused_q6k [prof] [prof_work] [change]"
     echo "load_pre: $(cat /proc/loadavg)"
     echo "start   : $(date '+%F %T')"
     ( ulimit -c 0 -v 32000000; timeout 7200 nice -n 0 "$BENCH" </dev/null ) > "$log" 2>&1
@@ -89,34 +101,29 @@ run_arm () {
     echo
 }
 
-stage_prof () {
-    echo "=== STAGE prof: per-stage timer build, conf field 10 = 1 ==="
-    echo "NOTE: this build contains the timer and the conf turns it ON, so the"
-    echo "      tok/s printed below is NOT a speed measurement -- it is inflated by"
-    echo "      the clock() marks. fc_prof_cal_ns is printed with each table."
-    bench_build
-    run_arm "PROF (both fused, prof=1)" "20 $LENS 1 1 1 1 1 1" /tmp/prof_stage_prof.log
-}
+stage_baseline () { bench_build; run_arm "BASELINE rate, timer OFF (canonical-ish)" "20 $LENS 1 1 1 1 1 0 0" /tmp/prof_stage_baseline.log; }
+stage_prof     () { bench_build; run_arm "PROF phase table, timer ON, prof_work ON" "20 $LENS 1 1 1 1 1 1 1" /tmp/prof_stage_prof.log; }
+stage_prof_nw  () { bench_build; run_arm "PROF phase table, timer ON, prof_work OFF" "20 $LENS 1 1 1 1 1 1 0" /tmp/prof_stage_prof_nw.log; }
+stage_conc     () { bench_build; run_arm "CONC pool concurrency, prof_work=1 (SHORT; times void)" "20 $CONC_LENS 1 1 1 1 1 1 1" /tmp/prof_stage_conc.log; }
 
 stage_ab () {
-    local line_a="20 $LENS 1 1 1 1 1 0"
-    local line_b="20 $LENS 1 1 1 1 1 1"
-    echo "=== STAGE ab: baseline (no change) vs change, timer OFF both arms ==="
+    echo "=== STAGE ab: baseline (change OFF) vs change ON, timer OFF both arms ==="
     bench_build
-    run_arm "A baseline (both fused, change OFF)" "$line_a" /tmp/prof_ab_A.log
-    run_arm "B change ON" "$line_b" /tmp/prof_ab_B.log
+    run_arm "A baseline  (change=0)" "20 $LENS 1 1 1 1 1 0 0 0" /tmp/prof_ab_A.log
+    run_arm "B change ON (change=1)" "20 $LENS 1 1 1 1 1 0 0 1" /tmp/prof_ab_B.log
 }
 
 peer_gate
 env_report
 case "${1:-}" in
-    exact) stage_exact ;;
-    prof)  stage_prof ;;
-    ab)    stage_ab ;;
-    *) echo "usage: $0 exact|prof|ab"; exit 2 ;;
+    exact)    stage_exact ;;
+    baseline) stage_baseline ;;
+    prof)     stage_prof ;;
+    conc)     stage_conc ;;
+    ab)       stage_ab ;;
+    *) echo "usage: $0 exact|baseline|prof|conc|ab"; exit 2 ;;
 esac
 
-# restore the canonical conf whatever happened
 printf '%s\n' "$CONF_CANON" > "$CONF"
 echo "restored conf: $(cat $CONF)"
 echo "=== driver done: $(date '+%F %T') load=$(cat /proc/loadavg) ==="

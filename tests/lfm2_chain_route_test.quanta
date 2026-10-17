@@ -1,0 +1,154 @@
+// tests/lfm2_chain_route_test.quanta
+//
+// ELEMENT-WISE BIT-EXACTNESS GATE FOR THE SCALAR-CHAIN TIED PROJECTION.
+//
+// The chain route (mm_fused_chain -> pool kind 5 -> pl_run_embed_map ->
+// jit_f_apply_chain) is the ONE fused route whose reference is a strict
+// left-to-right SCALAR sum. Every other fused kernel reduces four lanes in the
+// same order mm_dot4_s does, so a lane-order fault shows up immediately; a chain
+// kernel can fold its four products in the wrong ORDER and still produce a
+// plausible number. So it gets its own test, and this one is deliberately
+// stronger than the end-to-end logits diff in two ways:
+//
+//   (1) ALL 128000 ROWS of the real token_embd Q6_K tensor, through
+//       mm_embed_logits -- the actual function lfm2_forward calls -- with the
+//       flag OFF vs ON, compared element-wise by raw f64 bits. The flag-OFF run
+//       IS the reference (it is the shipped path), so a mismatch is unambiguous.
+//       Witnesses are asserted in BOTH directions: used must be 0 with the flag
+//       off and 1 with it on, or the comparison would be against itself.
+//
+//   (2) AN INDEPENDENT ORACLE over a sample of rows: mm_deq_row_raw into a
+//       buffer, then an explicit `acc = acc + row[c]*x[c]` loop written out here,
+//       recomputed from scratch. This is the guard against "both sides wrong the
+//       same way" -- if the kernel and the flag-off worker were both broken
+//       identically, (1) alone would pass.
+//
+// Run: ( ulimit -c 0 -v 32000000; nice -n 0 <bin> </dev/null )   model is 1.67 GB
+import std/gguf
+import std/lfm2_forward
+import std/lfm2_model
+import std/gguf_mm
+import std/fs
+
+const Q4_PATH = "/opt/ai/models/quanta/QUANTA-LFM2.5-2.6Bv1-Q4_K_M.gguf"
+const NW = 20
+const ORACLE_ROWS = 96        // rows recomputed by the independent scalar oracle
+const NCOLS = 2048
+const NV = 128000
+
+let bad = 0
+
+fn ref_chain(idx, row, x, ncols) -> f64 {
+    // the reference: dequantise the row, then sum left to right. Written out
+    // here, not called from a shared helper, so it cannot be the same code the
+    // worker runs.
+    let buf = mem_alloc(ncols * 8)
+    let dt = gguf_tensor_dtype(idx)
+    let rb = mm_row_bytes(dt, ncols)
+    let raw = mm_map_base + gguf_tensor_offset(idx) + row * rb
+    if mm_deq_row_raw(dt, raw, ncols, buf) != 0 { bad = bad + 1; return 0.0 }
+    let acc: f64 = 0.0
+    let c = 0
+    while c < ncols {
+        acc = acc + f64of(mem_load(buf + c * 8)) * f64of(mem_load(x + c * 8))
+        c = c + 1
+    }
+    return acc
+}
+
+fn main() {
+    prints("=== scalar-chain tied projection: bit-exactness through mm_embed_logits ===\n")
+    if gguf_load(Q4_PATH) != 0 { prints("FAIL gguf_load\n"); return 1 }
+    if fc_read_config() != 0 { prints("FAIL fc_read_config\n"); return 1 }
+    mm_set_workers_uncapped(NW)
+    mm_set_embed_workers_uncapped(NW)
+    if mm_attach_mmap_fd(file_open(Q4_PATH, 0)) != 0 { prints("FAIL mm_attach_mmap\n"); return 1 }
+    if mm_map_base == 0 { prints("FAIL: no mmap -- kind 5 not reachable\n"); return 1 }
+
+    let idx = lfm2_token_embd()
+    if idx < 0 { prints("FAIL: no token_embd\n"); return 1 }
+    prints("token_embd idx="); print(idx)
+    prints(" dtype="); print(gguf_tensor_dtype(idx))
+    prints(" nelem="); print(gguf_tensor_nelements(idx))
+    prints(" embed_workers_cfg="); print(NW); newline()
+
+    // ---- the kernel must exist, or the flag fail-closes and nothing is tested
+    if jit_f_setup_chain() != 0 { prints("FAIL: jit_f_setup_chain (no RWX region?)\n"); return 1 }
+    prints("chain_kernel_entry="); print(jit_f_ready_chain()); newline()
+    if jit_f_ready_chain() == 0 { prints("FAIL: chain kernel not emitted\n"); return 1 }
+
+    let x = mem_alloc(NCOLS * 8)
+    let i = 0
+    while i < NCOLS {
+        // deterministic, non-degenerate, non-uniform (a uniform x would hide a
+        // permutation fault: all products equal means any order gives the sum)
+        mem_store(x + i * 8, i2f((i * 131) % 997 - 498) / i2f(313.0))
+        i = i + 1
+    }
+
+    let y0 = mem_alloc(NV * 8)
+    let y1 = mem_alloc(NV * 8)
+    let z = 0
+    while z < NV { mem_store(y0 + z * 8, 0.0); mem_store(y1 + z * 8, 0.0); z = z + 1 }
+
+    // ---- (1) flag OFF: the shipped path IS the reference --------------------
+    mm_set_fused_chain(0)
+    let r0 = mm_embed_logits(idx, x, 0, NV, NCOLS, y0)
+    let u0 = mm_get_fused_chain_used()
+
+    // ---- flag ON -----------------------------------------------------------
+    mm_set_fused_chain(1)
+    let r1 = mm_embed_logits(idx, x, 0, NV, NCOLS, y1)
+    let u1 = mm_get_fused_chain_used()
+
+    prints("---\n")
+    prints("rc_off="); print(r0); prints(" rc_on="); print(r1)
+    prints(" used_off="); print(u0); prints(" used_on="); print(u1); newline()
+    if r0 != 0 || r1 != 0 { prints("FAIL: mm_embed_logits rc\n"); return 1 }
+    if u0 != 0 { prints("FAIL: witness -- chain used with the flag OFF\n"); bad = bad + 1 }
+    if u1 != 1 { prints("FAIL: witness -- chain NOT used with the flag ON (never dispatched)\n"); bad = bad + 1 }
+
+    let mism = 0
+    let nonzero = 0
+    let v = 0
+    while v < NV {
+        let b0 = mem_load(y0 + v * 8)
+        let b1 = mem_load(y1 + v * 8)
+        if b1 != b0 { mism = mism + 1 }
+        if b0 != 0 { nonzero = nonzero + 1 }
+        v = v + 1
+    }
+    prints("rows="); print(NV)
+    prints(" elems="); print(NV * NCOLS)
+    prints(" mismatch="); print(mism)
+    prints(" nonzero="); print(nonzero); newline()
+    if nonzero < NV { prints("FAIL: reference has zero rows -- the comparison is against zeros\n"); bad = bad + 1 }
+    bad = bad + mism
+
+    // ---- (2) independent oracle over a sample, both kernels -----------------
+    let omis = 0
+    let wbits = mem_alloc(16)
+    let orow = 0
+    while orow < ORACLE_ROWS {
+        let want = ref_chain(idx, orow, x, NCOLS)
+        let b0 = mem_load(y0 + orow * 8)
+        let b1 = mem_load(y1 + orow * 8)
+        if b1 != b0 { omis = omis + 1 }
+        // compare the oracle against BOTH sides BY BITS, not by f64 ==: value
+        // equality cannot see +0.0 vs -0.0, and bit-identity is the claim.
+        mem_store(wbits, want)
+        let wb = mem_load(wbits)
+        if b0 != wb || b1 != wb { omis = omis + 1 }
+        orow = orow + 1
+    }
+    prints("oracle_rows="); print(ORACLE_ROWS)
+    prints(" oracle_mismatch="); print(omis); newline()
+    bad = bad + omis
+
+    prints("---\n")
+    prints("total_bad="); print(bad); newline()
+    if bad != 0 { prints("FAIL: the scalar-chain route is NOT bit-identical\n"); return 1 }
+    prints("PASS: chain tied projection == the shipped scalar chain, element-wise, all 128000 rows\n")
+    prints("DONE\n")
+    return 0
+}

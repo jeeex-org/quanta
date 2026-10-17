@@ -254,10 +254,10 @@ fn mm_matvec_par(idx: u64, x: u64, rows: i64, cols: i64, y: u64, nworkers: i64) 
     // zero y so a worker that fails leaves a detectable value rather than
     // whatever was there before
     let z0 = 0
-    if mm_prof_on != 0 { z0 = clock() }
+    if mm_prof_on != 0 { z0 = mm_prof_now() }
     let r = 0
     while r < rows { mem_store(y + r * 8, 0.0); r = r + 1 }
-    if mm_prof_on != 0 { mm_prof_add(MMP_YZERO, clock() - z0) }
+    if mm_prof_on != 0 { mm_prof_add(MMP_YZERO, mm_prof_now() - z0) }
 
     // kind 4 = the mmap row path (bit-identical to kind 0, no pread): used only
     // when mm_attach_mmap() has mapped the file and the dtype is one the raw
@@ -275,14 +275,14 @@ fn mm_matvec_par(idx: u64, x: u64, rows: i64, cols: i64, y: u64, nworkers: i64) 
     // scratch cell from it at spawn time (mm_scratch_new(pl_cell_cols)).
     pl_cell_cols = cols
     let e0 = 0
-    if mm_prof_on != 0 { e0 = clock() }
+    if mm_prof_on != 0 { e0 = mm_prof_now() }
     if mm_pool_ensure(nworkers, cols) != 0 { return -1 }
-    if mm_prof_on != 0 { mm_prof_add(MMP_ENSURE, clock() - e0) }
+    if mm_prof_on != 0 { mm_prof_add(MMP_ENSURE, mm_prof_now() - e0) }
     let s0 = 0
-    if mm_prof_on != 0 { s0 = clock() }
+    if mm_prof_on != 0 { s0 = mm_prof_now() }
     if pl_submit() != 0 { pl_kill(); return -1 }
     if mm_prof_on != 0 {
-        mm_prof_add(MMP_SUBMIT, clock() - s0)
+        mm_prof_add(MMP_SUBMIT, mm_prof_now() - s0)
         mm_prof_add(MMP_CALLS, 1)
         mm_prof_add(MMP_WEXEC, nworkers)
         mm_prof_add(MMP_ELEMS, rows * cols)
@@ -388,6 +388,40 @@ fn mm_set_fused_q6k(n) {
 
 fn mm_get_fused_q6k() { return mm_fused_q6k }
 fn mm_get_fused_q6k_used() { return mm_fused_q6k_used }
+
+// ===========================================================================
+// SCALAR-CHAIN ROUTE FOR THE TIED OUTPUT PROJECTION -- opt-in, DEFAULT OFF
+// ===========================================================================
+// This is the third and last fused route, and it exists for exactly the reason
+// the other two DO NOT cover token_embd.weight: [2048, 128000] is pool kind 5
+// (pl_run_embed_map), whose reference dot is a strict LEFT-TO-RIGHT SCALAR
+// CHAIN, not mm_dot4_s's four lanes. Reusing the 4-lane kernel there would move
+// every product's summation order, which is the change that was already rejected
+// on blast radius. jit_f_apply_chain() instead keeps the chain (four SERIAL
+// vaddsd per group, ascending element order) and deletes the per-element Quanta
+// builtin call, which is what the chain actually pays for.
+//
+// It is 262,144,000 elements -- the single largest matvec in the model, 9.72% of
+// per-token matvec elements, and the only 9.72% that was still on a scalar dot
+// after the Q4_K and Q6_K twins landed. So it is the one place where "fuse the
+// remaining matvec" and "keep the reference order" are the same instruction.
+//
+// FAIL CLOSED, like the twins: mm_embed_logits_par calls jit_f_setup_chain()
+// on the main thread before any worker sees the flag and clears it if the RWX
+// region is refused.
+let mm_fused_chain = 0
+let mm_fused_chain_used = 0
+
+fn mm_set_fused_chain(n) {
+    if n < 0 { n = 0 }
+    if n != 0 { n = 1 }
+    mm_fused_chain = n
+    mm_fused_chain_used = 0
+    return 0
+}
+
+fn mm_get_fused_chain() { return mm_fused_chain }
+fn mm_get_fused_chain_used() { return mm_fused_chain_used }
 
 // ===========================================================================
 // RESOURCE POLITENESS -- the loader must never saturate the box unattended
@@ -778,10 +812,18 @@ fn mm_embed_logits_par(idx: u64, x: u64, v0: i64, vcount: i64, ncols: i64, y: u6
 
     // zero y so a worker failure leaves a detectable value
     let z0 = 0
-    if mm_prof_on != 0 { z0 = clock() }
+    if mm_prof_on != 0 { z0 = mm_prof_now() }
     let v = 0
     while v < vcount { mem_store(y + v * 8, 0.0); v = v + 1 }
-    if mm_prof_on != 0 { mm_prof_add(MMP_YZERO, clock() - z0) }
+    if mm_prof_on != 0 { mm_prof_add(MMP_YZERO, mm_prof_now() - z0) }
+
+    // FAIL CLOSED for the opt-in scalar-chain route: emit the kernel ONCE here,
+    // on the main thread, before any worker sees the flag, and clear the flag if
+    // the RWX mapping is refused -- so pl_run_embed_map never dispatches into a
+    // null code pointer on a box without executable anonymous memory.
+    if mm_fused_chain != 0 {
+        if jit_f_setup_chain() != 0 { mm_fused_chain = 0 }
+    }
 
     // job descriptor for the shared pool worker (module-level; the driver fills
     // it BEFORE the generation bump, and the fence in pl_submit orders the two)
@@ -798,14 +840,14 @@ fn mm_embed_logits_par(idx: u64, x: u64, v0: i64, vcount: i64, ncols: i64, y: u6
     pl_active = nworkers
     pl_cell_cols = ncols
     let e0 = 0
-    if mm_prof_on != 0 { e0 = clock() }
+    if mm_prof_on != 0 { e0 = mm_prof_now() }
     if mm_pool_ensure(nworkers, ncols) != 0 { return -1 }
-    if mm_prof_on != 0 { mm_prof_add(MMP_ENSURE, clock() - e0) }
+    if mm_prof_on != 0 { mm_prof_add(MMP_ENSURE, mm_prof_now() - e0) }
     let s0 = 0
-    if mm_prof_on != 0 { s0 = clock() }
+    if mm_prof_on != 0 { s0 = mm_prof_now() }
     if pl_submit() != 0 { pl_kill(); return -1 }
     if mm_prof_on != 0 {
-        mm_prof_add(MMP_SUBMIT, clock() - s0)
+        mm_prof_add(MMP_SUBMIT, mm_prof_now() - s0)
         mm_prof_add(MMP_CALLS, 1)
         mm_prof_add(MMP_WEXEC, nworkers)
         mm_prof_add(MMP_ELEMS_EMB, vcount * ncols)
@@ -916,12 +958,15 @@ fn mm_scratch_new(maxcols) {
     // (8 lanes at +0..63, 8 temps at +64..127). One region serves both -- only
     // one dot runs at a time per cell.
     let acc = mem_alloc(512)
-    let cell = mem_alloc(32)
+    let cell = mem_alloc(48)
     let argp = mem_alloc(32)         // fused kernel args: [W, X, DMD, nsuper]
+    // cell+32: THIS worker's own 16-byte timespec for the pool profile. Per
+    // worker, so the 20 workers never share the buffer the kernel writes.
     mem_store(cell, raw)
     mem_store(cell + 8, f64b)
     mem_store(cell + 16, acc)
     mem_store(cell + 24, argp)
+    mem_store(cell + 32, mem_alloc(16))
     return cell
 }
 
@@ -1074,13 +1119,40 @@ let pl_active = 0
 // phase table alone: is the 20-worker pool actually running 20-wide, or is the
 // static row slice imbalanced (t*w chunk, no stealing) so most workers idle
 // while one finishes? So the dispatcher times its own publish+wait
-// (MMP_SUBMIT) and every worker times its own busy period into ITS OWN slot
-// (disjoint writers -- no atomics needed, and none exist in this language).
+// (MMP_SUBMIT) and -- SEPARATELY, behind its own flag -- every worker times its
+// own busy period into ITS OWN slot (disjoint writers, so no atomics are needed
+// and none exist in this language).
 //   achieved concurrency = WORKER_BUSY_SUM / SUBMIT_SUM
 // ~nworkers means the pool is saturated; ~1-3 means workers are starved.
+//
+// THE WORKER TIMING IS A SEPARATE FLAG, and the reason is the mark primitive,
+// not the pool: clock() is mmap(16)+clock_gettime+munmap(16) per call, MEASURED
+// at 5148 ns/call, so a per-worker per-job mark pair would cost
+// 166 calls x 20 workers x 2 = 6640 VMA create/destroy pairs per token. The
+// marks below therefore use mm_prof_now_b() -- one raw clock_gettime syscall
+// into a PER-WORKER timespec (cell+32), no VMA churn. It stays a separate flag
+// so the phase table can be taken with zero worker-side syscalls if a doubt
+// ever arises about the worker marks themselves.
 let mm_prof_on = 0
+let mm_prof_work_on = 0  // worker-side marks; per-worker timespec, no mmap
 let mm_prof_acc = 0      // driver-side accumulators (single writer: the driver)
 let mm_prof_workp = 0    // per-worker busy ns; worker t writes ONLY slot t
+let mm_prof_ts = 0       // driver-side 16-byte timespec for the raw-syscall mark
+
+// THE MARK PRIMITIVE. Not clock(): that builtin is mmap(16)+clock_gettime+
+// munmap(16) per call (emitter.quanta:3142-3168), MEASURED at 5148 ns per call
+// single-threaded and ~5 ms of added TOKEN time per mark in context, because the
+// VMA create/destroy shoots down the TLB of every core running a worker. A timer
+// built on it cannot measure the thing it perturbs. One raw
+// clock_gettime(CLOCK_MONOTONIC) syscall into a caller-supplied timespec has
+// neither the VMA churn nor the shootdown. The timespec is PER CALLER: the
+// driver passes its own, each worker passes its own (cell+32), so there is no
+// shared-buffer race between the 20 workers.
+fn mm_prof_now_b(ts) -> i64 {
+    syscall(228, 1, ts, 0, 0, 0)
+    return mem_load(ts) * 1000000000 + mem_load(ts + 8)
+}
+fn mm_prof_now() -> i64 { return mm_prof_now_b(mm_prof_ts) }
 
 const MMP_SUBMIT    = 0  // dispatcher: publish + wait for all workers
 const MMP_CALLS     = 1  // parallel matvec calls
@@ -1094,13 +1166,19 @@ fn mm_prof_enable() -> i64 {
     if mm_prof_acc == 0 {
         mm_prof_acc = mem_alloc(32 * 8)
         mm_prof_workp = mem_alloc(MM_MAX_WORKERS * 8)
+        mm_prof_ts = mem_alloc(16)
     }
     mm_prof_reset()
     mm_prof_on = 1
     return 0
 }
-fn mm_prof_disable() -> i64 { mm_prof_on = 0; return 0 }
+fn mm_prof_disable() -> i64 { mm_prof_on = 0; mm_prof_work_on = 0; return 0 }
 fn mm_prof_is_on() -> i64 { return mm_prof_on }
+fn mm_set_prof_work(n) -> i64 {
+    if n != 0 { mm_prof_work_on = 1 } else { mm_prof_work_on = 0 }
+    return 0
+}
+fn mm_prof_work_enabled() -> i64 { return mm_prof_work_on }
 fn mm_prof_reset() -> i64 {
     if mm_prof_acc == 0 { return -1 }
     let i = 0
@@ -1322,12 +1400,17 @@ fn pl_worker(t: i64) -> i64 {
                 lfence()
                 // pool profile: this worker times ITS OWN busy period into ITS
                 // OWN slot. Disjoint writers, so no atomics are needed (and the
-                // language has none). Guarded so the OFF path is one compare.
+                // language has none). Gated behind its OWN flag because clock()
+                // is mmap+clock_gettime+munmap here -- see mm_prof_work_on.
                 let w0 = 0
-                if mm_prof_on != 0 { w0 = clock() }
+                let wts = 0
+                if mm_prof_work_on != 0 {
+                    wts = mem_load(cell + 32)
+                    w0 = mm_prof_now_b(wts)
+                }
                 if t < pl_active { pl_run(t, cell) }
-                if mm_prof_on != 0 {
-                    let wd = clock() - w0
+                if mm_prof_work_on != 0 {
+                    let wd = mm_prof_now_b(wts) - w0
                     mem_store(mm_prof_workp + t * 8, mem_load(mm_prof_workp + t * 8) + wd)
                 }
                 atomic_store(pl_donep + t * 8, g)
@@ -1683,17 +1766,43 @@ fn pl_run_embed_map(t: i64, cell) {
     if rb <= 0 { return -1 }
     let toff = gguf_tensor_offset(pl_idx)
     let f64b = mem_load(cell + 8)
+
+    // ---- the SCALAR-CHAIN route (opt-in, default OFF) ----------------------
+    // token_embd.weight is the ONE matvec whose reference dot is a strict
+    // left-to-right scalar chain, which is why the 4-lane folded Q6_K route does
+    // NOT apply to it. jit_f_apply_chain() keeps that chain -- four SERIAL vaddsd
+    // per group, ascending element order -- and removes the per-element Quanta
+    // builtin call instead of changing the order.
+    let fusedc = 0
+    let cargs = 0
+    if mm_fused_chain != 0 && dtype == 14 && pl_ncols - (pl_ncols / 256) * 256 == 0 {
+        cargs = mem_load(cell + 24)
+        if cargs != 0 { fusedc = 1 }
+    }
     let v = lo
     while v < hi {
         let raw = mm_map_base + toff + (pl_v0 + v) * rb
-        if mm_deq_row_raw(dtype, raw, pl_ncols, f64b) != 0 { return -1 }
-        let acc: f64 = 0.0
-        let c = 0
-        while c < pl_ncols {
-            acc = acc + f64of(mem_load(f64b + c * 8)) * f64of(mem_load(pl_x + c * 8))
-            c = c + 1
+        if fusedc != 0 {
+            // THIS worker's own args area (cell+24), allocated once at spawn --
+            // the same rule pl_run_rows_map follows, because a shared area is
+            // exactly the cross-worker race the _s variants exist to avoid and
+            // there are no atomics to fix it.
+            mem_store(cargs + 0, raw)               // W: this row's quant bytes
+            mem_store(cargs + 8, pl_x)              // X: fixed for the whole matvec
+            mem_store(cargs + 16, 0)                // DMD: unused by the chain kernel
+            mem_store(cargs + 24, pl_ncols / 256)   // nsuper
+            mem_store(pl_y + (pl_v0 + v) * 8, jit_f_apply_chain(cargs))
+            mm_fused_chain_used = 1
+        } else {
+            if mm_deq_row_raw(dtype, raw, pl_ncols, f64b) != 0 { return -1 }
+            let acc: f64 = 0.0
+            let c = 0
+            while c < pl_ncols {
+                acc = acc + f64of(mem_load(f64b + c * 8)) * f64of(mem_load(pl_x + c * 8))
+                c = c + 1
+            }
+            mem_store(pl_y + (pl_v0 + v) * 8, acc)
         }
-        mem_store(pl_y + (pl_v0 + v) * 8, acc)
         v = v + 1
     }
     return hi - lo

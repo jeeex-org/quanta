@@ -1,0 +1,96 @@
+// tests/lfm2_chain_kernel_test.quanta
+//
+// KERNEL-ISOLATED bit-exactness for jit_f_apply_chain(): ONE row at a time,
+// called DIRECTLY (no pool, no threads, no mm_embed_logits). This exists because
+// the route-level test (tests/lfm2_chain_route_test.quanta) SEGFAULTED, and the
+// cheapest way to place the fault is to take the pool and the wiring out of the
+// picture: if this passes, the kernel is sound and the fault is in the wiring;
+// if it faults here, the fault is in the emitted bytes.
+//
+// Build: ./compiler/0.0.246/bin/x86/qc -O tests/lfm2_chain_kernel_test.quanta <bin>
+// Run:   ( ulimit -c 0 -v 32000000; nice -n 0 <bin> </dev/null )
+import std/gguf
+import std/lfm2_forward
+import std/lfm2_model
+import std/gguf_mm
+import std/math
+import std/fs
+
+const Q4_PATH = "/opt/ai/models/quanta/QUANTA-LFM2.5-2.6Bv1-Q4_K_M.gguf"
+const NCOLS = 2048
+const NROWS = 24
+
+fn main() {
+    prints("=== chain kernel, isolated (direct call, no pool) ===\n")
+    if gguf_load(Q4_PATH) != 0 { prints("FAIL gguf_load\n"); return 1 }
+    if fc_read_config() != 0 { prints("FAIL fc_read_config\n"); return 1 }
+    if mm_attach_mmap_fd(file_open(Q4_PATH, 0)) != 0 { prints("FAIL mm_attach_mmap\n"); return 1 }
+
+    let idx = lfm2_token_embd()
+    if idx < 0 { prints("FAIL no token_embd\n"); return 1 }
+    let dt = gguf_tensor_dtype(idx)
+    let rb = mm_row_bytes(dt, NCOLS)
+    prints("dtype="); print(dt); prints(" row_bytes="); print(rb)
+    prints(" nelem="); print(gguf_tensor_nelements(idx)); newline()
+    if rb <= 0 { prints("FAIL row_bytes\n"); return 1 }
+
+    prints("setup_chain rc="); print(jit_f_setup_chain()); newline()
+    if jit_f_ready_chain() == 0 { prints("FAIL no chain kernel\n"); return 1 }
+    prints("entry="); print(jit_f_ready_chain()); newline()
+
+    let x = mem_alloc(NCOLS * 8)
+    let i = 0
+    while i < NCOLS {
+        mem_store(x + i * 8, i2f((i * 131) % 997 - 498) / i2f(313.0))
+        i = i + 1
+    }
+    // non-zero check on x itself: an all-zero x hides everything
+    let xacc: f64 = 0.0
+    i = 0
+    while i < NCOLS { xacc = xacc + f64of(mem_load(x + i * 8)); i = i + 1 }
+    prints("x_sum_bits="); print(mem_load(x)); newline()
+
+    let f64b = mem_alloc(NCOLS * 8)
+    let args = mem_alloc(32)
+    let toff = gguf_tensor_offset(idx)
+    prints("tensor_offset="); print(toff); prints(" map_base="); print(mm_map_base); newline()
+
+    let bad = 0
+    let nonzero = 0
+    let row = 0
+    while row < NROWS {
+        let raw = mm_map_base + toff + row * rb
+        // ---- the reference: dequantise, then sum strictly left to right
+        if mm_deq_row_raw(dt, raw, NCOLS, f64b) != 0 { prints("FAIL deq\n"); return 1 }
+        let want: f64 = 0.0
+        let c = 0
+        while c < NCOLS {
+            want = want + f64of(mem_load(f64b + c * 8)) * f64of(mem_load(x + c * 8))
+            c = c + 1
+        }
+        // ---- the kernel
+        mem_store(args + 0, raw)
+        mem_store(args + 8, x)
+        mem_store(args + 16, 0)
+        mem_store(args + 24, NCOLS / 256)
+        let gotbits = jit_f_apply_chain(args)
+        let got: f64 = f64of(gotbits)
+        if got != want { bad = bad + 1 }
+        if got != 0.0 { nonzero = nonzero + 1 }
+        prints("row="); print(row)
+        prints(" want="); pf64(want)
+        prints(" got="); pf64(got)
+        prints(" eq=")
+        if got == want { prints("1") } else { prints("0") }
+        newline()
+        row = row + 1
+    }
+    prints("---\n")
+    prints("rows="); print(NROWS); prints(" mismatch="); print(bad)
+    prints(" nonzero="); print(nonzero); newline()
+    if bad != 0 { prints("FAIL: chain kernel != reference\n"); return 1 }
+    if nonzero < NROWS { prints("FAIL: kernel returned zero rows\n"); return 1 }
+    prints("PASS: chain kernel bit-identical to the scalar chain on real rows\n")
+    prints("DONE\n")
+    return 0
+}
