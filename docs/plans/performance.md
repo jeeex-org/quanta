@@ -416,3 +416,32 @@ addressing model for Q4_K's nibble layout, and the VEX dest/src overlap in
 NOT yet an end-to-end tok/s number: the microbenchmark above is of the dot only.
 Integration into `lfm2_forward` and the 128/512/1024-token table are in flight.
 `clock()`'s absolute unit is unverified, so only ratios are trustworthy here.
+
+## Module rename: lfm2_mm -> gguf_mm, lfm2_bpe -> gguf_bpe (2026-10-17)
+
+Two modules carried a model-specific name while containing no model-specific code:
+
+- `lfm2_mm.quanta` -> **`gguf_mm.quanta`**: 0 `lfm2.*` metadata reads, 31 `gguf_`
+  calls. It is a descriptor/dtype-driven matvec over the GGUF tensor table, so it
+  serves ANY GGUF dtype - the name claimed an LFM2 dependency it never had and hid
+  the GGUF one it does.
+- `lfm2_bpe.quanta` -> **`gguf_bpe.quanta`**: GPT-2 byte-level BPE driven by the
+  GGUF vocabulary/merges. The model-specific part is the pre-tokenizer TYPE, which
+  lives in `lfm2_pretok.quanta`.
+
+Renamed with them: the three stdlib gate rows
+(`stdlib_lfm2_mm_test` -> `stdlib_gguf_mm_test`, and the two `..._bpe_...` rows),
+which now sit in the existing `stdlib_gguf_*` family.
+
+Deliberately NOT renamed, because they ARE model-bound: `lfm2_forward` (26 `lfm2.*`
+key reads and the hybrid short-conv + GQA layer graph), `lfm2_model` (the
+266-descriptor table for this exact model), `lfm2_pretok` (keyed on the model's
+`tokenizer.ggml.pre` type), `lfm2_chat` (its Jinja template), `cuda_lfm2` (offload
+of that forward). The point of the split is that adding a second architecture now
+means writing `<arch>_forward` + `<arch>_pretok` + `<arch>_chat`, with `gguf_mm`,
+`gguf_bpe` and `gguf.quanta` reused untouched.
+
+NOTE for readers of older `docs/research/*` files: they reference the former names
+(`lfm2_mm.quanta`, `lfm2_bpe.quanta`) because that is what the files were called
+when those measurements were taken. The records are left as written rather than
+rewritten.
