@@ -1148,3 +1148,39 @@ from ggml's f32 path with no visible cause. Blocks adopting f16/f32 across any c
 is every real use (e.g. a KV writer taking an `f16` value).
 
 Completion is tracked as `docs/plans/language-capabilities.md` #11; scoped into 0.0.248.
+
+### A27 · OPEN (compiler 0.0.247) · `clock()` costs 5,148 ns per call — it mmaps, syscalls and munmaps every time
+
+`clock()` is a compiler builtin (`emitter.quanta:3142`: "clock() -> i64 nanoseconds, CLOCK_MONOTONIC …
+Zero-arg. Internal mmap(16) timespec, clock_gettime(1, b…"). It allocates a 16-byte timespec with
+**`mmap` per call and `munmap`s it again** — so the language's only timer costs about five
+microseconds to read, wrapping a syscall that costs 135 ns.
+
+Measured (profiling unit, same box): `clock()` **5,148 ns/call**; one raw `clock_gettime`
+(`syscall(228, …)`) into a caller-supplied timespec **135 ns**. **38× overhead**, and it is paid per
+mark, so an instrumented hot path measures the instrument.
+
+Impact: fine-grained profiling is impossible — the instrument costs more than most operations being
+instrumented. `lib/std/gguf_mm.quanta:1129-1147` documents this and then **works around it**: the
+loader's profile marks use `mm_prof_now_b()`, a raw `clock_gettime` syscall, explicitly "Not clock()".
+That is a workaround forced by a builtin, which is exactly the class of thing that should be fixed in
+the language instead (`docs/plans/language-capabilities.md` #15).
+
+Expected: `clock()` should read the clock without allocating — a direct syscall, or the vDSO clock
+where available. The nanoseconds contract and CLOCK_MONOTONIC semantics stay identical.
+
+### A28 · OPEN (compiler 0.0.247) · adding a STATEMENT can change a function's inferred return type, breaking unrelated callers
+
+Found when a timer was added to the forward path: binding `mm_matvec(...)` to an untyped `let`
+propagated an **f64 format tag into `fc_short_conv`'s return type**, so the gate's
+`stdlib_lfm2_conv_test` **stopped compiling** — a change to an unrelated function's type signature,
+caused by adding a local.
+
+Impact: a function's apparent type depends on its statement list in a way that is not local. Adding
+instrumentation (or any binding) can silently change what callers see, so the failure surfaces far
+from the edit — here the gate caught it, which is the system working, but only because the row
+happened to compile against that function.
+
+Same family as A26: a type tag travelling where the source does not say it does. Expected: a
+function's return type is determined by its declaration or its returned expression, not by an
+unrelated local's inferred format.
