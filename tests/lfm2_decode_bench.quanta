@@ -15,20 +15,23 @@
 //   - the tied output projection and every matvec go through whatever the
 //     lib/std flags select; the flags are conf fields so ONE binary measures
 //     before AND after:
-//       field 5 use_mmap      (mm_attach_mmap + pool kinds 4/5)
+//   field 5 use_mmap      (mm_attach_mmap + pool kinds 4/5)
 //       field 6 cache_norms   (fc_cache_norms)
+//       field 8 fused_q4k     (mm_set_fused_q4k -- the folded Q4_K route)
+//       field 9 fused_q6k     (mm_set_fused_q6k -- the folded Q6_K route)
 //   - workers use mm_set_workers_uncapped: this is an attended benchmark that
 //     deliberately takes more than the polite 8-worker ceiling; the run script
 //     refuses to start while a peer model process is alive.
 //
 // Conf tests/lfm2_decode_bench.conf:
-//   "<workers> <len1> <len2> <len3> <use_mmap> <cache_norms> [ignore_eos] [fused_q4k]"
+//   "<workers> <len1> <len2> <len3> <use_mmap> <cache_norms> [ignore_eos] [fused_q4k] [fused_q6k]"
 //   ignore_eos=1: fc_argmax_masked suppresses EOS so a run always reaches its
 //   length (the reference prompt deterministically emits EOS at token 43;
 //   llama.cpp's --ignore-eos is the same lever for long perf runs).
-//   fused_q4k=1 (field 8, default 0): opt in to the fused Q4_K dequant-dot on
-//   the mmap row-workers (mm_set_fused_q4k). The flag is OFF unless a conf asks
-//   for it, so one binary measures BEFORE and AFTER in the same session.
+//   fused_q4k=1 (field 8, default 0): opt in to the folded Q4_K dequant-dot on
+//   the mmap row-workers (mm_set_fused_q4k). fused_q6k=1 (field 9, default 0):
+//   the folded Q6_K twin (mm_set_fused_q6k). Both default OFF, and they are
+//   separate so ONE binary measures Q4_K-only vs Q4_K+Q6_K in the same session.
 // Prompt: tests/lfm2_prompt.txt ("What is 2+2? Answer with the number only.").
 // ORACLE (current, re-pinned 0.0.246): first-token argmax 597 and the
 // generation starts `The answer is 4.` The older 5922 / `The answer is: 2`
@@ -72,7 +75,7 @@ fn parse_ints(buf, out) {
             have = 1
         } else {
             if have == 1 {
-                if n < 8 { mem_store(out + n * 8, cur) }
+                if n < 12 { mem_store(out + n * 8, cur) }
                 n = n + 1
                 cur = 0
                 have = 0
@@ -80,7 +83,7 @@ fn parse_ints(buf, out) {
         }
         i = i + 1
     }
-    if have == 1 { if n < 8 { mem_store(out + n * 8, cur) }; n = n + 1 }
+    if have == 1 { if n < 12 { mem_store(out + n * 8, cur) }; n = n + 1 }
     return n
 }
 
@@ -194,7 +197,7 @@ fn sort_i64(buf, n) {
 fn main() {
     prints("=== lfm2 decode bench ===\n")
     let cfgb = slurp(file_open(CONF_PATH, 0))
-    let conf = mem_alloc(64)
+    let conf = mem_alloc(128)
     let nw = 20
     let len1 = 128
     let len2 = 512
@@ -203,6 +206,7 @@ fn main() {
     let cachen = 1
     let igneos = 0
     let fused = 0
+    let fused6 = 0
     if cfgb != 0 {
         let nf = parse_ints(cfgb, conf)
         if nf >= 1 { nw = mem_load(conf) }
@@ -213,6 +217,7 @@ fn main() {
         if nf >= 6 { cachen = mem_load(conf + 40) }
         if nf >= 7 { igneos = mem_load(conf + 48) }
         if nf >= 8 { fused = mem_load(conf + 56) }
+        if nf >= 9 { fused6 = mem_load(conf + 64) }
     } else {
         prints("warn: conf unreadable; defaults\n")
     }
@@ -222,6 +227,7 @@ fn main() {
     prints(" cache_norms="); print(cachen)
     prints(" ignore_eos="); print(igneos)
     prints(" fused_q4k="); print(fused)
+    prints(" fused_q6k="); print(fused6)
     prints(" (argmax temp=0)\n")
 
     let t0 = clock()
@@ -232,9 +238,10 @@ fn main() {
     if fc_fw_init() != 0 { prints("FAIL fc_fw_init\n"); return 1 }
     mm_set_workers_uncapped(nw)
     mm_set_embed_workers_uncapped(nw)
-    // the fused Q4_K route is opt-in: only a conf field asks for it. Set BEFORE
-    // any forward runs; mm_matvec_par emits the kernel and fail-closes the flag.
+    // the folded routes are opt-in: only a conf field asks for them. Set BEFORE
+    // any forward runs; mm_matvec_par emits each kernel and fail-closes its flag.
     mm_set_fused_q4k(fused)
+    mm_set_fused_q6k(fused6)
     if usemap != 0 {
         if mm_attach_mmap_fd(file_open(Q4_PATH, 0)) != 0 { prints("FAIL mm_attach_mmap (continuing on pread)\n") }
     }
@@ -243,7 +250,8 @@ fn main() {
     }
     prints("load_ms="); print((clock() - t0) / 1000000)
     prints(" mmap_base="); print(mm_map_base)
-    prints(" fused_q4k_active="); print(mm_get_fused_q4k()); newline()
+    prints(" fused_q4k_active="); print(mm_get_fused_q4k())
+    prints(" fused_q6k_active="); print(mm_get_fused_q6k()); newline()
 
     // ---- prompt (identical construction to tests/lfm2_generate.quanta) ----
     let rawprompt = slurp(file_open(PROMPT_PATH, 0))

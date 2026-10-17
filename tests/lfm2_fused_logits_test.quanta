@@ -1,19 +1,31 @@
 // tests/lfm2_fused_logits_test.quanta
 //
-// THE BIT-EXACTNESS GATE FOR THE WIRING: identical LOGITS, not just argmax.
+// THE BIT-EXACTNESS GATE FOR THE FUSED ROUTE: identical LOGITS, not just argmax.
 //
-// Runs the SAME sequence THREE times in one process and diffs the full 128,000-
+// Runs the SAME sequence FIVE times in one process and diffs the full 128,000-
 // value logits vector element-wise at every step:
 //
-//   pass 0: fused_q4k = 0   (the existing path)
-//   pass 1: fused_q4k = 0   (CONTROL: proves fc_fw_reset() is a clean reset --
-//                            without this, "pass 2 differs" would prove nothing,
-//                            because two serial runs of a stateful pass differ
-//                            just as much when state is carried)
-//   pass 2: fused_q4k = 1   (the wired fused route)
+//   pass 0: fused_q4k=0 fused_q6k=0   (the existing path -- the REFERENCE)
+//   pass 1: fused_q4k=0 fused_q6k=0   (CONTROL: proves fc_fw_reset() is a clean
+//                                      reset -- without this, "pass N differs"
+//                                      would prove nothing, because two serial
+//                                      runs of a stateful pass differ just as
+//                                      much when state is carried)
+//   pass 2: fused_q4k=1 fused_q6k=0   (Q4_K fused only -- the earlier stage)
+//   pass 3: fused_q4k=0 fused_q6k=1   (Q6_K fused only -- the new twin)
+//   pass 4: fused_q4k=1 fused_q6k=1   (BOTH -- the shipped configuration)
 //
-// pass1-vs-pass0 must be 0 mismatches or the reset is not clean and the whole
-// comparison is void; then pass2-vs-pass0 must also be 0.
+// CONTROL pass1-vs-pass0 must be 0 mismatches or the reset is not clean and the
+// whole comparison is void; then passes 2, 3 and 4 vs pass 0 must each be 0.
+//
+// It also asserts the WITNESSES: mm_get_fused_used() must be 1 on the passes
+// that turned Q4_K on, and mm_get_fused_q6k_used() must be 1 on the passes that
+// turned Q6_K on -- otherwise a pass "matching" could simply not have dispatched
+// its kernel at all.
+//
+// NTOK = 24 so the first 24 generated ids can be required byte-identical across
+// configurations (the oracle: first-step argmax 597, generation
+// `The answer is 4.`).
 //
 // Build: ./compiler/0.0.246/bin/x86/qc -O tests/lfm2_fused_logits_test.quanta <bin>
 // Run (model is 1.67 GB; the VA cap must exceed it):
@@ -29,7 +41,7 @@ import std/fs
 const Q4_PATH = "/opt/ai/models/quanta/QUANTA-LFM2.5-2.6Bv1-Q4_K_M.gguf"
 const PROMPT_PATH = "tests/lfm2_prompt.txt"
 const NCTX = 2048
-const NTOK = 4          // greedy decode steps after the prompt
+const NTOK = 24         // greedy decode steps after the prompt
 const CAP = 16384
 
 let plen = 0
@@ -53,15 +65,15 @@ fn as_str(raw, n) {
     return s
 }
 
-// One full sequence from a clean state. Copies the final logits into `out`
-// (n_vocab f64) and the per-step argmax into `am` (NTOK+1 entries).
-// Returns 0 on success.
-fn run_seq(ids, n, flag, out, am) {
-    mm_set_fused_q4k(flag)
+// One full sequence from a clean state with both fused flags set as given.
+// Copies the final logits into `out` (n_vocab f64) and the per-step argmax
+// (prompt token + NTOK decode tokens) into `am`. Returns 0 on success.
+fn run_seq(ids, n, f4, f6, out, am) {
+    mm_set_fused_q4k(f4)
+    mm_set_fused_q6k(f6)
     if fc_fw_reset() != 0 { return -1 }
     let i = 0
     let step = 0
-    let nexttok = 0
     while i < n {
         let want = 0
         if i == n - 1 { want = 1 }
@@ -69,7 +81,6 @@ fn run_seq(ids, n, flag, out, am) {
         i = i + 1
     }
     mem_store(am + 0 * 8, fc_argmax(fc_n_vocab))
-    // greedy decode steps
     step = 1
     while step <= NTOK {
         let tok = fc_argmax(fc_n_vocab)
@@ -78,14 +89,53 @@ fn run_seq(ids, n, flag, out, am) {
         if fc_forward_token_ex(tok, n - 1 + step, want) != 0 { return -1 }
         step = step + 1
     }
-    // final logits
     let v = 0
     while v < fc_n_vocab { mem_store(out + v * 8, f64of(mem_load(fc_fw_logits + v * 8))); v = v + 1 }
     return 0
 }
 
+// element-wise diff of Lx against L0; returns mismatch count in r[0] and the
+// raw f64 bits of the largest |difference| in r[1].
+fn diff(L0, Lx, nv, r) {
+    let m = 0
+    let maxd: f64 = 0.0
+    let v = 0
+    while v < nv {
+        let b0 = mem_load(L0 + v * 8)
+        let bx = mem_load(Lx + v * 8)
+        if bx != b0 {
+            m = m + 1
+            let d: f64 = f64of(bx) - f64of(b0)
+            let ad: f64 = d
+            if ad < 0.0 { ad = 0.0 - ad }
+            if ad > maxd { maxd = ad }
+        }
+        v = v + 1
+    }
+    mem_store(r, m)
+    mem_store(r + 8, maxd)
+    return m
+}
+
+fn amdiff(a0, ax, nsteps, r) {
+    let m = 0
+    let s = 0
+    while s <= nsteps {
+        if mem_load(ax + s * 8) != mem_load(a0 + s * 8) { m = m + 1 }
+        s = s + 1
+    }
+    mem_store(r, m)
+    return m
+}
+
+fn print_am(am, nsteps) {
+    let s = 0
+    while s <= nsteps { print(mem_load(am + s * 8)); prints(" "); s = s + 1 }
+    newline()
+}
+
 fn main() {
-    prints("=== fused Q4_K wiring: LOGITS-level bit-exactness ===\n")
+    prints("=== fused Q4_K + Q6_K wiring: LOGITS-level bit-exactness ===\n")
     if gguf_load(Q4_PATH) != 0 { prints("FAIL gguf_load\n"); return 1 }
     if fc_read_config() != 0 { prints("FAIL fc_read_config\n"); return 1 }
     if bpe_init_from_gguf() == 0 { prints("FAIL bpe_init\n"); return 1 }
@@ -111,83 +161,100 @@ fn main() {
     let L0 = mem_alloc(nv * 8)
     let L1 = mem_alloc(nv * 8)
     let L2 = mem_alloc(nv * 8)
-    let a0 = mem_alloc(64)
-    let a1 = mem_alloc(64)
-    let a2 = mem_alloc(64)
+    let L3 = mem_alloc(nv * 8)
+    let L4 = mem_alloc(nv * 8)
+    let a0 = mem_alloc(512)
+    let a1 = mem_alloc(512)
+    let a2 = mem_alloc(512)
+    let a3 = mem_alloc(512)
+    let a4 = mem_alloc(512)
+    let r1 = mem_alloc(16)
+    let r2 = mem_alloc(16)
+    let r3 = mem_alloc(16)
+    let r4 = mem_alloc(16)
+    let ra = mem_alloc(16)
 
     mm_pool_begin()
-    prints("pass0 (existing path)...\n")
-    if run_seq(ids, n, 0, L0, a0) != 0 { prints("FAIL pass0\n"); return 1 }
-    prints("  argmax seq: ")
-    let s = 0
-    while s <= NTOK { print(mem_load(a0 + s * 8)); prints(" "); s = s + 1 }
-    newline()
+
+    prints("pass0 (existing path, REFERENCE)...\n")
+    if run_seq(ids, n, 0, 0, L0, a0) != 0 { prints("FAIL pass0\n"); return 1 }
+    prints("  argmax: "); print_am(a0, NTOK)
 
     prints("pass1 (existing path, CONTROL: reset cleanliness)...\n")
-    if run_seq(ids, n, 0, L1, a1) != 0 { prints("FAIL pass1\n"); return 1 }
-    prints("  argmax seq: ")
-    s = 0
-    while s <= NTOK { print(mem_load(a1 + s * 8)); prints(" "); s = s + 1 }
-    newline()
+    if run_seq(ids, n, 0, 0, L1, a1) != 0 { prints("FAIL pass1\n"); return 1 }
+    prints("  argmax: "); print_am(a1, NTOK)
 
-    prints("pass2 (FUSED route, flag ON)...\n")
-    if run_seq(ids, n, 1, L2, a2) != 0 { prints("FAIL pass2\n"); return 1 }
-    prints("  fused_used="); print(mm_get_fused_used())
-    prints("  argmax seq: ")
-    s = 0
-    while s <= NTOK { print(mem_load(a2 + s * 8)); prints(" "); s = s + 1 }
-    newline()
+    prints("pass2 (Q4_K fused only): flag ON, Q6_K OFF...\n")
+    if run_seq(ids, n, 1, 0, L2, a2) != 0 { prints("FAIL pass2\n"); return 1 }
+    let w2a = mm_get_fused_used()
+    let w2b = mm_get_fused_q6k_used()
+    prints("  fused_q4k_used="); print(w2a)
+    prints(" fused_q6k_used="); print(w2b)
+    prints("  argmax: "); print_am(a2, NTOK)
+
+    prints("pass3 (Q6_K fused only): flag ON, Q4_K OFF...\n")
+    if run_seq(ids, n, 0, 1, L3, a3) != 0 { prints("FAIL pass3\n"); return 1 }
+    let w3a = mm_get_fused_used()
+    let w3b = mm_get_fused_q6k_used()
+    prints("  fused_q4k_used="); print(w3a)
+    prints(" fused_q6k_used="); print(w3b)
+    prints("  argmax: "); print_am(a3, NTOK)
+
+    prints("pass4 (BOTH fused)...\n")
+    if run_seq(ids, n, 1, 1, L4, a4) != 0 { prints("FAIL pass4\n"); return 1 }
+    let w4a = mm_get_fused_used()
+    let w4b = mm_get_fused_q6k_used()
+    prints("  fused_q4k_used="); print(w4a)
+    prints(" fused_q6k_used="); print(w4b)
+    prints("  argmax: "); print_am(a4, NTOK)
+
     mm_pool_end()
 
-    // diff logits element-wise
-    let m01 = 0
-    let m02 = 0
-    let maxd02: f64 = 0.0
-    let v = 0
-    while v < nv {
-        let b0 = mem_load(L0 + v * 8)
-        if mem_load(L1 + v * 8) != b0 { m01 = m01 + 1 }
-        let b2 = mem_load(L2 + v * 8)
-        if b2 != b0 {
-            m02 = m02 + 1
-            let d: f64 = b2 - b0
-            let ad: f64 = d
-            if ad < 0.0 { ad = 0.0 - ad }
-            if ad > maxd02 { maxd02 = ad }
-        }
-        v = v + 1
-    }
-    // argmax sequences
-    let ma01 = 0
-    let ma02 = 0
-    s = 0
-    while s <= NTOK {
-        if mem_load(a1 + s * 8) != mem_load(a0 + s * 8) { ma01 = ma01 + 1 }
-        if mem_load(a2 + s * 8) != mem_load(a0 + s * 8) { ma02 = ma02 + 1 }
-        s = s + 1
-    }
+    diff(L0, L1, nv, r1)
+    diff(L0, L2, nv, r2)
+    diff(L0, L3, nv, r3)
+    diff(L0, L4, nv, r4)
+    amdiff(a0, a1, NTOK, ra)
+    let ma1 = mem_load(ra)
+    amdiff(a0, a2, NTOK, ra)
+    let ma2 = mem_load(ra)
+    amdiff(a0, a3, NTOK, ra)
+    let ma3 = mem_load(ra)
+    amdiff(a0, a4, NTOK, ra)
+    let ma4 = mem_load(ra)
 
     prints("---\n")
     prints("logits_n="); print(nv); newline()
-    prints("CONTROL pass1-vs-pass0 : logit_mism="); print(m01)
-    prints(" argmax_mism="); print(ma01); newline()
-    prints("FUSED   pass2-vs-pass0 : logit_mism="); print(m02)
-    prints(" argmax_mism="); print(ma02)
-    // raw f64 bits of the largest absolute difference (no float printf here)
-    let dbits = mem_alloc(8)
-    mem_store(dbits, maxd02)
-    prints(" max_abs_diff_bits="); print(mem_load(dbits)); newline()
+    prints("CONTROL pass1-vs-pass0 : logit_mism="); print(mem_load(r1))
+    prints(" argmax_mism="); print(ma1); newline()
+    prints("Q4K     pass2-vs-pass0 : logit_mism="); print(mem_load(r2))
+    prints(" argmax_mism="); print(ma2)
+    prints(" max_abs_diff_bits="); print(mem_load(r2 + 8)); newline()
+    prints("Q6K     pass3-vs-pass0 : logit_mism="); print(mem_load(r3))
+    prints(" argmax_mism="); print(ma3)
+    prints(" max_abs_diff_bits="); print(mem_load(r3 + 8)); newline()
+    prints("BOTH    pass4-vs-pass0 : logit_mism="); print(mem_load(r4))
+    prints(" argmax_mism="); print(ma4)
+    prints(" max_abs_diff_bits="); print(mem_load(r4 + 8)); newline()
     prints("pass0_argmax0="); print(mem_load(a0)); newline()
+    prints("pass4 first 24 ids: ")
+    let q = 1
+    while q <= 24 && q <= NTOK { print(mem_load(a4 + q * 8)); prints(" "); q = q + 1 }
+    newline()
 
-    if m01 != 0 || ma01 != 0 {
+    if mem_load(r1) != 0 || ma1 != 0 {
         prints("FAIL: the CONTROL is not clean -- fc_fw_reset() does not restore state; comparison void\n")
         return 2
     }
-    if m02 != 0 || ma02 != 0 {
-        prints("FAIL: the fused route is NOT bit-identical to the existing path\n")
-        return 1
-    }
-    prints("PASS: fused and existing paths give IDENTICAL logits (all 128000 values)\n")
+    if mem_load(r2) != 0 || ma2 != 0 { prints("FAIL: Q4_K fused route is not bit-identical\n"); return 3 }
+    if mem_load(r3) != 0 || ma3 != 0 { prints("FAIL: Q6_K fused route is not bit-identical\n"); return 4 }
+    if mem_load(r4) != 0 || ma4 != 0 { prints("FAIL: both-fused route is not bit-identical\n"); return 5 }
+    if mem_load(a0) != 597 { prints("FAIL: first-token argmax is not the oracle 597\n"); return 6 }
+    // witnesses: a matching pass that never dispatched its kernel proves nothing
+    if w2a != 1 || w2b != 0 { prints("FAIL: pass2 witness (Q4K fused should be used, Q6K not)\n"); return 7 }
+    if w3a != 0 || w3b != 1 { prints("FAIL: pass3 witness (Q6K fused should be used, Q4K not)\n"); return 8 }
+    if w4a != 1 || w4b != 1 { prints("FAIL: pass4 witness (both should be used)\n"); return 9 }
+    prints("PASS: fused Q4_K, fused Q6_K and both are IDENTICAL to the existing path (all 128000 logits)\n")
     prints("DONE\n")
     return 0
 }
