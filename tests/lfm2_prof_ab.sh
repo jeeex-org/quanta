@@ -36,7 +36,13 @@ REPO="$PWD"
 # Override with QC=... only deliberately.
 QC="${QC:-$PWD/compiler/0.0.246/bin/x86/qc}"
 CONF=tests/lfm2_decode_bench.conf
-SCRATCH="${TMPDIR:-/tmp}"
+# PRIVATE scratch: the peer runner also uses $TMPDIR/lfm2_decode_bench.bin,
+# so a concurrent peer would clobber this binary MID-RUN. Own directory.
+SCRATCH="${PROF_SCRATCH:-/home/tali/.hermes/cache/scratch/lfm2prof}"
+mkdir -p "$SCRATCH" || exit 2
+# log dir kept separate from the peer's /tmp names for the same reason
+LOGD="$SCRATCH/logs"
+mkdir -p "$LOGD" || exit 2
 BENCH="$SCRATCH/lfm2_decode_bench.bin"
 EXBIN="$SCRATCH/lfm2_fused_logits.bin"
 CONF_CANON="20 128 512 1024 1 1 1 0 0"
@@ -70,10 +76,10 @@ stage_exact () {
     ( ulimit -c 0 -v 8000000; "$QC" -O tests/lfm2_fused_logits_test.quanta "$EXBIN" ) \
         || { echo "COMPILE FAIL rc=$?"; exit 2; }
     echo "run_start: $(date '+%F %T')"
-    ( ulimit -c 0 -v 32000000; timeout 5400 nice -n 0 "$EXBIN" </dev/null ) > /tmp/prof_stage_exact.log 2>&1
+    ( ulimit -c 0 -v 32000000; timeout 5400 nice -n 0 "$EXBIN" </dev/null ) > $LOGD/prof_stage_exact.log 2>&1
     local rc=$?
     echo "run_end  : $(date '+%F %T')  rc=$rc"
-    grep -E 'prompt_ids|argmax:|used=|logits_n|CONTROL|Q4K |Q6K |BOTH |pass0_argmax0|first 24|PASS|FAIL|DONE' /tmp/prof_stage_exact.log
+    grep -E 'prompt_ids|argmax:|used=|logits_n|CONTROL|Q4K |Q6K |BOTH |pass0_argmax0|first 24|PASS|FAIL|DONE' $LOGD/prof_stage_exact.log
     if [ "$rc" != 0 ]; then
         echo "BIT-EXACTNESS GATE FAILED (rc=$rc) -- stop here, do not time anything"
         exit "$rc"
@@ -90,7 +96,7 @@ run_arm () {
     printf '%s\n' "$line" > "$CONF"
     echo "=== $tag ==="
     echo "conf    : $(cat $CONF)"
-    echo "          fields: workers len1 len2 len3 mmap cache_norms ignore_eos fused_q4k fused_q6k [prof] [prof_work] [change]"
+    echo "          fields: workers len1 len2 len3 mmap cache_norms ignore_eos fused_q4k fused_q6k [prof] [prof_work] [fused_chain]"
     echo "load_pre: $(cat /proc/loadavg)"
     echo "start   : $(date '+%F %T')"
     ( ulimit -c 0 -v 32000000; timeout 7200 nice -n 0 "$BENCH" </dev/null ) > "$log" 2>&1
@@ -101,16 +107,16 @@ run_arm () {
     echo
 }
 
-stage_baseline () { bench_build; run_arm "BASELINE rate, timer OFF (canonical-ish)" "20 $LENS 1 1 1 1 1 0 0" /tmp/prof_stage_baseline.log; }
-stage_prof     () { bench_build; run_arm "PROF phase table, timer ON, prof_work ON" "20 $LENS 1 1 1 1 1 1 1" /tmp/prof_stage_prof.log; }
-stage_prof_nw  () { bench_build; run_arm "PROF phase table, timer ON, prof_work OFF" "20 $LENS 1 1 1 1 1 1 0" /tmp/prof_stage_prof_nw.log; }
-stage_conc     () { bench_build; run_arm "CONC pool concurrency, prof_work=1 (SHORT; times void)" "20 $CONC_LENS 1 1 1 1 1 1 1" /tmp/prof_stage_conc.log; }
+stage_baseline () { bench_build; run_arm "BASELINE rate, timer OFF (canonical-ish)" "20 $LENS 1 1 1 1 1 0 0" $LOGD/prof_stage_baseline.log; }
+stage_prof     () { bench_build; run_arm "PROF phase table, timer ON, prof_work ON" "20 $LENS 1 1 1 1 1 1 1" $LOGD/prof_stage_prof.log; }
+stage_prof_nw  () { bench_build; run_arm "PROF phase table, timer ON, prof_work OFF" "20 $LENS 1 1 1 1 1 1 0" $LOGD/prof_stage_prof_nw.log; }
+stage_conc     () { bench_build; run_arm "CONC pool concurrency, prof_work=1 (SHORT; times void)" "20 $CONC_LENS 1 1 1 1 1 1 1" $LOGD/prof_stage_conc.log; }
 
 stage_ab () {
     echo "=== STAGE ab: baseline (change OFF) vs change ON, timer OFF both arms ==="
     bench_build
-    run_arm "A baseline  (change=0)" "20 $LENS 1 1 1 1 1 0 0 0" /tmp/prof_ab_A.log
-    run_arm "B change ON (change=1)" "20 $LENS 1 1 1 1 1 0 0 1" /tmp/prof_ab_B.log
+    run_arm "A chain=0 (baseline)" "20 $LENS 1 1 1 1 1 0 0 0" $LOGD/prof_ab_A.log
+    run_arm "B chain=1 (the change under test)" "20 $LENS 1 1 1 1 1 0 0 1" $LOGD/prof_ab_B.log
 }
 
 peer_gate
