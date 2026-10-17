@@ -537,26 +537,25 @@ fn jit_f_alloc(nbytes: i64) -> i64 {
 // HIGH-LEVEL ENTRY: one Q4_K row dot, ready to call from a model module
 // ============================================================================
 //
-// STATUS: BLOCKED BY A COMPILER DEFECT -- NOT USABLE YET. Do not wire this into
-// lfm2_forward/mm until the defect is fixed; jit_f_apply faults at run time.
+// STATUS: UNBLOCKED as of qc 0.0.246. The trio below is now callable from an
+// imported module and is exercised by the gate row
+// test_suites/codes/stdlib_jit_dispatch_test.quanta (expected rc=0, PASSING).
 //
-// qc 0.0.245 miscompiles closure_call when it is reached from a function inside
-// an IMPORTED module. Measured, minimal 2-module TU (imports jit_x86 +
-// jit_x86_fused only), identical tuple / argument area / bytes:
+// HISTORY, kept because the diagnosis matters and was wrong once: on 0.0.245
+// this call SIGSEGV'd (rc=139) when reached from a function inside an IMPORTED
+// module, while the byte-identical inline `closure_call(tbl, asz, 0)` in `main`
+// returned 4700186342854754304. The device blamed was closure_call. The real
+// cause was the parameter NAME `as`: funcscan recorded a parameter only when
+// its name token was TT_ID, so a parameter named with a reserved keyword token
+// was dropped, every later parameter shifted down one slot, and the kernel was
+// entered with rdi=0. Fixed in 0.0.246 (see
+// docs/research/keyword-named-parameters.md). NOTE the fix was a front-end
+// predicate, NOT a closure_call change, so this module needed no edit.
 //
-//     let va = closure_call(tbl, asz, 0)   // inline in main -> 4700186342854754304
-//     let vc = jit_f_apply(asz)            // via this module -> SIGSEGV (rc=139)
-//
-// The same fault appears with the tuple passed as a parameter, with a local
-// tuple, with/without accompanying mem_store, and from gguf_mm.quanta; the call
-// also traps the COMPILER (SIGILL, rc=132) in larger translation units. Inline
-// in the program's top-level module it always works, which is why every existing
-// test dispatches the kernel that way. Full evidence:
-// docs/research/jit-fused-dot-status.md and tests/lfm2_jit_cc_probe.quanta.
-//
-// jit_f_setup() emits the kernel ONCE and keeps the closure tuple here, so the
-// callers only have to supply the argument area once the defect is fixed.
+// jit_f_setup() emits the kernel ONCE and keeps the closure tuple here, so
+// callers only have to supply the argument area.
 let jf_tbl = 0
+let jf_tbl_folded = 0
 
 fn jit_f_setup() -> i64 {
     if jf_tbl != 0 { return 0 }
@@ -571,35 +570,49 @@ fn jit_f_ready() { return jf_tbl }
 
 // Call the emitted kernel with the argument area at `as` (4 qwords:
 // W, X, DMD, nsuper). Returns the dot as raw f64 bits.
-//
-// BLOCKED: faults when reached from here (an imported module) -- see the STATUS
-// note above. Kept because it is the interface the wiring needs, and because it
-// is the smallest reproducer of the defect.
 fn jit_f_apply(as) -> i64 {
     return closure_call(jf_tbl, as, 0)
 }
 
-// ---- the per-(row Sub-block) dequant argument table ------------------------
-// The kernel reads its scale/min factors from a precomputed table rather than
-// doing f16 arithmetic in the hot loop. Layout, per super-block:
+// ---- the FOLDED kernel, same entry shape -----------------------------------
+// Emits jit_f_build_folded() into its OWN region so the table kernel above is
+// left byte-identical (the gate row above depends on it). The folded kernel
+// derives its factors in-kernel and IGNORES [AS+16], so the DMD slot must
+// simply be left as anything -- pass 0.
+fn jit_f_setup_folded() -> i64 {
+    if jf_tbl_folded != 0 { return 0 }
+    if jit_f_alloc(65536) <= 0 { return -1 }
+    let t = jit_f_code(jit_f_build_folded())
+    if t <= 0 { return -2 }
+    jf_tbl_folded = t
+    return 0
+}
+
+fn jit_f_ready_folded() { return jf_tbl_folded }
+
+fn jit_f_apply_folded(as) -> i64 {
+    return closure_call(jf_tbl_folded, as, 0)
+}
+
+// ---- the per-super-block dequant argument table (the TABLE kernel's input) --
+// The table kernel reads its scale/min factors from a precomputed table rather
+// than doing f16 arithmetic in the hot loop. Layout, per super-block:
 //
 //     8 entries x 16 bytes = 128 bytes, entry k =
-//         +0  f64  d    * scale[k]       apply to the 4 low nibbles
-//         +8  f64  dmin * min[k]         subtract from those same 4
+//         +0  f64  d    * scale[k]       applies to the 4 low nibbles
+//         +8  f64  dmin * min[k]         subtracts from those same 4
 //
-// Wait: the (scale,min) pairing below is what a SUB-BLOCK contributes. Q4_K
-// has 8 per super-block and each covers 32 weights, which is 8 four-double
-// groups -- so one entry serves 8 groups, and the kernel must therefore
-// consume it, not advance past it, on 7 of every 8 groups.
+// One entry serves ONE 32-weight half, so the kernel must CONSUME the entry for
+// a whole 8-step half and advance rdx only once per half (see jit_f_build's
+// chunk loop). An earlier revision advanced one entry every four weights, which
+// read the wrong factors for 7/8 of the row -- that was fixed by giving rdx to
+// the chunk, and the corrected cadence is what tests/jit_vs_prod_test.quanta
+// and tests/lfm2_jit_mm_test.quanta verify bit-exactly against
+// q4k_matvec_real and mm_deq_row_raw + mm_dot4_s.
 //
-// THE BUG THIS CREATES, stated plainly rather than papered over: as written,
-// j_f_group() unconditionally does `add rdx,16` twice per 4-byte group, so it
-// advances one (scale,min) entry every FOUR weights instead of every 32. That
-// reads the wrong factors for 7/8 of the row. The verified credentials for
-// this file must therefore be established BEFORE the table is trusted, which
-// is why tests/lfm2_jit_fused_test.quanta checks the kernel against a scalar
-// oracle over real data rather than assuming the addressing is right. Fixing
-// it means emitting one of 8 group variants so only every 8th advances rdx.
+// NOTE: jit_f_build_folded() above does not read this table at all -- it derives
+// the same eight pairs in-kernel. This table remains the input for jit_f_build()
+// only.
 fn jit_f_dmd_alloc(nsuper: i64) -> i64 {
     let nbytes = nsuper * 128
     let p = mem_alloc(nbytes)

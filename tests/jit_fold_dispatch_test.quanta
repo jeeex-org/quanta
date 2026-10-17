@@ -1,0 +1,103 @@
+// tests/jit_fold_dispatch_test.quanta
+//
+// THE GATE ON WIRING: the FOLDED kernel must be dispatchable from inside the
+// imported module, not only inline in `main`.
+//
+// Why this row exists. Every measurement in docs/research/dmd-factor-fold.md and
+// every earlier JIT test dispatched the kernel with a literal
+// `closure_call(tbl, asz, 0)` written in the program's TOP-LEVEL module, because
+// on qc 0.0.245 reaching the call through a function in an IMPORTED module
+// SIGSEGV'd (rc=139) -- the defect the peer unit fixed in 0.0.246 (root cause:
+// a parameter named with a keyword token was dropped by funcscan, so the kernel
+// was entered with rdi=0; see docs/research/keyword-named-parameters.md).
+// That constraint shaped the whole campaign, so it is asserted here rather than
+// assumed gone.
+//
+// This row dispatches the folded kernel THREE ways on identical real Q4_K rows
+// and requires one answer:
+//   1. inline closure_call(tbl, asz, 0)      -- the old, always-working route
+//   2. jit_f_apply_folded(asz)               -- through an imported module fn
+//   3. mm_deq_row_raw + mm_dot4_s            -- the shape lfm2_forward executes
+//
+// Build: ./compiler/0.0.246/bin/x86/qc -O tests/jit_fold_dispatch_test.quanta <bin>
+// Run (the model is 1.67 GB and this row's VA cap must exceed it):
+//   ( ulimit -c 0 -v 32000000; nice -n 19 <bin> </dev/null )
+import std/gguf
+import std/lfm2_forward
+import std/lfm2_model
+import std/gguf_mm
+import std/gguf_bpe
+import std/fs
+import std/jit_x86
+import std/jit_x86_fused
+
+const Q4_PATH = "/opt/ai/models/quanta/QUANTA-LFM2.5-2.6Bv1-Q4_K_M.gguf"
+const NCTX = 2048
+const NROWS = 64
+
+fn main() {
+    prints("=== folded kernel: dispatch from an IMPORTED module (the 0.0.246 gate) ===\n")
+    if jit_f_setup_folded() != 0 { prints("FAIL jit_f_setup_folded\n"); return 10 }
+    let tbl_f = jit_f_ready_folded()
+    if tbl_f <= 0 { prints("FAIL folded tuple\n"); return 11 }
+    prints("folded_entry="); print(mem_load(tbl_f)); newline()
+
+    if gguf_load(Q4_PATH) != 0 { prints("FAIL gguf_load\n"); return 1 }
+    if fc_read_config() != 0 { prints("FAIL fc_read_config\n"); return 1 }
+    if bpe_init_from_gguf() == 0 { prints("FAIL bpe_init\n"); return 1 }
+    if fc_kv_init(NCTX) != 0 { prints("FAIL fc_kv_init\n"); return 1 }
+    if fc_fw_init() != 0 { prints("FAIL fc_fw_init\n"); return 1 }
+    if fc_fw_reset() != 0 { prints("FAIL fc_fw_reset\n"); return 1 }
+    mm_set_workers(0)
+    mm_set_embed_workers(0)
+    if mm_attach_mmap_fd(file_open(Q4_PATH, 0)) != 0 { prints("FAIL mm_attach_mmap\n"); return 1 }
+
+    let tg = lfm2_ffn_gate(0)
+    if tg < 0 { prints("FAIL tensor\n"); return 1 }
+    let dm = fc_d_model
+    let rb = mm_row_bytes(12, dm)
+    let nsuper = dm / 256
+    if gguf_tensor_dtype(tg) != 12 || rb != nsuper * 144 { prints("premise broken\n"); return 1 }
+
+    let x = mem_alloc(dm * 8)
+    let i = 0
+    while i < dm { mem_store(x + i * 8, i2f((i * 37) % 101 - 50) / i2f(71)); i = i + 1 }
+    let f64b = mem_alloc(dm * 8)
+    let acc = mem_alloc(512)
+    let prod_out = mem_alloc(8)
+    let asz = mem_alloc(32)
+    let toff = gguf_tensor_offset(tg)
+
+    let mism_inline = 0
+    let mism_mod = 0
+    let r = 0
+    while r < NROWS {
+        let raw = mm_map_base + toff + r * rb
+        if mm_deq_row_raw(12, raw, dm, f64b) != 0 { prints("FAIL deq\n"); return 1 }
+        let prod = mm_dot4_s(f64b, x, dm, acc)
+        mem_store(prod_out, prod)
+        let pb = mem_load(prod_out)
+
+        mem_store(asz + 0, raw)
+        mem_store(asz + 8, x)
+        mem_store(asz + 16, 0)          // folded kernel needs NO DMD table
+        mem_store(asz + 24, nsuper)
+
+        let ib = closure_call(tbl_f, asz, 0)        // 1. inline in main
+        let ab = jit_f_apply_folded(asz)            // 2. via the imported module
+
+        if ib != pb { mism_inline = mism_inline + 1 }
+        if ab != pb { mism_mod = mism_mod + 1 }
+        r = r + 1
+    }
+    prints("rows="); print(NROWS); newline()
+    prints("mism folded-inline  vs mm_deq+dot4 : "); print(mism_inline); newline()
+    prints("mism jit_f_apply_folded vs mm_deq+dot4 : "); print(mism_mod); newline()
+    if mism_inline != 0 || mism_mod != 0 {
+        prints("FAIL: dispatch from an imported module is NOT equivalent\n")
+        return 1
+    }
+    prints("PASS: folded kernel dispatches from an imported module, bit-exact\n")
+    prints("DONE\n")
+    return 0
+}
