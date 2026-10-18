@@ -127,21 +127,31 @@ of every block boundary — a row does not need any arithmetic at all to contain
 boundary. Byte-identity is therefore NOT what carries the equivalence claim here, and
 for this lever there is a much stronger and more specific oracle available:
 
-**The opcode multiset.** For each of the 230 differing rows, both executables were
-disassembled and the full instruction-text multisets compared (`test_suites/scripts/`
-`objdump_multiset_diff.py`). The lever's claim is "remove dead home stores and nothing
-else", which as a multiset statement is exactly:
+**WITHDRAWN (recorded 2026-10-18, during 0.0.252).** This section originally reported an
+opcode-multiset check over the 230 differing rows and claimed that every one of them
+differed ONLY by removed home stores. **That measurement was vacuous and the claim is
+withdrawn.** The executables this compiler writes carry NO section headers
+(`readelf -S` on one -> "There are no sections in this file"), so `objdump -d` printed
+zero instructions for both sides; the empty multisets compared equal and every row was
+reported as satisfying the containment test. An oracle that cannot fail is worse than no
+oracle, and this is exactly why rule #16 exists.
 
-```
-new_multiset - old_multiset == {}                      (nothing added, nothing renamed)
-old_multiset - new_multiset ⊆ { mov *,-N(%rbp...), ... }   (only home stores removed)
-```
+The tool is fixed and renamed to `test_suites/scripts/objdump_seq_diff.py`: it compiles
+with `--emit-obj` (relocatable objects DO have sections, and that is the artefact
+`scripts/bench_instr.sh` already uses), it REFUSES to report a verdict when either side
+disassembles to fewer than 10 instructions so a vacuous pass cannot recur, and it
+compares instruction SEQUENCES with `difflib` rather than multisets so a count-preserving
+register rename is visible. Its measured result for 0.0.249 -> 0.0.250 is reported in the
+phase-3 summary; no claim here rests on it.
 
-MEASURED: **all 230 differing rows satisfy both**, 0 rows add or rename a single
-instruction (a register rename would show up as one added *and* one removed
-instruction, so this check is sensitive to it). 0 further differing rows exist, so the
-whole 240-row footprint of this lever is accounted for: **every emitted byte that
-changed, changed because a dead home store was deleted.**
+What 0.0.250's equivalence actually rests on is unchanged and was measured directly:
+gate **240/240** exit-code match, all 38 benchmark outputs matching their C twins
+(`bench.sh` OK, 0 MISMATCH), `differential` (`-O` == no-`-O` and vs-seed), `fuzz`
+fail-closed with 0 crashes, `valgrind` clean, the self-host fixpoint `g2 == g3 == g4`,
+and — independently of any disassembly oracle — the instrument of record's own columns:
+`q_hst` fell by 405 and `q_instr` fell by 405, with `q_hld` and `q_lld` unchanged to the
+instruction, i.e. every instruction the lever removed is a home store and not one home
+load was added.
 
 Equivalence still rests on the behavioural oracles, all measured in this run: gate
 **240/240** exit-code match, all 38 benchmark outputs matching their C twins

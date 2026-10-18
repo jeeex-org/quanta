@@ -1,0 +1,182 @@
+import std/fs
+import std/sampling
+
+// tests/sampling_eos_selfcheck.quanta -- GATE-READY self-check of the EOS policy
+// in lib/std/sampling.quanta.
+//
+// WHY THIS FILE EXISTS: `tests/run_sampling_ref.sh` (numpy + a bit-exact Python
+// replica) is the reference harness, but it lives in tests/ because it needs
+// /usr/bin/python3 with numpy. lib/std/sampling.quanta has NO row in
+// EXPECTED.tsv or EXPECTED_STDLIB.tsv, so until this program is registered the
+// policy is verified only by a manual harness. This file is the same properties
+// checked WITHOUT numpy and WITHOUT the model: synthetic logits, deterministic
+// LCG, exit 0/1. Self-contained, sub-second, tiny -- it can be a gate row.
+//
+// It asserts PROPERTIES, not the harness's exact ids, so it stays valid if the
+// LCG seed or a vector changes:
+//
+//   1. policy disabled is the default and leaves the candidate set alone
+//      -> EOS survives top-k (the defect's precondition) and IS drawn;
+//   2. policy enabled, EOS inside top-k but not the argmax
+//      -> EOS is out of the kept set, the kept count is still k,
+//         EOS is never drawn in 300 samples;
+//   3. policy enabled, EOS IS the argmax
+//      -> kept in the candidate set, greedy returns EOS, EOS IS drawn;
+//   4. min_len = 3 with EOS as the argmax
+//      -> the first 3 draws are not EOS, and EOS comes back afterwards.
+//
+// Exit 0 = all properties hold. 1 = at least one failed (printed).
+
+let fails = 0
+
+fn chk(tag, ok) {
+    if ok != 0 {
+        prints("PASS "); prints(tag); newline()
+    } else {
+        prints("FAIL "); prints(tag); newline()
+        fails = fails + 1
+    }
+    return ok
+}
+
+// Is index `id` still a live candidate (not pushed to the -1e30 sentinel)?
+fn kept_has(p, n, id) {
+    let sent: f64 = 0.0 - 1.0e30
+    let v: f64 = f64of(mem_load(p + id * 8))
+    if f64bits(v) != f64bits(sent) { return 1 }
+    return 0
+}
+
+fn kept_count(p, n) {
+    let sent: f64 = 0.0 - 1.0e30
+    let sb = f64bits(sent)
+    let c = 0
+    let i = 0
+    while i < n {
+        let v: f64 = f64of(mem_load(p + i * 8))
+        if f64bits(v) != sb { c = c + 1 }
+        i = i + 1
+    }
+    return c
+}
+
+fn copy_n(dst, src, n) {
+    let i = 0
+    while i < n { mem_store(dst + i * 8, mem_load(src + i * 8)); i = i + 1 }
+}
+
+// Draw `ntry` ids from `src` (8 logits) at the given temperature/top-k and count
+// how often the id `eos` comes back.
+fn count_draws(src, eos, ntry, temp: f64, k, seed) {
+    let tv = mem_alloc(64)
+    sample_seed(seed)
+    let hits = 0
+    let i = 0
+    while i < ntry {
+        copy_n(tv, src, 8)
+        if sample_full(tv, 8, temp, k) == eos { hits = hits + 1 }
+        i = i + 1
+    }
+    return hits
+}
+
+fn main() {
+    prints("=== std/sampling EOS policy self-check ===\n")
+
+    // vector 1: EOS (id 2) is 4.0 -- rank 3, INSIDE top-k = 4, NOT the argmax
+    let v1 = mem_alloc(64)
+    mem_store(v1 + 0 * 8, f64bits(5.0))
+    mem_store(v1 + 1 * 8, f64bits(4.5))
+    mem_store(v1 + 2 * 8, f64bits(4.0))
+    mem_store(v1 + 3 * 8, f64bits(3.5))
+    mem_store(v1 + 4 * 8, f64bits(3.0))
+    mem_store(v1 + 5 * 8, f64bits(2.0))
+    mem_store(v1 + 6 * 8, f64bits(1.0))
+    mem_store(v1 + 7 * 8, f64bits(0.0))
+
+    // vector 2: EOS (id 2) is 6.0 -- the ARGMAX
+    let v2 = mem_alloc(64)
+    mem_store(v2 + 0 * 8, f64bits(1.0))
+    mem_store(v2 + 1 * 8, f64bits(2.0))
+    mem_store(v2 + 2 * 8, f64bits(6.0))
+    mem_store(v2 + 3 * 8, f64bits(0.5))
+    mem_store(v2 + 4 * 8, f64bits(0.25))
+    mem_store(v2 + 5 * 8, f64bits(0.75))
+    mem_store(v2 + 6 * 8, f64bits(0.1))
+    mem_store(v2 + 7 * 8, f64bits(0.0))
+
+    let tv = mem_alloc(64)
+    let eos = 2
+
+    // -- 1. default (disabled) -------------------------------------------------
+    sample_set_eos(0 - 1)
+    sample_set_min_len(0)
+    copy_n(tv, v1, 8)
+    sample_top_k(tv, 8, 4)
+    chk("default/off: EOS is inside the kept top-4 (defect precondition)",
+        kept_has(tv, 8, eos))
+    chk("default/off: EOS IS drawn at temp 0.8, k=4",
+        count_draws(v1, eos, 300, 0.8, 4, 4242) > 0)
+
+    // -- 2. enabled, EOS not the argmax ---------------------------------------
+    sample_set_eos(eos)
+    copy_n(tv, v1, 8)
+    sample_eos_policy(tv, 8)
+    sample_top_k(tv, 8, 4)
+    chk("on: EOS excluded from the kept set", kept_has(tv, 8, eos) == 0)
+    chk("on: kept count is still k = 4", kept_count(tv, 8) == 4)
+    chk("on: EOS never drawn in 300 samples (temp 0.8, k=4)",
+        count_draws(v1, eos, 300, 0.8, 4, 4242) == 0)
+    chk("on: EOS not drawn at high temperature either (temp 5.0, k=0)",
+        count_draws(v1, eos, 300, 5.0, 0, 7) == 0)
+    copy_n(tv, v1, 8)
+    chk("on: greedy is unchanged (EOS is not the argmax -> id 0)",
+        sample_full(tv, 8, 0.0, 4) == 0)
+
+    // -- 3. enabled, EOS IS the argmax ---------------------------------------
+    copy_n(tv, v2, 8)
+    sample_set_min_len(0)
+    chk("argmax: greedy returns EOS (a turn can still end deliberately)",
+        sample_full(tv, 8, 0.0, 0) == eos)
+    copy_n(tv, v2, 8)
+    sample_eos_policy(tv, 8)
+    sample_top_k(tv, 8, 4)
+    chk("argmax: EOS stays in the candidate set", kept_has(tv, 8, eos))
+    chk("argmax: EOS IS drawn in 300 samples (temp 1.0, k=4)",
+        count_draws(v2, eos, 300, 1.0, 4, 1234) > 0)
+
+    // -- 4. min_len -----------------------------------------------------------
+    sample_set_eos(eos)
+    sample_set_min_len(3)
+    sample_seed(99)
+    let early = 0
+    let i = 0
+    while i < 3 {
+        copy_n(tv, v2, 8)
+        if sample_full(tv, 8, 1.0, 0) == eos { early = early + 1 }
+        i = i + 1
+    }
+    chk("min_len=3: the first 3 draws are NOT EOS even though EOS is the argmax",
+        early == 0)
+    let after = 0
+    i = 0
+    while i < 3 {
+        copy_n(tv, v2, 8)
+        if sample_full(tv, 8, 1.0, 0) == eos { after = after + 1 }
+        i = i + 1
+    }
+    chk("min_len=3: EOS is drawable again once the floor is met", after == 3)
+
+    // a negative floor must clamp to "off", not wrap or crash
+    chk("min_len: a negative floor is clamped to 0",
+        sample_set_min_len(0 - 1) == 0)
+
+    // back to the shipped defaults
+    sample_set_eos(0 - 1)
+    sample_set_min_len(0)
+
+    prints("failures="); print(fails); prints("\n")
+    if fails > 0 { return 1 }
+    prints("ALL EOS POLICY CHECKS PASSED\n")
+    return 0
+}

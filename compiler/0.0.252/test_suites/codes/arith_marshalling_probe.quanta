@@ -1,0 +1,33 @@
+// arith_marshalling_probe — the RED-FIRST row for the F1 `adistinct` lever.
+//
+// Three values (a, b, c) are defined in the loop and then each used by the next
+// statement, so at every binary op BOTH operands are MAPPED and the old
+// adistinct() had to evict-and-store both of them. That is the shape that makes
+// the defect visible; a single `s = s + i*7` per iteration only reaches it once.
+//
+// Deliberately no division and no shift: those take the flush_clob(rax,rcx,rdx)
+// path, whose stores are NOT part of A31 and would blur the measurement. And
+// deliberately no print/println: the marshalling guard identifies the hot loop
+// by its byte span, so an inlined itoa loop in `main` would create a second,
+// larger backward branch and the guard could pick the wrong one. One loop in the
+// object => the guard cannot be ambiguous.
+//
+// Hand-derived golden (independent of any compiler):
+//   a = i + 1
+//   b = a * 3        = 3i + 3
+//   c = b - i        = 2i + 3
+//   s += a + b + c   = 6i + 7
+//   sum over i=0..99 = 6 * (99*100/2) + 7*100 = 6*4950 + 700 = 30400
+fn main() {
+  let s = 0
+  let i = 0
+  while i < 100 {
+    let a = i + 1
+    let b = a * 3
+    let c = b - i
+    s = s + a + b + c
+    i = i + 1
+  }
+  if s != 30400 { return 1 }
+  return 0
+}

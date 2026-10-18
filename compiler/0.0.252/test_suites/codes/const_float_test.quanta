@@ -1,0 +1,106 @@
+// Red-first gate row: a top-level `const` with a FLOAT initialiser.
+//
+// DEFECT: `const NAME = <float literal>` silently became the INTEGER 0.
+//
+// ROOT CAUSE (found, not guessed): the lexer emits a float literal as TT_FNUM
+// (7), but `eval_const()`'s literal branch tests `peek()==TT_NUM` (2), so it
+// returned 0 WITHOUT consuming the token. Two places then recorded that 0 into
+// the const table: the scan pass (features.quanta, ktext==57 -- the one that
+// actually runs for a TOP-LEVEL const) and parse_const(). Both now store the
+// exact IEEE-754 bit pattern with kind=2, and the three const-use sites emit
+// IR_FCONST (the float-constant opcode) instead of IR_CONST.
+//
+// RED-FIRST EVIDENCE (measured, raw):
+//   golden compiler/0.0.240/bin/x86/qc:
+//       CF bits 0                        <- want 4612811918334230528 (2.5)
+//       CF+2.5 bits 4612811918334230528  <- want 4617315517961601024 (5.0)
+//       (the sum is 2.5, i.e. CF acted as 0.0)
+//     -> this row returns 1.
+//   compiler/0.0.241/bin/x86/qc (the fix):
+//       CF bits 4612811918334230528
+//       CF+2.5 bits 4617315517961601024
+//     -> this row returns 0.
+//
+// EXPECTATIONS ARE DERIVED NUMERICALLY, not written from memory:
+//   /usr/bin/python3 -c "import struct; print(struct.unpack('<q',
+//     struct.pack('<d', 5.5))[0])"  -> 4617878467915022336
+// and the same for every constant below (see compiler/0.0.241/WIP.md).
+//
+// A float EXPRESSION initialiser (`const X = 2.5 * 4.0`) is NOT evaluable (there
+// is no float const evaluator) and is now a compile error rather than a silent 0:
+//   error: a float const initialiser must be a bare literal (no expression): X
+// That negative case cannot be a row in EXPECTED.tsv: the runner compiles every
+// row and counts a compile failure as a failure whatever the expected column
+// says. It is demonstrated in WIP.md with raw output instead.
+
+// identity helper so a const is passed as an ARGUMENT (a different vreg-tagging
+// path than an inline operand). Declared before main for clarity.
+fn addf(x: f64, y: f64) -> f64 {
+    return x + y
+}
+
+// The consts under test. Bare float literals, all shapes the lexer can emit:
+// a fraction, an exponent, and a long mantissa.
+const CF     = 2.5
+const CH     = 0.5
+const CFIF   = 1.5
+const CTN    = 0.1
+const CNEG5  = 1e-5
+const CHUN   = 100.25
+const CBIG   = 1e10
+const CAVO   = 6.02214076e23
+const CLONG  = 1.2345678901234567
+const CTHREE = 3.0
+// an integer const must keep working (regression guard)
+const CI_INT = 42
+
+let FAIL = 0
+
+fn chk(label, want, got) {
+    if want != got {
+        prints("FAIL ")
+        prints(label)
+        prints(": got ")
+        print(got)
+        prints(" want ")
+        print(want)
+        newline()
+        FAIL = FAIL + 1
+    }
+}
+
+fn main() {
+    // 1. the stored value IS the literal (exact IEEE-754 bits).
+    chk("CF",     4612811918334230528, f64bits(CF))
+    chk("CH",     4602678819172646912, f64bits(CH))
+    chk("CFIF",   4609434218613702656, f64bits(CFIF))
+    chk("CTN",    4591870180066957722, f64bits(CTN))
+    chk("CNEG5",  4532020583610935537, f64bits(CNEG5))
+    chk("CHUN",   4636754883540680704, f64bits(CHUN))
+    chk("CBIG",   4756540486875873280, f64bits(CBIG))
+    chk("CAVO",   4962933279127225623, f64bits(CAVO))
+    chk("CLONG",  4608238818662570491, f64bits(CLONG))
+    chk("CTHREE", 4613937818241073152, f64bits(CTHREE))
+    chk("CI_INT", 42,                  CI_INT)
+
+    // 2. the const is a FLOAT vreg, not an integer holding its bits: arithmetic
+    //    on it must take the float path. 2.5 + 2.5 == 5.0 exactly; if CF were an
+    //    integer 0 the sum would be 2.5 (bits 4612811918334230528).
+    let s: f64 = CF + CF
+    chk("CF+CF", 4617315517961601024, f64bits(s))
+    let p: f64 = CF * CH
+    chk("CF*CH", 4608308318706860032, f64bits(p))          // 1.25
+    // 3. passed as a function ARGUMENT.
+    let a: f64 = addf(CF, CTHREE)
+    chk("addf(CF,3.0)", 4617878467915022336, f64bits(a))   // 5.5
+
+    prints("const_float: ")
+    if FAIL == 0 {
+        prints("PASS\n")
+        return 0
+    }
+    prints("FAIL ")
+    print(FAIL)
+    prints(" case(s)\n")
+    return 1
+}

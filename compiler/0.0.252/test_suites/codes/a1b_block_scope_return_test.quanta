@@ -1,0 +1,32 @@
+// A1b (0.0.237): `return` from inside a block. The return is emitted where the
+// block is parsed and the block is still fully parsed afterwards, so the block's
+// bindings are still popped exactly once -- but the value returned must be the
+// binding that was in scope AT the return site, and a binding of the same name
+// declared only inside the block must not be visible to the code after it.
+//
+// Before the fix, g(1) resolved `r` to the block-local `r = 42` (the newest
+// binding, even though that block never ran in that call), so this returned a
+// stale value (measured 126) instead of 1; with block scoping it exits 42.
+fn g(n) {
+    let r = 1
+    if n == 0 { let r = 42
+        return r }
+    return r
+}
+fn h(n) {
+    let acc = 0
+    let i = 0
+    while i < 4 { let t = i * 2
+        if t == 4 { return acc + t }
+        acc = acc + t
+        i = i + 1 }
+    return acc
+}
+fn main() {
+    let a = g(0)
+    let b = g(1)
+    if a != 42 { exit(1) }
+    if b != 1 { exit(2) }
+    if h(0) != 6 { exit(3) }
+    exit(42)
+}

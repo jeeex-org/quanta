@@ -1,0 +1,19 @@
+// argconv_test -- where does an argument land for an asm!-only function?
+// Each probe returns the register contents; the exit code reveals the register.
+
+fn from_rdi(a) -> i64 { asm!("48 89 f8") }   // mov rax, rdi
+fn from_rsi(a) -> i64 { asm!("48 89 f0") }   // mov rax, rsi
+fn from_rax(a) -> i64 { asm!("48 89 c0") }   // mov rax, rax
+
+fn main() -> i64 {
+    // Probe 0: is the value in rdi?
+    let a = from_rdi(42)
+    if a == 42 { print("arg in rdi\n"); return 42 }
+    let b = from_rsi(43)
+    if b == 43 { print("arg in rsi\n"); return 43 }
+    let c = from_rax(44)
+    if c == 44 { print("arg in rax\n"); return 44 }
+    print("arg in none of rdi/rsi/rax\n")
+    print(a); print(" "); print(b); print(" "); print(c); print("\n")
+    return 1
+}

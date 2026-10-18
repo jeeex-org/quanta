@@ -1,0 +1,104 @@
+// Live test: semantic retrieval from the sqlite-vec store through std/rag.
+//
+// Exercises the in-language SEARCH path (the thing this change fixes):
+//   sentence --(configured encoder)--> embedding hex --> rag_search --> ranked rows
+// and prints every hit's source path, chunk type and vec0 L2 distance.
+//
+// Two ways to obtain the embedding, both real:
+//   1. rag_embed(query) -- the in-language encoder path (fork+exec+file-capture
+//      of scripts/rag_embed_file.py). This is the normal case.
+//   2. If (1) yields nothing, fall back to the hex the CONFIGURED encoder wrote
+//      to the file below. It is needed only under ./scripts/quanta_run.sh,
+//      whose HARD 1536 MB address-space cap is below what `import torch` needs
+//      (measured: torch maps ~6 GB of .so; import fails at 4 GB). rag_search
+//      itself uses only sqlite-vec (no torch), so the SEARCH half runs fine
+//      under the cap; the ENCODER half cannot.
+//
+// Run:  ./scripts/quanta_run.sh <binary> < /dev/null
+import std/rag
+import std/io
+import std/fs
+import std/str
+
+fn read_all(path) -> str {
+    let fd = open(path, 0, 0)
+    if fd < 0 { return "" }
+    let sz = file_size(fd)
+    let s = read_str(fd, sz)
+    close(fd)
+    return s
+}
+
+fn main() {
+    let query = "How do I compile Quanta source?"
+    let preemb = "/tmp/rag_emb_hex.txt"
+
+    prints("QUERY: ")
+    prints(query)
+    prints("\n\n")
+
+    // --- embedding ---
+    let emb = rag_embed(query)
+    let hex = ""
+    if len(emb) > 0 && mem_load8(emb + 8) != 91 {   // 91 = '[' -> [error: ...]
+        prints("[embed] rag_embed() produced ")
+        printi(len(emb))
+        prints(" hex chars\n")
+        hex = emb
+    } else {
+        prints("[embed] rag_embed() returned nothing: its python helper needs\n")
+        prints("        torch, which cannot map under quanta_run.sh's 1536MB cap.\n")
+        prints("[embed] using the hex the CONFIGURED encoder wrote to ")
+        prints(preemb)
+        prints("\n")
+        hex = read_all(preemb)
+    }
+    if len(hex) == 0 {
+        prints("FAIL: no embedding available\n")
+        exit(2)
+    }
+    prints("[embed] embedding ready (")
+    printi(len(hex))
+    prints(" hex chars = ")
+    printi(len(hex) / 2)
+    prints(" bytes)\n\n")
+
+    // --- semantic search ---
+    let rows = rag_search(hex, 5)
+    let lines = str_split(rows, "\n")
+    let i = 0
+    let n = len(lines)
+    let good = 0
+    prints("RANKED CHUNKS (source | type | chunk_index | distance):\n")
+    while i < n {
+        let line = lines[i]
+        if len(line) > 0 {
+            let f = str_split(line, "|")
+            if len(f) >= 5 {
+                prints("  #")
+                printi(good + 1)
+                prints("  dist=")
+                prints(f[4])
+                prints("  [")
+                prints(f[1])
+                prints(" #")
+                prints(f[2])
+                prints("]  ")
+                prints(f[0])
+                newline()
+                good = good + 1
+            }
+        }
+        i = i + 1
+    }
+    prints("\nrows returned: ")
+    printi(good)
+    newline()
+
+    if good <= 0 {
+        prints("FAIL: rag_search returned no ranked chunks\n")
+        exit(1)
+    }
+    prints("OK: in-language semantic search returned ranked chunks\n")
+    exit(0)
+}

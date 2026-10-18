@@ -1,0 +1,67 @@
+// test_suites/codes/stdlib_jit_dispatch_test.quanta
+//
+// ACCEPTANCE row for the 0.0.246 fix: the emitted JIT kernel must be callable
+// from a function inside an IMPORTED module, not only inline in `main`.
+//
+// `lib/std/jit_x86_fused.quanta` dispatches through
+//     fn jit_f_apply(as) -> i64 { return closure_call(jf_tbl, as, 0) }
+// and on 0.0.245 that call SIGSEGV'd (rc=139) while the byte-identical inline
+// `closure_call(tbl, asz, 0)` in `main` returned 4700186342854754304. The device
+// that was blamed was closure_call; the real cause was the parameter NAME `as`
+// (TT_AS, not TT_ID), which funcscan silently dropped -- so `as` read as 0 and
+// the kernel was entered with rdi=0.
+//
+// This row runs BOTH routes on identical data and requires the same bits, so it
+// asserts the kernel is dispatched correctly and that the two dispatch paths
+// agree. 0.0.245: rc=139.  0.0.246: rc=0.
+import std/jit_x86
+import std/jit_x86_fused
+
+const NSUPER = 8
+const N = NSUPER * 256
+
+fn main() -> i64 {
+    if jit_f_setup() != 0 { return 10 }        // emit the kernel once
+    let tbl = jit_f_ready()
+
+    let raw = mem_alloc(NSUPER * 144 + 64)
+    let i = 0
+    while i < NSUPER * 144 {
+        mem_store8(raw + i, (i * 37 + 11) - ((i * 37 + 11) / 256) * 256)
+        i = i + 1
+    }
+    let b = 0
+    while b < NSUPER {
+        mem_store8(raw + b * 144 + 0, 0)
+        mem_store8(raw + b * 144 + 1, 60)
+        mem_store8(raw + b * 144 + 2, 0)
+        mem_store8(raw + b * 144 + 3, 56)
+        b = b + 1
+    }
+    let x = mem_alloc(N * 8 + 256)
+    i = 0
+    while i < N { mem_store(x + i * 8, i2f(i % 29) * 0.25 + 0.125); i = i + 1 }
+
+    let dmd = jit_f_dmd_alloc(NSUPER)
+    b = 0
+    while b < NSUPER {
+        jit_f_dmd_fill(raw + b * 144, raw + b * 144 + 4,
+                       f16_to_f64(raw + b * 144), f16_to_f64(raw + b * 144 + 2),
+                       dmd + b * 128)
+        b = b + 1
+    }
+    let asz = mem_alloc(32)
+    mem_store(asz + 0, raw)
+    mem_store(asz + 8, x)
+    mem_store(asz + 16, dmd)
+    mem_store(asz + 24, NSUPER)
+
+    // route 1: inline in the top-level module (worked on 0.0.245 too)
+    let va = closure_call(tbl, asz, 0)
+    // route 2: through the imported module (SIGSEGV on 0.0.245)
+    let vc = jit_f_apply(asz)
+
+    if va != 4700186342854754304 { return 11 }
+    if vc != va { return 12 }
+    return 0
+}

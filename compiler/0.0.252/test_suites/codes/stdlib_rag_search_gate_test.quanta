@@ -1,0 +1,160 @@
+// Gate coverage for lib/std/rag.quanta (the repaired semantic-search path).
+//
+// WHY THIS ROW EXISTS
+//   lib/std/rag.quanta was repaired and had NO gate coverage at all -- it was not
+//   a row in EXPECTED_STDLIB.tsv, so the RAG unit's edits were exercised by
+//   nothing. This row exercises the in-language SEARCH path end to end:
+//
+//       embedding hex -> rag_search() --fork+exec--> scripts/rag_search_file.py
+//                                      (sqlite-vec vec0 KNN over the 21 GB store)
+//                    <--out_file----- ranked rows -> str_split -> fields
+//       and rag_parse_results() over the same rows.
+//
+// THE EMBEDDING IS BUILT IN-LANGUAGE, ON PURPOSE
+//   The real query encoder needs sentence-transformers + torch, which cannot map
+//   its shared objects under quanta_run.sh's address-space cap (measured:
+//   "libtorch_cuda.so: failed to map segment from shared object"). The prior live
+//   probe therefore fell back to a HAND-PLACED /tmp/rag_emb_hex.txt -- a file
+//   nothing in the repo creates, so as a gate row it would be RED on a fresh
+//   runner and GREEN only by accident here. That is the "self-skips on a missing
+//   dependency" trap wearing the opposite mask.
+//
+//   So this row synthesises a deterministic 384-float32 vector (the width the
+//   vec0 table declares, DIM=384) and hex-encodes it itself. That is enough to
+//   drive rag_search's ENTIRE path -- spill, exec, KNN, read back, split -- which
+//   is what the missing coverage was. It does NOT claim to verify embedding
+//   quality; the encoder is out of scope under the cap and the row says which
+//   vector it used.
+//
+// ONE PREREQUISITE: the 21 GB store. EXPECTED_STDLIB.tsv declares it in
+// SKIP_IF_MISSING, so the row is skipped (never silently passed) where absent.
+//
+// rc 0 = the search path returned 5 well-formed ranked rows, twice identically.
+// rc 2 = the store is present but the search returned nothing / malformed rows.
+
+import std/rag
+import std/str
+
+let DB = "/opt/tali/ti/ai/rag/vectors.db"
+let DIM = 384
+
+let FAIL = 0
+fn bad(msg) {
+    prints("FAIL: ")
+    prints(msg)
+    newline()
+    FAIL = FAIL + 1
+}
+
+// A length-prefixed Quanta string over a raw byte buffer: [u64 len][bytes][NUL].
+// rag_search() spills it with write_str(), which reads the header.
+fn as_str(raw, n) -> str {
+    let s = mem_alloc(n + 16)
+    mem_store(s, n)
+    let i = 0
+    while i < n { mem_store8(s + 8 + i, mem_load8(raw + i)); i = i + 1 }
+    mem_store8(s + 8 + n, 0)
+    return s
+}
+
+fn main() -> i64 {
+    // --- deterministic 384-float32 vector, as hex -----------------------------
+    // Three valid finite float32 patterns cycled by index, so the vector is
+    // varied and cannot be all-zero or NaN (a NaN vector would make every L2
+    // distance NaN and the ordering meaningless).
+    //   k%3==0 -> 0.5f  0x3F000000 -> LE 00 00 00 3F
+    //   k%3==1 -> 1.0f  0x3F800000 -> LE 00 00 80 3F
+    //   k%3==2 -> 0.25f 0x3E800000 -> LE 00 00 80 3E
+    let pat = mem_alloc(12)
+    mem_store8(pat + 0, 0);   mem_store8(pat + 1, 0);   mem_store8(pat + 2, 0);   mem_store8(pat + 3, 63)
+    mem_store8(pat + 4, 0);   mem_store8(pat + 5, 0);   mem_store8(pat + 6, 128); mem_store8(pat + 7, 63)
+    mem_store8(pat + 8, 0);   mem_store8(pat + 9, 0);   mem_store8(pat + 10, 128); mem_store8(pat + 11, 62)
+
+    let raw = mem_alloc(DIM * 4)
+    let k = 0
+    while k < DIM {
+        let s = (k % 3) * 4
+        let b = 0
+        while b < 4 { mem_store8(raw + k * 4 + b, mem_load8(pat + s + b)); b = b + 1 }
+        k = k + 1
+    }
+
+    let hx = "0123456789abcdef"
+    let nbytes = DIM * 4
+    let buf = mem_alloc(nbytes * 2 + 16)
+    let i = 0
+    while i < nbytes {
+        let bt = mem_load8(raw + i)
+        let hi = bt / 16
+        let lo = bt - hi * 16
+        mem_store8(buf + i * 2, mem_load8(hx + 8 + hi))
+        mem_store8(buf + i * 2 + 1, mem_load8(hx + 8 + lo))
+        i = i + 1
+    }
+    let hex = as_str(buf, nbytes * 2)
+    prints("[embed] synthetic ")
+    print(nbytes)
+    prints("-byte vector, ")
+    print(len(hex))
+    prints(" hex chars (encoder needs torch; cannot map under the cap)\n")
+
+    // --- search ---------------------------------------------------------------
+    let rows = rag_search(hex, 5)
+    if len(rows) == 0 { bad("rag_search returned an empty string"); return 2 }
+    if mem_load8(rows + 8) == 91 {   // '[' -> "[error: ...]"
+        prints("  rows: ")
+        prints(rows)
+        newline()
+        bad("rag_search returned an error string")
+        return 2
+    }
+
+    let lines = str_split(rows, "\n")
+    let n = len(lines)
+    let good = 0
+    i = 0
+    while i < n {
+        let line = lines[i]
+        if len(line) > 0 {
+            let f = str_split(line, "|")
+            if len(f) >= 5 {
+                if len(f[4]) == 0 { bad("row has an empty distance field") }
+                good = good + 1
+            } else {
+                bad("row has fewer than 5 pipe fields")
+            }
+        }
+        i = i + 1
+    }
+    // measured: the helper returns exactly k=5 rows for this store
+    if good != 5 { prints("  rows returned: "); print(good); newline(); bad("expected 5 ranked rows") }
+
+    // --- rag_parse_results over the same rows ---------------------------------
+    let ctx = rag_parse_results(rows)
+    let clines = str_split(ctx, "\n")
+    let cgood = 0
+    i = 0
+    while i < len(clines) {
+        if len(clines[i]) > 0 { cgood = cgood + 1 }
+        i = i + 1
+    }
+    if cgood != good { prints("  parsed lines: "); print(cgood); newline(); bad("rag_parse_results dropped rows") }
+
+    // --- determinism: the same vector must give byte-identical rows -----------
+    let rows2 = rag_search(hex, 5)
+    if len(rows2) != len(rows) { bad("rag_search is not deterministic (length)") }
+    else {
+        let j = 0
+        while j < len(rows) {
+            if mem_load8(rows + 8 + j) != mem_load8(rows2 + 8 + j) { bad("rag_search is not deterministic (bytes)"); j = len(rows) }
+            j = j + 1
+        }
+    }
+
+    prints("rag_search_gate: returned ")
+    print(good)
+    prints(" ranked rows")
+    if FAIL == 0 { prints(" -- PASS\n"); return 0 }
+    prints(" -- FAIL\n")
+    return 2
+}

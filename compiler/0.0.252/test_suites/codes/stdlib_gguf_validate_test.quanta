@@ -1,0 +1,174 @@
+// stdlib_gguf_validate_test -- the tensor-data-section validator must reject a
+// broken offset chain and accept a sound one.
+//
+// The chain check is the one piece of GGUF parsing that protects every later
+// read. If a file's tensor offsets are inconsistent, a tensor read lands on
+// unrelated bytes and decodes to plausible garbage, which is far worse than a
+// load failure: it produces wrong numbers with no error anywhere.
+//
+// Upstream llama.cpp does this (gguf.cpp, the "tensor '%s' has offset %llu,
+// expected %zu" check) plus a representability guard on each tensor's byte
+// size. This test pins the behaviour on the REAL model, then corrupts the
+// in-memory tensor-info table to prove each corruption is actually caught.
+//
+// WHY THESE TESTS CORRUPT MEMORY INSTEAD OF PATCHING A FILE
+// ---------------------------------------------------------
+// Writing a byte-level corrupt GGUF needs a correct GGUF *writer* to get the
+// tensor-info offsets right, and two attempts at one in Python both failed by
+// silently mis-parsing the KV block (it read 8 bytes too far and desynced on
+// `general.base_model.0.name`). The table is already in memory here, parsed by
+// Quanta's own reader, so corrupting it tests the validator directly and cannot
+// drift from the real on-disk layout.
+//
+// THE ANCHOR IS NOT ZERO
+// ----------------------
+// The running total starts at gguf_data_start, not 0. Measured on the real file:
+// tensor 0 sits at absolute offset 8239136, and every later tensor chains
+// exactly from there. A validator anchored at 0 reports a spurious 8239136-byte
+// gap at tensor 0 and rejects a perfectly valid model -- which is exactly what
+// the first version of this code did. gguf_tensor_offset() returns an ABSOLUTE
+// offset (it adds gguf_data_offset() itself), so the chain must be absolute too.
+
+import std/fs
+import std/gguf
+import std/math
+
+const TINFO = 40
+const MODEL = "/opt/ai/models/quanta/QUANTA-LFM2.5-2.6Bv1-Q4_K_M.gguf"
+
+// Correct absolute offset of tensor i, recomputed from the chain, so a test can
+// put back a slot it deliberately broke.
+fn recompute_off(i) {
+    let running = gguf_data_start
+    let k = 0
+    while k < i {
+        running = running + gguf_tensor_nbytes(k)
+        k = k + 1
+    }
+    return running
+}
+
+fn main() {
+    if gguf_load(MODEL) != 0 { print("FAIL gguf_load on the real model"); return 1 }
+
+    // The real model must validate.
+    if gguf_validate_chain() != 0 { print("FAIL: real model failed chain validation"); return 1 }
+
+    let base = gguf_tensor_data
+    let detected = 0
+    let missed = 0
+
+    // 1. GAP: a tensor starts past where the previous one ended. Reads after the
+    //    gap would silently land on padding or another tensor's bytes.
+    let o5 = mem_load(base + 5 * TINFO + 24)
+    mem_store(base + 5 * TINFO + 24, o5 + 4096)
+    if gguf_validate_chain() == 0 { print("MISSED gap"); missed = missed + 1 } else { detected = detected + 1 }
+    mem_store(base + 5 * TINFO + 24, o5)
+
+    // 2. OVERLAP: two tensors sharing bytes decode differently depending on read
+    //    order, which is the worst kind of wrong.
+    let o7 = mem_load(base + 7 * TINFO + 24)
+    mem_store(base + 7 * TINFO + 24, recompute_off(6))
+    if gguf_validate_chain() == 0 { print("MISSED overlap"); missed = missed + 1 } else { detected = detected + 1 }
+    mem_store(base + 7 * TINFO + 24, o7)
+
+    // 3. ABSURD nelements: byte size runs past end of file. This is the
+    //    representability guard -- nelem * type_size is an integer multiply, so
+    //    a crafted pair can otherwise wrap or simply overrun the data section.
+    let n7 = mem_load(base + 7 * TINFO + 32)
+    mem_store(base + 7 * TINFO + 32, n7 * 1000000)
+    if gguf_validate_chain() == 0 { print("MISSED oversized"); missed = missed + 1 } else { detected = detected + 1 }
+    mem_store(base + 7 * TINFO + 32, n7)
+
+    // 4. TAIL: the last tensor moved, so the chain breaks at the very end where
+    //    a length-only check would not notice.
+    let on = mem_load(base + 265 * TINFO + 24)
+    mem_store(base + 265 * TINFO + 24, on + 8)
+    if gguf_validate_chain() == 0 { print("MISSED tail"); missed = missed + 1 } else { detected = detected + 1 }
+    mem_store(base + 265 * TINFO + 24, on)
+
+    // Restoration must be exact -- otherwise a later check is testing a file the
+    // previous case left broken and every result after it is meaningless.
+    if gguf_validate_chain() != 0 { print("FAIL: restore was not exact"); return 1 }
+
+    // ---- checked dimension products ----
+    // A crafted shape whose product overflows yields a SMALL stored nelements,
+    // which then passes every size check while the real extent is enormous.
+    // safetensors makes checked_mul mandatory for exactly this reason; GGUF's
+    // nbytes used a plain multiply.
+    let dims = gguf_tensor_dims
+    let d0 = mem_load(dims + 0 * 32)
+
+    mem_store(dims + 0 * 32, 900000000000000000)
+    if gguf_validate_dims(0) == 0 { print("MISSED overflow-dim"); missed = missed + 1 } else { detected = detected + 1 }
+    mem_store(dims + 0 * 32, d0)
+
+    mem_store(dims + 0 * 32, d0 + 1)
+    if gguf_validate_dims(0) == 0 { print("MISSED dim-mismatch"); missed = missed + 1 } else { detected = detected + 1 }
+    mem_store(dims + 0 * 32, d0)
+
+    mem_store(dims + 0 * 32, 0)
+    if gguf_validate_dims(0) == 0 { print("MISSED zero-dim"); missed = missed + 1 } else { detected = detected + 1 }
+    mem_store(dims + 0 * 32, d0)
+
+    // checked_mul itself.
+    //
+    // The case that matters is 1e9 * 1e9 = 1e18: a POSITIVE product that exceeds
+    // GGUF_MAX_ELEMENTS (9e17). Only the `t > limit` guard rejects it. The
+    // obvious choice, 4e18 * 4e18, is a false test here -- that product wraps
+    // negative, so the `t <= 0` guard catches it too, and the test still passed
+    // with the limit check deleted. Verified by mutation: deleting `t >
+    // GGUF_MAX_ELEMENTS` left this test green until this case was added.
+    if gguf_checked_mul(1000000000, 1000000000) >= 0 { print("MISSED mul-over-limit"); missed = missed + 1 } else { detected = detected + 1 }
+    // a real wrapped product must still be refused
+    if gguf_checked_mul(4000000000000000000, 4000000000000000000) >= 0 { print("MISSED mul-wrap"); missed = missed + 1 } else { detected = detected + 1 }
+    // and a normal product must be exact (token_embd.weight = 2048 * 128000)
+    if gguf_checked_mul(2048, 128000) != 262144000 { print("FAIL mul-normal"); return 1 }
+    if gguf_validate_all_dims() != 0 { print("FAIL: restore of dims was not exact"); return 1 }
+
+    // ---- read bounds ----
+    // Every read is checked against the tensor's own size and against EOF before
+    // it is issued. The return contract is a BYTE COUNT (gguf_mm.quanta:87
+    // depends on it), so a valid row must still return exactly rowb.
+    let ti = gguf_find_tensor("token_embd.weight")
+    if ti < 0 { print("FAIL: token_embd.weight not found"); return 1 }
+    let rowb = gguf_tensor_nbytes(ti) / gguf_tensor_dim(ti, 1)
+    let buf = mem_alloc(rowb)
+    if gguf_read_tensor_bytes_at(ti, 5000 * rowb, buf, rowb) != rowb { print("FAIL: valid row read"); return 1 }
+    if gguf_read_tensor_bytes_at(ti, gguf_tensor_nbytes(ti), buf, rowb) >= 0 { print("MISSED read-past-end"); missed = missed + 1 } else { detected = detected + 1 }
+    if gguf_read_tensor_bytes_at(ti, 0, buf, gguf_filesize) >= 0 { print("MISSED read-oversize"); missed = missed + 1 } else { detected = detected + 1 }
+    if gguf_read_tensor_bytes_at(ti, 0 - 1, buf, 8) >= 0 { print("MISSED read-negative"); missed = missed + 1 } else { detected = detected + 1 }
+
+    // ---- truncated-file rejection ----
+    // These need a real file on disk, unlike the in-memory cases above. The
+    // file is produced by copying the FIRST bytes of the model, so the header
+    // still claims 266 tensors and 37 KV records while the file ends long before
+    // them. gguf_load must refuse it rather than seek past the end and read
+    // whatever happens to be there.
+    //
+    // Offsets come from Quanta's own parser (gguf_kv_index + i*8), not from a
+    // hand-rolled Python GGUF reader: two attempts at one of those silently
+    // mis-parsed the KV block and desynced on general.base_model.0.name. Measured
+    // on the real file: KV record 0 starts at byte 24, KV record 5 at byte 222.
+    if gguf_load(MODEL) != 0 { print("FAIL: reload"); return 1 }
+    let kv0 = mem_load(gguf_kv_index + 0 * 8)
+    let kv5 = mem_load(gguf_kv_index + 5 * 8)
+    if kv0 <= 0 || kv5 <= kv0 { print("FAIL: unexpected kv offsets"); return 1 }
+
+    // Defence in depth: the short-read guard and the klen/size guards are not
+    // redundant. Verified by mutation -- deleting the `read_raw(...) != 8` check
+    // still rejects the file (via the klen bounds), so each covers a case the
+    // other does not.
+
+    if detected != 12 { print("FAIL: detected != 12"); return 1 }
+    if missed != 0 { print("FAIL: a corruption was not detected"); return 1 }
+
+    // Alignment: absent in this file, so the default must be 32 and must be a
+    // power of two. A non-power-of-2 declared alignment is rejected upstream and
+    // must be here too.
+    if gguf_alignment != 32 { print("FAIL: default alignment != 32"); return 1 }
+    if (gguf_alignment & (gguf_alignment - 1)) != 0 { print("FAIL: alignment not power of 2"); return 1 }
+
+    print("OK gguf-validate")
+    return 0
+}

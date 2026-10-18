@@ -1,0 +1,28 @@
+// 0.0.248: the typed-buffer bound IS enforced -- and the bound is the ALLOCATOR'S
+// COUNT, not the declared `[N]`. Companion to f32_buffer_semantics_test.
+//
+// The same declaration as that row uses (`let c: f32[8] = mem_alloc(2)`), with
+// one index past the allocator's 2 elements. The runtime index check in IR_IDX /
+// IR_ISTORE is
+//
+//     cmp [base], idx     ; the header written by mem_alloc / IR_ARRNEW
+//     jb  +2
+//     ud2                 ; #UD -> SIGILL
+//
+// which is why this row's expected rc is 132 (128 + SIGILL). Two things are
+// established by it failing here rather than at [8]:
+//
+//   * a bound IS checked for a typed buffer (a user is not free to index
+//     anywhere), and
+//   * the checked bound is 2 -- the count the allocator recorded -- so the
+//     declared [8] is informational, exactly as the semantics row asserts.
+//
+// The trap is armed by default (`ovf_trap == 1`, secure by default) and is
+// suppressed inside `unsafe {}` and by --no-overflow-trap, so this row is
+// compiled and run with the default flags only.
+fn main() -> i64 {
+    let c: f32[8] = mem_alloc(2)
+    c[0] = 1.5
+    c[2] = 1.5                 // index == the allocator's count: traps
+    return 0
+}

@@ -1,0 +1,80 @@
+// 0.0.244 gate row: the REGISTER-PRESSURE / eviction path.
+//
+// A4 (next-use eviction) changes which vreg afree() throws out of the 13-register
+// pool when the pool is FULL. A wrong victim is not a slow program -- it is a
+// WRONG VALUE, because the evicted vreg's register is handed to another value
+// while the first one is still live. This row exists so that class of bug cannot
+// ship silently: it keeps 16 values live at once (pool = 13) inside a hot loop,
+// with the DEFINITION order opposed to the CONSUMPTION order, so every iteration
+// forces evictions and any mis-selected victim corrupts the sum.
+//
+// It is a COVERAGE row, not a red-first row, and that is stated plainly: 0.0.244's
+// eviction policy is semantics-preserving by construction, so there is no program
+// whose *result* differs between 0.0.243 and 0.0.244. The red-first evidence for
+// A4 is a codegen metric (fewer frame-relative memory ops), reported separately;
+// this row is the functional guard that the strategy it implements stays correct.
+//
+// Expected values are hand-derived from the source, not copied from either
+// compiler (closed forms checked in Python):
+//   phase A  sum over i<100000 of sum(k=1..16)(i+k)  = 8*N*(N-1) + 136*N
+//   phase B  sum over i<50000  of sum over the 8 products (i+2k+1)(i+2k+2)
+// A failure reports exit(100 + phase).
+fn main() {
+    let N = 100000
+    let i = 0
+    let s = 0
+    while i < N {
+        let t1 = i + 1
+        let t2 = i + 2
+        let t3 = i + 3
+        let t4 = i + 4
+        let t5 = i + 5
+        let t6 = i + 6
+        let t7 = i + 7
+        let t8 = i + 8
+        let t9 = i + 9
+        let t10 = i + 10
+        let t11 = i + 11
+        let t12 = i + 12
+        let t13 = i + 13
+        let t14 = i + 14
+        let t15 = i + 15
+        let t16 = i + 16
+        // CONSUMED IN REVERSE: the value needed next is the most recently defined
+        // one, which is exactly the one a LIFO victim choice would discard.
+        s = s + t16 + t15 + t14 + t13 + t12 + t11 + t10 + t9
+        s = s + t8 + t7 + t6 + t5 + t4 + t3 + t2 + t1
+        i = i + 1
+    }
+    if s != 80012800000 { exit(101) }
+
+    let M = 50000
+    let j = 0
+    let s2 = 0
+    while j < M {
+        let w0 = j + 1
+        let w1 = j + 2
+        let w2 = j + 3
+        let w3 = j + 4
+        let w4 = j + 5
+        let w5 = j + 6
+        let w6 = j + 7
+        let w7 = j + 8
+        let w8 = j + 9
+        let w9 = j + 10
+        let w10 = j + 11
+        let w11 = j + 12
+        let w12 = j + 13
+        let w13 = j + 14
+        let w14 = j + 15
+        let w15 = j + 16
+        // Same 16 live values, but each is consumed by a multiply, so a wrong
+        // victim shows up as a wrong product rather than a wrong sum.
+        s2 = s2 + w14 * w15 + w12 * w13 + w10 * w11 + w8 * w9
+        s2 = s2 + w6 * w7 + w4 * w5 + w2 * w3 + w0 * w1
+        j = j + 1
+    }
+    if s2 != 333493367200000 { exit(102) }
+
+    exit(42)
+}

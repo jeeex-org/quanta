@@ -1,0 +1,141 @@
+// test_suites/scripts/verify_status.quanta -- the gate's STATUS FRESHNESS and
+// integrity check (stage 12). This is the canonical path: run_tests.sh compiles
+// THIS file, and docs/roadmap/quanta.md names it. (scripts/verify_status.quanta
+// was an untracked, divergent near-copy -- removed so there is one checker.)
+//
+// HISTORY (why this file changed shape): it used to REGENERATE docs/status.json
+// and docs/status.md with a hard-coded generated_at ("2026-09-08T00:00:00Z") and
+// then "verify" them by printing fixed strings and returning 0. The stage was
+// therefore GREEN no matter how stale the file was -- which is exactly how
+// docs/status.json sat at 2026-09-08 while the tree moved on. A stage that
+// rewrites its own input cannot detect staleness.
+//
+// Generation and verification are now split:
+//   * REGENERATION:  bash scripts/regen_status.sh
+//                    (derives real counts and stamps a REAL generated_at)
+//   * VERIFICATION:  this file. It only READS docs/status.json and fails closed
+//                    when the file is missing, malformed, or older than
+//                    STATUS_MAX_AGE_SECS.
+//
+// Exit code is the contract the gate reads: 0 = fresh and well-formed, 1 = fail.
+// Every failure message names the regeneration command.
+
+module std_verify_status;
+
+import std/fs
+import std/str
+
+// docs/status.json must be regenerated within this window, in seconds. 30 days.
+const STATUS_MAX_AGE_SECS = 2592000;
+
+// Named in every failure message so the fix is one copy-paste away.
+const REGEN_CMD = "bash scripts/regen_status.sh";
+
+// Maximum bytes of docs/status.json we inspect (the file is ~10 KB).
+const STATUS_READ_MAX = 65536;
+
+// read_all(path) -> buffer whose payload starts at buf+8 and whose byte length
+// is stored at buf+0, or 0 on failure.
+fn read_all(path) -> i64 {
+    let fd = file_open(path, 0)
+    if fd < 0 { return 0 }
+    let buf = mmap(STATUS_READ_MAX + 16)
+    let n = file_read(fd, buf + 8, STATUS_READ_MAX)
+    file_close(fd)
+    if n <= 0 { return 0 }
+    mem_store(buf, n)
+    return buf
+}
+
+// find_sub(buf, n, needle) -> index of needle's first byte inside buf's payload,
+// or -1 if absent.
+fn find_sub(buf, n, needle) -> i64 {
+    let nl = len(needle)
+    if nl == 0 { return -1 }
+    if n < nl { return -1 }
+    let i = 0
+    while i <= n - nl {
+        let j = 0
+        let ok = 1
+        while j < nl {
+            if mem_load8(buf + 8 + i + j) != mem_load8(needle + 8 + j) { ok = 0 }
+            j = j + 1
+        }
+        if ok == 1 { return i }
+        i = i + 1
+    }
+    return -1
+}
+
+// read_int_after(buf, n, key) -> the decimal integer value that follows `key`
+// (skipping any ':'/whitespace), or -1 if the key is absent or has no digits.
+fn read_int_after(buf, n, key) -> i64 {
+    let at = find_sub(buf, n, key)
+    if at < 0 { return -1 }
+    let i = at + len(key)
+    while i < n {
+        let c = mem_load8(buf + 8 + i)
+        if c == 58 || c == 32 || c == 9 || c == 10 || c == 13 { i = i + 1 } else { break }
+    }
+    let val = 0
+    let any = 0
+    while i < n {
+        let c = mem_load8(buf + 8 + i)
+        if c < 48 || c > 57 { break }
+        val = val * 10 + (c - 48)
+        any = 1
+        i = i + 1
+    }
+    if any == 0 { return -1 }
+    return val
+}
+
+fn fail(msg) -> i64 {
+    prints("  FAIL: ")
+    prints(msg)
+    prints("\n  regenerate with: ")
+    prints(REGEN_CMD)
+    prints("\n")
+    return 1
+}
+
+fn init() -> i64 { return 0 }
+
+fn main() -> i64 {
+    prints("Checking docs/status.json freshness...\n")
+
+    let buf = read_all("docs/status.json")
+    if buf == 0 { return fail("docs/status.json is missing or unreadable") }
+    let n = mem_load(buf)
+
+    // Well-formedness: the fields the gate's contract depends on must be present.
+    if find_sub(buf, n, "\"generated_at\"") < 0 {
+        return fail("docs/status.json has no generated_at field")
+    }
+    if find_sub(buf, n, "\"si_metrics\"") < 0 {
+        return fail("docs/status.json has no si_metrics section")
+    }
+
+    let epoch = read_int_after(buf, n, "\"generated_at_epoch\"")
+    if epoch <= 0 {
+        return fail("docs/status.json has no parseable generated_at_epoch")
+    }
+
+    let now_s = now() / 1000000000
+    let age = now_s - epoch
+    if age < 0 { age = 0 }
+
+    prints("  generated_at_epoch="); printi(epoch)
+    prints(" now="); printi(now_s)
+    prints(" age_secs="); printi(age); prints("\n")
+
+    if age > STATUS_MAX_AGE_SECS {
+        prints("  STALE: older than ")
+        printi(STATUS_MAX_AGE_SECS / 86400)
+        prints(" days\n")
+        return fail("docs/status.json is stale")
+    }
+
+    prints("  PASS: docs/status.json is present, well-formed and fresh\n")
+    return 0
+}

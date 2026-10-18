@@ -174,11 +174,23 @@ re-instating the unconditional flush turns the gate RED for the reason the stage
 
 ## 6. Byte-identity across the gate rows
 
-All 240 `EXPECTED.tsv` rows compiled with both compilers, byte compare: see the
-per-version WIP.md for the counts. Like F1 — and unlike a flag change — this lever
-alters the store set of every block boundary, so a wide footprint is expected; what is
-NOT expected, and is the useful measurement, is that the *opcode multiset* shrinks by
-exactly the number of removed `mov [rbp+disp], reg` forms and grows by nothing.
+All 240 `EXPECTED.tsv` rows compiled with both compilers, byte compare:
+**10 identical / 230 differing / 0 compile-fail.** Like F1 — and unlike a flag change —
+this lever alters the store set of every block boundary, so a wide footprint is expected.
+
+**CORRECTION (recorded during 0.0.252).** This section originally added that the
+*opcode sequence* shrinks by exactly the number of removed `mov [rbp+disp], reg` forms
+and grows by nothing, citing `objdump_multiset_diff.py`. **That claim is withdrawn: the
+measurement was vacuous.** The executables this compiler writes have no section headers
+(`readelf -S` -> "There are no sections in this file"), so `objdump -d` printed zero
+instructions for both sides, the empty multisets compared equal, and every row was
+reported as passing. The tool is fixed and renamed `test_suites/scripts/objdump_seq_diff.py`
+(`--emit-obj`, a minimum-disassembly guard so a vacuous pass cannot recur, and difflib
+sequence comparison so a register swap is visible); its measured numbers are reported in
+the phase-3 summary. 0.0.250's equivalence rests on the behavioural oracles listed in §5
+and on the instrument of record's columns — `q_hst` −405 with `q_instr` −405 and
+`q_hld`/`q_lld` unchanged, i.e. every removed instruction is a home store and no home
+load was added — not on any disassembly oracle.
 
 ## 7. What this version does NOT fix
 

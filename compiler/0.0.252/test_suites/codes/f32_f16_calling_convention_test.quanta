@@ -1,0 +1,109 @@
+// 0.0.248: the f16/f32 CALLING CONVENTION, pinned on RAW 64-bit values.
+//
+// WHAT IS BEING PINNED. An f16/f32 argument crosses a function boundary as its
+// WIDENED f64 bit pattern in the ordinary ABI register (rdi/rsi/rdx/rcx/r8/r9,
+// then the stack from arg 6), and the CALLEE narrows it with one RNE rounding.
+// Callers and callees therefore have nothing to disagree about: there is no
+// sub-word width in flight, and the callee needs no knowledge of the call site
+// (which is the point -- parse and emit are fused per function and a callee can
+// be emitted before any call site exists).
+//
+// WHY RAW VALUES AND NOT A ROUND TRIP. "Pass a float, get the same float back"
+// cannot see a width mismatch: a 4-byte transfer of a widened carrier yields 0
+// for almost every value, and a raw f32 pattern read as an f64 is a denormal --
+// both can be mistaken for a pass if the comparison is between values that were
+// narrowed twice. So every check here reads the exact 64-bit content the callee
+// holds, with `f64bits` (the bit pattern, no arithmetic), and asserts against
+// hard-coded patterns:
+//
+//   x = 1.0000001        f64 pattern 4607182419250377371
+//   f32(x)               raw f32 bits 1065353217, widened carrier 4607182419336888320
+//   f16(x)               raw f16 bits 15360 (0x3C00), widened carrier 4607182418800017408
+//
+// 1.0000001 is chosen because it is NOT representable in f32 or f16, so every
+// one of those four numbers is distinct -- a width or rounding mistake cannot
+// coincide with the expected value.
+//
+// POSITION INDEPENDENCE. The same argument is delivered in every ABI slot, and
+// inside a mixed f64/f32/f16 call, so a wrong slot or a shifted argument list is
+// caught rather than merely a wrong width. Neighbouring arguments are asserted
+// too: an f32 parameter must not disturb the f64 values around it.
+fn g0(x: f32) -> i64 { return f64bits(x) }
+fn g1(a: f64, x: f32) -> i64 { return f64bits(x) }
+fn g2(a: f64, b: f64, x: f32) -> i64 { return f64bits(x) }
+fn g3(a: f64, b: f64, c: f64, x: f32) -> i64 { return f64bits(x) }
+fn g4(a: f64, b: f64, c: f64, d: f64, x: f32) -> i64 { return f64bits(x) }
+fn g5(a: f64, b: f64, c: f64, d: f64, e: f64, x: f32) -> i64 { return f64bits(x) }
+// arg 6 and beyond arrive on the STACK (SysV), which is a different path in both
+// the caller's marshalling and the callee's IR_PARAM, and therefore a separate
+// thing to pin.
+fn g6(a: f64, b: f64, c: f64, d: f64, e: f64, f: f64, x: f32) -> i64 { return f64bits(x) }
+
+// f16 in every slot, same shape.
+fn h0(x: f16) -> i64 { return f64bits(x) }
+fn h1(a: f64, x: f16) -> i64 { return f64bits(x) }
+fn h2(a: f64, b: f64, x: f16) -> i64 { return f64bits(x) }
+
+// Neighbour integrity: return the f64 arguments' patterns around an f32 one.
+fn mix_lo(x: f32, a: f64) -> i64 { return f64bits(a) }
+fn mix_mid(a: f64, x: f32, b: f64) -> i64 { return f64bits(a) + f64bits(b) }
+fn mix_hi(a: f64, x: f32) -> i64 { return f64bits(a) }
+
+// Returns: the value comes back in rax as the widened carrier.
+fn ret32() -> f32 { return 1.0000001 }
+fn ret16() -> f16 { return 1.0000001 }
+fn ret64() -> f64 { return 1.0000001 }
+
+fn main() -> i64 {
+    let X = 1.0000001
+    // The test's own input, pinned: if the literal does not round-trip, the row
+    // fails HERE (exit 1) and the failure is named as a literal problem.
+    if f64bits(X) != 4607182419250377371 { exit(1) }
+
+    let WANT32 = 4607182419336888320      // widened carrier of f32(1.0000001)
+    let RAW32  = 1065353217               // the raw binary32 bits
+    let WANT16 = 4607182418800017408      // widened carrier of f16(1.0000001)
+    let RAW16  = 15360                    // the raw binary16 bits (0x3C00)
+
+    // ---- f32 argument, every register slot, then the stack ----
+    if g0(X) != WANT32 { exit(10) }
+    if g1(1.0, X) != WANT32 { exit(11) }
+    if g2(1.0, 2.0, X) != WANT32 { exit(12) }
+    if g3(1.0, 2.0, 3.0, X) != WANT32 { exit(13) }
+    if g4(1.0, 2.0, 3.0, 4.0, X) != WANT32 { exit(14) }
+    if g5(1.0, 2.0, 3.0, 4.0, 5.0, X) != WANT32 { exit(15) }
+    if g6(1.0, 2.0, 3.0, 4.0, 5.0, 6.0, X) != WANT32 { exit(16) }
+
+    // ---- f16 argument ----
+    if h0(X) != WANT16 { exit(20) }
+    if h1(1.0, X) != WANT16 { exit(21) }
+    if h2(1.0, 2.0, X) != WANT16 { exit(22) }
+
+    // ---- the WIDTH discriminators ----
+    // A 4-byte convention that truncated the widened carrier would deliver 0
+    // (every f32 value's carrier has its low 29 bits zero). A convention that
+    // passed the raw binary32 bits would deliver that 32-bit integer where the
+    // callee expects an f64 bit pattern, i.e. a denormal with a tiny exponent.
+    // Both are excluded by the pattern assertions above; these two make the
+    // exclusion explicit so a reader can see what was ruled out.
+    if g0(X) == 0 { exit(30) }
+    if g0(X) == RAW32 { exit(31) }
+    if h0(X) == 0 { exit(32) }
+    if h0(X) == RAW16 { exit(33) }
+    // and the narrowing is REAL: the unrounded f64 pattern must not survive.
+    if g0(X) == f64bits(X) { exit(34) }
+    if h0(X) == f64bits(X) { exit(35) }
+
+    // ---- neighbouring arguments are untouched by the f32 argument ----
+    if mix_hi(7.5, X) != f64bits(7.5) { exit(40) }
+    if mix_lo(X, 7.5) != f64bits(7.5) { exit(41) }
+    if mix_mid(7.5, X, 0.5) != f64bits(7.5) + f64bits(0.5) { exit(42) }
+
+    // ---- returns: rax carries the widened carrier ----
+    if f64bits(ret32()) != WANT32 { exit(50) }
+    if f64bits(ret16()) != WANT16 { exit(51) }
+    // control: an f64 return is bit-identical to the literal.
+    if f64bits(ret64()) != f64bits(X) { exit(52) }
+
+    return 0
+}
