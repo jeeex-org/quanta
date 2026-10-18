@@ -1,0 +1,143 @@
+import std/gguf
+import std/lfm2_forward
+import std/lfm2_model
+import std/gguf_mm
+import std/gguf_bpe
+import std/lfm2_chat
+import std/fs
+import std/jit_x86
+import std/jit_x86_fused
+
+const Q4_PATH = "/opt/ai/models/quanta/QUANTA-LFM2.5-2.6Bv1-Q4_K_M.gguf"
+let acc8 = 0
+
+fn ref_reset() { let i = 0; while i < 8 { mem_store(acc8 + i*8, 0.0); i = i + 1 } return 0 }
+fn ref_f16f32(p) -> f64 { return f32bits_to_f64(f16bits_to_f32(mem_load16(p))) }
+
+fn main() {
+    if gguf_load(Q4_PATH) != 0 { prints("FAIL gguf_load\n"); return 1 }
+    if fc_read_config() != 0 { prints("FAIL config\n"); return 1 }
+    if bpe_init_from_gguf() == 0 { prints("FAIL bpe\n"); return 1 }
+    if fc_kv_init(2048) != 0 { prints("FAIL kv\n"); return 1 }
+    if fc_fw_init() != 0 { prints("FAIL fw\n"); return 1 }
+    mm_set_workers(0)
+    if mm_attach_mmap_fd(file_open(Q4_PATH, 0)) != 0 { prints("FAIL mmap\n"); return 1 }
+    if fc_cache_norms() != 0 { prints("FAIL norms\n"); return 1 }
+    acc8 = mem_alloc(64)
+
+    if jit_f_setup_folded() != 0 { prints("FAIL s0\n"); return 30 }
+    if jit_f_setup_folded_f32() != 0 { prints("FAIL s2\n"); return 31 }
+    if jit_f_setup_folded_f32_fma() != 0 { prints("FAIL s3\n"); return 32 }
+    if jit_f_setup_folded_q6k() != 0 { prints("FAIL s4\n"); return 33 }
+    if jit_f_setup_folded_q6k_f32() != 0 { prints("FAIL s5\n"); return 34 }
+    if jit_f_setup_folded_q6k_f32_fma() != 0 { prints("FAIL s6\n"); return 35 }
+
+    // ---------- Q4_K, row 0 of ffn_gate.0 ----------
+    let idx = lfm2_ffn_gate(0)
+    let cols = gguf_tensor_dim(idx, 0)
+    let rb = mm_row_bytes(12, cols)
+    let toff = gguf_tensor_offset(idx)
+    let raw = mm_map_base + toff
+    let x = mem_alloc(cols * 8)
+    let xf32 = mem_alloc(cols * 4)
+    let c = 0
+    while c < cols {
+        let u = i2f(c - (c / 128) * 128)
+        let v = (u - 63.5) * 0.001953125
+        mem_store(x + c * 8, v)
+        mem_store32(xf32 + c * 4, f64_to_f32bits(v))
+        c = c + 1
+    }
+    let argp = mem_alloc(64)
+    mem_store(argp + 0, raw)
+    mem_store(argp + 8, x)
+    mem_store(argp + 16, 0)
+    mem_store(argp + 24, cols / 256)
+    prints("Q4K cols="); print(cols); prints(" rb="); print(rb); prints(" nsuper="); print(cols/256); newline()
+    let r64 = jit_f_apply_folded(argp)
+    prints("  f64   = "); print_f(f64of(r64)); prints("  bits="); print(r64); newline()
+    mem_store(argp + 8, xf32)
+    let r32 = jit_f_apply_folded_f32(argp)
+    prints("  f32   = "); print_f(f64of(r32)); prints("  bits="); print(r32); newline()
+    let r32f = jit_f_apply_folded_f32_fma(argp)
+    prints("  f32fma= "); print_f(f64of(r32f)); prints("  bits="); print(r32f); newline()
+
+    // ---- reference, but with a CHOICE of arithmetic width so the two halves of
+    // the design (factor derivation vs accumulation) can be told apart.
+    ref_reset()
+    let nb = cols / 256
+    let bi = 0
+    while bi < nb {
+        let base = raw + bi * 144
+        let d32: f64 = ref_f16f32(base)
+        let m32: f64 = ref_f16f32(base + 2)
+        let scp = base + 4
+        let qp = base + 16
+        let e = 0
+        while e < 256 {
+            let cc = e / 64
+            let rr = e - cc * 64
+            let half = rr / 32
+            let off = rr - half * 32
+            let qb = mem_load8(qp + cc * 32 + off)
+            let q = 0
+            if half == 0 { q = qb - (qb / 16) * 16 } else { q = qb / 16 }
+            let ki = cc * 2 + half
+            let K: f64 = fmul32(d32, i2f(q4k_sc_jit(ki, scp)))
+            let M: f64 = fmul32(m32, i2f(q4k_min_jit(ki, scp)))
+            let w: f64 = fsub32(fmul32(i2f(q), K), M)
+            let xe = bi * 256 + e
+            let xv: f64 = f32bits_to_f64(mem_load32(xf32 + xe * 4))
+            let p: f64 = fmul32(w, xv)
+            let lane = e - (e / 8) * 8
+            mem_store(acc8 + lane * 8, fadd32(f64of(mem_load(acc8 + lane * 8)), p))
+            e = e + 1
+        }
+        bi = bi + 1
+    }
+    let l0: f64 = f64of(mem_load(acc8))
+    let l1: f64 = f64of(mem_load(acc8 + 8))
+    let l2: f64 = f64of(mem_load(acc8 + 16))
+    let l3: f64 = f64of(mem_load(acc8 + 24))
+    let l4: f64 = f64of(mem_load(acc8 + 32))
+    let l5: f64 = f64of(mem_load(acc8 + 40))
+    let l6: f64 = f64of(mem_load(acc8 + 48))
+    let l7: f64 = f64of(mem_load(acc8 + 56))
+    prints("  lanes f32acc:"); print_f(l0); prints(" "); print_f(l1); prints(" "); print_f(l2); prints(" "); print_f(l3)
+    prints(" "); print_f(l4); prints(" "); print_f(l5); prints(" "); print_f(l6); prints(" "); print_f(l7); newline()
+    let s: f64 = fadd32(fadd32(fadd32(l0, l4), fadd32(l1, l5)), fadd32(fadd32(l2, l6), fadd32(l3, l7)))
+    prints("  ref   = "); print_f(s); prints("  bits="); print(f64bits(f32bits_to_f64(f64_to_f32bits(s)))); newline()
+
+    // ---------- Q6_K, row 0 of ffn_down.3 ----------
+    prints("Q6K stage A\n")
+    let i6 = lfm2_ffn_down(3)
+    let cols6 = gguf_tensor_dim(i6, 0)
+    let rb6 = mm_row_bytes(14, cols6)
+    prints("  cols6="); print(cols6); prints(" rb6="); print(rb6); newline()
+    let x6 = mem_alloc(cols6 * 8)
+    let xf6 = mem_alloc(cols6 * 4)
+    c = 0
+    while c < cols6 {
+        let u = i2f(c - (c / 128) * 128)
+        let v = (u - 63.5) * 0.001953125
+        mem_store(x6 + c * 8, v)
+        mem_store32(xf6 + c * 4, f64_to_f32bits(v))
+        c = c + 1
+    }
+    prints("Q6K stage B (x built)\n")
+    mem_store(argp + 0, mm_map_base + gguf_tensor_offset(i6))
+    mem_store(argp + 8, x6)
+    mem_store(argp + 16, 0)
+    mem_store(argp + 24, cols6 / 256)
+    let q64 = jit_f_apply_folded_q6k(argp)
+    prints("  q6k f64   = "); print_f(f64of(q64)); newline()
+    prints("Q6K stage C (f64 kernel ok)\n")
+    mem_store(argp + 8, xf6)
+    let q32 = jit_f_apply_folded_q6k_f32(argp)
+    prints("  q6k f32   = "); print_f(f64of(q32)); newline()
+    prints("Q6K stage D (f32 kernel ok)\n")
+    let q32f = jit_f_apply_folded_q6k_f32_fma(argp)
+    prints("  q6k f32fma= "); print_f(f64of(q32f)); newline()
+    prints("Q6K stage E\n")
+    return 0
+}

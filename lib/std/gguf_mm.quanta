@@ -261,6 +261,26 @@ fn mm_matvec_par(idx: u64, x: u64, rows: i64, cols: i64, y: u64, nworkers: i64) 
             if jit_f_setup_folded_q6k_fma() != 0 { mm_fused_fma = 0 }
         }
     }
+    // The f32 modifier is fail-closed on ITS OWN regions the same way, and it
+    // composes with the FMA modifier: f32=1 fma=1 dispatches the f32 FMA kernels.
+    // If any f32 region is refused, mm_fused_f32 is cleared and the f64 kernels
+    // of whichever folded route is on continue to run.
+    if mm_fused_f32 != 0 {
+        if mm_fused_q4k != 0 {
+            if mm_fused_fma != 0 {
+                if jit_f_setup_folded_f32_fma() != 0 { mm_fused_f32 = 0; mm_fused_f32_drop = 1 }
+            } else {
+                if jit_f_setup_folded_f32() != 0 { mm_fused_f32 = 0; mm_fused_f32_drop = 1 }
+            }
+        }
+        if mm_fused_f32 != 0 && mm_fused_q6k != 0 {
+            if mm_fused_fma != 0 {
+                if jit_f_setup_folded_q6k_f32_fma() != 0 { mm_fused_f32 = 0; mm_fused_f32_drop = 1 }
+            } else {
+                if jit_f_setup_folded_q6k_f32() != 0 { mm_fused_f32 = 0; mm_fused_f32_drop = 1 }
+            }
+        }
+    }
 
     // NO y=0 PRE-FILL HERE. It used to be, for 927,744 rows/token. It cost
     // 7.53 ms/token of MAIN-THREAD time while the pool was parked (measured,
@@ -284,6 +304,27 @@ fn mm_matvec_par(idx: u64, x: u64, rows: i64, cols: i64, y: u64, nworkers: i64) 
     // pl_cols MUST be set before mm_pool_ensure(): a worker allocates its
     // scratch cell from it at spawn time (mm_scratch_new(pl_cell_cols)).
     pl_cell_cols = cols
+
+    // THE f32 x BUFFER, FILLED HERE ON THE MAIN THREAD. The f32 kernel reads x as
+    // f32; narrowing it per ROW would repeat the same work `rows` times and per
+    // WORKER would turn a read-only operand into a shared write. So it is
+    // narrowed once, here, before the pool is woken, and the workers only read
+    // it. GROW-ONLY (see pl_xf32_ensure): mem_free never unmaps, so a per-call
+    // alloc/free is permanent address-space growth and this runs 166 times a
+    // token.
+    // Fail-closed: if the buffer cannot be allocated, the flag is cleared and the
+    // f64 kernels run. mm_fused_f32_drop records WHY, so a silent "no effect"
+    // arm cannot be mistaken for "f32 is not faster".
+    if mm_fused_f32 != 0 && (mm_fused_q4k != 0 || mm_fused_q6k != 0) {
+        if pl_kind == 4 && (mmdt == 12 || mmdt == 14) && cols - (cols / 256) * 256 == 0 {
+            if pl_xf32_ensure(cols) != 0 {
+                mm_fused_f32 = 0
+                mm_fused_f32_drop = 2
+            } else {
+                pl_xf32_fill(x, cols)
+            }
+        }
+    }
     let e0 = 0
     if mm_prof_on != 0 { e0 = mm_prof_now() }
     if mm_pool_ensure(nworkers, cols) != 0 { return -1 }
@@ -543,6 +584,75 @@ fn mm_set_fused_fma(n) {
 
 fn mm_get_fused_fma() { return mm_fused_fma }
 fn mm_get_fused_fma_used() { return mm_fused_fma_used }
+
+// ===========================================================================
+// f32 VARIANT OF THE FOLDED KERNELS -- opt-in, DEFAULT OFF, its OWN flag
+// ===========================================================================
+// WHAT IT SELECTS. Like mm_fused_fma, this is a MODIFIER of mm_fused_q4k /
+// mm_fused_q6k: it does not add a route, it changes WHICH kernel those routes
+// dispatch. Both folded routes must be on for it to do anything, and turning it
+// off restores the f64 kernels byte for byte -- they live in their own RWX
+// regions and their bytes are not touched by this flag's existence.
+//
+// WHY IT IS THE BIGGER LEVER, MEASURED. Every kernel instruction before this was
+// a *pd form: 4 f64 lanes per ymm. The *ps forms carry 8, `vcvtdq2ps` converts
+// 8 int32 at once where `vcvtdq2pd` converts 4, and x becomes 4 bytes/element
+// instead of 8 -- halving the operand that is re-read once per ROW (x is read
+// rows*cols*8 bytes per matvec against ~0.5 bytes/element of weights, i.e. 16x
+// the weight traffic: docs/research/f32-fma-loader-kernels.md 3.1). Emitted
+// instruction count per Q4_K super-block drops from 847 to 356.
+//
+// WHY IT IS A SEPARATE FLAG AND NOT A REPLACEMENT. The f32 path MOVES BITS, for
+// two independent reasons: f32 ACCUMULATION is not f64 accumulation, and x is
+// narrowed to f32 once per matvec. llama.cpp's own SIMD dot products use f32 and
+// FMA, so this moves the loader TOWARD its reference -- but it is a different
+// sequence from THIS loader's f64 one, and the existing flags' gate is
+// bit-exactness against that. Hanging it on an existing flag would silently
+// replace a sequence whose gate is bit-exactness; that is exactly what the
+// separate flag exists to prevent.
+//
+// ITS BAR (deliberately different from every other flag's):
+//   * first-token argmax 597 and the first 24 generated ids IDENTICAL, and
+//   * a MEASURED, bounded logit excursion reported as max |difference| in
+//     absolute and in relative terms, with the sign-flip count and the run-to-run
+//     reproduction -- never "close enough". Measured by
+//     tests/lfm2_f32_kernel_ab_test.quanta and recorded in
+//     docs/research/f32-loader-kernels.md.
+//
+// SCOPE, the same as mm_fused_q6k's: the tied output projection (pool kind 5,
+// the scalar-chain kernel) is NOT on this route -- the chain keeps the
+// reference's left-to-right scalar order and a lane-based f32 kernel cannot
+// reproduce it.
+//
+// COMPOSITION WITH mm_fused_fma, stated rather than left to be inferred:
+//   f32=0 fma=0 -> f64 folded (unchanged)   f32=0 fma=1 -> f64 FMA (unchanged)
+//   f32=1 fma=0 -> f32 folded                f32=1 fma=1 -> f32 FMA folded
+//
+// FAIL CLOSED, and on TWO things: the RWX regions (see mm_matvec_par) and the
+// grow-only f32 x buffer. A box that refuses either keeps the f64 kernels of
+// whichever folded route is on -- a flag whose ON path crashes is worse than no
+// flag.
+let mm_fused_f32 = 0
+let mm_fused_f32_used = 0
+// Why the flag was dropped, if it was: 0 = not dropped, 1 = an RWX region was
+// refused, 2 = the f32 x buffer could not be allocated. Printed by the harness
+// so "the flag is on but nothing changed" can never be read as "f32 is not
+// faster" -- an unexercised arm that looks identical to a slow one is the exact
+// failure this series forbids.
+let mm_fused_f32_drop = 0
+
+fn mm_set_fused_f32(n) {
+    if n < 0 { n = 0 }
+    if n != 0 { n = 1 }
+    mm_fused_f32 = n
+    mm_fused_f32_used = 0
+    mm_fused_f32_drop = 0
+    return 0
+}
+
+fn mm_get_fused_f32() { return mm_fused_f32 }
+fn mm_get_fused_f32_used() { return mm_fused_f32_used }
+fn mm_get_fused_f32_drop() { return mm_fused_f32_drop }
 
 // ===========================================================================
 // SCALAR-CHAIN ROUTE FOR THE TIED OUTPUT PROJECTION -- opt-in, DEFAULT OFF
@@ -1338,6 +1448,24 @@ let pl_cell_cols = 0     // cols the live workers' scratch cells were sized for
 let pl_kind = 0          // 0 = matvec rows, 1 = embedding logits
 let pl_idx = 0
 let pl_x = 0
+// THE GROW-ONLY f32 ACTIVATION BUFFER -- the caller half of the f32 kernel route
+// (mm_fused_f32). pl_xf32 points at a buffer of pl_xf32_cap f32 elements, and at
+// most ONE allocation is ever made per size class per process.
+//
+// WHY GROW-ONLY IS NOT AN OPTIMISATION BUT A CORRECTNESS REQUIREMENT HERE:
+// mem_alloc is a raw mmap and mem_free NEVER unmaps -- it only pushes a
+// free-list node (A35). A per-matvec alloc/free pair therefore leaks nothing
+// visible but grows VmSize permanently: that is the exact mechanism behind the
+// 64 KB/token address-space growth that took several rounds to pin down. This
+// route runs once per matvec (166 times per token), so per-call churn would be
+// thousands of mappings per generation.
+//
+// The size is rounded UP to a power of two, so the tensors in this model
+// (cols 2048, 10752) cost exactly two allocations for the life of the process
+// and then never again. pl_xf32_cap is in ELEMENTS; the buffer is cap*4 bytes.
+let pl_xf32 = 0
+let pl_xf32_cap = 0
+let pl_xf32_allocs = 0     // sticky evidence: how many grows this process did
 let pl_rows = 0
 let pl_cols = 0
 let pl_y = 0
@@ -1351,6 +1479,44 @@ let pl_g = 0             // kind 6 (GLU): gate input ptr (f64)
 let pl_u = 0             // kind 6 (GLU): up input ptr (f64)
 let pl_glu_out = 0       // kind 6 (GLU): output ptr (f64)
 let pl_nelems = 0        // kind 6 (GLU): element count
+
+// ---- the grow-only f32 activation buffer -----------------------------------
+// Ensure pl_xf32 can hold `n` f32 elements. GROW-ONLY, and deliberately:
+// mem_free never unmaps (A35), so a per-matvec alloc/free pair is permanent
+// address-space growth, and this route runs 166 times per token. Rounding to a
+// power of two means the model's two column widths cost two mappings for the
+// whole process. Returns 0 or -1 (allocation refused).
+fn pl_xf32_ensure(n: i64) -> i64 {
+    if n <= 0 { return -1 }
+    if pl_xf32 != 0 && pl_xf32_cap >= n { return 0 }
+    let c = 4096
+    while c < n { c = c * 2 }
+    let p = mem_alloc(c * 4)
+    if p <= 0 { return -1 }
+    pl_xf32 = p
+    pl_xf32_cap = c
+    pl_xf32_allocs = pl_xf32_allocs + 1
+    return 0
+}
+
+// Narrow n f64 activations to f32, RNE, ONCE per matvec. Called on the MAIN
+// thread before the pool is woken, so no worker ever writes this buffer and no
+// worker reads a half-filled one. The narrowing is the same single
+// round-to-nearest-even step `vcvtpd2ps` would perform -- it is what makes the
+// f32 route move bits relative to the f64 one, and it is measured, not assumed
+// (tests/lfm2_f32_kernel_ab_test.quanta).
+fn pl_xf32_fill(x, n: i64) -> i64 {
+    let c = 0
+    while c < n {
+        mem_store32(pl_xf32 + c * 4, f64_to_f32bits(f64of(mem_load(x + c * 8))))
+        c = c + 1
+    }
+    return 0
+}
+fn pl_xf32_ptr() { return pl_xf32 }
+fn pl_xf32_cap_get() { return pl_xf32_cap }
+fn pl_xf32_allocs_get() { return pl_xf32_allocs }
+
 // kind 7 (parallel attention): q/out pointers, per-worker score scratch, the KV
 // cache addressing (computed by the caller from lfm2_forward's own layout, so
 // the worker needs no cross-module accessor), position and head geometry.
@@ -2226,6 +2392,7 @@ fn pl_run_rows_map(t: i64, cell) {
     let fused = 0
     let fused6 = 0
     let fusedfma = 0
+    let fused32 = 0
     let fargs = 0
     let fargs6 = 0
     if mm_fused_q4k != 0 && dtype == 12 && pl_cols - (pl_cols / 256) * 256 == 0 {
@@ -2241,18 +2408,34 @@ fn pl_run_rows_map(t: i64, cell) {
     // tables (see mm_matvec_par), so a refused RWX region leaves fusedfma = 0 and
     // the f64 kernels run instead of a null code pointer.
     if mm_fused_fma != 0 && (mm_fused_q4k != 0 || mm_fused_q6k != 0) { fusedfma = 1 }
+    // The f32 modifier likewise, and it is fail-closed on BOTH the region and the
+    // grow-only f32 x buffer: `pl_xf32 != 0` is the second half of that guard, and
+    // a zero here means the main thread's pl_xf32_ensure already cleared the flag
+    // (or no matvec has needed the buffer yet), in which case the f64 kernel runs.
+    if mm_fused_f32 != 0 && (fused != 0 || fused6 != 0) && pl_xf32 != 0 { fused32 = 1 }
 
     let r = lo
     while r < hi {
         let raw = mm_map_base + toff + r * rb
         if fused != 0 {
             mem_store(fargs + 0, raw)               // W: this row's quant bytes
-            mem_store(fargs + 8, pl_x)              // X: fixed for the whole matvec
+            // X: the f32 buffer when the f32 modifier is active, else the f64 x.
+            // The kernel form and the operand width must agree -- passing the f64
+            // pointer to a *ps kernel would read the wrong bytes and produce a
+            // plausible wrong number.
+            if fused32 != 0 { mem_store(fargs + 8, pl_xf32) } else { mem_store(fargs + 8, pl_x) }
             mem_store(fargs + 16, 0)                // DMD: unused by the folded kernel
             mem_store(fargs + 24, pl_cols / 256)    // nsuper
             // the kernel returns the f64 dot as raw bits; mem_store writes the
             // same 64 bits mm_dot4_s would.
-            if fusedfma != 0 {
+            if fused32 != 0 {
+                if fusedfma != 0 {
+                    mem_store(pl_y + r * 8, jit_f_apply_folded_f32_fma(fargs))
+                } else {
+                    mem_store(pl_y + r * 8, jit_f_apply_folded_f32(fargs))
+                }
+                mm_fused_f32_used = 1
+            } else if fusedfma != 0 {
                 mem_store(pl_y + r * 8, jit_f_apply_folded_fma(fargs))
                 mm_fused_fma_used = 1
             } else {
@@ -2261,10 +2444,17 @@ fn pl_run_rows_map(t: i64, cell) {
             mm_fused_used = 1
         } else if fused6 != 0 {
             mem_store(fargs6 + 0, raw)              // W: this row's quant bytes
-            mem_store(fargs6 + 8, pl_x)             // X: fixed for the whole matvec
+            if fused32 != 0 { mem_store(fargs6 + 8, pl_xf32) } else { mem_store(fargs6 + 8, pl_x) }
             mem_store(fargs6 + 16, 0)               // DMD: unused, Q6_K folds too
             mem_store(fargs6 + 24, pl_cols / 256)   // nsuper
-            if fusedfma != 0 {
+            if fused32 != 0 {
+                if fusedfma != 0 {
+                    mem_store(pl_y + r * 8, jit_f_apply_folded_q6k_f32_fma(fargs6))
+                } else {
+                    mem_store(pl_y + r * 8, jit_f_apply_folded_q6k_f32(fargs6))
+                }
+                mm_fused_f32_used = 1
+            } else if fusedfma != 0 {
                 mem_store(pl_y + r * 8, jit_f_apply_folded_q6k_fma(fargs6))
                 mm_fused_fma_used = 1
             } else {

@@ -30,6 +30,12 @@
 //   the fields are positional and a peer already measured the wrong arm here.
 //   fused_conv=1 (field 15): the parallel short-conv elementwise block
 //   (mm_set_fused_conv, pool kind 8).
+//   fused_f32=1 (field 17, default 0): select the f32 variants of the folded
+//   Q4_K / Q6_K kernels (mm_set_fused_f32). It MODIFIES fields 8/9 exactly as
+//   fused_fma modifies them, and it composes with it: f32=1 fma=1 dispatches the
+//   f32 FMA kernels. It MOVES BITS (f32 accumulation, and x narrowed to f32), so
+//   its bar is tests/lfm2_f32_kernel_ab_test.quanta / tests/lfm2_f32_logits_test,
+//   not the bit-exact logits gate.
 //   fused_fma=1 (field 16, default 0): select the FMA variants of the folded
 //   Q4_K / Q6_K kernels (mm_set_fused_fma). It MODIFIES fields 8/9, so both of
 //   those must be on for it to do anything. It MOVES BITS by construction, so it
@@ -282,6 +288,7 @@ fn main() {
     let attnf = 0
     let convf = 0
     let ffma = 0
+    let ff32 = 0
     if cfgb != 0 {
         let nf = parse_ints(cfgb, conf)
         if nf >= 1 { nw = mem_load(conf) }
@@ -300,6 +307,7 @@ fn main() {
         if nf >= 14 { attnf = mem_load(conf + 104) }
         if nf >= 15 { convf = mem_load(conf + 112) }
         if nf >= 16 { ffma = mem_load(conf + 120) }
+        if nf >= 17 { ff32 = mem_load(conf + 128) }
     } else {
         prints("warn: conf unreadable; defaults\n")
     }
@@ -317,6 +325,7 @@ fn main() {
     prints(" fused_attn="); print(attnf)
     prints(" fused_conv="); print(convf)
     prints(" fused_fma="); print(ffma)
+    prints(" fused_f32="); print(ff32)
     prints(" (argmax temp=0)\n")
 
     let t0 = clock()
@@ -336,6 +345,7 @@ fn main() {
     mm_set_fused_attn(attnf)
     mm_set_fused_conv(convf)
     mm_set_fused_fma(ffma)
+    mm_set_fused_f32(ff32)
     if usemap != 0 {
         if mm_attach_mmap_fd(file_open(Q4_PATH, 0)) != 0 { prints("FAIL mm_attach_mmap (continuing on pread)\n") }
     }
@@ -348,7 +358,11 @@ fn main() {
     prints(" fused_q4k_active="); print(mm_get_fused_q4k())
     prints(" fused_q6k_active="); print(mm_get_fused_q6k())
     prints(" fused_chain_active="); print(mm_get_fused_chain())
-    prints(" fused_fma_active="); print(mm_get_fused_fma()); newline()
+    prints(" fused_fma_active="); print(mm_get_fused_fma())
+    prints(" fused_f32_active="); print(mm_get_fused_f32())
+    prints(" fused_f32_drop="); print(mm_get_fused_f32_drop())
+    prints(" fused_f32_used="); print(mm_get_fused_f32_used())
+    prints(" xf32_allocs="); print(pl_xf32_allocs_get()); newline()
 
     // ---- prompt (identical construction to tests/lfm2_generate.quanta) ----
     let rawprompt = slurp(file_open(PROMPT_PATH, 0))

@@ -1466,43 +1466,41 @@ fn j_f32_high_fma() -> i64 {
 //   [r9-16] = f16 d, [r9-14] = f16 dmin, [r9-12..-1] = the 12 packed bytes.
 // The six-bit unpack is q4k_sc/q4k_min as in lib/std/matmul_q4k.quanta.
 fn j_f32_fold_factors() -> i64 {
-    femit("c4c1796e51f0", 6)       // vmovd xmm2, [r9-16]        d, dmin
-    femit("c4e27913d2", 5)         // vcvtph2ps xmm2, xmm2       [d,dmin,0,0] f32
-    femit("c4637904c200", 6)       // vpermilps xmm8, xmm2, 0x00 broadcast d
-    femit("c4637904ca55", 6)       // vpermilps xmm9, xmm2, 0x55 broadcast dmin
-    femit("c4c2793161f4", 6)       // vpmovzxbd xmm4, [r9-12]    a = sc0..3
-    femit("c4c2793169f8", 6)       // vpmovzxbd xmm5, [r9-8]     b = sc4..7
-    femit("c4c2793171fc", 6)       // vpmovzxbd xmm10,[r9-4]     c = sc8..11
-    // scales[0..3] = a & 63
-    femit("c5d572f31a", 5)         // vpslld xmm11, xmm4, 26
-    femit("c5d572d31a", 5)         // vpsrld xmm11, xmm11, 26
-    femit("c5785be7", 4)           // vcvtdq2ps xmm12, xmm11
-    femit("c4411859e0", 5)         // vmulps xmm12, xmm12, xmm8  d*sc[0..3]
-    // mins[0..3] = b & 63
-    femit("c5d572f51a", 5)         // vpslld xmm11, xmm5, 26
-    femit("c5d572d31a", 5)         // vpsrld xmm11, xmm11, 26
-    femit("c5785bf7", 4)           // vcvtdq2ps xmm14, xmm11
-    femit("c4410859f1", 5)         // vmulps xmm14, xmm14, xmm9  dmin*mn[0..3]
-    // scales[4..7] = (c & 15) | ((a >> 6) << 4)
-    femit("c5d572d306", 5)         // vpsrld xmm11, xmm4, 6
-    femit("c5d572f304", 5)         // vpslld xmm11, xmm11, 4
-    femit("c5e172f41c", 5)         // vpslld xmm3, xmm10, 28
-    femit("c5e172d41c", 5)         // vpsrld xmm3, xmm3, 28
-    femit("c5d5ebdb", 4)           // vpor xmm11, xmm11, xmm3
-    femit("c5785bef", 4)           // vcvtdq2ps xmm13, xmm11
-    femit("c4411859e8", 5)         // vmulps xmm13, xmm13, xmm8  d*sc[4..7]
-    // mins[4..7] = (c >> 4) | ((b >> 6) << 4)
-    femit("c5d572d506", 5)         // vpsrld xmm11, xmm5, 6
-    femit("c5d572f304", 5)         // vpslld xmm11, xmm11, 4
-    femit("c5d172d604", 5)         // vpsrld xmm5, xmm10, 4
-    femit("c5d5ebe9", 4)           // vpor xmm11, xmm11, xmm5
-    femit("c5785bff", 4)           // vcvtdq2ps xmm15, xmm11
-    femit("c4410859f9", 5)         // vmulps xmm15, xmm15, xmm9  dmin*mn[4..7]
-    // duplicate both halves so one lane-relative vpermilps broadcasts a factor
-    femit("c4431d18e401", 6)       // vinsertf128 ymm12, ymm12, xmm12, 1
-    femit("c4431518ed01", 6)       // vinsertf128 ymm13, ymm13, xmm13, 1
-    femit("c4430d18f601", 6)       // vinsertf128 ymm14, ymm14, xmm14, 1
-    femit("c4430518ff01", 6)       // vinsertf128 ymm15, ymm15, xmm15, 1
+    // <<<F32 PROLOGUE GENERATED -- do not hand-edit; run
+    //     `python3 tests/lfm2_f32_enc_gen.py` after editing tests/lfm2_f32_kernels.s.
+    femit("c4c1796e51f0", 6)   // vmovd xmm2, dword ptr [r9-16]
+    femit("c4e27913d2", 5)   // vcvtph2ps xmm2, xmm2
+    femit("c4637904c200", 6)   // vpermilps xmm8, xmm2, 0x00
+    femit("c4637904ca55", 6)   // vpermilps xmm9, xmm2, 0x55
+    femit("c4c2793161f4", 6)   // vpmovzxbd xmm4, dword ptr [r9-12]
+    femit("c4c2793169f8", 6)   // vpmovzxbd xmm5, dword ptr [r9-8]
+    femit("c442793151fc", 6)   // vpmovzxbd xmm10, dword ptr [r9-4]
+    femit("c5a172f41a", 5)   // vpslld xmm11, xmm4, 26
+    femit("c4c12172d31a", 6)   // vpsrld xmm11, xmm11, 26
+    femit("c441785be3", 5)   // vcvtdq2ps xmm12, xmm11
+    femit("c4411859e0", 5)   // vmulps xmm12, xmm12, xmm8
+    femit("c5a172f51a", 5)   // vpslld xmm11, xmm5, 26
+    femit("c4c12172d31a", 6)   // vpsrld xmm11, xmm11, 26
+    femit("c441785bf3", 5)   // vcvtdq2ps xmm14, xmm11
+    femit("c4410859f1", 5)   // vmulps xmm14, xmm14, xmm9
+    femit("c5a172d406", 5)   // vpsrld xmm11, xmm4, 6
+    femit("c4c12172f304", 6)   // vpslld xmm11, xmm11, 4
+    femit("c4c16172f21c", 6)   // vpslld xmm3, xmm10, 28
+    femit("c5e172d31c", 5)   // vpsrld xmm3, xmm3, 28
+    femit("c521ebdb", 4)   // vpor xmm11, xmm11, xmm3
+    femit("c441785beb", 5)   // vcvtdq2ps xmm13, xmm11
+    femit("c4411059e8", 5)   // vmulps xmm13, xmm13, xmm8
+    femit("c5a172d506", 5)   // vpsrld xmm11, xmm5, 6
+    femit("c4c12172f304", 6)   // vpslld xmm11, xmm11, 4
+    femit("c4c15172d204", 6)   // vpsrld xmm5, xmm10, 4
+    femit("c521ebdd", 4)   // vpor xmm11, xmm11, xmm5
+    femit("c441785bfb", 5)   // vcvtdq2ps xmm15, xmm11
+    femit("c4410059f9", 5)   // vmulps xmm15, xmm15, xmm9
+    femit("c4431d18e401", 6)   // vinsertf128 ymm12, ymm12, xmm12, 1
+    femit("c4431518ed01", 6)   // vinsertf128 ymm13, ymm13, xmm13, 1
+    femit("c4430d18f601", 6)   // vinsertf128 ymm14, ymm14, xmm14, 1
+    femit("c4430518ff01", 6)   // vinsertf128 ymm15, ymm15, xmm15, 1
+    // >>>END
     return 0
 }
 
@@ -1599,8 +1597,15 @@ fn jit_f_build_folded_f32(fma) -> i64 {
 // d: `movzx eax,word [r9+208]` reads exactly the 2 bytes the format promises.
 // sc: vpbroadcastb + vpmovsxbd + vcvtdq2ps + vbroadcastss -- four instructions
 // to an 8-lane f32 scale, against the f64 path's four to a 4-lane f64 one.
+// NOTE the prefix. `vpmovzxbd ymm6, [r9]` assembles to FIVE bytes with mod=00,
+// i.e. no displacement field at all, so appending a jb() byte to it inserts that
+// byte as the next instruction's first byte and shifts the whole stream -- the
+// kernel then runs off into padding and faults. The DISP8 form the kernel needs is
+// `vpmovzxbd ymm6, [r9+disp8]`, whose 5-byte prefix below is strictly shorter
+// than b_ldql8/b_ldql40 so the operand byte has somewhere to go. Both forms are
+// executed and prefix-compared in tests/lfm2_f32_enc_verify.c.
 fn j_f32_ld_ql(d) -> i64 {
-    jbytes(5, "c4c27d3131")        // vpmovzxbd ymm6, qword [r9+disp8]
+    jbytes(5, "c4c27d3171")        // vpmovzxbd ymm6, qword [r9+disp8]
     jb(d)
     return 0
 }

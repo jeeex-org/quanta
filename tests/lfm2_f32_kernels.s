@@ -12,7 +12,7 @@
 // ===================== harness prologue / epilogue ==========================
 // ctx: +0 r9_in, +8 r10_in, +16 rax_out, +24 r9_out, +32 r10_out,
 //      +64 ymm0, +128 ymm1, +192 ymm2, +256 ymm3, +320 ymm4, +384 ymm5,
-//      +448 ymm6, +512 ymm7, +576 ymm8, +640 ymm9,
+//      +448 ymm6, +512 ymm7, +576 ymm8, +640 ymm9, +960 ymm10, +1024 ymm11,
 //      +704 ymm12, +768 ymm13, +832 ymm14, +896 ymm15
 .globl verify_pre
 verify_pre:
@@ -28,6 +28,8 @@ verify_pre:
              vmovups ymm7,  ymmword ptr [rdi+512]
              vmovups ymm8,  ymmword ptr [rdi+576]
              vmovups ymm9,  ymmword ptr [rdi+640]
+             vmovups ymm10, ymmword ptr [rdi+960]
+             vmovups ymm11, ymmword ptr [rdi+1024]
              vmovups ymm12, ymmword ptr [rdi+704]
              vmovups ymm13, ymmword ptr [rdi+768]
              vmovups ymm14, ymmword ptr [rdi+832]
@@ -47,6 +49,8 @@ verify_post:
              vmovups ymmword ptr [rdi+512], ymm7
              vmovups ymmword ptr [rdi+576], ymm8
              vmovups ymmword ptr [rdi+640], ymm9
+             vmovups ymmword ptr [rdi+960], ymm10
+             vmovups ymmword ptr [rdi+1024], ymm11
              vmovups ymmword ptr [rdi+704], ymm12
              vmovups ymmword ptr [rdi+768], ymm13
              vmovups ymmword ptr [rdi+832], ymm14
@@ -91,7 +95,16 @@ a_acc:       vaddps ymm0, ymm0, ymm1
 .globl a_addr9
 a_addr9:     add r9, 8
 
-// ---- Q4_K f32 factor prologue ----
+// ---- Q4_K f32 factor prologue --------------------------------------------
+// THESE REGISTERS ARE THE KERNEL'S, not the f64 kernel's. The first transcription
+// of this block was hand-adapted from j_f_fold_factors and left FOUR instructions
+// sourcing xmm7 -- the f64 kernel's scratch -- where this kernel keeps its
+// unpack result in xmm11. It computed a plausible wrong number. The block is now
+// generated straight into lib/std/jit_x86_fused.quanta by
+// tests/lfm2_f32_enc_gen.py, so there is nothing to transcribe.
+//   xmm2 = [d,dmin,..] f32   ymm8 = broadcast d   ymm9 = broadcast dmin
+//   xmm4/5/10 = sc bytes a/b/c as dwords          xmm11 = unpack scratch
+//   xmm3 = scratch for the (c & 15) term          ymm12..15 = factor vectors
 .globl p_movd
 p_movd:      vmovd xmm2, dword ptr [r9-16]
 .globl p_ph2ps
@@ -100,10 +113,54 @@ p_ph2ps:     vcvtph2ps xmm2, xmm2
 p_perm_d:    vpermilps xmm8, xmm2, 0x00
 .globl p_perm_m
 p_perm_m:    vpermilps xmm9, xmm2, 0x55
-.globl p_cvt4
-p_cvt4:      vcvtdq2ps xmm12, xmm7
-.globl p_mul4
-p_mul4:      vmulps xmm12, xmm12, xmm8
+.globl p_ld_a
+p_ld_a:      vpmovzxbd xmm4, dword ptr [r9-12]
+.globl p_ld_b
+p_ld_b:      vpmovzxbd xmm5, dword ptr [r9-8]
+.globl p_ld_c
+p_ld_c:      vpmovzxbd xmm10, dword ptr [r9-4]
+.globl p_shl_a
+p_shl_a:     vpslld xmm11, xmm4, 26
+.globl p_shr_a
+p_shr_a:     vpsrld xmm11, xmm11, 26
+.globl p_cvt12
+p_cvt12:     vcvtdq2ps xmm12, xmm11
+.globl p_mul12
+p_mul12:     vmulps xmm12, xmm12, xmm8
+.globl p_shl_b
+p_shl_b:     vpslld xmm11, xmm5, 26
+.globl p_shr_b
+p_shr_b:     vpsrld xmm11, xmm11, 26
+.globl p_cvt14
+p_cvt14:     vcvtdq2ps xmm14, xmm11
+.globl p_mul14
+p_mul14:     vmulps xmm14, xmm14, xmm9
+.globl p_shr_a6
+p_shr_a6:    vpsrld xmm11, xmm4, 6
+.globl p_shl_a4
+p_shl_a4:    vpslld xmm11, xmm11, 4
+.globl p_shl_c28
+p_shl_c28:   vpslld xmm3, xmm10, 28
+.globl p_shr_c28
+p_shr_c28:   vpsrld xmm3, xmm3, 28
+.globl p_or1
+p_or1:       vpor xmm11, xmm11, xmm3
+.globl p_cvt13
+p_cvt13:     vcvtdq2ps xmm13, xmm11
+.globl p_mul13
+p_mul13:     vmulps xmm13, xmm13, xmm8
+.globl p_shr_b6
+p_shr_b6:    vpsrld xmm11, xmm5, 6
+.globl p_shl_b4
+p_shl_b4:    vpslld xmm11, xmm11, 4
+.globl p_shr_c4
+p_shr_c4:    vpsrld xmm5, xmm10, 4
+.globl p_or2
+p_or2:       vpor xmm11, xmm11, xmm5
+.globl p_cvt15
+p_cvt15:     vcvtdq2ps xmm15, xmm11
+.globl p_mul15
+p_mul15:     vmulps xmm15, xmm15, xmm9
 .globl p_dup12
 p_dup12:     vinsertf128 ymm12, ymm12, xmm12, 1
 .globl p_dup13
@@ -112,6 +169,19 @@ p_dup13:     vinsertf128 ymm13, ymm13, xmm13, 1
 p_dup14:     vinsertf128 ymm14, ymm14, xmm14, 1
 .globl p_dup15
 p_dup15:     vinsertf128 ymm15, ymm15, xmm15, 1
+
+// ---- Q4_K f32 FMA fold ----
+
+// ---- the per-chunk factor broadcast ---------------------------------------
+// ONE vpermilps per factor. VPERMILPS's imm8 selectors are LANE-RELATIVE inside
+// each 128-bit half -- the trap that cost a peer a day with vpermilpd -- and that
+// is exactly what is wanted HERE, because the prologue above left each factor
+// vector DUPLICATED into both halves. imm8 = j*0x55 broadcasts lane j of the low
+// half to all eight lanes. Verified by execution, including against the real
+// prologue's output.
+//   chunk 0 -> ymm12 lane 0 / lane 1     chunk 1 -> ymm12 lane 2 / lane 3
+//   chunk 2 -> ymm13 lane 0 / lane 1     chunk 3 -> ymm13 lane 2 / lane 3
+// and the same four pairs on ymm14/ymm15 for the mins.
 .globl p_bc12_00
 p_bc12_00:   vpermilps ymm6, ymm12, 0x00
 .globl p_bc12_55
@@ -128,24 +198,23 @@ p_bc13_55:   vpermilps ymm6, ymm13, 0x55
 p_bc13_aa:   vpermilps ymm6, ymm13, 0xaa
 .globl p_bc13_ff
 p_bc13_ff:   vpermilps ymm6, ymm13, 0xff
-.globl p_bd14_00
-p_bd14_00:   vpermilps ymm7, ymm14, 0x00
-.globl p_bd14_55
-p_bd14_55:   vpermilps ymm7, ymm14, 0x55
-.globl p_bd14_aa
-p_bd14_aa:   vpermilps ymm7, ymm14, 0xaa
-.globl p_bd14_ff
-p_bd14_ff:   vpermilps ymm7, ymm14, 0xff
-.globl p_bd15_00
-p_bd15_00:   vpermilps ymm7, ymm15, 0x00
-.globl p_bd15_55
-p_bd15_55:   vpermilps ymm7, ymm15, 0x55
-.globl p_bd15_aa
-p_bd15_aa:   vpermilps ymm7, ymm15, 0xaa
-.globl p_bd15_ff
-p_bd15_ff:   vpermilps ymm7, ymm15, 0xff
+.globl p_bc14_00
+p_bc14_00:   vpermilps ymm7, ymm14, 0x00
+.globl p_bc14_55
+p_bc14_55:   vpermilps ymm7, ymm14, 0x55
+.globl p_bc14_aa
+p_bc14_aa:   vpermilps ymm7, ymm14, 0xaa
+.globl p_bc14_ff
+p_bc14_ff:   vpermilps ymm7, ymm14, 0xff
+.globl p_bc15_00
+p_bc15_00:   vpermilps ymm7, ymm15, 0x00
+.globl p_bc15_55
+p_bc15_55:   vpermilps ymm7, ymm15, 0x55
+.globl p_bc15_aa
+p_bc15_aa:   vpermilps ymm7, ymm15, 0xaa
+.globl p_bc15_ff
+p_bc15_ff:   vpermilps ymm7, ymm15, 0xff
 
-// ---- Q4_K f32 FMA fold ----
 .globl a_fnma213
 a_fnma213:   vfnmadd213ps ymm1, ymm6, ymm7
 .globl a_fnma231
@@ -154,6 +223,16 @@ a_fnma231:   vfnmadd231ps ymm0, ymm1, ymmword ptr [r10]
 // ---- Q6_K f32 ----
 .globl b_ldql
 b_ldql:      vpmovzxbd ymm6, qword ptr [r9]
+// The DISP8 form, and it is here for a reason that cost a segfault: `as` encodes
+// `[r9]` with mod=00, i.e. NO displacement field at all, so the 5-byte sequence
+// above is a COMPLETE instruction. Appending a jb(disp8) byte to it inserts that
+// byte as the next instruction's first byte and shifts the whole kernel. With a
+// non-zero displacement `as` must emit mod=01 + disp8, which is the form the
+// kernel needs: 5 bytes of prefix, then the displacement byte.
+.globl b_ldql8
+b_ldql8:     vpmovzxbd ymm6, qword ptr [r9+8]
+.globl b_ldql40
+b_ldql40:    vpmovzxbd ymm6, qword ptr [r9+40]
 .globl b_ldqh
 b_ldqh:      vpmovzxbd ymm7, qword ptr [r9+128]
 .globl b_shr4

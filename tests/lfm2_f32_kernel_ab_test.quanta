@@ -1,0 +1,434 @@
+// tests/lfm2_f32_kernel_ab_test.quanta
+//
+// THE f32 KERNEL FAMILY'S OWN BAR. mm_set_fused_f32 selects the f32 variants of
+// the folded Q4_K / Q6_K kernels (pool kind 4, pl_run_rows_map). Those MOVE BITS
+// by construction -- f32 accumulation is not f64 accumulation, and x is narrowed
+// to f32 once per matvec -- so they cannot share the bit-exact gate the existing
+// flags have. This row is their bar, in three layers:
+//
+//   PART 1  kernel A/B on the SAME rows of the SAME tensors, interleaved,
+//           min-of-N AND sum-of-N (one estimator is not enough on this box), for
+//           four arms: f64, f64+FMA, f32, f32+FMA. All single-threaded.
+//   PART 2  the f32 kernels against an INDEPENDENT f32 REFERENCE written in
+//           Quanta source (f32 arithmetic via the fadd32/fsub32/fmul32 builtins,
+//           which are single-rounding binary32 ops), compared BIT FOR BIT on
+//           every row PART 1 timed. This is what proves the kernels' factor
+//           derivation, nibble unpack, lane assignment AND reduce order are the
+//           ones their comments claim -- a magnitude comparison would not.
+//   PART 3  the model-level bar is tests/lfm2_f32_logits_test.quanta (a full
+//           forward, argmax + ids + a measured logit excursion).
+//
+// The clock() unit is UNVERIFIED repo-wide, so read ratio_x1000 and never the
+// absolute ticks. Every figure is printed with the run's own load.
+//
+// Build: QC=$PWD/compiler/0.0.252/bin/x86/qc
+//        $QC -O tests/lfm2_f32_kernel_ab_test.quanta /tmp/f32ab
+// Run  : ( ulimit -c 0 -v 32000000; /tmp/f32ab </dev/null )
+import std/gguf
+import std/lfm2_forward
+import std/lfm2_model
+import std/gguf_mm
+import std/gguf_bpe
+import std/lfm2_chat
+import std/fs
+import std/jit_x86
+import std/jit_x86_fused
+
+const Q4_PATH = "/opt/ai/models/quanta/QUANTA-LFM2.5-2.6Bv1-Q4_K_M.gguf"
+const NROWS = 32
+const NCYC = 21
+
+// ===================== PART 1: kernel A/B ===================================
+// which: 0 = f64 folded, 1 = f64 FMA, 2 = f32, 3 = f32 FMA.
+// dtype selects the Q4_K / Q6_K pair. r10 (the kernel's X) is the f64 pointer
+// for arms 0/1 and the f32 pointer for arms 2/3 -- the widths must agree with
+// the kernel form or the answer is a plausible wrong number.
+fn sweep(which, dtype, toff, rb, cols, x, xf32, argp) -> i64 {
+    let t0 = clock()
+    let r = 0
+    while r < NROWS {
+        let raw = mm_map_base + toff + r * rb
+        mem_store(argp + 0, raw)
+        if which >= 2 { mem_store(argp + 8, xf32) } else { mem_store(argp + 8, x) }
+        mem_store(argp + 16, 0)
+        mem_store(argp + 24, cols / 256)
+        let v = 0
+        if dtype == 12 {
+            if which == 0 { v = jit_f_apply_folded(argp) }
+            else if which == 1 { v = jit_f_apply_folded_fma(argp) }
+            else if which == 2 { v = jit_f_apply_folded_f32(argp) }
+            else { v = jit_f_apply_folded_f32_fma(argp) }
+        } else {
+            if which == 0 { v = jit_f_apply_folded_q6k(argp) }
+            else if which == 1 { v = jit_f_apply_folded_q6k_fma(argp) }
+            else if which == 2 { v = jit_f_apply_folded_q6k_f32(argp) }
+            else { v = jit_f_apply_folded_q6k_f32_fma(argp) }
+        }
+        mem_store(argp + 32, v)
+        r = r + 1
+    }
+    return clock() - t0
+}
+
+// ===================== PART 2: the f32 reference ============================
+// Written from the BLOCK FORMAT, not from the kernel: the 6-bit factor unpack is
+// q4k_sc/q4k_min, the nibble extraction is transcribed from ggml's layout, and
+// every arithmetic step is one binary32 operation via fadd32/fsub32/fmul32 (the
+// builtins round each operand to f32 and perform ONE f32 op -- verified in
+// tests/lfm2_f32_enc_verify.c's sibling probe and by test_suites/codes/
+// fp16f32_type_test.quanta).
+//
+// ACCUMULATION ORDER, matching the kernels exactly:
+//   * elements are consumed in ASCENDING index;
+//   * element e accumulates into lane e%8 (a group of 8 consecutive elements
+//     lands in lanes 0..7);
+//   * the final reduce is ((L0+L4)+(L1+L5)) + ((L2+L6)+(L3+L7)) -- the same
+//     order tests/lfm2_f32_enc_verify.c pinned over 4000 random inputs.
+// Any of these three being different makes the bit comparison fail, which is the
+// point: the bit comparison is a test OF the documented order.
+let acc8 = 0
+
+fn ref_reset() {
+    let i = 0
+    while i < 8 { mem_store(acc8 + i * 8, 0.0); i = i + 1 }
+    return 0
+}
+
+// f32 view of an f16 field stored at `p` (exact: f16's 11-bit significand fits).
+fn ref_f16f32(p) -> f64 {
+    return f32bits_to_f64(f16bits_to_f32(mem_load16(p)))
+}
+
+fn ref_accum(e, p32) {
+    let lane = e - (e / 8) * 8
+    let cur: f64 = f64of(mem_load(acc8 + lane * 8))
+    mem_store(acc8 + lane * 8, fadd32(cur, p32))
+    return 0
+}
+
+fn ref_reduce() -> i64 {
+    let l0: f64 = f64of(mem_load(acc8))
+    let l1: f64 = f64of(mem_load(acc8 + 8))
+    let l2: f64 = f64of(mem_load(acc8 + 16))
+    let l3: f64 = f64of(mem_load(acc8 + 24))
+    let l4: f64 = f64of(mem_load(acc8 + 32))
+    let l5: f64 = f64of(mem_load(acc8 + 40))
+    let l6: f64 = f64of(mem_load(acc8 + 48))
+    let l7: f64 = f64of(mem_load(acc8 + 56))
+    let a0: f64 = fadd32(l0, l4)
+    let a1: f64 = fadd32(l1, l5)
+    let a2: f64 = fadd32(l2, l6)
+    let a3: f64 = fadd32(l3, l7)
+    let s: f64 = fadd32(fadd32(a0, a1), fadd32(a2, a3))
+    // the kernel widens the f32 sum to f64 with one exact cvtss2sd
+    return f64bits(f32bits_to_f64(f64_to_f32bits(s)))
+}
+
+// x is read as f32 from the buffer the harness built with the SAME narrowing the
+// loader uses (f64_to_f32bits + mem_store32).
+fn ref_q4k_row(raw, cols, xf32) -> i64 {
+    ref_reset()
+    let nb = cols / 256
+    let bi = 0
+    while bi < nb {
+        let base = raw + bi * 144
+        let d32: f64 = ref_f16f32(base)
+        let m32: f64 = ref_f16f32(base + 2)
+        let scp = base + 4
+        let qp = base + 16
+        let e = 0
+        while e < 256 {
+            let c = e / 64
+            let rr = e - c * 64
+            let half = rr / 32
+            let off = rr - half * 32
+            let qb = mem_load8(qp + c * 32 + off)
+            let q = 0
+            if half == 0 { q = qb - (qb / 16) * 16 } else { q = qb / 16 }
+            let ki = c * 2 + half
+            // K = d*sc and M = dmin*mn are each ONE f32 multiply, exactly as the
+            // kernel's vmulps does after vcvtph2ps/vcvtdq2ps.
+            let K: f64 = fmul32(d32, i2f(q4k_sc_jit(ki, scp)))
+            let M: f64 = fmul32(m32, i2f(q4k_min_jit(ki, scp)))
+            let w: f64 = fsub32(fmul32(i2f(q), K), M)
+            let xe = bi * 256 + e
+            let xv: f64 = f32bits_to_f64(mem_load32(xf32 + xe * 4))
+            let p: f64 = fmul32(w, xv)
+            ref_accum(e, p)
+            e = e + 1
+        }
+        bi = bi + 1
+    }
+    return ref_reduce()
+}
+
+fn ref_q6k_row(raw, cols, xf32) -> i64 {
+    ref_reset()
+    let nb = cols / 256
+    let bi = 0
+    while bi < nb {
+        let base = raw + bi * 210
+        let d32: f64 = ref_f16f32(base + 208)
+        let e = 0
+        while e < 256 {
+            let n = e / 128
+            let rr = e - n * 128
+            let s = rr / 32
+            let r2 = rr - s * 32
+            let h = r2 / 16
+            let off = r2 - h * 16
+            let g = off / 8
+            let k = off - g * 8
+            let s32 = (s - (s / 2) * 2) * 32
+            let qlb = mem_load8(base + n * 64 + s32 + h * 16 + g * 8 + k)
+            let qhb = mem_load8(base + 128 + n * 32 + h * 16 + g * 8 + k)
+            let lo = 0
+            if s >= 2 { lo = qlb / 16 } else { lo = qlb - (qlb / 16) * 16 }
+            let hi = 0
+            if s == 0 { hi = qhb - (qhb / 4) * 4 }
+            else if s == 1 { hi = qhb / 4 - ((qhb / 4) / 4) * 4 }
+            else if s == 2 { hi = qhb / 16 - ((qhb / 16) / 4) * 4 }
+            else { hi = qhb / 64 - ((qhb / 64) / 4) * 4 }
+            let q = lo + hi * 16 - 32
+            let scb = mem_load8(base + 192 + n * 8 + s * 2 + h)
+            let sc = scb
+            if scb > 127 { sc = scb - 256 }
+            // kernel order: q -> *sc -> *d, each one f32 op
+            let v1: f64 = fmul32(i2f(q), i2f(sc))
+            let v2: f64 = fmul32(v1, d32)
+            let xe = bi * 256 + e
+            let xv: f64 = f32bits_to_f64(mem_load32(xf32 + xe * 4))
+            let p: f64 = fmul32(v2, xv)
+            ref_accum(e, p)
+            e = e + 1
+        }
+        bi = bi + 1
+    }
+    return ref_reduce()
+}
+
+// Every timed row, through BOTH f32 kernels and the reference, compared as raw
+// f64 BITS. `exactly_one_nan` is the column that must stay 0: a class difference
+// would not be a rounding difference.
+fn oracle(dtype, toff, rb, cols, xf32, argp, stat) {
+    let bad = 0
+    let bothnan = 0
+    let onenan = 0
+    let maxulp = 0
+    let r = 0
+    while r < NROWS {
+        let raw = mm_map_base + toff + r * rb
+        mem_store(argp + 0, raw)
+        mem_store(argp + 8, xf32)
+        mem_store(argp + 16, 0)
+        mem_store(argp + 24, cols / 256)
+        let a = 0
+        let b = 0
+        let e = 0
+        if dtype == 12 {
+            a = jit_f_apply_folded_f32(argp)
+            b = jit_f_apply_folded_f32_fma(argp)
+            e = ref_q4k_row(raw, cols, xf32)
+        } else {
+            a = jit_f_apply_folded_q6k_f32(argp)
+            b = jit_f_apply_folded_q6k_f32_fma(argp)
+            e = ref_q6k_row(raw, cols, xf32)
+        }
+        mem_store(stat, a)
+        mem_store(stat + 8, b)
+        mem_store(stat + 16, e)
+        let ba = mem_load(stat)
+        let bb = mem_load(stat + 8)
+        let be = mem_load(stat + 16)
+        if ba != be { bad = bad + 1 }
+        // FMA is a deliberately DIFFERENT sequence (one rounding where the plain
+        // f32 form does two), so its distance from the reference is reported
+        // rather than required to be zero.
+        let na = isnan_bits(ba)
+        let ne = isnan_bits(be)
+        if na != 0 && ne != 0 { bothnan = bothnan + 1 }
+        else if na != 0 || ne != 0 { onenan = onenan + 1 }
+        if (ba < 0) == (be < 0) {
+            let u = be - ba
+            if u < 0 { if (0 - u) > maxulp { maxulp = 0 - u } }
+            else { if u > maxulp { maxulp = u } }
+        }
+        r = r + 1
+    }
+    prints("  rows="); print(NROWS)
+    prints(" f32_vs_ref_bit_mismatch="); print(bad)
+    prints(" exactly_one_nan="); print(onenan)
+    prints(" both_nan="); print(bothnan)
+    prints(" max_bit_distance_vs_ref_ulp="); print(maxulp)
+    newline()
+    return 0
+}
+
+// Same NaN test as the FMA harness: the float form (`v != v`) is unusable on this
+// tree (it returns false even for a NaN, measured), so classify on the pattern.
+fn isnan_bits(v) -> i64 {
+    let a = v
+    if a < 0 { a = a - (0 - 9223372036854775807 - 1) }
+    let e = a / 4503599627370496
+    let e2 = e - (e / 2048) * 2048
+    let m = a - (a / 4503599627370496) * 4503599627370496
+    if e2 == 2047 && m != 0 { return 1 }
+    return 0
+}
+
+// The box's own load, printed WITH every absolute number. This box's ambient load
+// moved the SAME tree between 1.85 and 3.148 tok/s, so an unlabelled figure is
+// not a measurement. Returns loadavg[0] x100 (the first field, two decimals).
+fn load1_x100() -> i64 {
+    let fd = file_open("/proc/loadavg", 0)
+    if fd < 0 { return -1 }
+    let b = mem_alloc(256)
+    let got = read_raw(fd, b, 256)
+    file_close(fd)
+    if got <= 0 { return -1 }
+    let whole = 0
+    let frac = 0
+    let i = 0
+    let seen_dot = 0
+    while i < got {
+        let ch = mem_load8(b + i)
+        if ch == 46 { seen_dot = 1 }        // '.'
+        else if ch >= 48 && ch <= 57 {
+            if seen_dot == 0 { whole = whole * 10 + (ch - 48) }
+            else if frac < 10 { frac = frac * 10 + (ch - 48) }
+        } else if seen_dot != 0 { i = got }
+        i = i + 1
+    }
+    return whole * 100 + frac
+}
+
+fn load_print() {
+    let l = load1_x100()
+    prints("loadavg1="); print(l / 100); prints("."); print(l - (l / 100) * 100)
+    return 0
+}
+
+fn bench(label, dtype, idx, stat) {
+    let cols = gguf_tensor_dim(idx, 0)
+    if cols <= 0 { prints(label); prints("  SKIP: dim(0)="); print(cols); prints(" idx="); print(idx); newline(); return -1 }
+    let rows = gguf_tensor_nelements(idx) / cols
+    let rb = mm_row_bytes(dtype, cols)
+    let toff = gguf_tensor_offset(idx)
+    if rows < NROWS { prints(label); prints("  SKIP: rows="); print(rows); newline(); return -1 }
+    if rb <= 0 { prints(label); prints("  SKIP: row_bytes="); print(rb); newline(); return -1 }
+    if cols - (cols / 256) * 256 != 0 { prints(label); prints("  SKIP: cols%256!=0\n"); return -1 }
+
+    let x = mem_alloc(cols * 8)
+    let xf32 = mem_alloc(cols * 4)
+    let c = 0
+    while c < cols {
+        let u = i2f(c - (c / 128) * 128)
+        let v = (u - 63.5) * 0.001953125
+        mem_store(x + c * 8, v)
+        mem_store32(xf32 + c * 4, f64_to_f32bits(v))
+        c = c + 1
+    }
+    let argp = mem_alloc(64)
+
+    prints(label)
+    prints("  cols="); print(cols); prints(" rows="); print(NROWS)
+    prints(" dtype="); print(dtype); newline()
+    oracle(dtype, toff, rb, cols, xf32, argp, stat)
+
+    let best0 = 0 - 1
+    let best1 = 0 - 1
+    let best2 = 0 - 1
+    let best3 = 0 - 1
+    let sum0 = 0
+    let sum1 = 0
+    let sum2 = 0
+    let sum3 = 0
+    let cyc = 0
+    while cyc < NCYC {
+        let t0 = sweep(0, dtype, toff, rb, cols, x, xf32, argp)
+        let t1 = sweep(1, dtype, toff, rb, cols, x, xf32, argp)
+        let t2 = sweep(2, dtype, toff, rb, cols, x, xf32, argp)
+        let t3 = sweep(3, dtype, toff, rb, cols, x, xf32, argp)
+        if best0 < 0 || t0 < best0 { best0 = t0 }
+        if best1 < 0 || t1 < best1 { best1 = t1 }
+        if best2 < 0 || t2 < best2 { best2 = t2 }
+        if best3 < 0 || t3 < best3 { best3 = t3 }
+        sum0 = sum0 + t0
+        sum1 = sum1 + t1
+        sum2 = sum2 + t2
+        sum3 = sum3 + t3
+        cyc = cyc + 1
+    }
+    prints("  best_ticks f64="); print(best0)
+    prints(" f64fma="); print(best1)
+    prints(" f32="); print(best2)
+    prints(" f32fma="); print(best3); newline()
+    // TWO estimators: min-of-N rejects warm-up and short bursts but is fooled when
+    // interference lasts a whole arm; sum-over-all-cycle totals cancel correlated
+    // drift. The FMA row's first revision reported only min-of-5 and gave 1.025x
+    // for a tensor min-of-11 later put at 1.178x.
+    if best2 > 0 { prints("  f64_over_f32_min_x1000="); print(best0 * 1000 / best2) }
+    else { prints("  f64_over_f32_min_x1000=NA") }
+    if sum2 > 0 { prints("  f64_over_f32_sum_x1000="); print(sum0 * 1000 / sum2) }
+    else { prints("  f64_over_f32_sum_x1000=NA") }
+    newline()
+    if best3 > 0 { prints("  f64_over_f32fma_min_x1000="); print(best0 * 1000 / best3) }
+    else { prints("  f64_over_f32fma_min_x1000=NA") }
+    if sum3 > 0 { prints("  f64_over_f32fma_sum_x1000="); print(sum0 * 1000 / sum3) }
+    else { prints("  f64_over_f32fma_sum_x1000=NA") }
+    newline()
+    if best1 > 0 { prints("  f32_over_f32fma_min_x1000="); print(best2 * 1000 / best3) }
+    else { prints("  f32_over_f32fma_min_x1000=NA") }
+    if sum1 > 0 { prints("  f32_over_f32fma_sum_x1000="); print(sum2 * 1000 / sum3) }
+    else { prints("  f32_over_f32fma_sum_x1000=NA") }
+    newline()
+    if best3 > 0 { prints("  f64fma_over_f32fma_min_x1000="); print(best1 * 1000 / best3) }
+    else { prints("  f64fma_over_f32fma_min_x1000=NA") }
+    if sum3 > 0 { prints("  f64fma_over_f32fma_sum_x1000="); print(sum1 * 1000 / sum3) }
+    else { prints("  f64fma_over_f32fma_sum_x1000=NA") }
+    newline()
+    return 0
+}
+
+fn main() {
+    prints("=== f32 folded kernels: kernel A/B, and the f32 reference oracle ===\n")
+    prints("load at start: ")
+    load_print()
+    newline()
+    if jit_f_setup_folded_f32() != 0 { prints("FAIL setup f32 q4k\n"); return 30 }
+    if jit_f_setup_folded_f32_fma() != 0 { prints("FAIL setup f32 q4k fma\n"); return 31 }
+    if jit_f_setup_folded_q6k_f32() != 0 { prints("FAIL setup f32 q6k\n"); return 32 }
+    if jit_f_setup_folded_q6k_f32_fma() != 0 { prints("FAIL setup f32 q6k fma\n"); return 33 }
+    if jit_f_setup_folded() != 0 { prints("FAIL setup q4k\n"); return 34 }
+    if jit_f_setup_folded_fma() != 0 { prints("FAIL setup q4k fma\n"); return 35 }
+    if jit_f_setup_folded_q6k() != 0 { prints("FAIL setup q6k\n"); return 36 }
+    if jit_f_setup_folded_q6k_fma() != 0 { prints("FAIL setup q6k fma\n"); return 37 }
+
+    if gguf_load(Q4_PATH) != 0 { prints("FAIL gguf_load\n"); return 1 }
+    if fc_read_config() != 0 { prints("FAIL fc_read_config\n"); return 1 }
+    if bpe_init_from_gguf() == 0 { prints("FAIL bpe_init\n"); return 1 }
+    if fc_kv_init(2048) != 0 { prints("FAIL fc_kv_init\n"); return 1 }
+    if fc_fw_init() != 0 { prints("FAIL fc_fw_init\n"); return 1 }
+    mm_set_workers(0)
+    mm_set_embed_workers(0)
+    if mm_attach_mmap_fd(file_open(Q4_PATH, 0)) != 0 { prints("FAIL mm_attach_mmap\n"); return 1 }
+    if fc_cache_norms() != 0 { prints("FAIL fc_cache_norms\n"); return 1 }
+
+    acc8 = mem_alloc(64)
+    let stat = mem_alloc(32)
+
+    // Single-threaded on purpose: the interleaved kernel A/B must not share the
+    // box with a 20-worker pool. The model-level bar lives in its own row.
+    prints("--- PART 1+2: four arms, same rows, interleaved; and the f32 oracle ---\n")
+    prints("(the RATIOS are the measurement; clock()'s unit is unverified)\n")
+    bench("Q4_K ffn_gate.0 :", 12, lfm2_ffn_gate(0), stat)
+    bench("Q4_K ffn_up.0   :", 12, lfm2_ffn_up(0), stat)
+    bench("Q6_K ffn_down.3 :", 14, lfm2_ffn_down(3), stat)
+    bench("Q6_K attn_v.2   :", 14, lfm2_attn_v(2), stat)
+
+    prints("load at end: ")
+    load_print()
+    newline()
+    prints("DONE\n")
+    return 0
+}

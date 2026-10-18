@@ -33,8 +33,10 @@
 #define CX_RAX    16
 #define CX_R9OUT  24
 #define CX_R10OUT 32
-#define CX_CTX    (1024)
-#define Y(n) ((n) <= 9 ? 64 + (n) * 64 : 64 + ((n) - 2) * 64)
+#define CX_CTX    (1152)
+/* +64 + N*64 for ymm0..ymm9, then the two extra slots the prologue needs */
+#define Y(n) ((n) < 10 ? 64 + (n) * 64 : \
+                 ((n) == 10 ? 960 : ((n) == 11 ? 1024 : 704 + ((n) - 12) * 64)))
 
 static int fails = 0;
 static const char *cur = "";
@@ -211,19 +213,19 @@ int main(void)
     runq("p_perm_m");
     for (k = 0; k < 4; k++) CHK(getYf(9)[k] == 2.0f, "vpermilps xmm,imm=0x55 is not a lane-1 broadcast");
 
-    cur = "p_cvt4"; zeroctx();
-    setYd(7, (int32_t[]){-5, 7, 100, -1000, 11, 12, 13, 14});
-    runq("p_cvt4");
+    cur = "p_cvt12"; zeroctx();
+    setYd(11, (int32_t[]){-5, 7, 100, -1000, 11, 12, 13, 14});
+    runq("p_cvt12");
     { int32_t src[4] = {-5, 7, 100, -1000};
-      for (k = 0; k < 4; k++) CHK(getYf(12)[k] == (float)src[k], "vcvtdq2ps xmm wrong");
+      for (k = 0; k < 4; k++) CHK(getYf(12)[k] == (float)src[k], "vcvtdq2ps xmm12,xmm11 wrong");
       for (k = 4; k < 8; k++) CHK(fb(getYf(12)[k]) == 0, "vcvtdq2ps xmm must zero the upper 128 bits"); }
 
-    cur = "p_mul4"; zeroctx();
+    cur = "p_mul12"; zeroctx();
     setYf(12, (float[]){10, 20, 30, 40});
     setYf(8, (float[]){2, 3, 4, 5});
-    runq("p_mul4");
+    runq("p_mul12");
     { float ex[4] = {20, 60, 120, 200};
-      for (k = 0; k < 4; k++) CHK(getYf(12)[k] == ex[k], "vmulps xmm wrong"); }
+      for (k = 0; k < 4; k++) CHK(getYf(12)[k] == ex[k], "vmulps xmm12,xmm12,xmm8 wrong"); }
 
     cur = "p_dup12"; zeroctx();
     setYf(12, (float[]){10, 20, 30, 40});
@@ -264,8 +266,8 @@ int main(void)
                 CHK(getYf(6)[k] == vals[bc[i].lane], tag);
         }
         struct { const char *nm; int src; int lane; } bd[] = {
-            {"p_bd14_00", 14, 0}, {"p_bd14_55", 14, 1}, {"p_bd14_aa", 14, 2}, {"p_bd14_ff", 14, 3},
-            {"p_bd15_00", 15, 0}, {"p_bd15_55", 15, 1}, {"p_bd15_aa", 15, 2}, {"p_bd15_ff", 15, 3},
+            {"p_bc14_00", 14, 0}, {"p_bc14_55", 14, 1}, {"p_bc14_aa", 14, 2}, {"p_bc14_ff", 14, 3},
+            {"p_bc15_00", 15, 0}, {"p_bc15_55", 15, 1}, {"p_bc15_aa", 15, 2}, {"p_bc15_ff", 15, 3},
         };
         for (i = 0; i < 8; i++) {
             zeroctx();
@@ -299,12 +301,88 @@ int main(void)
           "vfnmadd231ps ymm0,ymm1,m is not -(y1*m)+y0"); }
 
     /* ---------- Q6_K block ---------- */
-    cur = "b_ldql"; zeroctx();
-    memset(membuf, 0, 400);
-    { unsigned char by[8] = {0x01, 0x82, 0x13, 0xF4, 0x05, 0xAA, 0xFF, 0x7F};
-      memcpy(membuf, by, 8); }
-    setR9(membuf); runq("b_ldql");
-    for (k = 0; k < 8; k++) CHK(getYd(6)[k] == (int32_t)membuf[k], "b_ldql (ql) zero-extend wrong");
+    // The disp8 prefix form the kernel actually emits. TWO displacements, so the
+    // check is that the first FIVE bytes are the instruction and only the SIXTH is
+    // the operand: a 5-byte entry with mod=00 (no displacement field) would have
+    // swallowed that byte and shifted the whole kernel -- which is exactly the
+    // defect this pair exists to catch.
+    {
+        unsigned char by[8] = {0x01, 0x82, 0x13, 0xF4, 0x05, 0xAA, 0xFF, 0x7F};
+        int i8, i40;
+        unsigned char *b8 = lookup("b_ldql8", &i8), *b40 = lookup("b_ldql40", &i40);
+        CHK(i8 == 6 && i40 == 6, "b_ldql8/b_ldql40 must be 6-byte disp8 forms");
+        CHK(memcmp(b8, b40, 5) == 0, "the two forms must share a 5-byte prefix");
+        CHK(b8[5] == 8 && b40[5] == 40, "the 6th byte must be the displacement");
+        memset(membuf, 0, 400);
+        memcpy(membuf + 8, by, 8);
+        memcpy(membuf + 40, by, 8);
+        membuf[0] = 0xEE; membuf[16] = 0xEE; membuf[48] = 0xEE;
+        setR9(membuf);
+        runq("b_ldql8");
+        for (k = 0; k < 8; k++) CHK(getYd(6)[k] == (int32_t)by[k],
+                                    "b_ldql8 read the wrong offset");
+        runq("b_ldql40");
+        for (k = 0; k < 8; k++) CHK(getYd(6)[k] == (int32_t)by[k],
+                                    "b_ldql40 read the wrong offset");
+        CHK(getYd(6)[7] == 0x7F, "b_ldql40 read the wrong byte count");
+    }
+
+    // ---- the WHOLE Q4_K factor prologue, run as one block ----------------
+    // This is what makes the prologue's registers, not just its bytes, verified:
+    // a synthetic 144-byte super-block header goes in, and the 32 generated
+    // instructions must produce ymm12..15 = the eight (d*sc / dmin*mn) factors,
+    // each DUPLICATED into both 128-bit halves so one lane-relative vpermilps
+    // broadcasts them.
+    cur = "q4k-prologue"; {
+        static const unsigned char sc[12] = {0x3F, 0x2A, 0x15, 0x01, 0xC0, 0x80,
+                                             0x40, 0x00, 0x05, 0xA3, 0x7E, 0xFF};
+        uint16_t d_h = 0x3C00, mn_h = 0x3800;   /* f16 1.0 / f16 0.5 */
+        float d = 1.0f, dmin = 0.5f, ex12[8], ex13[8], ex14[8], ex15[8];
+        int scn[8], mnn[8];
+        memset(membuf, 0, 400);
+        memcpy(membuf + 0, &d_h, 2);
+        memcpy(membuf + 2, &mn_h, 2);
+        memcpy(membuf + 4, sc, 12);
+        for (k = 0; k < 4; k++) {
+            scn[k] = sc[k] & 63;
+            mnn[k] = sc[4 + k] & 63;
+            scn[4 + k] = (sc[8 + k] & 15) | ((sc[k] >> 6) << 4);
+            mnn[4 + k] = (sc[8 + k] >> 4) | ((sc[4 + k] >> 6) << 4);
+        }
+        for (k = 0; k < 4; k++) {
+            ex12[k] = d * (float)scn[k];   ex12[4 + k] = ex12[k];
+            ex13[k] = d * (float)scn[4 + k]; ex13[4 + k] = ex13[k];
+            ex14[k] = dmin * (float)mnn[k];  ex14[4 + k] = ex14[k];
+            ex15[k] = dmin * (float)mnn[4 + k]; ex15[4 + k] = ex15[k];
+        }
+        zeroctx();
+        setR9(membuf + 16);
+        runn((const char *[]){ "p_movd","p_ph2ps","p_perm_d","p_perm_m",
+            "p_ld_a","p_ld_b","p_ld_c","p_shl_a","p_shr_a","p_cvt12","p_mul12",
+            "p_shl_b","p_shr_b","p_cvt14","p_mul14","p_shr_a6","p_shl_a4",
+            "p_shl_c28","p_shr_c28","p_or1","p_cvt13","p_mul13","p_shr_b6",
+            "p_shl_b4","p_shr_c4","p_or2","p_cvt15","p_mul15",
+            "p_dup12","p_dup13","p_dup14","p_dup15", NULL });
+        for (k = 0; k < 8; k++) {
+            CHK(fb(getYf(12)[k]) == fb(ex12[k]), "ymm12 = d*sc[0..3], duplicated");
+            CHK(fb(getYf(13)[k]) == fb(ex13[k]), "ymm13 = d*sc[4..7], duplicated");
+            CHK(fb(getYf(14)[k]) == fb(ex14[k]), "ymm14 = dmin*mn[0..3], duplicated");
+            CHK(fb(getYf(15)[k]) == fb(ex15[k]), "ymm15 = dmin*mn[4..7], duplicated");
+        }
+        /* and the broadcast that consumes it, on the same register state */
+        runq("p_bc12_00");
+        for (k = 0; k < 8; k++) CHK(fb(getYf(6)[k]) == fb(ex12[0]),
+                                    "prologue -> p_bc12_00 is not d*sc[0] in 8 lanes");
+        zeroctx(); setR9(membuf + 16);
+        runn((const char *[]){ "p_movd","p_ph2ps","p_perm_d","p_perm_m",
+            "p_ld_a","p_ld_b","p_ld_c","p_shl_a","p_shr_a","p_cvt12","p_mul12",
+            "p_shl_b","p_shr_b","p_cvt14","p_mul14","p_shr_a6","p_shl_a4",
+            "p_shl_c28","p_shr_c28","p_or1","p_cvt13","p_mul13","p_shr_b6",
+            "p_shl_b4","p_shr_c4","p_or2","p_cvt15","p_mul15",
+            "p_dup12","p_dup13","p_dup14","p_dup15", "p_bc15_ff", NULL });
+        for (k = 0; k < 8; k++) CHK(fb(getYf(7)[k]) == fb(ex15[3]),
+                                    "prologue -> p_bc15_ff is not dmin*mn[7] in 8 lanes");
+    }
 
     cur = "b_ldqh"; zeroctx();
     memset(membuf, 0, 400);
