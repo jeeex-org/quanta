@@ -2,7 +2,8 @@
 
 **Run:** `bash scripts/bench.sh` — `--md` for a markdown table, `--runs N` for more repetitions.
 Both sides are compiled fresh each run and executed through `scripts/qcrun.sh` (hard memory cap, nice,
-timeout), alternating, best-of-N. Current VERSION: **0.0.244**.
+timeout), alternating, best-of-N. Current VERSION: **0.0.247** (the tables below are
+0.0.237/0.0.238 history; the current baseline is table 4 and table 5).
 
 **Load-independent metrics:** `bash scripts/bench_instr.sh <qc> [--only a,b] [--fn name] [--tsv FILE]`
 compiles every Quanta twin with `--emit-obj` (which carries a symbol table) and every C twin with
@@ -209,6 +210,108 @@ the dead `sar`-then-`idiv` double work) buys 0-12 %, not multiples.
 So `idiv` was **not** the dominant cost. What is left is the per-operation spill/reload traffic that the
 same document measures as `work()` = 254 instructions vs gcc's 9 — the A4 / next-use-eviction lever
 (1104-byte frames, one home slot per vreg). That is where the remaining gap lives.
+
+## Table 4 — load-independent baseline at 0.0.247, and the root cause re-measured
+
+Wall-clock table 5 is load-sensitive; **this is the instrument of record** for codegen work. Measured
+2026-10-18, `scripts/bench_instr.sh ./compiler/0.0.247/bin/x86/qc`, governor `powersave`, load 17.4-18.9
+(`Hermes` at 946 %). Full raw output: `docs/research/suite-instr-0.0.247.txt` / `.tsv`; per-case hot-loop
+instruction census: `docs/research/hotloop-census-0.0.247.txt`; full defect write-up and fix designs:
+`docs/research/arithmetic-codegen-defects-0.0.247.md`.
+
+**All 38 cases compile. No COMPILE_FAIL, no MISMATCH, no TWIN_FOLDED.**
+
+| case | q_loop | c_loop | ratio | q home ops in loop | C twin vectorised? |
+|---|---:|---:|---:|---:|---|
+| regpressure | 310 | 9 | 34.44 | 43.2 % | no — **algebraically collapsed** by gcc |
+| float | 127 | 8 | **15.88** | 57.5 % | no |
+| params8 | 81 | 6 | 13.50 | 53.1 % | no |
+| q4k | 62 | 5 | 12.40 | 46.8 % | yes |
+| match | 148 | 13 | 11.38 | 32.4 % | no |
+| heavy_float / heavy_float2 | 65 | 6 | **10.83** | 52.3 % | no |
+| fnptr_indirect | 76 | 11 | 6.91 | 52.6 % | no |
+| higher_order | 48 | 7 | 6.86 | 54.2 % | no |
+| closure_call | 47 | 7 | 6.71 | 48.9 % | no |
+| closure_capture | 47 | 8 | 5.88 | 48.9 % | no |
+| generic_call | 46 | 8 | 5.75 | 56.5 % | no |
+| heavy_mem | 57 | 10 | 5.70 | 47.4 % | yes |
+| big_array / mem_ops | 59 | 11 | 5.36 | 47.5 % | yes |
+| loop_sum | 38 | 8 | 4.75 | 50.0 % | no |
+| heavy_div / heavy_div2 | 52 | 13 | 4.00 | 48.1 % | yes |
+| recursion | 43 | 11 | 3.91 | 48.8 % | no |
+| heavy_int / heavy_int2 | 65 | 17 | 3.82 | 41.5 % | yes |
+| div_const | 84 | 23 | 3.65 | 51.2 % | **yes** |
+| arith | 98 | 27 | 3.63 | 39.8 % | **yes** |
+| heavy_recursion | 43 | 15 | 2.87 | 48.8 % | yes |
+| q4k_matmul | 55 | 20 | 2.75 | 45.5 % | yes |
+| fileio | 101 | 50 | 2.02 | 53.5 % | yes |
+| fib | 10 | 5 | 2.00 | 0 % | no |
+| mem | 59 | 33 | 1.79 | 47.5 % | yes |
+| file_io | 10 | 8 | 1.25 | 0 % | no |
+| enum, string | — | — | no loop in `main` | — | — |
+| fib_recursive, float_ops, int_ops, nested_calls, struct | 10 | 0 | **not a ratio** | 0 % | no loop on either side |
+
+### Two reading rules, both measured
+
+1. **15 of 38 C twins are auto-vectorised by gcc at `-O2`** (arith, big_array, div_const, fileio,
+   heavy_div, heavy_div2, heavy_int, heavy_int2, heavy_mem, heavy_recursion, mem, mem_ops, q4k,
+   q4k_heavy, q4k_matmul). `arith`'s C loop is 24 of its 27 instructions of `vpaddd`/`vpmuldq`/
+   `vpblendd` on `%ymm` — gcc does **8 `int` lanes per loop pass** where Quanta does one. So `arith`
+   3.63× is (scalar codegen) × (SIMD), not a scalar-codegen ratio. **`float` and `heavy_float` are the
+   honest scalar arithmetic cases** — both sides scalar, and the two worst ones.
+2. **`float_ops`, `int_ops`, `enum`, `struct`, `nested_calls`, `fib_recursive` are loop-free on both
+   sides** (8 C twins contain no `for`/`while`: also `file_io`, `string`). `float_ops`'s C twin is
+   constant-folded (`movabs $0x3fe5555555555555`), so it does no arithmetic while Quanta emits 402
+   instructions of call sequences — yet the row prints a ratio, because guard 1 is skipped for a C
+   source with no `for`/`while`. Not a deleted loop: there was never a loop.
+3. **The twins are not the same width, and that is what licenses the vectorisation.** 21 of the 30
+   looped C twins use `for (int i = …)` against a Quanta `let i = 0` that is **i64** — and `int i` is
+   exactly what lets gcc vectorise 8-wide (`vpmullq`, the 64-bit multiply, is AVX-512-only, so a
+   `long i` twin cannot vectorise the multiply on this CPU at all). All 15 vectorised rows are `int i`
+   rows. Outputs still agree (no overflow at these bounds, e.g. `20000000*7 = 1.4e8 < INT32_MAX`), so
+   no row is miscompiled — but the cost compared is not the same computation and the ratio is flattered
+   toward gcc. **Not changed here**: rewriting 21 C twins moves every ratio in these tables and resets
+   the phase-2 baseline, so it is sequenced as its own commit. Fix = `for (int i` → `for (long i` in
+   21 files; verify with `scripts/bench.sh`. Recommend doing it **before** the phase-2 measurement
+   campaign. Detail: `docs/research/arithmetic-codegen-defects-0.0.247.md` §3c.
+
+### Root cause, re-measured: `adistinct()`, not `sdef()`
+
+The paragraph above ("home stores dominate … `sdef()` stores the home slot on every definition
+(`emitter.quanta:1102`) and `flush_all()` stores every live value again") was measured on the 0.0.233
+compiler and its premise has since been **half-fixed**: 0.0.245 made `sdef()` write back only when the
+vreg is unmapped. The store volume did fall 42 %, yet the hot loops still store 21-101 times each — so
+the remaining writer is a different one, and it is named by disassembly rather than by reading source:
+
+**`emitter.quanta:473-488`, `adistinct(res, a1, a2)` evicts — that is, stores — BOTH operand vregs on
+every binary operation it is called for (30 call sites in `codegen.quanta`).** Because `a1`/`a2` are the
+two operand registers just obtained by `aphys()`, the loop stores both live operands to their home slots
+before the operation uses them; neither the operation nor the result register clobbers them, and nothing
+reads those slots in between. The operands' next use then reloads them. Measured on `benchmark_arith`'s
+`i * 7`: stores to both operand homes at `0x14b` and `0x153`, `imul` at `0x15e`, and the reload of `i`
+at `0x5a1`/`0x144` — exactly one dead store + one redundant load per operand per operation.
+
+Corroborating measurements (all in `docs/research/arithmetic-codegen-defects-0.0.247.md`):
+
+- **30-67 % of hot-loop home stores are provably dead** (cyclic dead-store walk over the emitted
+  listing): arith 15/26, div_const 18/29, heavy_div 10/17, heavy_float 8/21, float 13/43,
+  regpressure 68/101.
+- **Operation identity does not change the loop cost.** Isolated probes of `s + i*7`, `s + i*8`,
+  `s + i*3` and `s + i/8` emit **byte-identical 45-instruction loop bodies** — only the immediate
+  differs. One `add` costs what one `mul` costs what one `sar` costs. **The arithmetic is not slow; the
+  operand marshalling is.**
+- The frame is **per-function** (`codegen.quanta:1369`: `spill_region = 48 + vreg_n*8`, floor 1024) and
+  is 75-83 % unused in every normal arithmetic case (deepest slot touched: 192-328 bytes of a 1120-1136
+  byte frame). The frame is not a runtime cost and `min_spill` is not a performance lever.
+- **`loop_depth` (`codegen.quanta:1433`) is never incremented**, so the `if loop_depth == 0` guard on
+  `ovf_trap_emit()` is always true and every integer add/sub/mul/neg pays `jno +0x2; ud2` — 21 % of
+  `regpressure`'s loop body, 5 instructions of `arith`'s.
+- **The float register allocator is dead code**: `fphys()` (`emitter.quanta:760`) has **zero call
+  sites** anywhere in the compiler, so FP values are allocated from the *integer* pool and round-trip
+  GPR↔`xmm` on every use (`movq %rax,%xmm0` … `addsd` … `movq %xmm0,%rdx`) — 17 such moves in `float`'s
+  loop. Its `fspill_home` writes ~8 KB below `%rbp` while the frame reserves 1120 bytes, so it cannot be
+  enabled before the frame formula is fixed.
+
 
 ## Flagged rows — findings, not suite bugs
 
