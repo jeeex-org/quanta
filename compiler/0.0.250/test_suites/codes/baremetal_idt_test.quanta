@@ -1,0 +1,162 @@
+// baremetal_idt_test -- Phase D5 (0.0.233): the ring-0 milestone.
+//
+// Built with --bare and booted by QEMU -kernel (PVH: QEMU loads the ELF64,
+// enters the 32-bit stub from the Xen PHYS32_ENTRY note, the stub enables long
+// mode and jumps here). This program runs in RING 0 with no OS underneath.
+//
+// It installs an IDT, wires vector 3 (#BP, the int3 instruction) to a handler,
+// executes int3, and the handler prints the milestone string over COM1.
+//
+//   qemu-system-x86_64 -kernel baremetal_idt -display none -serial stdio \
+//       -no-reboot -m 1100 -cpu max
+//
+// Expected serial output:
+//   Quanta ring0: IDT demo
+//   triggering int3
+//   Hello from Quanta            <- printed from INSIDE the interrupt handler
+//   returned from int3
+//
+// Layout (all in free low RAM; the image is at 0x400000, page tables at
+// 0x200000-0x202FFF, the 64-bit stack top is 0x2FF000 growing down):
+//   0x300000  IDT (256 gates x 16 bytes = 4 KiB)
+//   0x301000  SCRATCH: 64-bit slot holding the handler address the trampoline
+//             calls (the trampoline is hand-written machine code; it loads the
+//             address from this fixed slot so no relocation is needed)
+//   0x302000  lidt pseudo-descriptor (2-byte limit + 8-byte base)
+
+const IDT_BASE = 3145728      // 0x300000
+const SCRATCH  = 3149824      // 0x301000
+const PSEUDO   = 3153920      // 0x302000
+
+// uart_putc(c): write one byte to COM1. The first argument arrives in RDI.
+//   48 89 f8         mov rax, rdi     (asm! can only see rax)
+//   ba f8 03 00 00   mov edx, 0x3f8  (COM1)
+//   ee               out dx, al
+//   b8 00 00 00 00   mov eax, 0      (return 0)
+fn uart_putc(c: i64) -> i64 {
+    asm!("48 89 f8 ba f8 03 00 00 ee b8 00 00 00 00")
+}
+
+// uart_puts(s): write every byte of a string. A Quanta string's byte payload
+// starts 8 bytes into the value (the same offset file_write(2, s+8, len(s))
+// uses).
+fn uart_puts(s) -> i64 {
+    let n = len(s)
+    let i = 0
+    while i < n {
+        uart_putc(mem_load8(s + 8 + i))
+        i = i + 1
+    }
+    return 0
+}
+
+// int3_tramp: the naked #BP entry. Saves the caller-saved registers, calls the
+// Quanta handler through the fixed SCRATCH slot, restores everything the
+// interrupted code expects, and iretqs.
+//
+//   50                    push rax
+//   51                    push rcx
+//   52                    push rdx
+//   56                    push rsi
+//   57                    push rdi
+//   41 50                 push r8
+//   41 51                 push r9
+//   41 52                 push r10
+//   41 53                 push r11
+//   48 a1 00 10 30 00 00 00 00 00   mov rax, [0x301000]   (handler address)
+//   ff d0                 call rax
+//   41 5b                 pop r11
+//   41 5a                 pop r10
+//   41 59                 pop r9
+//   41 58                 pop r8
+//   5f                    pop rdi
+//   5e                    pop rsi
+//   5a                    pop rdx
+//   59                    pop rcx
+//   58                    pop rax
+//   48 cf                 iretq
+naked fn int3_tramp() -> i64 {
+    asm!("50 51 52 56 57 41 50 41 51 41 52 41 53 48 a1 00 10 30 00 00 00 00 00 ff d0 41 5b 41 5a 41 59 41 58 5f 5e 5a 59 58 48 cf")
+}
+
+// The actual handler: an ordinary Quanta function, called from the trampoline
+// above. This is what prints the milestone string — proof that Quanta code runs
+// in ring 0 with an installed IDT.
+fn hello_from_handler() -> i64 {
+    uart_puts("Hello from Quanta\n")
+    return 0
+}
+
+fn main() -> i64 {
+    uart_puts("Quanta ring0: IDT demo\n")
+
+    // 1. Zero the IDT (256 gates).
+    let zi = 0
+    while zi < 4096 {
+        unsafe { mem_store8(IDT_BASE + zi, 0) }
+        zi = zi + 1
+    }
+
+    // 2. Gate 3: present, DPL 0, 64-bit interrupt gate (type_attr 0x8E).
+    //    The handler address is split across the 16/16/32-bit offset fields —
+    //    which is exactly what a packed struct would give us; written here as
+    //    explicit byte stores because the gate lives at a fixed address.
+    let h = fnptr(int3_tramp)
+    let g = IDT_BASE + 3 * 16
+    unsafe { mem_store8(g + 0, h % 256) }              // off_lo
+    unsafe { mem_store8(g + 1, (h / 256) % 256) }
+    unsafe { mem_store8(g + 2, 8) }                    // selector = 0x0008 (the
+    unsafe { mem_store8(g + 3, 0) }                    // stub's 64-bit code seg)
+    unsafe { mem_store8(g + 4, 0) }                    // ist = 0
+    unsafe { mem_store8(g + 5, 142) }                  // type_attr = 0x8E
+    unsafe { mem_store8(g + 6, (h / 65536) % 256) }    // off_mid
+    unsafe { mem_store8(g + 7, (h / 16777216) % 256) }
+    unsafe { mem_store8(g + 8, (h / 4294967296) % 256) }   // off_hi
+    unsafe { mem_store8(g + 9, 0) }
+    unsafe { mem_store8(g + 10, 0) }
+    unsafe { mem_store8(g + 11, 0) }
+    unsafe { mem_store8(g + 12, 0) }                   // reserved
+    unsafe { mem_store8(g + 13, 0) }
+    unsafe { mem_store8(g + 14, 0) }
+    unsafe { mem_store8(g + 15, 0) }
+
+    // 3. Publish the Quanta handler's address for the trampoline.
+    let hh = fnptr(hello_from_handler)
+    unsafe { mem_store8(SCRATCH + 0, hh % 256) }
+    unsafe { mem_store8(SCRATCH + 1, (hh / 256) % 256) }
+    unsafe { mem_store8(SCRATCH + 2, (hh / 65536) % 256) }
+    unsafe { mem_store8(SCRATCH + 3, (hh / 16777216) % 256) }
+    unsafe { mem_store8(SCRATCH + 4, (hh / 4294967296) % 256) }
+    unsafe { mem_store8(SCRATCH + 5, 0) }
+    unsafe { mem_store8(SCRATCH + 6, 0) }
+    unsafe { mem_store8(SCRATCH + 7, 0) }
+
+    // 4. lidt pseudo-descriptor: limit = 4095, base = IDT_BASE.
+    unsafe { mem_store8(PSEUDO + 0, 255) }     // limit low  (0x0FFF)
+    unsafe { mem_store8(PSEUDO + 1, 15) }
+    unsafe { mem_store8(PSEUDO + 2, 0) }       // base = 0x0000000000300000
+    unsafe { mem_store8(PSEUDO + 3, 0) }
+    unsafe { mem_store8(PSEUDO + 4, 48) }
+    unsafe { mem_store8(PSEUDO + 5, 0) }
+    unsafe { mem_store8(PSEUDO + 6, 0) }
+    unsafe { mem_store8(PSEUDO + 7, 0) }
+    unsafe { mem_store8(PSEUDO + 8, 0) }
+    unsafe { mem_store8(PSEUDO + 9, 0) }
+    // lidt [0x302000] = 0F 01 /3 m16&64 with an absolute disp32
+    asm!("0f 01 1c 25 00 20 30 00")
+
+    // 5. Fire int3. The CPU pushes an interrupt frame, our trampoline runs, the
+    //    Quanta handler prints, iretq returns here.
+    uart_puts("triggering int3\n")
+    asm!("cc")
+
+    // 6. Reaching this line proves iretq restored the interrupted context.
+    uart_puts("returned from int3\n")
+
+    // 7. End the run deterministically: write 0 to QEMU's isa-debug-exit port so
+    //    QEMU exits (status 1) rather than hlt-looping until the harness times
+    //    out. b0 00 = mov al,0 ; ba 01 05 00 00 = mov edx,0x501 (BA takes a
+    //    4-byte immediate in 64-bit mode); ee = out dx,al.
+    asm!("b0 00 ba 01 05 00 00 ee")
+    return 0
+}

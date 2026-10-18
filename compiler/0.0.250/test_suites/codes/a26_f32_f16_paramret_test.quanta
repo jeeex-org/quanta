@@ -1,0 +1,72 @@
+// A26 (docs/plans/bugs.md): f16/f32 PARAMETER and RETURN annotations.
+//
+// RED FIRST. On 0.0.247 this row exits 4: `fn id32(x: f32)` compiled with rc=0
+// and then handed back the caller's FULL f64 -- the declared type was dropped
+// with no diagnostic, exactly the same failure class as A23 (a keyword-named
+// parameter dropped). fn_parft/fn_retft existed as 2 MB tables that nothing
+// wrote and nothing read. On 0.0.248 every check below passes.
+//
+// THE ORACLE IS THE LANGUAGE'S OWN STORAGE. `w[0] = 1.0000001` into an `f32[2]`
+// buffer stores the correctly rounded binary32 value, and `h[0]` likewise for
+// f16, so the expected bit pattern is produced by the compiler rather than by a
+// hand-computed constant. `f64bits` compares bit patterns, never floats, so a
+// value that is merely "close" cannot pass.
+//
+// The control is `fn id64(x: f64) -> f64`, which must NOT change the value: if
+// the control ever fails, the harness is wrong, not the compiler.
+fn id32(x: f32) -> f64 { return x }
+fn id64(x: f64) -> f64 { return x }
+fn ret32() -> f32 { return 1.0000001 }
+fn id16(x: f16) -> f64 { return x }
+fn ret16() -> f16 { return 1.0000001 }
+
+// The promotion rule in both directions, from the same declared signatures:
+// an f32 value passed to an f64 parameter widens EXACTLY (no rounding), and an
+// f64 literal passed to an f32 parameter narrows with one RNE rounding.
+fn take64(v: f64) -> i64 { return f64bits(v) }
+fn take32(v: f32) -> i64 { return f64bits(v) }
+fn take16(v: f16) -> i64 { return f64bits(v) }
+
+// Chained use of a declared return type: the caller must keep the f32 identity,
+// so this computes in binary32 (one rounding at each step) rather than f64.
+fn half32(v: f32) -> f32 { return v * 0.5 }
+
+fn main() -> i64 {
+    let w: f32[2] = mem_alloc(2)
+    let h: f16[2] = mem_alloc(2)
+    w[0] = 1.0000001
+    h[0] = 1.0000001
+
+    // ---- control: an f64 parameter changes nothing ----
+    if id64(1.0000001) != 1.0000001 { exit(3) }
+    if f64bits(id64(1.0000001)) != f64bits(1.0000001) { exit(3) }
+
+    // ---- parameter annotations ----
+    if f64bits(id32(1.0000001)) != f64bits(w[0]) { exit(4) }   // f32 param narrowed
+    if f64bits(id16(1.0000001)) != f64bits(h[0]) { exit(6) }   // f16 param narrowed
+
+    // ---- return annotations ----
+    if f64bits(ret32()) != f64bits(w[0]) { exit(5) }           // f32 return narrowed
+    if f64bits(ret16()) != f64bits(h[0]) { exit(7) }           // f16 return narrowed
+
+    // ---- the declared type survives the boundary in BOTH directions ----
+    // f32 -> f64 parameter: exact widening, so the pattern is unchanged.
+    if take64(w[0]) != f64bits(w[0]) { exit(11) }
+    // f64 -> f32 parameter: the same single rounding the buffer store performs.
+    if take32(1.0000001) != f64bits(w[0]) { exit(12) }
+    // f16 -> f64: exact.
+    if take64(h[0]) != f64bits(h[0]) { exit(13) }
+    // f16 -> f32: exact (an f16 value is representable in binary32).
+    if take32(h[0]) != f64bits(h[0]) { exit(14) }
+    // f64 literal -> f16 parameter: one rounding, the same as the f16 store.
+    if take16(1.0000001) != f64bits(h[0]) { exit(15) }
+
+    // ---- a declared f32 return keeps f32 arithmetic in the caller ----
+    // half32(w[0]) is 0.5 * f32(1.0000001), computed in binary32 and returned as
+    // f32. Compare against the same computation done in f32 storage: a buffer
+    // element is fetched as f32 and the multiply is routed to the f32 builtin.
+    let w2: f32[2] = mem_alloc(2)
+    w2[0] = w[0] * 0.5
+    if f64bits(half32(w[0])) != f64bits(w2[0]) { exit(16) }
+    return 0
+}

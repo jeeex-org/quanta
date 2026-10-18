@@ -410,6 +410,57 @@ else
 fi
 rm -f "$MARS_OBJ" "$MARS_DIS"
 
+# --- Stage 1.6f: F2 DEAD-STORE GUARD (0.0.250) --------------------------------
+# The 0.0.250 lever is dead-store elimination at the BLOCK-BOUNDARY flush_all():
+# a store to a vreg's home slot that no later code reads is skipped. It has no
+# functional symptom, so -- like marshal-guard -- the row is a byte scan of the
+# emitted object, using the SAME metric definition as scripts/bench_instr.sh.
+#
+# The kernel (test_suites/codes/arith_deadstore_probe.quanta) is a loop whose whole
+# body is dead temporaries: `d` is the only value the body produces that is read
+# again, and a/b/c are consumed by the next line. 0.0.249's flush_all() stores
+# every mapped vreg on the way out of the block anyway.
+#
+# MEASURED (loop / loop home-stores / loop home-loads, --emit-obj + objdump):
+#   0.0.249 golden (pre-F2)  66 / 21 / 4   -> FAILS every threshold
+#   0.0.250 golden (F2)      52 /  7 / 4   -> PASSES
+# Thresholds 60 / 12 / 6 sit strictly between the two on all three counts, so
+# re-instating the unconditional flush turns this gate RED for the reason the
+# stage exists. Counts are emitted bytes: exact, load-independent, no tolerance.
+F2D_MAX_LOOP=60
+F2D_MAX_LST=12
+F2D_MAX_LLD=6
+F2D_RC=0
+F2D_SRC="$TEST_SUITES/codes/arith_deadstore_probe.quanta"
+F2D_OBJ="/tmp/f2d_probe.o"
+F2D_DIS="/tmp/f2d_probe.dis"
+if [ ! -f "$F2D_SRC" ]; then
+  echo "  FAIL deadstore-guard: $F2D_SRC missing (the F2 red-first row)"
+  F2D_RC=1
+elif ! "$QC" --emit-obj "$F2D_SRC" "$F2D_OBJ" >/dev/null 2>&1; then
+  echo "  FAIL deadstore-guard: probe failed to compile with --emit-obj"
+  F2D_RC=1
+else
+  objdump -d --no-show-raw-insn "$F2D_OBJ" > "$F2D_DIS" 2>/dev/null
+  read -r f2d_loop f2d_lst f2d_lld <<<"$(awk -v want=main "$MARS_AWK" "$F2D_DIS")"
+  if [ "${f2d_loop:-0}" -le 0 ]; then
+    echo "  FAIL deadstore-guard: no hot loop found in the probe (loop=$f2d_loop) -- the kernel must not fold"
+    F2D_RC=1
+  elif [ "${f2d_lst:-0}" -gt "$F2D_MAX_LST" ]; then
+    echo "  FAIL deadstore-guard: $f2d_lst home stores in the loop body > $F2D_MAX_LST (the block-boundary flush is storing dead temporaries again; see 0.0.250 F2)"
+    F2D_RC=1
+  elif [ "${f2d_lld:-0}" -gt "$F2D_MAX_LLD" ]; then
+    echo "  FAIL deadstore-guard: $f2d_lld home loads in the loop body > $F2D_MAX_LLD"
+    F2D_RC=1
+  elif [ "${f2d_loop:-0}" -gt "$F2D_MAX_LOOP" ]; then
+    echo "  FAIL deadstore-guard: loop body $f2d_loop > $F2D_MAX_LOOP instructions"
+    F2D_RC=1
+  else
+    echo "  PASS deadstore-guard: loop=$f2d_loop (<=$F2D_MAX_LOOP) home-stores=$f2d_lst (<=$F2D_MAX_LST) home-loads=$f2d_lld (<=$F2D_MAX_LLD)"
+  fi
+fi
+rm -f "$F2D_OBJ" "$F2D_DIS"
+
 # --- Stage 1.5: EXTERN "C" FFI (object mode + gcc link) ----------------------
 # The main loop above compiles in EXEC mode only ($QC -O), where extern "C"
 # cannot resolve libc. This stage actually links a real libc FFI test so the
@@ -990,7 +1041,8 @@ echo "  asm-assembler : $([ $ASM_RC = 0 ] && echo GREEN || echo RED)  (mnemonic 
 echo "  bare-metal    : $([ $BM_RC = 0 ] && echo GREEN || echo RED)  (ring-0 under QEMU: PVH boot, UART + IDT/int3 handler, 0.0.233 Phase D)
   float-print   : $([ $FPR_RC = 0 ] && echo GREEN || echo RED)  (0.0.235 A2: print/exit on an f64 is a compile error; print_f/f64bits are the routes)
   f16c-indep    : $([ $F16C_RC = 0 ] && echo GREEN || echo RED)  (0.0.248: no F16C opcode in an f16 program -- the emitted binary is not tied to one microarchitecture)
-  marshal-guard : $([ $MARS_RC = 0 ] && echo GREEN || echo RED)  (0.0.249 F1: no operand-eviction home stores in a hot loop -- the emitted loop SHAPE, from the object bytes)"
+  marshal-guard : $([ $MARS_RC = 0 ] && echo GREEN || echo RED)  (0.0.249 F1: no operand-eviction home stores in a hot loop -- the emitted loop SHAPE, from the object bytes)
+  deadstore-guard: $([ "${F2D_RC:-1}" = 0 ] && echo GREEN || echo RED)  (0.0.250 F2: the block-boundary flush stops storing dead temporaries -- the emitted loop SHAPE, from the object bytes)"
 # Block promotion on a real functional/security/perf/valgrind/fuzz/diff/stdlib/mtu/qobj/verify-status
 # regression. Security KNOWN issues are surfaced by the script but do not turn
 # the gate red.
@@ -1016,7 +1068,7 @@ if [ $FUNCTIONAL_RC -ne 0 ] || [ $NATIVE_RC -ne 0 ] || [ $SECURITY_RC -ne 0 ] ||
    || [ $VALGRIND_RC -ne 0 ] || [ $FUZZ_RC -ne 0 ] || [ $DIFF_RC -ne 0 ] \
    || [ $GENERICS_RC -ne 0 ] || [ $STDLIB_RC -ne 0 ] || [ $MTU_RC -ne 0 ] \
    || [ $QOBJ_RC -ne 0 ] || [ $VERIFY_STATUS_RC -ne 0 ] || [ $OUTGUARD_RC -ne 0 ] || [ $NAKED_RC -ne 0 ] || [ $ASM_RC -ne 0 ] || [ $BM_RC -ne 0 ] \
-   || [ $GGUF_RC -ne 0 ] || [ $FPR_RC -ne 0 ] || [ $F16C_RC -ne 0 ] || [ $MARS_RC -ne 0 ]; then
+   || [ $GGUF_RC -ne 0 ] || [ $FPR_RC -ne 0 ] || [ $F16C_RC -ne 0 ] || [ $MARS_RC -ne 0 ] || [ "${F2D_RC:-1}" -ne 0 ]; then
   exit 1
 fi
 exit 0

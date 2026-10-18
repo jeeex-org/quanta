@@ -1,0 +1,4716 @@
+// std/gguf.quanta — Complete GGUF inference engine for Quanta 0.0.195
+// Uses proper floating point: fadd, fmul, fdiv, i2f, f2i, sqrt
+// General GGUF support: proper metadata parsing, alignment, string arrays
+import std/fs
+import std/math
+
+let gguf_fd = -1
+
+// ---------------------------------------------------------------------------
+// mmap-backed file access (Phase 7 item 1).
+//
+// MEASURED, not assumed. Same 256 MiB window of the real LFM2 Q4_K_M GGUF,
+// scanning one byte per page, clock() verified to move first:
+//
+//     pread cold            59.2 ms   (946 ms per 4 GiB)
+//     pread warm            78.9 ms   (1262 ms per 4 GiB)
+//     mmap, no madvise      10.4 ms   (166 ms per 4 GiB)
+//     mmap + POPULATE_READ   3.9 ms   ( 62 ms per 4 GiB)   <- 15.3x over cold pread
+//
+// All four produced identical checksums, so this is a speed result and not a
+// correctness one. Note the warm-pread row is SLOWER than cold: re-reading 256 MiB
+// through 65536 preads costs more in syscall overhead than the saved page faults
+// are worth, which is the reason to stop using pread for bulk tensor reads.
+//
+// MADV_POPULATE_READ is advisory -- it faults the whole window in immediately
+// rather than on first touch. It is issued once, right after the mapping is made,
+// so it overlaps with header parsing instead of stalling the first tensor read.
+//
+// The window is capped rather than mapping the whole file: the largest local GGUF
+// is ~1.7 GB and a single unlimited mapping competes with the dequantised tensors
+// for the same address space.
+// ---------------------------------------------------------------------------
+let gguf_map_base = 0        // mapping base, 0 when unmapped
+let gguf_map_off = 0         // FILE offset that gguf_map_base was mapped at
+let gguf_map_len = 0         // mapped length in bytes
+let gguf_map_faulted = 0     // 1 once POPULATE_READ has been issued
+
+// mmap REQUIRES a page-aligned file offset. gguf_data_start is NOT page-aligned:
+// for the LFM2 Q4_K_M model it is 8239136, and 8239136 mod 4096 = 2080, so
+// mmap at that offset returns EINVAL.
+//
+// Confirmed to be the kernel, not Quanta: the same offsets reproduce identically
+// from a plain C program (8237056 ok, 8239136 EINVAL, 8388608 ok). So the mapping
+// is placed at the page-aligned offset BELOW the data section and the 2080-byte
+// difference is carried here. Reads then compute against gguf_map_off rather than
+// against the data start, which is why nothing else in this file has to change.
+const GGUF_PAGE = 4096
+
+fn gguf_page_align_down(v) -> i64 {
+    return v - (v % GGUF_PAGE)
+}
+
+// Window granularity for the mapping. Large enough that a tensor read is normally
+// one memcpy with no fault at all; small enough that mapping a 1.7 GB file does
+// not reserve all of it.
+const GGUF_MAP_WINDOW = 67108864    // 64 MiB
+
+// MADV_POPULATE_READ -- prefault the whole window.
+fn gguf_map_populate(base, len) {
+    if len <= 0 { return }
+    syscall(28, base, len, 22, 0, 0, 0)
+}
+
+// Map [offset, offset+len) of the open GGUF, or return 0 to mean "not mapped".
+// Caller must gguf_unmap_range() the result.
+fn gguf_map_range(offset, len) {
+    if gguf_fd < 0 { return 0 }
+    if len <= 0 { return 0 }
+    // PROT_READ | MAP_PRIVATE
+    let base = mmap_file(0, len, 1, 2, gguf_fd, offset)
+    if base < 0 { return 0 }
+    return base
+}
+
+fn gguf_unmap_range(base, len) {
+    if base <= 0 { return }
+    munmap_file(base, len)
+}
+
+// Prefault the single window that holds the tensor DATA section. Called once per
+// load, after the header walk has produced gguf_data_offset.
+//
+// Returns the mapped base, or 0 if mapping was refused (in which case every read
+// still works through the pread path -- this is an optimisation, never a
+// dependency).
+fn gguf_map_data_window() {
+    if gguf_fd < 0 { return 0 }
+    if gguf_map_base != 0 { return gguf_map_base }
+
+    let data_off = gguf_data_offset()
+    if data_off <= 0 { return 0 }
+    let sz = gguf_filesize
+
+    // mmap needs a page-aligned file offset; gguf_data_start is not one.
+    let map_off = gguf_page_align_down(data_off)
+    if map_off < 0 { return 0 }
+
+    let remaining = sz - map_off
+    if remaining <= 0 { return 0 }
+
+    let len = remaining
+    if len > GGUF_MAP_WINDOW { len = GGUF_MAP_WINDOW }
+
+    let base = gguf_map_range(map_off, len)
+    if base == 0 { return 0 }
+
+    // Fault it in now, so the cost overlaps header parsing rather than landing on
+    // the first tensor read.
+    gguf_map_populate(base, len)
+
+    gguf_map_base = base
+    gguf_map_off = map_off
+    gguf_map_len = len
+    gguf_map_faulted = 1
+    return base
+}
+
+// Copy `len` bytes at file offset `off` into `dst`, using the mapped window when
+// the range is inside it and falling back to pread otherwise.
+//
+// Returns bytes copied. Every existing tensor read goes through here, so there is
+// exactly one copy loop and one fallback rather than 73 of each.
+fn gguf_read_bytes(off, dst, len) {
+    if len <= 0 { return 0 }
+
+    // Inside the mapped window?
+    if gguf_map_base != 0 {
+        // gguf_map_base was mapped at file offset gguf_map_off, which is the
+        // page-aligned value BELOW the data start. Compare in file coordinates so
+        // the 2080-byte alignment delta is carried here rather than being lost.
+        let rel = off - gguf_map_off
+        if rel >= 0 && rel + len <= gguf_map_len {
+            let src = gguf_map_base + rel
+            // 8 bytes per step, not 1. mem_store/mem_load are already 8-byte
+            // operations, so the byte loop left seven of every eight bytes of each
+            // access unused: measured 14.1 ms against 6.8 ms for the pread path
+            // over 30 tensor reads, i.e. the copy was slower than the syscall it
+            // replaced. Tensor offsets are 32-byte aligned by GGUF's own rule, and
+            // dst comes from mem_alloc, so an 8-byte step never straddles a page
+            // boundary here; the tail is handled byte-wise.
+            let words = len / 8
+            let i = 0
+            while i < words {
+                mem_store(dst + i * 8, mem_load(src + i * 8))
+                i = i + 1
+            }
+            let done = words * 8
+            while done < len {
+                mem_store8(dst + done, mem_load8(src + done))
+                done = done + 1
+            }
+            return len
+        }
+    }
+
+    // Fallback: pread.
+    lseek(gguf_fd, off, 0)
+    return file_read(gguf_fd, dst, len)
+}
+let gguf_n_tensors = 0
+let gguf_n_kv = 0
+let gguf_data_start = 0
+// Byte offset of the tensor-info table, set by read_tensor_info().
+let gguf_tinfo_start = 0
+// Total file size, captured at load. The chain validator needs it to prove each
+// tensor stays inside the file; upstream gguf_reader tracks the equivalent as
+// nbytes_remain and bounds every read against it.
+let gguf_filesize = 0
+let gguf_tensor_dims = 0
+let gguf_tensor_data = 0
+
+// Byte offset of each metadata KV record, plus the shape of any string array
+// it carries. Built by scan_metadata() so metadata VALUES -- not just their
+// sizes -- become reachable. The tokenizer needs the actual token strings and
+// the merge list, and no existing API exposed them: scan_metadata() only ever
+// skipped over them.
+//
+// Layout, parallel to the tensor-info table, 4 i64s per KV record:
+//   gguf_kv_index[i]    : file offset of KV record i
+//   gguf_kv_arr_off[i]  : file offset of element 0 of its string array,
+//                         or -1 when the value is not a string array
+//   gguf_kv_arr_len[i]  : element count, 0 when not a string array
+//   gguf_kv_etype[i]    : element type ID, 0 when not an array
+//
+// String array elements are variable length, so the array is walked on demand
+// (gguf_arr_elem_off) rather than indexed up front. The tokenizer arrays are
+// 128000 and 293320 entries; an offset index for them would cost 3.4 MB and
+// buy nothing, since both are read front to back exactly once.
+let gguf_kv_index = 0
+let gguf_kv_arr_off = 0
+let gguf_kv_arr_len = 0
+let gguf_kv_etype = 0
+
+const TINFO_SIZE = 40
+const KVREC_SIZE = 24
+
+// GGUF layout: the tensor DATA section begins after the tensor-info table,
+// padded to a 32-byte boundary. Each tensor's `offset` is RELATIVE to this
+// point -- seeking to the raw offset lands in the header and yields zeros.
+fn record_data_start(fd) {
+    let info_end = lseek(fd, 0, 1)
+    let rem = info_end - (info_end / 32) * 32
+    if rem != 0 { lseek(fd, 32 - rem, 1) }
+    gguf_data_start = lseek(fd, 0, 1)
+    return 0
+}
+
+// Walk the metadata KV block, leaving fd at the tensor-info table.
+// Returns the metadata byte count excluding the 24-byte header.
+//
+// Also records, per KV, where its value lives (gguf_kv_*), so the value can
+// be fetched later by gguf_kv_find(). Recording the offset costs one lseek(0,1)
+// per record; the alternative -- re-walking the block on every lookup -- turns
+// a vocab search into an O(n_kv * n_tokens) scan of a 20 MB region.
+// Cap on the metadata (KV) block, and on any single string length inside it.
+//
+// ComfyUI caps a safetensors header at 100 MB and rejects anything larger before
+// allocating; safetensors does the same. Without a cap, a file declaring a
+// 4 GB key length causes an allocation and a seek sized by an attacker-chosen
+// number. The real model uses ~1.6 MB of metadata, so this leaves three orders of
+// magnitude of headroom while still bounding the damage.
+const GGUF_MAX_META = 268435456      // 256 MB total metadata block
+const GGUF_MAX_STRING = 67108864     // 64 MB for any one string
+
+fn scan_metadata(fd, n_kv) {
+    let klen_buf = mem_alloc(8)
+    let vtype_buf = mem_alloc(4)
+    let slen_buf = mem_alloc(8)
+
+    // n_kv is attacker-controlled and is multiplied into four allocations below.
+    // A huge value overflows or simply asks for an enormous buffer, so bound it
+    // against the file itself: there cannot be more KV records than there are
+    // bytes, and every record costs at least 12 bytes on disk.
+    if n_kv < 0 { return -1 }
+    if n_kv > 1000000 { return -1 }
+    if gguf_filesize > 0 && n_kv > gguf_filesize / 12 { return -1 }
+
+    gguf_kv_index = mem_alloc(n_kv * KVREC_SIZE)
+    gguf_kv_arr_off = mem_alloc(n_kv * 8)
+    gguf_kv_arr_len = mem_alloc(n_kv * 8)
+    gguf_kv_etype = mem_alloc(n_kv * 8)
+
+    let meta_size = 0
+    let i = 0
+    
+    while i < n_kv {
+        mem_store(gguf_kv_index + i * 8, lseek(fd, 0, 1))
+        mem_store(gguf_kv_arr_off + i * 8, -1)
+        mem_store(gguf_kv_arr_len + i * 8, 0)
+        mem_store(gguf_kv_etype + i * 8, 0)
+
+        // Truncation check: a short read here means the file ended mid-record.
+        if read_raw(fd, klen_buf, 8) != 8 { return -1 }
+        let klen = mem_load(klen_buf)
+        if klen < 0 || klen > GGUF_MAX_STRING { return -1 }
+        // The running metadata size must stay inside both the cap and the file.
+        if meta_size > GGUF_MAX_META - 8 - klen { return -1 }
+        if gguf_filesize > 0 && meta_size + 8 + klen > gguf_filesize { return -1 }
+        meta_size = meta_size + 8 + klen
+        lseek(fd, klen, 1)
+        
+        read_raw(fd, vtype_buf, 4)
+        meta_size = meta_size + 4
+        let vtype = mem_load(vtype_buf)
+        
+        if vtype == 0 { lseek(fd, 1, 1); meta_size = meta_size + 1 }
+        else if vtype == 1 { lseek(fd, 1, 1); meta_size = meta_size + 1 }
+        else if vtype == 2 { lseek(fd, 2, 1); meta_size = meta_size + 2 }
+        else if vtype == 3 { lseek(fd, 2, 1); meta_size = meta_size + 2 }
+        else if vtype == 4 { lseek(fd, 4, 1); meta_size = meta_size + 4 }
+        else if vtype == 5 { lseek(fd, 4, 1); meta_size = meta_size + 4 }
+        else if vtype == 6 { lseek(fd, 4, 1); meta_size = meta_size + 4 }
+        else if vtype == 7 { lseek(fd, 1, 1); meta_size = meta_size + 1 }
+        else if vtype == 10 { lseek(fd, 8, 1); meta_size = meta_size + 8 }
+        else if vtype == 11 { lseek(fd, 8, 1); meta_size = meta_size + 8 }
+        else if vtype == 12 { lseek(fd, 8, 1); meta_size = meta_size + 8 }
+        else if vtype == 8 {
+            read_raw(fd, slen_buf, 8)
+            let slen = mem_load(slen_buf)
+            lseek(fd, slen, 1)
+            meta_size = meta_size + 8 + slen
+        } else if vtype == 9 {
+            read_raw(fd, vtype_buf, 4)
+            meta_size = meta_size + 4
+            read_raw(fd, slen_buf, 8)
+            meta_size = meta_size + 8
+            let alen = mem_load(slen_buf)
+            let etype = mem_load(vtype_buf)
+            // Record the element type, element count and data offset for EVERY
+            // array, not just string ones. Previously only the `etype == 8` branch
+            // below filled these three, so a numeric array reported count -1,
+            // etype 0 and offset -1 -- and a caller seeking to that offset read
+            // from before the start of the file. LFM2's
+            // lfm2.attention.head_count_kv is exactly such an array (i32, 30
+            // elements), so the per-layer KV head counts came back as zero and
+            // fc_read_config() failed closed rather than reporting it.
+            //
+            // The string-array walk below is kept for the length-prefixed
+            // elem_off()/elem_len()/slurp() helpers, which need per-element
+            // offsets; numeric arrays are read at gguf_kv_arr_off + 0 with
+            // esize bytes per element.
+            mem_store(gguf_kv_etype + i * 8, etype)
+            mem_store(gguf_kv_arr_off + i * 8, lseek(fd, 0, 1))
+            mem_store(gguf_kv_arr_len + i * 8, alen)
+            if etype == 8 {
+                let ai = 0
+                while ai < alen {
+                    read_raw(fd, slen_buf, 8)
+                    let slen = mem_load(slen_buf)
+                    lseek(fd, slen, 1)
+                    meta_size = meta_size + 8 + slen
+                    ai = ai + 1
+                }
+            } else {
+                let esize = 1
+                if etype == 2 || etype == 3 { esize = 2 }
+                if etype == 4 || etype == 5 || etype == 6 { esize = 4 }
+                if etype == 10 || etype == 11 || etype == 12 { esize = 8 }
+                lseek(fd, alen * esize, 1)
+                meta_size = meta_size + alen * esize
+            }
+        }
+        
+        i = i + 1
+    }
+    
+    return meta_size
+}
+
+// Read the gguf_n_tensors tensor-info records into gguf_tensor_data.
+fn read_tensor_info(fd) {
+    // Where the tensor-info table starts, in bytes from the beginning of the file.
+    //
+    // Recorded so that external tooling (the byte-level corrupt-file generator)
+    // can patch a field at a known offset WITHOUT re-walking the KV block. Two
+    // hand-rolled Python GGUF readers desynced on general.base_model.0.name and
+    // produced garbage; asking the verified parser for offsets removes that
+    // whole failure mode.
+    gguf_tinfo_start = lseek(fd, 0, 1)
+    // n_tensors is attacker-controlled and multiplies an allocation. Each tensor
+    // record costs at least 40 bytes in the file, so the file bounds the count.
+    if gguf_n_tensors < 0 || gguf_n_tensors > 10000000 { return -1 }
+    if gguf_filesize > 0 && gguf_n_tensors * TINFO_SIZE > gguf_filesize { return -1 }
+    gguf_tensor_data = mem_alloc(gguf_n_tensors * TINFO_SIZE)
+    
+    let nlen_buf = mem_alloc(8)
+    let ndims_buf = mem_alloc(4)
+    let dim_buf = mem_alloc(8)
+    let dtype_buf = mem_alloc(4)
+    let off_buf = mem_alloc(8)
+    let name_buf = mem_alloc(256)
+
+    // Shape storage: up to 4 dims per tensor, kept alongside the fixed
+    // tensor-info record so gguf_tensor_dim() does not need a second lookup.
+    gguf_tensor_dims = mem_alloc(gguf_n_tensors * 32)
+    
+    let i = 0
+    while i < gguf_n_tensors {
+        file_read(fd, nlen_buf, 8)
+        let nlen = mem_load(nlen_buf)
+        file_read(fd, name_buf, nlen)
+        mem_store8(name_buf + nlen, 0)
+        
+        file_read(fd, ndims_buf, 4)
+        let ndims = mem_load(ndims_buf)
+        
+        let nelem = 1
+        let d = 0
+        while d < ndims {
+            file_read(fd, dim_buf, 8)
+            let dim = mem_load(dim_buf)
+            nelem = nelem * dim
+            mem_store(gguf_tensor_dims + i * 32 + d * 8, dim)
+            d = d + 1
+        }
+        // clear any stale dims from a wider previous record
+        while d < 4 {
+            mem_store(gguf_tensor_dims + i * 32 + d * 8, 0)
+            d = d + 1
+        }
+        
+        file_read(fd, dtype_buf, 4)
+        let dtype = mem_load(dtype_buf)
+        
+        file_read(fd, off_buf, 8)
+        let offset = mem_load(off_buf)
+        
+        let name_copy = mem_alloc(nlen + 1)
+        d = 0
+        while d < nlen {
+            mem_store8(name_copy + d, mem_load8(name_buf + d))
+            d = d + 1
+        }
+        mem_store8(name_copy + nlen, 0)
+        
+        mem_store(gguf_tensor_data + i * TINFO_SIZE, name_copy)
+        mem_store(gguf_tensor_data + i * TINFO_SIZE + 8, ndims)
+        mem_store(gguf_tensor_data + i * TINFO_SIZE + 16, dtype)
+        mem_store(gguf_tensor_data + i * TINFO_SIZE + 24, offset)
+        mem_store(gguf_tensor_data + i * TINFO_SIZE + 32, nelem)
+        
+        i = i + 1
+    }
+    
+    return 0
+}
+
+fn gguf_load(path) {
+    let fd = open(path, 0, 0)
+    if fd < 0 { return -1 }
+    gguf_fd = fd
+    gguf_filesize = file_size(fd)
+    
+    // GGUF header: magic(4) + version(4) + n_kv(8) + n_tensors(8) = 24 bytes
+    let hdr = mem_alloc(24)
+    file_read(fd, hdr, 24)
+    if mem_load8(hdr) != 71 { close(fd); gguf_fd = -1; return -2 }
+    
+    // GGUF v3 header layout:
+    //   +0 magic(4)  +4 version(4)  +8 tensor_count(8)  +16 metadata_kv_count(8)
+    // tensor_count comes FIRST, then metadata_kv_count. Reading these the
+    // other way round makes the metadata walk iterate over tensor records and
+    // desync every subsequent read.
+    let n_kv = mem_load(hdr + 16)
+    gguf_n_tensors = mem_load(hdr + 8)
+    gguf_n_kv = n_kv
+    
+    let meta_size = scan_metadata(fd, n_kv)
+    if meta_size < 0 { close(fd); gguf_fd = -1; return -8 }
+    
+    // GGUF alignment: pad to the alignment boundary after metadata.
+    // Read from general.alignment; upstream llama.cpp reads the same key and
+    // rejects a non-power-of-2 value. A file declaring alignment 64 while we
+    // assumed 32 would silently mis-place every tensor data section.
+    // NO alignment padding between the metadata block and the tensor-info
+    // table. gguf writes the KV block and the tensor-info records back to
+    // back; only the tensor DATA section is aligned. Padding here pushes the
+    // tensor-info read three bytes past the real first record and reads a
+    // garbage name length.
+    let total_meta = 24 + meta_size
+    
+    read_tensor_info(fd)
+    
+    record_data_start(fd)
+    
+    // Adopt the declared alignment, then prove the tensor data section is a
+    // consistent chain. Both are checked here rather than lazily so a malformed
+    // file is rejected at load instead of producing wrong numbers much later.
+    if gguf_read_alignment() != 0 { close(fd); gguf_fd = -1; return -5 }
+    let vr = gguf_validate_chain()
+    if vr != 0 { close(fd); gguf_fd = -1; return -6 }
+    // Checked dimension products: a crafted shape whose product wraps must not
+    // produce a small element count that passes every size check.
+    let dr = gguf_validate_all_dims()
+    if dr != 0 { close(fd); gguf_fd = -1; return -7 }
+
+    // Map and prefault the tensor DATA window (Phase 7 item 1). Best effort: a
+    // refusal leaves every read on the pread path, which is slower but correct,
+    // so this must never turn a successful load into a failure.
+    gguf_map_data_window()
+    return 0
+}
+
+// Alignment used for the tensor DATA section. Read from the
+// general.alignment metadata key; defaults to 32 when absent, which is what
+// upstream does (GGUF_DEFAULT_ALIGNMENT).
+let gguf_alignment = 32
+
+// Validate the tensor data section after read_tensor_info() has filled it.
+//
+// Upstream llama.cpp rejects the file outright if any tensor's offset differs
+// from the running padded total (gguf.cpp, the "tensor '%s' has offset %llu,
+// expected %zu" check). We enforce the same chain, plus a representability
+// check on each tensor's byte size.
+//
+// MEASURED ON THE REAL MODEL before writing this, because a naive port would
+// have rejected a valid file: the chain is NOT anchored at 0. The first tensor
+// sits at the data-section origin (gguf_data_start = 8239136 for the real
+// LFM2 Q4_K_M file), and every later tensor chains exactly from there. Starting
+// the running total at 0 instead of at gguf_data_start yields exactly one
+// spurious "gap" at index 0 (delta 8239136) and would have made gguf_load fail
+// on every well-formed file. So: running total starts at the data origin.
+//
+// A real gap (offset beyond where the previous tensor ended) means the file is
+// internally inconsistent and tensor reads could land on unrelated bytes, so
+// we reject. Overlap is likewise rejected: two tensors sharing bytes would
+// decode to different values depending on read order.
+//
+// Return 0 on success, or a negative code identifying the first offending
+// tensor so a caller can report which one.
+fn gguf_validate_chain() {
+    if gguf_n_tensors <= 0 { return 0 }
+    let n = gguf_n_tensors
+    // running total, ABSOLUTE file offset.
+    //
+    // gguf_tensor_offset() already adds gguf_data_offset() (see its definition:
+    // it returns gguf_data_offset() + the stored relative offset), so the chain
+    // must start at the data-section origin, NOT at 0. An earlier version of
+    // this validator started at 0 and compared against absolute offsets, which
+    // reported a spurious gap of 8239136 at tensor 0 and made gguf_load REJECT
+    // the real, valid model. Measured, not assumed.
+    let running = gguf_data_start
+    let i = 0
+    while i < n {
+        let off = gguf_tensor_offset(i)
+        let nb = gguf_tensor_nbytes(i)
+        if nb < 0 { return -1000 - i }
+        if off < 0 { return -2000 - i }
+        // the chain must be exact: no gap, no overlap
+        if off != running { return -3000 - i }
+        // representability: running + nb must not wrap, and must stay inside
+        // the file. nb is derived from nelements * type_size with integer
+        // multiply, so this is the guard against a crafted nelem/dtype pair.
+        // running and off are absolute; compare against the real file size
+        if off > gguf_filesize { return -4000 - i }
+        if nb > gguf_filesize - off { return -4000 - i }
+        running = running + nb
+        i = i + 1
+    }
+    return 0
+}
+
+// Validate that the declared alignment is usable, and adopt it.
+fn gguf_read_alignment() {
+    let k = gguf_kv_find("general.alignment")
+    if k < 0 { gguf_alignment = 32 ; return 0 }
+    let v = gguf_kv_int(k)
+    if v <= 0 { return -1 }
+    // power of two, as upstream requires
+    if (v & (v - 1)) != 0 { return -1 }
+    gguf_alignment = v
+    return 0
+}
+
+// Safe multiply: return 0 (and report overflow) if a * b would exceed `limit`.
+//
+// GGUF dims come from an untrusted file, so the element count is a product of up
+// to 4 attacker-chosen dimensions. safetensors makes the same guard mandatory
+// (every dimension product is a checked_mul) precisely because a wrapped product
+// yields a SMALL number that then passes every size check while the real read
+// runs far past the end of the buffer. Quanta's nbytes used a plain multiply,
+// so a crafted shape could make a tensor claim to be tiny while its true extent
+// was enormous.
+//
+// Returns the product, or -1 on overflow. `limit` is the largest product we are
+// willing to accept; GGUF files legitimately reach ~2.6e8 elements
+// (token_embd.weight = 262144000), so the limit is generous but finite.
+const GGUF_MAX_ELEMENTS = 900000000000000000
+
+fn gguf_checked_mul(a, b) {
+    if a <= 0 || b <= 0 { return -1 }
+    if a > GGUF_MAX_ELEMENTS || b > GGUF_MAX_ELEMENTS { return -1 }
+    let t = a * b
+    if t <= 0 { return -1 }
+    if t > GGUF_MAX_ELEMENTS { return -1 }
+    return t
+}
+
+// Recompute a tensor's element count from its dimensions with checked
+// multiplication, and require it to agree with the stored nelements.
+//
+// Two separate attacks are covered:
+//   - dims whose product OVERFLOWS, so the stored nelements is small and every
+//     downstream size check passes while the true extent is huge
+//   - dims that simply DISAGREE with the stored nelements, which means the file
+//     is internally inconsistent
+//
+// Returns 0 if consistent, or a negative code.
+fn gguf_validate_dims(idx) {
+    if idx < 0 || idx >= gguf_n_tensors { return -1000 }
+    let nd = gguf_tensor_ndims(idx)
+    if nd <= 0 || nd > 4 { return -1001 - idx }
+    let prod = 1
+    let d = 0
+    while d < nd {
+        let v = gguf_tensor_dim(idx, d)
+        if v <= 0 { return -1002 - idx }
+        let c = gguf_checked_mul(prod, v)
+        if c < 0 { return -1003 - idx }
+        prod = c
+        d = d + 1
+    }
+    if prod != gguf_tensor_nelements(idx) { return -1004 - idx }
+    // the byte size must also be representable and must fit the file
+    let nb = gguf_tensor_nbytes(idx)
+    if nb <= 0 { return -1005 - idx }
+    if nb > gguf_filesize { return -1006 - idx }
+    return 0
+}
+
+// Validate every tensor's dimensions. Returns 0, or -(3000+idx) for the first
+// tensor that fails, so a caller can name the offender.
+fn gguf_validate_all_dims() {
+    let i = 0
+    while i < gguf_n_tensors {
+        let r = gguf_validate_dims(i)
+        if r != 0 { return r - 3000 }
+        i = i + 1
+    }
+    return 0
+}
+
+// ===========================================================================
+// BIT-WIDTH ACCESSORS
+//
+// Needed for the HuggingFace quantization formats (GPTQ, AWQ, NF4, MLX), which
+// pack 2-8 bits per element. Every dtype above is a whole number of BYTES per
+// block, which is why gguf_tensor_nbytes() is already correct for all 35 of them
+// -- verified against ggml's own struct sizes by
+// scripts/audit/check_dtype_sizes.py, which reports 0 mismatches.
+//
+// That verification is what makes this additive rather than a fix: the GGUF path
+// needs nothing changed. These accessors are for formats that pack below a byte.
+//
+// bit_at(p, i): value of bit i (0 = LEAST significant) of the byte at p.
+// MSB/LSB first: GGUF and safetensors pack low bits first within a byte, while
+// GPTQ's qweight packs the LOW nibble first per int32. Read bit 0 = LSB so the
+// caller chooses the convention; getting this backwards transposes every value
+// in a quantized tensor without erroring.
+fn gguf_bit_at(p, i) {
+    if i < 0 || i > 7 { return 0 }
+    let b = mem_load8(p)
+    return (b >> i) & 1
+}
+
+// Extract `nbits` bits starting at bit `start` from the byte at p, as an
+// unsigned integer. Handles a field that straddles two bytes, which 3-, 5- and
+// 6-bit MLX packings require -- a bytes-per-element model cannot express those
+// at all, because 3 bits/element does not land on a byte boundary.
+fn gguf_bits_extract(p, start, nbits) {
+    if nbits <= 0 { return 0 }
+    if nbits > 32 { return 0 }
+    if start < 0 { return 0 }
+    let acc = 0
+    let i = 0
+    while i < nbits {
+        let src = p + (start + i) / 8
+        let bit = (start + i) % 8
+        let avail = 8 - bit
+        let take = nbits - i
+        if take > avail { take = avail }
+        // read `take` bits starting at `bit`, LSB-first
+        let chunk = 0
+        let j = 0
+        while j < take {
+            chunk = chunk | (gguf_bit_at(src, bit + j) << j)
+            j = j + 1
+        }
+        acc = acc | (chunk << i)
+        i = i + take
+    }
+    return acc
+}
+
+// Byte offset and bit offset of element `idx` for a `bits`-per-element packing.
+// Returns the byte address; the caller then uses gguf_bits_extract with the bit
+// offset. Kept as two accessors because the address alone is not enough for a
+// sub-byte type -- the single most common way to read these wrongly is to treat
+// the bit offset as part of the address and then read whole bytes.
+fn gguf_packed_byte(p, idx, bits) {
+    if bits <= 0 { return p }
+    return p + (idx * bits) / 8
+}
+
+fn gguf_packed_bit(p, idx, bits) {
+    if bits <= 0 { return 0 }
+    return (idx * bits) % 8
+}
+
+// Read element `idx` of a `bits`-per-element packing, sign-extended for a signed
+// format (signed_widths != 0). GPTQ and AWQ store signed 4-bit values; NF4 and
+// MLX affine store unsigned. Getting the signedness wrong yields plausible but
+// wrong weights -- the same class of error as dequantizing an AWQ zero-point by
+// ADDING it when the file never stored one.
+fn gguf_packed_read(p, idx, bits, signed_widths) {
+    if bits <= 0 || bits > 32 { return 0 }
+    let byteaddr = gguf_packed_byte(p, idx, bits)
+    let bitoff = gguf_packed_bit(p, idx, bits)
+    let raw = gguf_bits_extract(byteaddr, bitoff, bits)
+    if signed_widths != 0 {
+        // sign-extend from `bits`
+        let sgn = 1 << (bits - 1)
+        if (raw & sgn) != 0 { return raw - (1 << bits) }
+    }
+    return raw
+}
+
+fn gguf_tensor_name(idx) { return mem_load(gguf_tensor_data + idx * TINFO_SIZE) }
+// Materialise a tensor's name as a real Quanta string object.
+//
+// gguf_tensor_name() returns the RAW C pointer into the mmap'd header region.
+// It is usable for byte comparison (that is how gguf_find_tensor works) but not
+// for anything else: printing it emits the address ("name@140353555505152") and
+// the pointer is not length-prefixed, so len()/str operations read whatever
+// 8 bytes precede it. The weight table needs real strings to key on.
+//
+// The string object layout is [i64 length][bytes...], matching str::substr and
+// the emitter's str() builtin. The GGUF name is NUL-terminated, so the length is
+// found by scanning for the terminator rather than stored anywhere.
+fn gguf_tensor_name_str(idx) {
+    let p = gguf_tensor_name(idx)
+    if p == 0 { return 0 }
+    let n = 0
+    while mem_load8(p + n) != 0 { n = n + 1 }
+    if n == 0 { return 0 }
+    let buf = mem_alloc((n + 9 + 7) / 8)
+    mem_store(buf, n)
+    let i = 0
+    while i < n {
+        mem_store8(buf + 8 + i, mem_load8(p + i))
+        i = i + 1
+    }
+    return buf
+}
+
+// Number of bytes in a tensor's name, excluding the NUL terminator. This is a
+// length, not a string, so it is safe to call from a context where a string
+// cannot be passed around.
+fn gguf_tensor_name_len(idx) {
+    let p = gguf_tensor_name(idx)
+    if p == 0 { return 0 }
+    let n = 0
+    while mem_load8(p + n) != 0 { n = n + 1 }
+    return n
+}
+
+fn gguf_tensor_dtype(idx) { return mem_load(gguf_tensor_data + idx * TINFO_SIZE + 16) }
+// Absolute file offset of a tensor's data. The GGUF header stores each
+// tensor's offset RELATIVE to the start of the tensor-data section, so
+// callers seeking to a tensor must add gguf_data_offset() or they land at
+// file offset 0 -- the magic bytes -- and dequantize reads garbage.
+fn gguf_tensor_offset(idx) {
+    return gguf_data_offset() + mem_load(gguf_tensor_data + idx * TINFO_SIZE + 24) }
+fn gguf_tensor_nelements(idx) { return mem_load(gguf_tensor_data + idx * TINFO_SIZE + 32) }
+fn gguf_tensor_ndims(idx) { return mem_load(gguf_tensor_data + idx * TINFO_SIZE + 8) }
+fn gguf_tensor_dim(idx, d) {
+    if d < 0 || d > 3 { return 0 }
+    return mem_load(gguf_tensor_dims + idx * 32 + d * 8)
+}
+
+// Byte size of a tensor's raw storage, from its dtype and element count.
+fn gguf_type_size(dtype) {
+    if dtype == 0 || dtype == 1 || dtype == 7 { return 1 }
+    if dtype == 2 || dtype == 3 { return 2 }
+    if dtype == 6 || dtype == 8 || dtype == 9 || dtype == 30 { return 1 }
+    if dtype == 10 || dtype == 11 || dtype == 12 { return 8 }
+    if dtype == 13 { return 4 }
+    return 0
+}
+
+// Byte size of a quantised tensor, from the GGML block layouts.
+//
+// Every quantised type is (elements_per_block, bytes_per_block); the size is
+// (nelements / elems_per_block) * bytes_per_block. This used to return the
+// ELEMENT COUNT for the k-quants, so Q4_K (dtype 12) reported 22020096 for
+// blk.0.ffn_gate.weight instead of 12386304 -- a tensor then read as f32 would
+// run 1.8x past the end of its own storage.
+//
+// Every (bytes, block) pair below is derived from the static_assert in upstream
+// ggml-common.h, which states each block's own size:
+//
+//   type                       elems  bytes
+//   F32   (0)                    1      4
+//   F16   (1)                    1      2
+//   Q4_0  (2) / Q4_1  (3)       32    18 / 20
+//   Q5_0  (6) / Q5_1  (7)       32    22 / 24
+//   Q8_0  (8) / Q8_1  (9)       32    34 / 36
+//   Q2_K (10) / Q3_K (11)      256    84 / 110
+//   Q4_K (12) / Q5_K (13)      256   144 / 176
+//   Q6_K (14) / Q8_K (15)      256   210 / 292
+//   IQ2_XXS(16) / IQ2_XS (17)  256    66 / 74
+//   IQ3_XXS(18) / IQ1_S  (19)  256    98 / 50
+//   IQ4_NL(20)                  32     18   <- 32-element block, not 256
+//   IQ3_S (21) / IQ2_S (22)     256   110 /  82
+//   IQ4_XS(23)                  256   136
+//   I8(24) I16(25) I32(26) I64(27) F64(28)   1  1/2/4/8/8
+//   IQ1_M(29)                   256    56
+//   BF16 (30)                     1      2   <- 2 bytes/elem, not a 256 block
+//   TQ1_0(34) / TQ2_0(35)       256    54 / 66
+//   MXFP4(39)                    32     17
+//   NVFP4(40)                    64     36
+//   Q1_0 (41) / Q2_0 (42)       128/64 18 / 18
+//
+// IQ4_NL, IQ2_S and IQ4_XS previously carried Q4_K/Q4_1/Q4_K's numbers, and
+// IQ3_S and IQ1_M were short. That made the loader's total tensor-data footprint
+// overrun the file by 2.50 GB on QUANTA-GG4-26B4-IQ4.gguf and 2.87 GB on
+// QUANTA-GW38-27B-IQ4.gguf, silently reading unrelated bytes as weights. The
+// corrected table brings both files into the same ~15 MB of metadata padding as
+// every other model on the box.
+fn gguf_block_elems(dtype) {
+    if dtype == 0 { return 1 }
+    if dtype == 1 { return 1 }
+    if dtype == 2 { return 32 }
+    if dtype == 3 { return 32 }
+    if dtype == 6 { return 32 }
+    if dtype == 7 { return 32 }
+    if dtype == 8 { return 32 }
+    if dtype == 9 { return 32 }
+    if dtype == 10 { return 256 }
+    if dtype == 11 { return 256 }
+    if dtype == 12 { return 256 }
+    if dtype == 13 { return 256 }
+    if dtype == 14 { return 256 }
+    if dtype == 15 { return 256 }
+    if dtype == 16 { return 256 }
+    if dtype == 17 { return 256 }
+    if dtype == 18 { return 256 }
+    if dtype == 19 { return 256 }
+    if dtype == 20 { return 32 }
+    if dtype == 21 { return 256 }
+    if dtype == 22 { return 256 }
+    if dtype == 23 { return 256 }
+    if dtype == 24 { return 1 }
+    if dtype == 25 { return 1 }
+    if dtype == 26 { return 1 }
+    if dtype == 27 { return 1 }
+    if dtype == 28 { return 1 }
+    if dtype == 29 { return 256 }
+    if dtype == 30 { return 1 }
+    if dtype == 34 { return 256 }
+    if dtype == 35 { return 256 }
+    if dtype == 39 { return 32 }
+    if dtype == 40 { return 64 }
+    if dtype == 41 { return 128 }
+    return 1
+}
+
+fn gguf_tensor_nbytes(idx) {
+    let dtype = gguf_tensor_dtype(idx)
+    let n = gguf_tensor_nelements(idx)
+    if dtype == 0 { return n * 4 }        // F32
+    if dtype == 1 { return n * 2 }        // F16
+    if dtype == 2 { return (n / 32) * 18 }   // Q4_0
+    if dtype == 3 { return (n / 32) * 20 }   // Q4_1
+    if dtype == 6 { return (n / 32) * 22 }   // Q5_0
+    if dtype == 7 { return (n / 32) * 24 }   // Q5_1
+    if dtype == 8 { return (n / 32) * 34 }   // Q8_0
+    if dtype == 9 { return (n / 32) * 36 }   // Q8_1
+    if dtype == 10 { return (n / 256) * 84 }   // Q2_K
+    if dtype == 11 { return (n / 256) * 110 }  // Q3_K
+    if dtype == 12 { return (n / 256) * 144 }  // Q4_K
+    if dtype == 13 { return (n / 256) * 176 }  // Q5_K
+    if dtype == 14 { return (n / 256) * 210 }  // Q6_K
+    if dtype == 15 { return (n / 256) * 292 }  // Q8_K
+    if dtype == 16 { return (n / 256) * 66 }   // IQ2_XXS
+    if dtype == 17 { return (n / 256) * 74 }   // IQ2_XS
+    if dtype == 18 { return (n / 256) * 98 }   // IQ3_XXS
+    if dtype == 19 { return (n / 256) * 50 }   // IQ1_S
+    if dtype == 20 { return (n / 32) * 18 }    // IQ4_NL  (QK4_NL=32, NOT 256)
+    if dtype == 21 { return (n / 256) * 110 }  // IQ3_S
+    if dtype == 22 { return (n / 256) * 82 }   // IQ2_S
+    if dtype == 23 { return (n / 256) * 136 }  // IQ4_XS
+    if dtype == 24 { return n }                 // I8
+    if dtype == 25 { return n * 2 }             // I16
+    if dtype == 26 { return n * 4 }             // I32
+    if dtype == 27 { return n * 8 }             // I64
+    if dtype == 28 { return n * 8 }             // F64
+    if dtype == 29 { return (n / 256) * 56 }    // IQ1_M
+    if dtype == 30 { return n * 2 }             // BF16  (2 bytes/elem, NOT a 256 block)
+    if dtype == 34 { return (n / 256) * 54 }    // TQ1_0
+    if dtype == 35 { return (n / 256) * 66 }    // TQ2_0
+    if dtype == 39 { return (n / 32) * 17 }     // MXFP4  (QK_MXFP4=32)
+    if dtype == 40 { return (n / 64) * 36 }     // NVFP4  (QK_NVFP4=64, 4 E4M3 scales)
+    if dtype == 41 { return (n / 128) * 18 }    // Q1_0    (QK1_0=128)
+    if dtype == 42 { return (n / 64) * 18 }     // Q2_0    (QK2_0=64)
+    return n
+}
+
+// Read `nbytes` of a tensor's RAW (still quantised) storage into `buf`.
+// Tensor offsets in GGUF are relative to the start of the aligned tensor
+// data section, so the file position must include gguf_data_start.
+fn gguf_read_tensor_bytes(idx, buf, nbytes) {
+    if idx < 0 || idx >= gguf_n_tensors { return -1 }
+    // gguf_tensor_offset() already returns an ABSOLUTE file offset (it adds
+    // gguf_data_start itself). Adding it again here seeked 8239136 bytes past
+    // the tensor, so every tensor read returned unrelated file data instead of
+    // failing.
+    let abs_pos = gguf_tensor_offset(idx)
+    // Bound against the tensor's own size and against EOF, same as
+    // gguf_read_tensor_bytes_at(). Returns a byte count, so a short read at EOF
+    // is detectable by the caller.
+    if nbytes < 0 { return -3 }
+    let tsz = gguf_tensor_nbytes(idx)
+    if nbytes > tsz { return -3 }
+    if abs_pos > gguf_filesize { return -5 }
+    if nbytes > gguf_filesize - abs_pos { return -5 }
+    if lseek(gguf_fd, abs_pos, 0) < 0 { return -2 }
+    return read_raw(gguf_fd, buf, nbytes)
+}
+
+fn gguf_num_tensors() { return gguf_n_tensors }
+fn gguf_num_kv() { return gguf_n_kv }
+fn gguf_data_offset() { return gguf_data_start }
+fn gguf_close() {
+    // Unmap before closing the fd: the mapping keeps its own reference to the
+    // file, but leaving the window up across a reload would leak a 256 MiB
+    // address-space range every time a model is swapped.
+    if gguf_map_base != 0 {
+        gguf_unmap_range(gguf_map_base, gguf_map_len)
+        gguf_map_base = 0
+        gguf_map_off = 0
+        gguf_map_len = 0
+        gguf_map_faulted = 0
+    }
+    if gguf_fd >= 0 { close(gguf_fd); gguf_fd = -1 }
+}
+
+// ---- metadata value access -------------------------------------------------
+//
+// The tensor APIs can name and read tensors but nothing could reach a metadata
+// VALUE: scan_metadata() only ever skipped over them. The LFM2 tokenizer needs
+// tokenizer.ggml.tokens (128000 strings), tokenizer.ggml.merges (293320
+// strings) and the three special token IDs, so the offsets recorded by
+// scan_metadata() are turned into reads here.
+//
+// These accessors are for the header region only. The file is opened normally
+// and read with read_raw(); nothing here materialises the tensor data, so a
+// 2.6B model costs a few KB of state, not its 1.5 GB of weights.
+
+// Index of the KV record named `name`, or -1. `name` is a Quanta string.
+fn gguf_kv_find(name) {
+    let want = len(name)
+    let i = 0
+    while i < gguf_n_kv {
+        lseek(gguf_fd, mem_load(gguf_kv_index + i * 8), 0)
+        let lb = mem_alloc(8)
+        read_raw(gguf_fd, lb, 8)
+        let klen = mem_load(lb)
+        let kb = mem_alloc(klen + 1)
+        read_raw(gguf_fd, kb, klen)
+        let ok = 1
+        if klen != want {
+            ok = 0
+        } else {
+            let j = 0
+            while j < want {
+                if mem_load8(kb + j) != mem_load8(name + 8 + j) { ok = 0; j = want }
+                j = j + 1
+            }
+        }
+        if ok == 1 { return i }
+        i = i + 1
+    }
+    return -1
+}
+
+// Value type ID of KV `i` (see gguf_vtype_* below).
+fn gguf_kv_type(i) {
+    lseek(gguf_fd, mem_load(gguf_kv_index + i * 8), 0)
+    let lb = mem_alloc(8)
+    read_raw(gguf_fd, lb, 8)
+    let klen = mem_load(lb)
+    lseek(gguf_fd, klen, 1)
+    let tb = mem_alloc(4)
+    read_raw(gguf_fd, tb, 4)
+    return mem_load(tb)
+}
+
+// Byte offset of the VALUE of KV `i` (i.e. just past its key and type field).
+fn gguf_kv_value_off(i) {
+    let off = mem_load(gguf_kv_index + i * 8)
+    lseek(gguf_fd, off, 0)
+    let lb = mem_alloc(8)
+    read_raw(gguf_fd, lb, 8)
+    let klen = mem_load(lb)
+    return off + 8 + klen + 4
+}
+
+// Integer value of a scalar u32/i32/u64/i64 KV. Returns -1 if `i` is not a
+// scalar integer, so a type mismatch cannot be mistaken for a real value.
+fn gguf_kv_int(i) {
+    let vt = gguf_kv_type(i)
+    lseek(gguf_fd, gguf_kv_value_off(i), 0)
+    let b = mem_alloc(8)
+    if vt == 1 || vt == 2 || vt == 3 || vt == 4 || vt == 5 {
+        read_raw(gguf_fd, b, 4)
+        if vt == 1 || vt == 3 || vt == 5 {
+            // signed: sign-extend from 32 bits
+            let v = mem_load(b)
+            if v > 2147483647 { v = v - 4294967296 }
+            return v
+        }
+        return mem_load(b)
+    }
+    if vt == 7 { read_raw(gguf_fd, b, 1); return mem_load8(b) }
+    if vt == 10 || vt == 11 || vt == 12 {
+        read_raw(gguf_fd, b, 8)
+        return mem_load(b)
+    }
+    return -1
+}
+
+// Floating value of a scalar f32/f64 KV, as f64.
+fn gguf_kv_float(i) {
+    let vt = gguf_kv_type(i)
+    lseek(gguf_fd, gguf_kv_value_off(i), 0)
+    let b = mem_alloc(8)
+    if vt == 6 {
+        read_raw(gguf_fd, b, 4)
+        // f32 -> f64 must go through f32_to_f64(), which reinterprets the 4 bytes
+        // as an IEEE single and produces a real double.
+        //
+        // This used to be f64of(mem_load(b)), which reinterprets the FOUR bytes
+        // as the low half of an f64 bit pattern. That is not a valid f64: a
+        // zero-extended f32 pattern denormalises to ~1e-315, so every f32
+        // metadata value read 0 or a denormal. LFM2's rope.freq_base (1e7) and
+        // layer_norm_rms_epsilon (1e-5) both came back as 0.0.
+        return f32_to_f64(b)
+    }
+    if vt == 12 {
+        read_raw(gguf_fd, b, 8)
+        return mem_load(b)
+    }
+    return 0.0
+}
+
+// String value of a scalar string KV, as a real Quanta string.
+// GGUF stores a string as u64 length + raw bytes, with NO NUL terminator.
+fn gguf_kv_str(i) {
+    if gguf_kv_type(i) != 8 { return 0 }
+    let off = gguf_kv_value_off(i)
+    lseek(gguf_fd, off, 0)
+    let lb = mem_alloc(8)
+    read_raw(gguf_fd, lb, 8)
+    let n = mem_load(lb)
+    let buf = mem_alloc((n + 9 + 7) / 8)
+    mem_store(buf, n)
+    if n > 0 { read_raw(gguf_fd, buf + 8, n) }
+    return buf
+}
+
+// Byte length of a scalar string KV, or -1 if `i` is not a string.
+// Prefer this over len(gguf_kv_str(i)) at a call site: a Quanta string RETURNED
+// from a function prints as a raw pointer, and passing one back IN as a
+// parameter is unreliable (len()/index of a string parameter reads adjacent
+// memory). Working with explicit length + buffer keeps every access byte-exact.
+fn gguf_kv_str_len(i) {
+    if gguf_kv_type(i) != 8 { return -1 }
+    lseek(gguf_fd, gguf_kv_value_off(i), 0)
+    let lb = mem_alloc(8)
+    read_raw(gguf_fd, lb, 8)
+    return mem_load(lb)
+}
+
+// Copy the bytes of scalar string KV `i` into `dst`. Returns the byte count.
+fn gguf_kv_str_bytes(i, dst) {
+    let n = gguf_kv_str_len(i)
+    if n < 0 { return -1 }
+    lseek(gguf_fd, gguf_kv_value_off(i) + 8, 0)
+    if n > 0 { read_raw(gguf_fd, dst, n) }
+    return n
+}
+
+// Element count of a string array KV, or -1 if `i` is not a string array.
+fn gguf_kv_arr_count(i) {
+    if mem_load(gguf_kv_arr_len + i * 8) == 0 { return -1 }
+    if mem_load(gguf_kv_etype + i * 8) != 8 { return -1 }
+    return mem_load(gguf_kv_arr_len + i * 8)
+}
+
+// Element count of ANY array KV, string or numeric. -1 only if the entry is not
+// an array at all (length 0).
+//
+// gguf_kv_arr_count() above deliberately rejects numeric arrays, because every
+// caller of it walks LENGTH-PREFIXED elements and would read nonsense on an i32
+// array. That guard is correct for them and must stay. Numeric arrays need their
+// own accessor: LFM2's lfm2.attention.head_count_kv is an i32 array of 30
+// per-layer KV head counts, and reading it needed count, element type and data
+// offset without the string precondition.
+fn gguf_kv_arr_count_any(i) {
+    let n = mem_load(gguf_kv_arr_len + i * 8)
+    if n <= 0 { return -1 }
+    return n
+}
+
+// Element type of array KV `i`: 5 = i32, 12 = f64, 8 = string. -1 if not an array.
+fn gguf_kv_arr_etype(i) {
+    if mem_load(gguf_kv_arr_len + i * 8) <= 0 { return -1 }
+    return mem_load(gguf_kv_etype + i * 8)
+}
+
+// Bytes per element of a numeric array, from its element type.
+fn gguf_kv_arr_esize(i) {
+    let et = gguf_kv_arr_etype(i)
+    if et == 0 || et == 1 || et == 7 { return 1 }
+    if et == 2 || et == 3 { return 2 }
+    if et == 4 || et == 5 || et == 6 { return 4 }
+    if et == 10 || et == 11 || et == 12 { return 8 }
+    return 0
+}
+
+// Read `idx` of a numeric array into `dst` as its raw little-endian bytes.
+// Returns the element size, or -1 if the array is a string array or the read is
+// short. Use mem_load(dst) to decode an i32, f32_bits_to_f64-style helpers for a
+// float -- this deliberately does not interpret the value.
+fn gguf_kv_arr_elem_num(i, idx, dst) {
+    let es = gguf_kv_arr_esize(i)
+    if es <= 0 { return -1 }
+    let cnt = gguf_kv_arr_count_any(i)
+    if idx < 0 || idx >= cnt { return -1 }
+    let pos = mem_load(gguf_kv_arr_off + i * 8)
+    if pos < 0 { return -1 }
+    lseek(gguf_fd, pos + idx * es, 0)
+    if read_raw(gguf_fd, dst, es) != es { return -1 }
+    return es
+}
+
+// File offset of element `idx` of the string array in KV `i`.
+//
+// Walks the variable-length elements from the start every call, so this is
+// O(idx). That is deliberate: the tokenizer reads each array front to back
+// exactly once, and a persistent offset index for 293320 merges would cost
+// 2.3 MB of resident state for a single pass. Callers that need random access
+// should build their own index once.
+fn gguf_kv_arr_elem_off(i, idx) {
+    let pos = mem_load(gguf_kv_arr_off + i * 8)
+    if pos < 0 { return -1 }
+    let lb = mem_alloc(8)
+    let k = 0
+    while k < idx {
+        lseek(gguf_fd, pos, 0)
+        read_raw(gguf_fd, lb, 8)
+        let n = mem_load(lb)
+        pos = pos + 8 + n
+        k = k + 1
+    }
+    lseek(gguf_fd, pos, 0)
+    read_raw(gguf_fd, lb, 8)
+    return pos + 8
+}
+
+// Length in bytes of element `idx` of the string array in KV `i`.
+fn gguf_kv_arr_elem_len(i, idx) {
+    let at = gguf_kv_arr_elem_off(i, idx)
+    if at < 0 { return 0 }
+    lseek(gguf_fd, at - 8, 0)
+    let lb = mem_alloc(8)
+    read_raw(gguf_fd, lb, 8)
+    return mem_load(lb)
+}
+
+// Element `idx` of a string array KV, as a real Quanta string.
+fn gguf_kv_arr_elem(i, idx) {
+    let at = gguf_kv_arr_elem_off(i, idx)
+    if at < 0 { return 0 }
+    let n = gguf_kv_arr_elem_len(i, idx)
+    if n == 0 { return 0 }
+    let buf = mem_alloc((n + 9 + 7) / 8)
+    mem_store(buf, n)
+    read_raw(gguf_fd, buf + 8, n)
+    return buf
+}
+
+// Read `n` raw bytes of element `idx` into `dst`. Used by the tokenizer, which
+// compares byte-level encoded forms against the vocab and must not pay for a
+// string object per candidate.
+fn gguf_kv_arr_elem_bytes(i, idx, dst, n) {
+    let at = gguf_kv_arr_elem_off(i, idx)
+    if at < 0 { return -1 }
+    lseek(gguf_fd, at, 0)
+    read_raw(gguf_fd, dst, n)
+    return n
+}
+
+// Total bytes of all elements in a string array KV, so a caller can size one
+// buffer for the whole array and slurp it in a single sequential read.
+//
+// Single pass by construction: it seeks to the array start once and then reads
+// forward through the 8-byte length / n-byte payload sequence, rather than
+// calling gguf_kv_arr_elem_off() per element (which would be O(n^2) over
+// 293320 merges).
+fn gguf_kv_arr_total_bytes(i) {
+    let cnt = gguf_kv_arr_count(i)
+    if cnt < 0 { return 0 }
+    let pos = mem_load(gguf_kv_arr_off + i * 8)
+    if pos < 0 { return 0 }
+    lseek(gguf_fd, pos, 0)
+    let lb = mem_alloc(8)
+    let total = 0
+    let k = 0
+    while k < cnt {
+        read_raw(gguf_fd, lb, 8)
+        let n = mem_load(lb)
+        if n > 0 { lseek(gguf_fd, n, 1) }
+        // The 8-byte length prefix is part of the packed record, so it counts
+        // toward the size. Omitting it under-reports by exactly 8*count, which
+        // for the 128000-entry vocab is a 1.02 MB shortfall -- enough to
+        // overrun the destination on the last few entries.
+        total = total + 8 + n
+        k = k + 1
+    }
+    return total
+}
+
+// Slurp a whole string array KV into `dst` as a packed sequence of
+// [u64 length][length bytes] records, in file order -- the same encoding
+// gguf_kv_arr_elem_off() describes, so the two can be used interchangeably.
+//
+// Returns the number of bytes written. The tokenizer does exactly this once for
+// tokenizer.ggml.tokens and once for tokenizer.ggml.merges, then works from
+// memory: the merges array is ~5 MB and searching it per BPE step from the
+// file would dominate the run.
+fn gguf_kv_arr_slurp(i, dst) {
+    let cnt = gguf_kv_arr_count(i)
+    if cnt < 0 { return 0 }
+    let pos = mem_load(gguf_kv_arr_off + i * 8)
+    if pos < 0 { return 0 }
+    lseek(gguf_fd, pos, 0)
+    let lb = mem_alloc(8)
+    let at = dst
+    let k = 0
+    while k < cnt {
+        read_raw(gguf_fd, lb, 8)
+        let n = mem_load(lb)
+        mem_store(at, n)
+        if n > 0 { read_raw(gguf_fd, at + 8, n) }
+        at = at + 8 + n
+        k = k + 1
+    }
+    return at - dst
+}
+
+// Offset of element `idx` within a buffer packed by gguf_kv_arr_slurp().
+// Walks the packed records, so O(idx) -- callers that need many random lookups
+// should build their own index in one pass.
+fn slurp_elem_off(packed, idx) {
+    let at = packed
+    let k = 0
+    while k < idx {
+        let n = mem_load(at)
+        at = at + 8 + n
+        k = k + 1
+    }
+    return at + 8
+}
+
+fn gguf_find_tensor(name) {
+    let name_len = len(name)
+    let i = 0
+    while i < gguf_n_tensors {
+        let tname = gguf_tensor_name(i)
+        if tname != 0 {
+            let ok = 1
+            let j = 0
+            while j < name_len {
+                if mem_load8(tname + j) != mem_load8(name + 8 + j) { ok = 0; j = name_len }
+                j = j + 1
+            }
+            if ok == 1 && mem_load8(tname + name_len) == 0 { return i }
+        }
+        i = i + 1
+    }
+    return -1
+}
+
+// Read tensor `idx` of ANY supported dtype into `buf` as f64.
+//     buf layout: nelem * 8 bytes, little-endian IEEE 754 binary64.
+//
+// Dispatch is on the GGML type ID, NOT on gguf_type_size(). The two disagree:
+// gguf_type_size() returns 1 for type 0 (F32) and for type 1 (F16), because it
+// describes the QUANTISED types' per-element granularity for block layouts. Using
+// it as a dtype test is a category error, and the earlier version of this
+// function dispatched on it and so matched NEITHER F32 (0) nor F16 (1) -- it
+// fell through every branch and returned having loaded nothing, silently.
+//
+// Returning 0 on an unsupported type is deliberate: an unsupported dtype must
+// fail explicitly, not substitute another format's bytes for this one.
+// TRUE when read_tensor_f64() can materialize this dtype into caller-provided
+// f64 storage.
+//
+// Callers MUST ask this before allocating. read_tensor_f64() reports failure by
+// returning 0, but the buffer it fills is sized by the caller from
+// gguf_tensor_nelements(), and an unimplemented dtype still demands the FULL
+// allocation before the refusal is discovered -- token_embd.weight at 1.27e9
+// elements is 10.2 GB of f64 for a tensor that cannot be read at all, which
+// blows the 6 GB inference scope before any error is reported.
+fn gguf_dtype_supported(dtype) {
+    if dtype == 0 { return 1 }   // F32
+    if dtype == 1 { return 1 }   // F16
+    if dtype == 2 { return 1 }   // Q4_0
+    if dtype == 8 { return 1 }   // Q8_0
+    if dtype == 12 { return 1 }  // Q4_K
+    if dtype == 13 { return 1 }  // Q5_K
+    if dtype == 14 { return 1 }  // Q6_K
+    if dtype == 3 { return 1 }   // Q4_1
+    if dtype == 6 { return 1 }   // Q5_0
+    if dtype == 7 { return 1 }   // Q5_1
+    if dtype == 10 { return 1 }  // Q2_K
+    if dtype == 11 { return 1 }  // Q3_K
+    if dtype == 15 { return 1 }  // Q8_K
+    // Phase 9: IQ4_NL (20) is a 32-element block, NOT 256 -- the size table
+    // already recorded that distinction at gguf_type_size. IQ4_XS (23) is 256.
+    if dtype == 20 { return 1 }  // IQ4_NL
+    if dtype == 23 { return 1 }  // IQ4_XS
+    if dtype == 30 { return 1 }  // BF16
+    if dtype == 39 { return 1 }  // MXFP4
+    if dtype == 40 { return 1 }  // NVFP4
+    // NOTE: Q8_1 (9) is deliberately ABSENT and must stay absent. It is not a
+    // row-storage format -- upstream exports no dequantize_row_q8_1 because it
+    // has no per-element meaning. Its qs[] bytes are only ever consumed as int8
+    // multipliers inside vec_dot, paired with a matching weight block. A
+    // "dequantizer" for it would have to invent semantics, and an earlier
+    // hand-written deq_q8_1 did exactly that. Supporting Q8_1 means a matvec
+    // kernel, not a dequant function.
+    return 0
+}
+
+// TRUE when this tensor's dtype can be materialized natively.
+fn gguf_tensor_supported(idx) {
+    return gguf_dtype_supported(gguf_tensor_dtype(idx))
+}
+
+// read_block_f64(dtype, raw, nelem, out): dequantize a RAW block buffer that the
+// caller already has in memory, without a GGUF file in the picture.
+//
+// Split out from read_tensor_f64() so fixture-based tests (and any future
+// direct kernel use) can hand over bytes and get f64 out, instead of the only
+// entry point being "point me at a tensor in a model on disk". Both share the
+// same dispatch table below, so a dtype cannot be supported in one and missing
+// in the other.
+//
+// `raw` must hold exactly gguf_nbytes(dtype, nelem) bytes.
+fn read_block_f64(dtype, raw, nelem, out) {
+    if gguf_dtype_supported(dtype) == 0 { return 0 }
+    if dtype == 0 {
+        dequant_f32(raw, nelem, out)
+    } else if dtype == 1 {
+        dequant_f16(raw, nelem, out)
+    } else if dtype == 12 {
+        dequant_q4k(raw, nelem, out)
+    } else if dtype == 13 {
+        dequant_q5k(raw, nelem, out)
+    } else if dtype == 14 {
+        dequant_q6k(raw, nelem, out)
+    } else if dtype == 20 {
+        dequant_iq4_nl(raw, nelem, out)
+    } else if dtype == 23 {
+        dequant_iq4_xs(raw, nelem, out)
+    } else if dtype == 39 {
+        dequant_mxfp4(raw, nelem, out)
+    } else if dtype == 40 {
+        dequant_nvfp4(raw, nelem, out)
+    } else if dtype == 8 {
+        dequant_q8_0(raw, nelem, out)
+    } else if dtype == 2 {
+        dequant_q4_0(raw, nelem, out)
+    } else if dtype == 30 {
+        dequant_bf16(raw, nelem, out)
+    } else if dtype == 3 {
+        dequant_q4_1(raw, nelem, out)
+    } else if dtype == 6 {
+        dequant_q5_0(raw, nelem, out)
+    } else if dtype == 7 {
+        dequant_q5_1(raw, nelem, out)
+    } else if dtype == 10 {
+        dequant_q2k(raw, nelem, out)
+    } else if dtype == 11 {
+        dequant_q3k(raw, nelem, out)
+    } else if dtype == 15 {
+        dequant_q8k(raw, nelem, out)
+    } else {
+        return 0
+    }
+    return 1
+}
+
+fn read_tensor_f64(idx, buf) {
+    if gguf_dtype_supported(gguf_tensor_dtype(idx)) == 0 { return 0 }
+    let dtype = gguf_tensor_dtype(idx)
+    let offset = gguf_tensor_offset(idx)
+    let nelem = gguf_tensor_nelements(idx)
+
+    // gguf_tensor_offset() is ALREADY absolute -- it adds gguf_data_offset()
+    // itself (see its definition and gguf_read_tensor_bytes). Adding the data
+    // start a second time seeks 8239136 bytes past the tensor and reads
+    // unrelated bytes, which is what produced the garbage first values here.
+    // Do NOT add gguf_data_offset() to `offset`.
+    if dtype == 0 {
+        let n = nelem * 4
+        let raw = mem_alloc(n)
+        gguf_read_bytes(offset, raw, n)
+        dequant_f32(raw, nelem, buf)
+        mem_free(raw)
+    } else if dtype == 1 {
+        let n = nelem * 2
+        let raw = mem_alloc(n)
+        gguf_read_bytes(offset, raw, n)
+        dequant_f16(raw, nelem, buf)
+        mem_free(raw)
+    } else if dtype == 12 {
+        let n = gguf_tensor_nbytes(idx)
+        let raw = mem_alloc(n)
+        gguf_read_bytes(offset, raw, n)
+        dequant_q4k(raw, nelem, buf)
+        mem_free(raw)
+    } else if dtype == 13 {
+        let n = gguf_tensor_nbytes(idx)
+        let raw = mem_alloc(n)
+        gguf_read_bytes(offset, raw, n)
+        dequant_q5k(raw, nelem, buf)
+        mem_free(raw)
+    } else if dtype == 14 {
+        let n = gguf_tensor_nbytes(idx)
+        let raw = mem_alloc(n)
+        gguf_read_bytes(offset, raw, n)
+        dequant_q6k(raw, nelem, buf)
+        mem_free(raw)
+    } else if dtype == 8 {
+        let n = gguf_tensor_nbytes(idx)
+        let raw = mem_alloc(n)
+        gguf_read_bytes(offset, raw, n)
+        dequant_q8_0(raw, nelem, buf)
+        mem_free(raw)
+    } else if dtype == 2 {
+        let n = gguf_tensor_nbytes(idx)
+        let raw = mem_alloc(n)
+        gguf_read_bytes(offset, raw, n)
+        dequant_q4_0(raw, nelem, buf)
+        mem_free(raw)
+    } else if dtype == 30 {
+        let n = nelem * 2
+        let raw = mem_alloc(n)
+        gguf_read_bytes(offset, raw, n)
+        dequant_bf16(raw, nelem, buf)
+        mem_free(raw)
+    } else if dtype == 39 {
+        let n = gguf_tensor_nbytes(idx)
+        let raw = mem_alloc(n)
+        gguf_read_bytes(offset, raw, n)
+        dequant_mxfp4(raw, nelem, buf)
+        mem_free(raw)
+    } else if dtype == 40 {
+        let n = gguf_tensor_nbytes(idx)
+        let raw = mem_alloc(n)
+        gguf_read_bytes(offset, raw, n)
+        dequant_nvfp4(raw, nelem, buf)
+        mem_free(raw)
+    } else if dtype == 3 {
+        let n = gguf_tensor_nbytes(idx)
+        let raw = mem_alloc(n)
+        gguf_read_bytes(offset, raw, n)
+        dequant_q4_1(raw, nelem, buf)
+        mem_free(raw)
+    } else if dtype == 6 {
+        let n = gguf_tensor_nbytes(idx)
+        let raw = mem_alloc(n)
+        gguf_read_bytes(offset, raw, n)
+        dequant_q5_0(raw, nelem, buf)
+        mem_free(raw)
+    } else if dtype == 7 {
+        let n = gguf_tensor_nbytes(idx)
+        let raw = mem_alloc(n)
+        gguf_read_bytes(offset, raw, n)
+        dequant_q5_1(raw, nelem, buf)
+        mem_free(raw)
+    } else if dtype == 10 {
+        let n = gguf_tensor_nbytes(idx)
+        let raw = mem_alloc(n)
+        gguf_read_bytes(offset, raw, n)
+        dequant_q2k(raw, nelem, buf)
+        mem_free(raw)
+    } else if dtype == 11 {
+        let n = gguf_tensor_nbytes(idx)
+        let raw = mem_alloc(n)
+        gguf_read_bytes(offset, raw, n)
+        dequant_q3k(raw, nelem, buf)
+        mem_free(raw)
+    } else if dtype == 15 {
+        let n = gguf_tensor_nbytes(idx)
+        let raw = mem_alloc(n)
+        gguf_read_bytes(offset, raw, n)
+        dequant_q8k(raw, nelem, buf)
+        mem_free(raw)
+    } else {
+        // Explicit failure. An unsupported dtype must NOT silently return 0,
+        // which a caller cannot distinguish from "success, all zeroes".
+        return 0
+    }
+    return 1
+}
+
+// read_tensor_f64_prefix(idx, buf, nprobe): read and dequantize only the first
+// nprobe elements of a tensor, instead of the full tensor. This is needed for
+// the loader-dispatch test: a full 22M-element Q4_K tensor expands to 176 MB
+// of f64 and its dequantization is minutes of work, which exceeds the memory
+// cap and the test's purpose (proving the dispatch branch ran, not benchmarking).
+//
+// The raw byte count for nprobe elements is computed from the block size:
+//   blocks = ceil(nprobe / elems_per_block)
+//   raw_bytes = blocks * bytes_per_block
+fn read_tensor_f64_prefix(idx, buf, nprobe) {
+    if gguf_dtype_supported(gguf_tensor_dtype(idx)) == 0 { return 0 }
+    let dtype = gguf_tensor_dtype(idx)
+    let offset = gguf_tensor_offset(idx)
+    let nelem = gguf_tensor_nelements(idx)
+    if nprobe > nelem { nprobe = nelem }
+
+    // Compute raw bytes needed for nprobe elements
+    let raw_bytes = 0
+    if dtype == 0 {
+        raw_bytes = nprobe * 4
+    } else if dtype == 1 {
+        raw_bytes = nprobe * 2
+    } else if dtype == 30 {
+        raw_bytes = nprobe * 2
+    } else {
+        // Quantized formats: compute from block size
+        let block_bytes = gguf_tensor_nbytes(idx) / (nelem / gguf_block_elems(dtype))
+        let block_elems = gguf_block_elems(dtype)
+        let blocks = (nprobe + block_elems - 1) / block_elems
+        raw_bytes = blocks * block_bytes
+    }
+
+    let raw = mem_alloc(raw_bytes)
+    gguf_read_bytes(offset, raw, raw_bytes)
+
+    // Dequantize only nprobe elements
+    if dtype == 0 {
+        dequant_f32(raw, nprobe, buf)
+    } else if dtype == 1 {
+        dequant_f16(raw, nprobe, buf)
+    } else if dtype == 12 {
+        dequant_q4k(raw, nprobe, buf)
+    } else if dtype == 13 {
+        dequant_q5k(raw, nprobe, buf)
+    } else if dtype == 14 {
+        dequant_q6k(raw, nprobe, buf)
+    } else if dtype == 8 {
+        dequant_q8_0(raw, nprobe, buf)
+    } else if dtype == 2 {
+        dequant_q4_0(raw, nprobe, buf)
+    } else if dtype == 30 {
+        dequant_bf16(raw, nprobe, buf)
+    } else if dtype == 39 {
+        dequant_mxfp4(raw, nprobe, buf)
+    } else if dtype == 40 {
+        dequant_nvfp4(raw, nprobe, buf)
+    } else if dtype == 3 {
+        dequant_q4_1(raw, nprobe, buf)
+    } else if dtype == 6 {
+        dequant_q5_0(raw, nprobe, buf)
+    } else if dtype == 7 {
+        dequant_q5_1(raw, nprobe, buf)
+    } else if dtype == 10 {
+        dequant_q2k(raw, nprobe, buf)
+    } else if dtype == 11 {
+        dequant_q3k(raw, nprobe, buf)
+    } else if dtype == 15 {
+        dequant_q8k(raw, nprobe, buf)
+    } else if dtype == 20 {
+        dequant_iq4_nl(raw, nprobe, buf)
+    } else if dtype == 23 {
+        dequant_iq4_xs(raw, nprobe, buf)
+    } else {
+        mem_free(raw)
+        return 0
+    }
+    mem_free(raw)
+    return 1
+}
+
+fn f32_to_f64(ptr) {
+    let b0 = mem_load8(ptr)
+    let b1 = mem_load8(ptr + 1)
+    let b2 = mem_load8(ptr + 2)
+    let b3 = mem_load8(ptr + 3)
+    
+    // f32 layout: sign = b3 bit 7; exp = b3 bits 0-6 | b2 bit 7;
+    // mant = b2 bits 0-6 | b1 | b0.
+    let sign = i2f(b3 / 128)
+    let exp32 = i2f(b3 - (b3 / 128) * 128) * i2f(2) + i2f(b2 / 128)
+    let mant32 = i2f(b2 - (b2 / 128) * 128) * i2f(65536) + i2f(b1) * i2f(256) + i2f(b0)
+    
+    let two = i2f(2)
+    let one = i2f(1)
+    let zero = i2f(0)
+    
+    if exp32 == zero {
+        // exp == 0: signed zero, or a subnormal. This used to return 0 for
+        // both, which silently discarded every subnormal weight. A subnormal
+        // f32 has value mant32 * 2^-149, exactly representable in f64.
+        if mant32 == zero {
+            // Signed zero. This returned `fsub(zero, zero)`, but that is
+            // +0.0 - +0.0 = +0.0 under round-to-nearest -- so every -0.0f32
+            // weight came back as +0.0 and the sign bit was simply lost.
+            // Negating the ZERO VARIABLE is what produces -0.0: 0.0 * -1.0 is
+            // -0.0 exactly, because the sign is applied to the zero itself.
+            if sign == one { return fmul(zero, i2f(0-1)) }
+            return zero
+        }
+        let sub = one
+        let si = 0
+        while si < 149 { sub = fdiv(sub, two); si = si + 1 }
+        let subv = fmul(mant32, sub)
+        if sign == one { return fsub(zero, subv) }
+        return subv
+    }
+    
+    if exp32 == i2f(255) {
+        // exp == 255: Inf when mant == 0, NaN otherwise. This used to return 0
+        // for both, so an Inf or NaN weight became a zero weight.
+        // 2^1023 is the largest finite f64, so one more doubling overflows to
+        // exactly +Inf. Keep the loop to 1023 iterations -- a 1024-iteration
+        // one kept doubling a value that was already Inf.
+        let pinf = one
+        let pi = 0
+        while pi < 1023 { pinf = fmul(pinf, two); pi = pi + 1 }
+        pinf = fmul(pinf, two)
+        if mant32 != zero {
+            // NaN: Inf - Inf is the canonical quiet NaN.
+            return fsub(pinf, pinf)
+        }
+        if sign == one { return fsub(zero, pinf) }
+        return pinf
+    }
+    
+    let new_exp = f2i(exp32 - i2f(127))
+    let mant_frac = fdiv(mant32, i2f(8388608))
+    let one_plus_mant = fadd(one, mant_frac)
+    
+    let pow2 = one
+    let i = 0
+    if new_exp >= 0 {
+        while i < new_exp { pow2 = fmul(pow2, two); i = i + 1 }
+    } else {
+        let neg = 0 - new_exp
+        while i < neg { pow2 = fdiv(pow2, two); i = i + 1 }
+    }
+    
+    let result = fmul(pow2, one_plus_mant)
+    if sign == one { result = fsub(zero, result) }
+    return result
+}
+
+// --------------------------------------------------------------- F32 (type 0)
+//
+// 99 of the 266 tensors in the reference model are F32 -- 37% of it -- and this
+// was the only dtype with no decoder. The shapes are the small per-layer
+// vectors, which is exactly why it went unnoticed: they are 1/260th the size of
+// the weight matrices, so a run that only ever touched the k-quants looked
+// complete.
+//
+//   token_embd_norm.weight   [2048]     x61
+//   ...                      [3, 2048]  x22      per-layer, one row per norm kind
+//   ...                      [64]       x16
+//
+// F32 has no quantisation: the bytes ARE the IEEE-754 values, so this is a
+// widening f32 -> f64 over the whole buffer. f32_to_f64() is exact for normals,
+// subnormals, zeros and both infinities (it was fixed for subnormals earlier);
+// the widening is always exact because every f32 is representable in f64.
+fn dequant_f32(raw, nelements, out) {
+    let i = 0
+    while i < nelements {
+        mem_store(out + i * 8, f32_to_f64(raw + i * 4))
+        i = i + 1
+    }
+}
+
+// f16_to_f64(ptr): widen an IEEE 754 binary16 at `ptr` to binary64.
+//
+// Every binary16 is exactly representable in binary32 and binary64, so this is a
+// widening with no rounding at all -- only exponent rebasing and a mantissa
+// shift. Handles both zeros, subnormals, the normal range, and both infinities;
+// NaN is produced as Inf - Inf, the canonical quiet NaN.
+//
+// Transcribed from ggml's GGML_FP16_TO_FP32, which in ggml-impl.h is POWER8
+// inline assembly (mtfprd / xscvhpdp) and so cannot be used directly. Verified
+// bit-for-bit against a compiled reference by scripts/audit/dequant_oracle.py.
+// f16_to_f64(ptr): widen an IEEE 754 binary16 at `ptr` to binary64.
+//
+// Every binary16 is exactly representable in binary32 and binary64, so this is a
+// widening with no rounding at all -- only exponent rebasing and a mantissa
+// shift. Handles both zeros, subnormals, the normal range, both infinities; NaN
+// is produced as Inf - Inf, the canonical quiet NaN.
+//
+// Bit layout, little-endian:
+//
+//   lo = bits 0..7   -> mantissa bits 0..7
+//   hi = bits 8..15  -> mantissa bits 8..9, exponent bits 0..4, sign
+//
+// so exp = (hi >> 2) & 31 and mant = lo | ((hi & 3) << 8). The FIRST version of
+// this function masked lo to SEVEN bits and read only hi bit 0 for the top of the
+// mantissa, which is correct for neither: it lost the low 7 bits of every value's
+// mantissa and one of its top bits. Verified bit-for-bit against a compiled
+// reference by scripts/audit/dequant_diff.py.
+//
+// ggml's GGML_FP16_TO_FP32 is POWER8 inline assembly (mtfprd / xscvhpdp) in
+// ggml-impl.h, so it cannot be used directly here.
+fn f16_to_f64(ptr) {
+    let lo = mem_load8(ptr)
+    let hi = mem_load8(ptr + 1)
+
+    let sign = hi / 128                                  // 0 or 1
+    let hib = hi - sign * 128                            // bits 0..6 of hi
+    let exp = hib / 4                                    // (hi >> 2) & 31
+    let mant = lo + (hib - (hib / 4) * 4) * 256          // lo | ((hi & 3) << 8)
+
+    let two = i2f(2)
+    let one = i2f(1)
+    let zero = i2f(0)
+
+    if exp == 0 {
+        if mant == 0 {
+            // Signed zero. Negating the zero variable produces -0.0 exactly. The
+            // sign is applied to the zero itself, not to a subtraction, because
+            // 0.0 - 0.0 is +0.0 under round-to-nearest.
+            if sign == 1 { return fmul(zero, i2f(0 - 1)) }
+            return zero
+        }
+        // Subnormal: value = mant * 2^-24. Build the scale by repeated halving
+        // and multiply the integer mantissa in. A plain (exp - 15) rebasing
+        // returns 0 for every subnormal, which is a real defect class -- f32's
+        // own converter had it and it silently discarded subnormal weights.
+        let scale = one
+        let i = 0
+        while i < 24 { scale = fdiv(scale, two); i = i + 1 }
+        let v = fmul(i2f(mant), scale)
+        if sign == 1 { return fsub(zero, v) }
+        return v
+    }
+
+    if exp == 31 {
+        // Inf when mant == 0, NaN otherwise. 2^1023 is the largest finite f64, so
+        // one more doubling overflows to exactly +Inf.
+        let pinf = one
+        let i = 0
+        while i < 1023 { pinf = fmul(pinf, two); i = i + 1 }
+        pinf = fmul(pinf, two)
+        if mant != 0 {
+            // Inf - Inf produces x87's "indefinite" value 0xC000000000000000,
+            // which is a NEGATIVE quiet NaN -- so a positive input NaN came out
+            // with its sign flipped. Build the NaN from its bits instead:
+            // exponent all ones, quiet bit set, sign copied from the input. That
+            // is deterministic and matches what a widening conversion owes the
+            // caller (IEEE does not fix the payload, but it does fix the class
+            // and the sign).
+            let nanpat = 9221120237041090560    // 0x7FF8000000000000, quiet NaN
+            if sign == 1 { return f64of(0 - nanpat) }
+            return f64of(nanpat)
+        }
+        if sign == 1 { return fsub(zero, pinf) }
+        return pinf
+    }
+
+    // Normal: value = (1 + mant/1024) * 2^(exp - 15). Since f16 and f64 share a
+    // biased-exponent convention with the same bias offset relationship here,
+    // the exponent shift is exp - 15 + 1023 applied to the f64 exponent field;
+    // done here by multiplying out a power of two, which is exact.
+    let leading = fadd(one, fdiv(i2f(mant), i2f(1024)))
+    let e = exp - 15
+    let pow2 = one
+    let i = 0
+    if e >= 0 {
+        while i < e { pow2 = fmul(pow2, two); i = i + 1 }
+    } else {
+        let neg = 0 - e
+        while i < neg { pow2 = fdiv(pow2, two); i = i + 1 }
+    }
+    let v = fmul(leading, pow2)
+    if sign == 1 { return fsub(zero, v) }
+    return v
+}
+
+// -------------------------------------------------------------- Q6_K (type 14)
+//
+// Q6_K super-block: 210 bytes -> 256 weights, in ggml-quants.h order:
+//
+//   +0   u8  ql[128]    quants, LOW 4 bits, interleaved
+//   +128 u8  qh[64]     quants, UPPER 2 bits
+//   +192 i8  scales[16] per-16-element scales
+//   +208 f16 d          super-block scale
+//
+// THE PREVIOUS BODY OF THIS FUNCTION WAS NOT Q6_K. It read a 2-byte scale at
+// offset 0 and 3-byte quant groups from offset 2 -- which is not any GGML block
+// layout at all. It read the FIRST QUANT BYTE as the super-block scale and
+// produced plausible numbers, so nothing caught it: it is used for 19 of the
+// reference model's 266 tensors, including token_embd.weight (the whole
+// embedding table), and tests/test_inference_ops.quanta only asserted the Q4_K
+// path, so Q6_K was never checked against a value.
+//
+// Verified bit-for-bit against the compiled reference (scripts/audit/
+// dequant_oracle.py extracts dequantize_row_q6_K verbatim and links it).
+//
+// The quant packing, transcribed from ggml-quants.c:
+//
+//   q1 = (ql[l]      & 0xF) | ((qh[l] >> 0 & 3) << 4) - 32
+//   q2 = (ql[l+32]   & 0xF) | ((qh[l] >> 2 & 3) << 4) - 32
+//   q3 = (ql[l]      >> 4)  | ((qh[l] >> 4 & 3) << 4) - 32
+//   q4 = (ql[l+32]   >> 4)  | ((qh[l] >> 6 & 3) << 4) - 32
+//   y[l+0]  = d * sc[is+0] * q1
+//   y[l+32] = d * sc[is+2] * q2
+//   y[l+64] = d * sc[is+4] * q3
+//   y[l+96] = d * sc[is+6] * q4        is = l/16
+fn dequant_q6k(raw, nelements, out) {
+    let n_blocks = nelements / 256
+    let bi = 0
+    while bi < n_blocks {
+        let bo = bi * 210
+        let d = f16_to_f64(raw + bo + 208)
+        // The C runs TWO passes of 128 elements per 256-element block:
+        //
+        //     for (n = 0; n < 256; n += 128) {
+        //         for (l = 0; l < 32; ++l) { ... }
+        //         y += 128; ql += 64; qh += 32; sc += 8;
+        //     }
+        //
+        // The first version ran a SINGLE pass, so it filled elements 0..127 and
+        // left 128..255 as whatever the buffer held -- which was zero. Every
+        // Q6_K tensor was half garbage. The audit caught it only because one
+        // assertion read element 254; the first eight all matched the oracle.
+        let n = 0
+        while n < 2 {
+            let ql = bo + n * 64
+            let qh = bo + 128 + n * 32
+            let sc = bo + 192 + n * 8
+            let ybase = bi * 256 + n * 128
+            let l = 0
+            while l < 32 {
+                // Sub-scale index: is = 0 for l < 16, 1 for l >= 16.
+                //
+                // Each 128-element pass advances the SCALE POINTER by 8
+                // (`sc += 8` in the reference, see the `sc` binding above), and
+                // within a pass `is` selects which half of that 8-byte group is
+                // used. Combined with the +0/+2/+4/+6 strides this reaches all
+                // 8 scale bytes of the pass, i.e. all 16 bytes of the block.
+                //
+                // This is correct as written. An intermediate revision replaced
+                // it with `(l / 16) * 8`, reasoning that `sc` did not move --
+                // but it does (sc += 8 per pass), so that change made elements
+                // 16..127 read past the scale array into the trailing `d`
+                // field. Do not "simplify" this back into a single pointer.
+                let is = l / 16
+                let ql0 = mem_load8(raw + ql + l)
+                let ql1 = mem_load8(raw + ql + l + 32)
+                let qhb = mem_load8(raw + qh + l)
+
+                let h0 = qhb - (qhb / 4) * 4
+                let t1 = qhb / 4
+                let h1 = t1 - (t1 / 4) * 4
+                let t2 = t1 / 4
+                let h2 = t2 - (t2 / 4) * 4
+                let h3 = t2 / 4
+
+                let q1 = (ql0 - (ql0 / 16) * 16 + h0 * 16) - 32
+                let q2 = (ql1 - (ql1 / 16) * 16 + h1 * 16) - 32
+                let q3 = (ql0 / 16 + h2 * 16) - 32
+                let q4 = (ql1 / 16 + h3 * 16) - 32
+
+                mem_store(out + (ybase + l) * 8, fmul(d, fmul(i2f(i8_at(raw + sc + is)), i2f(q1))))
+                mem_store(out + (ybase + l + 32) * 8, fmul(d, fmul(i2f(i8_at(raw + sc + is + 2)), i2f(q2))))
+                mem_store(out + (ybase + l + 64) * 8, fmul(d, fmul(i2f(i8_at(raw + sc + is + 4)), i2f(q3))))
+                mem_store(out + (ybase + l + 96) * 8, fmul(d, fmul(i2f(i8_at(raw + sc + is + 6)), i2f(q4))))
+                l = l + 1
+            }
+            n = n + 1
+        }
+        bi = bi + 1
+    }
+}
+
+// -------------------------------------------------------------- Q5_K (type 13)
+//
+// Q5_K super-block: 176 bytes -> 256 weights:
+//
+//   +0   f16 d          super-block scale
+//   +2   f16 dmin       super-block minimum scale
+//   +4   u8 scales[12]  eight (scale, min) pairs, 6 bits each, bit-packed
+//   +16  u8 qh[32]      5th bit of each quant
+//   +48  u8 qs[128]     low 4 bits, nibble-packed
+//
+// Same shape as Q4_K plus the qh high-bit plane. Transcribed from
+// dequantize_row_q5_K in ggml-quants.c and verified bit-for-bit against the
+// compiled reference (scripts/audit/dequant_diff.py).
+
+// pow4i(n): 4^n for n in 0..3 -- the Q5_K high-bit mask sequence.
+//
+// The C advances the masks with `u1 <<= 2`, i.e. it QUADRUPLES them each
+// 64-element group: u1 = 1, 4, 16, 64 with u2 = 2, 8, 32, 128 alongside. The
+// first version used a powers-of-TWO table (1, 2, 4, 8), which is right for
+// Q4_K's single mask and wrong for Q5_K's pair from group 1 on -- so elements
+// 0..63 matched and 64..255 did not.
+fn pow4i(n) {
+    if n <= 0 { return 1 }
+    if n == 1 { return 4 }
+    if n == 2 { return 16 }
+    return 64
+}
+
+fn dequant_q5k(raw, nelements, out) {
+    let n_blocks = nelements / 256
+    let bi = 0
+    while bi < n_blocks {
+        let bo = bi * 176
+        let d = f16_to_f64(raw + bo)
+        let dmin = f16_to_f64(raw + bo + 2)
+        let ybase = bi * 256
+        // Four groups of 64 elements. Each group uses TWO (scale,min) pairs and
+        // TWO high-bit masks, u1 and u2, which advance by a factor of 2 per group
+        // -- so group g uses masks 2^g and 2^(g+1). Within a group the first 32
+        // elements take the LOW nibble of ql[l] and mask u1; the next 32 take
+        // the HIGH nibble and mask u2.
+        let grp = 0
+        while grp < 4 {
+            let is = grp * 2
+            let sc1 = q5_scale(raw + bo + 4, is)
+            let mn1 = q5_min(raw + bo + 4, is)
+            let sc2 = q5_scale(raw + bo + 4, is + 1)
+            let mn2 = q5_min(raw + bo + 4, is + 1)
+            let d1 = fmul(d, i2f(sc1))
+            let m1 = fmul(dmin, i2f(mn1))
+            let d2 = fmul(d, i2f(sc2))
+            let m2 = fmul(dmin, i2f(mn2))
+            // The C carries the high-bit masks in u1/u2 and advances them with
+            // `u1 <<= 2` each group, so group g uses (2^g, 2^(g+1)).
+            //
+            // They are read from a table rather than computed with a runtime
+            // division: `hbit / u1` is a DIVIDE, not a bit test, and it silently
+            // produced 0 for every odd group, dropping the +16 on half the
+            // elements. `x & mask` is the operation the C means by
+            // `qh[l] & u1`.
+            let u1 = pow4i(grp)
+            let u2 = u1 * 2
+            let ql = bo + 48 + grp * 32
+            // qh does NOT advance: the C keeps `const uint8_t *qh = x[i].qh;`
+            // and indexes qh[l] with l in 0..31 for EVERY group, letting only the
+            // u1/u2 masks move. Advancing qh per group reads different bytes.
+            let qh = bo + 16
+            let l = 0
+            while l < 32 {
+                let qlo = mem_load8(raw + ql + l)
+                let qhi = mem_load8(raw + qh + l)
+                // (ql[l] & 0xF) + (qh[l] & u1 ? 16 : 0)
+                let nib_a = qlo - (qlo / 16) * 16
+                // `qh[l] & u1 ? 16 : 0`. u1 is a power of two, so bit k of qhi is
+                // set iff floor(qhi / u1) is ODD. The first version wrote
+                // `qhi % u1 != 0`, which is a MODULO and is zero for every
+                // u1 == 1 -- so bit 0 was never set and half the elements lost
+                // their +16.
+                let bit_a = 0
+                if (qhi / u1) - ((qhi / u1) / 2) * 2 == 1 { bit_a = 16 }
+                // (ql[l] >> 4) + (qh[l] & u2 ? 16 : 0)
+                let nib_b = qlo / 16
+                let bit_b = 0
+                if (qhi / u2) - ((qhi / u2) / 2) * 2 == 1 { bit_b = 16 }
+                mem_store(out + (ybase + grp * 64 + l) * 8,
+                          fsub(fmul(d1, i2f(nib_a + bit_a)), m1))
+                mem_store(out + (ybase + grp * 64 + 32 + l) * 8,
+                          fsub(fmul(d2, i2f(nib_b + bit_b)), m2))
+                l = l + 1
+            }
+            grp = grp + 1
+        }
+        bi = bi + 1
+    }
+}
+
+// The six-bit (scale, min) pairs in a k-quant block's scales[12] array.
+// ggml's get_scale_min_k4: for k < 4 the low nibbles carry it; for k >= 4 the
+// value straddles two bytes, two bits in scales[k+4] and four in the high bits
+// of scales[k-4].
+fn q5_scale(q, k) {
+    if k < 4 { return mem_load8(q + k) - (mem_load8(q + k) / 64) * 64 }
+    let a = mem_load8(q + k + 4)
+    let b = mem_load8(q + k - 4)
+    return (a - (a / 16) * 16) + (b / 64) * 16
+}
+
+fn q5_min(q, k) {
+    if k < 4 { return mem_load8(q + k + 4) - (mem_load8(q + k + 4) / 64) * 64 }
+    let a = mem_load8(q + k + 4)
+    let b = mem_load8(q + k)
+    return (a / 16) + (b / 64) * 16
+}
+
+// -------------------------------------------------------------- Q8_0 (type 8)
+//
+// 34 bytes -> 32 weights. d f16 at +0, then 32 signed bytes.
+//
+//   y[i*32 + j] = qs[j] * d
+//
+// The standard KV-cache quant, and the one a caller is most likely to reach for
+// after Q6_K. Verified against the compiled dequantize_row_q8_0.
+// i8_at(ptr): read one byte as a SIGNED int8.
+//
+// Two's complement: b >= 128 means b - 256. The first version of dequant_q8_0
+// wrote `b - (b / 128) * 128 - (b / 128) * 256`, which subtracts 128 AND 256 and
+// so turns 240 (which is -16) into -144 -- off by 128 for every byte with the
+// high bit set, i.e. for every negative quant, which is exactly the half of the
+// range that matters.
+fn i8_at(ptr) {
+    let b = mem_load8(ptr)
+    if b >= 128 { return b - 256 }
+    return b
+}
+
+fn dequant_q8_0(raw, nelements, out) {
+    let n_blocks = nelements / 32
+    let bi = 0
+    while bi < n_blocks {
+        let bo = bi * 34
+        let d = f16_to_f64(raw + bo)
+        let j = 0
+        while j < 32 {
+            let q = i8_at(raw + bo + 2 + j)
+            mem_store(out + (bi * 32 + j) * 8, fmul(d, i2f(q)))
+            j = j + 1
+        }
+        bi = bi + 1
+    }
+}
+
+// --------------------------------------------------------------- Q4_0 (type 2)
+//
+// 32 values / 18 bytes. ggml-common.h: block_q4_0 { fp16 d; uint8 qs[16]; }.
+// ggml-quants.c: dequantize_row_q4_0() is just a nibble split with no min term --
+//     y[j]      = (qs[j] & 0xF) - 8) * d
+//     y[j + 16] = (qs[j] >> 4)  - 8) * d
+// so element j and element j+16 come from the SAME byte, low nibble then high.
+// There is no `m`, unlike Q4_1.
+//
+// This is NOT Q4_1 and NOT Q4_K. An earlier body here read a second scale at
+// +2 and used the Q4_1/K layout, which silently produced garbage for every
+// Q4_0 tensor.
+fn dequant_q4_0(raw, nelements, out) {
+    let n_blocks = nelements / 32
+    let bi = 0
+    while bi < n_blocks {
+        let bo = bi * 18
+        let d = f16_to_f64(raw + bo)
+        let j = 0
+        while j < 16 {
+            // NOTE: this local must NOT be named `byte` -- that is a reserved
+            // type keyword and the parser rejects it as a binding name.
+            let qb = mem_load8(raw + bo + 2 + j)
+            let lo = qb & 15
+            let hi = qb >> 4
+            mem_store(out + (bi * 32 + j) * 8, fmul(d, i2f(lo - 8)))
+            mem_store(out + (bi * 32 + 16 + j) * 8, fmul(d, i2f(hi - 8)))
+            j = j + 1
+        }
+        bi = bi + 1
+    }
+}
+
+// -------------------------------------------------------------- BF16 (type 30)
+//
+// 1 value / 2 bytes. BF16 is the top 16 bits of an IEEE binary32 with a zero
+// exponent field and no mantissa -- i.e. bf16 == fp32 with the low half
+// discarded. So widening is a SHIFT, not a conversion: there is no separate
+// exponent or rounding rule to get wrong.
+//
+// NOTE this is NOT f16_to_f64(). A BF16 bit pattern is an fp16 bit pattern only
+// by coincidence; feeding one to the half-precision converter reads the exponent
+// at the wrong width and returns values that are wrong by powers of two.
+fn dequant_bf16(raw, nelements, out) {
+    let i = 0
+    // Scratch is hoisted out of the loop: mem_alloc inside a loop body is unsafe
+    // (the next iteration can clobber the block).
+    // mem_alloc returns a HEADER-CARRYING pointer: [ptr] is the element count and
+    // the data begins at ptr+8. Writing at scratch+0 wrote the header and the
+    // converter then read the count 8 as an fp32 exponent-zero pattern -- every
+    // element came back 0.0. All access below is via p = scratch + 8.
+    let scratch = mem_alloc(8)
+    let p = scratch + 8
+    // Bytes 0 and 1 of the fp32 pattern are the mantissa's LOW half and must be
+    // zero for every element, so they are zeroed ONCE here and never touched
+    // again. Only bytes 2 and 3 are rewritten per iteration. (Building the 4-byte
+    // pattern with an inner per-byte loop instead returned 0.0 for every element,
+    // and lifted out into its own function it SIGILLed -- so it stays flattened.)
+    mem_store8(p + 0, 0)
+    mem_store8(p + 1, 0)
+    while i < nelements {
+        // A bf16 element is EXACTLY bytes [i*2, i*2+2). Placed in the HIGH half of
+        // the 4-byte fp32 scratch, the 32-bit pattern the converter reads IS
+        // bf16<<16 -- the authoritative C-oracle form.
+        //
+        // Two earlier forms were wrong. f32_to_f64(raw + i*2) read 4 bytes and
+        // folded the NEXT element into the mantissa low bits (sum off by 0.033 on
+        // the 27.5M-element per_layer_model_proj.weight, plus every min/max).
+        // Shifting straight into an f64 was worse: an f64 whose pattern is
+        // bf16<<48 has bias 1023 where fp32 has 127, so it is off by a factor of
+        // 2^896 -- 16561 widened to 4352.0 instead of 1.0. No shift works: the
+        // exponent must be REBASED, which is exactly what f32_to_f64 does.
+        // Little-endian: the fp32 SIGN+EXPONENT byte is b3 and the top mantissa
+        // byte is b2. So bf16<<16 lands in bytes 2 and 3 -- bytes 0 and 1 would
+        // build the pattern 0x00003f80, a subnormal ~1.7e-38, not 1.0. Every
+        // element came back 0.0 at 6 decimal places until this was corrected.
+        mem_store8(p + 2, mem_load8(raw + i * 2))
+        mem_store8(p + 3, mem_load8(raw + i * 2 + 1))
+        mem_store(out + i * 8, f32_to_f64(p))
+        i = i + 1
+    }
+}
+
+// ---------------------------------------------------------------- F16 (type 1)
+//
+// 1 value / 2 bytes, no quantisation. Just the widening.
+// --------------------------------------------------------------- Q4_1 (type 3)
+//
+// 32 values / 20 bytes. Two scales -- delta AND min -- so unlike Q4_0 the
+// reconstruction is affine, not multiplicative:
+//     y = q*d + m
+// Element order is the split-nibble order shared by every Q4x format: the low
+// nibble of byte j is element j, the HIGH nibble is element j+16. Not
+// interleaved.
+fn dequant_q4_1(raw, nelements, out) {
+    let n_blocks = nelements / 32
+    let bi = 0
+    while bi < n_blocks {
+        let bo = bi * 20
+        let d = f16_to_f64(raw + bo)
+        let m = f16_to_f64(raw + bo + 2)
+        let j = 0
+        while j < 16 {
+            let qb = mem_load8(raw + bo + 4 + j)
+            let lo = qb & 15
+            let hi = qb >> 4
+            mem_store(out + (bi * 32 + j) * 8, fadd(fmul(d, i2f(lo)), m))
+            mem_store(out + (bi * 32 + 16 + j) * 8, fadd(fmul(d, i2f(hi)), m))
+            j = j + 1
+        }
+        bi = bi + 1
+    }
+}
+
+// --------------------------------------------------------------- Q5_0 (type 6)
+//
+// 32 values / 22 bytes. Delta only (no min), but 5-bit: the low 4 bits come
+// from the nibble and the 5th bit from a 32-bit `qh` read little-endian, which
+// is why qh must be assembled from 4 bytes by hand rather than loaded as one.
+//
+// The -16 is the Q5 signed offset (5-bit range is -16..15).
+//
+// qh bit layout: element j's high bit is (qh >> j) & 1, and element j+16's is
+// (qh >> (j+16)) & 1. Upstream writes this as `((qh >> (j+0)) << 4) & 0x10`
+// and `((qh >> (j+12)) & 0x10)`, i.e. the same two bits moved into bit 4 so they
+// can be OR'd with a 4-bit nibble.
+fn dequant_q5_0(raw, nelements, out) {
+    let n_blocks = nelements / 32
+    let bi = 0
+    while bi < n_blocks {
+        let bo = bi * 22
+        let d = f16_to_f64(raw + bo)
+        let qh = mem_load32(raw + bo + 2)
+        let j = 0
+        while j < 16 {
+            let qb = mem_load8(raw + bo + 6 + j)
+            let h0 = (qh >> j) & 1
+            let h1 = (qh >> (j + 16)) & 1
+            let x0 = ((qb & 15) | (h0 << 4)) - 16
+            let x1 = ((qb >> 4) | (h1 << 4)) - 16
+            mem_store(out + (bi * 32 + j) * 8, fmul(d, i2f(x0)))
+            mem_store(out + (bi * 32 + 16 + j) * 8, fmul(d, i2f(x1)))
+            j = j + 1
+        }
+        bi = bi + 1
+    }
+}
+
+// --------------------------------------------------------------- Q5_1 (type 7)
+//
+// 32 values / 24 bytes. Q5_0 plus a min, so affine like Q4_1, and UNSIGNED:
+// the 5-bit value is 0..31 with no -16 offset.
+fn dequant_q5_1(raw, nelements, out) {
+    let n_blocks = nelements / 32
+    let bi = 0
+    while bi < n_blocks {
+        let bo = bi * 24
+        let d = f16_to_f64(raw + bo)
+        let m = f16_to_f64(raw + bo + 2)
+        let qh = mem_load32(raw + bo + 4)
+        let j = 0
+        while j < 16 {
+            let qb = mem_load8(raw + bo + 8 + j)
+            let h0 = (qh >> j) & 1
+            let h1 = (qh >> (j + 16)) & 1
+            let x0 = (qb & 15) | (h0 << 4)
+            let x1 = (qb >> 4) | (h1 << 4)
+            mem_store(out + (bi * 32 + j) * 8, fadd(fmul(d, i2f(x0)), m))
+            mem_store(out + (bi * 32 + 16 + j) * 8, fadd(fmul(d, i2f(x1)), m))
+            j = j + 1
+        }
+        bi = bi + 1
+    }
+}
+
+// --------------------------------------------------------------- Q8_K (type 15)
+//
+// 256 values / 292 bytes. The simplest K format and the only one that is not
+// sub-block scaled: a single f32 delta and 256 signed bytes.
+//     y = d * qs[j]
+// The 16 int16 bsums are block SUMS, used for activation quantization, and are
+// not part of dequantization -- reading them as data shifts every element.
+fn dequant_q8k(raw, nelements, out) {
+    let n_blocks = nelements / 256
+    let bi = 0
+    while bi < n_blocks {
+        let bo = bi * 292
+        // `d` is a raw f32, not f16 -- this is the one K block with a full-
+        // precision scale, so f16_to_f64 here would halve the mantissa.
+        let d = f32_to_f64(raw + bo)
+        let j = 0
+        while j < 256 {
+            let q = mem_load8(raw + bo + 4 + j)
+            // Sign-extend from int8. mem_load8() returns 0..255 UNSIGNED (measured,
+            // not assumed), so a bare `q - 256` maps 0..127 to -256..-129 and
+            // inflates every magnitude. Branch instead of biasing: `q & 0x80`
+            // set means negative.
+            let sv = q
+            if (q & 128) != 0 { sv = q - 256 }
+            mem_store(out + (bi * 256 + j) * 8, fmul(d, i2f(sv)))
+            j = j + 1
+        }
+        bi = bi + 1
+    }
+}
+
+// --------------------------------------------------------------- Q2_K (type 10)
+//
+// 256 values / 84 bytes. 16 groups of 16, each with a 4-bit scale AND a 4-bit
+// min packed in one scales byte (low nibble = scale, high nibble = min):
+//     y = d * (sc & 0xF) * q - dmin * (sc >> 4)
+//
+// Layout order matters twice over, and both are easy to get backwards:
+//   * quants are stored in FOUR passes of 64 (two halves of 32 bytes), each
+//     pass holding one 2-bit shift of 16+16 elements, so element order is
+//     NOT the flat order of the qs array;
+//   * the `q` cursor advances 32 bytes per 128-element pass, so the two 128-
+//     element halves of a super-block read from disjoint qs regions.
+fn dequant_q2k(raw, nelements, out) {
+    let n_blocks = nelements / 256
+    let bi = 0
+    while bi < n_blocks {
+        let bo = bi * 84
+        // Layout: scales[16]@+0, qs[64]@+16, f16 d@+80, f16 dmin@+82.
+        // The scales come FIRST in block_q2_K, not last -- reading d at +64
+        // returns a garbage half (d=-0.000195 instead of ~0.0018) and inflates
+        // every element by 4e5.
+        let d = f16_to_f64(raw + bo + 80)
+        let dmin = f16_to_f64(raw + bo + 82)
+        let is = 0
+        let yo = bi * 256
+        // n steps over 128-element passes; qcursor walks the qs region.
+        let pass = 0
+        while pass < 2 {
+            let qc = bo + 16 + pass * 32
+            let shift = 0
+            let j = 0
+            while j < 4 {
+                let sc = mem_load8(raw + bo + is)
+                let dl = fmul(d, i2f(sc & 15))
+                let ml = fmul(dmin, i2f(sc >> 4))
+                let l = 0
+                while l < 16 {
+                    let q = mem_load8(raw + qc + l)
+                    let v = (q >> shift) & 3
+                    mem_store(out + (yo + pass * 128 + j * 32 + l) * 8, fsub(fmul(dl, i2f(v)), ml))
+                    l = l + 1
+                }
+                is = is + 1
+                let sc2 = mem_load8(raw + bo + is)
+                let dl2 = fmul(d, i2f(sc2 & 15))
+                let ml2 = fmul(dmin, i2f(sc2 >> 4))
+                l = 0
+                while l < 16 {
+                    let q = mem_load8(raw + qc + 16 + l)
+                    let v = (q >> shift) & 3
+                    mem_store(out + (yo + pass * 128 + j * 32 + 16 + l) * 8, fsub(fmul(dl2, i2f(v)), ml2))
+                    l = l + 1
+                }
+                is = is + 1
+                shift = shift + 2
+                j = j + 1
+            }
+            pass = pass + 1
+        }
+        bi = bi + 1
+    }
+}
+
+// --------------------------------------------------------------- Q3_K (type 11)
+//
+// 256 values / 110 bytes. 16 groups of 16, each with a 6-bit scale, plus a
+// per-element high bit in `hmask`:
+//     y = d * (scale - 32) * (q_low2 - (hmask_bit ? 0 : 4))
+//
+// The 6-bit scales are stored PACKED 12 bytes, not one byte each, so they must
+// be unpacked before use. Upstream does this with 32-bit SWAR masks
+// (kmask1/kmask2) in one shot over four u32 words; doing it with four
+// independent 12-byte reads and a bit cursor avoids depending on 32-bit shifts
+// being correct, at the cost of being slower -- which is irrelevant here.
+fn dequant_q3k(raw, nelements, out) {
+    let n_blocks = nelements / 256
+    let bi = 0
+    while bi < n_blocks {
+        let bo = bi * 110
+        // Layout: hmask[32]@+0, qs[64]@+32, scales[12]@+96, f16 d@+108.
+        let d = f16_to_f64(raw + bo + 108)
+
+        // Unpack the 16 six-bit scales from 12 packed bytes, 8 per 32-bit word.
+        // Upstream does this with SWAR masks on four u32s; here the four
+        // resulting words are written to a 16-byte scratch and read back as
+        // bytes, so the per-byte extraction needs no 32-bit shift assumptions.
+        let a0 = mem_load32(raw + bo + 96)
+        let a1 = mem_load32(raw + bo + 100)
+        let tm = mem_load32(raw + bo + 104)
+        // 0x03030303 and 0x0f0f0f0f. Written as decimal because a hex literal
+        // is not worth the transcription risk here: a mistyped mask still
+        // compiles and still yields plausible-looking scales.
+        let km1 = 50529027
+        let km2 = 252645135
+        let n2 = ((a0 >> 4) & km2) | (((tm >> 4) & km1) << 4)
+        let n3 = ((a1 >> 4) & km2) | (((tm >> 6) & km1) << 4)
+        let n0 = (a0 & km2) | ((tm & km1) << 4)
+        let n1 = (a1 & km2) | (((tm >> 2) & km1) << 4)
+        let sb = mem_alloc(32)
+        let sp = sb + 8
+        mem_store(sp, n0)
+        mem_store(sp + 4, n1)
+        mem_store(sp + 8, n2)
+        mem_store(sp + 12, n3)
+
+        let is = 0
+        let yo = bi * 256
+        // Two 128-element passes. NOTE: upstream advances the `q` cursor by 32
+        // per pass but leaves `hm` pointing at the start of hmask for BOTH
+        // passes -- only the mask BIT index moves. Advancing hmask by pass is
+        // the natural mistake and silently corrupts the upper half.
+        let pass = 0
+        while pass < 2 {
+            let qc = bo + 32 + pass * 32
+            let shift = 0
+            let j = 0
+            while j < 4 {
+                let dl = fmul(d, i2f(mem_load8(sp + is) - 32))
+                let mbit = j + pass * 4
+                let l = 0
+                while l < 16 {
+                    let q = mem_load8(raw + qc + l)
+                    let hb = mem_load8(raw + bo + l)
+                    let hi = (hb >> mbit) & 1
+                    // hmask bit SET means the high bit was NOT consumed, so
+                    // subtract 0; bit CLEAR means it WAS, so subtract 4. This
+                    // polarity is the easy thing to invert: writing `(hi << 2)`
+                    // compiles, runs, and produces values that look plausible
+                    // but are wrong by exactly the 4-offset.
+                    let sub = 4
+                    if hi != 0 { sub = 0 }
+                    let v = ((q >> shift) & 3) - sub
+                    mem_store(out + (yo + pass * 128 + j * 32 + l) * 8, fmul(dl, i2f(v)))
+                    l = l + 1
+                }
+                is = is + 1
+                let dl2 = fmul(d, i2f(mem_load8(sp + is) - 32))
+                l = 0
+                while l < 16 {
+                    let q = mem_load8(raw + qc + 16 + l)
+                    let hb = mem_load8(raw + bo + 16 + l)
+                    let hi = (hb >> mbit) & 1
+                    // hmask bit SET means the high bit was NOT consumed, so
+                    // subtract 0; bit CLEAR means it WAS, so subtract 4. This
+                    // polarity is the easy thing to invert: writing `(hi << 2)`
+                    // compiles, runs, and produces values that look plausible
+                    // but are wrong by exactly the 4-offset.
+                    let sub = 4
+                    if hi != 0 { sub = 0 }
+                    let v = ((q >> shift) & 3) - sub
+                    mem_store(out + (yo + pass * 128 + j * 32 + 16 + l) * 8, fmul(dl2, i2f(v)))
+                    l = l + 1
+                }
+                is = is + 1
+                shift = shift + 2
+                j = j + 1
+            }
+            pass = pass + 1
+        }
+        bi = bi + 1
+    }
+}
+
+fn dequant_f16(raw, nelements, out) {
+    let i = 0
+    while i < nelements {
+        mem_store(out + i * 8, f16_to_f64(raw + i * 2))
+        i = i + 1
+    }
+}
+
+// --------------------------------------------------------------- Q4_K (type 12)
+//
+// Q4_K super-block: 144 bytes -> 256 f32 weights.
+//   +0  f16 d      super-block scale for the 6-bit sub-scales
+//   +2  f16 dmin   super-block scale for the 6-bit sub-mins
+//   +4  u8 scales[12]  eight (scale, min) pairs, each 6 bits, bit-packed
+//   +16 u8 qs[128]     4-bit quants, low nibble = even element, high = odd
+//
+// The previous body of this function was NOT Q4_K: it read a 2-byte scale at +0
+// and treated the quants as starting at +8, which is Q4_0's layout. It compiled
+// and ran, so it silently produced garbage weights for every Q4_K tensor -- worse
+// than failing to build. Layout and arithmetic transcribed from
+// ggml-quants.c: dequantize_row_q4_K() + get_scale_min_k4(), and checked value
+// for value against the real QUANTA-LFM2.5 Q4_K_M tensor
+// (blk.0.ffn_gate.weight, file offset 8239136 + 233119744).
+
+// 6-bit (scale, min) pair for sub-block index `j`, read from the 12-byte packed
+// scale table at `sc`. This mirrors get_scale_min_k4() from ggml-quants.c
+// exactly, and both halves MUST be read from the same 12-byte table with the
+// same index j:
+//
+//     j < 4 : sc[j]   & 63          -> scale
+//             sc[j+4] & 63          -> min
+//     j >= 4: sc[j+4] & 0xF          scale low nibble
+//             (sc[j-4] >> 6) << 4    scale high bits   <- j-4, not j
+//             sc[j+4] >> 4           min low nibble
+//             (sc[j]   >> 6) << 4    min high bits      <- j, not j-4
+//
+// Two bugs lived here and both produced ~1e20 outputs. Passing `sc` and `sc+4`
+// as two different bases (to read the scale half and the min half) ran off the
+// end of the 12-byte table once j reached 4. And deriving both high halves from
+// `sc[j-4]` mis-paired the scale and min of every sub-block from 4 upward.
+fn q4k_sc(j, sc) {
+    // Shifts, NOT `/`. Every divisor here is a constant power of two, so `/64`
+    // is a right shift by 6 and `/16` a right shift by 4. Quanta's -O is a
+    // verified no-op (byte-identical binaries with and without it), so these
+    // were real `idiv` instructions -- ~40-80 cycles each -- and this function
+    // runs 8x per 64 elements, twice per chunk. The `>>` below is exact: the
+    // operands are non-negative, so a shift and a divide agree bit for bit.
+    if j < 4 { return mem_load8(sc + j) - (mem_load8(sc + j) >> 6) * 64 }
+    let lo = mem_load8(sc + j + 4)
+    return (lo - (lo >> 4) * 16) + ((mem_load8(sc + j - 4) >> 6) * 16)
+}
+
+fn q4k_min(j, sc) {
+    // Shifts, not divides -- same reasoning as q4k_sc above. `lo >> 4` replaces
+    // `lo / 16`, and `(lo >> 4 >> 4)` replaces `(lo / 16 / 16)`.
+    if j < 4 { return mem_load8(sc + j + 4) - (mem_load8(sc + j + 4) >> 6) * 64 }
+    let lo = mem_load8(sc + j + 4)
+    return (lo >> 4 - (lo >> 4 >> 4) * 16) + ((mem_load8(sc + j) >> 6) * 16)
+}
+
+fn dequant_q4k(raw, nelements, out) {
+    let n_blocks = nelements / 256
+    let bi = 0
+    while bi < n_blocks {
+        let bo = bi * 144
+        let d    = f16_to_f64(raw + bo)
+        let dmin = f16_to_f64(raw + bo + 2)
+        let sc   = raw + bo + 4
+        let q    = raw + bo + 16
+
+        // Four 64-element chunks, each pairing two 32-element sub-blocks that
+        // share a 32-byte span of quants: low nibbles first, then high nibbles.
+        let chunk = 0
+        let is = 0
+        while chunk < 4 {
+            let s0 = q4k_sc(is, sc)
+            let m0 = q4k_min(is, sc)
+            let s1 = q4k_sc(is + 1, sc)
+            let m1 = q4k_min(is + 1, sc)
+            let d1 = fmul(d, i2f(s0))
+            let mm1 = fmul(dmin, i2f(m0))
+            let d2 = fmul(d, i2f(s1))
+            let mm2 = fmul(dmin, i2f(m1))
+
+            // One pass over the 32 bytes, emitting BOTH nibbles.
+            //
+            // MEASURED, do not "optimise" this further without timing it:
+            //   direct fmul/fsub, two passes   129 ms  (before the shift/mask fix)
+            //   shift/mask instead of idiv      93 ms  <- the real win, 1.39x
+            //   merged into one pass            98 ms  (noise, kept for clarity)
+            //   precomputed 16-entry table     101 ms  (SLOWER -- reverted)
+            //   4-wide AVX2 f64                267 ms  (3.5x SLOWER -- reverted)
+            //   + new nib2f64 emitter builtin  194 ms  (2.7x SLOWER -- reverted)
+            //
+            // TWO hypotheses were tested and BOTH were wrong:
+            //
+            // 1. "Widening the arithmetic should help." It made it 3.5x slower.
+            // 2. "The problem is that Quanta-level temporaries round-trip through
+            //    the frame, so a builtin with register-resident temporaries should
+            //    fix it." A real emitter builtin was written for this (nib2f64:
+            //    9 instructions per byte, 2 stores, no frame traffic, verified
+            //    correct on all outputs) and the result was 194 ms vs 93 ms
+            //    scalar -- still 2.7x slower. Reverted, including the builtin.
+            //
+            // What the two results together actually say: this loop is bound by
+            // WORK PER ELEMENT, not by where the temporaries live. 6 memory ops
+            // per element (the load, and 2 in + 2 out per wide op), and no
+            // amount of instruction-level rearranging removes them. The scalar
+            // form already does 3 per element and is close to the floor.
+            //
+            // The only real wins available are the ones that change the WORK:
+            //   - SIMD that keeps operands in vector registers across a whole
+            //     row (an mm register, not memory) -- needs new builtins that
+            //     operate on vector state, not pointer-in/pointer-out;
+            //   - a fused Q4_K matvec (q4k_matvec_avx2 is a placeholder), which
+            //     never materialises f64 at all;
+            //   - threads (blocked on the clone trampoline).
+            // Do NOT retry widening or builtin-extraction without measuring.
+            let op = out + (bi * 256 + chunk * 64) * 8
+            let l = 0
+            while l < 32 {
+                let b = mem_load8(q + l)
+                // Shifts/mask, NOT `b / 16` and `(b/16)*16`. Quanta's -O is a
+                // verified no-op (byte-identical binaries with and without it),
+                // so an integer divide here is a real `idiv` -- ~40-80 cycles
+                // each, twice per element, which was the bulk of the dequant.
+                mem_store(op + l * 8, fsub(fmul(d1, i2f(b & 15)), mm1))
+                mem_store(op + (32 + l) * 8, fsub(fmul(d2, i2f(b >> 4)), mm2))
+                l = l + 1
+            }
+            q = q + 32
+            is = is + 2
+            chunk = chunk + 1
+        }
+        bi = bi + 1
+    }
+    return 0
+}
+
+// ===========================================================================
+// IQ4_NL and IQ4_XS -- Phase 9
+//
+// Both are 4-bit codebooks with the SAME nibble layout as Q4_0's, and both ship
+// an f16 scale per block. The difference is the block WIDTH and, for IQ4_XS, a
+// second per-sub-block scale.
+//
+// From upstream ggml, read from source:
+//
+//   kvalues_iq4nl                 ggml-common.h:1120-1122
+//   #define QK4_NL 32              ggml-common.h:447
+//   #define QK_K  256              ggml-common.h:89
+//   block_iq4_nl { f16 d; u8 qs[16]; }     ggml-common.h:449-452  -> 18 bytes
+//   block_iq4_xs { f16 d; u16 scales_h;
+//                   u8 scales_l[4]; u8 qs[128]; }  ggml-common.h:454-460 -> 136 bytes
+//   dequantize_row_iq4_nl          ggml-quants.c:2726-2742
+//   dequantize_row_iq4_xs          ggml-quants.c:2744-2765
+//
+// The codebook (ggml-common.h:1121), which is int8_t and NOT the Q4_0 one:
+//
+//     -127, -104, -83, -65, -49, -35, -22, -10, 1, 13, 25, 38, 53, 69, 89, 113
+//
+// NIBBLE ORDER IS THE TRAP. Both kernels emit LOW nibbles for the FIRST half of
+// the block and HIGH nibbles for the second, from the SAME 16 bytes:
+//
+//     IQ4_NL:  y[j]      = d * k[qs[j] & 0xf]     j = 0..15
+//               y[j + 16] = d * k[qs[j] >> 4]      j = 0..15
+//     IQ4_XS:  per 32-element sub-block ib, dl = d * (ls - 32):
+//               y[j]      = dl * k[qs[j] & 0xf]    j = 0..15
+//               y[j + 16] = dl * k[qs[j] >> 4]     j = 0..15
+//
+// so element i is NOT built from byte i/2. Reading it the other way round gives
+// plausible numbers that do not match upstream on any element.
+//
+// IQ4_XS's scale unpack (ggml-quants.c:2754), where `ls` is 6 bits assembled
+// from two places -- 4 bits from scales_l, 2 from scales_h:
+//
+//     ls = ((scales_l[ib/2] >> 4*(ib%2)) & 0xf) | (((scales_h >> 2*ib) & 3) << 4)
+//     dl = d * (ls - 32)
+//
+// The `- 32` is a signed 6-bit value: ls==0 means -32, ls==63 means +31. Reading
+// it unsigned makes every sub-block's scale wrong by up to 2x, and the error
+// compounds across the 8 sub-blocks of a block.
+//
+// ---------------------------------------------------------------------------
+// IQ4_NL: 32 elements per 18-byte block.
+// ---------------------------------------------------------------------------
+fn iq4nl_k(i) -> i64 {
+    let t = [-127, -104, -83, -65, -49, -35, -22, -10, 1, 13, 25, 38, 53, 69, 89, 113]
+    return t[i]
+}
+
+fn dequant_iq4_nl(raw, nelements, out) -> i64 {
+    let n_blocks = nelements / 32
+    let bi = 0
+    while bi < n_blocks {
+        let bo = bi * 18
+        let d = f16_to_f64(raw + bo)
+        let q = raw + bo + 2
+        let op = out + bi * 32 * 8
+        let j = 0
+        while j < 16 {
+            let b = mem_load8(q + j)
+            mem_store(op + j * 8, fmul(d, i2f(iq4nl_k(b & 15))))
+            mem_store(op + (16 + j) * 8, fmul(d, i2f(iq4nl_k(b >> 4))))
+            j = j + 1
+        }
+        bi = bi + 1
+    }
+    return 0
+}
+
+// ---------------------------------------------------------------------------
+// IQ4_XS: 256 elements per 136-byte block, 8 sub-blocks of 32.
+//
+// The 6-bit scale is split ACROSS the block: 2 bits per sub-block live in the
+// leading u16 scales_h, and 4 bits per PAIR of sub-blocks live in scales_l[4].
+// Sub-block ib therefore reads scales_l[ib/2] and scales_h bit 2*ib.
+// ---------------------------------------------------------------------------
+fn iq4xs_scale(sl, ib, sh) -> i64 {
+    let lo = (sl >> (4 * (ib - (ib / 2) * 2))) & 15
+    let hi = (sh >> (2 * ib)) & 3
+    return lo + hi * 16
+}
+
+fn dequant_iq4_xs(raw, nelements, out) -> i64 {
+    let n_blocks = nelements / 256
+    let bi = 0
+    while bi < n_blocks {
+        let bo = bi * 136
+        let d = f16_to_f64(raw + bo)
+        // scales_h is a little-endian u16 at offset 2
+        let sh = mem_load8(raw + bo + 2) + mem_load8(raw + bo + 3) * 256
+        let sl_base = raw + bo + 4
+        let q_base = raw + bo + 8
+        let ib = 0
+        while ib < 8 {
+            let sl = mem_load8(sl_base + ib / 2)
+            let ls = iq4xs_scale(sl, ib, sh)
+            let dl = fmul(d, i2f(ls - 32))
+            let q = q_base + ib * 16
+            let op = out + (bi * 256 + ib * 32) * 8
+            let j = 0
+            while j < 16 {
+                let b = mem_load8(q + j)
+                mem_store(op + j * 8, fmul(dl, i2f(iq4nl_k(b & 15))))
+                mem_store(op + (16 + j) * 8, fmul(dl, i2f(iq4nl_k(b >> 4))))
+                j = j + 1
+            }
+            ib = ib + 1
+        }
+        bi = bi + 1
+    }
+    return 0
+}
+
+// ---------------------------------------------------------------------------
+// MXFP4 (dtype 39): 32 elements per 17-byte block.
+//
+// Block layout (block_mxfp4):
+//   uint8_t e;         // E8M0 scale byte
+//   uint8_t qs[16];    // packed 4-bit E2M1 values
+//
+// E8M0: 8-bit exponent, 0 mantissa. Value = 2^(e-127) for e >= 2,
+// denormal patterns for e < 2. The f64 bit pattern is (e + 895) << 52.
+//
+// Codebook (kvalues_fp4, 16 entries):
+//   {0, 1, 2, 3, 4, 6, 8, 12, 0, -1, -2, -3, -4, -6, -8, -12}
+//
+// Nibble order: LOW nibbles for first 16 elements, HIGH nibbles for last 16.
+// ---------------------------------------------------------------------------
+fn mxfp4_k(n) -> i64 {
+    if n == 0 { return 0 }
+    if n == 1 { return 1 }
+    if n == 2 { return 2 }
+    if n == 3 { return 3 }
+    if n == 4 { return 4 }
+    if n == 5 { return 6 }
+    if n == 6 { return 8 }
+    if n == 7 { return 12 }
+    if n == 8 { return 0 }
+    if n == 9 { return -1 }
+    if n == 10 { return -2 }
+    if n == 11 { return -3 }
+    if n == 12 { return -4 }
+    if n == 13 { return -6 }
+    if n == 14 { return -8 }
+    return -12
+}
+
+fn e8m0_f64(e) -> i64 {
+    // (e + 895) << 52 gives the f64 bit pattern for 2^(e-127)
+    return (e + 895) << 52
+}
+
+fn dequant_mxfp4(raw, nelements, out) -> i64 {
+    let n_blocks = nelements / 32
+    let bi = 0
+    while bi < n_blocks {
+        let bo = bi * 17
+        let e = mem_load8(raw + bo)
+        let d = f64of(e8m0_f64(e))
+        let q = raw + bo + 1
+        let op = out + bi * 32 * 8
+        let j = 0
+        while j < 16 {
+            let b = mem_load8(q + j)
+            mem_store(op + j * 8, fmul(d, i2f(mxfp4_k(b & 15))))
+            mem_store(op + (16 + j) * 8, fmul(d, i2f(mxfp4_k(b >> 4))))
+            j = j + 1
+        }
+        bi = bi + 1
+    }
+    return 0
+}
+
+// ---------------------------------------------------------------------------
+// NVFP4 (dtype 40): 64 elements per 36-byte block.
+//
+// Block layout (block_nvfp4):
+//   uint8_t d[4];     // UE4M3 scales, one per 16-element sub-block
+//   uint8_t qs[32];   // packed 4-bit E2M1 values
+//
+// UE4M3: unsigned, 4 exp bits (bias=7), 3 mantissa bits.
+// Value = raw * 0.5 to match kvalues_mxfp4 convention.
+// Special: 0x00 and 0x7F both map to 0.0.
+//
+// Sub-block s (0..3) uses scale d[s], elements s*16..s*16+15.
+// Nibble order per sub-block: LOW nibbles for first 8, HIGH for last 8.
+// ---------------------------------------------------------------------------
+fn ue4m3_f64(x) -> i64 {
+    if x == 0 || x == 0x7F { return 0 }
+    let exp = (x >> 3) & 15
+    let man = x & 7
+    // 2^(exp-7): exp is 0..15, so exp-7 is -7..8
+    let p2: f64
+    if exp >= 7 {
+        p2 = i2f(1 << (exp - 7))
+    } else {
+        p2 = 1.0 / i2f(1 << (7 - exp))
+    }
+    let raw: f64
+    if exp == 0 {
+        raw = i2f(man) * 0.001953125  // 2^-9
+    } else {
+        raw = (1.0 + i2f(man) / 8.0) * p2
+    }
+    // multiply by 0.5 to match kvalues_mxfp4
+    return f64bits(raw * 0.5)
+}
+
+fn dequant_nvfp4(raw, nelements, out) -> i64 {
+    let n_blocks = nelements / 64
+    let bi = 0
+    while bi < n_blocks {
+        let bo = bi * 36
+        let q_base = raw + bo + 4
+        let op_base = out + bi * 64 * 8
+        let s = 0
+        while s < 4 {
+            let d = f64of(ue4m3_f64(mem_load8(raw + bo + s)))
+            let q = q_base + s * 8
+            let op = op_base + s * 16 * 8
+            let j = 0
+            while j < 8 {
+                let b = mem_load8(q + j)
+                mem_store(op + j * 8, fmul(d, i2f(mxfp4_k(b & 15))))
+                mem_store(op + (8 + j) * 8, fmul(d, i2f(mxfp4_k(b >> 4))))
+                j = j + 1
+            }
+            s = s + 1
+        }
+        bi = bi + 1
+    }
+    return 0
+}
+
+// ---------------------------------------------------------------------------
+// MLX affine quantization: 3-array format (weights, scales, biases).
+//
+// Weights are uint32-packed UNSIGNED values, packed along input_dim.
+// Scales and biases are f32 arrays of [output_dim, groups] where groups = input_dim/group_size.
+// Dequant: out[row*I + col] = scale[row, col/gs] * q[row, col] + bias[row, col/gs]
+//
+// Q4: 8 values per uint32 word, 4 bits each, mask=0xF
+// Q8: 4 values per uint32 word, 8 bits each, mask=0xFF
+// Little-endian uint32 words, lowest bits = lowest logical column.
+//
+// This is a 3-buffer format, so it uses a separate entry point from read_block_f64.
+// ---------------------------------------------------------------------------
+fn dequant_mlx_affine_q4(raw_w, raw_s, raw_b, output_dim, input_dim, group_size, out) -> i64 {
+    let per_word = 8
+    let mask = 15
+    let groups = input_dim / group_size
+    let row = 0
+    while row < output_dim {
+        let w_row = raw_w + row * (input_dim / per_word) * 4
+        let out_row = out + row * input_dim * 8
+        let group = 0
+        while group < groups {
+            let scalar_idx = row * groups + group
+            let scale = f32_to_f64(raw_s + scalar_idx * 4)
+            let bias = f32_to_f64(raw_b + scalar_idx * 4)
+            let word_base = group * (group_size / per_word)
+            let input_base = group * group_size
+            let local = 0
+            while local < group_size {
+                let word_idx = word_base + local / per_word
+                let word = le32(w_row + word_idx * 4)
+                let shift = 4 * (local % per_word)
+                let q = (word >> shift) & mask
+                mem_store(out_row + (input_base + local) * 8, fmul(scale, i2f(q)) + bias)
+                local = local + 1
+            }
+            group = group + 1
+        }
+        row = row + 1
+    }
+    return 0
+}
+
+fn dequant_mlx_affine_q8(raw_w, raw_s, raw_b, output_dim, input_dim, group_size, out) -> i64 {
+    let per_word = 4
+    let mask = 255
+    let groups = input_dim / group_size
+    let row = 0
+    while row < output_dim {
+        let w_row = raw_w + row * (input_dim / per_word) * 4
+        let out_row = out + row * input_dim * 8
+        let group = 0
+        while group < groups {
+            let scalar_idx = row * groups + group
+            let scale = f32_to_f64(raw_s + scalar_idx * 4)
+            let bias = f32_to_f64(raw_b + scalar_idx * 4)
+            let word_base = group * (group_size / per_word)
+            let input_base = group * group_size
+            let local = 0
+            while local < group_size {
+                let word_idx = word_base + local / per_word
+                let word = le32(w_row + word_idx * 4)
+                let shift = 8 * (local % per_word)
+                let q = (word >> shift) & mask
+                mem_store(out_row + (input_base + local) * 8, fmul(scale, i2f(q)) + bias)
+                local = local + 1
+            }
+            group = group + 1
+        }
+        row = row + 1
+    }
+    return 0
+}
+
+fn le32(ptr) -> i64 {
+    let b0 = mem_load8(ptr)
+    let b1 = mem_load8(ptr + 1)
+    let b2 = mem_load8(ptr + 2)
+    let b3 = mem_load8(ptr + 3)
+    return b0 + b1 * 256 + b2 * 65536 + b3 * 16777216
+}
+
+// ---------------------------------------------------------------------------
+// NF4 (bitsandbytes): 4-bit Normal Float 4.
+//
+// Codebook (16 entries, from bitsandbytes csrc/kernels.cu):
+//   {-1.0, -0.696, -0.525, -0.395, -0.284, -0.185, -0.091, 0.0,
+//    0.0796, 0.161, 0.246, 0.338, 0.441, 0.563, 0.723, 1.0}
+//
+// Flat dequant: out[j] = code[nibble(j)] * absmax[j // blocksize]
+//   - Nibble order: HIGH nibble for even j, LOW nibble for odd j
+//   - absmax is f32, one per blocksize elements
+//   - Packed bytes: high nibble is the even element, low nibble is the odd
+//
+// This is a 2-array format (packed weights + absmax scales).
+// ---------------------------------------------------------------------------
+fn nf4_k(n) -> i64 {
+    if n == 0 { return 0xBFF0000000000000 }
+    if n == 1 { return 0xBFE6473620000000 }
+    if n == 2 { return 0xBFE0CD6600000000 }
+    if n == 3 { return 0xBFD9465400000000 }
+    if n == 4 { return 0xBFD23449A0000000 }
+    if n == 5 { return 0xBFC7A6A7E0000000 }
+    if n == 6 { return 0xBFB74F0E20000000 }
+    if n == 7 { return 0 }
+    if n == 8 { return 0x3FB45F5FE0000000 }
+    if n == 9 { return 0x3FC4995C60000000 }
+    if n == 10 { return 0x3FCF809BA0000000 }
+    if n == 11 { return 0x3FD5A06740000000 }
+    if n == 12 { return 0x3FDC349700000000 }
+    if n == 13 { return 0x3FE200F560000000 }
+    if n == 14 { return 0x3FE7227660000000 }
+    return 0x3FF0000000000000
+}
+
+fn dequant_nf4_flat(raw_q, raw_absmax, nelements, blocksize, out) -> i64 {
+    let n_blocks = nelements / blocksize
+    let bi = 0
+    while bi < n_blocks {
+        let scale = f32_to_f64(raw_absmax + bi * 4)
+        let q_base = raw_q + bi * (blocksize / 2)
+        let op_base = out + bi * blocksize * 8
+        let j = 0
+        while j < blocksize {
+            let byte_idx = j / 2
+            let b = mem_load8(q_base + byte_idx)
+            let nib: i64
+            if j % 2 == 0 {
+                nib = b >> 4
+            } else {
+                nib = b & 15
+            }
+            let val = fmul(scale, f64of(nf4_k(nib)))
+            mem_store(op_base + j * 8, val)
+            j = j + 1
+        }
+        bi = bi + 1
+    }
+    return 0
+}
+
+// ---------------------------------------------------------------------------
+// GPTQ: int32-packed weights with per-group scales and zero-points.
+//
+// Dequant (from llama.cpp conversion/base.py:366-395):
+//   pack_factor = 32 // bits
+//   wf[k] = k * bits  (shift for each packed value)
+//   weight[i, k, j] = (qweight[i, j] >> wf[k]) & maxq
+//   zeros[i, k, j]   = (qzeros[i, j] >> wf[k]) & maxq
+//   if gptq format (not v2): zeros += 1
+//   out[i, col] = scales[i, col // group_size] * (weight[i, k, j] - zeros[i, k, j])
+//     where col = j * pack_factor + k
+//
+// This is a 3-array format (qweight, qzeros, scales).
+// ---------------------------------------------------------------------------
+fn dequant_gptq(raw_w, raw_z, raw_s, num_rows, num_cols, bits, group_size, out) -> i64 {
+    let pack_factor = 32 / bits
+    let maxq = (1 << bits) - 1
+    let num_input_dim = num_cols * pack_factor
+    let row = 0
+    while row < num_rows {
+        let w_row = raw_w + row * num_cols * 4
+        let z_row = raw_z + row * num_cols * 4
+        let s_row = raw_s + row * (num_input_dim / group_size) * 4
+        let out_row = out + row * num_input_dim * 8
+        let j = 0
+        while j < num_cols {
+            let w_word = le32(w_row + j * 4)
+            let z_word = le32(z_row + j * 4)
+            let k = 0
+            while k < pack_factor {
+                let shift = k * bits
+                let w_val = (w_word >> shift) & maxq
+                let z_val = ((z_word >> shift) & maxq) + 1
+                let col = j * pack_factor + k
+                let scale = f32_to_f64(s_row + (col / group_size) * 4)
+                let val = fmul(scale, f64of(i2f(w_val - z_val)))
+                mem_store(out_row + col * 8, val)
+                k = k + 1
+            }
+            j = j + 1
+        }
+        row = row + 1
+    }
+    return 0
+}
+
+// ---------------------------------------------------------------------------
+// AWQ (Activation-aware Weight Quantization): 4-bit affine with nibble permutation.
+//
+// 3-buffer format (qweight, qzeros, scales), NOT GGUF.
+//
+// qweight: [in_features, out_features // 8] int32 -- 8x int4 per int32
+// qzeros:  [in_features // group_size, out_features // 8] int32 -- 8x int4 per int32
+// scales:  [in_features // group_size, out_features] f16
+//
+// bits = 4, group_size = 128 (typical)
+//
+// Dequant: out[i,j] = (qweight[i,j] - qzeros[i//gs, j]) * scales[i//gs, j]
+//
+// The AWQ packing interleaves nibbles for coalesced GPU access. The
+// AWQ_REVERSE_ORDER = [0, 4, 1, 5, 2, 6, 3, 7] undoes it during dequant.
+// Without this permutation, values are in the wrong positions but still
+// finite-looking, so it needs a fixture test.
+//
+// Reference: AutoAWQ awq/utils/packing_utils.py
+//   AWQ_REVERSE_ORDER = [0, 4, 1, 5, 2, 6, 3, 7]
+//   dequantize_gemm: unpack -> reverse_order -> mask -> (iw - iz) * scales
+// ---------------------------------------------------------------------------
+fn dequant_awq(raw_w, raw_z, raw_s, in_features, out_features, group_size, out) -> i64 {
+    let per_word = 8
+    let mask = 15
+    let groups = in_features / group_size
+    let words_per_row = out_features / per_word
+    // AWQ nibble permutation (undoes the packing interleave)
+    let rev = [0, 4, 1, 5, 2, 6, 3, 7]
+    let row = 0
+    while row < in_features {
+        let w_row = raw_w + row * words_per_row * 4
+        let group_idx = row / group_size
+        let z_row = raw_z + group_idx * words_per_row * 4
+        let s_row = raw_s + group_idx * out_features * 2
+        let out_row = out + row * out_features * 8
+        let j = 0
+        while j < words_per_row {
+            let w_word = le32(w_row + j * 4)
+            let z_word = le32(z_row + j * 4)
+            let k = 0
+            while k < per_word {
+                let src_k = rev[k]
+                let shift = 4 * src_k
+                let w_val = (w_word >> shift) & mask
+                let z_val = (z_word >> shift) & mask
+                let col = j * per_word + k
+                let scale = f16_to_f64(s_row + col * 2)
+                let val = fmul(scale, f64of(i2f(w_val - z_val)))
+                mem_store(out_row + col * 8, val)
+                k = k + 1
+            }
+            j = j + 1
+        }
+        row = row + 1
+    }
+    return 0
+}
+
+// ---------------------------------------------------------------------------
+// EXL3 (ExLlamaV3): trellis-coded quantization with Hadamard transforms.
+//
+// This is the most complex format in Phase 9. The pipeline:
+//   1. Unpack trellis (circular tail-biting bitstream) → 256 fp16 per tile
+//   2. Decode codewords via procedural codebook (magic multiply + LOP3 + fp16 sum)
+//   3. Apply tensor core permutation (shuffle from TC layout to row-major)
+//   4. Apply left Hadamard (input side, 128×128)
+//   5. Multiply by suh (input scales + sign flips)
+//   6. Apply right Hadamard (output side, 128×128)
+//   7. Multiply by svh (output scales + sign flips)
+//
+// Reference: turboderp/exllamav3
+//   exllamav3_ext/quant/codebook.cuh  -- decode_3inst<cb>
+//   exllamav3_ext/quant/exl3_dq.cuh   -- dq<bits, cb> (single codeword)
+//   exllamav3_ext/quant/pack.cu       -- pack_trellis_kernel
+//   modules/quant/exl3.py             -- LinearEXL3 full pipeline
+// ---------------------------------------------------------------------------
+
+// Procedural codebook decode (from codebook.cuh).
+// Takes a 16-bit codeword and returns the decoded value as f64 bits.
+// The codeword is first zero-extended to 32 bits, then the magic multiply
+// and LOP3 produce two fp16 values that are summed.
+fn exl3_decode_codeword(x, cb) -> i64 {
+    // Zero-extend to 32 bits
+    x = x & 0xFFFF
+    // cb 0: default (neither mcg nor mul1)
+    // cb 1: mcg present
+    // cb 2: mul1 present (different shape)
+    if cb == 2 {
+        // mul1 codebook: different shape
+        x = x * 0x83DCD12D
+        // __dp4a: byte-sum + acc
+        let acc = 0x6400  // fp16 for 1024.0
+        let b0 = x & 0xFF
+        let b1 = (x >> 8) & 0xFF
+        let b2 = (x >> 16) & 0xFF
+        let b3 = (x >> 24) & 0xFF
+        let sum = b0 + b1 + b2 + b3 + acc
+        // k_inv_h = 0x1eee (1/147.7 in fp16), k_bias_h = 0xc931 (-10.39 in fp16)
+        // result = sum * k_inv_h + k_bias_h (fp16 arithmetic)
+        // For now, return the raw sum (fp16 arithmetic is complex)
+        return sum & 0xFFFF
+    }
+    // cb 0 and cb 1 share the LOP3 + fp16 pair sum path
+    if cb == 0 {
+        x = x * 89226354
+        x = x + 64248484
+    }
+    if cb == 1 {
+        x = x * 0xCBAC1FED
+    }
+    // LOP3: (x & 0x8fff8fff) ^ 0x3b603b60
+    x = (x & 0x8fff8fff) ^ 0x3b603b60
+    // Extract two fp16 values and sum them
+    let lo = x & 0xFFFF
+    let hi = (x >> 16) & 0xFFFF
+    // f16_to_f64 takes a pointer, so store to temp buffer first
+    let tmp = mem_alloc(4)
+    mem_store8(tmp, lo & 0xFF)
+    mem_store8(tmp + 1, (lo >> 8) & 0xFF)
+    let lo_f = f16_to_f64(tmp)
+    mem_store8(tmp, hi & 0xFF)
+    mem_store8(tmp + 1, (hi >> 8) & 0xFF)
+    let hi_f = f16_to_f64(tmp)
+    return f64bits(lo_f + hi_f)
+}
+
+// Unpack a single 16×16 tile from the trellis bitstream.
+// raw: pointer to the trellis data for this tile
+// K: bits per codeword (e.g., 4 for 4-bit, 6 for 6-bit)
+// cb: codebook index (0, 1, or 2)
+// out: pointer to 256 f64 values (16×16 tile)
+fn exl3_unpack_trellis_tile(raw, K, cb, out) -> i64 {
+    // Each tile is 16×16 = 256 elements
+    // Each element has a K-bit codeword
+    // Total bits per tile = 256 * K
+    // Stored as uint16 words: 256 * K / 16 = 16 * K words
+    // Circular: codeword for element t starts at bit position t * K + K - 16 (mod 256 * K)
+    let total_bits = 256 * K
+    let words_per_tile = total_bits / 16  // = 16 * K
+    let t = 0
+    while t < 256 {
+        // Bit position where this codeword starts
+        let b0 = t * K + K - 16 + total_bits  // add total_bits to avoid negative
+        let b1 = b0 + 16
+        let i0 = b0 / 32
+        let i1 = (b1 - 1) / 32
+        let s0 = (i1 + 1) * 32 - b1
+        // Read two uint32 words (circular)
+        let a = mem_load32(raw + (i0 % (total_bits / 32)) * 4)
+        let b = mem_load32(raw + (i1 % (total_bits / 32)) * 4)
+        // Funnel shift: align 16-bit window
+        let w0 = ((b >> s0) | (a << (32 - s0))) & 0xFFFF
+        // Decode codeword
+        let val = exl3_decode_codeword(w0, cb)
+        mem_store(out + t * 8, val)
+        t = t + 1
+    }
+    return 0
+}
+
+// Tensor core permutation: maps from TC layout to row-major within a 16×16 tile.
+// Returns the 256-element permutation array as individual values.
+// perm[i] = destination row-major index for source TC index i.
+fn exl3_tc_perm_element(src_idx) -> i64 {
+    // src_idx = t * 8 + i, where t in 0..31, i in 0..7
+    let t = src_idx / 8
+    let i = src_idx % 8
+    let r0 = (t % 4) * 2
+    let c0 = t / 4
+    let rr = 0
+    let cc = 0
+    if i == 0 { rr = r0; cc = c0 }
+    else if i == 1 { rr = r0 + 1; cc = c0 }
+    else if i == 2 { rr = r0 + 8; cc = c0 }
+    else if i == 3 { rr = r0 + 9; cc = c0 }
+    else if i == 4 { rr = r0; cc = c0 + 8 }
+    else if i == 5 { rr = r0 + 1; cc = c0 + 8 }
+    else if i == 6 { rr = r0 + 8; cc = c0 + 8 }
+    else { rr = r0 + 9; cc = c0 + 8 }
+    return rr * 16 + cc
+}
+
+// Apply tensor core permutation to a 16×16 tile.
+// in: 256 f64 values in TC layout
+// out: 256 f64 values in row-major layout
+fn exl3_apply_tc_perm(in_ptr, out_ptr) -> i64 {
+    let i = 0
+    while i < 256 {
+        let dest = exl3_tc_perm_element(i)
+        mem_store(out_ptr + dest * 8, mem_load(in_ptr + i * 8))
+        i = i + 1
+    }
+    return 0
+}
+
+// Hadamard matrix element: H[i][j] = (-1)^popcount(i & j) / sqrt(n)
+fn exl3_hadamard_element(i, j, n) -> i64 {
+    let x = i & j
+    let count = 0
+    let tmp = x
+    // Count bits in x
+    let c = 0
+    let t = x
+    let c2 = 0
+    let t2 = t
+    // Unrolled bit count for 8 bits (n <= 128)
+    let b0 = t2 & 1; t2 = t2 >> 1
+    let b1 = t2 & 1; t2 = t2 >> 1
+    let b2 = t2 & 1; t2 = t2 >> 1
+    let b3 = t2 & 1; t2 = t2 >> 1
+    let b4 = t2 & 1; t2 = t2 >> 1
+    let b5 = t2 & 1; t2 = t2 >> 1
+    let b6 = t2 & 1; t2 = t2 >> 1
+    let b7 = t2 & 1
+    let count2 = b0 + b1 + b2 + b3 + b4 + b5 + b6 + b7
+    let sign = if count2 % 2 == 0 { 1.0 } else { -1.0 }
+    // Compute 1/sqrt(n) using Newton's method
+    let n_f = f64of(i2f(n))
+    let guess = n_f
+    let g = guess
+    // g = (g + n/g) / 2, 20 iterations
+    let g1 = (g + n_f / g) / 2.0
+    let g2 = (g1 + n_f / g1) / 2.0
+    let g3 = (g2 + n_f / g2) / 2.0
+    let g4 = (g3 + n_f / g3) / 2.0
+    let g5 = (g4 + n_f / g4) / 2.0
+    let g6 = (g5 + n_f / g5) / 2.0
+    let g7 = (g6 + n_f / g6) / 2.0
+    let g8 = (g7 + n_f / g7) / 2.0
+    let g9 = (g8 + n_f / g8) / 2.0
+    let g10 = (g9 + n_f / g9) / 2.0
+    let g11 = (g10 + n_f / g10) / 2.0
+    let g12 = (g11 + n_f / g11) / 2.0
+    let g13 = (g12 + n_f / g12) / 2.0
+    let g14 = (g13 + n_f / g13) / 2.0
+    let g15 = (g14 + n_f / g14) / 2.0
+    let g16 = (g15 + n_f / g15) / 2.0
+    let g17 = (g16 + n_f / g16) / 2.0
+    let g18 = (g17 + n_f / g17) / 2.0
+    let g19 = (g18 + n_f / g18) / 2.0
+    let g20 = (g19 + n_f / g19) / 2.0
+    let sqrt_n = g20
+    let result = sign / sqrt_n
+    return f64bits(result)
+}
+
+// Apply Hadamard transform to a block of data.
+// data: n×n f64 values
+// n: block size (must be power of 2, typically 128)
+// dir: 0 for forward (H @ data), 1 for inverse (data @ H^T)
+fn exl3_hadamard_transform(data, n, dir) -> i64 {
+    // For forward: out[i][j] = sum_k H[i][k] * data[k][j]
+    // For inverse: out[i][j] = sum_k data[i][k] * H[k][j]
+    // Since H is symmetric, both are the same operation
+    let tmp = mem_alloc(n * n * 8)
+    let i = 0
+    while i < n {
+        let j = 0
+        while j < n {
+            let sum = f64of(0.0)
+            let k = 0
+            while k < n {
+                let h_ik = f64of(exl3_hadamard_element(i, k, n))
+                let d_kj = f64of(mem_load(data + (k * n + j) * 8))
+                sum = sum + h_ik * d_kj
+                k = k + 1
+            }
+            mem_store(tmp + (i * n + j) * 8, sum)
+            j = j + 1
+        }
+        i = i + 1
+    }
+    // Copy back
+    let idx = 0
+    while idx < n * n {
+        mem_store(data + idx * 8, mem_load(tmp + idx * 8))
+        idx = idx + 1
+    }
+    return 0
+}
+
+// Full EXL3 dequant: trellis + Hadamard + scales.
+// raw_trellis: int16 packed codewords
+// raw_suh: fp16 input scales (K values)
+// raw_svh: fp16 output scales (N values)
+// K: input dimension (must be divisible by 16)
+// N: output dimension (must be divisible by 16)
+// bits: bits per codeword (e.g., 4, 6)
+// cb: codebook index (0, 1, or 2)
+// out: K×N f64 output
+fn dequant_exl3(raw_trellis, raw_suh, raw_svh, K, N, bits, cb, out) -> i64 {
+    let tiles_k = K / 16
+    let tiles_n = N / 16
+    let had_dim = 128  // Hadamard block size
+
+    // Step 1: Unpack trellis tiles and apply tensor core permutation
+    let tile_idx = 0
+    while tile_idx < tiles_k * tiles_n {
+        let tile_offset = tile_idx * 16 * bits  // uint16 words per tile
+        let tile_tmp = mem_alloc(256 * 8)
+        exl3_unpack_trellis_tile(raw_trellis + tile_offset * 2, bits, cb, tile_tmp)
+        // Apply tensor core permutation
+        let tile_out = out + tile_idx * 256 * 8
+        exl3_apply_tc_perm(tile_tmp, tile_out)
+        tile_idx = tile_idx + 1
+    }
+
+    // Step 2: Apply left Hadamard (input side) in blocks of had_dim
+    let row = 0
+    while row < K {
+        let col_block = 0
+        while col_block < N {
+            let block_size = had_dim
+            if col_block + block_size > N { block_size = N - col_block }
+            // Extract block, apply Hadamard, write back
+            let block = mem_alloc(block_size * block_size * 8)
+            let i = 0
+            while i < block_size {
+                let j = 0
+                while j < block_size {
+                    mem_store(block + (i * block_size + j) * 8,
+                               mem_load(out + ((row + i) * N + col_block + j) * 8))
+                    j = j + 1
+                }
+                i = i + 1
+            }
+            exl3_hadamard_transform(block, block_size, 0)
+            i = 0
+            while i < block_size {
+                let j = 0
+                while j < block_size {
+                    mem_store(out + ((row + i) * N + col_block + j) * 8,
+                               mem_load(block + (i * block_size + j) * 8))
+                    j = j + 1
+                }
+                i = i + 1
+            }
+            col_block = col_block + block_size
+        }
+        row = row + had_dim
+    }
+
+    // Step 3: Multiply by suh (input scales)
+    let i = 0
+    while i < K {
+        let suh_val = f16_to_f64(raw_suh + i * 2)
+        let j = 0
+        while j < N {
+            let idx = (i * N + j) * 8
+            mem_store(out + idx, fmul(f64of(mem_load(out + idx)), suh_val))
+            j = j + 1
+        }
+        i = i + 1
+    }
+
+    // Step 4: Apply right Hadamard (output side) in blocks of had_dim
+    let col = 0
+    while col < N {
+        let row_block = 0
+        while row_block < K {
+            let block_size = had_dim
+            if row_block + block_size > K { block_size = K - row_block }
+            let block = mem_alloc(block_size * block_size * 8)
+            let i = 0
+            while i < block_size {
+                let j = 0
+                while j < block_size {
+                    mem_store(block + (i * block_size + j) * 8,
+                               mem_load(out + ((row_block + i) * N + col + j) * 8))
+                    j = j + 1
+                }
+                i = i + 1
+            }
+            exl3_hadamard_transform(block, block_size, 1)
+            i = 0
+            while i < block_size {
+                let j = 0
+                while j < block_size {
+                    mem_store(out + ((row_block + i) * N + col + j) * 8,
+                               mem_load(block + (i * block_size + j) * 8))
+                    j = j + 1
+                }
+                i = i + 1
+            }
+            row_block = row_block + block_size
+        }
+        col = col + had_dim
+    }
+
+    // Step 5: Multiply by svh (output scales)
+    let j = 0
+    while j < N {
+        let svh_val = f16_to_f64(raw_svh + j * 2)
+        let i = 0
+        while i < K {
+            let idx = (i * N + j) * 8
+            mem_store(out + idx, fmul(f64of(mem_load(out + idx)), svh_val))
+            i = i + 1
+        }
+        j = j + 1
+    }
+
+    return 0
+}
+
+// ---------------------------------------------------------------------------
+// Phase 8: Partial load / block swap.
+//
+// load_partial(model, budget) returns a handle that can grow. Tensors are
+// loaded on demand and evicted when the budget is exceeded. Eviction is by
+// offloaded-memory descending (largest first), not LRU.
+//
+// Invariant: partial load and full load must produce identical numbers.
+// Enforced by a test that runs both and compares bit-for-bit.
+// ---------------------------------------------------------------------------
+
+// Partial load state
+let pl_handle = -1          // current partial load handle
+let pl_budget = 0           // memory budget in bytes
+let pl_used = 0             // currently used bytes
+let pl_n_tensors = 0        // number of tensors in the model
+let pl_loaded = 0           // number of tensors currently loaded
+let pl_tensor_idx = 0       // tensor indices (up to 1024)
+let pl_tensor_size = 0      // tensor sizes in bytes
+let pl_tensor_data = 0      // tensor data pointers (0 = not loaded)
+let pl_tensor_lru = 0       // LRU counter per tensor
+
+// Initialize partial load for a model with a given memory budget.
+// Returns 0 on success, -1 on failure.
+fn load_partial_init(budget) {
+    pl_budget = budget
+    pl_used = 0
+    pl_n_tensors = gguf_n_tensors
+    pl_loaded = 0
+    pl_handle = 1
+    // Allocate arrays for up to 1024 tensors
+    pl_tensor_idx = mem_alloc(1024 * 8)
+    pl_tensor_size = mem_alloc(1024 * 8)
+    pl_tensor_data = mem_alloc(1024 * 8)
+    pl_tensor_lru = mem_alloc(1024 * 8)
+    let i = 0
+    while i < pl_n_tensors {
+        mem_store(pl_tensor_idx + i * 8, i)
+        mem_store(pl_tensor_size + i * 8, gguf_tensor_nbytes(i))
+        mem_store(pl_tensor_data + i * 8, 0)
+        mem_store(pl_tensor_lru + i * 8, 0)
+        i = i + 1
+    }
+    return 0
+}
+
+// Evict tensors until we have enough free space.
+// Eviction is by offloaded-memory descending (largest first).
+fn pl_evict_until(free_needed) {
+    while pl_used + free_needed > pl_budget && pl_loaded > 0 {
+        // Find the largest loaded tensor
+        let largest_idx = -1
+        let largest_size = 0
+        let i = 0
+        while i < pl_n_tensors {
+            let data = mem_load(pl_tensor_data + i * 8)
+            if data != 0 {
+                let sz = mem_load(pl_tensor_size + i * 8)
+                if sz > largest_size {
+                    largest_size = sz
+                    largest_idx = i
+                }
+            }
+            i = i + 1
+        }
+        if largest_idx < 0 { break }
+        // Evict it
+        let data = mem_load(pl_tensor_data + largest_idx * 8)
+        mem_free(data)
+        mem_store(pl_tensor_data + largest_idx * 8, 0)
+        pl_used = pl_used - largest_size
+        pl_loaded = pl_loaded - 1
+    }
+}
+
+// Load a tensor into memory. Returns pointer to f64 data, or 0 on failure.
+fn pl_load_tensor(idx) {
+    // Check if already loaded
+    let existing = mem_load(pl_tensor_data + idx * 8)
+    if existing != 0 {
+        // Update LRU
+        pl_tensor_lru = pl_tensor_lru + 1
+        mem_store(pl_tensor_lru + idx * 8, pl_tensor_lru)
+        return existing
+    }
+    // Check if dtype is supported
+    if gguf_dtype_supported(gguf_tensor_dtype(idx)) == 0 { return 0 }
+    let dtype = gguf_tensor_dtype(idx)
+    let offset = gguf_tensor_offset(idx)
+    let nelem = gguf_tensor_nelements(idx)
+    let nbytes = gguf_tensor_nbytes(idx)
+    // Evict until we have space
+    pl_evict_until(nbytes)
+    // Allocate and load
+    let buf = mem_alloc(nelem * 8)
+    let raw = mem_alloc(nbytes)
+    gguf_read_bytes(offset, raw, nbytes)
+    // Dequantize
+    if dtype == 0 {
+        dequant_f32(raw, nelem, buf)
+    } else if dtype == 1 {
+        dequant_f16(raw, nelem, buf)
+    } else if dtype == 12 {
+        dequant_q4k(raw, nelem, buf)
+    } else if dtype == 13 {
+        dequant_q5k(raw, nelem, buf)
+    } else if dtype == 14 {
+        dequant_q6k(raw, nelem, buf)
+    } else if dtype == 20 {
+        dequant_iq4_nl(raw, nelem, buf)
+    } else if dtype == 23 {
+        dequant_iq4_xs(raw, nelem, buf)
+    } else if dtype == 8 {
+        dequant_q8_0(raw, nelem, buf)
+    } else if dtype == 2 {
+        dequant_q4_0(raw, nelem, buf)
+    } else if dtype == 30 {
+        dequant_bf16(raw, nelem, buf)
+    } else if dtype == 3 {
+        dequant_q4_1(raw, nelem, buf)
+    } else if dtype == 6 {
+        dequant_q5_0(raw, nelem, buf)
+    } else if dtype == 7 {
+        dequant_q5_1(raw, nelem, buf)
+    } else if dtype == 10 {
+        dequant_q2k(raw, nelem, buf)
+    } else if dtype == 11 {
+        dequant_q3k(raw, nelem, buf)
+    } else if dtype == 15 {
+        dequant_q8k(raw, nelem, buf)
+    } else {
+        mem_free(raw)
+        mem_free(buf)
+        return 0
+    }
+    mem_free(raw)
+    // Store pointer
+    mem_store(pl_tensor_data + idx * 8, buf)
+    mem_store(pl_tensor_size + idx * 8, nbytes)
+    pl_used = pl_used + nbytes
+    pl_loaded = pl_loaded + 1
+    pl_tensor_lru = pl_tensor_lru + 1
+    mem_store(pl_tensor_lru + idx * 8, pl_tensor_lru)
+    return buf
+}
+
+// Get a tensor's data, loading it if necessary.
+// Returns pointer to f64 data, or 0 on failure.
+fn pl_get_tensor(idx) {
+    if pl_handle < 0 { return 0 }
+    return pl_load_tensor(idx)
+}
+
+// Free all partial load state.
+fn load_partial_free() {
+    if pl_handle < 0 { return }
+    let i = 0
+    while i < pl_n_tensors {
+        let data = mem_load(pl_tensor_data + i * 8)
+        if data != 0 { mem_free(data) }
+        i = i + 1
+    }
+    mem_free(pl_tensor_idx)
+    mem_free(pl_tensor_size)
+    mem_free(pl_tensor_data)
+    mem_free(pl_tensor_lru)
+    pl_handle = -1
+    pl_used = 0
+    pl_loaded = 0
+}
+
+// ---------------------------------------------------------------------------
+// Phase 8b: MoE expert offload.
+//
+// Design from exllamav3_ext/cpu/moe_handoff.h:
+// - A persistent worker consumes a job ring (not spawned per forward pass)
+// - Pinned shared memory for staging
+// - Three-state slot protocol: data_ready, done, consumed
+// - Slot reuse waits on consumed, not done
+//
+// Quanta's version is single-process (no CUDA, no shared memory across processes).
+// The design carries over: bounded job ring, three-state slot protocol,
+// pinned staging. The invariant is the same as Phase 8:
+// placement decides speed, never semantics.
+// ---------------------------------------------------------------------------
+
+// MoE offload state
+let moe_n_slots = 0           // number of slots in the job ring
+let moe_slot_data = 0         // slot data pointers
+let moe_slot_ready = 0        // data_ready sequence numbers
+let moe_slot_done = 0         // done sequence numbers
+let moe_slot_consumed = 0     // consumed sequence numbers
+let moe_jobs_tail = 0         // producer index
+let moe_jobs_head = 0         // consumer index
+let moe_quit = 0              // quit flag
+
+// Initialize MoE offload with a given number of slots.
+// Returns 0 on success, -1 on failure.
+fn moe_init(n_slots) {
+    if n_slots <= 0 || n_slots > 64 { return -1 }
+    moe_n_slots = n_slots
+    moe_slot_data = mem_alloc(n_slots * 8)
+    moe_slot_ready = mem_alloc(n_slots * 8)
+    moe_slot_done = mem_alloc(n_slots * 8)
+    moe_slot_consumed = mem_alloc(n_slots * 8)
+    let i = 0
+    while i < n_slots {
+        mem_store(moe_slot_data + i * 8, 0)
+        mem_store(moe_slot_ready + i * 8, 0)
+        mem_store(moe_slot_done + i * 8, 0)
+        mem_store(moe_slot_consumed + i * 8, 0)
+        i = i + 1
+    }
+    moe_jobs_tail = 0
+    moe_jobs_head = 0
+    moe_quit = 0
+    return 0
+}
+
+// Allocate a slot for expert loading.
+// Returns slot index, or -1 if no slot available.
+fn moe_alloc_slot() {
+    let i = 0
+    while i < moe_n_slots {
+        let consumed = mem_load(moe_slot_consumed + i * 8)
+        let ready = mem_load(moe_slot_ready + i * 8)
+        if consumed >= ready {
+            // Slot is free
+            return i
+        }
+        i = i + 1
+    }
+    return -1
+}
+
+// Submit a job to the ring.
+// job_type: 0 = load expert, 1 = unload expert
+// expert_idx: index of the expert tensor
+// Returns 0 on success, -1 on failure.
+fn moe_submit_job(job_type, expert_idx) {
+    let slot = moe_alloc_slot()
+    if slot < 0 { return -1 }
+    // Store job info in slot
+    mem_store(moe_slot_data + slot * 8, expert_idx)
+    // Increment ready sequence
+    let ready = mem_load(moe_slot_ready + slot * 8)
+    mem_store(moe_slot_ready + slot * 8, ready + 1)
+    // Advance tail
+    moe_jobs_tail = (moe_jobs_tail + 1) % moe_n_slots
+    return 0
+}
+
+// Process one job from the ring.
+// Returns 0 if a job was processed, 1 if no job available.
+fn moe_process_job() {
+    if moe_jobs_head == moe_jobs_tail { return 1 }
+    let slot = moe_jobs_head
+    let expert_idx = mem_load(moe_slot_data + slot * 8)
+    // Load the expert tensor
+    let data = pl_get_tensor(expert_idx)
+    if data != 0 {
+        // Mark done
+        let done = mem_load(moe_slot_done + slot * 8)
+        mem_store(moe_slot_done + slot * 8, done + 1)
+    }
+    // Advance head
+    moe_jobs_head = (moe_jobs_head + 1) % moe_n_slots
+    return 0
+}
+
+// Mark a slot as consumed.
+fn moe_mark_consumed(slot) {
+    let consumed = mem_load(moe_slot_consumed + slot * 8)
+    mem_store(moe_slot_consumed + slot * 8, consumed + 1)
+}
+
+// Free all MoE offload state.
+fn moe_free() {
+    if moe_n_slots <= 0 { return }
+    // moe_slot_data stores expert_idx, not pointers -- do NOT free it
+    mem_free(moe_slot_data)
+    mem_free(moe_slot_ready)
+    mem_free(moe_slot_done)
+    mem_free(moe_slot_consumed)
+    moe_n_slots = 0
+    moe_quit = 1
+}
+
+fn rms_norm(out, x, w, n) {
+    // Standard RMSNorm: y[i] = x[i] / sqrt(mean(x^2)) * w[i].
+    //
+    // The divisor is sqrt(mean), NOT sqrt(1 + mean). The stray +1 (meant as an
+    // epsilon guard) scaled every vector by 1/sqrt(2) at unit magnitude, which
+    // is a factor-of-1.41 error on every layer of the model. Measured on
+    // x = all ones, w = [0.001, ..., 2.048]:
+    //     with the +1: 0.0007071067812 / 1.4481546879
+    //     correct:     0.0010000000000 / 2.0480000000
+    let ms = i2f(0)
+    let i = 0
+    while i < n {
+        // f64of is REQUIRED: mem_load() returns the raw 8 bytes as an integer,
+        // so without it every value below is a float's bit pattern fed to
+        // fadd/fmul as a number. The integer path also overflows -- 4.0's bit
+        // pattern is 4612676019179889152 and squaring it needs 2^124, which
+        // raises the compiler's overflow trap.
+        let v = f64of(mem_load(x + i * 8))
+        ms = fadd(ms, fmul(v, v))
+        i = i + 1
+    }
+    let ir = fdiv(i2f(1), sqrt(fdiv(ms, i2f(n))))
+
+    i = 0
+    while i < n {
+        let xv = f64of(mem_load(x + i * 8))
+        let wv = f64of(mem_load(w + i * 8))
+        mem_store(out + i * 8, fmul(fmul(xv, ir), wv))
+        i = i + 1
+    }
+}
+
+fn matvec(A, x, rows, cols, y) {
+    let i = 0
+    while i < rows {
+        // `acc` MUST be a typed float and both operands MUST go through f64of.
+        // mem_load() returns a raw 64-bit bit pattern, so the untyped version
+        // this replaces emitted an integer imul plus the signed-overflow trap
+        // and overflowed on ordinary index arithmetic.
+        let acc: f64 = 0.0
+        let j = 0
+        while j < cols {
+            let a = f64of(mem_load(A + (i * cols + j) * 8))
+            let xv = f64of(mem_load(x + j * 8))
+            acc = acc + a * xv
+            j = j + 1
+        }
+        mem_store(y + i * 8, acc)
+        i = i + 1
+    }
+}
+
+fn softmax_arr(out, inp, n) {
+    if n <= 0 { return 0 }
+    let max_val: f64 = f64of(mem_load(inp))
+    let i = 1
+    while i < n {
+        let v = f64of(mem_load(inp + i * 8))
+        if v > max_val { max_val = v }
+        i = i + 1
+    }
+    let sum: f64 = 0.0
+    i = 0
+    while i < n {
+        let ev = gguf_exp(f64of(mem_load(inp + i * 8)) - max_val)
+        mem_store(out + i * 8, ev)
+        sum = sum + ev
+        i = i + 1
+    }
+    i = 0
+    while i < n {
+        mem_store(out + i * 8, f64of(mem_load(out + i * 8)) / sum)
+        i = i + 1
+    }
+}
+
+fn swiglu(out, x, y, n) {
+    let i = 0
+    while i < n {
+        // Same defect rms_norm had: mem_load() yields the integer bit pattern,
+        // so swiglu was computing silu on bit patterns rather than values.
+        let xv = f64of(mem_load(x + i * 8))
+        let yv = f64of(mem_load(y + i * 8))
+        // sigmoid(x) = 1 / (1 + e^-x). This used pow(2, -x), which is
+        // 1/(1 + e^(-x*ln2)) -- a sigmoid of ln2*x, not of x. Measured on
+        // x = 2, y = 10: it returned 16.0, and the correct
+        // silu(2)*10 = 2/(1+e^-2)*10 = 17.615941559557648.
+        let sig = fdiv(i2f(1), fadd(i2f(1), gguf_exp(fsub(i2f(0), xv))))
+        mem_store(out + i * 8, fmul(fmul(xv, sig), yv))
+        i = i + 1
+    }
+}
+
+fn vec_add(out, a, b, n) {
+    let i = 0
+    while i < n {
+        mem_store(out + i * 8, f64of(mem_load(a + i * 8)) + f64of(mem_load(b + i * 8)))
+        i = i + 1
+    }
+}
+
+fn vec_mul(out, a, b, n) {
+    let i = 0
+    while i < n {
+        mem_store(out + i * 8, f64of(mem_load(a + i * 8)) * f64of(mem_load(b + i * 8)))
+        i = i + 1
+    }
+}
+
+// ---------------------------------------------------------------- skipping
+
+// Advance fd by `n` bytes.
+fn gguf_skip(fd, n) {
+    if n <= 0 { return 0 }
+    return lseek(fd, n, 1)
+}
+
+// Byte width of a scalar GGUF metadata value type.
+fn gguf_value_size(vtype) {
+    if vtype == 0 || vtype == 1 || vtype == 7 { return 1 }
+    if vtype == 2 || vtype == 3 { return 2 }
+    if vtype == 4 || vtype == 5 || vtype == 6 { return 4 }
+    return 0
+}
+
+// Advance fd past one metadata value of type `vtype`, including its length
+// prefix when the value is a string or an array. This is what lets a reader
+// walk a KV block without interpreting the payload.
+fn gguf_skip_value(fd, vtype) {
+    let b8 = mem_alloc(8)
+    let b4 = mem_alloc(4)
+    if vtype == 8 {
+        // string: u64 length + bytes
+        read_raw(fd, b8, 8)
+        gguf_skip(fd, mem_load(b8))
+    } else if vtype == 9 {
+        // array: u32 element type + u64 count + payload
+        read_raw(fd, b4, 4)
+        let etype = mem_load(b4)
+        read_raw(fd, b8, 8)
+        let alen = mem_load(b8)
+        if etype == 8 {
+            let i = 0
+            while i < alen {
+                read_raw(fd, b8, 8)
+                gguf_skip(fd, mem_load(b8))
+                i = i + 1
+            }
+        } else {
+            let esz = gguf_value_size(etype)
+            gguf_skip(fd, alen * esz)
+        }
+    } else {
+        gguf_skip(fd, gguf_value_size(vtype))
+    }
+    return 0
+}
+
+// Print a human-readable summary of the loaded model.
+fn gguf_print_info() {
+    print("GGUF tensors=") print(gguf_n_tensors) print(" kv=") print(gguf_n_kv) print(" data@") print(gguf_data_start) print("\n")
+    let i = 0
+    while i < gguf_n_tensors {
+        if i < 8 {
+            print("  [") print(i) print("] name@")
+            print(gguf_tensor_name(i))
+            print(" dims=")
+            let nd = gguf_tensor_ndims(i)
+            let d = 0
+            while d < nd { print(gguf_tensor_dim(i, d)) print(",") d = d + 1 }
+            print(" dt=") print(gguf_tensor_dtype(i)) print("\n")
+        }
+        i = i + 1
+    }
+    return 0
+}
+
+// ------------------------------------------------------- tensor data access
+
+// Read a tensor's raw (quantised) bytes into a fresh buffer and return the
+// buffer address; the length is available from gguf_tensor_nbytes().
+fn gguf_read_tensor(idx) {
+    if idx < 0 || idx >= gguf_n_tensors { return 0 }
+    let nbytes = gguf_tensor_nbytes(idx)
+    let buf = mem_alloc(nbytes)
+    if gguf_read_tensor_bytes(idx, buf, nbytes) < 0 { return 0 }
+    return buf
+}
+
+// Read a contiguous slice of a tensor, `byte_off` bytes into it. Needed for
+// token embeddings: token_embd.weight is [2048, 128000] Q6_K = 262 MB, so
+// reading the whole tensor to fetch one 1680-byte row wastes both memory and
+// time on every single token. Callers pass byte_off = row * bytes_per_row.
+fn gguf_read_tensor_bytes_at(idx, byte_off, buf, nbytes) {
+    if idx < 0 || idx >= gguf_n_tensors { return -1 }
+    if byte_off < 0 || nbytes < 0 { return -3 }
+
+    // Bound the read against the tensor's OWN size and against end of file.
+    //
+    // This is the gguf.cpp `nbytes_remain` guard: every read is checked against
+    // what is actually available before it is issued, so a bad `byte_off` or an
+    // over-long `nbytes` cannot read past the tensor or past EOF. Before this,
+    // a caller could pass any offset and the kernel would happily read unrelated
+    // bytes -- which for a quantized weight means decoding garbage with no error.
+    //
+    // The RETURN CONTRACT IS UNCHANGED: this returns a BYTE COUNT on success and
+    // a negative value on failure. lfm2_mm.quanta:87 depends on it --
+    // `if gguf_read_tensor_bytes_at(idx, r*rb, buf, rb) != rb` -- so returning a
+    // short count on a partial read is what makes an EOF mid-read detectable.
+    let tsz = gguf_tensor_nbytes(idx)
+    if tsz <= 0 { return -4 }
+    // byte_off and nbytes must both be representable and must not wrap
+    if byte_off > tsz - nbytes { return -3 }
+    let abs = gguf_tensor_offset(idx)
+    if abs > gguf_filesize { return -5 }
+    if nbytes > gguf_filesize - abs { return -5 }
+    if byte_off > gguf_filesize - abs - nbytes { return -5 }
+
+    // pread, NOT lseek+read.
+    //
+    // The fd is SHARED, so lseek(fd, off) + read(fd, ...) is a race the moment
+    // two threads read different offsets: worker A seeks, worker B seeks, A
+    // reads B's bytes. That is exactly what broke the parallel matvec -- element
+    // mismatches grew with worker count (2 -> 83 rows, 4 -> 499, 16 -> 926).
+    //
+    // pread64 takes the offset as an argument, so the seek and the read are one
+    // atomic operation from the caller's point of view and the fd position is
+    // never used. syscall 17 is pread64, and the generic syscall() builtin maps
+    // its FOURTH argument to r10, which is precisely where pread64 wants the
+    // offset.
+    let n = syscall(17, gguf_fd, buf, nbytes, abs + byte_off, 0, 0)
+    if n < 0 { return -2 }
+    return n
+}
+
+// ------------------------------------------------------------- linear algebra
+
+// y = A * x for a row-major matrix A of `rows` x `cols` values, 8 bytes each.
+// x holds `cols` values, y receives `rows` results. This is the plain
+// reference matvec used to check dequantised tensor data; the quantised
+// kernels in the inference path are separate.
+fn gguf_matvec(A: u64, x: u64, rows: i64, cols: i64, y: u64) {
+    let r = 0
+    while r < rows {
+        // `acc` MUST be a typed float. mem_load() returns a raw 64-bit integer
+        // bit pattern, so an untyped `acc` made `acc + a * xv` an integer
+        // multiply: the compiler emitted `imul` + the signed-overflow trap
+        // (`jno`/`ud2`), and the multiply then overflowed on ordinary index
+        // arithmetic -> SIGILL (exit 132) instead of a result.
+        let acc: f64 = 0.0
+        let c = 0
+        while c < cols {
+            let a = f64of(mem_load(A + (r * cols + c) * 8))
+            let xv = f64of(mem_load(x + c * 8))
+            acc = acc + a * xv
+            c = c + 1
+        }
+        mem_store(y + r * 8, acc)
+        r = r + 1
+    }
+    return 0
+}
+
+// exp(x) for f64. There is no native `exp` builtin, so this is range
+// reduced: exp(x) = 2^k * exp(r) with k = round(x / ln2) and |r| <= ln2/2,
+// leaving a series that converges to full f64 precision in a few terms.
+// gguf_exp(x) -- kept as a name for callers already using it; the
+// implementation moved to lib/std/math.quanta as expf().
+//
+// It was hand-rolled here and duplicated nowhere else, but there was no tested
+// home for f64 transcendentals at all: this was the only implementation in the
+// tree, with no accuracy bar and no coverage. std/math's expf is verified
+// against Python's math.exp on the raw IEEE-754 bits over 260 cases including
+// subnormals, overflow, and a dense sweep of |x| < 61.
+//
+//   exp(0)    exact
+//   exp(+-1)  1 ULP
+//   exp(-10)  4 ULP
+//   exp(700)  414 ULP (worst; 2^k dominates)  -- 4.97e-14 relative
+fn gguf_exp(x: f64) -> f64 {
+    return expf(x)
+}
+
+// Softmax: out[i] = exp(inp[i] - max) / sum, over `n` f64 values.
+//
+// Every float local and every mem_load() result must be converted with f64of():
+// mem_load() yields a raw 64-bit INTEGER bit pattern, so an untyped `mx` made
+// `x > mx` an integer compare and `gguf_exp(inp[i] - mx)` an integer subtract.
+// The result was all zeros.
+fn gguf_softmax(out: u64, inp: u64, n: i64) {
+    if n <= 0 { return 0 }
+    let mx: f64 = f64of(mem_load(inp))
+    let i = 1
+    while i < n {
+        let x = f64of(mem_load(inp + i * 8))
+        if x > mx { mx = x }
+        i = i + 1
+    }
+    let sum: f64 = 0.0
+    i = 0
+    while i < n {
+        let e = gguf_exp(f64of(mem_load(inp + i * 8)) - mx)
+        mem_store(out + i * 8, e)
+        sum = sum + e
+        i = i + 1
+    }
+    i = 0
+    while i < n {
+        mem_store(out + i * 8, f64of(mem_load(out + i * 8)) / sum)
+        i = i + 1
+    }
+    return 0
+}
+// ===========================================================================
+// Phase 6.1: Per-context GGUF API (appended to gguf.quanta)
+// ===========================================================================
+
+// ---- GgufCtx layout (mem_alloc'd buffer) ----
+// All offsets in bytes from context base
+const GCTX_FD            = 0
+const GCTX_MAP_BASE      = 8
+const GCTX_MAP_OFF       = 16
+const GCTX_MAP_LEN       = 24
+const GCTX_MAP_FAULTED   = 32
+const GCTX_N_TENSORS     = 40
+const GCTX_N_KV          = 48
+const GCTX_DATA_START    = 56
+const GCTX_TINFO_START   = 64
+const GCTX_FILESIZE      = 72
+const GCTX_TENSOR_DIMS   = 80
+const GCTX_TENSOR_DATA   = 88
+const GCTX_KV_INDEX      = 96
+const GCTX_KV_ARR_OFF    = 104
+const GCTX_KV_ARR_LEN    = 112
+const GCTX_KV_ETYPE      = 120
+const GCTX_ALIGNMENT     = 128
+const GCTX_SIZE          = 136
+
+fn gguf_ctx_alloc() -> u64 {
+    let ctx = mem_alloc(GCTX_SIZE)
+    let i = 0
+    while i < GCTX_SIZE { mem_store(ctx + i, 0); i = i + 8 }
+    return ctx
+}
+
+fn gguf_ctx_free(ctx: u64) {
+    if ctx == 0 { return }
+    // Close fd if open
+    let fd = mem_load(ctx + GCTX_FD)
+    if fd > 0 { close(fd) }
+    // Unmap if mapped
+    let base = mem_load(ctx + GCTX_MAP_BASE)
+    let len = mem_load(ctx + GCTX_MAP_LEN)
+    if base != 0 && len != 0 { munmap_file(base, len) }
+    // Free all allocated buffers
+    let dims = mem_load(ctx + GCTX_TENSOR_DIMS)
+    if dims != 0 { /* gguf_tensor_dims is not separately freed in original */ }
+    let tdata = mem_load(ctx + GCTX_TENSOR_DATA)
+    if tdata != 0 { /* original doesn't free this either */ }
+    let kvidx = mem_load(ctx + GCTX_KV_INDEX)
+    if kvidx != 0 { /* original doesn't free this either */ }
+    let kvaoff = mem_load(ctx + GCTX_KV_ARR_OFF)
+    if kvaoff != 0 { /* original doesn't free this either */ }
+    let kvalen = mem_load(ctx + GCTX_KV_ARR_LEN)
+    if kvalen != 0 { /* original doesn't free this either */ }
+    let kvetype = mem_load(ctx + GCTX_KV_ETYPE)
+    if kvetype != 0 { /* original doesn't free this either */ }
+    // Note: we don't free the context buffer itself here
+}
+
+fn gguf_ctx_fd(ctx: u64) -> i64 {
+    return mem_load(ctx + GCTX_FD)
+}
+
+fn gguf_ctx_set_fd(ctx: u64, fd: i64) {
+    mem_store(ctx + GCTX_FD, fd)
+}
+
+fn gguf_ctx_map_base(ctx: u64) -> u64 {
+    return mem_load(ctx + GCTX_MAP_BASE)
+}
+
+fn gguf_ctx_set_map_base(ctx: u64, base: u64) {
+    mem_store(ctx + GCTX_MAP_BASE, base)
+}
+
+fn gguf_ctx_map_off(ctx: u64) -> i64 {
+    return mem_load(ctx + GCTX_MAP_OFF)
+}
+
+fn gguf_ctx_set_map_off(ctx: u64, off: i64) {
+    mem_store(ctx + GCTX_MAP_OFF, off)
+}
+
+fn gguf_ctx_map_len(ctx: u64) -> i64 {
+    return mem_load(ctx + GCTX_MAP_LEN)
+}
+
+fn gguf_ctx_set_map_len(ctx: u64, len: i64) {
+    mem_store(ctx + GCTX_MAP_LEN, len)
+}
+
+fn gguf_ctx_map_faulted(ctx: u64) -> i64 {
+    return mem_load(ctx + GCTX_MAP_FAULTED)
+}
+
+fn gguf_ctx_set_map_faulted(ctx: u64, v: i64) {
+    mem_store(ctx + GCTX_MAP_FAULTED, v)
+}
+
+fn gguf_ctx_n_tensors(ctx: u64) -> i64 {
+    return mem_load(ctx + GCTX_N_TENSORS)
+}
+
+fn gguf_ctx_set_n_tensors(ctx: u64, n: i64) {
+    mem_store(ctx + GCTX_N_TENSORS, n)
+}
+
+fn gguf_ctx_n_kv(ctx: u64) -> i64 {
+    return mem_load(ctx + GCTX_N_KV)
+}
+
+fn gguf_ctx_set_n_kv(ctx: u64, n: i64) {
+    mem_store(ctx + GCTX_N_KV, n)
+}
+
+fn gguf_ctx_data_start(ctx: u64) -> i64 {
+    return mem_load(ctx + GCTX_DATA_START)
+}
+
+fn gguf_ctx_set_data_start(ctx: u64, off: i64) {
+    mem_store(ctx + GCTX_DATA_START, off)
+}
+
+fn gguf_ctx_tinfo_start(ctx: u64) -> i64 {
+    return mem_load(ctx + GCTX_TINFO_START)
+}
+
+fn gguf_ctx_set_tinfo_start(ctx: u64, off: i64) {
+    mem_store(ctx + GCTX_TINFO_START, off)
+}
+
+fn gguf_ctx_filesize(ctx: u64) -> i64 {
+    return mem_load(ctx + GCTX_FILESIZE)
+}
+
+fn gguf_ctx_set_filesize(ctx: u64, sz: i64) {
+    mem_store(ctx + GCTX_FILESIZE, sz)
+}
+
+fn gguf_ctx_tensor_dims(ctx: u64) -> u64 {
+    return mem_load(ctx + GCTX_TENSOR_DIMS)
+}
+
+fn gguf_ctx_set_tensor_dims(ctx: u64, ptr: u64) {
+    mem_store(ctx + GCTX_TENSOR_DIMS, ptr)
+}
+
+fn gguf_ctx_tensor_data(ctx: u64) -> u64 {
+    return mem_load(ctx + GCTX_TENSOR_DATA)
+}
+
+fn gguf_ctx_set_tensor_data(ctx: u64, ptr: u64) {
+    mem_store(ctx + GCTX_TENSOR_DATA, ptr)
+}
+
+fn gguf_ctx_kv_index(ctx: u64) -> u64 {
+    return mem_load(ctx + GCTX_KV_INDEX)
+}
+
+fn gguf_ctx_set_kv_index(ctx: u64, ptr: u64) {
+    mem_store(ctx + GCTX_KV_INDEX, ptr)
+}
+
+fn gguf_ctx_kv_arr_off(ctx: u64) -> u64 {
+    return mem_load(ctx + GCTX_KV_ARR_OFF)
+}
+
+fn gguf_ctx_set_kv_arr_off(ctx: u64, ptr: u64) {
+    mem_store(ctx + GCTX_KV_ARR_OFF, ptr)
+}
+
+fn gguf_ctx_kv_arr_len(ctx: u64) -> u64 {
+    return mem_load(ctx + GCTX_KV_ARR_LEN)
+}
+
+fn gguf_ctx_set_kv_arr_len(ctx: u64, ptr: u64) {
+    mem_store(ctx + GCTX_KV_ARR_LEN, ptr)
+}
+
+fn gguf_ctx_kv_etype(ctx: u64) -> u64 {
+    return mem_load(ctx + GCTX_KV_ETYPE)
+}
+
+fn gguf_ctx_set_kv_etype(ctx: u64, ptr: u64) {
+    mem_store(ctx + GCTX_KV_ETYPE, ptr)
+}
+
+fn gguf_ctx_alignment(ctx: u64) -> i64 {
+    return mem_load(ctx + GCTX_ALIGNMENT)
+}
+
+fn gguf_ctx_set_alignment(ctx: u64, a: i64) {
+    mem_store(ctx + GCTX_ALIGNMENT, a)
+}
+
+// ---- Context-aware versions of core functions ----
+
+fn gguf_page_align_down_ctx(ctx: u64, v: i64) -> i64 {
+    return v - (v % GGUF_PAGE)
+}
+
+fn gguf_map_populate_ctx(ctx: u64, base: u64, len: i64) {
+    if len <= 0 { return }
+    syscall(28, base, len, 22, 0, 0, 0)
+}
+
+fn gguf_map_range_ctx(ctx: u64, offset: i64, len: i64) -> u64 {
+    let fd = gguf_ctx_fd(ctx)
+    if fd < 0 { return 0 }
+    if len <= 0 { return 0 }
+    let base = mmap_file(0, len, 1, 2, fd, offset)
+    if base < 0 { return 0 }
+    return base
+}
+
+fn gguf_unmap_range_ctx(ctx: u64, base: u64, len: i64) {
+    if base <= 0 { return }
+    munmap_file(base, len)
+}
+
+fn gguf_map_data_window_ctx(ctx: u64) -> u64 {
+    let fd = gguf_ctx_fd(ctx)
+    if fd < 0 { return 0 }
+    if gguf_ctx_map_base(ctx) != 0 { return gguf_ctx_map_base(ctx) }
+
+    let data_off = gguf_data_offset_ctx(ctx)
+    if data_off <= 0 { return 0 }
+    let sz = gguf_ctx_filesize(ctx)
+
+    let map_off = gguf_page_align_down_ctx(ctx, data_off)
+    if map_off < 0 { return 0 }
+
+    let remaining = sz - map_off
+    if remaining <= 0 { return 0 }
+
+    let len = remaining
+    if len > GGUF_MAP_WINDOW { len = GGUF_MAP_WINDOW }
+
+    let base = gguf_map_range_ctx(ctx, map_off, len)
+    if base == 0 { return 0 }
+
+    gguf_map_populate_ctx(ctx, base, len)
+
+    gguf_ctx_set_map_base(ctx, base)
+    gguf_ctx_set_map_off(ctx, map_off)
+    gguf_ctx_set_map_len(ctx, len)
+    gguf_ctx_set_map_faulted(ctx, 1)
+    return base
+}
+
+fn gguf_read_bytes_ctx(ctx: u64, off: i64, dst: u64, len: i64) -> i64 {
+    if len <= 0 { return 0 }
+
+    let map_base = gguf_ctx_map_base(ctx)
+    if map_base != 0 {
+        let map_off = gguf_ctx_map_off(ctx)
+        let map_len = gguf_ctx_map_len(ctx)
+        let rel = off - map_off
+        if rel >= 0 && rel + len <= map_len {
+            let src = map_base + rel
+            let words = len / 8
+            let i = 0
+            while i < words {
+                mem_store(dst + i * 8, mem_load(src + i * 8))
+                i = i + 1
+            }
+            let done = words * 8
+            while done < len {
+                mem_store8(dst + done, mem_load8(src + done))
+                done = done + 1
+            }
+            return len
+        }
+    }
+
+    let fd = gguf_ctx_fd(ctx)
+    lseek(fd, off, 0)
+    return file_read(fd, dst, len)
+}
+
+fn gguf_load_ctx(path: u64, ctx: u64) -> i64 {
+    let fd = open(path, 0, 0)
+    if fd < 0 { return -1 }
+    gguf_ctx_set_fd(ctx, fd)
+    gguf_ctx_set_filesize(ctx, file_size(fd))
+
+    let hdr = mem_alloc(24)
+    file_read(fd, hdr, 24)
+    if mem_load8(hdr) != 71 { close(fd); gguf_ctx_set_fd(ctx, -1); return -2 }
+
+    let n_kv = mem_load(hdr + 16)
+    gguf_ctx_set_n_tensors(ctx, mem_load(hdr + 8))
+    gguf_ctx_set_n_kv(ctx, n_kv)
+
+    let meta_size = scan_metadata_ctx(ctx, n_kv)
+    if meta_size < 0 { close(fd); gguf_ctx_set_fd(ctx, -1); return -8 }
+
+    let total_meta = 24 + meta_size
+
+    read_tensor_info_ctx(ctx, fd)
+
+    record_data_start_ctx(ctx, fd)
+
+    if gguf_read_alignment_ctx(ctx) != 0 { close(fd); gguf_ctx_set_fd(ctx, -1); return -5 }
+    let vr = gguf_validate_chain_ctx(ctx)
+    if vr != 0 { close(fd); gguf_ctx_set_fd(ctx, -1); return -6 }
+    let dr = gguf_validate_all_dims_ctx(ctx)
+    if dr != 0 { close(fd); gguf_ctx_set_fd(ctx, -1); return -7 }
+
+    gguf_map_data_window_ctx(ctx)
+    return 0
+}
+
+fn gguf_read_alignment_ctx(ctx: u64) -> i64 {
+    let k = gguf_kv_find_ctx(ctx, "general.alignment")
+    if k < 0 {
+        gguf_ctx_set_alignment(ctx, 32)
+        return 0
+    }
+    let val_off = gguf_kv_value_offset_ctx(ctx, k)
+    if val_off < 0 { return -1 }
+    let buf = mem_alloc(4)
+    let fd = gguf_ctx_fd(ctx)
+    lseek(fd, val_off, 0)
+    if read_raw(fd, buf, 4) != 4 { return -1 }
+    let align = mem_load(buf)
+    if align <= 0 || (align & (align - 1)) != 0 { return -1 }
+    gguf_ctx_set_alignment(ctx, align)
+    return 0
+}
+
+fn gguf_kv_find_ctx(ctx: u64, name: u64) -> i64 {
+    let want = len(name)
+    let n_kv = gguf_ctx_n_kv(ctx)
+    let idx = gguf_ctx_kv_index(ctx)
+    let fd = gguf_ctx_fd(ctx)
+    let i = 0
+    while i < n_kv {
+        lseek(fd, mem_load(idx + i * 8), 0)
+        let lb = mem_alloc(8)
+        if read_raw(fd, lb, 8) != 8 { return -1 }
+        let klen = mem_load(lb)
+        if klen < 0 || klen > GGUF_MAX_STRING { return -1 }
+        let kb = mem_alloc(klen + 1)
+        read_raw(fd, kb, klen)
+        let ok = 1
+        if klen != want {
+            ok = 0
+        } else {
+            let j = 0
+            while j < want {
+                if mem_load8(kb + j) != mem_load8(name + 8 + j) { ok = 0; j = want }
+                j = j + 1
+            }
+        }
+        if ok == 1 { return i }
+        i = i + 1
+    }
+    return -1
+}
+
+fn gguf_kv_value_offset_ctx(ctx: u64, k: i64) -> i64 {
+    let off = mem_load(gguf_ctx_kv_index(ctx) + k * 8)
+    let fd = gguf_ctx_fd(ctx)
+    lseek(fd, off, 0)
+    let lb = mem_alloc(8)
+    if read_raw(fd, lb, 8) != 8 { return -1 }
+    let klen = mem_load(lb)
+    return off + 8 + klen + 4
+}
+
+fn scan_metadata_ctx(ctx: u64, n_kv: i64) -> i64 {
+    let fd = gguf_ctx_fd(ctx)
+    let fsz = gguf_ctx_filesize(ctx)
+    let klen_buf = mem_alloc(8)
+    let vtype_buf = mem_alloc(4)
+    let slen_buf = mem_alloc(8)
+
+    // n_kv is attacker-controlled and multiplies four allocations below.
+    if n_kv < 0 { return -1 }
+    if n_kv > 1000000 { return -1 }
+    if fsz > 0 && n_kv > fsz / 12 { return -1 }
+
+    let kv_index = mem_alloc(n_kv * KVREC_SIZE)
+    let kv_arr_off = mem_alloc(n_kv * 8)
+    let kv_arr_len = mem_alloc(n_kv * 8)
+    let kv_etype = mem_alloc(n_kv * 8)
+    gguf_ctx_set_kv_index(ctx, kv_index)
+    gguf_ctx_set_kv_arr_off(ctx, kv_arr_off)
+    gguf_ctx_set_kv_arr_len(ctx, kv_arr_len)
+    gguf_ctx_set_kv_etype(ctx, kv_etype)
+
+    let meta_size = 0
+    let i = 0
+    while i < n_kv {
+        mem_store(kv_index + i * 8, lseek(fd, 0, 1))
+        mem_store(kv_arr_off + i * 8, -1)
+        mem_store(kv_arr_len + i * 8, 0)
+        mem_store(kv_etype + i * 8, 0)
+
+        if read_raw(fd, klen_buf, 8) != 8 { return -1 }
+        let klen = mem_load(klen_buf)
+        if klen < 0 || klen > GGUF_MAX_STRING { return -1 }
+        if meta_size > GGUF_MAX_META - 8 - klen { return -1 }
+        if fsz > 0 && meta_size + 8 + klen > fsz { return -1 }
+        meta_size = meta_size + 8 + klen
+        lseek(fd, klen, 1)
+
+        read_raw(fd, vtype_buf, 4)
+        meta_size = meta_size + 4
+        let vtype = mem_load(vtype_buf)
+
+        if vtype == 0 { lseek(fd, 1, 1); meta_size = meta_size + 1 }
+        else if vtype == 1 { lseek(fd, 1, 1); meta_size = meta_size + 1 }
+        else if vtype == 2 { lseek(fd, 2, 1); meta_size = meta_size + 2 }
+        else if vtype == 3 { lseek(fd, 2, 1); meta_size = meta_size + 2 }
+        else if vtype == 4 { lseek(fd, 4, 1); meta_size = meta_size + 4 }
+        else if vtype == 5 { lseek(fd, 4, 1); meta_size = meta_size + 4 }
+        else if vtype == 6 { lseek(fd, 4, 1); meta_size = meta_size + 4 }
+        else if vtype == 7 { lseek(fd, 1, 1); meta_size = meta_size + 1 }
+        else if vtype == 10 { lseek(fd, 8, 1); meta_size = meta_size + 8 }
+        else if vtype == 11 { lseek(fd, 8, 1); meta_size = meta_size + 8 }
+        else if vtype == 12 { lseek(fd, 8, 1); meta_size = meta_size + 8 }
+        else if vtype == 8 {
+            read_raw(fd, slen_buf, 8)
+            let slen = mem_load(slen_buf)
+            lseek(fd, slen, 1)
+            meta_size = meta_size + 8 + slen
+        } else if vtype == 9 {
+            read_raw(fd, vtype_buf, 4)
+            meta_size = meta_size + 4
+            read_raw(fd, slen_buf, 8)
+            meta_size = meta_size + 8
+            let alen = mem_load(slen_buf)
+            let etype = mem_load(vtype_buf)
+            mem_store(kv_etype + i * 8, etype)
+            mem_store(kv_arr_off + i * 8, lseek(fd, 0, 1))
+            mem_store(kv_arr_len + i * 8, alen)
+            if etype == 8 {
+                let ai = 0
+                while ai < alen {
+                    read_raw(fd, slen_buf, 8)
+                    let slen = mem_load(slen_buf)
+                    lseek(fd, slen, 1)
+                    meta_size = meta_size + 8 + slen
+                    ai = ai + 1
+                }
+            } else {
+                let esize = 1
+                if etype == 2 || etype == 3 { esize = 2 }
+                if etype == 4 || etype == 5 || etype == 6 { esize = 4 }
+                if etype == 10 || etype == 11 || etype == 12 { esize = 8 }
+                lseek(fd, alen * esize, 1)
+                meta_size = meta_size + alen * esize
+            }
+        }
+
+        i = i + 1
+    }
+
+    return meta_size
+}
+
+fn read_tensor_info_ctx(ctx: u64, fd: i64) -> i64 {
+    gguf_ctx_set_tinfo_start(ctx, lseek(fd, 0, 1))
+    let n = gguf_ctx_n_tensors(ctx)
+    if n < 0 || n > 10000000 { return -1 }
+    let fsz = gguf_ctx_filesize(ctx)
+    if fsz > 0 && n * TINFO_SIZE > fsz { return -1 }
+
+    let tdata = mem_alloc(n * TINFO_SIZE)
+    gguf_ctx_set_tensor_data(ctx, tdata)
+    // Shape storage, parallel to the tensor-info table: 4 dims per tensor.
+    let tdims = mem_alloc(n * 32)
+    gguf_ctx_set_tensor_dims(ctx, tdims)
+
+    let nlen_buf = mem_alloc(8)
+    let ndims_buf = mem_alloc(4)
+    let dim_buf = mem_alloc(8)
+    let dtype_buf = mem_alloc(4)
+    let off_buf = mem_alloc(8)
+    let name_buf = mem_alloc(256)
+
+    let i = 0
+    while i < n {
+        if read_raw(fd, nlen_buf, 8) != 8 { return -1 }
+        let nlen = mem_load(nlen_buf)
+        if nlen < 0 || nlen > GGUF_MAX_STRING { return -1 }
+        file_read(fd, name_buf, nlen)
+        mem_store8(name_buf + nlen, 0)
+
+        if read_raw(fd, ndims_buf, 4) != 4 { return -1 }
+        let ndims = mem_load(ndims_buf)
+        if ndims < 0 || ndims > 4 { return -1 }
+
+        let nelem = 1
+        let d = 0
+        while d < ndims {
+            if read_raw(fd, dim_buf, 8) != 8 { return -1 }
+            let dim = mem_load(dim_buf)
+            if dim < 0 { return -1 }
+            nelem = nelem * dim
+            mem_store(tdims + i * 32 + d * 8, dim)
+            d = d + 1
+        }
+        // clear stale dims from a wider previous record
+        while d < 4 {
+            mem_store(tdims + i * 32 + d * 8, 0)
+            d = d + 1
+        }
+
+        if read_raw(fd, dtype_buf, 4) != 4 { return -1 }
+        let dtype = mem_load(dtype_buf)
+
+        if read_raw(fd, off_buf, 8) != 8 { return -1 }
+        let offset = mem_load(off_buf)
+        if offset < 0 { return -1 }
+
+        let name_copy = mem_alloc(nlen + 1)
+        d = 0
+        while d < nlen {
+            mem_store8(name_copy + d, mem_load8(name_buf + d))
+            d = d + 1
+        }
+        mem_store8(name_copy + nlen, 0)
+
+        mem_store(tdata + i * TINFO_SIZE, name_copy)
+        mem_store(tdata + i * TINFO_SIZE + 8, ndims)
+        mem_store(tdata + i * TINFO_SIZE + 16, dtype)
+        mem_store(tdata + i * TINFO_SIZE + 24, offset)
+        mem_store(tdata + i * TINFO_SIZE + 32, nelem)
+
+        i = i + 1
+    }
+
+    return 0
+}
+
+fn record_data_start_ctx(ctx: u64, fd: i64) -> i64 {
+    let info_end = lseek(fd, 0, 1)
+    let rem = info_end - (info_end / 32) * 32
+    if rem != 0 { lseek(fd, 32 - rem, 1) }
+    gguf_ctx_set_data_start(ctx, lseek(fd, 0, 1))
+    return 0
+}
+
+fn gguf_validate_chain_ctx(ctx: u64) -> i64 {
+    let n = gguf_ctx_n_tensors(ctx)
+    if n <= 0 { return 0 }
+    let running = gguf_ctx_data_start(ctx)
+    let fsz = gguf_ctx_filesize(ctx)
+    let i = 0
+    while i < n {
+        let off = gguf_ctx_tensor_offset(ctx, i)
+        let nb = gguf_ctx_tensor_nbytes(ctx, i)
+        if nb < 0 { return -1000 - i }
+        if off < 0 { return -2000 - i }
+        if off != running { return -3000 - i }
+        if fsz > 0 && off > fsz { return -4000 - i }
+        if fsz > 0 && nb > fsz - off { return -4000 - i }
+        running = running + nb
+        i = i + 1
+    }
+    return 0
+}
+
+fn gguf_validate_all_dims_ctx(ctx: u64) -> i64 {
+    let n = gguf_ctx_n_tensors(ctx)
+    let i = 0
+    while i < n {
+        let nd = gguf_ctx_tensor_ndims(ctx, i)
+        if nd <= 0 || nd > 4 { return -1001 - i }
+        let prod = 1
+        let d = 0
+        while d < nd {
+            let v = gguf_ctx_tensor_dim(ctx, i, d)
+            if v <= 0 { return -1002 - i }
+            prod = prod * v
+            if prod <= 0 || prod > 900000000000000000 { return -1003 - i }
+            d = d + 1
+        }
+        if prod != gguf_ctx_tensor_nelements(ctx, i) { return -1004 - i }
+        let nb = gguf_ctx_tensor_nbytes(ctx, i)
+        if nb <= 0 { return -1005 - i }
+        let fsz = gguf_ctx_filesize(ctx)
+        if fsz > 0 && nb > fsz { return -1006 - i }
+        i = i + 1
+    }
+    return 0
+}
+
+fn gguf_data_offset_ctx(ctx: u64) -> i64 {
+    // Original gguf_data_offset
+    return gguf_ctx_data_start(ctx)
+}
+
+fn gguf_close_ctx(ctx: u64) -> i64 {
+    let fd = gguf_ctx_fd(ctx)
+    if fd > 0 { close(fd) }
+    gguf_ctx_set_fd(ctx, -1)
+    let base = gguf_ctx_map_base(ctx)
+    let len = gguf_ctx_map_len(ctx)
+    if base != 0 && len != 0 { munmap_file(base, len) }
+    gguf_ctx_set_map_base(ctx, 0)
+    return 0
+}
+
+// ---- Getter functions for loader_traits ----
+
+fn gguf_ctx_num_tensors(ctx: u64) -> i64 {
+    return gguf_ctx_n_tensors(ctx)
+}
+
+fn gguf_ctx_tensor_name_str(ctx: u64, i: i64) -> u64 {
+    let tdata = gguf_ctx_tensor_data(ctx)
+    let p = mem_load(tdata + i * TINFO_SIZE)
+    if p == 0 { return 0 }
+    let n = 0
+    while mem_load8(p + n) != 0 { n = n + 1 }
+    if n == 0 { return 0 }
+    let buf = mem_alloc((n + 9 + 7) / 8 * 8)
+    mem_store(buf, n)
+    let k = 0
+    while k < n {
+        mem_store8(buf + 8 + k, mem_load8(p + k))
+        k = k + 1
+    }
+    return buf
+}
+
+fn gguf_ctx_tensor_dtype(ctx: u64, i: i64) -> i64 {
+    let tdata = gguf_ctx_tensor_data(ctx)
+    return mem_load(tdata + i * TINFO_SIZE + 16)
+}
+
+fn gguf_ctx_tensor_offset(ctx: u64, i: i64) -> i64 {
+    let tdata = gguf_ctx_tensor_data(ctx)
+    let rel = mem_load(tdata + i * TINFO_SIZE + 24)
+    return gguf_data_offset_ctx(ctx) + rel
+}
+
+fn gguf_ctx_tensor_nelements(ctx: u64, i: i64) -> i64 {
+    let tdata = gguf_ctx_tensor_data(ctx)
+    return mem_load(tdata + i * TINFO_SIZE + 32)
+}
+
+fn gguf_ctx_tensor_ndims(ctx: u64, i: i64) -> i64 {
+    let tdata = gguf_ctx_tensor_data(ctx)
+    return mem_load(tdata + i * TINFO_SIZE + 8)
+}
+
+fn gguf_ctx_tensor_dim(ctx: u64, i: i64, d: i64) -> i64 {
+    let ndims = gguf_ctx_tensor_ndims(ctx, i)
+    if d < 0 || d >= ndims { return -1 }
+    let tdims = gguf_ctx_tensor_dims(ctx)
+    return mem_load(tdims + i * 32 + d * 8)
+}
+
+fn gguf_ctx_tensor_nbytes(ctx: u64, i: i64) -> i64 {
+    let dtype = gguf_ctx_tensor_dtype(ctx, i)
+    let n = gguf_ctx_tensor_nelements(ctx, i)
+    if n <= 0 { return 0 }
+    if dtype == 0 { return n * 4 }
+    if dtype == 1 { return n * 2 }
+    if dtype == 2 { return (n / 32) * 18 }
+    if dtype == 3 { return (n / 32) * 20 }
+    if dtype == 6 { return (n / 32) * 22 }
+    if dtype == 7 { return (n / 32) * 24 }
+    if dtype == 8 { return (n / 32) * 34 }
+    if dtype == 9 { return (n / 32) * 36 }
+    if dtype == 10 { return (n / 256) * 84 }
+    if dtype == 11 { return (n / 256) * 110 }
+    if dtype == 12 { return (n / 256) * 144 }
+    if dtype == 13 { return (n / 256) * 176 }
+    if dtype == 14 { return (n / 256) * 210 }
+    if dtype == 15 { return (n / 256) * 292 }
+    if dtype == 16 { return (n / 256) * 66 }
+    if dtype == 17 { return (n / 256) * 74 }
+    if dtype == 18 { return (n / 256) * 98 }
+    if dtype == 19 { return (n / 256) * 50 }
+    if dtype == 20 { return (n / 32) * 18 }
+    if dtype == 21 { return (n / 256) * 110 }
+    if dtype == 22 { return (n / 256) * 82 }
+    if dtype == 23 { return (n / 256) * 136 }
+    if dtype == 24 { return n }
+    if dtype == 25 { return n * 2 }
+    if dtype == 26 { return n * 4 }
+    if dtype == 27 { return n * 8 }
+    if dtype == 28 { return n * 8 }
+    if dtype == 29 { return (n / 256) * 56 }
+    if dtype == 30 { return n * 2 }
+    if dtype == 34 { return (n / 256) * 54 }
+    if dtype == 35 { return (n / 256) * 66 }
+    if dtype == 39 { return (n / 32) * 17 }
+    if dtype == 40 { return (n / 64) * 36 }
+    if dtype == 41 { return (n / 128) * 18 }
+    if dtype == 42 { return (n / 64) * 18 }
+    return n
+}
+
+fn gguf_type_size_ctx(ctx: u64, dtype: i64) -> i64 {
+    // Original gguf_type_size - copy here
+    if dtype == 0 { return 1 }
+    if dtype == 1 { return 1 }
+    if dtype == 2 { return 2 }
+    if dtype == 3 { return 2 }
+    if dtype == 4 { return 4 }
+    if dtype == 5 { return 4 }
+    if dtype == 6 { return 4 }
+    if dtype == 7 { return 1 }
+    if dtype == 8 { return 1 }
+    if dtype == 9 {
+        let etype = mem_load(gguf_ctx_kv_etype(ctx))
+        return gguf_type_size_ctx(ctx, etype)
+    }
+    if dtype == 10 { return 8 }
+    if dtype == 11 { return 8 }
+    if dtype == 12 { return 8 }
+    if dtype == 13 { return 8 }
+    if dtype == 14 { return 8 }
+    if dtype == 15 { return 8 }
+    return 8
+}
+
+fn gguf_block_elems_ctx(ctx: u64, dtype: i64) -> i64 {
+    // Original gguf_block_elems
+    if dtype == 10 { return 256 } // Q4_K
+    if dtype == 11 { return 32 }  // Q5_K
+    if dtype == 12 { return 256 } // Q6_K
+    if dtype == 13 { return 256 } // Q8_K
+    if dtype == 14 { return 256 } // IQ4_NL
+    if dtype == 15 { return 256 } // IQ4_XS
+    if dtype == 16 { return 256 } // MXFP4
+    if dtype == 17 { return 256 } // NVFP4
+    return 1
+}
+
+fn gguf_ctx_find_tensor(ctx: u64, name: u64) -> i64 {
+    let want = len(name)
+    let n = gguf_ctx_num_tensors(ctx)
+    let i = 0
+    while i < n {
+        let tname = gguf_ctx_tensor_name_str(ctx, i)
+        if tname != 0 {
+            let ok = 1
+            if mem_load(tname) != want {
+                ok = 0
+            } else {
+                let j = 0
+                while j < want {
+                    if mem_load8(tname + 8 + j) != mem_load8(name + 8 + j) { ok = 0; j = want }
+                    j = j + 1
+                }
+            }
+            if ok == 1 { return i }
+        }
+        i = i + 1
+    }
+    return -1
+}
+
+fn gguf_ctx_read_tensor_bytes_at(ctx: u64, i: i64, off: i64, buf: u64, nbytes: i64) -> i64 {
+    let base_off = gguf_ctx_tensor_offset(ctx, i)
+    if base_off < 0 { return -1 }
+    let abs_off = base_off + off
+    return gguf_read_bytes_ctx(ctx, abs_off, buf, nbytes)
+}

@@ -1,0 +1,141 @@
+include "accounting_gaap_financial_instruments.quanta"
+// Test: Financial Instruments (ASC 320/326/815/825)
+// Verifies CECL, classification, fair value, amortized cost, hedge effectiveness
+
+fn main() {
+    let failed = 0
+    
+    // Test: CECL loss allowance = EAD * PD * LGD
+    // $1M exposure, 200bps PD (2%), 40% LGD → 1M * 0.02 * 0.4 = 8000
+    let ecl1 = cecl_loss_allowance(1000000, 200, 40)
+    if ecl1 != 8000 {
+        prints("FAIL: cecl_loss_allowance(1M,200bps,40pct)=")
+        printi(ecl1)
+        prints(" expected 8000\n")
+        failed = failed + 1
+    }
+    
+    // Test: zero exposure → zero loss
+    let ecl2 = cecl_loss_allowance(0, 500, 50)
+    if ecl2 != 0 {
+        prints("FAIL: cecl zero exposure\n")
+        failed = failed + 1
+    }
+    
+    // Test: equity method classification (20-50% ownership)
+    let cl1 = classify_investment(25, 0, 1)
+    if cl1 != 4 {
+        prints("FAIL: classify investment 25pct equity\n")
+        failed = failed + 1
+    }
+    
+    // Test: HTM classification (intent to hold)
+    let cl2 = classify_investment(5, 1, 0)
+    if cl2 != 1 {
+        prints("FAIL: classify investment HTM\n")
+        failed = failed + 1
+    }
+    
+    // Test: trading classification (active market)
+    let cl3 = classify_investment(5, 0, 1)
+    if cl3 != 3 {
+        prints("FAIL: classify investment trading\n")
+        failed = failed + 1
+    }
+    
+    // Test: AFS classification (default)
+    let cl4 = classify_investment(5, 0, 0)
+    if cl4 != 2 {
+        prints("FAIL: classify investment AFS\n")
+        failed = failed + 1
+    }
+    
+    // Test: fair value Level 1 (quoted prices)
+    let fv1 = fair_value_level(1, 0)
+    if fv1 != 1 {
+        prints("FAIL: fair_value_level1\n")
+        failed = failed + 1
+    }
+    
+    // Test: fair value Level 2 (observable inputs)
+    let fv2 = fair_value_level(0, 1)
+    if fv2 != 2 {
+        prints("FAIL: fair_value_level2\n")
+        failed = failed + 1
+    }
+    
+    // Test: fair value Level 3 (unobservable)
+    let fv3 = fair_value_level(0, 0)
+    if fv3 != 3 {
+        prints("FAIL: fair_value_level3\n")
+        failed = failed + 1
+    }
+    
+    // Test: effective interest amortized cost
+    let ea1 = effective_interest_amortized_cost(100000, 5)
+    if ea1 != 5000 {
+        prints("FAIL: effective_interest(100k,5pct)=")
+        printi(ea1)
+        prints(" expected 5000\n")
+        failed = failed + 1
+    }
+    
+    // Test: hedge effectiveness (offset ratio 80-125%)
+    // Hedge change = -90, hedged change = 100 → ratio = 90%
+    let he1 = hedge_effectiveness(-90, 100)
+    if he1 != 1 {
+        prints("FAIL: hedge_effectiveness 90pct\n")
+        failed = failed + 1
+    }
+    
+    // Test: hedge ineffective (ratio < 80%)
+    let he2 = hedge_effectiveness(-70, 100)
+    if he2 != 0 {
+        prints("FAIL: hedge ineffective 70pct\n")
+        failed = failed + 1
+    }
+    
+    // Test: derivative criteria
+    let d1 = is_derivative(1, 1, 1)
+    if d1 != 1 {
+        prints("FAIL: is_derivative true\n")
+        failed = failed + 1
+    }
+    
+    // Test: not a derivative (missing net settlement)
+    let d2 = is_derivative(1, 1, 0)
+    if d2 != 0 {
+        prints("FAIL: is_derivative false\n")
+        failed = failed + 1
+    }
+    
+    // Test: impairment trigger (intent to sell)
+    let im1 = impairment_trigger(10, 1)
+    if im1 != 1 {
+        prints("FAIL: impairment trigger intent_sell\n")
+        failed = failed + 1
+    }
+    
+    // Test: impairment trigger (significant decline > 30%)
+    let im2 = impairment_trigger(40, 0)
+    if im2 != 1 {
+        prints("FAIL: impairment trigger significant_decline\n")
+        failed = failed + 1
+    }
+    
+    // Test: no impairment trigger
+    let im3 = impairment_trigger(15, 0)
+    if im3 != 0 {
+        prints("FAIL: impairment trigger none\n")
+        failed = failed + 1
+    }
+    
+    if failed == 0 {
+        prints("FINANCIAL INSTRUMENTS: ALL TESTS PASSED\n")
+        return 0
+    }
+    prints("FINANCIAL INSTRUMENTS: ")
+    printi(failed)
+    prints(" TEST(S) FAILED\n")
+    return 1
+}

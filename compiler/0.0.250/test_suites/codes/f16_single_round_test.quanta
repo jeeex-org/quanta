@@ -1,0 +1,114 @@
+// 0.0.248: f64 -> f16 rounds EXACTLY ONCE, in every path that can produce an f16.
+//
+// RED FIRST. On 0.0.247 this row exits 11. There, f64 -> f16 was cvtsd2ss
+// followed by vcvtps2ph -- a rounding to binary32 and THEN a rounding to
+// binary16 -- and `as f16` was worse: ft_narrow(l, 1) followed by
+// ft_narrow(nr, 2), naming binary32 as an intermediate precision the cast never
+// asked for. Double rounding is not equivalent to single rounding: it differs
+// exactly when the first rounding lands on a binary16 midpoint. That is dense
+// near midpoints and rare elsewhere, so it survives ordinary tests (2 of
+// 2,000,000 random f64 bit patterns; a handful of hand-picked values) and fails
+// on unlucky data.
+//
+// THE WITNESSES ARE CONSTRUCTED, NOT HUNTED, and that is the point of the row.
+//
+//   H      = an EVEN f16 bit pattern, so H + 1 is the next f16 value up and the
+//            tie between them breaks DOWNWARD under ties-to-even.
+//   a, b   = the two f16 values, taken from their BIT PATTERNS via
+//            f16bits_to_f64 -- exact, and no decimal literal is involved.
+//   m      = (a + b) * 0.5, the exact midpoint. a + b is exact (11-bit
+//            significands) and halving is exact, so m is exact.
+//   x      = m + eps, with eps a power of two small enough that m is still the
+//            nearest binary32 to x, and large enough that x != m.
+//
+// Then the two rules give DIFFERENT answers, by construction:
+//   single rounding:  x is strictly above the midpoint    -> H + 1
+//   double rounding:  f32(x) is exactly m, and m is a tie  -> ties-to-even -> H
+//
+// So `f64_to_f16bits(x) == H + 1` and `!= H` are assertions about the NUMBER of
+// roundings, not about arithmetic luck. eps = 2^-37 is used where the midpoint is
+// in the f16 normal range and 2^-45 where it is subnormal (there the binary32
+// spacing at x is tighter and 2^-37 would be coarse enough to leave the
+// midpoint). Both are built as 1.0/2^n, so the literal itself is exact.
+//
+// The readout is `f64_to_f16bits`, which on an input that is already f16
+// representable performs NO rounding -- it reads the 16 bits. It cannot mask the
+// defect it measures.
+fn id16(x: f16) -> f16 { return x }
+
+fn main() -> i64 {
+    let EN = 1.0 / 137438953472.0        // 2^-37: f16 normal-range midpoints
+    let ES = 1.0 / 35184372088832.0      // 2^-45: f16 subnormal midpoints
+    let h: f16[8] = mem_alloc(8)
+
+    // ---- (1) midpoint of 0x3C00/0x3C01 (1.0 and 1.0009765625) ----
+    let m1 = (f16bits_to_f64(15360) + f16bits_to_f64(15361)) * 0.5
+    let x1 = m1 + EN
+    if f64_to_f16bits(x1) != 15361 { exit(11) }      // single rounding
+    if f64_to_f16bits(x1) == 15360 { exit(12) }      // never the double-rounded tie
+    if f64_to_f16bits(x1 as f16) != 15361 { exit(13) }
+    if f64_to_f16bits(x1 as f16) == 15360 { exit(14) }
+    if f64_to_f16bits(id16(x1)) != 15361 { exit(15) }
+    h[0] = x1
+    if mem_load16(h + 8) != 15361 { exit(16) }
+    if mem_load16(h + 8) == 15360 { exit(17) }
+
+    // ---- (2) midpoint of 0x4400/0x4401 (4.0 and 4.00390625) ----
+    let m2 = (f16bits_to_f64(17408) + f16bits_to_f64(17409)) * 0.5
+    let x2 = m2 + EN
+    if f64_to_f16bits(x2) != 17409 { exit(20) }
+    if f64_to_f16bits(x2) == 17408 { exit(21) }
+    if f64_to_f16bits(x2 as f16) != 17409 { exit(22) }
+    h[1] = x2
+    if mem_load16(h + 10) != 17409 { exit(23) }
+
+    // ---- (3) midpoint of 0x6CE0/0x6CE1 (4992 and 4996) ----
+    let m3 = (f16bits_to_f64(27872) + f16bits_to_f64(27873)) * 0.5
+    let x3 = m3 + EN
+    if f64_to_f16bits(x3) != 27873 { exit(30) }
+    if f64_to_f16bits(x3) == 27872 { exit(31) }
+    if f64_to_f16bits(x3 as f16) != 27873 { exit(32) }
+    h[2] = x3
+    if mem_load16(h + 12) != 27873 { exit(33) }
+
+    // ---- (4) a SUBNORMAL midpoint: 0x0200/0x0201 (both f16 subnormals) ----
+    let m4 = (f16bits_to_f64(512) + f16bits_to_f64(513)) * 0.5
+    let x4 = m4 + ES
+    if f64_to_f16bits(x4) != 513 { exit(40) }
+    if f64_to_f16bits(x4) == 512 { exit(41) }
+    if f64_to_f16bits(x4 as f16) != 513 { exit(42) }
+    h[3] = x4
+    if mem_load16(h + 14) != 513 { exit(43) }
+
+    // ---- (5) the midpoint just below the f16 maximum: 0x7BFE/0x7BFF ----
+    // 65472 and 65504 (the largest finite f16). The double-rounded path lands on
+    // 0x7BFE; the single rounding lands on the maximum, so this case also pins
+    // the tie-at-the-top behaviour.
+    let m5 = (f16bits_to_f64(31742) + f16bits_to_f64(31743)) * 0.5
+    let x5 = m5 + EN
+    if f64_to_f16bits(x5) != 31743 { exit(50) }
+    if f64_to_f16bits(x5) == 31742 { exit(51) }
+    if f64_to_f16bits(x5 as f16) != 31743 { exit(52) }
+    h[4] = x5
+    if mem_load16(h + 16) != 31743 { exit(53) }
+
+    // ---- (6) the ordinary paths still hold (no regression in the easy cases) ----
+    if f64_to_f16bits(1.5) != 15872 { exit(60) }           // 0x3E00
+    if f64_to_f16bits(0.0 - 2.0) != 49152 { exit(61) }     // 0xC000
+    if f64_to_f16bits(0.25) != 13312 { exit(62) }          // 0x3400
+    if f64_to_f16bits(f16bits_to_f64(31743)) != 31743 { exit(63) }   // f16 max round-trips
+    // Overflow: 65520 is the RNE boundary, and ties-to-even at the top of the
+    // range goes UP to infinity (the significand below it is odd).
+    if f64_to_f16bits(65504.0) != 31743 { exit(64) }
+    if f64_to_f16bits(65520.0) != 31744 { exit(65) }       // 0x7C00 inf
+    if f64_to_f16bits(131072.0) != 31744 { exit(66) }
+    // Underflow: 2^-25 is exactly half the smallest subnormal, so ties-to-even
+    // sends it to zero -- and to NEGATIVE zero on the other side.
+    let tiny = 1.0 / 33554432.0
+    if f64_to_f16bits(tiny) != 0 { exit(67) }
+    if f64_to_f16bits(0.0 - tiny) != 32768 { exit(68) }
+    // NaN canonicalises to 0x7E00 with the sign preserved (libggml behaviour).
+    if f64_to_f16bits(f16bits_to_f64(31745)) != 32256 { exit(69) }   // 0x7C01 -> 0x7E00
+    if f64_to_f16bits(f16bits_to_f64(64513)) != 65024 { exit(70) }   // 0xFC01 -> 0xFE00
+    return 0
+}

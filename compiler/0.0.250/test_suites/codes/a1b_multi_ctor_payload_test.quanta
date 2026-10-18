@@ -1,0 +1,27 @@
+// A1b (0.0.237): the BARE Option/Result constructors (`Some(v)`, `None`,
+// `Ok(v)`, `Err(v)` -- not the `Option::Some` qualified form) hand the payload to
+// the tuple allocator through an arm-local binding. With the leak, the payload
+// resolved to the LAST-PARSED arm's cell, so a function constructing more than
+// one of them read the WRONG payload. Measured on 0.0.236: the Ok payload came
+// back as 5 (the Some payload's value) instead of 7, giving a silent wrong
+// result. Gated rows that pass on 0.0.236 all construct at most one payload
+// constructor per function, which is why this stayed hidden.
+fn main() {
+    let a = Some(5)
+    let b = None
+    let c = Ok(7)
+    let d = Err(1)
+    let s1 = match a { Some(v) => v, None => 100 }
+    let s2 = match b { Some(v) => 200, None => 2 }
+    let s3 = match c { Ok(v) => v * 10, Err(e) => 300 }
+    let s4 = match d { Ok(v) => 400, Err(e) => 4 }
+    if s1 != 5 { exit(1) }
+    if s2 != 2 { exit(2) }
+    if s3 != 70 { exit(3) }
+    if s4 != 4 { exit(4) }
+    // and the qualified form in the same function must keep working
+    let q = Option::Some(9)
+    let t = match q { Option::Some(v) => v, Option::None => 0 }
+    if t != 9 { exit(5) }
+    exit(42)
+}

@@ -1,0 +1,35 @@
+// baremetal_uart_test -- Phase D (0.0.233): minimal bare-metal smoke test.
+//
+// Compiled with --bare: the ELF carries the 32-bit PVH entry stub + Xen
+// PHYS32_ENTRY note, QEMU enters the stub, the stub enables long mode and jumps
+// to this program's _start, which runs in ring 0 with no OS underneath.
+//
+// Writes "OK\n" to COM1 (0x3F8) with out dx,al and returns. Serial output is
+// the only evidence channel in ring 0 without an IDT, hence:
+//
+//   qemu-system-x86_64 -kernel baremetal_uart -display none -serial stdio -m 256
+//
+// must print OK.
+//
+// Hex: BA F8 03 00 00   mov edx, 0x3f8
+//      B0 4F            mov al, 'O'
+//      EE               out dx, al
+//      B0 4B            mov al, 'K'
+//      EE               out dx, al
+//      B0 0A            mov al, 10
+//      EE               out dx, al
+
+fn main() -> i64 {
+    asm!("ba f8 03 00 00 b0 4f ee b0 4b ee b0 0a ee")
+    // End the run deterministically: write 0 to QEMU's isa-debug-exit port so
+    // QEMU exits (code 1) instead of hlt-looping until the harness times out.
+    //   b0 00          mov al, 0
+    //   ba 01 05 00 00 mov edx, 0x501   (BA takes a 4-byte immediate in 64-bit
+    //                                    mode — a 2-byte one desynchronises the
+    //                                    stream: measured, the write then never
+    //                                    reaches the device and QEMU hangs)
+    //   ee             out dx, al
+    // (the harness passes -device isa-debug-exit,iobase=0x501,iosize=0x4)
+    asm!("b0 00 ba 01 05 00 00 ee")
+    return 0
+}

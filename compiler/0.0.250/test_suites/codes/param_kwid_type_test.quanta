@@ -1,0 +1,23 @@
+// test_suites/codes/param_kwid_type_test.quanta
+//
+// RED-FIRST row for the 0.0.246 fix, second manifestation: a parameter named
+// `type` made the COMPILER trap.
+//
+// 0.0.245: `type` lexes as TT_TYPE. funcscan skipped it as a parameter name, and
+// the body reference `type` reached parse_primary as a TT_TYPE token, which no
+// atom branch handles -- the parser desynchronised and qc died with SIGILL
+// (rc=132) emitting NO binary.  Red on 0.0.245 = COMPILE-FAIL; green after the
+// fix.
+//
+// The same failure made any `type`-parameterised function uncompilable; it is
+// also one of the two reasons lib/std/ast.quanta does not build (the other is
+// its string-keyed brace literal, a SEPARATE still-open defect that traps both
+// 0.0.245 and 0.0.246, so this row does not claim to repair ast.quanta).
+fn tag(name, type) -> i64 { return type * 1000 + name }
+fn only_type(type) -> i64 { return type }
+
+fn main() -> i64 {
+    if tag(3, 5) != 5003 { return 1 }
+    if only_type(9) != 9 { return 2 }
+    return 0
+}

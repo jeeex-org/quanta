@@ -1,0 +1,879 @@
+// HTTP/3 (RFC 9114) over QUIC
+// Pure Quanta implementation, zero external dependencies
+// Built on top of QUIC (0.0.146) and TLS 1.3 hybrid PQC (0.0.145)
+
+import std/quic
+import std/tls13
+import std/sha3_hash
+
+// ============================================================================
+// HTTP/3 Constants
+// ============================================================================
+
+fn h3_version(): i64 { return 0x00000001 }  // HTTP/3 version
+fn h3_alpn(): u8[] {
+    let alpn: u8[5] = { 104, 51, 45, 50, 51 }  // "h3-29" draft-29 / "h3" final
+    return alpn
+}
+
+// Settings identifiers (RFC 9114 Section 7.2.1)
+fn h3_settings_qpack_max_table_capacity(): i64 { return 0x01 }
+fn h3_settings_max_field_section_size(): i64 { return 0x02 }
+fn h3_settings_qpack_blocked_streams(): i64 { return 0x03 }
+fn h3_settings_enable_connect_protocol(): i64 { return 0x08 }
+fn h3_settings_h3_datagram(): i64 { return 0x33 }  // draft
+
+// Default settings
+fn h3_default_qpack_max_table_capacity(): i64 { return 0 }  // 0 = unlimited
+fn h3_default_max_field_section_size(): i64 { return 16384 }  // 16 KB
+fn h3_default_qpack_blocked_streams(): i64 { return 100 }
+fn h3_default_enable_connect_protocol(): i64 { return 0 }
+
+// Frame types (RFC 9114 Section 7.2)
+fn h3_frame_data(): i64 { return 0x00 }
+fn h3_frame_headers(): i64 { return 0x01 }
+fn h3_frame_priority(): i64 { return 0x02 }  // deprecated but still defined
+fn h3_frame_cancel_push(): i64 { return 0x03 }
+fn h3_frame_settings(): i64 { return 0x04 }
+fn h3_frame_push_promise(): i64 { return 0x05 }
+fn h3_frame_goaway(): i64 { return 0x07 }
+fn h3_frame_max_push_id(): i64 { return 0x0D }
+fn h3_frame_datagram(): i64 { return 0x33 }  // draft
+
+// Stream types
+fn h3_stream_type_control(): i64 { return 0x00 }
+fn h3_stream_type_push(): i64 { return 0x01 }
+fn h3_stream_type_request(): i64 { return 0x02 }  // client-initiated bidirectional
+fn h3_stream_type_qpack_encoder(): i64 { return 0x03 }  // unidirectional
+fn h3_stream_type_qpack_decoder(): i64 { return 0x04 }  // unidirectional
+
+// Error codes (RFC 9114 Section 8.1)
+fn h3_err_no_error(): i64 { return 0x0100 }
+fn h3_err_general_protocol_error(): i64 { return 0x0101 }
+fn h3_err_internal_error(): i64 { return 0x0102 }
+fn h3_err_stream_creation_error(): i64 { return 0x0103 }
+fn h3_err_closed_critical_stream(): i64 { return 0x0104 }
+fn h3_err_frame_unexpected(): i64 { return 0x0105 }
+fn h3_err_frame_error(): i64 { return 0x0106 }
+fn h3_err_excessive_load(): i64 { return 0x0107 }
+fn h3_err_id_error(): i64 { return 0x0108 }
+fn h3_err_settings_error(): i64 { return 0x0109 }
+fn h3_err_missing_settings(): i64 { return 0x010A }
+fn h3_err_request_rejected(): i64 { return 0x010B }
+fn h3_err_request_cancelled(): i64 { return 0x010C }
+fn h3_err_request_incomplete(): i64 { return 0x010D }
+fn h3_err_early_response(): i64 { return 0x010E }
+fn h3_err_connect_error(): i64 { return 0x010F }
+fn h3_err_version_fallback(): i64 { return 0x0110 }
+fn h3_err_qpack_decompression_failed(): i64 { return 0x0200 }
+fn h3_err_qpack_encoder_stream_error(): i64 { return 0x0201 }
+fn h3_err_qpack_decoder_stream_error(): i64 { return 0x0202 }
+fn h3_err_h3_datagram_error(): i64 { return 0x0330 }
+
+// HTTP methods
+fn h3_method_get(): u8[] { let m: u8[4] = { 71, 69, 84, 0 }; return m }
+fn h3_method_post(): u8[] { let m: u8[5] = { 80, 79, 83, 84, 0 }; return m }
+fn h3_method_head(): u8[] { let m: u8[5] = { 72, 69, 65, 68, 0 }; return m }
+fn h3_method_put(): u8[] { let m: u8[4] = { 80, 85, 84, 0 }; return m }
+fn h3_method_delete(): u8[] { let m: u8[7] = { 68, 69, 76, 69, 84, 69, 0 }; return m }
+fn h3_method_connect(): u8[] { let m: u8[8] = { 67, 79, 78, 78, 69, 67, 84, 0 }; return m }
+fn h3_method_options(): u8[] { let m: u8[8] = { 79, 80, 84, 73, 79, 78, 83, 0 }; return m }
+
+// Pseudo-header fields (RFC 9114 Section 3.2.1)
+fn h3_pseudo_method(): u8[] { let m: u8[8] = { 58, 109, 101, 116, 104, 111, 100, 0 }; return m }  // :method
+fn h3_pseudo_path(): u8[] { let m: u8[6] = { 58, 112, 97, 116, 104, 0 }; return m }  // :path
+fn h3_pseudo_scheme(): u8[] { let m: u8[8] = { 58, 115, 99, 104, 101, 109, 101, 0 }; return m }  // :scheme
+fn h3_pseudo_authority(): u8[] { let m: u8[11] = { 58, 97, 117, 116, 104, 111, 114, 105, 116, 121, 0 }; return m }  // :authority
+fn h3_pseudo_status(): u8[] { let m: u8[8] = { 58, 115, 116, 97, 116, 117, 115, 0 }; return m }  // :status
+fn h3_pseudo_protocol(): u8[] { let m: u8[11] = { 58, 112, 114, 111, 116, 111, 99, 111, 108, 0 }; return m }  // :protocol
+
+// Common header fields
+fn h3_header_content_type(): u8[] { let m: u8[13] = { 99, 111, 110, 116, 101, 110, 116, 45, 116, 121, 112, 101, 0 }; return m }
+fn h3_header_content_length(): u8[] { let m: u8[15] = { 99, 111, 110, 116, 101, 110, 116, 45, 108, 101, 110, 103, 116, 104, 0 }; return m }
+fn h3_header_host(): u8[] { let m: u8[5] = { 104, 111, 115, 116, 0 }; return m }
+fn h3_header_user_agent(): u8[] { let m: u8[12] = { 117, 115, 101, 114, 45, 97, 103, 101, 110, 116, 0 }; return m }
+fn h3_header_accept(): u8[] { let m: u8[7] = { 97, 99, 99, 101, 112, 116, 0 }; return m }
+fn h3_header_accept_encoding(): u8[] { let m: u8[17] = { 97, 99, 99, 101, 112, 116, 45, 101, 110, 99, 111, 100, 105, 110, 103, 0 }; return m }
+fn h3_header_connection(): u8[] { let m: u8[11] = { 99, 111, 110, 110, 101, 99, 116, 105, 111, 110, 0 }; return m }
+fn h3_header_date(): u8[] { let m: u8[5] = { 100, 97, 116, 101, 0 }; return m }
+fn h3_header_server(): u8[] { let m: u8[7] = { 115, 101, 114, 118, 101, 114, 0 }; return m }
+fn h3_header_vary(): u8[] { let m: u8[5] = { 118, 97, 114, 121, 0 }; return m }
+
+// ============================================================================
+// QPACK (RFC 9204) - Header Compression for HTTP/3
+// ============================================================================
+
+// Static table (RFC 9204 Appendix A) - subset of common headers
+struct qpack_static_entry {
+    name: u8[64],
+    name_len: i64,
+    value: u8[256],
+    value_len: i64
+}
+
+// Static table entries (indexed from 1)
+fn qpack_static_table_size(): i64 { return 99 }
+
+fn qpack_static_name(idx: i64, dst: u8[], dst_len: i64[]): i64 {
+    if idx < 1 || idx > qpack_static_table_size() { return -1 }
+    // Simplified: return common entries
+    if idx == 1 {  // :authority
+        let name: u8[] = h3_header_host()
+        let i: i64 = 0
+        while i < 4 { dst[i] = name[i]; i = i + 1 }
+        dst_len[0] = 4
+        return 0
+    }
+    if idx == 2 {  // :path /
+        let name: u8[] = h3_pseudo_path()
+        let i: i64 = 0
+        while i < 4 { dst[i] = name[i]; i = i + 1 }
+        dst_len[0] = 4
+        return 0
+    }
+    if idx == 8 {  // :status 200
+        let name: u8[] = h3_pseudo_status()
+        let i: i64 = 0
+        while i < 7 { dst[i] = name[i]; i = i + 1 }
+        dst_len[0] = 7
+        return 0
+    }
+    return -1
+}
+
+fn qpack_static_value(idx: i64, dst: u8[], dst_len: i64[]): i64 {
+    if idx < 1 || idx > qpack_static_table_size() { return -1 }
+    if idx == 2 {  // :path /
+        dst[0] = 47  // '/'
+        dst_len[0] = 1
+        return 0
+    }
+    if idx == 8 {  // :status 200
+        dst[0] = 50; dst[1] = 48; dst[2] = 48  // "200"
+        dst_len[0] = 3
+        return 0
+    }
+    return -1
+}
+
+// Dynamic table
+struct qpack_dynamic_table {
+    entries: u8[100][320],  // [name_len + name + value_len + value] per entry
+    count: i64,
+    capacity: i64,
+    inserted_count: i64,
+    base: i64
+}
+
+fn qpack_dynamic_table_init(table: qpack_dynamic_table[], capacity: i64): i64 {
+    table[0].count = 0
+    table[0].capacity = capacity
+    table[0].inserted_count = 0
+    table[0].base = 0
+    return 0
+}
+
+// QPACK encoder stream instructions (RFC 9204 Section 4.2)
+fn qpack_ins_insert_with_name_ref(): i64 { return 0x80 }  // 1xxxxxxx
+fn qpack_ins_insert_without_name_ref(): i64 { return 0x40 }  // 01xxxxxx
+fn qpack_ins_duplicate(): i64 { return 0x00 }  // 00xxxxxx
+fn qpack_ins_dynamic_table_size_update(): i64 { return 0x20 }  // 001xxxxx
+fn qpack_ins_insert_count_increment(): i64 { return 0x00 }  // same as duplicate with specific encoding
+
+// QPACK decoder stream instructions (RFC 9204 Section 4.3)
+fn qpack_ins_section_ack(): i64 { return 0x80 }  // 1xxxxxxx
+fn qpack_ins_stream_cancellation(): i64 { return 0x40 }  // 01xxxxxx
+fn qpack_ins_insert_count_increment_dec(): i64 { return 0x00 }  // 00xxxxxx
+
+// Encode integer with prefix (RFC 9204 Section 4.1)
+fn qpack_encode_int(val: i64, prefix_bits: i64, dst: u8[], offset: i64): i64 {
+    let max_val: i64 = (1 << prefix_bits) - 1
+    if val < max_val {
+        dst[offset] = val as u8
+        return offset + 1
+    }
+    dst[offset] = max_val as u8
+    offset = offset + 1
+    val = val - max_val
+    while val >= 128 {
+        dst[offset] = (val & 0x7F | 0x80) as u8
+        offset = offset + 1
+        val = val >> 7
+    }
+    dst[offset] = val as u8
+    return offset + 1
+}
+
+fn qpack_decode_int(src: u8[], offset: i64, prefix_bits: i64, val: i64[]): i64 {
+    let max_val: i64 = (1 << prefix_bits) - 1
+    let first: i64 = src[offset] as i64
+    if first < max_val {
+        val[0] = first
+        return offset + 1
+    }
+    val[0] = max_val
+    offset = offset + 1
+    let m: i64 = 0
+    while true {
+        let b: i64 = src[offset] as i64
+        offset = offset + 1
+        val[0] = val[0] + ((b & 0x7F) << m)
+        if (b & 0x80) == 0 { break }
+        m = m + 7
+    }
+    return offset
+}
+
+// String encoding (length-prefixed)
+fn qpack_encode_string(s: u8[], len: i64, dst: u8[], offset: i64): i64 {
+    offset = qpack_encode_int(len, 7, dst, offset)
+    let i: i64 = 0
+    while i < len {
+        dst[offset + i] = s[i]
+        i = i + 1
+    }
+    return offset + len
+}
+
+// Encoder: Insert with name reference
+fn qpack_encoder_insert_name_ref(
+    table: qpack_dynamic_table[],
+    name_idx: i64,  // 0 = static, >0 = dynamic
+    is_static: i64,
+    value: u8[],
+    value_len: i64,
+    dst: u8[],
+    offset: i64
+): i64 {
+    let prefix: i64 = 0x80  // 1xxxxxxx
+    if is_static != 0 {
+        // Static table reference: 1xxxxxxx with 6-bit prefix
+        offset = qpack_encode_int(name_idx, 6, dst, offset)
+    } else {
+        // Dynamic table reference: 0xxxxxxx with 6-bit prefix (but bit 7=0 for dynamic)
+        // Actually: Insert with Name Reference: 1 T N(6)
+        // T=1 for static, T=0 for dynamic
+        // We'll use simplified encoding
+        offset = qpack_encode_int(name_idx, 6, dst, offset)
+    }
+    offset = qpack_encode_string(value, value_len, dst, offset)
+    return offset
+}
+
+// Encoder: Set dynamic table capacity
+fn qpack_encoder_set_capacity(table: qpack_dynamic_table[], capacity: i64, dst: u8[], offset: i64): i64 {
+    // 001xxxxx with 5-bit prefix
+    dst[offset] = 0x20 | (capacity & 0x1F) as u8
+    if capacity >= 32 {
+        // Need extended encoding - simplified
+        offset = offset + 1
+    } else {
+        offset = offset + 1
+    }
+    table[0].capacity = capacity
+    return offset
+}
+
+// ============================================================================
+// HTTP/3 Frame Encoding/Decoding
+// ============================================================================
+
+// Frame header: Type (varint) + Length (varint)
+fn h3_encode_frame_header(frame_type: i64, length: i64, dst: u8[], offset: i64): i64 {
+    offset = quic_varint_encode(frame_type, dst, offset)
+    offset = quic_varint_encode(length, dst, offset)
+    return offset
+}
+
+fn h3_decode_frame_header(src: u8[], offset: i64, frame_type: i64[], length: i64[]): i64 {
+    let varint_val: i64[1]
+    offset = quic_varint_decode(src, offset, varint_val)
+    frame_type[0] = varint_val[0]
+    offset = quic_varint_decode(src, offset, varint_val)
+    length[0] = varint_val[0]
+    return offset
+}
+
+// SETTINGS frame
+fn h3_encode_settings_frame(settings: i64[][], count: i64, dst: u8[], offset: i64): i64 {
+    let start: i64 = offset
+    offset = h3_encode_frame_header(h3_frame_settings(), 0, dst, offset)  // placeholder length
+    let i: i64 = 0
+    while i < count {
+        offset = quic_varint_encode(settings[i][0], dst, offset)  // identifier
+        offset = quic_varint_encode(settings[i][1], dst, offset)  // value
+        i = i + 1
+    }
+    let length: i64 = offset - start - 2  // exclude frame header (simplified)
+    // Would need to backfill length - simplified for now
+    return offset
+}
+
+// HEADERS frame (with QPACK)
+fn h3_encode_headers_frame(
+    stream_id: i64,
+    headers: u8[][],
+    header_count: i64,
+    end_headers: i64,
+    dst: u8[],
+    offset: i64
+): i64 {
+    // HEADERS frame payload: QPACK-encoded header block
+    // For simplicity, encode as raw header fields
+    let payload_start: i64 = offset
+    offset = h3_encode_frame_header(h3_frame_headers(), 0, dst, offset)
+    
+    let i: i64 = 0
+    while i < header_count {
+        let name: u8[] = headers[i * 2]
+        let value: u8[] = headers[i * 2 + 1]
+        // Find name length
+        let name_len: i64 = 0
+        while name[name_len] != 0 && name_len < 255 { name_len = name_len + 1 }
+        let value_len: i64 = 0
+        while value[value_len] != 0 && value_len < 255 { value_len = value_len + 1 }
+        
+        offset = qpack_encode_int(name_len, 7, dst, offset)
+        let j: i64 = 0
+        while j < name_len {
+            dst[offset + j] = name[j]
+            j = j + 1
+        }
+        offset = offset + name_len
+        offset = qpack_encode_int(value_len, 7, dst, offset)
+        j = 0
+        while j < value_len {
+            dst[offset + j] = value[j]
+            j = j + 1
+        }
+        offset = offset + value_len
+        i = i + 1
+    }
+    return offset
+}
+
+// DATA frame
+fn h3_encode_data_frame(data: u8[], data_len: i64, dst: u8[], offset: i64): i64 {
+    offset = h3_encode_frame_header(h3_frame_data(), data_len, dst, offset)
+    let i: i64 = 0
+    while i < data_len {
+        dst[offset + i] = data[i]
+        i = i + 1
+    }
+    return offset + data_len
+}
+
+// GOAWAY frame
+fn h3_encode_goaway_frame(stream_id: i64, dst: u8[], offset: i64): i64 {
+    offset = h3_encode_frame_header(h3_frame_goaway(), 0, dst, offset)
+    offset = quic_varint_encode(stream_id, dst, offset)
+    return offset
+}
+
+// MAX_PUSH_ID frame
+fn h3_encode_max_push_id_frame(push_id: i64, dst: u8[], offset: i64): i64 {
+    offset = h3_encode_frame_header(h3_frame_max_push_id(), 0, dst, offset)
+    offset = quic_varint_encode(push_id, dst, offset)
+    return offset
+}
+
+// ============================================================================
+// HTTP/3 Connection State
+// ============================================================================
+
+struct h3_conn {
+    quic_conn: quic_conn,
+    state: i64,  // 0=connecting, 1=connected, 2=closing, 3=closed
+    
+    // Settings
+    local_settings: i64[10][2],  // [id][value]
+    local_settings_count: i64,
+    remote_settings: i64[10][2],
+    remote_settings_count: i64,
+    settings_received: i64,
+    
+    // QPACK
+    qpack_encoder_table: qpack_dynamic_table,
+    qpack_decoder_table: qpack_dynamic_table,
+    qpack_max_table_capacity: i64,
+    qpack_blocked_streams: i64,
+    encoder_stream_id: i64,
+    decoder_stream_id: i64,
+    encoder_insert_count: i64,
+    decoder_insert_count: i64,
+    
+    // Streams
+    control_stream_send_id: i64,
+    control_stream_recv_id: i64,
+    push_stream_count: i64,
+    max_push_id: i64,
+    
+    // Request/Response tracking
+    request_stream_ids: i64[100],
+    request_count: i64,
+    
+    // Server push
+    push_ids: i64[100],
+    push_count: i64,
+    
+    // Flow control
+    max_field_section_size: i64,
+    enable_connect_protocol: i64,
+}
+
+fn h3_conn_init(h3: h3_conn[], quic: quic_conn[]): i64 {
+    // Copy QUIC connection
+    h3[0].quic_conn = quic[0]
+    h3[0].state = 0  // connecting
+    
+    // Default settings
+    h3[0].local_settings[0][0] = h3_settings_qpack_max_table_capacity()
+    h3[0].local_settings[0][1] = h3_default_qpack_max_table_capacity()
+    h3[0].local_settings[1][0] = h3_settings_max_field_section_size()
+    h3[0].local_settings[1][1] = h3_default_max_field_section_size()
+    h3[0].local_settings[2][0] = h3_settings_qpack_blocked_streams()
+    h3[0].local_settings[2][1] = h3_default_qpack_blocked_streams()
+    h3[0].local_settings[3][0] = h3_settings_enable_connect_protocol()
+    h3[0].local_settings[3][1] = h3_default_enable_connect_protocol()
+    h3[0].local_settings_count = 4
+    
+    h3[0].settings_received = 0
+    h3[0].max_field_section_size = h3_default_max_field_section_size()
+    h3[0].enable_connect_protocol = h3_default_enable_connect_protocol()
+    
+    // QPACK
+    qpack_dynamic_table_init(h3[0].qpack_encoder_table, 4096)
+    qpack_dynamic_table_init(h3[0].qpack_decoder_table, 4096)
+    h3[0].qpack_max_table_capacity = h3_default_qpack_max_table_capacity()
+    h3[0].qpack_blocked_streams = h3_default_qpack_blocked_streams()
+    h3[0].encoder_insert_count = 0
+    h3[0].decoder_insert_count = 0
+    
+    return 0
+}
+
+// Open control streams (must be first streams)
+fn h3_open_control_streams(h3: h3_conn[]): i64 {
+    // Client: stream 0 = control send, stream 2 = QPACK encoder, stream 4 = QPACK decoder
+    // Server: stream 1 = control send, stream 3 = QPACK encoder, stream 5 = QPACK decoder
+    let is_client: i64 = h3[0].quic_conn.is_server == 0 ? 1 : 0
+    
+    if is_client != 0 {
+        h3[0].control_stream_send_id = 0
+        h3[0].encoder_stream_id = 2
+        h3[0].decoder_stream_id = 4
+    } else {
+        h3[0].control_stream_send_id = 1
+        h3[0].encoder_stream_id = 3
+        h3[0].decoder_stream_id = 5
+    }
+    h3[0].control_stream_recv_id = h3[0].control_stream_send_id ^ 1
+    
+    return 0
+}
+
+// Send SETTINGS frame on control stream
+fn h3_send_settings(h3: h3_conn[]): i64 {
+    let payload: u8[1024]
+    let offset: i64 = 0
+    offset = h3_encode_settings_frame(h3[0].local_settings, h3[0].local_settings_count, payload, offset)
+    
+    // Send on control stream via QUIC STREAM frame
+    let frame: u8[1500]
+    let frame_len: i64 = quic_encode_stream_frame(
+        h3[0].control_stream_send_id, 0, payload, offset, 0, frame, 0
+    )
+    
+    // Encrypt and send via QUIC
+    let encrypted: u8[1500]
+    let enc_len: i64 = quic_encrypt_payload(
+        h3[0].quic_conn.app_key, h3[0].quic_conn.app_iv,
+        h3[0].quic_conn.pn_sent[quic_level_1rtt()],
+        frame, frame_len, encrypted
+    )
+    
+    let pkt: u8[1500]
+    let pkt_len: i64 = quic_send_1rtt(h3[0].quic_conn, encrypted, enc_len, pkt)
+    
+    return pkt_len
+}
+
+// Process incoming frame on control stream
+fn h3_process_control_frame(h3: h3_conn[], frame_type: i64, payload: u8[], payload_len: i64): i64 {
+    if frame_type == h3_frame_settings() {
+        return h3_process_settings(h3, payload, payload_len)
+    } else if frame_type == h3_frame_goaway() {
+        return h3_process_goaway(h3, payload, payload_len)
+    } else if frame_type == h3_frame_max_push_id() {
+        return h3_process_max_push_id(h3, payload, payload_len)
+    } else if frame_type == h3_frame_cancel_push() {
+        // Handle cancel push
+    }
+    return 0
+}
+
+fn h3_process_settings(h3: h3_conn[], payload: u8[], payload_len: i64): i64 {
+    let offset: i64 = 0
+    let end: i64 = payload_len
+    let count: i64 = 0
+    
+    while offset < end && count < 10 {
+        let varint_val: i64[1]
+        offset = quic_varint_decode(payload, offset, varint_val)
+        let id: i64 = varint_val[0]
+        offset = quic_varint_decode(payload, offset, varint_val)
+        let value: i64 = varint_val[0]
+        
+        h3[0].remote_settings[count][0] = id
+        h3[0].remote_settings[count][1] = value
+        count = count + 1
+        
+        // Apply settings
+        if id == h3_settings_qpack_max_table_capacity() {
+            h3[0].qpack_max_table_capacity = value
+            qpack_dynamic_table_init(h3[0].qpack_decoder_table, value)
+        } else if id == h3_settings_max_field_section_size() {
+            h3[0].max_field_section_size = value
+        } else if id == h3_settings_qpack_blocked_streams() {
+            h3[0].qpack_blocked_streams = value
+        } else if id == h3_settings_enable_connect_protocol() {
+            h3[0].enable_connect_protocol = value
+        }
+    }
+    h3[0].remote_settings_count = count
+    h3[0].settings_received = 1
+    return 0
+}
+
+fn h3_process_goaway(h3: h3_conn[], payload: u8[], payload_len: i64): i64 {
+    let varint_val: i64[1]
+    let offset: i64 = quic_varint_decode(payload, 0, varint_val)
+    let stream_id: i64 = varint_val[0]
+    // Stop accepting new requests on streams >= stream_id
+    h3[0].state = 2  // closing
+    return 0
+}
+
+fn h3_process_max_push_id(h3: h3_conn[], payload: u8[], payload_len: i64): i64 {
+    let varint_val: i64[1]
+    let offset: i64 = quic_varint_decode(payload, 0, varint_val)
+    h3[0].max_push_id = varint_val[0]
+    return 0
+}
+
+// ============================================================================
+// Request/Response Handling
+// ============================================================================
+
+// Send HTTP request
+fn h3_send_request(
+    h3: h3_conn[],
+    method: u8[],
+    path: u8[],
+    scheme: u8[],
+    authority: u8[],
+    headers: u8[][],
+    header_count: i64,
+    body: u8[],
+    body_len: i64
+): i64 {
+    if h3[0].settings_received == 0 { return -1 }
+    
+    // Allocate request stream (client-initiated bidirectional: 4n)
+    let stream_id: i64 = h3[0].request_count * 4
+    h3[0].request_stream_ids[h3[0].request_count] = stream_id
+    h3[0].request_count = h3[0].request_count + 1
+    
+    // Build headers
+    let hdrs: u8[16][64]
+    let hdr_count: i64 = 0
+    
+    // Pseudo-headers (required)
+    let name_buf: u8[64]
+    let val_buf: u8[256]
+    
+    // :method
+    let i: i64 = 0
+    while method[i] != 0 { name_buf[i] = method[i]; i = i + 1 }
+    name_buf[i] = 0
+    i = 0
+    while path[i] != 0 { val_buf[i] = path[i]; i = i + 1 }
+    val_buf[i] = 0
+    hdrs[hdr_count * 2] = name_buf
+    hdrs[hdr_count * 2 + 1] = val_buf
+    hdr_count = hdr_count + 1
+    
+    // :path
+    i = 0
+    while path[i] != 0 { name_buf[i] = path[i]; i = i + 1 }
+    name_buf[i] = 0
+    i = 0
+    while path[i] != 0 { val_buf[i] = path[i]; i = i + 1 }
+    val_buf[i] = 0
+    hdrs[hdr_count * 2] = name_buf
+    hdrs[hdr_count * 2 + 1] = val_buf
+    hdr_count = hdr_count + 1
+    
+    // :scheme
+    i = 0
+    while scheme[i] != 0 { name_buf[i] = scheme[i]; i = i + 1 }
+    name_buf[i] = 0
+    i = 0
+    while scheme[i] != 0 { val_buf[i] = scheme[i]; i = i + 1 }
+    val_buf[i] = 0
+    hdrs[hdr_count * 2] = name_buf
+    hdrs[hdr_count * 2 + 1] = val_buf
+    hdr_count = hdr_count + 1
+    
+    // :authority
+    i = 0
+    while authority[i] != 0 { name_buf[i] = authority[i]; i = i + 1 }
+    name_buf[i] = 0
+    i = 0
+    while authority[i] != 0 { val_buf[i] = authority[i]; i = i + 1 }
+    val_buf[i] = 0
+    hdrs[hdr_count * 2] = name_buf
+    hdrs[hdr_count * 2 + 1] = val_buf
+    hdr_count = hdr_count + 1
+    
+    // Additional headers
+    i = 0
+    while i < header_count {
+        hdrs[hdr_count * 2] = headers[i * 2]
+        hdrs[hdr_count * 2 + 1] = headers[i * 2 + 1]
+        hdr_count = hdr_count + 1
+        i = i + 1
+    }
+    
+    // Send HEADERS frame
+    let frame: u8[1500]
+    let frame_offset: i64 = 0
+    frame_offset = h3_encode_headers_frame(stream_id, hdrs, hdr_count, 1, frame, frame_offset)
+    
+    // Send via QUIC
+    let encrypted: u8[1500]
+    let enc_len: i64 = quic_encrypt_payload(
+        h3[0].quic_conn.app_key, h3[0].quic_conn.app_iv,
+        h3[0].quic_conn.pn_sent[quic_level_1rtt()],
+        frame, frame_offset, encrypted
+    )
+    
+    let pkt: u8[1500]
+    let pkt_len: i64 = quic_send_1rtt(h3[0].quic_conn, encrypted, enc_len, pkt)
+    
+    // Send body if present
+    if body_len > 0 {
+        frame_offset = 0
+        frame_offset = h3_encode_data_frame(body, body_len, frame, frame_offset)
+        enc_len = quic_encrypt_payload(
+            h3[0].quic_conn.app_key, h3[0].quic_conn.app_iv,
+            h3[0].quic_conn.pn_sent[quic_level_1rtt()],
+            frame, frame_offset, encrypted
+        )
+        pkt_len = quic_send_1rtt(h3[0].quic_conn, encrypted, enc_len, pkt)
+    }
+    
+    return stream_id
+}
+
+// Process response on request stream
+fn h3_process_response(h3: h3_conn[], stream_id: i64, frames: u8[][], frame_count: i64): i64 {
+    let i: i64 = 0
+    while i < frame_count {
+        let frame_type: i64 = frames[i][0] as i64  // simplified
+        
+        if frame_type == h3_frame_headers() {
+            // Parse response headers
+            // Extract :status, content-type, etc.
+        } else if frame_type == h3_frame_data() {
+            // Process response body
+        }
+        i = i + 1
+    }
+    return 0
+}
+
+// ============================================================================
+// Server Request Handling
+// ============================================================================
+
+fn h3_handle_request(h3: h3_conn[], stream_id: i64, headers: u8[][], header_count: i64): i64 {
+    // Parse request
+    let method: u8[16]
+    let path: u8[256]
+    let scheme: u8[16]
+    let authority: u8[256]
+    
+    let i: i64 = 0
+    while i < header_count {
+        let name: u8[64] = headers[i * 2]
+        let value: u8[256] = headers[i * 2 + 1]
+        
+        // Check pseudo-headers
+        if name[0] == 58 {  // ':'
+            // Compare with known pseudo-headers
+            if name[1] == 109 && name[2] == 101 && name[3] == 116 && name[4] == 104 && name[5] == 111 && name[6] == 100 {  // :method
+                // copy value to method
+            } else if name[1] == 112 && name[2] == 97 && name[3] == 116 && name[4] == 104 {  // :path
+                // copy value to path
+            } else if name[1] == 115 && name[2] == 99 && name[3] == 104 && name[4] == 101 && name[5] == 109 && name[6] == 101 {  // :scheme
+                // copy value to scheme
+            } else if name[1] == 97 && name[2] == 117 && name[3] == 117 && name[4] == 116 && name[5] == 104 && name[6] == 111 && name[7] == 114 && name[8] == 105 && name[9] == 116 && name[10] == 121 {  // :authority
+                // copy value to authority
+            }
+        }
+        i = i + 1
+    }
+    
+    // Generate response
+    let status: u8[4] = { 50, 48, 48, 0 }  // "200"
+    let server: u8[7] = { 113, 117, 97, 110, 116, 97, 0 }  // "quanta"
+    let content_type: u8[25] = { 116, 101, 120, 116, 47, 112, 108, 97, 105, 110, 0 }  // "text/plain"
+    
+    let resp_headers: u8[8][64]
+    let resp_count: i64 = 0
+    
+    // :status
+    resp_headers[resp_count * 2] = h3_pseudo_status()
+    resp_headers[resp_count * 2 + 1] = status
+    resp_count = resp_count + 1
+    
+    // server
+    resp_headers[resp_count * 2] = h3_header_server()
+    resp_headers[resp_count * 2 + 1] = server
+    resp_count = resp_count + 1
+    
+    // content-type
+    resp_headers[resp_count * 2] = h3_header_content_type()
+    resp_headers[resp_count * 2 + 1] = content_type
+    resp_count = resp_count + 1
+    
+    // Send response HEADERS
+    let frame: u8[1500]
+    let frame_offset: i64 = 0
+    frame_offset = h3_encode_headers_frame(stream_id, resp_headers, resp_count, 1, frame, frame_offset)
+    
+    let encrypted: u8[1500]
+    let enc_len: i64 = quic_encrypt_payload(
+        h3[0].quic_conn.app_key, h3[0].quic_conn.app_iv,
+        h3[0].quic_conn.pn_sent[quic_level_1rtt()],
+        frame, frame_offset, encrypted
+    )
+    
+    let pkt: u8[1500]
+    quic_send_1rtt(h3[0].quic_conn, encrypted, enc_len, pkt)
+    
+    // Send response body
+    let body: u8[32] = { 72, 101, 108, 108, 111, 32, 72, 51, 33, 0 }  // "Hello H3!"
+    let body_len: i64 = 9
+    
+    frame_offset = 0
+    frame_offset = h3_encode_data_frame(body, body_len, frame, frame_offset)
+    enc_len = quic_encrypt_payload(
+        h3[0].quic_conn.app_key, h3[0].quic_conn.app_iv,
+        h3[0].quic_conn.pn_sent[quic_level_1rtt()],
+        frame, frame_offset, encrypted
+    )
+    quic_send_1rtt(h3[0].quic_conn, encrypted, enc_len, pkt)
+    
+    return 0
+}
+
+// ============================================================================
+// QPACK Encoder/Decoder Stream Processing
+// ============================================================================
+
+fn h3_process_encoder_stream(h3: h3_conn[], data: u8[], data_len: i64): i64 {
+    // Process QPACK encoder instructions from peer
+    let offset: i64 = 0
+    while offset < data_len {
+        let first: i64 = data[offset] as i64
+        if (first & 0x80) != 0 {
+            // Insert with name reference (static or dynamic)
+            // Simplified parsing
+            offset = offset + 1
+        } else if (first & 0x40) != 0 {
+            // Insert without name reference
+            offset = offset + 1
+        } else if (first & 0x20) != 0 {
+            // Dynamic table size update
+            offset = offset + 1
+        } else {
+            // Duplicate
+            offset = offset + 1
+        }
+    }
+    return 0
+}
+
+fn h3_process_decoder_stream(h3: h3_conn[], data: u8[], data_len: i64): i64 {
+    // Process QPACK decoder instructions from peer (acknowledgements)
+    let offset: i64 = 0
+    while offset < data_len {
+        let first: i64 = data[offset] as i64
+        if (first & 0x80) != 0 {
+            // Section acknowledgment
+            offset = offset + 1
+        } else if (first & 0x40) != 0 {
+            // Stream cancellation
+            offset = offset + 1
+        } else {
+            // Insert count increment
+            offset = offset + 1
+        }
+    }
+    return 0
+}
+
+// ============================================================================
+// Main Entry Points
+// ============================================================================
+
+// Client connection
+fn h3_client_connect(h3: h3_conn[], host: u8[], port: i64): i64 {
+    // Initialize QUIC connection
+    quic_client_init(h3[0].quic_conn)
+    
+    // Perform QUIC handshake (includes TLS 1.3)
+    // ...
+    
+    // Open HTTP/3 control streams
+    h3_open_control_streams(h3)
+    
+    // Send SETTINGS
+    h3_send_settings(h3)
+    
+    h3[0].state = 1  // connected
+    return 0
+}
+
+// Server connection
+fn h3_server_accept(h3: h3_conn[]): i64 {
+    quic_server_init(h3[0].quic_conn)
+    h3_open_control_streams(h3)
+    h3_send_settings(h3)
+    h3[0].state = 1
+    return 0
+}
+
+// ============================================================================
+// Connection Close
+// ============================================================================
+
+fn h3_close_connection(h3: h3_conn[], error_code: i64): i64 {
+    let frame: u8[100]
+    let offset: i64 = h3_encode_goaway_frame(h3[0].request_stream_ids[h3[0].request_count - 1], frame, 0)
+    
+    let encrypted: u8[1500]
+    let enc_len: i64 = quic_encrypt_payload(
+        h3[0].quic_conn.app_key, h3[0].quic_conn.app_iv,
+        h3[0].quic_conn.pn_sent[quic_level_1rtt()],
+        frame, offset, encrypted
+    )
+    
+    let pkt: u8[1500]
+    quic_send_1rtt(h3[0].quic_conn, encrypted, enc_len, pkt)
+    
+    h3[0].state = 3  // closed
+    return 0
+}

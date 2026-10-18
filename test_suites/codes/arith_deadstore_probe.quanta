@@ -1,0 +1,25 @@
+// F2 red-first row (0.0.250) — dead home stores at the BLOCK BOUNDARY.
+//
+// Every temporary in this loop body dies at the back edge: `d` is the only value
+// the body produces that is read again, and `a`/`b`/`c` are consumed by the next
+// line of the same body. 0.0.249's flush_all() nonetheless stores EVERY mapped
+// vreg on the way out of the block, so the loop carries home stores for values
+// nothing ever reads. 0.0.250 computes block liveness and stores only what the
+// successor block can read.
+//
+// Hand-derived golden (no printer: print pulls the inlined itoa loop into `main`
+// and the guard picks the largest-span backward branch):
+//   sum over i in 0..7 of ((i*3 + 1) * 2 - i*3) = sum of (i*3 + 2) = 3*28 + 16 = 100
+fn main() {
+    let s = 0
+    let i = 0
+    while i < 8 {
+        let a = i * 3
+        let b = a + 1
+        let c = b * 2
+        let d = c - a
+        s = s + d
+        i = i + 1
+    }
+    return s
+}

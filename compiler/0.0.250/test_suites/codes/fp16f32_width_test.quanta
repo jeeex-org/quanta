@@ -1,0 +1,61 @@
+// 0.0.247: the STORAGE WIDTHS of f16 and f32, with no new builtin in sight.
+//
+// This row exists to be RED AT RUNTIME on the previous compiler rather than red
+// at compile time. Nothing here names a new function, so 0.0.246 compiles it
+// cleanly -- and then fails, because on 0.0.246 a `f32[N]` annotation is parsed
+// and DISCARDED (the float type words are not types, only literal suffixes), so
+// the element is stored at the default 8-byte stride and `mem_load32` at the
+// element's 4-byte offset reads the LOW half of an f64, which for 1.5 is 0.
+// A row that fails to COMPILE on the old version proves less: this one shows the
+// compiler running, computing the wrong layout, and being caught.
+//
+// The assertion style is deliberate: raw bytes read back at explicit offsets,
+// with a 0xA5 sentinel around them, so "2 bytes per element" and "4 bytes per
+// element" are proved, not inferred from the values.
+fn main() -> i64 {
+    // ---- f32 element = 4 bytes ----
+    let b: f32[8] = mem_alloc(8)
+    let i = 0
+    while i < 64 { mem_store8(b + 8 + i, 165); i = i + 1 }
+    b[0] = 1.5
+    b[1] = 2.25
+    b[2] = 0.0 - 3.5
+    if mem_load32(b + 8) != 1069547520 { exit(11) }     // 0x3FC00000 f32 1.5
+    if mem_load32(b + 12) != 1074790400 { exit(12) }    // 0x40100000 f32 2.25
+    if mem_load32(b + 16) != 3227516928 { exit(13) }    // 0xC0600000 f32 -3.5
+    if mem_load32(b + 20) != 2779096485 { exit(14) }    // 0xA5A5A5A5: only 4 bytes written
+    b[7] = 0.25
+    if mem_load32(b + 8 + 7*4) != 1048576000 { exit(15) }   // 0x3E800000 f32 0.25
+
+    // ---- f16 element = 2 bytes ----
+    let h: f16[8] = mem_alloc(8)
+    let j = 0
+    while j < 64 { mem_store8(h + 8 + j, 165); j = j + 1 }
+    h[0] = 1.5
+    h[1] = 0.0 - 2.0
+    h[2] = 0.25
+    h[3] = 0.0 - 3.5
+    if mem_load16(h + 8) != 15872 { exit(21) }      // 0x3E00 f16 1.5
+    if mem_load16(h + 10) != 49152 { exit(22) }     // 0xC000 f16 -2.0
+    if mem_load16(h + 12) != 13312 { exit(23) }     // 0x3400 f16 0.25
+    if mem_load16(h + 14) != 49920 { exit(24) }     // 0xC300 f16 -3.5
+    if mem_load32(h + 16) != 2779096485 { exit(25) }   // 0xA5A5A5A5: 8 bytes written by 4 elements
+    h[7] = 65504.0
+    if mem_load16(h + 8 + 7*2) != 31743 { exit(26) }   // 0x7BFF f16 max finite
+    // the whole f16 storage is 16 bytes of a 64-byte block: the tail is untouched
+    if mem_load32(h + 8 + 16) != 2779096485 { exit(27) }
+
+    // ---- the two widths are DIFFERENT, on the same value ----
+    // 1.5 in an f32 element is 0x3FC00000 (4 bytes); in an f16 element 0x3E00
+    // (2 bytes). If both were 8-byte f64 the two reads below would agree.
+    let only32: f32[4] = mem_alloc(4)
+    let only16: f16[4] = mem_alloc(4)
+    mem_store32(only16 + 8, 0)      // zero so the 32-bit read below is deterministic
+    only32[0] = 1.5
+    only16[0] = 1.5
+    if mem_load32(only32 + 8) == mem_load32(only16 + 8) { exit(31) }
+    if mem_load32(only32 + 8) != 1069547520 { exit(32) }
+    if mem_load16(only16 + 8) != 15872 { exit(33) }
+    println("fp16f32 width tests passed")
+    return 0
+}

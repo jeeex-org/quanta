@@ -1,0 +1,143 @@
+// Red-first gate row for the tokenizer-trait special-token defect.
+//
+// DEFECT: lib/std/tokenizer_trait.quanta's vt_encode() called bpe_encode(),
+// which does NO special-token matching. A chat template's control tokens
+// (`<|im_start|>`, `<|im_end|>`) were therefore byte-encoded and BPE-merged as
+// ordinary text instead of resolving to their single vocabulary ids. The driver
+// hit exactly this and it cost hours of wrong-prompt debugging: the prompt is
+// still valid ids, so nothing downstream reports an error -- the model simply
+// sees a different prompt.
+//
+// FIX: vt_encode() dispatches to bpe_encode_special(), which falls back to
+// bpe_encode() when the vocab carries no token_type array.
+//
+// RED-FIRST EVIDENCE (measured):
+//   with the fix reverted (vt_encode -> bpe_encode), this row returns 1:
+//     FAIL: <|im_start|>user = 6 ids, want 2
+//     (bpe_encode byte-encodes the 12-byte control token as '<','|','i',... )
+//   with the fix, the same row returns 0.
+//
+// EXPECTATIONS are llama.cpp's own tokenizer, not this tree:
+//   /usr/bin/python3 -c 'import llama_cpp; m.tokenize(text, add_bos=False,
+//     special=True)' on QUANTA-LFM2.5-2.6Bv1-Q4_K_M.gguf ->
+//     "<|im_start|>user"        -> [124899, 5922]
+//     "<|im_end|>"              -> [124900]
+//     "hello<|im_end|>world"    -> [52071, 124900, 27735]
+//     "a<|im_start|>b"          -> [73, 124899, 74]
+//     "hello world"             -> [52071, 1530]     (no special: unchanged)
+//     "The quick brown fox"     -> [597, 4104, 10299, 35886]
+//
+// Needs the real model: EXPECTED_STDLIB.tsv carries the GGUF in SKIP_IF_MISSING.
+import std/tokenizer_trait
+import std/str
+
+let MODEL = "/opt/ai/models/quanta/QUANTA-LFM2.5-2.6Bv1-Q4_K_M.gguf"
+
+let FAIL = 0
+
+// Encode a string literal through the trait, resolving the [u64 len] header.
+fn enc(lit, ids, max_ids) -> i64 {
+    return vt_encode(lit + 8, len(lit), ids, max_ids)
+}
+
+fn id_at(ids, i) -> i64 { return mem_load(ids + i * 8) }
+
+// A fixed-length id list in a heap buffer.
+fn wset(a, b, c, d) -> i64 {
+    let p = mem_alloc(32)
+    mem_store(p + 0 * 8, a)
+    mem_store(p + 1 * 8, b)
+    if c >= 0 { mem_store(p + 2 * 8, c) }
+    if d >= 0 { mem_store(p + 3 * 8, d) }
+    return p
+}
+
+// Assert a whole id sequence equals `want` (a fixed-length list).
+fn expect_seq(label, ids, got, want, wlen) -> i64 {
+    if got != wlen {
+        prints("FAIL: ")
+        prints(label)
+        prints(" = ")
+        print(got)
+        prints(" ids, want ")
+        print(wlen)
+        newline()
+        FAIL = FAIL + 1
+        return 0
+    }
+    let i = 0
+    while i < wlen {
+        if id_at(ids, i) != mem_load(want + i * 8) {
+            prints("FAIL: ")
+            prints(label)
+            prints(" id[")
+            print(i)
+            prints("] = ")
+            print(id_at(ids, i))
+            prints(", want ")
+            print(mem_load(want + i * 8))
+            newline()
+            FAIL = FAIL + 1
+        }
+        i = i + 1
+    }
+    return 0
+}
+
+// bpe_encode on the control-token string, via the family directly (no trait
+// dispatch), to show it does NOT emit the special id.
+fn enc_plain(ids) -> i64 {
+    let s = "<|im_start|>user"
+    return bpe_encode(s + 8, len(s), ids, 512)
+}
+
+fn main() -> i64 {
+    if gguf_load(MODEL) != 0 {
+        print("std_tokenizer_trait_special: FAIL cannot open the model\n")
+        return 1
+    }
+    if vt_load() != 1 {
+        print("std_tokenizer_trait_special: FAIL vt_load\n")
+        return 1
+    }
+    if vt_init_family() != 1 {
+        print("std_tokenizer_trait_special: FAIL vt_init_family\n")
+        return 1
+    }
+
+    let ids = mem_alloc(8192)
+
+    // 1. the control token resolves to ONE id, not to ordinary text.
+    expect_seq("<|im_start|>user", ids, enc("<|im_start|>user", ids, 512), wset(124899, 5922, -1, -1), 2)
+    expect_seq("<|im_end|>",       ids, enc("<|im_end|>",       ids, 512), wset(124900, -1, -1, -1), 1)
+
+    // 2. a control token in the MIDDLE is found at the next pre-token boundary,
+    //    not only at the start of the string.
+    expect_seq("hello<|im_end|>world", ids, enc("hello<|im_end|>world", ids, 512), wset(52071, 124900, 27735, -1), 3)
+    expect_seq("a<|im_start|>b",       ids, enc("a<|im_start|>b",       ids, 512), wset(73, 124899, 74, -1), 3)
+
+    // 3. text with no special token is byte-identical to plain BPE. This is the
+    //    guard that the change did not alter the ordinary path.
+    expect_seq("hello world",         ids, enc("hello world",         ids, 512), wset(52071, 1530, -1, -1), 2)
+    expect_seq("The quick brown fox", ids, enc("The quick brown fox", ids, 512), wset(597, 4104, 10299, 35886), 4)
+
+    // 4. the DEFECT'S SIGNATURE, asserted directly: plain bpe_encode does NOT
+    //    produce the special id, so a call site that reaches for bpe_encode is
+    //    distinguishable from the special-aware one. If a future edit switched
+    //    vt_encode back, check 1 above fails AND this shows why.
+    let plain = enc_plain(ids)
+    if plain == 2 && id_at(ids, 0) == 124899 {
+        print("FAIL: bpe_encode matched the special id; the special path is not distinguishable\n")
+        FAIL = FAIL + 1
+    }
+
+    print("std_tokenizer_trait_special: ")
+    if FAIL == 0 {
+        print("PASS\n")
+        return 0
+    }
+    print("FAIL ")
+    print(FAIL)
+    print(" check(s)\n")
+    return 1
+}

@@ -1,0 +1,934 @@
+// 0.0.238 gate row: integer `/` and `%` are FLOOR, and the remainder takes the
+// DIVISOR's sign -- pinned so a strength reduction can never silently switch to
+// C truncation. Every expected q/r is hand-derived independently (Python floor
+// semantics), NOT copied from either compiler's output.
+//
+// The divisors here are RUNTIME values, so this row exercises the idiv + floor-
+// correction path, which the strength reduction does NOT replace. The constant-
+// divisor path has its own row: divmod_const_strength_test.quanta.
+//
+// INT64_MIN cannot be written as a decimal literal (the lexer reads the positive
+// part first and rejects 9223372036854775808 as out of i64 range), so it is built
+// once under unsafe{} and stored from that cell (the overflow trap would kill the
+// construction otherwise).
+// Covers all four sign combinations, exact and inexact multiples, INT64_MIN,
+// INT64_MAX, +-2^62, and negative divisors (remainder must be negative).
+fn chk(a, d, q, r) {
+    if a / d != q { return 1 }
+    if a % d != r { return 2 }
+    return 0
+}
+fn main() {
+    let minv = 0
+    unsafe { minv = (0 - 9223372036854775807) - 1 }   // INT64_MIN
+    let vals = mem_alloc(180*32)
+    let n = 0
+    mem_store(vals + n*32 + 0, 0)
+    mem_store(vals + n*32 + 8, -2)
+    mem_store(vals + n*32 + 16, 0)
+    mem_store(vals + n*32 + 24, 0)
+    n = n + 1
+    mem_store(vals + n*32 + 0, 0)
+    mem_store(vals + n*32 + 8, -3)
+    mem_store(vals + n*32 + 16, 0)
+    mem_store(vals + n*32 + 24, 0)
+    n = n + 1
+    mem_store(vals + n*32 + 0, 0)
+    mem_store(vals + n*32 + 8, -7)
+    mem_store(vals + n*32 + 16, 0)
+    mem_store(vals + n*32 + 24, 0)
+    n = n + 1
+    mem_store(vals + n*32 + 0, 0)
+    mem_store(vals + n*32 + 8, -128)
+    mem_store(vals + n*32 + 16, 0)
+    mem_store(vals + n*32 + 24, 0)
+    n = n + 1
+    mem_store(vals + n*32 + 0, 0)
+    mem_store(vals + n*32 + 8, 2)
+    mem_store(vals + n*32 + 16, 0)
+    mem_store(vals + n*32 + 24, 0)
+    n = n + 1
+    mem_store(vals + n*32 + 0, 0)
+    mem_store(vals + n*32 + 8, 3)
+    mem_store(vals + n*32 + 16, 0)
+    mem_store(vals + n*32 + 24, 0)
+    n = n + 1
+    mem_store(vals + n*32 + 0, 0)
+    mem_store(vals + n*32 + 8, 5)
+    mem_store(vals + n*32 + 16, 0)
+    mem_store(vals + n*32 + 24, 0)
+    n = n + 1
+    mem_store(vals + n*32 + 0, 0)
+    mem_store(vals + n*32 + 8, 7)
+    mem_store(vals + n*32 + 16, 0)
+    mem_store(vals + n*32 + 24, 0)
+    n = n + 1
+    mem_store(vals + n*32 + 0, 0)
+    mem_store(vals + n*32 + 8, 128)
+    mem_store(vals + n*32 + 16, 0)
+    mem_store(vals + n*32 + 24, 0)
+    n = n + 1
+    mem_store(vals + n*32 + 0, 0)
+    mem_store(vals + n*32 + 8, 1000)
+    mem_store(vals + n*32 + 16, 0)
+    mem_store(vals + n*32 + 24, 0)
+    n = n + 1
+    mem_store(vals + n*32 + 0, 1)
+    mem_store(vals + n*32 + 8, -2)
+    mem_store(vals + n*32 + 16, -1)
+    mem_store(vals + n*32 + 24, -1)
+    n = n + 1
+    mem_store(vals + n*32 + 0, 1)
+    mem_store(vals + n*32 + 8, -3)
+    mem_store(vals + n*32 + 16, -1)
+    mem_store(vals + n*32 + 24, -2)
+    n = n + 1
+    mem_store(vals + n*32 + 0, 1)
+    mem_store(vals + n*32 + 8, -7)
+    mem_store(vals + n*32 + 16, -1)
+    mem_store(vals + n*32 + 24, -6)
+    n = n + 1
+    mem_store(vals + n*32 + 0, 1)
+    mem_store(vals + n*32 + 8, -128)
+    mem_store(vals + n*32 + 16, -1)
+    mem_store(vals + n*32 + 24, -127)
+    n = n + 1
+    mem_store(vals + n*32 + 0, 1)
+    mem_store(vals + n*32 + 8, 2)
+    mem_store(vals + n*32 + 16, 0)
+    mem_store(vals + n*32 + 24, 1)
+    n = n + 1
+    mem_store(vals + n*32 + 0, 1)
+    mem_store(vals + n*32 + 8, 3)
+    mem_store(vals + n*32 + 16, 0)
+    mem_store(vals + n*32 + 24, 1)
+    n = n + 1
+    mem_store(vals + n*32 + 0, 1)
+    mem_store(vals + n*32 + 8, 5)
+    mem_store(vals + n*32 + 16, 0)
+    mem_store(vals + n*32 + 24, 1)
+    n = n + 1
+    mem_store(vals + n*32 + 0, 1)
+    mem_store(vals + n*32 + 8, 7)
+    mem_store(vals + n*32 + 16, 0)
+    mem_store(vals + n*32 + 24, 1)
+    n = n + 1
+    mem_store(vals + n*32 + 0, 1)
+    mem_store(vals + n*32 + 8, 128)
+    mem_store(vals + n*32 + 16, 0)
+    mem_store(vals + n*32 + 24, 1)
+    n = n + 1
+    mem_store(vals + n*32 + 0, 1)
+    mem_store(vals + n*32 + 8, 1000)
+    mem_store(vals + n*32 + 16, 0)
+    mem_store(vals + n*32 + 24, 1)
+    n = n + 1
+    mem_store(vals + n*32 + 0, -1)
+    mem_store(vals + n*32 + 8, -2)
+    mem_store(vals + n*32 + 16, 0)
+    mem_store(vals + n*32 + 24, -1)
+    n = n + 1
+    mem_store(vals + n*32 + 0, -1)
+    mem_store(vals + n*32 + 8, -3)
+    mem_store(vals + n*32 + 16, 0)
+    mem_store(vals + n*32 + 24, -1)
+    n = n + 1
+    mem_store(vals + n*32 + 0, -1)
+    mem_store(vals + n*32 + 8, -7)
+    mem_store(vals + n*32 + 16, 0)
+    mem_store(vals + n*32 + 24, -1)
+    n = n + 1
+    mem_store(vals + n*32 + 0, -1)
+    mem_store(vals + n*32 + 8, -128)
+    mem_store(vals + n*32 + 16, 0)
+    mem_store(vals + n*32 + 24, -1)
+    n = n + 1
+    mem_store(vals + n*32 + 0, -1)
+    mem_store(vals + n*32 + 8, 2)
+    mem_store(vals + n*32 + 16, -1)
+    mem_store(vals + n*32 + 24, 1)
+    n = n + 1
+    mem_store(vals + n*32 + 0, -1)
+    mem_store(vals + n*32 + 8, 3)
+    mem_store(vals + n*32 + 16, -1)
+    mem_store(vals + n*32 + 24, 2)
+    n = n + 1
+    mem_store(vals + n*32 + 0, -1)
+    mem_store(vals + n*32 + 8, 5)
+    mem_store(vals + n*32 + 16, -1)
+    mem_store(vals + n*32 + 24, 4)
+    n = n + 1
+    mem_store(vals + n*32 + 0, -1)
+    mem_store(vals + n*32 + 8, 7)
+    mem_store(vals + n*32 + 16, -1)
+    mem_store(vals + n*32 + 24, 6)
+    n = n + 1
+    mem_store(vals + n*32 + 0, -1)
+    mem_store(vals + n*32 + 8, 128)
+    mem_store(vals + n*32 + 16, -1)
+    mem_store(vals + n*32 + 24, 127)
+    n = n + 1
+    mem_store(vals + n*32 + 0, -1)
+    mem_store(vals + n*32 + 8, 1000)
+    mem_store(vals + n*32 + 16, -1)
+    mem_store(vals + n*32 + 24, 999)
+    n = n + 1
+    mem_store(vals + n*32 + 0, 7)
+    mem_store(vals + n*32 + 8, -2)
+    mem_store(vals + n*32 + 16, -4)
+    mem_store(vals + n*32 + 24, -1)
+    n = n + 1
+    mem_store(vals + n*32 + 0, 7)
+    mem_store(vals + n*32 + 8, -3)
+    mem_store(vals + n*32 + 16, -3)
+    mem_store(vals + n*32 + 24, -2)
+    n = n + 1
+    mem_store(vals + n*32 + 0, 7)
+    mem_store(vals + n*32 + 8, -7)
+    mem_store(vals + n*32 + 16, -1)
+    mem_store(vals + n*32 + 24, 0)
+    n = n + 1
+    mem_store(vals + n*32 + 0, 7)
+    mem_store(vals + n*32 + 8, -128)
+    mem_store(vals + n*32 + 16, -1)
+    mem_store(vals + n*32 + 24, -121)
+    n = n + 1
+    mem_store(vals + n*32 + 0, 7)
+    mem_store(vals + n*32 + 8, 2)
+    mem_store(vals + n*32 + 16, 3)
+    mem_store(vals + n*32 + 24, 1)
+    n = n + 1
+    mem_store(vals + n*32 + 0, 7)
+    mem_store(vals + n*32 + 8, 3)
+    mem_store(vals + n*32 + 16, 2)
+    mem_store(vals + n*32 + 24, 1)
+    n = n + 1
+    mem_store(vals + n*32 + 0, 7)
+    mem_store(vals + n*32 + 8, 5)
+    mem_store(vals + n*32 + 16, 1)
+    mem_store(vals + n*32 + 24, 2)
+    n = n + 1
+    mem_store(vals + n*32 + 0, 7)
+    mem_store(vals + n*32 + 8, 7)
+    mem_store(vals + n*32 + 16, 1)
+    mem_store(vals + n*32 + 24, 0)
+    n = n + 1
+    mem_store(vals + n*32 + 0, 7)
+    mem_store(vals + n*32 + 8, 128)
+    mem_store(vals + n*32 + 16, 0)
+    mem_store(vals + n*32 + 24, 7)
+    n = n + 1
+    mem_store(vals + n*32 + 0, 7)
+    mem_store(vals + n*32 + 8, 1000)
+    mem_store(vals + n*32 + 16, 0)
+    mem_store(vals + n*32 + 24, 7)
+    n = n + 1
+    mem_store(vals + n*32 + 0, -7)
+    mem_store(vals + n*32 + 8, -2)
+    mem_store(vals + n*32 + 16, 3)
+    mem_store(vals + n*32 + 24, -1)
+    n = n + 1
+    mem_store(vals + n*32 + 0, -7)
+    mem_store(vals + n*32 + 8, -3)
+    mem_store(vals + n*32 + 16, 2)
+    mem_store(vals + n*32 + 24, -1)
+    n = n + 1
+    mem_store(vals + n*32 + 0, -7)
+    mem_store(vals + n*32 + 8, -7)
+    mem_store(vals + n*32 + 16, 1)
+    mem_store(vals + n*32 + 24, 0)
+    n = n + 1
+    mem_store(vals + n*32 + 0, -7)
+    mem_store(vals + n*32 + 8, -128)
+    mem_store(vals + n*32 + 16, 0)
+    mem_store(vals + n*32 + 24, -7)
+    n = n + 1
+    mem_store(vals + n*32 + 0, -7)
+    mem_store(vals + n*32 + 8, 2)
+    mem_store(vals + n*32 + 16, -4)
+    mem_store(vals + n*32 + 24, 1)
+    n = n + 1
+    mem_store(vals + n*32 + 0, -7)
+    mem_store(vals + n*32 + 8, 3)
+    mem_store(vals + n*32 + 16, -3)
+    mem_store(vals + n*32 + 24, 2)
+    n = n + 1
+    mem_store(vals + n*32 + 0, -7)
+    mem_store(vals + n*32 + 8, 5)
+    mem_store(vals + n*32 + 16, -2)
+    mem_store(vals + n*32 + 24, 3)
+    n = n + 1
+    mem_store(vals + n*32 + 0, -7)
+    mem_store(vals + n*32 + 8, 7)
+    mem_store(vals + n*32 + 16, -1)
+    mem_store(vals + n*32 + 24, 0)
+    n = n + 1
+    mem_store(vals + n*32 + 0, -7)
+    mem_store(vals + n*32 + 8, 128)
+    mem_store(vals + n*32 + 16, -1)
+    mem_store(vals + n*32 + 24, 121)
+    n = n + 1
+    mem_store(vals + n*32 + 0, -7)
+    mem_store(vals + n*32 + 8, 1000)
+    mem_store(vals + n*32 + 16, -1)
+    mem_store(vals + n*32 + 24, 993)
+    n = n + 1
+    mem_store(vals + n*32 + 0, 8)
+    mem_store(vals + n*32 + 8, -2)
+    mem_store(vals + n*32 + 16, -4)
+    mem_store(vals + n*32 + 24, 0)
+    n = n + 1
+    mem_store(vals + n*32 + 0, 8)
+    mem_store(vals + n*32 + 8, -3)
+    mem_store(vals + n*32 + 16, -3)
+    mem_store(vals + n*32 + 24, -1)
+    n = n + 1
+    mem_store(vals + n*32 + 0, 8)
+    mem_store(vals + n*32 + 8, -7)
+    mem_store(vals + n*32 + 16, -2)
+    mem_store(vals + n*32 + 24, -6)
+    n = n + 1
+    mem_store(vals + n*32 + 0, 8)
+    mem_store(vals + n*32 + 8, -128)
+    mem_store(vals + n*32 + 16, -1)
+    mem_store(vals + n*32 + 24, -120)
+    n = n + 1
+    mem_store(vals + n*32 + 0, 8)
+    mem_store(vals + n*32 + 8, 2)
+    mem_store(vals + n*32 + 16, 4)
+    mem_store(vals + n*32 + 24, 0)
+    n = n + 1
+    mem_store(vals + n*32 + 0, 8)
+    mem_store(vals + n*32 + 8, 3)
+    mem_store(vals + n*32 + 16, 2)
+    mem_store(vals + n*32 + 24, 2)
+    n = n + 1
+    mem_store(vals + n*32 + 0, 8)
+    mem_store(vals + n*32 + 8, 5)
+    mem_store(vals + n*32 + 16, 1)
+    mem_store(vals + n*32 + 24, 3)
+    n = n + 1
+    mem_store(vals + n*32 + 0, 8)
+    mem_store(vals + n*32 + 8, 7)
+    mem_store(vals + n*32 + 16, 1)
+    mem_store(vals + n*32 + 24, 1)
+    n = n + 1
+    mem_store(vals + n*32 + 0, 8)
+    mem_store(vals + n*32 + 8, 128)
+    mem_store(vals + n*32 + 16, 0)
+    mem_store(vals + n*32 + 24, 8)
+    n = n + 1
+    mem_store(vals + n*32 + 0, 8)
+    mem_store(vals + n*32 + 8, 1000)
+    mem_store(vals + n*32 + 16, 0)
+    mem_store(vals + n*32 + 24, 8)
+    n = n + 1
+    mem_store(vals + n*32 + 0, -8)
+    mem_store(vals + n*32 + 8, -2)
+    mem_store(vals + n*32 + 16, 4)
+    mem_store(vals + n*32 + 24, 0)
+    n = n + 1
+    mem_store(vals + n*32 + 0, -8)
+    mem_store(vals + n*32 + 8, -3)
+    mem_store(vals + n*32 + 16, 2)
+    mem_store(vals + n*32 + 24, -2)
+    n = n + 1
+    mem_store(vals + n*32 + 0, -8)
+    mem_store(vals + n*32 + 8, -7)
+    mem_store(vals + n*32 + 16, 1)
+    mem_store(vals + n*32 + 24, -1)
+    n = n + 1
+    mem_store(vals + n*32 + 0, -8)
+    mem_store(vals + n*32 + 8, -128)
+    mem_store(vals + n*32 + 16, 0)
+    mem_store(vals + n*32 + 24, -8)
+    n = n + 1
+    mem_store(vals + n*32 + 0, -8)
+    mem_store(vals + n*32 + 8, 2)
+    mem_store(vals + n*32 + 16, -4)
+    mem_store(vals + n*32 + 24, 0)
+    n = n + 1
+    mem_store(vals + n*32 + 0, -8)
+    mem_store(vals + n*32 + 8, 3)
+    mem_store(vals + n*32 + 16, -3)
+    mem_store(vals + n*32 + 24, 1)
+    n = n + 1
+    mem_store(vals + n*32 + 0, -8)
+    mem_store(vals + n*32 + 8, 5)
+    mem_store(vals + n*32 + 16, -2)
+    mem_store(vals + n*32 + 24, 2)
+    n = n + 1
+    mem_store(vals + n*32 + 0, -8)
+    mem_store(vals + n*32 + 8, 7)
+    mem_store(vals + n*32 + 16, -2)
+    mem_store(vals + n*32 + 24, 6)
+    n = n + 1
+    mem_store(vals + n*32 + 0, -8)
+    mem_store(vals + n*32 + 8, 128)
+    mem_store(vals + n*32 + 16, -1)
+    mem_store(vals + n*32 + 24, 120)
+    n = n + 1
+    mem_store(vals + n*32 + 0, -8)
+    mem_store(vals + n*32 + 8, 1000)
+    mem_store(vals + n*32 + 16, -1)
+    mem_store(vals + n*32 + 24, 992)
+    n = n + 1
+    mem_store(vals + n*32 + 0, 100)
+    mem_store(vals + n*32 + 8, -2)
+    mem_store(vals + n*32 + 16, -50)
+    mem_store(vals + n*32 + 24, 0)
+    n = n + 1
+    mem_store(vals + n*32 + 0, 100)
+    mem_store(vals + n*32 + 8, -3)
+    mem_store(vals + n*32 + 16, -34)
+    mem_store(vals + n*32 + 24, -2)
+    n = n + 1
+    mem_store(vals + n*32 + 0, 100)
+    mem_store(vals + n*32 + 8, -7)
+    mem_store(vals + n*32 + 16, -15)
+    mem_store(vals + n*32 + 24, -5)
+    n = n + 1
+    mem_store(vals + n*32 + 0, 100)
+    mem_store(vals + n*32 + 8, -128)
+    mem_store(vals + n*32 + 16, -1)
+    mem_store(vals + n*32 + 24, -28)
+    n = n + 1
+    mem_store(vals + n*32 + 0, 100)
+    mem_store(vals + n*32 + 8, 2)
+    mem_store(vals + n*32 + 16, 50)
+    mem_store(vals + n*32 + 24, 0)
+    n = n + 1
+    mem_store(vals + n*32 + 0, 100)
+    mem_store(vals + n*32 + 8, 3)
+    mem_store(vals + n*32 + 16, 33)
+    mem_store(vals + n*32 + 24, 1)
+    n = n + 1
+    mem_store(vals + n*32 + 0, 100)
+    mem_store(vals + n*32 + 8, 5)
+    mem_store(vals + n*32 + 16, 20)
+    mem_store(vals + n*32 + 24, 0)
+    n = n + 1
+    mem_store(vals + n*32 + 0, 100)
+    mem_store(vals + n*32 + 8, 7)
+    mem_store(vals + n*32 + 16, 14)
+    mem_store(vals + n*32 + 24, 2)
+    n = n + 1
+    mem_store(vals + n*32 + 0, 100)
+    mem_store(vals + n*32 + 8, 128)
+    mem_store(vals + n*32 + 16, 0)
+    mem_store(vals + n*32 + 24, 100)
+    n = n + 1
+    mem_store(vals + n*32 + 0, 100)
+    mem_store(vals + n*32 + 8, 1000)
+    mem_store(vals + n*32 + 16, 0)
+    mem_store(vals + n*32 + 24, 100)
+    n = n + 1
+    mem_store(vals + n*32 + 0, -100)
+    mem_store(vals + n*32 + 8, -2)
+    mem_store(vals + n*32 + 16, 50)
+    mem_store(vals + n*32 + 24, 0)
+    n = n + 1
+    mem_store(vals + n*32 + 0, -100)
+    mem_store(vals + n*32 + 8, -3)
+    mem_store(vals + n*32 + 16, 33)
+    mem_store(vals + n*32 + 24, -1)
+    n = n + 1
+    mem_store(vals + n*32 + 0, -100)
+    mem_store(vals + n*32 + 8, -7)
+    mem_store(vals + n*32 + 16, 14)
+    mem_store(vals + n*32 + 24, -2)
+    n = n + 1
+    mem_store(vals + n*32 + 0, -100)
+    mem_store(vals + n*32 + 8, -128)
+    mem_store(vals + n*32 + 16, 0)
+    mem_store(vals + n*32 + 24, -100)
+    n = n + 1
+    mem_store(vals + n*32 + 0, -100)
+    mem_store(vals + n*32 + 8, 2)
+    mem_store(vals + n*32 + 16, -50)
+    mem_store(vals + n*32 + 24, 0)
+    n = n + 1
+    mem_store(vals + n*32 + 0, -100)
+    mem_store(vals + n*32 + 8, 3)
+    mem_store(vals + n*32 + 16, -34)
+    mem_store(vals + n*32 + 24, 2)
+    n = n + 1
+    mem_store(vals + n*32 + 0, -100)
+    mem_store(vals + n*32 + 8, 5)
+    mem_store(vals + n*32 + 16, -20)
+    mem_store(vals + n*32 + 24, 0)
+    n = n + 1
+    mem_store(vals + n*32 + 0, -100)
+    mem_store(vals + n*32 + 8, 7)
+    mem_store(vals + n*32 + 16, -15)
+    mem_store(vals + n*32 + 24, 5)
+    n = n + 1
+    mem_store(vals + n*32 + 0, -100)
+    mem_store(vals + n*32 + 8, 128)
+    mem_store(vals + n*32 + 16, -1)
+    mem_store(vals + n*32 + 24, 28)
+    n = n + 1
+    mem_store(vals + n*32 + 0, -100)
+    mem_store(vals + n*32 + 8, 1000)
+    mem_store(vals + n*32 + 16, -1)
+    mem_store(vals + n*32 + 24, 900)
+    n = n + 1
+    mem_store(vals + n*32 + 0, 3624)
+    mem_store(vals + n*32 + 8, -2)
+    mem_store(vals + n*32 + 16, -1812)
+    mem_store(vals + n*32 + 24, 0)
+    n = n + 1
+    mem_store(vals + n*32 + 0, 3624)
+    mem_store(vals + n*32 + 8, -3)
+    mem_store(vals + n*32 + 16, -1208)
+    mem_store(vals + n*32 + 24, 0)
+    n = n + 1
+    mem_store(vals + n*32 + 0, 3624)
+    mem_store(vals + n*32 + 8, -7)
+    mem_store(vals + n*32 + 16, -518)
+    mem_store(vals + n*32 + 24, -2)
+    n = n + 1
+    mem_store(vals + n*32 + 0, 3624)
+    mem_store(vals + n*32 + 8, -128)
+    mem_store(vals + n*32 + 16, -29)
+    mem_store(vals + n*32 + 24, -88)
+    n = n + 1
+    mem_store(vals + n*32 + 0, 3624)
+    mem_store(vals + n*32 + 8, 2)
+    mem_store(vals + n*32 + 16, 1812)
+    mem_store(vals + n*32 + 24, 0)
+    n = n + 1
+    mem_store(vals + n*32 + 0, 3624)
+    mem_store(vals + n*32 + 8, 3)
+    mem_store(vals + n*32 + 16, 1208)
+    mem_store(vals + n*32 + 24, 0)
+    n = n + 1
+    mem_store(vals + n*32 + 0, 3624)
+    mem_store(vals + n*32 + 8, 5)
+    mem_store(vals + n*32 + 16, 724)
+    mem_store(vals + n*32 + 24, 4)
+    n = n + 1
+    mem_store(vals + n*32 + 0, 3624)
+    mem_store(vals + n*32 + 8, 7)
+    mem_store(vals + n*32 + 16, 517)
+    mem_store(vals + n*32 + 24, 5)
+    n = n + 1
+    mem_store(vals + n*32 + 0, 3624)
+    mem_store(vals + n*32 + 8, 128)
+    mem_store(vals + n*32 + 16, 28)
+    mem_store(vals + n*32 + 24, 40)
+    n = n + 1
+    mem_store(vals + n*32 + 0, 3624)
+    mem_store(vals + n*32 + 8, 1000)
+    mem_store(vals + n*32 + 16, 3)
+    mem_store(vals + n*32 + 24, 624)
+    n = n + 1
+    mem_store(vals + n*32 + 0, -3624)
+    mem_store(vals + n*32 + 8, -2)
+    mem_store(vals + n*32 + 16, 1812)
+    mem_store(vals + n*32 + 24, 0)
+    n = n + 1
+    mem_store(vals + n*32 + 0, -3624)
+    mem_store(vals + n*32 + 8, -3)
+    mem_store(vals + n*32 + 16, 1208)
+    mem_store(vals + n*32 + 24, 0)
+    n = n + 1
+    mem_store(vals + n*32 + 0, -3624)
+    mem_store(vals + n*32 + 8, -7)
+    mem_store(vals + n*32 + 16, 517)
+    mem_store(vals + n*32 + 24, -5)
+    n = n + 1
+    mem_store(vals + n*32 + 0, -3624)
+    mem_store(vals + n*32 + 8, -128)
+    mem_store(vals + n*32 + 16, 28)
+    mem_store(vals + n*32 + 24, -40)
+    n = n + 1
+    mem_store(vals + n*32 + 0, -3624)
+    mem_store(vals + n*32 + 8, 2)
+    mem_store(vals + n*32 + 16, -1812)
+    mem_store(vals + n*32 + 24, 0)
+    n = n + 1
+    mem_store(vals + n*32 + 0, -3624)
+    mem_store(vals + n*32 + 8, 3)
+    mem_store(vals + n*32 + 16, -1208)
+    mem_store(vals + n*32 + 24, 0)
+    n = n + 1
+    mem_store(vals + n*32 + 0, -3624)
+    mem_store(vals + n*32 + 8, 5)
+    mem_store(vals + n*32 + 16, -725)
+    mem_store(vals + n*32 + 24, 1)
+    n = n + 1
+    mem_store(vals + n*32 + 0, -3624)
+    mem_store(vals + n*32 + 8, 7)
+    mem_store(vals + n*32 + 16, -518)
+    mem_store(vals + n*32 + 24, 2)
+    n = n + 1
+    mem_store(vals + n*32 + 0, -3624)
+    mem_store(vals + n*32 + 8, 128)
+    mem_store(vals + n*32 + 16, -29)
+    mem_store(vals + n*32 + 24, 88)
+    n = n + 1
+    mem_store(vals + n*32 + 0, -3624)
+    mem_store(vals + n*32 + 8, 1000)
+    mem_store(vals + n*32 + 16, -4)
+    mem_store(vals + n*32 + 24, 376)
+    n = n + 1
+    mem_store(vals + n*32 + 0, 4611686018427387904)
+    mem_store(vals + n*32 + 8, -2)
+    mem_store(vals + n*32 + 16, -2305843009213693952)
+    mem_store(vals + n*32 + 24, 0)
+    n = n + 1
+    mem_store(vals + n*32 + 0, 4611686018427387904)
+    mem_store(vals + n*32 + 8, -3)
+    mem_store(vals + n*32 + 16, -1537228672809129302)
+    mem_store(vals + n*32 + 24, -2)
+    n = n + 1
+    mem_store(vals + n*32 + 0, 4611686018427387904)
+    mem_store(vals + n*32 + 8, -7)
+    mem_store(vals + n*32 + 16, -658812288346769701)
+    mem_store(vals + n*32 + 24, -3)
+    n = n + 1
+    mem_store(vals + n*32 + 0, 4611686018427387904)
+    mem_store(vals + n*32 + 8, -128)
+    mem_store(vals + n*32 + 16, -36028797018963968)
+    mem_store(vals + n*32 + 24, 0)
+    n = n + 1
+    mem_store(vals + n*32 + 0, 4611686018427387904)
+    mem_store(vals + n*32 + 8, 2)
+    mem_store(vals + n*32 + 16, 2305843009213693952)
+    mem_store(vals + n*32 + 24, 0)
+    n = n + 1
+    mem_store(vals + n*32 + 0, 4611686018427387904)
+    mem_store(vals + n*32 + 8, 3)
+    mem_store(vals + n*32 + 16, 1537228672809129301)
+    mem_store(vals + n*32 + 24, 1)
+    n = n + 1
+    mem_store(vals + n*32 + 0, 4611686018427387904)
+    mem_store(vals + n*32 + 8, 5)
+    mem_store(vals + n*32 + 16, 922337203685477580)
+    mem_store(vals + n*32 + 24, 4)
+    n = n + 1
+    mem_store(vals + n*32 + 0, 4611686018427387904)
+    mem_store(vals + n*32 + 8, 7)
+    mem_store(vals + n*32 + 16, 658812288346769700)
+    mem_store(vals + n*32 + 24, 4)
+    n = n + 1
+    mem_store(vals + n*32 + 0, 4611686018427387904)
+    mem_store(vals + n*32 + 8, 128)
+    mem_store(vals + n*32 + 16, 36028797018963968)
+    mem_store(vals + n*32 + 24, 0)
+    n = n + 1
+    mem_store(vals + n*32 + 0, 4611686018427387904)
+    mem_store(vals + n*32 + 8, 1000)
+    mem_store(vals + n*32 + 16, 4611686018427387)
+    mem_store(vals + n*32 + 24, 904)
+    n = n + 1
+    mem_store(vals + n*32 + 0, -4611686018427387904)
+    mem_store(vals + n*32 + 8, -2)
+    mem_store(vals + n*32 + 16, 2305843009213693952)
+    mem_store(vals + n*32 + 24, 0)
+    n = n + 1
+    mem_store(vals + n*32 + 0, -4611686018427387904)
+    mem_store(vals + n*32 + 8, -3)
+    mem_store(vals + n*32 + 16, 1537228672809129301)
+    mem_store(vals + n*32 + 24, -1)
+    n = n + 1
+    mem_store(vals + n*32 + 0, -4611686018427387904)
+    mem_store(vals + n*32 + 8, -7)
+    mem_store(vals + n*32 + 16, 658812288346769700)
+    mem_store(vals + n*32 + 24, -4)
+    n = n + 1
+    mem_store(vals + n*32 + 0, -4611686018427387904)
+    mem_store(vals + n*32 + 8, -128)
+    mem_store(vals + n*32 + 16, 36028797018963968)
+    mem_store(vals + n*32 + 24, 0)
+    n = n + 1
+    mem_store(vals + n*32 + 0, -4611686018427387904)
+    mem_store(vals + n*32 + 8, 2)
+    mem_store(vals + n*32 + 16, -2305843009213693952)
+    mem_store(vals + n*32 + 24, 0)
+    n = n + 1
+    mem_store(vals + n*32 + 0, -4611686018427387904)
+    mem_store(vals + n*32 + 8, 3)
+    mem_store(vals + n*32 + 16, -1537228672809129302)
+    mem_store(vals + n*32 + 24, 2)
+    n = n + 1
+    mem_store(vals + n*32 + 0, -4611686018427387904)
+    mem_store(vals + n*32 + 8, 5)
+    mem_store(vals + n*32 + 16, -922337203685477581)
+    mem_store(vals + n*32 + 24, 1)
+    n = n + 1
+    mem_store(vals + n*32 + 0, -4611686018427387904)
+    mem_store(vals + n*32 + 8, 7)
+    mem_store(vals + n*32 + 16, -658812288346769701)
+    mem_store(vals + n*32 + 24, 3)
+    n = n + 1
+    mem_store(vals + n*32 + 0, -4611686018427387904)
+    mem_store(vals + n*32 + 8, 128)
+    mem_store(vals + n*32 + 16, -36028797018963968)
+    mem_store(vals + n*32 + 24, 0)
+    n = n + 1
+    mem_store(vals + n*32 + 0, -4611686018427387904)
+    mem_store(vals + n*32 + 8, 1000)
+    mem_store(vals + n*32 + 16, -4611686018427388)
+    mem_store(vals + n*32 + 24, 96)
+    n = n + 1
+    mem_store(vals + n*32 + 0, 9223372036854775807)
+    mem_store(vals + n*32 + 8, -2)
+    mem_store(vals + n*32 + 16, -4611686018427387904)
+    mem_store(vals + n*32 + 24, -1)
+    n = n + 1
+    mem_store(vals + n*32 + 0, 9223372036854775807)
+    mem_store(vals + n*32 + 8, -3)
+    mem_store(vals + n*32 + 16, -3074457345618258603)
+    mem_store(vals + n*32 + 24, -2)
+    n = n + 1
+    mem_store(vals + n*32 + 0, 9223372036854775807)
+    mem_store(vals + n*32 + 8, -7)
+    mem_store(vals + n*32 + 16, -1317624576693539401)
+    mem_store(vals + n*32 + 24, 0)
+    n = n + 1
+    mem_store(vals + n*32 + 0, 9223372036854775807)
+    mem_store(vals + n*32 + 8, -128)
+    mem_store(vals + n*32 + 16, -72057594037927936)
+    mem_store(vals + n*32 + 24, -1)
+    n = n + 1
+    mem_store(vals + n*32 + 0, 9223372036854775807)
+    mem_store(vals + n*32 + 8, 2)
+    mem_store(vals + n*32 + 16, 4611686018427387903)
+    mem_store(vals + n*32 + 24, 1)
+    n = n + 1
+    mem_store(vals + n*32 + 0, 9223372036854775807)
+    mem_store(vals + n*32 + 8, 3)
+    mem_store(vals + n*32 + 16, 3074457345618258602)
+    mem_store(vals + n*32 + 24, 1)
+    n = n + 1
+    mem_store(vals + n*32 + 0, 9223372036854775807)
+    mem_store(vals + n*32 + 8, 5)
+    mem_store(vals + n*32 + 16, 1844674407370955161)
+    mem_store(vals + n*32 + 24, 2)
+    n = n + 1
+    mem_store(vals + n*32 + 0, 9223372036854775807)
+    mem_store(vals + n*32 + 8, 7)
+    mem_store(vals + n*32 + 16, 1317624576693539401)
+    mem_store(vals + n*32 + 24, 0)
+    n = n + 1
+    mem_store(vals + n*32 + 0, 9223372036854775807)
+    mem_store(vals + n*32 + 8, 128)
+    mem_store(vals + n*32 + 16, 72057594037927935)
+    mem_store(vals + n*32 + 24, 127)
+    n = n + 1
+    mem_store(vals + n*32 + 0, 9223372036854775807)
+    mem_store(vals + n*32 + 8, 1000)
+    mem_store(vals + n*32 + 16, 9223372036854775)
+    mem_store(vals + n*32 + 24, 807)
+    n = n + 1
+    mem_store(vals + n*32 + 0, minv)
+    mem_store(vals + n*32 + 8, -2)
+    mem_store(vals + n*32 + 16, 4611686018427387904)
+    mem_store(vals + n*32 + 24, 0)
+    n = n + 1
+    mem_store(vals + n*32 + 0, minv)
+    mem_store(vals + n*32 + 8, -3)
+    mem_store(vals + n*32 + 16, 3074457345618258602)
+    mem_store(vals + n*32 + 24, -2)
+    n = n + 1
+    mem_store(vals + n*32 + 0, minv)
+    mem_store(vals + n*32 + 8, -7)
+    mem_store(vals + n*32 + 16, 1317624576693539401)
+    mem_store(vals + n*32 + 24, -1)
+    n = n + 1
+    mem_store(vals + n*32 + 0, minv)
+    mem_store(vals + n*32 + 8, -128)
+    mem_store(vals + n*32 + 16, 72057594037927936)
+    mem_store(vals + n*32 + 24, 0)
+    n = n + 1
+    mem_store(vals + n*32 + 0, minv)
+    mem_store(vals + n*32 + 8, 2)
+    mem_store(vals + n*32 + 16, -4611686018427387904)
+    mem_store(vals + n*32 + 24, 0)
+    n = n + 1
+    mem_store(vals + n*32 + 0, minv)
+    mem_store(vals + n*32 + 8, 3)
+    mem_store(vals + n*32 + 16, -3074457345618258603)
+    mem_store(vals + n*32 + 24, 1)
+    n = n + 1
+    mem_store(vals + n*32 + 0, minv)
+    mem_store(vals + n*32 + 8, 5)
+    mem_store(vals + n*32 + 16, -1844674407370955162)
+    mem_store(vals + n*32 + 24, 2)
+    n = n + 1
+    mem_store(vals + n*32 + 0, minv)
+    mem_store(vals + n*32 + 8, 7)
+    mem_store(vals + n*32 + 16, -1317624576693539402)
+    mem_store(vals + n*32 + 24, 6)
+    n = n + 1
+    mem_store(vals + n*32 + 0, minv)
+    mem_store(vals + n*32 + 8, 128)
+    mem_store(vals + n*32 + 16, -72057594037927936)
+    mem_store(vals + n*32 + 24, 0)
+    n = n + 1
+    mem_store(vals + n*32 + 0, minv)
+    mem_store(vals + n*32 + 8, 1000)
+    mem_store(vals + n*32 + 16, -9223372036854776)
+    mem_store(vals + n*32 + 24, 192)
+    n = n + 1
+    mem_store(vals + n*32 + 0, -3074457345618258602)
+    mem_store(vals + n*32 + 8, -2)
+    mem_store(vals + n*32 + 16, 1537228672809129301)
+    mem_store(vals + n*32 + 24, 0)
+    n = n + 1
+    mem_store(vals + n*32 + 0, -3074457345618258602)
+    mem_store(vals + n*32 + 8, -3)
+    mem_store(vals + n*32 + 16, 1024819115206086200)
+    mem_store(vals + n*32 + 24, -2)
+    n = n + 1
+    mem_store(vals + n*32 + 0, -3074457345618258602)
+    mem_store(vals + n*32 + 8, -7)
+    mem_store(vals + n*32 + 16, 439208192231179800)
+    mem_store(vals + n*32 + 24, -2)
+    n = n + 1
+    mem_store(vals + n*32 + 0, -3074457345618258602)
+    mem_store(vals + n*32 + 8, -128)
+    mem_store(vals + n*32 + 16, 24019198012642645)
+    mem_store(vals + n*32 + 24, -42)
+    n = n + 1
+    mem_store(vals + n*32 + 0, -3074457345618258602)
+    mem_store(vals + n*32 + 8, 2)
+    mem_store(vals + n*32 + 16, -1537228672809129301)
+    mem_store(vals + n*32 + 24, 0)
+    n = n + 1
+    mem_store(vals + n*32 + 0, -3074457345618258602)
+    mem_store(vals + n*32 + 8, 3)
+    mem_store(vals + n*32 + 16, -1024819115206086201)
+    mem_store(vals + n*32 + 24, 1)
+    n = n + 1
+    mem_store(vals + n*32 + 0, -3074457345618258602)
+    mem_store(vals + n*32 + 8, 5)
+    mem_store(vals + n*32 + 16, -614891469123651721)
+    mem_store(vals + n*32 + 24, 3)
+    n = n + 1
+    mem_store(vals + n*32 + 0, -3074457345618258602)
+    mem_store(vals + n*32 + 8, 7)
+    mem_store(vals + n*32 + 16, -439208192231179801)
+    mem_store(vals + n*32 + 24, 5)
+    n = n + 1
+    mem_store(vals + n*32 + 0, -3074457345618258602)
+    mem_store(vals + n*32 + 8, 128)
+    mem_store(vals + n*32 + 16, -24019198012642646)
+    mem_store(vals + n*32 + 24, 86)
+    n = n + 1
+    mem_store(vals + n*32 + 0, -3074457345618258602)
+    mem_store(vals + n*32 + 8, 1000)
+    mem_store(vals + n*32 + 16, -3074457345618259)
+    mem_store(vals + n*32 + 24, 398)
+    n = n + 1
+    mem_store(vals + n*32 + 0, 123456789012345)
+    mem_store(vals + n*32 + 8, -2)
+    mem_store(vals + n*32 + 16, -61728394506173)
+    mem_store(vals + n*32 + 24, -1)
+    n = n + 1
+    mem_store(vals + n*32 + 0, 123456789012345)
+    mem_store(vals + n*32 + 8, -3)
+    mem_store(vals + n*32 + 16, -41152263004115)
+    mem_store(vals + n*32 + 24, 0)
+    n = n + 1
+    mem_store(vals + n*32 + 0, 123456789012345)
+    mem_store(vals + n*32 + 8, -7)
+    mem_store(vals + n*32 + 16, -17636684144621)
+    mem_store(vals + n*32 + 24, -2)
+    n = n + 1
+    mem_store(vals + n*32 + 0, 123456789012345)
+    mem_store(vals + n*32 + 8, -128)
+    mem_store(vals + n*32 + 16, -964506164159)
+    mem_store(vals + n*32 + 24, -7)
+    n = n + 1
+    mem_store(vals + n*32 + 0, 123456789012345)
+    mem_store(vals + n*32 + 8, 2)
+    mem_store(vals + n*32 + 16, 61728394506172)
+    mem_store(vals + n*32 + 24, 1)
+    n = n + 1
+    mem_store(vals + n*32 + 0, 123456789012345)
+    mem_store(vals + n*32 + 8, 3)
+    mem_store(vals + n*32 + 16, 41152263004115)
+    mem_store(vals + n*32 + 24, 0)
+    n = n + 1
+    mem_store(vals + n*32 + 0, 123456789012345)
+    mem_store(vals + n*32 + 8, 5)
+    mem_store(vals + n*32 + 16, 24691357802469)
+    mem_store(vals + n*32 + 24, 0)
+    n = n + 1
+    mem_store(vals + n*32 + 0, 123456789012345)
+    mem_store(vals + n*32 + 8, 7)
+    mem_store(vals + n*32 + 16, 17636684144620)
+    mem_store(vals + n*32 + 24, 5)
+    n = n + 1
+    mem_store(vals + n*32 + 0, 123456789012345)
+    mem_store(vals + n*32 + 8, 128)
+    mem_store(vals + n*32 + 16, 964506164158)
+    mem_store(vals + n*32 + 24, 121)
+    n = n + 1
+    mem_store(vals + n*32 + 0, 123456789012345)
+    mem_store(vals + n*32 + 8, 1000)
+    mem_store(vals + n*32 + 16, 123456789012)
+    mem_store(vals + n*32 + 24, 345)
+    n = n + 1
+    mem_store(vals + n*32 + 0, -123456789012345)
+    mem_store(vals + n*32 + 8, -2)
+    mem_store(vals + n*32 + 16, 61728394506172)
+    mem_store(vals + n*32 + 24, -1)
+    n = n + 1
+    mem_store(vals + n*32 + 0, -123456789012345)
+    mem_store(vals + n*32 + 8, -3)
+    mem_store(vals + n*32 + 16, 41152263004115)
+    mem_store(vals + n*32 + 24, 0)
+    n = n + 1
+    mem_store(vals + n*32 + 0, -123456789012345)
+    mem_store(vals + n*32 + 8, -7)
+    mem_store(vals + n*32 + 16, 17636684144620)
+    mem_store(vals + n*32 + 24, -5)
+    n = n + 1
+    mem_store(vals + n*32 + 0, -123456789012345)
+    mem_store(vals + n*32 + 8, -128)
+    mem_store(vals + n*32 + 16, 964506164158)
+    mem_store(vals + n*32 + 24, -121)
+    n = n + 1
+    mem_store(vals + n*32 + 0, -123456789012345)
+    mem_store(vals + n*32 + 8, 2)
+    mem_store(vals + n*32 + 16, -61728394506173)
+    mem_store(vals + n*32 + 24, 1)
+    n = n + 1
+    mem_store(vals + n*32 + 0, -123456789012345)
+    mem_store(vals + n*32 + 8, 3)
+    mem_store(vals + n*32 + 16, -41152263004115)
+    mem_store(vals + n*32 + 24, 0)
+    n = n + 1
+    mem_store(vals + n*32 + 0, -123456789012345)
+    mem_store(vals + n*32 + 8, 5)
+    mem_store(vals + n*32 + 16, -24691357802469)
+    mem_store(vals + n*32 + 24, 0)
+    n = n + 1
+    mem_store(vals + n*32 + 0, -123456789012345)
+    mem_store(vals + n*32 + 8, 7)
+    mem_store(vals + n*32 + 16, -17636684144621)
+    mem_store(vals + n*32 + 24, 2)
+    n = n + 1
+    mem_store(vals + n*32 + 0, -123456789012345)
+    mem_store(vals + n*32 + 8, 128)
+    mem_store(vals + n*32 + 16, -964506164159)
+    mem_store(vals + n*32 + 24, 7)
+    n = n + 1
+    mem_store(vals + n*32 + 0, -123456789012345)
+    mem_store(vals + n*32 + 8, 1000)
+    mem_store(vals + n*32 + 16, -123456789013)
+    mem_store(vals + n*32 + 24, 655)
+    n = n + 1
+    let i = 0
+    while i < n {
+        let rc = chk(mem_load(vals + i*32), mem_load(vals + i*32 + 8),
+                     mem_load(vals + i*32 + 16), mem_load(vals + i*32 + 24))
+        if rc != 0 { exit(100 + rc) }
+        i = i + 1
+    }
+    exit(42)
+}

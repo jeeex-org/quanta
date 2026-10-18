@@ -1,0 +1,33 @@
+// A1b (0.0.237): a loop body's binding must not outlive the loop, and leaving
+// the body with `break` or `continue` must not change that. `continue`/`break`
+// return to the body's parse loop rather than unwinding it, so the block's
+// bindings are still popped exactly once -- the symmetry requirement.
+//
+// Before the fix the outer `p` was clobbered by the body's `let p = 99` and this
+// exits 99; with block scoping it exits 42.
+fn main() {
+    let p = 5
+    let q = 0
+    while q < 4 { let p = 99
+        q = q + 1
+        if q == 1 { continue }
+        if q == 3 { break }
+        p = p }
+    if p != 5 { exit(1) }
+    // nested: an inner block inside the loop body must not affect the body's own p
+    let r = 0
+    let n = 0
+    while n < 2 { let r = 88
+        if n == 0 { let r = 44 }
+        n = n + 1
+        p = p }
+    if p != 5 { exit(2) }
+    if r != 0 { exit(3) }
+    // loop {} form
+    let k = 0
+    loop { let p = 66
+        k = k + 1
+        if k > 2 { break } }
+    if p != 5 { exit(4) }
+    exit(42)
+}

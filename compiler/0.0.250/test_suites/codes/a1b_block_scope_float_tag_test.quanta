@@ -1,0 +1,18 @@
+// A1b (0.0.237): the per-vreg TYPE tag must not be inherited through a rebind.
+//
+// This is the same defect seen from the tag side, and it was an observable
+// compile failure rather than a wrong number: `let x = 1.5` inside a block
+// retagged the outer integer `x`'s vreg (the inner binding was the resolution
+// target), so `print(x)` after the block was refused -- print on an f64 is a
+// compile error since 0.0.235 (defect A2). With block scoping, `x` after the
+// block is the outer INTEGER again and prints 3.
+//
+// Before the fix: FAIL (compile) "print on an f64". After: exits 42.
+fn main() {
+    let x = 3
+    let a = 1
+    if a == 1 { let x = 1.5
+        if x < 2.0 { x = x + 0.0 } }
+    print(x)
+    exit(42)
+}

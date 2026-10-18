@@ -1,0 +1,22 @@
+// 0.0.235 A4: recursion-depth guard.
+//
+// Quanta emits a ~1104-byte frame per function (`sub $0x450,%rsp`), so a fixed
+// 8MB stack holds ~8,000 nested frames where an -O0 C twin of the same shape
+// reaches ~262,000 -- the ratio is the frame-size ratio. This test recurses to a
+// depth BOTH sides survive comfortably, so a change that shrinks (or grows) the
+// frame is caught here before it becomes a crash deeper up.
+//
+// `1 + down(n-1)` deliberately defeats self-tail-call optimisation: a bare
+// `return down(n-1)` compiles to a jump and would measure iterations, not frames
+// (that mistake produced a false "2,000,000 frames survived" reading).
+//
+// Expected exit code: 3000 % 256 = 184.
+fn down(n) {
+    if n <= 0 { return 0 }
+    return 1 + down(n - 1)
+}
+
+fn main() {
+    let d = down(3000)
+    exit(d - (d/256)*256)
+}

@@ -1,0 +1,52 @@
+// 0.0.236 A7 gate row: an UNTYPED parameter carrying a string must reach the
+// callee as TEXT, not as a pointer value.
+//
+// Same root-cause family as A6 (the f64 case, gated by f64_call_order_test):
+// the parameter slot carries no type, so the callee's `print` takes the INTEGER
+// path and the user sees a 20-digit number where text was expected. Both forms
+// compile without complaint, so the failure is silent. Derived from
+// tests/a7_untyped_str_param_defect.quanta.
+//
+// This row captures the callee's stdout (dup2 a scratch file onto fd 1), reads
+// it back, and compares it to the expected text byte-for-byte.
+//   RED-FIRST, measured:
+//     compiler/0.0.235/bin/x86/qc -> run rc=1  (prints "11093937921109393744")
+//     compiler/0.0.236/bin/x86/qc -> run rc=0  (prints "untyped tag: GLOBAL")
+// The gate runs tests from test_suites/run (git-ignored scratch), so the
+// relative capture filename lands there.
+fn make_one() -> str {
+    return "GLOBAL"
+}
+
+// Deliberately untyped: `tag` and `x` have no `: str`, so the parameter slot
+// carries no type and the caller's string-ness must be inferred (the A7 fix).
+fn show(tag, x) {
+    print(tag)
+    print(x)
+}
+
+fn main() {
+    let fd = file_open("a7_capture.txt", 577, 420)
+    if fd < 0 { exit(2) }
+    dup2(1, 10)            // stash the real stdout on fd 10
+    dup2(fd, 1)            // stdout -> the scratch file
+    show("untyped tag: ", make_one())
+    dup2(10, 1)            // restore stdout
+    file_close(fd)
+
+    let rfd = file_open("a7_capture.txt", 0)
+    if rfd < 0 { exit(3) }
+    let buf = mmap(128)
+    let n = file_read(rfd, buf, 120)
+    file_close(rfd)
+    if n <= 0 { exit(4) }
+
+    let want = "untyped tag: GLOBAL"
+    if n != len(want) { exit(1) }
+    let i = 0
+    while i < n {
+        if mem_load8(buf + i) != mem_load8(want + 8 + i) { exit(1) }
+        i = i + 1
+    }
+    exit(0)
+}

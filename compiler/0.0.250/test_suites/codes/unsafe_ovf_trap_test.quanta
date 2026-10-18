@@ -1,0 +1,20 @@
+// A33 row 2 of 2 — WITHOUT `unsafe { }` the integer-overflow trap is ON, and this
+// program must SIGILL (exit 132 = 128 + SIGILL(4)).
+//
+// This is the direction that stops the escape hatch from being "solved" by deleting
+// the trap. It is identical to unsafe_ovf_suppressed_test.quanta except that the
+// overflowing statement is NOT wrapped: i64::MAX + i64::MAX overflows on the second
+// iteration (2^64-2 does not fit in i64), and the emitter's `jno; ud2` guard fires.
+//
+// The trap must NOT be wired to loop nesting (bugs.md A33's dead `loop_depth`
+// guard): deleting that constant-true guard changes no emitted byte, whereas
+// connecting it would silently remove overflow detection from every loop.
+fn main() {
+    let s = 0
+    let i = 0
+    while i < 5 {
+        s = s + 9223372036854775807
+        i = i + 1
+    }
+    return 0
+}
