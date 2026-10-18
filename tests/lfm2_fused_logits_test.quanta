@@ -68,12 +68,13 @@ fn as_str(raw, n) {
 // One full sequence from a clean state with both fused flags set as given.
 // Copies the final logits into `out` (n_vocab f64) and the per-step argmax
 // (prompt token + NTOK decode tokens) into `am`. Returns 0 on success.
-fn run_seq(ids, n, f4, f6, fch, fglu, fattn, out, am) {
+fn run_seq(ids, n, f4, f6, fch, fglu, fattn, fcv, out, am) {
     mm_set_fused_q4k(f4)
     mm_set_fused_q6k(f6)
     mm_set_fused_chain(fch)
     mm_set_fused_glu(fglu)
     mm_set_fused_attn(fattn)
+    mm_set_fused_conv(fcv)
     if fc_fw_reset() != 0 { return -1 }
     let i = 0
     let step = 0
@@ -180,6 +181,9 @@ fn main() {
     let L7 = mem_alloc(nv * 8)
     let a7 = mem_alloc(512)
     let r7 = mem_alloc(16)
+    let L8 = mem_alloc(nv * 8)
+    let a8 = mem_alloc(512)
+    let r8 = mem_alloc(16)
     let r1 = mem_alloc(16)
     let r2 = mem_alloc(16)
     let r3 = mem_alloc(16)
@@ -189,15 +193,15 @@ fn main() {
     mm_pool_begin()
 
     prints("pass0 (existing path, REFERENCE)...\n")
-    if run_seq(ids, n, 0, 0, 0, 0, 0, L0, a0) != 0 { prints("FAIL pass0\n"); return 1 }
+    if run_seq(ids, n, 0, 0, 0, 0, 0, 0, L0, a0) != 0 { prints("FAIL pass0\n"); return 1 }
     prints("  argmax: "); print_am(a0, NTOK)
 
     prints("pass1 (existing path, CONTROL: reset cleanliness)...\n")
-    if run_seq(ids, n, 0, 0, 0, 0, 0, L1, a1) != 0 { prints("FAIL pass1\n"); return 1 }
+    if run_seq(ids, n, 0, 0, 0, 0, 0, 0, L1, a1) != 0 { prints("FAIL pass1\n"); return 1 }
     prints("  argmax: "); print_am(a1, NTOK)
 
     prints("pass2 (Q4_K fused only): flag ON, Q6_K OFF...\n")
-    if run_seq(ids, n, 1, 0, 0, 0, 0, L2, a2) != 0 { prints("FAIL pass2\n"); return 1 }
+    if run_seq(ids, n, 1, 0, 0, 0, 0, 0, L2, a2) != 0 { prints("FAIL pass2\n"); return 1 }
     let w2a = mm_get_fused_used()
     let w2b = mm_get_fused_q6k_used()
     prints("  fused_q4k_used="); print(w2a)
@@ -205,7 +209,7 @@ fn main() {
     prints("  argmax: "); print_am(a2, NTOK)
 
     prints("pass3 (Q6_K fused only): flag ON, Q4_K OFF...\n")
-    if run_seq(ids, n, 0, 1, 0, 0, 0, L3, a3) != 0 { prints("FAIL pass3\n"); return 1 }
+    if run_seq(ids, n, 0, 1, 0, 0, 0, 0, L3, a3) != 0 { prints("FAIL pass3\n"); return 1 }
     let w3a = mm_get_fused_used()
     let w3b = mm_get_fused_q6k_used()
     prints("  fused_q4k_used="); print(w3a)
@@ -213,7 +217,7 @@ fn main() {
     prints("  argmax: "); print_am(a3, NTOK)
 
     prints("pass4 (BOTH fused)...\n")
-    if run_seq(ids, n, 1, 1, 0, 0, 0, L4, a4) != 0 { prints("FAIL pass4\n"); return 1 }
+    if run_seq(ids, n, 1, 1, 0, 0, 0, 0, L4, a4) != 0 { prints("FAIL pass4\n"); return 1 }
     let w4a = mm_get_fused_used()
     let w4b = mm_get_fused_q6k_used()
     prints("  fused_q4k_used="); print(w4a)
@@ -226,7 +230,7 @@ fn main() {
     // could silently reorder and still look right; that is why it gets its own
     // pass and its own witness rather than riding along in pass4.
     prints("pass5 (Q4_K + Q6_K + chain)...\n")
-    if run_seq(ids, n, 1, 1, 1, 0, 0, L5, a5) != 0 { prints("FAIL pass5\n"); return 1 }
+    if run_seq(ids, n, 1, 1, 1, 0, 0, 0, L5, a5) != 0 { prints("FAIL pass5\n"); return 1 }
     let w5a = mm_get_fused_used()
     let w5b = mm_get_fused_q6k_used()
     let w5c = mm_get_fused_chain_used()
@@ -242,7 +246,7 @@ fn main() {
     // bit-identical -- and its witness (mm_get_glu_used) must be 1 or the pass
     // proves only that the scalar fallback ran twice.
     prints("pass6 (Q4_K + Q6_K + chain + parallel GLU)...\n")
-    if run_seq(ids, n, 1, 1, 1, 1, 0, L6, a6) != 0 { prints("FAIL pass6\n"); return 1 }
+    if run_seq(ids, n, 1, 1, 1, 1, 0, 0, L6, a6) != 0 { prints("FAIL pass6\n"); return 1 }
     let w6g = mm_get_glu_used()
     prints("  fused_glu_used="); print(w6g)
     prints("  argmax: "); print_am(a6, NTOK)
@@ -252,10 +256,22 @@ fn main() {
     // the arithmetic and order are unchanged, so this must be bit-identical; the
     // witness (mm_get_attn_used) must be 1 or only the scalar loop ran twice.
     prints("pass7 (+ parallel attention over query heads)...\n")
-    if run_seq(ids, n, 1, 1, 1, 1, 1, L7, a7) != 0 { prints("FAIL pass7\n"); return 1 }
+    if run_seq(ids, n, 1, 1, 1, 1, 1, 0, L7, a7) != 0 { prints("FAIL pass7\n"); return 1 }
     let w7a = mm_get_attn_used()
     prints("  fused_attn_used="); print(w7a)
     prints("  argmax: "); print_am(a7, NTOK)
+
+    // pass8: the parallel SHORT-CONV elementwise block (mm_set_fused_conv) on top
+    // of everything -- the whole channel-wise conv pipeline (b*x gate, causal bx
+    // window, 3-tap correlation, new state, c gate) distributed over channels.
+    // Per channel the arithmetic and order are unchanged, so this must be
+    // bit-identical; the witness (mm_get_conv_used) must be 1 or only the scalar
+    // reference path ran twice.
+    prints("pass8 (+ parallel short-conv elementwise block)...\n")
+    if run_seq(ids, n, 1, 1, 1, 1, 1, 1, L8, a8) != 0 { prints("FAIL pass8\n"); return 1 }
+    let w8c = mm_get_conv_used()
+    prints("  fused_conv_used="); print(w8c)
+    prints("  argmax: "); print_am(a8, NTOK)
 
     mm_pool_end()
 
@@ -266,6 +282,7 @@ fn main() {
     diff(L0, L5, nv, r5)
     diff(L0, L6, nv, r6)
     diff(L0, L7, nv, r7)
+    diff(L0, L8, nv, r8)
     amdiff(a0, a1, NTOK, ra)
     let ma1 = mem_load(ra)
     amdiff(a0, a2, NTOK, ra)
@@ -280,6 +297,8 @@ fn main() {
     let ma6 = mem_load(ra)
     amdiff(a0, a7, NTOK, ra)
     let ma7 = mem_load(ra)
+    amdiff(a0, a8, NTOK, ra)
+    let ma8 = mem_load(ra)
 
     prints("---\n")
     prints("logits_n="); print(nv); newline()
@@ -303,6 +322,9 @@ fn main() {
     prints("ATTN    pass7-vs-pass0 : logit_mism="); print(mem_load(r7))
     prints(" argmax_mism="); print(ma7)
     prints(" max_abs_diff_bits="); print(mem_load(r7 + 8)); newline()
+    prints("CONV    pass8-vs-pass0 : logit_mism="); print(mem_load(r8))
+    prints(" argmax_mism="); print(ma8)
+    prints(" max_abs_diff_bits="); print(mem_load(r8 + 8)); newline()
     prints("pass0_argmax0="); print(mem_load(a0)); newline()
     prints("pass4 first 24 ids: ")
     let q = 1
@@ -319,6 +341,7 @@ fn main() {
     if mem_load(r5) != 0 || ma5 != 0 { prints("FAIL: chain (tied projection) route is not bit-identical\n"); return 10 }
     if mem_load(r6) != 0 || ma6 != 0 { prints("FAIL: parallel GLU route is not bit-identical\n"); return 12 }
     if mem_load(r7) != 0 || ma7 != 0 { prints("FAIL: parallel attention route is not bit-identical\n"); return 14 }
+    if mem_load(r8) != 0 || ma8 != 0 { prints("FAIL: parallel short-conv route is not bit-identical\n"); return 16 }
     if mem_load(a0) != 597 { prints("FAIL: first-token argmax is not the oracle 597\n"); return 6 }
     // witnesses: a matching pass that never dispatched its kernel proves nothing
     if w2a != 1 || w2b != 0 { prints("FAIL: pass2 witness (Q4K fused should be used, Q6K not)\n"); return 7 }
@@ -327,6 +350,7 @@ fn main() {
     if w5a != 1 || w5b != 1 || w5c != 1 { prints("FAIL: pass5 witness (q4k+q6k+chain should all be used)\n"); return 11 }
     if w6g != 1 { prints("FAIL: pass6 witness (parallel GLU should have been used)\n"); return 13 }
     if w7a != 1 { prints("FAIL: pass7 witness (parallel attention should have been used)\n"); return 15 }
+    if w8c != 1 { prints("FAIL: pass8 witness (parallel short-conv should have been used)\n"); return 17 }
     prints("PASS: fused Q4_K, fused Q6_K, both, and the scalar-chain tied projection are IDENTICAL to the existing path (all 128000 logits)\n")
     prints("DONE\n")
     return 0

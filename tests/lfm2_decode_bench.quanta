@@ -24,7 +24,12 @@
 //     refuses to start while a peer model process is alive.
 //
 // Conf tests/lfm2_decode_bench.conf:
-//   "<workers> <len1> <len2> <len3> <use_mmap> <cache_norms> [ignore_eos] [fused_q4k] [fused_q6k]"
+//   "<workers> <len1> <len2> <len3> <use_mmap> <cache_norms> [ignore_eos] [fused_q4k] [fused_q6k] [prof] [prof_work] [fused_chain] [fused_glu] [fused_attn] [fused_conv]"
+//   Fields 10+ are NEW and optional: a 9-field conf still works (all default 0),
+//   so the older A/B drivers are unaffected. COUNT THEM before trusting an arm --
+//   the fields are positional and a peer already measured the wrong arm here.
+//   fused_conv=1 (field 15): the parallel short-conv elementwise block
+//   (mm_set_fused_conv, pool kind 8).
 //   ignore_eos=1: fc_argmax_masked suppresses EOS so a run always reaches its
 //   length (the reference prompt deterministically emits EOS at token 43;
 //   llama.cpp's --ignore-eos is the same lever for long perf runs).
@@ -265,6 +270,7 @@ fn main() {
     let chain = 0
     let glu = 0
     let attnf = 0
+    let convf = 0
     if cfgb != 0 {
         let nf = parse_ints(cfgb, conf)
         if nf >= 1 { nw = mem_load(conf) }
@@ -281,6 +287,7 @@ fn main() {
         if nf >= 12 { chain = mem_load(conf + 88) }
         if nf >= 13 { glu = mem_load(conf + 96) }
         if nf >= 14 { attnf = mem_load(conf + 104) }
+        if nf >= 15 { convf = mem_load(conf + 112) }
     } else {
         prints("warn: conf unreadable; defaults\n")
     }
@@ -296,6 +303,7 @@ fn main() {
     prints(" fused_chain="); print(chain)
     prints(" fused_glu="); print(glu)
     prints(" fused_attn="); print(attnf)
+    prints(" fused_conv="); print(convf)
     prints(" (argmax temp=0)\n")
 
     let t0 = clock()
@@ -313,6 +321,7 @@ fn main() {
     mm_set_fused_chain(chain)
     mm_set_fused_glu(glu)
     mm_set_fused_attn(attnf)
+    mm_set_fused_conv(convf)
     if usemap != 0 {
         if mm_attach_mmap_fd(file_open(Q4_PATH, 0)) != 0 { prints("FAIL mm_attach_mmap (continuing on pread)\n") }
     }
@@ -375,6 +384,7 @@ fn main() {
         if chain != 0 { mm_set_fused_chain(1) }
         if glu != 0 { mm_set_fused_glu(1) }
         if attnf != 0 { mm_set_fused_attn(1) }
+        if convf != 0 { mm_set_fused_conv(1) }
 
         let tp0 = clock()
         let i = 0
@@ -467,7 +477,9 @@ fn main() {
         prints(" fused_chain_used="); print(mm_get_fused_chain_used())
         prints(" fused_glu_active="); print(mm_get_fused_glu())
         prints(" fused_glu_used="); print(mm_get_glu_used())
-        prints(" fused_attn_used="); print(mm_get_attn_used()); newline()
+        prints(" fused_attn_used="); print(mm_get_attn_used())
+        prints(" fused_conv_active="); print(mm_get_fused_conv())
+        prints(" fused_conv_used="); print(mm_get_conv_used()); newline()
         prints("prefill_ms="); print((tp1 - tp0) / 1000000)
         prints(" prefill_ms_per_tok="); print((tp1 - tp0) / 1000000 / n); newline()
         prints("gen_ms="); print((g1 - g0) / 1000000); newline()

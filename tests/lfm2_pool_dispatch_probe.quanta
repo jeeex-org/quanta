@@ -1,0 +1,119 @@
+// tests/lfm2_pool_dispatch_probe.quanta
+//
+// MEASURES THE POOL'S PER-CALL FIXED DISPATCH COST, with no model attached.
+//
+// WHY: the decode profile shows 166 pool calls per token and a per-call WALL
+// time (~1.77 ms at both 128 and 1024 tokens, i.e. context-independent) that is
+// far larger than the per-worker busy time (~0.85-0.94 ms). The gap is the
+// dispatch ramp: publish -> every worker scheduled -> run -> stamp -> main
+// observes. Whether a new pool SUBMIT is cheap or expensive decides whether
+// moving main-thread elementwise work (conv_kernel, conv_gate, conv_state) onto
+// the pool is a win or a LOSS -- 22 extra calls/token is only worth it if the
+// fixed cost is small. So measure it directly instead of inferring it.
+//
+// METHOD: drive the pool with `mm_glu_par` (a legitimate, already-existing pool
+// job) at n = nw elements -- ONE element per worker, so the worker's own
+// arithmetic is ~0 and the measured wall is dispatch. Repeat K times, divide.
+// The worker marks are kind-independent (pl_worker takes them for every kind),
+// so mm_prof_work_ns() gives the worker-busy sum for these jobs even though
+// mm_glu_par does not touch the MMP_SUBMIT accumulator (only the matvec paths
+// do). Wall is measured with the same raw clock_gettime syscall the library's
+// marks use (syscall 228), NOT clock() -- clock() mmaps per call (defect A27).
+//
+// Reported per worker count so the scaling of the fixed cost is visible: if it
+// grows with nw it is the wake broadcast (scheduling nw threads), not a fixed
+// syscall cost.
+//
+// Build: ./compiler/0.0.247/bin/x86/qc -O tests/lfm2_pool_dispatch_probe.quanta <bin>
+// Run:   <bin>            (no model, no VA cap needed)
+import std/gguf_mm
+import std/fs
+
+const NELEM = 262144          // max job element count this probe uses
+let pr_ts = 0
+let pr_g = 0
+let pr_u = 0
+let pr_out = 0
+
+// Raw clock_gettime(CLOCK_MONOTONIC) into one caller-owned timespec: one
+// syscall, no VMA churn. Same primitive as mm_prof_now_b / fc_prof_now.
+fn pr_now() -> i64 {
+    syscall(228, 1, pr_ts, 0, 0, 0)
+    return mem_load(pr_ts) * 1000000000 + mem_load(pr_ts + 8)
+}
+
+// One case: pool width nw, job element count n, K repetitions.
+// Prints wall ns/call, worker-busy ns per worker per call, and the implied
+// achieved concurrency of a job that has essentially no work in it.
+fn run_case(nw, n, k) {
+    // (re)size the pool to exactly nw; mm_pool_ensure tears down and respawns
+    // when the width changes, which is what we want between cases.
+    mm_pool_ensure(nw, 4096)
+    // warm: a few calls so nothing first-touch (scratch alloc in the worker,
+    // page faults) lands inside the timed window.
+    let w = 0
+    while w < 64 {
+        if mm_glu_par(pr_g, pr_u, pr_out, n, nw) != 0 {
+            prints("FAIL mm_glu_par nw="); print(nw); prints(" n="); print(n); newline()
+            return 1
+        }
+        w = w + 1
+    }
+    mm_prof_reset()
+    let t0 = pr_now()
+    let i = 0
+    while i < k {
+        if mm_glu_par(pr_g, pr_u, pr_out, n, nw) != 0 {
+            prints("FAIL mm_glu_par timed nw="); print(nw); newline()
+            return 1
+        }
+        i = i + 1
+    }
+    let t1 = pr_now()
+    let wall = t1 - t0
+    let busy = mm_prof_work_ns()
+    prints("case nw="); print(nw); prints(" n="); print(n)
+    prints(" k="); print(k)
+    prints(" wall_ns_per_call="); print(wall / k)
+    prints(" workerexec="); print(mm_prof_ns(4) / k)
+    prints(" busy_ns_per_worker_per_call=")
+    if nw > 0 { print(busy / (k * nw)) } else { prints("NA") }
+    prints(" implied_conc_x100=")
+    if wall > 0 { print(busy * 100 / wall) } else { prints("NA") }
+    newline()
+    return 0
+}
+
+fn main() {
+    prints("=== pool dispatch fixed-cost probe (no model) ===\n")
+    pr_ts = mem_alloc(16)
+    pr_g = mem_alloc(NELEM * 8)
+    pr_u = mem_alloc(NELEM * 8)
+    pr_out = mem_alloc(NELEM * 8)
+    let i = 0
+    while i < NELEM {
+        mem_store(pr_g + i * 8, 0.001 * i2f(i))
+        mem_store(pr_u + i * 8, 0.002 * i2f(i))
+        i = i + 1
+    }
+    mm_pool_begin()
+    if mm_prof_enable() != 0 { prints("FAIL mm_prof_enable\n"); return 1 }
+    mm_set_prof_work(1)
+    print("workers_on_box="); print(mm_get_workers())
+    prints(" (mm_workers is NOT used by this probe; cases set their own width)\n")
+
+    // One element per worker: pure dispatch. K large so the per-call figure is
+    // not dominated by timer noise.
+    run_case(4,  4,  4000)
+    run_case(8,  8,  4000)
+    run_case(12, 12, 4000)
+    run_case(16, 16, 4000)
+    run_case(20, 20, 4000)
+    // Same width, real work: shows the marginal cost of work on top of dispatch.
+    run_case(20, 20000, 400)
+    run_case(20, 200000, 100)
+    mm_prof_disable()
+    mm_pool_end()
+    prints("DONE\n")
+    return 0
+}

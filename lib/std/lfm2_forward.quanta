@@ -409,9 +409,77 @@ fn fc_short_conv(L, x: u64, state: u64, out: u64) {
     if mm_matvec(cin, x, dm * 3, dm, fc_sc_ip) != 0 { return -1 }
     fc_prof_stop(FCP_C_INPROJ)
 
+    // ---- the conv kernel, dequantised: needed by BOTH paths ---------------
+    // conv_out[c] = sum_k conv[k][c] * bx[t_last - k][c]
+    //
+    // The kernel is [l_cache, d_model] = [3, 2048] = 6144 elements, small enough
+    // to dequantize whole. out_proj is [d_model, d_model] = 4.2 M elements and
+    // goes through the row-wise matvec instead. Both are under mm_small_cap; a
+    // weight that were not returns -1 rather than silently materializing 20 GB.
+    //
+    // KERNEL INDEXING: shortconv.conv is [3, 2048] in ggml order, so ne[0]=3 is
+    // the CONTIGUOUS dimension. ggml_compute_forward_ssm_conv_f32 reads it as
+    //     sumf += s[i0 + i1*ncs] * c[i0 + i1*nc];
+    // i.e. element (channel i1, tap i0) is at flat index i0 + i1*nc = tap + ch*3.
+    // Reading it as (k*dm + c) -- channel-major, stride 2048 -- gives the right
+    // answer only for channel 0 and the wrong tap for every other channel, which
+    // flattens the logits and changes the argmax.
+    // With the cache active the kernel comes straight from fc_nc_conv (same
+    // read_tensor_f64 bytes, read once); otherwise it is re-read per call.
+    // The load used to run twice when the cache was cold (once unconditionally,
+    // once in the else); it now runs once. Same bytes in fc_sc_kw, so the
+    // arithmetic is unchanged -- only the redundant second dequant is gone.
+    fc_prof_begin(FCP_C_KERN)
+    let kwptr = 0
+    if fc_nc_ready != 0 {
+        kwptr = fc_nc_conv + L * kw * dm * 8
+    } else {
+        if mm_load_small(cwt, kw * dm, fc_sc_kw) != kw * dm { return -1 }
+        kwptr = fc_sc_kw
+    }
+    fc_prof_stop(FCP_C_KERN)
+
+    // ---- opt-in PARALLEL elementwise block (mm_set_fused_conv) ------------
+    // The b*x gate, the causal bx window, the 3-tap correlation, the new state
+    // and the c gate are ALL independent per channel, so they run on the pool as
+    // one channel-sliced job (pool kind 8). BIT-IDENTICAL arithmetic, order
+    // preserved (pl_run_conv). DECLINES when the live pool is not the right
+    // width, so the flag can only lose the optimisation -- never an answer.
+    let conv_ok = -1
+    if mm_get_fused_conv() != 0 {
+        conv_ok = mm_conv_par(fc_sc_ip, state, fc_sc_k, fc_sc_y, kwptr,
+                              dm, dc, kw, mm_get_workers())
+    }
+    if conv_ok != 0 {
+        // the scalar reference path (unchanged arithmetic)
+        if fc_conv_scalar(dm, dc, kw, kwptr, state) != 0 { return -1 }
+    }
+    // NOTE the shape: compare the call IN PLACE, never bind it to an untyped
+    // `let`. Binding it propagates a float tag into this function's return value
+    // (measured: the gate row stdlib_lfm2_conv_test.quanta then failed to COMPILE
+    // with "print on an f64 would write its raw bit pattern"), i.e. adding a timer
+    // changed a type. The marks add no binding, so no tag moves.
+    fc_prof_begin(FCP_C_OUT)
+    if mm_matvec(cout, fc_sc_y, dm, dm, out) != 0 { fc_prof_stop(FCP_C_OUT); return -1 }
+    fc_prof_stop(FCP_C_OUT)
+    return 0
+}
+
+// The SCALAR (main-thread) elementwise short-conv block: the b*x gate, the
+// causal bx window, the 3-tap correlation, the new state and the c gate. This
+// is the REFERENCE path and the flag-OFF control for mm_set_fused_conv; its
+// arithmetic is byte-identical to what fc_short_conv ran inline before the
+// parallel version existed. `kwptr` is the dequantised [l_cache, d_model]
+// kernel, resolved by the caller because BOTH paths need it.
+//
+// NOTE the shape at the matvec call sites (they stay in fc_short_conv): a call
+// is compared IN PLACE, never bound to an untyped `let`, because binding one
+// propagates a float tag into the enclosing function's inferred return type
+// (defect A28). No matvec call is made here, so no such tag can originate here.
+fn fc_conv_scalar(dm, dc, kw, kwptr, state) -> i64 {
+    let cs = dm
     // Gate: bx[t] = b[t] * x[t], reading the three chunks in order.
     fc_prof_begin(FCP_C_GATE)
-    let cs = dm
     let t = 0
     while t < dm {
         let bv = f64of(mem_load(fc_sc_ip + t * 8))
@@ -421,8 +489,8 @@ fn fc_short_conv(L, x: u64, state: u64, out: u64) {
     }
     fc_prof_stop(FCP_C_GATE)
 
-    fc_prof_begin(FCP_C_SHIFT)
     // Prepend the causal state: bx = [state[0..dc), g[0..dm)] along time.
+    fc_prof_begin(FCP_C_SHIFT)
     t = 0
     while t < dc {
         let c = 0
@@ -439,64 +507,38 @@ fn fc_short_conv(L, x: u64, state: u64, out: u64) {
     }
     fc_prof_stop(FCP_C_SHIFT)
 
-    fc_prof_begin(FCP_C_KERN)
-
-    // conv_out[c] = sum_k conv[k][c] * bx[t_last - k][c]
-    //
-    // The kernel is [l_cache, d_model] = [3, 2048] = 6144 elements, small enough
-    // to dequantize whole. out_proj is [d_model, d_model] = 4.2 M elements and
-    // goes through the row-wise matvec instead. Both are under mm_small_cap; a
-    // weight that were not returns -1 rather than silently materializing 20 GB.
-    if mm_load_small(cwt, kw * dm, fc_sc_kw) != kw * dm { return -1 }
-
     // One output time step, correlation with taps in increasing time order:
     //   k0*s0 + k1*s1 + k2*g
-    //
-    // KERNEL INDEXING: shortconv.conv is [3, 2048] in ggml order, so ne[0]=3 is
-    // the CONTIGUOUS dimension. ggml_compute_forward_ssm_conv_f32 reads it as
-    //     sumf += s[i0 + i1*ncs] * c[i0 + i1*nc];
-    // i.e. element (channel i1, tap i0) is at flat index i0 + i1*nc = tap + ch*3.
-    // Reading it as (k*dm + c) -- channel-major, stride 2048 -- gives the right
-    // answer only for channel 0 and the wrong tap for every other channel, which
-    // flattens the logits and changes the argmax.
-    // With the cache active the kernel comes straight from fc_nc_conv (same
-    // read_tensor_f64 bytes, read once); otherwise it is re-read per call.
-    let kwptr = 0
-    if fc_nc_ready != 0 {
-        kwptr = fc_nc_conv + L * kw * dm * 8
-    } else {
-        if mm_load_small(cwt, kw * dm, fc_sc_kw) != kw * dm { return -1 }
-        kwptr = fc_sc_kw
-    }
-    let c = 0
-    while c < dm {
+    fc_prof_begin(FCP_C_KERN)
+    let c2 = 0
+    while c2 < dm {
         let acc: f64 = 0.0
         let k = 0
         while k < kw {
-            let w = f64of(mem_load(kwptr + (c * kw + k) * 8))
-            acc = acc + w * f64of(mem_load(fc_sc_bx + (k * dm + c) * 8))
+            let w = f64of(mem_load(kwptr + (c2 * kw + k) * 8))
+            acc = acc + w * f64of(mem_load(fc_sc_bx + (k * dm + c2) * 8))
             k = k + 1
         }
-        mem_store(fc_sc_k + c * 8, acc)
-        c = c + 1
+        mem_store(fc_sc_k + c2 * 8, acc)
+        c2 = c2 + 1
     }
     fc_prof_stop(FCP_C_KERN)
 
-    fc_prof_begin(FCP_C_SHIFT)
     // New state: the LAST dc positions of the 3-wide window, i.e. (s1, g).
     // Positions dc-1 .. kw-1, so the oldest retained token drops out each call.
+    fc_prof_begin(FCP_C_SHIFT)
     t = 0
     while t < dc {
-        let c = 0
-        while c < dm {
-            mem_store(state + (t * dm + c) * 8, f64of(mem_load(fc_sc_bx + ((dc - 1 + t) * dm + c) * 8)))
-            c = c + 1
+        let c3 = 0
+        while c3 < dm {
+            mem_store(state + (t * dm + c3) * 8, f64of(mem_load(fc_sc_bx + ((dc - 1 + t) * dm + c3) * 8)))
+            c3 = c3 + 1
         }
         t = t + 1
     }
     fc_prof_stop(FCP_C_SHIFT)
 
-    // y = c * conv_out, then out_proj @ y
+    // y = c * conv_out
     fc_prof_begin(FCP_C_GATE)
     t = 0
     while t < dm {
@@ -505,14 +547,6 @@ fn fc_short_conv(L, x: u64, state: u64, out: u64) {
         t = t + 1
     }
     fc_prof_stop(FCP_C_GATE)
-    // NOTE the shape: compare the call IN PLACE, never bind it to an untyped
-    // `let`. Binding it propagates a float tag into this function's return value
-    // (measured: the gate row stdlib_lfm2_conv_test.quanta then failed to COMPILE
-    // with "print on an f64 would write its raw bit pattern"), i.e. adding a timer
-    // changed a type. The marks add no binding, so no tag moves.
-    fc_prof_begin(FCP_C_OUT)
-    if mm_matvec(cout, fc_sc_y, dm, dm, out) != 0 { fc_prof_stop(FCP_C_OUT); return -1 }
-    fc_prof_stop(FCP_C_OUT)
     return 0
 }
 

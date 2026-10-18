@@ -322,6 +322,70 @@ fn mm_glu_par(g, u, out, n, nworkers) -> i64 {
     return 0
 }
 
+// ===========================================================================
+// PARALLEL SHORT-CONV ELEMENTWISE BLOCK -- opt-in, DEFAULT OFF
+// ===========================================================================
+// COST IT ATTACKS, measured (all other flags ON, 20 workers, 128-token decode,
+// tests/lfm2_prof_ab.sh prof_attn): the short-conv elementwise block is
+// conv_gate 1,265 + conv_state 2,513 + conv_kernel 23,357 = 27,135 us/token of
+// 361,338 (7.5%), ALL of it on the MAIN THREAD while 20 workers sit parked. The
+// two matvecs around it (conv_inproj 28,895 + conv_outproj 12,128) already use
+// the pool. The dispatch probe (tests/lfm2_pool_dispatch_probe.quanta) measures
+// the pool's per-call fixed cost at 14.6 us for 20 workers, so the 22 extra
+// submits this costs (0.32 ms/token) are negligible against the 27 ms moved.
+//
+// WHY IT IS NOT A WORKAROUND. Each channel's whole pipeline (gate, the causal
+// bx window, the 3-tap correlation, the c gate and its own new state word) is
+// independent of every other channel, so a static channel slice is the CORRECT
+// partition -- the same class as the GLU (kind 6) and the attention heads (kind
+// 7), not a concession to the missing atomics. The only read-write buffer,
+// `state`, is touched by exactly one worker per channel.
+//
+// BIT-EXACTNESS: per channel the arithmetic and its order are the reference's
+// (see pl_run_conv). tests/lfm2_fused_logits_test pass8 runs the whole model
+// with this ON and diffs all 128,000 logits; stdlib_lfm2_conv_test checks the
+// layer output against an independently computed reference.
+let mm_fused_conv = 0
+let mm_conv_used = 0
+
+fn mm_set_fused_conv(n) {
+    if n < 0 { n = 0 }
+    if n != 0 { n = 1 }
+    mm_fused_conv = n
+    mm_conv_used = 0
+    return 0
+}
+
+fn mm_get_fused_conv() { return mm_fused_conv }
+fn mm_get_conv_used() { return mm_conv_used }
+
+// mm_conv_par(...) -> 0 if the live pool computed the short-conv elementwise
+// block for every channel, non-zero to decline (the caller keeps its scalar
+// loop). Declines rather than building a pool, like mm_glu_par / mm_attn_par.
+// The conv layer sits INSIDE the pool bracket the forward already holds, so a
+// live pool of the right width is the normal decode case; a decline is a lost
+// optimisation, never a wrong answer.
+fn mm_conv_par(ip, state, kout, y, kern, dm, dc, kw, nworkers) -> i64 {
+    if nworkers <= 1 { return -1 }
+    if dm / nworkers < 1 { return -1 }
+    if pl_size != nworkers { return -1 }
+    pl_kind = 8
+    pl_cv_ip = ip
+    pl_cv_state = state
+    pl_cv_kout = kout
+    pl_cv_y = y
+    pl_cv_kern = kern
+    pl_cv_dm = dm
+    pl_cv_dc = dc
+    pl_cv_kw = kw
+    pl_nw = nworkers
+    pl_active = nworkers
+    if pl_submit() != 0 { pl_kill(); return -1 }
+    if pl_depth == 0 { mm_pool_end() }
+    return 0
+}
+
+
 // y = W x. W is `rows` x `cols`; x holds cols f64 values, y receives rows.
 // Worker count for mm_matvec. 0 or 1 means the serial path, which is the
 // default so nothing changes for callers that do not opt in.
@@ -846,11 +910,9 @@ fn mm_embed_logits_batch_ser(idx, x, v0, vcount, ncols, B, y) -> i64 {
 // Worker slice for the batched embed-logits: byte-identical arithmetic to
 // pl_run_embed, repeated for every activation vector in the batch.
 fn pl_run_embed_b(t: i64, cell) {
-    let per = pl_vcount / pl_nw
-    let lo = t * per
-    let hi = lo + per
-    if t == pl_nw - 1 { hi = pl_vcount }
-    if hi > pl_vcount { hi = pl_vcount }
+    // QUOTIENT split (see pl_run_rows)
+    let lo = t * pl_vcount / pl_nw
+    let hi = (t + 1) * pl_vcount / pl_nw
     let v = lo
     while v < hi {
         if mm_load_row_s(pl_idx, pl_v0 + v, pl_ncols, cell) != 0 { return -1 }
@@ -1242,6 +1304,19 @@ let pl_a_pos = 0
 let pl_a_nh = 0
 let pl_a_nkv = 0
 let pl_a_hd = 0
+// kind 8 (parallel short-conv elementwise block): the whole channel-wise part of
+// fc_short_conv -- the b*x gate, the causal bx window, the 3-tap correlation and
+// the c*conv_out gate -- is independent PER CHANNEL, so worker t owns channels
+// [t*dm/nw, (t+1)*dm/nw) and computes every one of those steps for its own
+// channels. See pl_run_conv for why that is race-free with no atomics.
+let pl_cv_ip = 0          // in_proj output, 3*dm wide (b | c | x)
+let pl_cv_state = 0       // causal state, dc*dm wide (read AND written in place)
+let pl_cv_kout = 0        // conv output, dm wide
+let pl_cv_y = 0           // c*conv_out, dm wide (input to the out_proj matvec)
+let pl_cv_kern = 0        // dequantised conv kernel, kw*dm wide
+let pl_cv_dm = 0
+let pl_cv_dc = 0          // state width = kw - 1
+let pl_cv_kw = 0          // kernel width (taps)
 
 // ===========================================================================
 // OPT-IN POOL PROFILE -- DEFAULT OFF, ZERO EFFECT WHEN OFF
@@ -1357,14 +1432,16 @@ fn mm_prof_label(slot) -> i64 {
 }
 
 // Static row slice, BYTE-IDENTICAL arithmetic to the old pm_worker: same reads
-// (mm_load_row_s), same summation order (mm_dot4_s), same partition rule (the
-// last worker absorbs the remainder).
+// (mm_load_row_s), same summation order (mm_dot4_s). The partition rule is the
+// QUOTIENT split (worker t owns [t*N/nw, (t+1)*N/nw)), generalised from the
+// attention kernel to every kind -- see pl_run_rows.
 fn pl_run_rows(t: i64, cell) {
-    let per = pl_rows / pl_nw
-    let lo = t * per
-    let hi = lo + per
-    if t == pl_nw - 1 { hi = pl_rows }
-    if hi > pl_rows { hi = pl_rows }
+    // QUOTIENT split: worker t owns [t*N/nw, (t+1)*N/nw). Sizes differ by at
+    // most one. The old rule ("the last worker absorbs the remainder") gave the
+    // tail worker up to 2x its share on small row counts and, at 32 attention
+    // heads over 20 workers, THIRTEEN of them to one worker -- see pl_run_attn.
+    let lo = t * pl_rows / pl_nw
+    let hi = (t + 1) * pl_rows / pl_nw
     let r = lo
     while r < hi {
         if mm_load_row_s(pl_idx, r, pl_cols, cell) != 0 { return -1 }
@@ -1376,11 +1453,9 @@ fn pl_run_rows(t: i64, cell) {
 
 // Static slice of [v0, v0+vcount), byte-identical to the old pem_worker.
 fn pl_run_embed(t: i64, cell) {
-    let per = pl_vcount / pl_nw
-    let lo = t * per
-    let hi = lo + per
-    if t == pl_nw - 1 { hi = pl_vcount }
-    if hi > pl_vcount { hi = pl_vcount }
+    // QUOTIENT split (see pl_run_rows)
+    let lo = t * pl_vcount / pl_nw
+    let hi = (t + 1) * pl_vcount / pl_nw
     let v = lo
     while v < hi {
         if mm_load_row_s(pl_idx, pl_v0 + v, pl_ncols, cell) != 0 { return -1 }
@@ -1404,6 +1479,7 @@ fn pl_run(t: i64, cell) {
     if pl_kind == 5 { return pl_run_embed_map(t, cell) }
     if pl_kind == 6 { return pl_run_glu(t, cell) }
     if pl_kind == 7 { return pl_run_attn(t, cell) }
+    if pl_kind == 8 { return pl_run_conv(t, cell) }
     return pl_run_rows(t, cell)
 }
 
@@ -1517,11 +1593,9 @@ fn pl_run_glu(t: i64, cell) {
     // writers store the same value, so the racy multi-writer store is benign;
     // reading it after pl_submit() proves the parallel GLU actually ran.
     mm_glu_used = 1
-    let per = pl_nelems / pl_nw
-    let lo = t * per
-    let hi = lo + per
-    if t == pl_nw - 1 { hi = pl_nelems }
-    if hi > pl_nelems { hi = pl_nelems }
+    // QUOTIENT split (see pl_run_rows)
+    let lo = t * pl_nelems / pl_nw
+    let hi = (t + 1) * pl_nelems / pl_nw
     let i = lo
     while i < hi {
         let g = f64of(mem_load(pl_g + i * 8))
@@ -1530,6 +1604,67 @@ fn pl_run_glu(t: i64, cell) {
         let uv = f64of(mem_load(pl_u + i * 8))
         mem_store(pl_glu_out + i * 8, g * sg * uv)
         i = i + 1
+    }
+    return hi - lo
+}
+
+// Static CHANNEL slice of the entire elementwise short-conv block.
+//
+// WHY THIS IS THE CORRECT PARTITION AND NOT A WORKAROUND. Every quantity the
+// block computes for channel c depends only on channel c: the gate g[c] =
+// b[c]*x[c]; the bx taps (k < dc from the causal state, k == dc from g[c]); the
+// 3-tap correlation k_out[c]; the c gate y[c] = c_in[c]*k_out[c]; and the new
+// state words state[t*dm+c]. Two channels never touch the same output word, so
+// worker t owning [t*dm/nw, (t+1)*dm/nw) is deterministic and race-free with NO
+// atomics -- the same argument as the GLU (kind 6) and the head split (kind 7).
+// The only read-write buffer, `state`, is touched by exactly one worker per
+// channel.
+//
+// BIT-EXACTNESS. Per channel the values and their order are the reference's:
+// the taps are the same bits (a stored fc_sc_g[c] reloads exactly, so using g
+// directly is identical), the kernel element is kernel[c*kw+k] and the sum runs
+// left to right in increasing k, the new state is bx[dc-1+t], and y is the same
+// product in the same order. Only WHICH thread evaluates each channel changes.
+// The in-place state update is safe because the only state READ is at index
+// dc-1+t >= dc-1 while the WRITES go to indices t <= dc-1, so the single
+// overlapping index (dc-1, read by t=0) is read before the write at t=dc-1.
+fn pl_run_conv(t: i64, cell) {
+    // dispatch witness: any worker reaching here sets the sticky flag; all
+    // writers store the same value, so the racy multi-writer store is benign.
+    mm_conv_used = 1
+    let dm = pl_cv_dm
+    let dc = pl_cv_dc
+    let kw = pl_cv_kw
+    let ip = pl_cv_ip
+    let st = pl_cv_state
+    let kout = pl_cv_kout
+    let y = pl_cv_y
+    let kern = pl_cv_kern
+    // QUOTIENT split (see pl_run_rows): channel-parallel, sizes differ by <= 1.
+    let lo = t * dm / pl_nw
+    let hi = (t + 1) * dm / pl_nw
+    let c = lo
+    while c < hi {
+        let gc = f64of(mem_load(ip + c * 8)) * f64of(mem_load(ip + (2 * dm + c) * 8))
+        let acc: f64 = 0.0
+        let k = 0
+        while k < kw {
+            let bv: f64 = 0.0
+            if k < dc { bv = f64of(mem_load(st + (k * dm + c) * 8)) } else { bv = gc }
+            acc = acc + f64of(mem_load(kern + (c * kw + k) * 8)) * bv
+            k = k + 1
+        }
+        mem_store(kout + c * 8, acc)
+        let tt = 0
+        while tt < dc {
+            let src = dc - 1 + tt
+            let nv: f64 = 0.0
+            if src < dc { nv = f64of(mem_load(st + (src * dm + c) * 8)) } else { nv = gc }
+            mem_store(st + (tt * dm + c) * 8, nv)
+            tt = tt + 1
+        }
+        mem_store(y + c * 8, f64of(mem_load(ip + (dm + c) * 8)) * acc)
+        c = c + 1
     }
     return hi - lo
 }
@@ -1580,11 +1715,9 @@ fn mm_matmul_ser(idx, x, rows, cols, B, y) -> i64 {
 // Worker slice: static rows, one read per row, B dots. Same partition rule and
 // the same primitives as pl_run_rows, so the arithmetic is unchanged.
 fn pl_run_mm(t: i64, cell) {
-    let per = pl_rows / pl_nw
-    let lo = t * per
-    let hi = lo + per
-    if t == pl_nw - 1 { hi = pl_rows }
-    if hi > pl_rows { hi = pl_rows }
+    // QUOTIENT split (see pl_run_rows)
+    let lo = t * pl_rows / pl_nw
+    let hi = (t + 1) * pl_rows / pl_nw
     let r = lo
     while r < hi {
         if mm_load_row_s(pl_idx, r, pl_cols, cell) != 0 { return -1 }
@@ -1941,11 +2074,11 @@ fn mm_deq_row_raw(dtype, raw: u64, elems: i64, dst: u64) -> i64 {
 //      reaches <= 1 cycle/element is the fused register-resident builtin
 //      spec'd in docs/research/decode-fused-dot.md section 3.
 fn pl_run_rows_map(t: i64, cell) {
-    let per = pl_rows / pl_nw
-    let lo = t * per
-    let hi = lo + per
-    if t == pl_nw - 1 { hi = pl_rows }
-    if hi > pl_rows { hi = pl_rows }
+    // QUOTIENT split (see pl_run_rows): this is the decode hot path (FFN gate/up/
+    // down, attn q/k/v/out, conv in/out proj), and its small-row tensors (512-row
+    // k/v projections) previously handed the tail worker 32 rows against 25.
+    let lo = t * pl_rows / pl_nw
+    let hi = (t + 1) * pl_rows / pl_nw
     let dtype = gguf_tensor_dtype(pl_idx)
     let rb = mm_row_bytes(dtype, pl_cols)
     if rb <= 0 { return -1 }
@@ -2017,11 +2150,9 @@ fn pl_run_rows_map(t: i64, cell) {
 // pl_run_embed -- bit-identical by construction. (The multi-lane dot is NOT
 // an option here either -- see the note on pl_run_rows_map.)
 fn pl_run_embed_map(t: i64, cell) {
-    let per = pl_vcount / pl_nw
-    let lo = t * per
-    let hi = lo + per
-    if t == pl_nw - 1 { hi = pl_vcount }
-    if hi > pl_vcount { hi = pl_vcount }
+    // QUOTIENT split (see pl_run_rows)
+    let lo = t * pl_vcount / pl_nw
+    let hi = (t + 1) * pl_vcount / pl_nw
     let dtype = gguf_tensor_dtype(pl_idx)
     let rb = mm_row_bytes(dtype, pl_ncols)
     if rb <= 0 { return -1 }
