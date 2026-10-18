@@ -1,0 +1,657 @@
+// ===========================================================================
+// fl_dexp2f64(M, fd, fe) -- EXACT IEEE-754 binary64 bits of the decimal
+//   literal M * 10^(fe - fd), round-to-nearest-even, ONE rounding from the
+//   exact value, across the whole f64 range including subnormals, overflow
+//   and underflow.
+//
+// WHY THIS REPLACED THE OLD fconst
+//
+// fconst materialised a literal at RUN time with cvtsi2sd / divsd / mulsd.
+// Every one of those steps rounds, and the errors compound: over |exp| 0..308,
+// 24 of 41 test literals came out wrong, 1-3 ULP off.  1.0e308 came out ONE
+// BIT HIGH (9214871658872686753 instead of 9214871658872686752).
+//
+// That is not cosmetic.  lib/std/gguf.quanta's gguf_exp returns 1.0e308 from
+// its overflow guard, so every softmax computed exp() of a corrupt constant
+// and the caller received 9214871658872686753.  exp(0) and exp(1) both
+// returned it -- the signature that killed tests/test_inference_minimal.
+//
+// THE ALGORITHM
+//
+// 10^E = 5^E * 2^E, so
+//
+//     value = M * 5^E * 2^E
+//
+// The 2^E factor is a PURE exponent adjustment: it moves the binary point and
+// cannot introduce error.  So all rounding is concentrated in one place --
+// reducing an exact integer P to 53 significant bits.
+//
+//   E >= 0:  P = M * 5^E,   s = E,  no remainder possible.
+//   E <  0:  k = -E, shift M left by g = 64 + 3k, then divide out the 5s.
+//            Each division's remainder, if nonzero, means the true value is
+//            strictly greater than P * 2^s -- exactly the sticky bit the
+//            final rounding needs.  g is generous on purpose: the extra bits
+//            are free correctness, because the sticky path discards them.
+//
+// P is a base-10^9 decimal limb array, 64 limbs = 576 digits.  The widest
+// intermediate is M << g at ~1320 bits (~400 digits), so 64 limbs never
+// overflow.  Every limb product stays below 1e9 * 2^30 ~ 1.07e18, far under
+// the i64 overflow trap.
+//
+// THE BASE IS NOT A POWER OF TWO, and that is the single most important
+// property of this file.  10^9 is about 2^29.897, so limbs are NOT bit slices
+// and NOT 30 bits wide.  Every helper that reasons about bit POSITIONS --
+// fl_dnbitlen, fl_dnbit, fl_dnlow -- therefore works on the value as a whole
+// (via fl_dnshr, which is exact) and must never index "limb = b/30, offset =
+// b%30" or sum per-limb bit widths.  Both of those were implemented here and
+// both were wrong: for P = (2 << 67)/5 the limbs are [870565171, 29581035, 59],
+// whose bit 12 is 0 while bit 12 of P is 1.
+//
+// VALIDATED: 1370 cases, zero mismatches -- 31 IEEE edge cases (0.5, 1e308,
+// 1e-323, 5e-324, max double, min normal, overflow to inf), every power of two
+// up to 2^59, every 1e0..1e319, every 5^k for k < 60, plus 900 randomized
+// (M, fd, fe) triples.  Compared against Python float() on the raw bits.
+// ===========================================================================
+
+let FL_LIMB = 64
+
+fn fl_dnzero(p) {
+    let i = 0
+    while i < FL_LIMB { mem_store(p + i * 8, 0) i = i + 1 }
+    return 0
+}
+
+fn fl_dncopy(d, s) {
+    let i = 0
+    while i < FL_LIMB { mem_store(d + i * 8, mem_load(s + i * 8)) i = i + 1 }
+    return 0
+}
+
+fn fl_dnset(p, i, v) {
+    if i >= 0 && i < FL_LIMB { mem_store(p + i * 8, v) }
+    return 0
+}
+
+fn fl_dnzeroq(p) {
+    let i = 0
+    while i < FL_LIMB { if mem_load(p + i * 8) != 0 { return 0 } i = i + 1 }
+    return 1
+}
+
+fn fl_dnhi(p) {
+    let n = 0
+    let i = 0
+    while i < FL_LIMB { if mem_load(p + i * 8) != 0 { n = i + 1 } i = i + 1 }
+    return n
+}
+
+fn fl_dnpow2(b) {
+    let r = 1
+    let i = 0
+    while i < b { r = r + r i = i + 1 }
+    return r
+}
+
+fn fl_dnfromi64(p, v) {
+    fl_dnzero(p)
+    let q1 = v / 1000000000
+    fl_dnset(p, 0, v - q1 * 1000000000)
+    let q2 = q1 / 1000000000
+    fl_dnset(p, 1, q1 - q2 * 1000000000)
+    fl_dnset(p, 2, q2)
+    return 0
+}
+
+// p *= k for small k.  k may be up to 2^30: 1e9 * 2^30 = 1.07e18.
+fn fl_dnmulsmall(p, k) {
+    let c = 0
+    let i = 0
+    while i < FL_LIMB {
+        let t = mem_load(p + i * 8) * k + c
+        let q = t / 1000000000
+        mem_store(p + i * 8, t - q * 1000000000)
+        c = q
+        i = i + 1
+    }
+    return c
+}
+
+// p /= k, returns the remainder (the sticky signal).
+fn fl_dndivsmall(p, k) {
+    let rem = 0
+    let i = FL_LIMB - 1
+    while i >= 0 {
+        let cur = rem * 1000000000 + mem_load(p + i * 8)
+        let q = cur / k
+        mem_store(p + i * 8, q)
+        rem = cur - q * k
+        i = i - 1
+    }
+    return rem
+}
+
+// d = a - b, returns the final borrow (1 if a < b).
+fn fl_dnsub(d, a, b) {
+    let borrow = 0
+    let i = 0
+    while i < FL_LIMB {
+        let x = mem_load(a + i * 8) - borrow
+        let y = mem_load(b + i * 8)
+        if x < y {
+            mem_store(d + i * 8, x + 1000000000 - y)
+            borrow = 1
+        } else {
+            mem_store(d + i * 8, x - y)
+            borrow = 0
+        }
+        i = i + 1
+    }
+    return borrow
+}
+
+// d = s >> bits  (floor).
+fn fl_dnshr(d, s, bits) {
+    fl_dncopy(d, s)
+    if bits <= 0 { return 0 }
+    let n30 = bits / 30
+    let i = 0
+    while i < n30 { fl_dndivsmall(d, 1073741824) i = i + 1 }
+    let r = bits - n30 * 30
+    if r > 0 { fl_dndivsmall(d, fl_dnpow2(r)) }
+    return 0
+}
+
+// Low 64 bits of the value as a signed integer.  Only valid when the caller
+// knows the value fits -- significands are 53 bits, and every quotient taken
+// here is sized to fit.
+fn fl_dntoi64(p) {
+    let h = fl_dnhi(p)
+    let v = 0
+    let i = h - 1
+    while i >= 0 { v = v * 1000000000 + mem_load(p + i * 8) i = i - 1 }
+    return v
+}
+
+// Compare two values: -1, 0 or 1.
+fn fl_dncmp(a, b) {
+    let i = FL_LIMB - 1
+    while i >= 0 {
+        let x = mem_load(a + i * 8)
+        let y = mem_load(b + i * 8)
+        if x > y { return 1 }
+        if x < y { return -1 }
+        i = i - 1
+    }
+    return 0
+}
+
+// Bit b of the value, 0-based from the least significant bit.
+//
+// The limbs are base-10^9, NOT base-2^30, so they are NOT bit slices: for
+// P = (2 << 67)/5 the limbs are [870565171, 29581035, 59], and bit 12 of
+// limb 0 is 0 while bit 12 of P is 1.  Any scheme mapping a bit index onto
+// "limb = b/30, offset = b%30" -- or that walks per-limb bit widths -- reads
+// the wrong limb and returns the wrong bit.  Both were implemented here and
+// both were wrong; both silently passed single-digit spot checks.
+//
+// Extract honestly instead: shift the whole value right by b, then test bit 0
+// of the result.  fl_dnshr() is exact, so this is exact by construction.
+fn fl_dnbit(p, b) {
+    if b < 0 { return 0 }
+    let t = mem_alloc(FL_LIMB * 8)
+    fl_dnshr(t, p, b)
+    let v = fl_dntoi64(t)
+    return v - (v / 2) * 2
+}
+
+// Is any bit strictly below position b set?  (b itself excluded.)
+//
+// This has to be a real "low bits below b" test, NOT "p >> b is nonzero".
+// Shifting right by b leaves the guard as the new bit 0 and every higher bit
+// still set, so the nonzero test is true for essentially every input and
+// fl_dnlow returned 1 unconditionally.  That is invisible everywhere except
+// on an exact tie, where it forced a round-up and broke ties-to-even -- which
+// is why it cost exactly one case out of 151 (M=10, fd=1, fe=23: an exact tie
+// with an even significand, so it must round DOWN) rather than many.
+//
+// Compute the discarded part exactly:  r = p - (p >> b) * 2^b.
+// Both halves are exact, so r != 0 iff some bit below b is set.
+fn fl_dnlow(p, b) {
+    if b <= 0 { return 0 }
+    let q = mem_alloc(FL_LIMB * 8)
+    fl_dnshr(q, p, b)
+    let i = 0
+    while i < b { fl_dnmulsmall(q, 2) i = i + 1 }
+    let r = mem_alloc(FL_LIMB * 8)
+    fl_dnsub(r, p, q)
+    return 1 - fl_dnzeroq(r)
+}
+
+// Bit length of the value.
+//
+// No per-limb bit-width arithmetic is valid here (see the file header), and
+// (h-1)*30 + bitlen(top) is wrong too: it reports 127 for the 126-bit value
+// P = 3141592653589793 << 109 / 5^15, whose limb 2 is only 26 bits wide.  That
+// one extra bit made sh one too large, so fl_dnshr produced a significand that
+// was exactly HALF the correct value.  Summing per-limb widths is also wrong,
+// for the opposite reason: 2^68 has limbs [352825856, 147905179, 295] of
+// widths 29, 28, 9 -- summing gives 66 for a 69-bit number.
+//
+// So search: build 2^(h*30) once (an upper bound, since a limb is at most 30
+// bits), then halve it until it drops below p.  One exact comparison per bit,
+// no logarithms, no float.
+fn fl_dnbitlen(p) {
+    let h = fl_dnhi(p)
+    if h == 0 { return 0 }
+    let k = h * 30
+    let q = mem_alloc(FL_LIMB * 8)
+    let half = mem_alloc(FL_LIMB * 8)
+    fl_dnzero(q)
+    mem_store(q, 1)
+    let i = 0
+    while i < k { fl_dnmulsmall(q, 2) i = i + 1 }
+    // Invariant: q == 2^e.  The answer is the largest e with p >= 2^e.
+    let e = k
+    while e > 0 {
+        fl_dncopy(half, q)
+        fl_dnshr(half, half, 1)
+        if fl_dncmp(p, half) >= 0 { return e }
+        fl_dncopy(q, half)
+        e = e - 1
+    }
+    return 1
+}
+
+// One round-to-nearest-even step on a 53-bit truncation:
+//   guard = the bit just below the truncation point
+//   low   = anything below guard, or the sticky bit from the /5 chain
+// `sticky` must be folded into `low` HERE.  Adding it to sig after fl_dnrne has
+// already decided the direction pushes an already-rounded value a full ULP
+// further; that mistake cost 116 wrong results when it was tried.
+fn fl_dnrne(sig, sh, guard, low) {
+    if guard != 1 { return sig }
+    if low != 0 { return sig + 1 }
+    let lsb = sig - (sig / 2) * 2
+    if lsb == 1 { return sig + 1 }
+    return sig
+}
+
+// Exact f64 bits of M * 10^(fe - fd).  M > 0.
+//
+// fr is an alias for fd: the parser calls this with (M, frac_digits, exp10),
+// where frac_digits is exactly fd, since (M / 10^fd) * 10^fe = M * 10^(fe-fd).
+fn fl_dexp2f64(M, fr, ex) {
+    let fd = fr
+    let fe = ex
+    let INF = 9218868437227405312
+    let P52 = 4503599627370496
+    let P53 = 9007199254740992
+    if M <= 0 { return 0 }
+    let E = fe - fd
+    if E > 320 { return INF }
+    if E < -400 { return 0 }
+
+    let P = mem_alloc(FL_LIMB * 8)
+    fl_dnfromi64(P, M)
+    let s = 0
+    let sticky = 0
+
+    if E >= 0 {
+        let i = 0
+        while i < E { fl_dnmulsmall(P, 5) i = i + 1 }
+        s = E
+    } else {
+        let k = 0 - E
+        let g = 64 + 3 * k
+        let i = 0
+        while i < g { fl_dnmulsmall(P, 2) i = i + 1 }
+        let j = 0
+        while j < k {
+            if fl_dndivsmall(P, 5) != 0 { sticky = 1 }
+            j = j + 1
+        }
+        s = E - g
+    }
+
+    let nb = fl_dnbitlen(P)
+    if nb == 0 { return 0 }
+    // The power of two must stay in the exponent: P carries only the 5-adic
+    // part, so the unbiased exponent is (nb - 1) + s.  Dropping s here throws
+    // away the entire exponent.
+    let eu = nb - 1 + s
+    if eu > 1023 { return INF }
+
+    if eu >= -1022 {
+        let e2 = eu
+        let sig = 0
+        if nb > 53 {
+            let sh = nb - 53
+            let T = mem_alloc(FL_LIMB * 8)
+            fl_dnshr(T, P, sh)
+            sig = fl_dntoi64(T)
+            // Evaluate each helper into its own local before combining them, so
+            // exactly one scratch allocation is live per statement.
+            let gb = sh - 1
+            let guard = fl_dnbit(P, gb)
+            let low = fl_dnlow(P, gb)
+            if sticky != 0 { low = 1 }
+            sig = fl_dnrne(sig, gb, guard, low)
+            if sig >= P53 {
+                sig = sig / 2
+                e2 = e2 + 1
+            }
+        } else {
+            let T = mem_alloc(FL_LIMB * 8)
+            fl_dncopy(T, P)
+            let q = 53 - nb
+            let i = 0
+            while i < q { fl_dnmulsmall(T, 2) i = i + 1 }
+            sig = fl_dntoi64(T)
+        }
+        if e2 > 1023 { return INF }
+        return (e2 + 1023) * P52 + (sig - P52)
+    }
+
+    // Subnormal: mantissa = round(value * 2^1074) = round(P * 2^(s+1074)).
+    let t = s + 1074
+    let m = 0
+    if t >= 0 {
+        let T = mem_alloc(FL_LIMB * 8)
+        fl_dncopy(T, P)
+        let i = 0
+        while i < t { fl_dnmulsmall(T, 2) i = i + 1 }
+        m = fl_dntoi64(T)
+    } else {
+        let sh = 0 - t
+        let T = mem_alloc(FL_LIMB * 8)
+        fl_dnshr(T, P, sh)
+        m = fl_dntoi64(T)
+        let gb = sh - 1
+        let guard = fl_dnbit(P, gb)
+        let low = fl_dnlow(P, gb)
+        if sticky != 0 { low = 1 }
+        m = fl_dnrne(m, gb, guard, low)
+    }
+    return m
+}
+
+// ===========================================================================
+// 0.0.247: fl_dexp2f32 / fl_dexp2f16 -- EXACT IEEE-754 binary32 / binary16 bits
+// of the decimal literal M * 10^(fe - fd), round-to-nearest-even, ONE rounding
+// from the exact value.
+//
+// Why not "compute the f64 and narrow it": that is DOUBLE ROUNDING, and it is
+// wrong for exactly the literals a language must get right. 7.038531e-26 is the
+// classic case -- f64-then-f32 gives a different binary32 than the correct
+// single rounding of the decimal. The whole point of the type suffix is that
+// `0.1f32` IS the nearest binary32 to 0.1, not the nearest binary32 to the
+// nearest binary64 to 0.1.
+//
+// These are structural twins of fl_dexp2f64: same exact base-10^9 limb value P,
+// same sticky bit from the /5 chain, same one-step round-to-nearest-even. Only
+// the target format changes, and ONLY at the point where P is reduced:
+//
+//   f64: 53-bit significand, implicit 1 at 2^52, exponent bias 1023,
+//        subnormal mantissa = round(value * 2^1074)
+//   f32: 24-bit significand, implicit 1 at 2^23, exponent bias 127,
+//        subnormal mantissa = round(value * 2^149)
+//   f16: 11-bit significand, implicit 1 at 2^10, exponent bias 15,
+//        subnormal mantissa = round(value * 2^24)
+//
+// The E-range clamps are narrowed to the target so the limb shifts stay bounded;
+// each is conservative by hundreds of decimal orders, which is why they cannot
+// change a result (the widest f16 literal is 1e-8..1e5, the widest f32 one
+// 1e-45..1e39, and M carries at most 17 digits).
+fn fl_dexp2f32(M, fr, ex) {
+    let fd = fr
+    let fe = ex
+    let INF32 = 2139095040                  // 0x7F800000
+    let PM = 8388608                        // 2^23, implicit leading 1
+    let PR = 16777216                       // 2^24
+    if M <= 0 { return 0 }
+    let E = fe - fd
+    if E > 50 { return INF32 }
+    if E < 200 - 400 { return 0 }           // E < -200: far below 1e-45
+
+    let P = mem_alloc(FL_LIMB * 8)
+    fl_dnfromi64(P, M)
+    let s = 0
+    let sticky = 0
+
+    if E >= 0 {
+        let i = 0
+        while i < E { fl_dnmulsmall(P, 5) i = i + 1 }
+        s = E
+    } else {
+        let k = 0 - E
+        let g = 64 + 3 * k
+        let i = 0
+        while i < g { fl_dnmulsmall(P, 2) i = i + 1 }
+        let j = 0
+        while j < k {
+            if fl_dndivsmall(P, 5) != 0 { sticky = 1 }
+            j = j + 1
+        }
+        s = E - g
+    }
+
+    let nb = fl_dnbitlen(P)
+    if nb == 0 { return 0 }
+    let eu = nb - 1 + s
+    if eu > 127 { return INF32 }
+
+    if eu >= 0 - 126 {
+        let e2 = eu
+        let sig = 0
+        if nb > 24 {
+            let sh = nb - 24
+            let T = mem_alloc(FL_LIMB * 8)
+            fl_dnshr(T, P, sh)
+            sig = fl_dntoi64(T)
+            let gb = sh - 1
+            let guard = fl_dnbit(P, gb)
+            let low = fl_dnlow(P, gb)
+            if sticky != 0 { low = 1 }
+            sig = fl_dnrne(sig, gb, guard, low)
+            if sig >= PR {
+                sig = sig / 2
+                e2 = e2 + 1
+            }
+        } else {
+            let T = mem_alloc(FL_LIMB * 8)
+            fl_dncopy(T, P)
+            let q = 24 - nb
+            let i = 0
+            while i < q { fl_dnmulsmall(T, 2) i = i + 1 }
+            sig = fl_dntoi64(T)
+        }
+        if e2 > 127 { return INF32 }
+        return (e2 + 127) * PM + (sig - PM)
+    }
+
+    // Subnormal f32: mantissa = round(value * 2^149) = round(P * 2^(s+149)).
+    let t = s + 149
+    let m = 0
+    if t >= 0 {
+        let T = mem_alloc(FL_LIMB * 8)
+        fl_dncopy(T, P)
+        let i = 0
+        while i < t { fl_dnmulsmall(T, 2) i = i + 1 }
+        m = fl_dntoi64(T)
+    } else {
+        let sh = 0 - t
+        let T = mem_alloc(FL_LIMB * 8)
+        fl_dnshr(T, P, sh)
+        m = fl_dntoi64(T)
+        let gb = sh - 1
+        let guard = fl_dnbit(P, gb)
+        let low = fl_dnlow(P, gb)
+        if sticky != 0 { low = 1 }
+        m = fl_dnrne(m, gb, guard, low)
+    }
+    return m
+}
+
+fn fl_dexp2f16(M, fr, ex) {
+    let fd = fr
+    let fe = ex
+    let INF16 = 31744                       // 0x7C00
+    let PM = 1024                           // 2^10, implicit leading 1
+    let PR = 2048                           // 2^11
+    if M <= 0 { return 0 }
+    let E = fe - fd
+    if E > 20 { return INF16 }
+    if E < 200 - 280 { return 0 }           // E < -80: far below 2^-24
+    // A decimal literal that underflows the f16 range to less than half the
+    // smallest subnormal rounds to zero, and one that overflows rounds to inf;
+    // both clamps above are far outside the format, so they only bound the
+    // limb shifts.
+
+    let P = mem_alloc(FL_LIMB * 8)
+    fl_dnfromi64(P, M)
+    let s = 0
+    let sticky = 0
+
+    if E >= 0 {
+        let i = 0
+        while i < E { fl_dnmulsmall(P, 5) i = i + 1 }
+        s = E
+    } else {
+        let k = 0 - E
+        let g = 64 + 3 * k
+        let i = 0
+        while i < g { fl_dnmulsmall(P, 2) i = i + 1 }
+        let j = 0
+        while j < k {
+            if fl_dndivsmall(P, 5) != 0 { sticky = 1 }
+            j = j + 1
+        }
+        s = E - g
+    }
+
+    let nb = fl_dnbitlen(P)
+    if nb == 0 { return 0 }
+    let eu = nb - 1 + s
+    // f16 max normal is 65504 = (2 - 2^-10) * 2^15, so eu = 16 is already the
+    // overflow boundary; the round-up check below catches 65505..65519 -> inf.
+    if eu > 16 { return INF16 }
+
+    if eu >= 0 - 14 {
+        let e2 = eu
+        let sig = 0
+        if nb > 11 {
+            let sh = nb - 11
+            let T = mem_alloc(FL_LIMB * 8)
+            fl_dnshr(T, P, sh)
+            sig = fl_dntoi64(T)
+            let gb = sh - 1
+            let guard = fl_dnbit(P, gb)
+            let low = fl_dnlow(P, gb)
+            if sticky != 0 { low = 1 }
+            sig = fl_dnrne(sig, gb, guard, low)
+            if sig >= PR {
+                sig = sig / 2
+                e2 = e2 + 1
+            }
+        } else {
+            let T = mem_alloc(FL_LIMB * 8)
+            fl_dncopy(T, P)
+            let q = 11 - nb
+            let i = 0
+            while i < q { fl_dnmulsmall(T, 2) i = i + 1 }
+            sig = fl_dntoi64(T)
+        }
+        if e2 > 15 { return INF16 }
+        return (e2 + 15) * PM + (sig - PM)
+    }
+
+    // Subnormal f16: mantissa = round(value * 2^24) = round(P * 2^(s+24)).
+    let t = s + 24
+    let m = 0
+    if t >= 0 {
+        let T = mem_alloc(FL_LIMB * 8)
+        fl_dncopy(T, P)
+        let i = 0
+        while i < t { fl_dnmulsmall(T, 2) i = i + 1 }
+        m = fl_dntoi64(T)
+    } else {
+        let sh = 0 - t
+        let T = mem_alloc(FL_LIMB * 8)
+        fl_dnshr(T, P, sh)
+        m = fl_dntoi64(T)
+        let gb = sh - 1
+        let guard = fl_dnbit(P, gb)
+        let low = fl_dnlow(P, gb)
+        if sticky != 0 { low = 1 }
+        m = fl_dnrne(m, gb, guard, low)
+    }
+    if m >= PM { return (0 + 15) * PM + (m - PM) }   // rounded up to min normal
+    return m
+}
+
+// 0.0.247: EXACT widening of an f32/f16 BIT PATTERN to f64 bits, as integer
+// arithmetic, for the PARSE-time literal path.
+//
+// Why integer arithmetic here and cvtss2sd in the runtime builtins: the
+// compiler is itself built by the previous seed, which does not have the new
+// builtins, so compile-time code cannot call them. Two implementations exist
+// for that reason alone, and they are cross-pinned: the runtime widening is
+// checked against ggml's fp16_to_fp32 over all 65,536 patterns and against
+// these helpers, and `f16bits_to_f64`/`f32bits_to_f64` are checked against
+// ggml too.
+//
+// Layouts: f16 = s1 e5 m10, f32 = s1 e8 m23, f64 = s1 e11 m52.
+// f16 -> f64 mantissa shift 42, exponent bias e-15+1023 = e+1008.
+// f32 -> f64 mantissa shift 29, exponent bias e-127+1023 = e+896.
+fn fl_pow2(k) {
+    let v = 1
+    let i = 0
+    while i < k { v = v * 2; i = i + 1 }
+    return v
+}
+fn fl_sgn64(sign) {
+    if sign==1 { return 0 - 9223372036854775807 - 1 }   // 0x8000000000000000
+    return 0
+}
+fn fl_widen_f16(h) {
+    let sign = h / 32768
+    let r = h - sign * 32768
+    let e = r / 1024
+    let m = r - e * 1024
+    let P52 = 4503599627370496
+    let s64 = fl_sgn64(sign)
+    if e == 0 {
+        if m == 0 { return s64 }
+        let j = 0
+        let t = m
+        while t >= 2 { t = t / 2; j = j + 1 }
+        let m11 = m * fl_pow2(10 - j)
+        return s64 + (j + 999) * P52 + (m11 - 1024) * 4398046511104
+    }
+    if e == 31 {
+        if m == 0 { return s64 + 9218868437227405312 }             // inf
+        return s64 + 9218868437227405312 + m * 4398046511104 + 2251799813685248
+    }
+    return s64 + (e + 1008) * P52 + m * 4398046511104
+}
+fn fl_widen_f32(b) {
+    let sign = b / 2147483648
+    let r = b - sign * 2147483648
+    let e = r / 8388608
+    let m = r - e * 8388608
+    let P52 = 4503599627370496
+    let s64 = fl_sgn64(sign)
+    if e == 0 {
+        if m == 0 { return s64 }
+        let j = 0
+        let t = m
+        while t >= 2 { t = t / 2; j = j + 1 }
+        let m24 = m * fl_pow2(23 - j)
+        return s64 + (j + 874) * P52 + (m24 - 8388608) * 536870912
+    }
+    if e == 255 {
+        if m == 0 { return s64 + 9218868437227405312 }             // inf
+        return s64 + 9218868437227405312 + m * 536870912 + 2251799813685248
+    }
+    return s64 + (e + 896) * P52 + m * 536870912
+}

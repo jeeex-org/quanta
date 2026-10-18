@@ -1,0 +1,51 @@
+// A36 red-first row (0.0.254) — a function whose body is a CONVERSION builtin
+// must be inferred from that builtin's DIRECTION.
+//
+// `ret_expr_is_float()` (funcscan.quanta) decides a function's return type by
+// walking every token of the body for floatness MARKERS, and its list does not
+// name the conversion family. A wrapper with no explicit `-> f64` annotation is
+// therefore inferred by accident, in BOTH directions:
+//
+//   (a) fn cvt(p) { return f32bits_to_f64(p) }      -- f32 raw bits -> f64 VALUE.
+//       MUST be FLOAT-returning. On 0.0.253 it is inferred INTEGER, so a caller's
+//       ordinary `d + 1.0` runs the integer path over the f64's BITS. MEASURED by
+//       the loader peer while adopting the builtins: the UNFUSED decode path's
+//       flags-OFF argmax came out 25438 against the oracle 597, all 128,000
+//       logits different, while every fused flag stayed bit-exact (which is why
+//       it was not obvious).
+//
+//   (b) fn rawbits(x) { return f64_to_f32bits(x) }  -- f64 -> RAW f32 BITS (i64).
+//       MUST be INTEGER-returning. The list's coarse `f64_` prefix matched this
+//       name too, so on 0.0.253 it is inferred FLOAT and a caller treats the raw
+//       bits as a double -- the same defect mirrored.
+//
+// NOTE ON THE PROBE SHAPE (measured, not guessed): using `fsubf(d, 1.0)` here
+// does NOT expose (a), because the `*f` builtin bit-moves its operand regardless
+// of the tag. The plain `d + 1.0` form is the sensitive one and is what is used.
+//
+// Return = a_ok*100 + b_ok*10 + 4. Correct = 114. On 0.0.253 = 4.
+fn cvt(p) { return f32bits_to_f64(p) }        // f32 bits -> f64 value   (FLOAT)
+fn rawbits(x) { return f64_to_f32bits(x) }    // f64 value -> f32 bits   (INT)
+
+fn main() {
+    // (a) 0x3F800000 is the f32 bit pattern of 1.0.
+    let p = 1065353216
+    let d = cvt(p)                     // the DOUBLE 1.0 when inferred float
+    let rd = d + 1.0                   // 2.0 when float ; integer path over bits otherwise
+    let a_ok = 0
+    if f2i(rd) == 2 { a_ok = 1 }
+
+    // (b) rawbits(1.0) is the i64 1065353216 (0x3F800000). If the function were
+    // (wrongly) tagged float, `rb + 7` would take the FP path over the bit
+    // pattern (yielding 7.0's bits), not an integer add.
+    //
+    // NOTE (measured): `f2i(rb)` is NOT a valid discriminator here -- f2i always
+    // bit-moves its operand (it assumes f64 bits), so f2i(1065353216) is 0 either
+    // way. The sensitive form is an ordinary integer-context arithmetic op.
+    let rb = rawbits(1.0)
+    let s = rb + 7
+    let b_ok = 0
+    if s == 1065353223 { b_ok = 1 }
+
+    return a_ok * 100 + b_ok * 10 + 4
+}
