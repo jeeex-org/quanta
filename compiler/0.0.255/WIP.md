@@ -138,15 +138,29 @@ the shape that would have exposed it.
 
 ### 5.1 gate
 
-(recorded from the run)
+**`=== Results: 246/246 pass, 0 fail (incl. 0 compile-fail) [rows: EXPECTED.tsv]
+===`**, **0 RED stages — `GATE_RC=0`**, with `PASS constmul-guard: loop=65
+(<=66)`. Red-first proof through the REAL gate: running the same gate with
+`QC=compiler/0.0.254/bin/x86/qc` gives **`FAIL constmul-guard: loop body 69 > 66`**
+and **`GATE_RC=1`** — the stage blocks promotion for the reason it exists.
 
 ### 5.2 bench.sh
 
-(recorded from the run)
+`scripts/bench.sh` with `QC=compiler/0.0.255/bin/x86/qc`: **38/38 compiled, 0
+MISMATCH** (`grep -c MISMATCH` = 0), **`BENCH_RC=0`**.
+
+Byte-identity vs 0.0.254 (`test_suites/scripts/byte_identity.sh`): **identical
+175, differing 70, compile-fail 0** of 245 rows (the 246th is the new
+`constmul_reuse_test`). 70 rows move because removing a copy changes register
+allocation downstream — expected for this class of lever, and the reason the
+equivalence rests on the behavioural oracles rather than on byte counts.
 
 ### 5.3 verify-release
 
-(recorded from the run)
+`bash scripts/verify-release.sh 0.0.255 "$(cat VERSION)"`: **14 passed, 0 failed**
+(`VR_RC=0`), including `<VER>=0.0.254` rebuilding bit-for-bit, the src/bin
+lockstep (the committed binary is the seed-chain fixed point), the self-host fixed
+point, and the official gate re-run.
 
 ## 6. Byte-identity
 
