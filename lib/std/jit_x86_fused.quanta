@@ -1300,3 +1300,485 @@ fn jit_f_ready_folded_q6k_fma() { return jf_tbl_fma_q6k }
 fn jit_f_apply_folded_q6k_fma(as) -> i64 {
     return closure_call(jf_tbl_fma_q6k, as, 0)
 }
+
+// ============================================================================
+// THE f32 KERNEL FAMILY -- opt-in, DEFAULT OFF, its OWN flag (mm_fused_f32)
+// ============================================================================
+// WHY f32. Every FP instruction in the kernels above is a *pd form: 4 f64 lanes
+// per ymm. The *ps forms carry EIGHT lanes, `vcvtdq2ps` converts 8 int32 at once
+// where `vcvtdq2pd` converts only the low 4, and x becomes 4 bytes/element
+// instead of 8 -- halving the one operand that is re-read once per ROW (x is
+// read rows*cols*8 bytes per matvec against 0.5 bytes/element of weights, i.e.
+// 16x the weight traffic; see docs/research/f32-fma-loader-kernels.md 3.1).
+//
+// Measured instruction counts of the emitted bodies, per Q4_K super-block
+// (256 weights), the f64 folded kernel against the f32 one:
+//   f64: 43-instruction factor prologue + 4 chunks x (8x13 low + 1 rewind +
+//        8x12 high) = 43 + 4*201 = 847
+//   f32: 32-instruction factor prologue + 16 broadcasts + 4 chunks x (4x10 low
+//        + 1 rewind + 4x9 high) = 48 + 4*77 = 356
+// i.e. ~2.4x fewer instructions for the same 256 weights, because a group is 8
+// weights instead of 4. That is the lever: not a percentage but a multiple.
+//
+// BIT STATUS: this path MOVES BITS and therefore has its OWN flag and its OWN
+// bar, exactly like the FMA kernels. Two independent reasons bits move:
+//   1. f32 ACCUMULATION, not f64. llama.cpp's own SIMD dot products accumulate
+//      in f32, so this moves the loader TOWARD its reference -- but it is a
+//      different sequence from THIS loader's f64 one, and the existing flags'
+//      gate is bit-exactness against that. Hence: a separate flag, never a
+//      silent substitution.
+//   2. x is NARROWED to f32 once per matvec (RNE), where the f64 path keeps it
+//      in f64. One rounding per activation element.
+// The measured bound is in docs/research/f32-loader-kernels.md and is reproduced
+// by tests/lfm2_f32_kernel_ab_test.quanta (argmax 597, first 24 ids identical,
+// and a max |logit difference| stated as an absolute value and a relative one).
+//
+// COMPOSITION WITH mm_fused_fma -- stated, not left to be inferred:
+//   f32=0 fma=0 -> the f64 folded kernels          (unchanged)
+//   f32=0 fma=1 -> the f64 FMA kernels             (unchanged)
+//   f32=1 fma=0 -> the f32 kernels                 (this section)
+//   f32=1 fma=1 -> the f32 FMA kernels             (this section, fused fold)
+// mm_fused_f32 is a MODIFIER of mm_fused_q4k / mm_fused_q6k exactly as
+// mm_fused_fma is: it changes WHICH kernel those routes dispatch. The f64
+// kernels' bytes are not touched and their gate rows depend on that.
+//
+// REGISTER MAP of the f32 Q4_K kernel (the Q6_K one is beside its builder):
+//   rdi = AS     r9 = W cursor   r10 = X f32 cursor   rcx = nsuper
+//   ymm0 = 8-lane f32 accumulator    ymm1 = weight scratch
+//   ymm2 = [d,dmin,0,0] f32          ymm8/ymm9  = broadcast d / dmin (4 f32)
+//   ymm4/ymm5/ymm10 = sc bytes a/b/c as dwords     ymm3/ymm11 = unpack scratch
+//   ymm12 = [d*sc0..3]   ymm13 = [d*sc4..7]    (each later DUPLICATED to 8 lanes)
+//   ymm14 = [dmin*mn0..3] ymm15 = [dmin*mn4..7] (each later DUPLICATED)
+//   ymm6 = this half's scale broadcast (8 f32)   ymm7 = this half's min (8 f32)
+// No callee-saved register is touched: no prologue, no epilogue, no stack.
+//
+// THE BROADCAST TRICK, and why it is 1 instruction. VPERMILPS's imm8 selectors
+// are LANE-RELATIVE within each 128-bit half -- the exact trap that cost a peer
+// a day with vpermilpd. It is used here ON PURPOSE: after each factor vector is
+// DUPLICATED into both halves by `vinsertf128 ymm,ymm,xmm,1` (verified by
+// execution: the imm8 low bit selects the destination lane, and 1 means the HIGH
+// one, so the register becomes [x,x]), a single `vpermilps ymm6, ymm12, j*0x55`
+// broadcasts lane j of the low half to all eight lanes. That is one instruction
+// per factor, against the f64 kernel's one vpermpd per factor, while carrying
+// twice the lanes.
+
+// ---- the shared 8-lane f32 reduce: ymm0 -> f64 bits in rax -----------------
+// ORDER, stated because it is a specific choice and not "whatever the hardware
+// does": with ymm0 = [L0..L7],
+//     vextractf128 + vaddps  -> A = [L0+L4, L1+L5, L2+L6, L3+L7]
+//     vhaddps x2             -> (A0+A1)+(A2+A3)
+// i.e. ((L0+L4)+(L1+L5)) + ((L2+L6)+(L3+L7)), every step in f32.
+// PINNED BY EXECUTION over 4000 random finite inputs, bit-for-bit, in
+// tests/lfm2_f32_enc_verify.c -- this order is a stated contract, not an
+// emergent property. The f32 sum is then widened ONCE to f64 (exact), because
+// the calling contract is "the dot as f64 bits in rax".
+fn j_f32_vxorps_y0() -> i64 { return femit("c5fc57c0", 4) }
+fn j_f32_reduce() -> i64 {
+    femit("c4e37d19c101", 6)     // vextractf128 xmm1, ymm0, 1
+    femit("c5f858c1", 4)         // vaddps xmm0, xmm0, xmm1
+    femit("c5fb7cc0", 4)         // vhaddps xmm0, xmm0, xmm0
+    femit("c5fb7cc0", 4)         // vhaddps xmm0, xmm0, xmm0
+    femit("c5fa5ac0", 4)         // vcvtss2sd xmm0, xmm0, xmm0   (exact widening)
+    femit("c4e1f97ec0", 5)       // vmovq rax, xmm0
+    return 0
+}
+
+// ---- Q4_K f32: the 8-weight group body --------------------------------------
+// vpmovzxbd ymm1, qword [r9]   c4 c2 7d 31 09   FOUR bytes -> FOUR dwords
+// (the xmm form above). The ymm destination form has L=1 and reads EIGHT bytes,
+// giving 8 dwords: low nibbles are weights [i..i+7], high nibbles [32+i..39+i].
+// Verified by execution including the read length: lane 7 must carry byte 7.
+fn j_f32_vpmovzxbd_y1_r9() -> i64 { return femit("c4c27d3109", 5) }
+fn j_f32_vpslld_y1_28() -> i64 { return femit("c5f572f11c", 5) }   // <<28: low nib -> high
+fn j_f32_vpsrld_y1_28() -> i64 { return femit("c5f572d11c", 5) }   // >>28: & 15
+fn j_f32_vpsrld_y1_4()  -> i64 { return femit("c5f572d104", 5) }   // >>4 : high nibble
+fn j_f32_vcvtdq2ps_y1() -> i64 { return femit("c5fc5bc9", 4) }     // 8 int32 -> 8 f32
+fn j_f32_vmulps_y1_y6() -> i64 { return femit("c5f459ce", 4) }     // * (d*sc)
+fn j_f32_vsubps_y1_y7() -> i64 { return femit("c5f45ccf", 4) }     // - (dmin*mn)
+fn j_f32_vmulps_y1_r10() -> i64 { return femit("c4c174590a", 5) }  // * x (8 f32 = 32 bytes)
+fn j_f32_vaddps_y0_y1() -> i64 { return femit("c5fc58c1", 4) }
+fn j_f32_add_r9_8() -> i64 { return femit("4983c108", 4) }
+// the FMA fold, byte-for-byte the f64 shape with ps opcodes:
+//   vfnmadd213ps ymm1, ymm6, ymm7   ymm1 = -(q*K) + M  = -w
+//   vfnmadd231ps ymm0, ymm1, [r10]  ymm0 = -((-w)*x) + ymm0 = acc + w*x
+fn j_f32_vfnmadd213_y1_y6_y7() -> i64 { return femit("c4e24daccf", 5) }
+fn j_f32_vfnmadd231_y0_y1_r10() -> i64 { return femit("c4c275bc02", 5) }
+
+// One 8-weight group of the LOW-nibble half. r9 advances 8 quant bytes, r10
+// advances 8 f32. ymm6/ymm7 must already hold this half's two broadcast factors.
+fn j_f32_low_nb() -> i64 {
+    j_f32_vpmovzxbd_y1_r9()
+    j_f32_vpslld_y1_28()
+    j_f32_vpsrld_y1_28()
+    j_f32_vcvtdq2ps_y1()
+    j_f32_vmulps_y1_y6()
+    j_f32_vsubps_y1_y7()
+    j_f32_vmulps_y1_r10()
+    j_f32_vaddps_y0_y1()
+    j_f32_add_r9_8()
+    j_f_add_r10_32()
+    return 0
+}
+// One 8-weight group of the HIGH-nibble half: the same quant bytes >>4.
+fn j_f32_high_nb() -> i64 {
+    j_f32_vpmovzxbd_y1_r9()
+    j_f32_vpsrld_y1_4()
+    j_f32_vcvtdq2ps_y1()
+    j_f32_vmulps_y1_y6()
+    j_f32_vsubps_y1_y7()
+    j_f32_vmulps_y1_r10()
+    j_f32_vaddps_y0_y1()
+    j_f32_add_r9_8()
+    j_f_add_r10_32()
+    return 0
+}
+fn j_f32_low_fma() -> i64 {
+    j_f32_vpmovzxbd_y1_r9()
+    j_f32_vpslld_y1_28()
+    j_f32_vpsrld_y1_28()
+    j_f32_vcvtdq2ps_y1()
+    j_f32_vfnmadd213_y1_y6_y7()
+    j_f32_vfnmadd231_y0_y1_r10()
+    j_f32_add_r9_8()
+    j_f_add_r10_32()
+    return 0
+}
+fn j_f32_high_fma() -> i64 {
+    j_f32_vpmovzxbd_y1_r9()
+    j_f32_vpsrld_y1_4()
+    j_f32_vcvtdq2ps_y1()
+    j_f32_vfnmadd213_y1_y6_y7()
+    j_f32_vfnmadd231_y0_y1_r10()
+    j_f32_add_r9_8()
+    j_f_add_r10_32()
+    return 0
+}
+
+// ---- Q4_K f32 factor prologue ----------------------------------------------
+// The f64 prologue (j_f_fold_factors) widened d/dmin to f64 and the 6-bit
+// fields to f64. Here everything stays f32: `vcvtph2ps` gives d and dmin as f32
+// directly (f16's 11-bit significand is exact in f32, so no rounding at all),
+// `vcvtdq2ps` converts four 6-bit fields at once, and the pair product is one
+// `vmulps`. The final four `vinsertf128` duplicate each 4-lane vector into both
+// halves so the per-chunk broadcast is a single lane-relative `vpermilps`.
+//
+// Header layout is unchanged: r9 points at the 128 quant bytes, so
+//   [r9-16] = f16 d, [r9-14] = f16 dmin, [r9-12..-1] = the 12 packed bytes.
+// The six-bit unpack is q4k_sc/q4k_min as in lib/std/matmul_q4k.quanta.
+fn j_f32_fold_factors() -> i64 {
+    femit("c4c1796e51f0", 6)       // vmovd xmm2, [r9-16]        d, dmin
+    femit("c4e27913d2", 5)         // vcvtph2ps xmm2, xmm2       [d,dmin,0,0] f32
+    femit("c4637904c200", 6)       // vpermilps xmm8, xmm2, 0x00 broadcast d
+    femit("c4637904ca55", 6)       // vpermilps xmm9, xmm2, 0x55 broadcast dmin
+    femit("c4c2793161f4", 6)       // vpmovzxbd xmm4, [r9-12]    a = sc0..3
+    femit("c4c2793169f8", 6)       // vpmovzxbd xmm5, [r9-8]     b = sc4..7
+    femit("c4c2793171fc", 6)       // vpmovzxbd xmm10,[r9-4]     c = sc8..11
+    // scales[0..3] = a & 63
+    femit("c5d572f31a", 5)         // vpslld xmm11, xmm4, 26
+    femit("c5d572d31a", 5)         // vpsrld xmm11, xmm11, 26
+    femit("c5785be7", 4)           // vcvtdq2ps xmm12, xmm11
+    femit("c4411859e0", 5)         // vmulps xmm12, xmm12, xmm8  d*sc[0..3]
+    // mins[0..3] = b & 63
+    femit("c5d572f51a", 5)         // vpslld xmm11, xmm5, 26
+    femit("c5d572d31a", 5)         // vpsrld xmm11, xmm11, 26
+    femit("c5785bf7", 4)           // vcvtdq2ps xmm14, xmm11
+    femit("c4410859f1", 5)         // vmulps xmm14, xmm14, xmm9  dmin*mn[0..3]
+    // scales[4..7] = (c & 15) | ((a >> 6) << 4)
+    femit("c5d572d306", 5)         // vpsrld xmm11, xmm4, 6
+    femit("c5d572f304", 5)         // vpslld xmm11, xmm11, 4
+    femit("c5e172f41c", 5)         // vpslld xmm3, xmm10, 28
+    femit("c5e172d41c", 5)         // vpsrld xmm3, xmm3, 28
+    femit("c5d5ebdb", 4)           // vpor xmm11, xmm11, xmm3
+    femit("c5785bef", 4)           // vcvtdq2ps xmm13, xmm11
+    femit("c4411859e8", 5)         // vmulps xmm13, xmm13, xmm8  d*sc[4..7]
+    // mins[4..7] = (c >> 4) | ((b >> 6) << 4)
+    femit("c5d572d506", 5)         // vpsrld xmm11, xmm5, 6
+    femit("c5d572f304", 5)         // vpslld xmm11, xmm11, 4
+    femit("c5d172d604", 5)         // vpsrld xmm5, xmm10, 4
+    femit("c5d5ebe9", 4)           // vpor xmm11, xmm11, xmm5
+    femit("c5785bff", 4)           // vcvtdq2ps xmm15, xmm11
+    femit("c4410859f9", 5)         // vmulps xmm15, xmm15, xmm9  dmin*mn[4..7]
+    // duplicate both halves so one lane-relative vpermilps broadcasts a factor
+    femit("c4431d18e401", 6)       // vinsertf128 ymm12, ymm12, xmm12, 1
+    femit("c4431518ed01", 6)       // vinsertf128 ymm13, ymm13, xmm13, 1
+    femit("c4430d18f601", 6)       // vinsertf128 ymm14, ymm14, xmm14, 1
+    femit("c4430518ff01", 6)       // vinsertf128 ymm15, ymm15, xmm15, 1
+    return 0
+}
+
+// Broadcast factor lane k (k = 2c for a chunk's low half, 2c+1 for its high).
+// k 0..3 live in ymm12 (scales) / ymm14 (mins), k 4..7 in ymm13 / ymm15; the
+// duplicated halves make `vpermilps ymm6, src, (k%4)*0x55` an 8-lane broadcast.
+fn j_f32_bc6_lo(c) -> i64 {
+    if c == 0 { return femit("c4c37d04f400", 6) }
+    if c == 1 { return femit("c4c37d04f4aa", 6) }
+    if c == 2 { return femit("c4c37d04f500", 6) }
+    return femit("c4c37d04f5aa", 6)
+}
+fn j_f32_bc6_hi(c) -> i64 {
+    if c == 0 { return femit("c4c37d04f455", 6) }
+    if c == 1 { return femit("c4c37d04f4ff", 6) }
+    if c == 2 { return femit("c4c37d04f555", 6) }
+    return femit("c4c37d04f5ff", 6)
+}
+fn j_f32_bc7_lo(c) -> i64 {
+    if c == 0 { return femit("c4c37d04fe00", 6) }
+    if c == 1 { return femit("c4c37d04feaa", 6) }
+    if c == 2 { return femit("c4c37d04ff00", 6) }
+    return femit("c4c37d04ffaa", 6)
+}
+fn j_f32_bc7_hi(c) -> i64 {
+    if c == 0 { return femit("c4c37d04fe55", 6) }
+    if c == 1 { return femit("c4c37d04feff", 6) }
+    if c == 2 { return femit("c4c37d04ff55", 6) }
+    return femit("c4c37d04ffff", 6)
+}
+
+// Whole Q4_K f32 kernel. `fma` selects the fused fold; a SEPARATE region is
+// allocated for each so neither the f64 kernels nor each other's bytes move.
+// Cadence, and it is the f64 cadence with 8-weight steps instead of 4:
+//   4 chunks; chunk c covers weights [64c,64c+64): its low 32 use scale pair 2c
+//   (4 groups of 8 bytes), then r9 rewinds 32 bytes and its high 32 use pair
+//   2c+1. r10 walks x forward throughout, so lanes accumulate elements
+//   k, k+8, k+16, ... in ascending order and the reduce order above applies.
+fn jit_f_build_folded_f32(fma) -> i64 {
+    let entry = ja_pos()
+    j_f_load_w()
+    j_f_skip_header()          // r9 -> the quant bytes; header now at r9-16
+    j_f_load_x()
+    j_f_load_n()
+    j_f32_vxorps_y0()
+
+    let bodytop = ja_pos()
+
+    j_f32_fold_factors()
+
+    let chunk = 0
+    while chunk < 4 {
+        j_f32_bc6_lo(chunk)
+        j_f32_bc7_lo(chunk)
+        let b = 0
+        while b < 4 {
+            if fma != 0 { j_f32_low_fma() } else { j_f32_low_nb() }
+            b = b + 1
+        }
+        j_f_rewind_r9_32()     // re-read the same 32 quant bytes
+        j_f32_bc6_hi(chunk)
+        j_f32_bc7_hi(chunk)
+        b = 0
+        while b < 4 {
+            if fma != 0 { j_f32_high_fma() } else { j_f32_high_nb() }
+            b = b + 1
+        }
+        chunk = chunk + 1
+    }
+    j_f_skip_header()          // 128 quant bytes + 16 header = 144 stride
+
+    jbytes(4, "4883e901")      // sub rcx, 1
+    j_jne32()
+    let disp_at = ja_pos()
+    jbytes(4, "00000000")
+    if j_patch32(disp_at, bodytop) != 0 { return 0 - 1 }
+
+    j_f32_reduce()
+    j_f_ret()
+    return entry
+}
+
+// ============================================================================
+// FOLDED Q6_K f32 KERNEL -- the twin of jit_f_build_folded_q6k
+// ============================================================================
+// The Q6_K block is 210 bytes: ql[128] at +0, qh[64] at +128, sc[16] i8 at
+// +192, f16 d at +208. Section offsets are the f64 kernel's, with 8-element
+// groups instead of 4 (so g*8, and two groups per 16-element half):
+//    ql offset : n*64 + (s%2)*32 + h*16 + g*8     (max 120 -> disp8)
+//    qh offset : 128 + n*32 + h*16 + g*8          (min 128  -> disp32)
+// Consuming n(0,1) -> s(0..3) -> h(0,1) -> g(0,1) walks destination element
+// index n*128+s*32+h*16+g*8+k in ASCENDING order, so lane k accumulates
+// elements k, k+8, ... and the shared reduce order applies unchanged.
+// d: `movzx eax,word [r9+208]` reads exactly the 2 bytes the format promises.
+// sc: vpbroadcastb + vpmovsxbd + vcvtdq2ps + vbroadcastss -- four instructions
+// to an 8-lane f32 scale, against the f64 path's four to a 4-lane f64 one.
+fn j_f32_ld_ql(d) -> i64 {
+    jbytes(5, "c4c27d3131")        // vpmovzxbd ymm6, qword [r9+disp8]
+    jb(d)
+    return 0
+}
+fn j_f32_ld_qh(d) -> i64 {
+    jbytes(5, "c4c27d31b9")        // vpmovzxbd ymm7, qword [r9+disp32]
+    ji32(d)
+    return 0
+}
+fn j_f32_qh_shr(sh) -> i64 {
+    jbytes(4, "c5c572d7")          // vpsrld ymm7, ymm7, sh
+    jb(sh)
+    return 0
+}
+fn j_f32_d_load() -> i64 {
+    jbytes(8, "410fb781d0000000")  // movzx eax, word ptr [r9+208]
+    jbytes(4, "c5f96ec8")          // vmovd xmm1, eax
+    jbytes(5, "c4e27913c9")        // vcvtph2ps xmm1, xmm1   (f16 -> f32, exact)
+    jbytes(5, "c4e27d18c9")        // vbroadcastss ymm1, xmm1 (8 lanes of d)
+    return 0
+}
+fn j_f32_q6_consts() -> i64 {
+    jbytes(4, "c5e576db")          // vpcmpeqd ymm3, ymm3, ymm3
+    jbytes(5, "c5e572f305")        // vpslld ymm3, ymm3, 5    -> 8 x -32
+    jbytes(4, "c5dd76e4")          // vpcmpeqd ymm4, ymm4, ymm4
+    jbytes(5, "c5dd72d41c")        // vpsrld ymm4, ymm4, 28   -> 8 x 15
+    jbytes(4, "c5d576ed")          // vpcmpeqd ymm5, ymm5, ymm5
+    jbytes(5, "c5d572d51e")        // vpsrld ymm5, ymm5, 30   -> 8 x 3
+    return 0
+}
+fn j_f32_sc_load(d) -> i64 {
+    jbytes(5, "c4c2797891")        // vpbroadcastb xmm2, byte [r9+disp32]
+    ji32(d)
+    return 0
+}
+fn j_f32_sc_sext() -> i64 { return jbytes(5, "c4e27921d2") }     // vpmovsxbd xmm2, xmm2
+fn j_f32_sc_cvt()  -> i64 { return jbytes(4, "c5f85bd2") }       // vcvtdq2ps xmm2, xmm2
+fn j_f32_sc_bc()   -> i64 { return jbytes(5, "c4e27d18d2") }     // vbroadcastss ymm2, xmm2
+
+// One 8-element group -> one 8-lane f32 contribution into ymm0.
+// ymm1 = broadcast d, ymm2 = broadcast sc, ymm3/4/5 = -32 / 15 / 3.
+fn j_f32_q6_group(s, qlo, qho) -> i64 {
+    j_f32_ld_ql(qlo)
+    if s >= 2 { jbytes(5, "c5cd72d604") }        // vpsrld ymm6, ymm6, 4
+    else { jbytes(4, "c5cddbf4") }               // vpand ymm6, ymm6, ymm4
+    j_f32_ld_qh(qho)
+    if s > 0 { j_f32_qh_shr(s * 2) }
+    jbytes(4, "c5c5dbfd")                        // vpand ymm7, ymm7, ymm5
+    jbytes(5, "c5c572f704")                      // vpslld ymm7, ymm7, 4
+    jbytes(4, "c5cdebf7")                        // vpor ymm6, ymm6, ymm7
+    jbytes(4, "c5cdfef3")                        // vpaddd ymm6, ymm6, ymm3  (-32)
+    jbytes(4, "c5fc5bf6")                        // vcvtdq2ps ymm6, ymm6
+    jbytes(4, "c5cc59f2")                        // vmulps ymm6, ymm6, ymm2  (*sc)
+    jbytes(4, "c5cc59f1")                        // vmulps ymm6, ymm6, ymm1  (*d)
+    jbytes(5, "c4c14c5932")                      // vmulps ymm6, ymm6, [r10] (*x)
+    jbytes(4, "c5fc58c6")                        // vaddps ymm0, ymm0, ymm6
+    j_f_add_r10_32()
+    return 0
+}
+// The FMA fold: the *sc and *d multiplies stay separate -- *d is where the
+// reference rounds -- and only the accumulate fuses, exactly as in the f64 FMA
+// twin. vfmadd231ps ymm0, ymm6, [r10] = ymm6*[r10] + ymm0.
+fn j_f32_q6_group_fma(s, qlo, qho) -> i64 {
+    j_f32_ld_ql(qlo)
+    if s >= 2 { jbytes(5, "c5cd72d604") }
+    else { jbytes(4, "c5cddbf4") }
+    j_f32_ld_qh(qho)
+    if s > 0 { j_f32_qh_shr(s * 2) }
+    jbytes(4, "c5c5dbfd")
+    jbytes(5, "c5c572f704")
+    jbytes(4, "c5cdebf7")
+    jbytes(4, "c5cdfef3")
+    jbytes(4, "c5fc5bf6")
+    jbytes(4, "c5cc59f2")
+    jbytes(4, "c5cc59f1")
+    jbytes(5, "c4c24db802")                      // vfmadd231ps ymm0, ymm6, [r10]
+    j_f_add_r10_32()
+    return 0
+}
+
+fn jit_f_build_folded_q6k_f32(fma) -> i64 {
+    let entry = ja_pos()
+    j_f_load_w()
+    j_f_load_x()
+    j_f_load_n()
+    j_f32_vxorps_y0()
+
+    let bodytop = ja_pos()
+
+    j_f32_d_load()
+    j_f32_q6_consts()
+
+    let n = 0
+    while n < 2 {
+        let s = 0
+        while s < 4 {
+            let h = 0
+            while h < 2 {
+                j_f32_sc_load(192 + n * 8 + s * 2 + h)
+                j_f32_sc_sext()
+                j_f32_sc_cvt()
+                j_f32_sc_bc()
+                let g = 0
+                while g < 2 {
+                    if fma != 0 {
+                        j_f32_q6_group_fma(s, n * 64 + (s - (s / 2) * 2) * 32 + h * 16 + g * 8, 128 + n * 32 + h * 16 + g * 8)
+                    } else {
+                        j_f32_q6_group(s, n * 64 + (s - (s / 2) * 2) * 32 + h * 16 + g * 8, 128 + n * 32 + h * 16 + g * 8)
+                    }
+                    g = g + 1
+                }
+                h = h + 1
+            }
+            s = s + 1
+        }
+        n = n + 1
+    }
+    jbytes(7, "4981c1d2000000")    // add r9, 210
+
+    jbytes(4, "4883e901")          // sub rcx, 1
+    j_jne32()
+    let disp_at = ja_pos()
+    jbytes(4, "00000000")
+    if j_patch32(disp_at, bodytop) != 0 { return 0 - 1 }
+
+    j_f32_reduce()
+    j_f_ret()
+    return entry
+}
+
+// ---- the f32 kernels' own RWX regions and tables ---------------------------
+// Own regions again, so neither the f64 kernels nor the FMA kernels move. Same
+// argument area ([W, X, DMD, nsuper]) but [AS+8] must point at the f32 x
+// supplied by the grow-only buffer in gguf_mm.quanta, NOT at the f64 x.
+let jf_tbl_f32 = 0
+let jf_tbl_f32_fma = 0
+let jf_tbl_f32_q6k = 0
+let jf_tbl_f32_q6k_fma = 0
+
+fn jit_f_setup_folded_f32() -> i64 {
+    if jf_tbl_f32 != 0 { return 0 }
+    if jit_f_alloc(65536) <= 0 { return -1 }
+    let t = jit_f_code(jit_f_build_folded_f32(0))
+    if t <= 0 { return -2 }
+    jf_tbl_f32 = t
+    return 0
+}
+fn jit_f_ready_folded_f32() { return jf_tbl_f32 }
+fn jit_f_apply_folded_f32(as) -> i64 { return closure_call(jf_tbl_f32, as, 0) }
+
+fn jit_f_setup_folded_f32_fma() -> i64 {
+    if jf_tbl_f32_fma != 0 { return 0 }
+    if jit_f_alloc(65536) <= 0 { return -1 }
+    let t = jit_f_code(jit_f_build_folded_f32(1))
+    if t <= 0 { return -2 }
+    jf_tbl_f32_fma = t
+    return 0
+}
+fn jit_f_ready_folded_f32_fma() { return jf_tbl_f32_fma }
+fn jit_f_apply_folded_f32_fma(as) -> i64 { return closure_call(jf_tbl_f32_fma, as, 0) }
+
+fn jit_f_setup_folded_q6k_f32() -> i64 {
+    if jf_tbl_f32_q6k != 0 { return 0 }
+    if jit_f_alloc(65536) <= 0 { return -1 }
+    let t = jit_f_code(jit_f_build_folded_q6k_f32(0))
+    if t <= 0 { return -2 }
+    jf_tbl_f32_q6k = t
+    return 0
+}
+fn jit_f_ready_folded_q6k_f32() { return jf_tbl_f32_q6k }
+fn jit_f_apply_folded_q6k_f32(as) -> i64 { return closure_call(jf_tbl_f32_q6k, as, 0) }
+
+fn jit_f_setup_folded_q6k_f32_fma() -> i64 {
+    if jf_tbl_f32_q6k_fma != 0 { return 0 }
+    if jit_f_alloc(65536) <= 0 { return -1 }
+    let t = jit_f_code(jit_f_build_folded_q6k_f32(1))
+    if t <= 0 { return -2 }
+    jf_tbl_f32_q6k_fma = t
+    return 0
+}
+fn jit_f_ready_folded_q6k_f32_fma() { return jf_tbl_f32_q6k_fma }
+fn jit_f_apply_folded_q6k_f32_fma(as) -> i64 { return closure_call(jf_tbl_f32_q6k_fma, as, 0) }

@@ -202,10 +202,15 @@ b_sc_sext:   vpmovsxbd xmm2, xmm2
 b_sc_cvt:    vcvtdq2ps xmm2, xmm2
 .globl b_sc_bc
 b_sc_bc:     vbroadcastss ymm2, xmm2
-.globl b_consts
-b_consts:    vpcmpeqd ymm3, ymm3, ymm3
-             vpslld ymm3, ymm3, 5
-             vpcmpeqd ymm4, ymm4, ymm4
-             vpsrld ymm4, ymm4, 28
-             vpcmpeqd ymm5, ymm5, ymm5
-             vpsrld ymm5, ymm5, 30
+.globl b_c1
+b_c1:        vpcmpeqd ymm3, ymm3, ymm3
+.globl b_c2
+b_c2:        vpslld ymm3, ymm3, 5
+.globl b_c3
+b_c3:        vpcmpeqd ymm4, ymm4, ymm4
+.globl b_c4
+b_c4:        vpsrld ymm4, ymm4, 28
+.globl b_c5
+b_c5:        vpcmpeqd ymm5, ymm5, ymm5
+.globl b_c6
+b_c6:        vpsrld ymm5, ymm5, 30

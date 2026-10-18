@@ -313,7 +313,8 @@ int main(void)
     setR9(membuf); runq("b_ldqh");
     for (k = 0; k < 8; k++) CHK(getYd(7)[k] == (int32_t)membuf[128 + k], "b_ldqh (qh,+128 disp32) wrong");
 
-    cur = "b_consts"; zeroctx(); runq("b_consts");
+    cur = "b_c1..c6"; zeroctx();
+    runn((const char *[]){ "b_c1", "b_c2", "b_c3", "b_c4", "b_c5", "b_c6", NULL });
     for (k = 0; k < 8; k++) {
         CHK(getYd(3)[k] == -32, "ymm3 is not 8 dwords of -32");
         CHK(getYd(4)[k] == 15,  "ymm4 is not 8 dwords of 15");
