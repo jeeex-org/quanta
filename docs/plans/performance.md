@@ -445,3 +445,38 @@ NOTE for readers of older `docs/research/*` files: they reference the former nam
 (`lfm2_mm.quanta`, `lfm2_bpe.quanta`) because that is what the files were called
 when those measurements were taken. The records are left as written rather than
 rewritten.
+
+## Floating-point / arithmetic levers (read from the EMITTED code, 2026-10-18)
+
+Instruction census of the JIT kernels (`lib/std/jit_x86_fused.quanta`, `jit_x86.quanta`):
+
+    26 vmulpd      25 vcvtdq2pd     15 vaddpd     14 vaddsd
+     6 vsubpd       4 vmulsd        2 vsubsd      2 vcvtps2pd
+
+**1. FMA is completely unused.** No `vfmadd`/`vfmsub` appears anywhere in `lib/std/`, while
+`/proc/cpuinfo` reports `fma`. Every multiply-accumulate is a separate `vmulpd`+`vaddpd` (or
+`vmulsd`+`vaddsd`). `vfmadd231pd` performs `a*b+c` in ONE instruction: half the instructions in the
+MAC chains, and one rounding instead of two.
+
+**Caveat, and it is the whole reason this is not "free": FMA MOVES BITS.** Single-rounding differs
+from mul-then-add in the last ULP, so this is a numerics change. Note that llama.cpp's own SIMD dot
+products use FMA, so adopting it moves the loader TOWARD its reference rather than away from it —
+but it does break "bit-identical to our own scalar f64 path", which is the bar every fused flag
+currently holds.
+
+Decision: implement as a **separate opt-in flag, default OFF**. The existing flags keep their
+bit-exact gate untouched; the FMA flag's bar is argmax and generated-token-ids identical with a
+documented bounded logit difference. Never silently replace the existing sequence.
+
+**2. Every FP instruction is `*pd` — 4 f64 lanes per ymm.** The `*ps` forms are 8 lanes, so f32 is
+2x the arithmetic per instruction ON TOP of halving operand traffic, and `vcvtdq2ps` converts 8
+int32 at once where `vcvtdq2pd` converts 4. This is gated on f32 DATA IN MEMORY (language
+capability #1 + loader adoption), not on the JIT: the JIT emits raw encodings and can already emit
+any of these.
+
+**3. Combined ceiling:** f64 -> f32 with FMA is a **~4x** bound on the MAC chains (2x lanes x 2x FMA)
+in isolation from parallelism.
+
+**4. Do not "vectorize" the scalar tails.** The 14 `vaddsd` + 4 `vmulsd` are the chain-order kernel's
+serial accumulation, which preserves the reference order BY DESIGN (that ordering is what makes the
+tied projection bit-exact). Vectorising those would break the property the kernel exists to keep.
