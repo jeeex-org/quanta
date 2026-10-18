@@ -298,13 +298,32 @@ a long-run VA cap from 13.5 GB any more -- re-measure, because the current tree 
 
 ### Gate
 
-- `QC=./compiler/0.0.247/bin/x86/qc bash test_suites/scripts/run_tests.sh` (the pinned
-  binary every decode number in this document was measured with): see §7b.
-- A plain `bash test_suites/scripts/run_tests.sh` was ALSO run and returned
-  **238/238 native (0 fail, 0 compile-fail) and STDLIB 114/114 GREEN**, but note it did
-  NOT use 0.0.247: a peer bumped `VERSION` to **0.0.248** mid-campaign and created
-  `compiler/0.0.249`, and the runner derives `QC` from `VERSION`. That result is
-  therefore attributed to `compiler/0.0.248`, not to the pinned tree.
+`EXPECTED.tsv` now has **238** rows (it was 233 when this unit's brief was written --
+a peer's f16/f32 campaign grew the suite; a rising row count is not a regression).
+
+- **Pinned, `QC=$PWD/compiler/0.0.247/bin/x86/qc bash test_suites/scripts/run_tests.sh`**
+  (the binary every decode number here was measured with): **235/238 native pass
+  (3 fail, 0 compile-fail), STDLIB 114/114 GREEN**, security 8/8, perf 3/3.
+  The 3 reds are exactly the peer's NEW feature rows, which cannot pass on a compiler
+  that predates their features: `a26_f32_f16_paramret_test` (rc=4),
+  `f32_f16_calling_convention_test` (rc=10), `f16_single_round_test` (rc=11), plus the
+  `f16c-independence` rows (58 and 6 F16C opcodes present in a 0.0.247 binary) and the
+  `marshalling-guard` row (26 home stores vs their 23 threshold -- their A31/0.0.249 F1
+  lever). None of them touches `lib/std` or my paths.
+- **Plain, `bash test_suites/scripts/run_tests.sh`** on the same tree returned
+  **238/238 native (0 fail, 0 compile-fail) and STDLIB 114/114 GREEN, rc=0** -- but it
+  did NOT use 0.0.247: a peer bumped `VERSION` to **0.0.248** and created
+  `compiler/0.0.249`, and the runner derives `QC` from `VERSION`, so that run is
+  attributed to `compiler/0.0.248`.
+
+The two runs are the clean cross-check: same tree, two compilers, and the ONLY rows
+that flip are the three f16/arith feature rows. So the changes in this unit are green
+on both, and the 3 reds are a compiler-version artefact, not a regression.
+
+**Note for the next unit:** `test_suites/scripts/run_tests.sh` was DIRTY (peer-owned,
++80 lines adding the marshalling/f16c stages) for the whole of this session, so both
+gate runs above executed a peer's in-progress runner.
+
 
 
 ## 5. Attention: does the score loop need a vectorised kernel yet?
@@ -385,8 +404,7 @@ same run family under a heavier ambient load; this session measured 1.84.
 cd /opt/tali/quanta && ulimit -c 0
 export QC=$PWD/compiler/0.0.247/bin/x86/qc      # md5 a17e3cfb056f55d4ee68a0db0dfcfa22
 bash tests/lfm2_prof_ab.sh exact                 # bit-exactness gate, 9 passes
-python3 tests/lfm2_pool_dispatch_probe.quanta    # (compile+run; see the header)
-./compiler/0.0.247/bin/x86/qc -O tests/lfm2_pool_dispatch_probe.quanta /tmp/pp && /tmp/pp
+"$QC" -O tests/lfm2_pool_dispatch_probe.quanta /tmp/pp && /tmp/pp    # dispatch probe, no model
 LENS="128 256 128" bash tests/lfm2_prof_ab.sh ab_conv
 LENS="128 1024 128" bash tests/lfm2_prof_ab.sh prof_attn    # conv OFF arm
 LENS="128 1024 128" bash tests/lfm2_prof_ab.sh prof_conv    # conv ON arm
