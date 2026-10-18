@@ -265,3 +265,29 @@ decimals, and why every literal the new rows do use is asserted against `f64bits
   absent, would narrow nothing. Source inlining (`expand_includes`) is the path every row in the tree
   takes, so this is a cache-format gap rather than a live defect; recorded here rather than hidden.
 * **A29 and A30** (above) are open, with their own red-first rows still to be written.
+
+---
+
+## 8. Verification summary (raw)
+
+| check | command | result |
+|---|---|---|
+| full gate | `bash test_suites/scripts/run_tests.sh` | **238/238 pass, 0 fail** (was 233 rows; +5 new), **stdlib 114/114 GREEN**, every stage GREEN, `GATE_EXIT=0`, new `f16c-indep` stage GREEN |
+| release verification | `bash scripts/verify-release.sh 0.0.248 0.0.247` | **14 passed, 0 failed** (exit 0) |
+| self-host fixpoint | `setarch -R genN src/x86/main.quanta genN+1` ×3, then `md5sum` | gen1 == gen2 == gen3 == gen4 == the committed binary = `b9e36271373d108eb52989f08d841365` |
+| frozen baseline intact | `verify-release` check 8 | 0.0.247's source rebuilds bit-for-bit: `a17e3cfb056f55d4ee68a0db0dfcfa22` |
+| ADDITIVE, measured | compile all 238 native rows with both compilers, compare binaries | **232 rows byte-identical**; the 6 that differ are exactly the f16/f32 rows (`fp16f32_width_test`, `fp16f32_type_test`, `a26_f32_f16_paramret_test`, `f32_f16_calling_convention_test`, `f16_single_round_test`, `f32_buffer_semantics_test`) — no existing f64 or integer program emits a different byte |
+| oracle unchanged | `fp16_conv_oracle_test` | 65,536 + 131,072 + 65,536 cases, 0 mismatches, on integer code |
+
+The byte-identity row is the strongest available statement that this version is additive: the whole
+native corpus is compiled twice, with the previous compiler and with this one, and only programs that
+actually use f16/f32 differ. Combined with the fixpoint and the frozen-baseline check, no existing
+f64 result — the 128k-logit inference, the tokenizer rows, every gate row — can have moved.
+
+One note on attribution for anyone re-running this: `verify-release`'s gate compiles `lib/std/**`
+as the working tree has it, so a peer's UNCOMMITTED edit under `lib/std/` is measured too. The first
+run of the check here reported `stdlib RED` on four `stdlib_lfm2_*` rows with
+`call to undeclared function: fc_conv_scalar` — a symbol that exists only in a peer's uncommitted
+`lib/std/lfm2_forward.quanta` (`git grep fc_conv_scalar HEAD -- lib/std` finds nothing). Verified
+not-ours by compiling one of those rows against a PRISTINE `lib/std` from HEAD in a scratch symlink
+farm: compile rc=0, run rc=0. The re-run above is 14/0.
