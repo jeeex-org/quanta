@@ -1062,3 +1062,241 @@ fn q4k_min_jit(j, sc) {
 //
 // 4. The results must be summed EXACTLY once per row. Keeping y scalar is what
 //    preserves the scalar path's summation order across super-blocks.
+
+// ============================================================================
+// FMA VARIANT of the folded kernels (opt-in, default OFF, its OWN flag)
+// ============================================================================
+// WHY. lib/std had no `vfmadd` anywhere in it while /proc/cpuinfo reports `fma`.
+// Every multiply-accumulate in the folded kernels was a separate `vmulpd` +
+// `vaddpd`. Measured instruction census of the emitted bodies before this:
+// 26 vmulpd / 25 vcvtdq2pd / 15 vaddpd (docs/plans/performance.md).
+//
+// WHAT CHANGES, per 4-weight group:
+//
+//   Q4_K (j_f_low_nb / j_f_high_nb): 4 FP ops -> 2
+//       vmulpd  ymm1, ymm1, ymm6        q*K
+//       vsubpd  ymm1, ymm1, ymm7        w = q*K - M
+//       vmulpd  ymm1, ymm1, [r10]       w*x
+//       vaddpd  ymm0, ymm0, ymm1
+//     becomes
+//       vfnmadd213pd ymm1, ymm6, ymm7   ymm1 = -(q*K) + M  = -w
+//       vfnmadd231pd ymm0, ymm1, [r10]  ymm0 = -((-w)*x) + ymm0 = ymm0 + w*x
+//     It also halves the DEPENDENCY CHAIN of the fold (2 dependent ops instead
+//     of 4), which matters more than the instruction count here because the
+//     seven dequant ops above it are independent and issue underneath it.
+//
+//   Q6_K (q6_group): 4 FP ops -> 3
+//       vmulpd ymm6, ymm6, ymm2         *sc   (exact)
+//       vmulpd ymm6, ymm6, ymm1         *d    (rounds -- MUST stay a separate
+//                                              multiply: it is where the
+//                                              reference rounds)
+//       vfmadd231pd ymm0, ymm6, [r10]   acc += (q*sc*d)*x, ONE rounding
+//
+// ENCODINGS ARE VERIFIED BY EXECUTION, not by reading the manual. The three
+// forms were assembled and then RUN in a C harness with known operands,
+// asserting on all four lanes
+//     vfnmadd213pd y1,y6,y7 == -(y1*y6)+y7
+//     vfnmadd231pd y0,y1,m  == -(y1*m)+y0
+//     vfmadd231pd  y0,y6,m  ==  y6*m+y0
+// (A previous unit lost a day to `vpermilpd`'s lane-relative selectors, so no
+// FMA operand-order assumption is taken on faith.)
+//
+// THE CHAIN KERNEL IS DELIBERATELY NOT FUSED, and the reason is structural
+// rather than budgetary. jit_f_build_chain_q6k() keeps the reference's strict
+// left-to-right scalar accumulation; its fold is four SERIAL vaddsd whose
+// operands are already-computed products, so there is nothing for an FMA to
+// fuse that the reference has not already rounded. It would gain zero
+// instructions and move bits for no speed. It therefore stays on the f64 route
+// even when the FMA flag is on. Stated here, not left to be inferred.
+//
+// BIT STATUS: this path MOVES BITS (single-rounding differs from mul-then-add)
+// which is exactly why it is a separate flag with its own bar -- see the
+// mm_fused_fma block in gguf_mm.quanta for the measured bound.
+
+// vfnmadd213pd ymm1, ymm6, ymm7   c4 e2 cd ac cf   ymm1 = -(ymm1*ymm6) + ymm7
+fn j_f_vfnmadd213_y1_y6_y7() -> i64 { return femit("c4e2cdaccf", 5) }
+// vfnmadd231pd ymm0, ymm1, [r10]  c4 c2 f5 bc 02   ymm0 = -(ymm1*[r10]) + ymm0
+fn j_f_vfnmadd231_y0_y1_r10() -> i64 { return femit("c4c2f5bc02", 5) }
+// vfmadd231pd ymm0, ymm6, [r10]   c4 c2 cd b8 02   ymm0 = ymm6*[r10] + ymm0
+fn j_f_vfmadd231_y0_y6_r10() -> i64 { return femit("c4c2cdb802", 5) }
+
+// ---- Q4_K: the two 4-weight group bodies with the fold fused ----------------
+fn j_f_low_fma() -> i64 {
+    j_f_vpmovzxbd_x1_r9()
+    j_f_vpslld_28()
+    j_f_vpsrld_28()
+    j_f_vpsrldq_x2_x1_8()
+    j_f_vcvtdq2pd_y1_x1()
+    j_f_vcvtdq2pd_y2_x2()
+    j_f_vinsertf128_y1_y1_x2_1()
+    j_f_vfnmadd213_y1_y6_y7()
+    j_f_vfnmadd231_y0_y1_r10()
+    j_f_add_r9_4()
+    j_f_add_r10_32()
+    return 0
+}
+
+fn j_f_high_fma() -> i64 {
+    j_f_vpmovzxbd_x1_r9()
+    j_f_vpsrld_4()
+    j_f_vpsrldq_x2_x1_8()
+    j_f_vcvtdq2pd_y1_x1()
+    j_f_vcvtdq2pd_y2_x2()
+    j_f_vinsertf128_y1_y1_x2_1()
+    j_f_vfnmadd213_y1_y6_y7()
+    j_f_vfnmadd231_y0_y1_r10()
+    j_f_add_r9_4()
+    j_f_add_r10_32()
+    return 0
+}
+
+// Whole FMA Q4_K kernel: byte-for-byte jit_f_build_folded() except that the two
+// group bodies are the FMA ones. A separate entry point into its OWN region, so
+// the f64 kernels stay byte-identical (their gate rows depend on that).
+fn jit_f_build_folded_fma() -> i64 {
+    let entry = ja_pos()
+    j_f_load_w()
+    j_f_skip_header()
+    j_f_load_x()
+    j_f_load_n()
+    j_f_vxorpd_y0()
+
+    let bodytop = ja_pos()
+
+    j_f_fold_factors()
+
+    let chunk = 0
+    while chunk < 4 {
+        j_f_perm6_lo(chunk)
+        j_f_perm7_lo(chunk)
+        let b = 0
+        while b < 8 { j_f_low_fma(); b = b + 1 }
+        j_f_rewind_r9_32()
+        j_f_perm6_hi(chunk)
+        j_f_perm7_hi(chunk)
+        b = 0
+        while b < 8 { j_f_high_fma(); b = b + 1 }
+        chunk = chunk + 1
+    }
+    j_f_skip_header()
+
+    jbytes(4, "4883e901")      // sub rcx, 1
+    j_jne32()
+    let disp_at = ja_pos()
+    jbytes(4, "00000000")
+    if j_patch32(disp_at, bodytop) != 0 { return 0 - 1 }
+
+    j_f_vextracti128_x2_y0()
+    j_f_vhaddpd_x3_x0()
+    j_f_vhaddpd_x4_x2()
+    j_f_vaddsd_x3_x4()
+    j_f_vmovq_rax_x3()
+    j_f_ret()
+    return entry
+}
+
+// ---- Q6_K: the 4-element group body with the fold fused ---------------------
+// The dequant encodings are IDENTICAL to q6_group; only the last two FP ops
+// collapse into one vfmadd231pd.
+fn q6_group_fma(s, qlo, qho) -> i64 {
+    q6_ld_ql(qlo)
+    if s >= 2 { jbytes(5, "c5c972d604") }        // vpsrld xmm6,xmm6,4
+    else { jbytes(4, "c5c9dbf4") }               // vpand xmm6,xmm6,xmm4
+    q6_ld_qh(qho)
+    if s > 0 { q6_qh_shr(s * 2) }                // vpsrld xmm7,xmm7,2s
+    jbytes(4, "c5c1dbfd")                        // vpand xmm7,xmm7,xmm5  (&3)
+    jbytes(5, "c5c172f704")                      // vpslld xmm7,xmm7,4
+    jbytes(4, "c5c9ebf7")                        // vpor xmm6,xmm6,xmm7
+    jbytes(4, "c5c9fef3")                        // vpaddd xmm6,xmm6,xmm3 (-32)
+    jbytes(4, "c5fee6f6")                        // vcvtdq2pd ymm6,xmm6 (exact)
+    jbytes(4, "c5cd59f2")                        // vmulpd ymm6,ymm6,ymm2 (*sc, exact)
+    jbytes(4, "c5cd59f1")                        // vmulpd ymm6,ymm6,ymm1 (*d, rounds)
+    j_f_vfmadd231_y0_y6_r10()                    // acc += (q*sc*d)*x  (one rounding)
+    jbytes(4, "4983c220")                        // add r10, 32
+    return 0
+}
+
+fn jit_f_build_folded_q6k_fma() -> i64 {
+    let entry = ja_pos()
+    j_f_load_w()
+    j_f_load_x()
+    j_f_load_n()
+    j_f_vxorpd_y0()
+
+    let bodytop = ja_pos()
+
+    q6_d_load()
+    q6_consts()
+
+    let n = 0
+    while n < 2 {
+        let s = 0
+        while s < 4 {
+            let h = 0
+            while h < 2 {
+                q6_ld_sc(192 + n * 8 + s * 2 + h)
+                q6_sc_sext()
+                q6_sc_tod()
+                let g = 0
+                while g < 4 {
+                    q6_group_fma(s, n * 64 + (s - (s / 2) * 2) * 32 + h * 16 + g * 4, 128 + n * 32 + h * 16 + g * 4)
+                    g = g + 1
+                }
+                h = h + 1
+            }
+            s = s + 1
+        }
+        n = n + 1
+    }
+    jbytes(7, "4981c1d2000000")    // add r9, 210
+
+    jbytes(4, "4883e901")          // sub rcx,1
+    j_jne32()
+    let disp_at = ja_pos()
+    jbytes(4, "00000000")
+    if j_patch32(disp_at, bodytop) != 0 { return 0 - 1 }
+
+    jbytes(6, "c4e37d39c201")      // vextracti128 xmm2, ymm0, 1
+    jbytes(4, "c5f97cd8")          // vhaddpd xmm3, xmm0, xmm0
+    jbytes(4, "c5e97ce2")          // vhaddpd xmm4, xmm2, xmm2
+    jbytes(4, "c5e358dc")          // vaddsd xmm3, xmm3, xmm4
+    jbytes(5, "c4e1f97ed8")        // vmovq rax, xmm3
+    jbytes(1, "c3")                // ret
+    return entry
+}
+
+// ---- the FMA kernels' own RWX regions and tables ---------------------------
+// Own regions again, so the f64 kernels' bytes are untouched. Same argument area
+// ([W, X, DMD, nsuper], [AS+16] unread) and the same closure_call door.
+let jf_tbl_fma = 0
+let jf_tbl_fma_q6k = 0
+
+fn jit_f_setup_folded_fma() -> i64 {
+    if jf_tbl_fma != 0 { return 0 }
+    if jit_f_alloc(65536) <= 0 { return -1 }
+    let t = jit_f_code(jit_f_build_folded_fma())
+    if t <= 0 { return -2 }
+    jf_tbl_fma = t
+    return 0
+}
+
+fn jit_f_ready_folded_fma() { return jf_tbl_fma }
+
+fn jit_f_apply_folded_fma(as) -> i64 {
+    return closure_call(jf_tbl_fma, as, 0)
+}
+
+fn jit_f_setup_folded_q6k_fma() -> i64 {
+    if jf_tbl_fma_q6k != 0 { return 0 }
+    if jit_f_alloc(65536) <= 0 { return -1 }
+    let t = jit_f_code(jit_f_build_folded_q6k_fma())
+    if t <= 0 { return -2 }
+    jf_tbl_fma_q6k = t
+    return 0
+}
+
+fn jit_f_ready_folded_q6k_fma() { return jf_tbl_fma_q6k }
+
+fn jit_f_apply_folded_q6k_fma(as) -> i64 {
+    return closure_call(jf_tbl_fma_q6k, as, 0)
+}

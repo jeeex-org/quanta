@@ -24,12 +24,17 @@
 //     refuses to start while a peer model process is alive.
 //
 // Conf tests/lfm2_decode_bench.conf:
-//   "<workers> <len1> <len2> <len3> <use_mmap> <cache_norms> [ignore_eos] [fused_q4k] [fused_q6k] [prof] [prof_work] [fused_chain] [fused_glu] [fused_attn] [fused_conv]"
+//   "<workers> <len1> <len2> <len3> <use_mmap> <cache_norms> [ignore_eos] [fused_q4k] [fused_q6k] [prof] [prof_work] [fused_chain] [fused_glu] [fused_attn] [fused_conv] [fused_fma]"
 //   Fields 10+ are NEW and optional: a 9-field conf still works (all default 0),
 //   so the older A/B drivers are unaffected. COUNT THEM before trusting an arm --
 //   the fields are positional and a peer already measured the wrong arm here.
 //   fused_conv=1 (field 15): the parallel short-conv elementwise block
 //   (mm_set_fused_conv, pool kind 8).
+//   fused_fma=1 (field 16, default 0): select the FMA variants of the folded
+//   Q4_K / Q6_K kernels (mm_set_fused_fma). It MODIFIES fields 8/9, so both of
+//   those must be on for it to do anything. It MOVES BITS by construction, so it
+//   has its own bar: tests/lfm2_fma_kernel_ab_test.quanta, not the bit-exact
+//   logits gate.
 //   ignore_eos=1: fc_argmax_masked suppresses EOS so a run always reaches its
 //   length (the reference prompt deterministically emits EOS at token 43;
 //   llama.cpp's --ignore-eos is the same lever for long perf runs).
@@ -276,6 +281,7 @@ fn main() {
     let glu = 0
     let attnf = 0
     let convf = 0
+    let ffma = 0
     if cfgb != 0 {
         let nf = parse_ints(cfgb, conf)
         if nf >= 1 { nw = mem_load(conf) }
@@ -293,6 +299,7 @@ fn main() {
         if nf >= 13 { glu = mem_load(conf + 96) }
         if nf >= 14 { attnf = mem_load(conf + 104) }
         if nf >= 15 { convf = mem_load(conf + 112) }
+        if nf >= 16 { ffma = mem_load(conf + 120) }
     } else {
         prints("warn: conf unreadable; defaults\n")
     }
@@ -309,6 +316,7 @@ fn main() {
     prints(" fused_glu="); print(glu)
     prints(" fused_attn="); print(attnf)
     prints(" fused_conv="); print(convf)
+    prints(" fused_fma="); print(ffma)
     prints(" (argmax temp=0)\n")
 
     let t0 = clock()
@@ -327,6 +335,7 @@ fn main() {
     mm_set_fused_glu(glu)
     mm_set_fused_attn(attnf)
     mm_set_fused_conv(convf)
+    mm_set_fused_fma(ffma)
     if usemap != 0 {
         if mm_attach_mmap_fd(file_open(Q4_PATH, 0)) != 0 { prints("FAIL mm_attach_mmap (continuing on pread)\n") }
     }
@@ -335,9 +344,11 @@ fn main() {
     }
     prints("load_ms="); print((clock() - t0) / 1000000)
     prints(" mmap_base="); print(mm_map_base)
+    prints(" fused_fma_used="); print(mm_get_fused_fma_used())
     prints(" fused_q4k_active="); print(mm_get_fused_q4k())
     prints(" fused_q6k_active="); print(mm_get_fused_q6k())
-    prints(" fused_chain_active="); print(mm_get_fused_chain()); newline()
+    prints(" fused_chain_active="); print(mm_get_fused_chain())
+    prints(" fused_fma_active="); print(mm_get_fused_fma()); newline()
 
     // ---- prompt (identical construction to tests/lfm2_generate.quanta) ----
     let rawprompt = slurp(file_open(PROMPT_PATH, 0))
@@ -390,6 +401,7 @@ fn main() {
         if glu != 0 { mm_set_fused_glu(1) }
         if attnf != 0 { mm_set_fused_attn(1) }
         if convf != 0 { mm_set_fused_conv(1) }
+        if ffma != 0 { mm_set_fused_fma(1) }
 
         let tp0 = clock()
         let i = 0

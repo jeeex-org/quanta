@@ -1,0 +1,457 @@
+// tests/lfm2_fma_kernel_ab_test.quanta
+//
+// THE BIT-MOVING FLAG'S HARNESS. mm_set_fused_fma selects the FMA variants of the
+// folded Q4_K / Q6_K kernels. Those MOVE BITS by construction (one rounding where
+// the f64 kernels round twice), so they cannot share the existing flags'
+// bit-exact gate. This row is their own bar, and it is deliberately two-layered:
+//
+//   PART 1 (kernel level)  the two kernels on the SAME row of the SAME tensor,
+//                          interleaved. Reports
+//                            * the per-row result difference (bits + |value|),
+//                            * the interleaved A/B ratio.
+//                          Kernel-level because that is the only place the
+//                          ratio is attributable: the end-to-end number cannot
+//                          say whether the kernel got faster or something else
+//                          paid for it.
+//   PART 2 (model level)   two full sequences in ONE process, fma=0 then fma=1,
+//                          diffing all 128,000 logits, the per-step argmax and
+//                          the first 24 generated ids. This is where the bar is
+//                          asserted:
+//                            argmax IDENTICAL for every step, ids IDENTICAL, and
+//                            a MEASURED, REPORTED logit excursion (bits, |value|,
+//                            and the max ULP distance).
+//
+// It never asserts "close enough": PART 2 prints the excursion and requires the
+// ids to match; the size of the excursion is the result, not a threshold.
+//
+// The clock() unit is UNVERIFIED repo-wide, so read ratio_x1000 and never the
+// absolute ns. Every figure is printed with the run's own load.
+//
+// Build: QC=./compiler/0.0.249/bin/x86/qc ; $QC -O tests/lfm2_fma_kernel_ab_test.quanta /tmp/fa
+// Run  : ( ulimit -c 0 -v 32000000; /tmp/fa </dev/null )
+import std/gguf
+import std/lfm2_forward
+import std/lfm2_model
+import std/gguf_mm
+import std/gguf_bpe
+import std/lfm2_chat
+import std/fs
+import std/jit_x86
+import std/jit_x86_fused
+
+const Q4_PATH = "/opt/ai/models/quanta/QUANTA-LFM2.5-2.6Bv1-Q4_K_M.gguf"
+const PROMPT_PATH = "tests/lfm2_prompt.txt"
+const NCTX = 2048
+const NTOK = 24
+const CAP = 16384
+const NROWS = 256
+const NCYC = 21
+
+let plen = 0
+
+fn slurp(fd) {
+    if fd < 0 { return 0 }
+    let b = mem_alloc(CAP)
+    let got = read_raw(fd, b, CAP)
+    file_close(fd)
+    if got <= 0 { return 0 }
+    plen = got
+    return b
+}
+
+fn as_str(raw, n) {
+    let s = mem_alloc(n + 16)
+    mem_store(s, n)
+    let i = 0
+    while i < n { mem_store8(s + 8 + i, mem_load8(raw + i)); i = i + 1 }
+    mem_store8(s + 8 + n, 0)
+    return s
+}
+
+// ===================== PART 1: kernel A/B ===================================
+// which: 0 = f64 folded kernel, 1 = the FMA variant. dtype selects the pair.
+// Returns the elapsed clock() ticks, and leaves the LAST row's result bits in
+// `outbits` (bits) plus the running bit-difference count / max |value| in
+// `dbits` / `dmax`.
+fn sweep(which, dtype, toff, rb, cols, x, argp, outbits, dbits, dmax) -> i64 {
+    let t0 = clock()
+    let r = 0
+    while r < NROWS {
+        let raw = mm_map_base + toff + r * rb
+        mem_store(argp + 0, raw)
+        mem_store(argp + 8, x)
+        mem_store(argp + 16, 0)
+        mem_store(argp + 24, cols / 256)
+        let v = 0
+        if dtype == 12 {
+            if which == 0 { v = jit_f_apply_folded(argp) } else { v = jit_f_apply_folded_fma(argp) }
+        } else {
+            if which == 0 { v = jit_f_apply_folded_q6k(argp) } else { v = jit_f_apply_folded_q6k_fma(argp) }
+        }
+        mem_store(outbits, v)
+        r = r + 1
+    }
+    return clock() - t0
+}
+
+// f64 NaN test ON THE BIT PATTERN, via integers. The float form (`v != v`) is
+// unusable on this tree -- it returns false even for a NaN, measured -- and every
+// comparison in this file that mattered had to be integer-based for that reason.
+fn isnan_bits(v) -> i64 {
+    let a = v
+    if a < 0 { a = a - (0 - 9223372036854775807 - 1) }
+    let e = a / 4503599627370496
+    let e2 = e - (e / 2048) * 2048
+    let m = a - (a / 4503599627370496) * 4503599627370496
+    if e2 == 2047 && m != 0 { return 1 }
+    return 0
+}
+
+// EVERY row, through BOTH kernels, compared bit-for-bit at the f64 level. One
+// sampled row was the first version and it was too weak: it reported
+// bit_diff=0 for all four tensors, which is a statement about four rows, not
+// about the kernel. This walks the same NROWS the timing walks.
+fn cmpall(dtype, toff, rb, cols, x, argp, acc) {
+    let bad = 0
+    let maxulp = 0
+    let zeroflip = 0        // bits differ but the VALUES subtract to exactly 0
+    let sgnflip = 0         // bit patterns with opposite sign bits
+    let bothnan = 0         // both results are NaN (different bit patterns)
+    let onenan = 0          // exactly one is NaN -- a CLASS difference, must be 0
+    // THE MAX ACCUMULATOR LIVES IN MEMORY, NOT IN A LOCAL, and that is a
+    // measurement result, not style. As a register local it read back exactly
+    // 0.0 while `bad` counted 85 differing rows in the same call -- i.e. it was
+    // destroyed. The loop body contains a `closure_call` into the JIT'd kernel,
+    // which uses every ymm/xmm register, and a float local live across it did
+    // not survive. A CONTROL probe settled the scope: an ordinary Quanta call
+    // does preserve a live f64 local across it (verified), so this is specific
+    // to the closure_call path, and NOT a property of the shipped loader, whose
+    // kernels write their result straight to memory
+    // (`mem_store(pl_y + r*8, jit_f_apply_folded(fargs))`).
+    // The model-level bound below (PART 2) has no call in its loop and was
+    // unaffected -- it reproduced identically three times.
+    mem_store(acc + 16, 0.0)
+    let r = 0
+    while r < NROWS {
+        let raw = mm_map_base + toff + r * rb
+        mem_store(argp + 0, raw)
+        mem_store(argp + 8, x)
+        mem_store(argp + 16, 0)
+        mem_store(argp + 24, cols / 256)
+        let a = 0
+        let b = 0
+        if dtype == 12 {
+            a = jit_f_apply_folded(argp)
+            b = jit_f_apply_folded_fma(argp)
+        } else {
+            a = jit_f_apply_folded_q6k(argp)
+            b = jit_f_apply_folded_q6k_fma(argp)
+        }
+        mem_store(acc, a)
+        mem_store(acc + 8, b)
+        let ba = mem_load(acc)
+        let bb = mem_load(acc + 8)
+        if ba != bb {
+            bad = bad + 1
+            // A NaN result explains "bits differ but no value comparison fires",
+            // which is exactly what the first revision reported and could not
+            // explain: for a NaN, `d < 0`, `d > prev` and `d == 0` are ALL false,
+            // so a max-|difference| accumulator stays 0 while rows differ.
+            let na = isnan_bits(ba)
+            let nb = isnan_bits(bb)
+            if na != 0 && nb != 0 { bothnan = bothnan + 1 }
+            else if na != 0 || nb != 0 { onenan = onenan + 1 }
+            else {
+                let d: f64 = f64of(bb) - f64of(ba)
+                if d < 0.0 { d = 0.0 - d }
+                let prev: f64 = f64of(mem_load(acc + 16))
+                if d > prev { mem_store(acc + 16, d) }
+                if d == 0.0 { zeroflip = zeroflip + 1 }
+            }
+            // A bit difference with a ZERO value difference can only be +0.0 vs
+            // -0.0 (or two NaN payloads), and that is worth naming rather than
+            // leaving as "max_abs_diff = 0 while rows differ". The ULP column is
+            // the bit distance, which is nonzero even then.
+            // |bb - ba| OVERFLOWS i64 when the two patterns have opposite sign
+            // bits (e.g. -0.0 vs +0.0, which is exactly the pair that lands
+            // here): `bb - ba` is then ~1.8e19 and traps on this tree. The first
+            // version of this line SIGILL'd on ffn_down.3 -- the tensor whose
+            // differing rows are the +0.0/-0.0 ones. Guard by sign; the ULP
+            // column is only meaningful between same-signed patterns anyway.
+            if (ba < 0) != (bb < 0) { sgnflip = sgnflip + 1 }
+            else {
+                let u = bb - ba
+                if u < 0 {
+                    if (0 - u) > maxulp { maxulp = 0 - u }
+                } else {
+                    if u > maxulp { maxulp = u }
+                }
+            }
+        }
+        r = r + 1
+    }
+    prints("  rows_compared="); print(NROWS)
+    prints(" rows_bits_differ_but_value_equal="); print(zeroflip)
+    prints(" both_results_nan="); print(bothnan)
+    prints(" exactly_one_nan="); print(onenan)
+    prints(" sign_bit_flips="); print(sgnflip)
+    prints(" max_bit_distance_ulp="); print(maxulp)
+    prints(" rows_bit_different="); print(bad)
+    let maxd: f64 = f64of(mem_load(acc + 16))
+    prints(" max_abs_diff="); print_f(maxd)
+    // print_f is six fractional digits, which renders any small difference as
+    // 0.000000 -- so the excursion is ALSO reported scaled, and as raw bits, on
+    // the same principle as the model-level bound below.
+    prints(" max_abs_diff_x1e18="); print(f2i(maxd * 1000000000000000000.0))
+    prints(" max_abs_diff_bits="); print(mem_load(acc + 16))
+    newline()
+    return 0
+}
+
+fn bench(label, dtype, idx, acc) {
+    let cols = gguf_tensor_dim(idx, 0)
+    // A BAD INDEX IS A HARD STOP, not a divide-by-zero: the first revision of
+    // this row passed an index whose dim(0) came back 0 and `nelements / cols`
+    // trap-ed with SIGFPE before printing anything. Fail with a name instead.
+    if cols <= 0 { prints(label); prints("  SKIP: dim(0)="); print(cols); prints(" idx="); print(idx); newline(); return -1 }
+    let rows = gguf_tensor_nelements(idx) / cols
+    let rb = mm_row_bytes(dtype, cols)
+    let toff = gguf_tensor_offset(idx)
+    let x = mem_alloc(cols * 8)
+    let argp = mem_alloc(32)
+    let outbits = mem_alloc(8)
+    let dbits = mem_alloc(8)
+    let dmax = mem_alloc(8)
+    let c = 0
+    while c < cols {
+        let u = i2f(c - (c / 128) * 128)
+        mem_store(x + c * 8, (u - 63.5) * 0.001953125)
+        c = c + 1
+    }
+    if rows <= 0 { prints(label); prints("  SKIP: rows="); print(rows); newline(); return -1 }
+    if rb <= 0 { prints(label); prints("  SKIP: row_bytes="); print(rb); newline(); return -1 }
+    if NROWS > rows { prints(label); prints("  SKIP: rows<NROWS ("); print(rows); prints(")\n"); return -1 }
+    cmpall(dtype, toff, rb, cols, x, argp, acc)
+    let bestA = 0 - 1
+    let bestB = 0 - 1
+    let sumA = 0
+    let sumB = 0
+    let cyc = 0
+    while cyc < NCYC {
+        let ta = sweep(0, dtype, toff, rb, cols, x, argp, outbits, dbits, dmax)
+        let tb = sweep(1, dtype, toff, rb, cols, x, argp, outbits, dbits, dmax)
+        if bestA < 0 || ta < bestA { bestA = ta }
+        if bestB < 0 || tb < bestB { bestB = tb }
+        sumA = sumA + ta
+        sumB = sumB + tb
+        cyc = cyc + 1
+    }
+    prints(label)
+    prints("  cols="); print(cols); prints(" rows="); print(NROWS)
+    prints("  f64_best="); print(bestA)
+    prints("  fma_best="); print(bestB)
+    // TWO estimators, because one is not enough on this box. `best` is min-of-N,
+    // which rejects warm-up and short bursts but is fooled when interference lasts
+    // a whole arm; `sum` is the total over all interleaved cycles, which cancels
+    // correlated drift. The first revision reported only min-of-5 and gave 1.025x
+    // for a tensor that min-of-11 later put at 1.178x.
+    if bestB > 0 { prints("  f64_over_fma_min_x1000="); print(bestA * 1000 / bestB) }
+    else { prints("  f64_over_fma_min_x1000=NA") }
+    if sumB > 0 { prints("  f64_over_fma_sum_x1000="); print(sumA * 1000 / sumB) }
+    else { prints("  f64_over_fma_sum_x1000=NA") }
+    newline()
+    return 0
+}
+
+// ===================== PART 2: model-level bound ============================
+fn run_seq(ids, n, ffma, out, am) {
+    mm_set_fused_q4k(1)
+    mm_set_fused_q6k(1)
+    mm_set_fused_fma(ffma)
+    mm_set_fused_chain(1)
+    if fc_fw_reset() != 0 { return -1 }
+    let i = 0
+    let step = 0
+    while i < n {
+        let want = 0
+        if i == n - 1 { want = 1 }
+        if fc_forward_token_ex(mem_load(ids + i * 8), i, want) != 0 { return -1 }
+        i = i + 1
+    }
+    mem_store(am + 0 * 8, fc_argmax(fc_n_vocab))
+    step = 1
+    while step <= NTOK {
+        let tok = fc_argmax(fc_n_vocab)
+        mem_store(am + step * 8, tok)
+        if fc_forward_token_ex(tok, n - 1 + step, 1) != 0 { return -1 }
+        step = step + 1
+    }
+    let v = 0
+    while v < fc_n_vocab { mem_store(out + v * 8, f64of(mem_load(fc_fw_logits + v * 8))); v = v + 1 }
+    return 0
+}
+
+// The reported excursion: mismatch count, max |difference| (bits + value), and
+// the max ULP distance. ULP distance is |bits_a - bits_b|, which is exact for two
+// doubles of the SAME sign -- true for every logit pair here, and the count of
+// sign-changing pairs is reported rather than assumed zero.
+fn excursion(L0, L1, nv, r) {
+    let m = 0
+    let maxd: f64 = 0.0
+    let maxulp = 0
+    let sgn = 0
+    let refmax: f64 = 0.0
+    let v = 0
+    while v < nv {
+        let b0 = mem_load(L0 + v * 8)
+        let b1 = mem_load(L1 + v * 8)
+        // the reference's own largest |logit|, so the bound can be stated
+        // scale-free as well as absolutely
+        let rv: f64 = f64of(b0)
+        let arv: f64 = rv
+        if arv < 0.0 { arv = 0.0 - arv }
+        if arv > refmax { refmax = arv }
+        if b1 != b0 {
+            m = m + 1
+            let d: f64 = f64of(b1) - f64of(b0)
+            let ad: f64 = d
+            if ad < 0.0 { ad = 0.0 - ad }
+            if ad > maxd { maxd = ad }
+            if (b0 < 0) != (b1 < 0) { sgn = sgn + 1 }
+            else {
+                let u = b1 - b0
+                if u < 0 { if (0 - u) > maxulp { maxulp = 0 - u } }
+                else { if u > maxulp { maxulp = u } }
+            }
+        }
+        v = v + 1
+    }
+    mem_store(r, m)
+    mem_store(r + 8, maxd)
+    mem_store(r + 16, maxulp)
+    mem_store(r + 24, sgn)
+    mem_store(r + 32, refmax)
+    return 0
+}
+
+// The prompt/ids construction the bench and the logits gate both use. Kept in
+// its own function only so main() reads as the experiment it is.
+let g_user = 0
+let g_ids = 0
+let g_n = 0
+
+fn prompt_ids() {
+    let rawprompt = slurp(file_open(PROMPT_PATH, 0))
+    if rawprompt == 0 { return -1 }
+    g_user = as_str(rawprompt, plen)
+    let pb = mem_alloc(CAP)
+    let pbytes = chat_build(0, g_user, pb)
+    g_ids = mem_alloc(8192 * 8)
+    mem_store(g_ids, bpe_bos)
+    g_n = bpe_encode_special(pb, pbytes, g_ids + 8, 8000) + 1
+    return 0
+}
+
+fn main() {
+    prints("=== FMA folded kernels: kernel A/B, and their model-level bit bar ===\n")
+    if jit_f_setup_folded_fma() != 0 { prints("FAIL setup fma q4k\n"); return 30 }
+    if jit_f_setup_folded_q6k_fma() != 0 { prints("FAIL setup fma q6k\n"); return 31 }
+    if jit_f_setup_folded() != 0 { prints("FAIL setup q4k\n"); return 32 }
+    if jit_f_setup_folded_q6k() != 0 { prints("FAIL setup q6k\n"); return 33 }
+
+    if gguf_load(Q4_PATH) != 0 { prints("FAIL gguf_load\n"); return 1 }
+    if fc_read_config() != 0 { prints("FAIL fc_read_config\n"); return 1 }
+    if bpe_init_from_gguf() == 0 { prints("FAIL bpe_init\n"); return 1 }
+    if fc_kv_init(NCTX) != 0 { prints("FAIL fc_kv_init\n"); return 1 }
+    if fc_fw_init() != 0 { prints("FAIL fc_fw_init\n"); return 1 }
+    mm_set_workers(0)
+    mm_set_embed_workers(0)
+    if mm_attach_mmap_fd(file_open(Q4_PATH, 0)) != 0 { prints("FAIL mm_attach_mmap\n"); return 1 }
+    if fc_cache_norms() != 0 { prints("FAIL fc_cache_norms\n"); return 1 }
+
+    let acc = mem_alloc(4)
+
+    prints("--- PART 1: kernel vs FMA kernel, same rows, interleaved ---\n")
+    prints("(the RATIO is the measurement; clock()'s unit is unverified)\n")
+    bench("Q4_K ffn_gate.0 :", 12, lfm2_ffn_gate(0), acc)
+    bench("Q4_K ffn_up.0   :", 12, lfm2_ffn_up(0), acc)
+    bench("Q6_K ffn_down.3 :", 14, lfm2_ffn_down(3), acc)
+    bench("Q6_K attn_v.2   :", 14, lfm2_attn_v(2), acc)
+
+    prints("--- PART 2: model-level bar (fma=0 vs fma=1, one process) ---\n")
+    if prompt_ids() != 0 { prints("FAIL read prompt\n"); return 1 }
+    prints("prompt_ids="); print(g_n); newline()
+    if g_n <= 1 { prints("FAIL encode\n"); return 1 }
+
+    let nv = fc_n_vocab
+    let L0 = mem_alloc(nv * 8)
+    let L1 = mem_alloc(nv * 8)
+    let a0 = mem_alloc(512)
+    let a1 = mem_alloc(512)
+    let rr = mem_alloc(40)
+    // Part 1 ran single-threaded on purpose (the interleaved kernel A/B must not
+    // share the box with a 20-worker pool). Part 2 is a full forward, so it runs
+    // the SHIPPED configuration: 20 workers, the same as the bench and the
+    // logits gate. Without this the two sequences take minutes instead of
+    // seconds and the first revision of this row timed out before printing.
+    mm_set_workers_uncapped(20)
+    mm_set_embed_workers_uncapped(20)
+    mm_pool_begin()
+
+    prints("run A (fma=0, the f64 kernels)...\n")
+    if run_seq(g_ids, g_n, 0, L0, a0) != 0 { prints("FAIL runA\n"); return 1 }
+    let wA = mm_get_fused_fma_used()
+    prints("run B (fma=1, the FMA kernels)...\n")
+    if run_seq(g_ids, g_n, 1, L1, a1) != 0 { prints("FAIL runB\n"); return 1 }
+    let wB = mm_get_fused_fma_used()
+    mm_pool_end()
+
+    prints("witness fma_used: runA="); print(wA); prints(" runB="); print(wB); newline()
+
+    excursion(L0, L1, nv, rr)
+    let mism = mem_load(rr)
+    let maxulp = mem_load(rr + 16)
+    let sgn = mem_load(rr + 24)
+    prints("logits_n="); print(nv); newline()
+    prints("EXCURSION logit_mism="); print(mism)
+    prints("  max_abs_diff_bits="); print(mem_load(rr + 8))
+    prints("  max_abs_diff="); print_f(f64of(mem_load(rr + 8)))
+    prints("  max_ulp="); print(maxulp)
+    prints("  sign_flips="); print(sgn); newline()
+    // print_f is six fractional digits, so a ~1e-14 excursion renders as
+    // 0.000000. The bound is therefore ALSO stated scaled and relative, and the
+    // raw bits are printed above -- never "0.000000" alone.
+    let refmax: f64 = f64of(mem_load(rr + 32))
+    prints("max logit |ref|="); print_f(refmax)
+    prints("  excursion_x1e18="); print(f2i(f64of(mem_load(rr + 8)) * 1000000000000000000.0))
+    prints("  excursion_over_maxlogit_x1e15="); print(f2i(f64of(mem_load(rr + 8)) / refmax * 1000000000000000.0))
+    newline()
+
+    let amm = 0
+    let s = 0
+    while s <= NTOK {
+        if mem_load(a0 + s * 8) != mem_load(a1 + s * 8) { amm = amm + 1 }
+        s = s + 1
+    }
+    prints("argmax_mism="); print(amm); newline()
+    prints("ids fma=0: ")
+    s = 1
+    while s <= NTOK { print(mem_load(a0 + s * 8)); prints(" "); s = s + 1 }
+    newline()
+    prints("ids fma=1: ")
+    s = 1
+    while s <= NTOK { print(mem_load(a1 + s * 8)); prints(" "); s = s + 1 }
+    newline()
+    prints("first_argmax fma=0="); print(mem_load(a0)); prints(" fma=1="); print(mem_load(a1)); newline()
+
+    // THE BAR: the FMA kernel must have been USED, and the semantic output must
+    // be identical. The numeric excursion is REPORTED above, never asserted as
+    // "close enough".
+    if wB != 1 { prints("FAIL: run B did not dispatch the FMA kernel\n"); return 40 }
+    if mem_load(a0) != 597 { prints("FAIL: fma=0 first argmax is not the oracle 597\n"); return 41 }
+    if mem_load(a1) != 597 { prints("FAIL: fma=1 first argmax is not the oracle 597\n"); return 42 }
+    if amm != 0 { prints("FAIL: FMA moved the argmax sequence\n"); return 43 }
+    prints("PASS: FMA kernels dispatch, first argmax 597, all 25 argmax and the first 24 ids identical\n")
+    prints("DONE\n")
+    return 0
+}
