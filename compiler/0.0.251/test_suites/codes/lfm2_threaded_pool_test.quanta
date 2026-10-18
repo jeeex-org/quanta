@@ -1,0 +1,89 @@
+// Regression guard for the threaded matvec pool (defect A9).
+//
+// PRE-FIX BEHAVIOUR: mm_matvec_par() spawned nworkers threads PER CALL, and
+// thread_create() maps a fresh 1 MB child stack that thread_join() never
+// unmaps. Runtime evidence: `strace -f` counted 2329 clone() calls inside ONE
+// 30-layer forward at 20 workers = ~2.3 GB of address space, and `ulimit -v
+// 4194304` killed the process inside that forward. The kill is SILENT -- the
+// emitter's mmap-failure guard exit(1)s on the main thread while the group's
+// worker threads keep running, so the process is reported as exited 0.
+//
+// WHAT THIS ROW ASSERTS
+//   1. 150 jobs at 20 workers complete under the gate's 1.5 GB cap. A pool
+//      regression back to per-call threads leaks 150 x 20 x 1 MB = 3 GB there
+//      and dies, so the row fails.
+//   2. The pooled result is ELEMENT-WISE identical to the serial block
+//      reference at 2/4/8/20 workers (no tolerance: a weight that moves by one
+//      ULP is a different model).
+//   3. Completion is encoded as rc=7 and every failure path returns a distinct
+//      non-zero code. It is deliberately NOT rc=0: this defect's failure mode
+//      also reports 0, so a rc=0 row would pass while the program was dying
+//      (rule #16).
+//
+// Needs the real model: EXPECTED.tsv carries it in SKIP_IF_MISSING.
+import std/gguf
+import std/gguf_mm
+
+const P = "/opt/ai/models/quanta/QUANTA-LFM2.5-2.6Bv1-Q4_K_M.gguf"
+const JOBS = 150          // 150 x 20 workers would be 3 GB of leaked stacks
+const FEW = 4             // identity checks at the smaller counts stay cheap
+
+const NW_MAIN = 20
+
+// One worker-count run: JOBS jobs, then element-wise vs the serial reference.
+// Returns 0 on success, 8 on a mismatch, 6 on an engine error.
+fn run_jobs(idx: u64, x: u64, rows: i64, cols: i64, y: u64, refbuf: u64, nw: i64, jobs: i64) -> i64 {
+    let j = 0
+    while j < jobs {
+        if mm_matvec_par(idx, x, rows, cols, y, nw) != 0 { return 6 }
+        j = j + 1
+    }
+    let r = 0
+    while r < rows {
+        if mem_load(y + r * 8) != mem_load(refbuf + r * 8) { return 8 }
+        r = r + 1
+    }
+    return 0
+}
+
+fn main() -> i64 {
+    if gguf_load(P) < 0 { return 1 }
+    if mm_init(2048) != 0 { return 2 }
+    // shortconv out_proj is [rows, 2048]: narrow enough for the gate's 15 s cap,
+    // wide enough for 20-way row partitioning.
+    let idx = gguf_find_tensor("blk.0.shortconv.out_proj.weight")
+    if idx < 0 { return 3 }
+    let rows = gguf_tensor_dim(idx, 1)
+    let cols = gguf_tensor_dim(idx, 0)
+    if cols != 2048 { return 4 }
+    if rows / NW_MAIN < 1 { return 4 }
+
+    let x = mem_alloc(cols * 8)
+    let y = mem_alloc(rows * 8)
+    let refbuf = mem_alloc(rows * 8)
+    let i = 0
+    while i < cols {
+        mem_store(x + i * 8, 0.01 + i2f(i) * 0.0001)
+        i = i + 1
+    }
+    // serial reference: block path, one row at a time
+    if mm_matvec_blk(idx, x, rows, cols, refbuf) != 0 { return 9 }
+
+    mm_set_workers(NW_MAIN)
+    // Hold ONE pool for the whole loop. A size change rebuilds it, so the
+    // counts below exercise spawn/teardown as well as steady-state reuse.
+    mm_pool_begin()
+
+    let bad = run_jobs(idx, x, rows, cols, y, refbuf, NW_MAIN, JOBS)
+    if bad != 0 { return bad }
+    bad = run_jobs(idx, x, rows, cols, y, refbuf, 8, FEW)
+    if bad != 0 { return bad }
+    bad = run_jobs(idx, x, rows, cols, y, refbuf, 4, FEW)
+    if bad != 0 { return bad }
+    bad = run_jobs(idx, x, rows, cols, y, refbuf, 2, FEW)
+    if bad != 0 { return bad }
+
+    mm_pool_end()
+    gguf_close()
+    return 7
+}

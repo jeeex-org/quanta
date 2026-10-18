@@ -1,0 +1,20 @@
+// A1b (0.0.237): a TUPLE-payload enum variant, and the unit-variant arm beside
+// it. Both arms of that if/else declared `vr` locally and the code after the
+// branch (the enum/var tag stores and `return vr`) resolved -- because a block's
+// bindings were never popped -- to the LAST-PARSED arm's cell, which for a tuple
+// variant is the unit arm's vreg: allocated at parse time but never written at
+// run time. Measured on 0.0.236: the compiler SIGSEGVs (rc=139, 3/3 runs) on
+// this program. With block-scoped bindings it compiles and exits 42.
+enum Shape { Point, Rect(i64, i64) }
+fn main() {
+    let r = Shape::Rect(3, 4)
+    let p = Shape::Point
+    let a = match r { Shape::Rect(w, h) => w * h, Shape::Point => 0 }
+    let b = match p { Shape::Rect(w, h) => 111, Shape::Point => 7 }
+    if a != 12 { exit(1) }
+    if b != 7 { exit(2) }
+    let q = Shape::Rect(5, 6)
+    let c = match q { Shape::Rect(w, h) => w + h, Shape::Point => 99 }
+    if c != 11 { exit(3) }
+    exit(42)
+}

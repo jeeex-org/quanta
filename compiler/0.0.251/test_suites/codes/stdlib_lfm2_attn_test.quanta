@@ -1,0 +1,368 @@
+// stdlib_lfm2_attn_test -- the GQA attention path must match a reference that
+// runs the same graph by a different route.
+//
+// Transcribed from llama.cpp src/models/lfm2.cpp build_attn_block():
+//
+//   q = q_proj @ x                     [2048, 32*64]
+//   k = k_proj @ x                     [2048,  8*64]
+//   v = v_proj @ x                     [2048,  8*64]
+//   q = rms_norm(q, attn_q_norm)       PER HEAD over head_dim (64 elements)
+//   k = rms_norm(k, attn_k_norm)       PER HEAD over head_dim
+//   q = rope(q, pos) ; k = rope(k, pos)
+//   k, v appended to the KV cache
+//   scores[h][t] = q[h] . k[t] / sqrt(head_dim)
+//   softmax over t in 0..pos, then out[h] = sum_t scores[h][t] * v[t]
+//   y = wo @ concat(out[0..32))
+//
+// The reference below dequantizes the weights WHOLE with read_tensor_f64 and does
+// the dot products by hand. fc_attention instead goes through the row-wise
+// lfm2_mm kernels and the shared KV cache, so agreement means the layer is right
+// rather than merely self-consistent.
+//
+// Two facts this test exists to pin, both learned the hard way:
+//
+//   1. lfm2_attn_q_norm() and friends return a TENSOR INDEX, not a pointer.
+//      mm_matvec takes an index; fc_rms_norm takes a pointer. Passing the index
+//      straight through dereferences address 23 and segfaults. The weights must
+//      be materialized with read_tensor_f64 first.
+//
+//   2. q_norm/k_norm are per HEAD over head_dim. The weight tensors have 64
+//      elements, not 2048. Normalizing the concatenated 2048-wide vector instead
+//      is a different computation with a different scale, and every score comes
+//      out wrong while still looking plausible.
+//
+// GQA mapping: 32 query heads over 8 KV heads, so query head h reads KV head
+// h/4. Getting that wrong still produces plausible numbers.
+
+import std/fs
+import std/gguf
+import std/lfm2_forward
+import std/lfm2_model
+import std/gguf_mm
+import std/math
+
+let MODEL = "/opt/ai/models/quanta/QUANTA-LFM2.5-2.6Bv1-Q4_K_M.gguf"
+let TOL = 0.0001
+
+// Cosine similarity: the layer output is a sum of 2048 weighted values, so an
+// elementwise tolerance says little. Two implementations that agree on the whole
+// vector will score ~1.0; one that differs in the GQA mapping or the per-head
+// norm will not.
+fn cosine(a: u64, b: u64, n: i64) -> f64 {
+    let dot: f64 = 0.0
+    let na: f64 = 0.0
+    let nb: f64 = 0.0
+    let i = 0
+    while i < n {
+        let x = f64of(mem_load(a + i * 8))
+        let y = f64of(mem_load(b + i * 8))
+        dot = dot + x * y
+        na = na + x * x
+        nb = nb + y * y
+        i = i + 1
+    }
+    if na <= 0.0 || nb <= 0.0 { return 0.0 }
+    // sqrt(na) * sqrt(nb), NOT sqrt(na * sqrt(nb)). The first version had an
+    // extra sqrt and reported 2.145 for two identical vectors -- a similarity
+    // above 1 is impossible, which is what exposed it. A check that cannot fail
+    // is worse than no check: it looked green while proving nothing.
+    return dot / (sqrt(na) * sqrt(nb))
+}
+
+// ---- reference weights, loaded once ----------------------------------------
+let ref_Wq = 0
+let ref_Wk = 0
+let ref_Wv = 0
+let ref_Wo = 0
+let ref_Wqn = 0
+let ref_Wkn = 0
+
+fn ref_load(L) {
+    if ref_Wq != 0 { return 0 }
+    let hd = fc_head_dim
+    ref_Wq = mem_alloc(gguf_tensor_nelements(lfm2_attn_q(L)) * 8)
+    ref_Wk = mem_alloc(gguf_tensor_nelements(lfm2_attn_k(L)) * 8)
+    ref_Wv = mem_alloc(gguf_tensor_nelements(lfm2_attn_v(L)) * 8)
+    ref_Wo = mem_alloc(gguf_tensor_nelements(lfm2_attn_output(L)) * 8)
+    ref_Wqn = mem_alloc(hd * 8)
+    ref_Wkn = mem_alloc(hd * 8)
+    read_tensor_f64(lfm2_attn_q(L), ref_Wq)
+    read_tensor_f64(lfm2_attn_k(L), ref_Wk)
+    read_tensor_f64(lfm2_attn_v(L), ref_Wv)
+    read_tensor_f64(lfm2_attn_output(L), ref_Wo)
+    read_tensor_f64(lfm2_attn_q_norm(L), ref_Wqn)
+    read_tensor_f64(lfm2_attn_k_norm(L), ref_Wkn)
+    return 0
+}
+
+// Whole-tensor matvec, row-major: out[j] = sum_c W[j*cols + c] * x[c].
+fn ref_matvec(W: u64, x: u64, rows: i64, cols: i64, y: u64) {
+    let j = 0
+    while j < rows {
+        let acc: f64 = 0.0
+        let c = 0
+        while c < cols {
+            acc = acc + f64of(mem_load(W + (j * cols + c) * 8)) * f64of(mem_load(x + c * 8))
+            c = c + 1
+        }
+        mem_store(y + j * 8, acc)
+        j = j + 1
+    }
+    return 0
+}
+
+// Per-head RMSNorm with epsilon, in place over nheads * head_dim values.
+fn ref_norm_head(p: u64, nheads: i64, hd: i64, w: u64) {
+    let eps = fc_rms_eps
+    let j = 0
+    while j < nheads {
+        let ss: f64 = 0.0
+        let c = 0
+        while c < hd {
+            let vv = f64of(mem_load(p + (j * hd + c) * 8))
+            ss = ss + vv * vv
+            c = c + 1
+        }
+        let inv: f64 = 1.0 / sqrt(ss / i2f(hd) + eps)
+        c = 0
+        while c < hd {
+            let vv = f64of(mem_load(p + (j * hd + c) * 8))
+            let wv = f64of(mem_load(w + c * 8))
+            mem_store(p + (j * hd + c) * 8, vv * inv * wv)
+            c = c + 1
+        }
+        j = j + 1
+    }
+    return 0
+}
+
+// RoPE in place, recomputing cos/sin here rather than calling fc_rope_cache, so
+// agreement is not tautological. Half-split pairing: element p pairs with p+hd/2.
+fn ref_rope(p: u64, nheads: i64, hd: i64, pos) {
+    let half = hd / 2
+    let scale: f64 = pow(f64of(10000000.0), 0.0 - 2.0 / i2f(hd))
+    let theta: f64 = i2f(pos)
+    let i = 0
+    while i < half {
+        let cs = cos(theta)
+        let sn = sin(theta)
+        let t = 0
+        while t < nheads {
+            let b0 = p + (t * hd + i) * 8
+            let b1 = p + (t * hd + i + half) * 8
+            let x0 = f64of(mem_load(b0))
+            let x1 = f64of(mem_load(b1))
+            mem_store(b0, x0 * cs - x1 * sn)
+            mem_store(b1, x0 * sn + x1 * cs)
+            t = t + 1
+        }
+        theta = theta * scale
+        i = i + 1
+    }
+    return 0
+}
+
+// q for this position, and k/v appended into the reference's own cache.
+fn ref_qkv(L, pos, x: u64, q: u64, KC: u64, VC: u64) {
+    let dm = fc_d_model
+    let hd = fc_head_dim
+    let nh = fc_n_heads
+    let nkv = fc_nkv_of(L)
+    if ref_matvec(ref_Wq, x, nh * hd, dm, q) != 0 { return -1 }
+    let k = mem_alloc(nkv * hd * 8)
+    let v = mem_alloc(nkv * hd * 8)
+    if ref_matvec(ref_Wk, x, nkv * hd, dm, k) != 0 { return -1 }
+    if ref_matvec(ref_Wv, x, nkv * hd, dm, v) != 0 { return -1 }
+    if ref_norm_head(q, nh, hd, ref_Wqn) != 0 { return -1 }
+    if ref_norm_head(k, nkv, hd, ref_Wkn) != 0 { return -1 }
+    if ref_rope(q, nh, hd, pos) != 0 { return -1 }
+    if ref_rope(k, nkv, hd, pos) != 0 { return -1 }
+    let base = pos * nkv * hd
+    let c = 0
+    while c < nkv * hd {
+        mem_store(KC + (base + c) * 8, f64of(mem_load(k + c * 8)))
+        mem_store(VC + (base + c) * 8, f64of(mem_load(v + c * 8)))
+        c = c + 1
+    }
+    return 0
+}
+
+// Attention over the reference's own cache, positions 0..pos inclusive.
+fn ref_attend(L, pos, q: u64, KC: u64, VC: u64, out: u64) {
+    let dm = fc_d_model
+    let hd = fc_head_dim
+    let nh = fc_n_heads
+    let nkv = fc_nkv_of(L)
+    let scale: f64 = 1.0 / sqrt(i2f(hd))
+    let o = mem_alloc(nh * hd * 8)
+    let c = 0
+    while c < nh * hd { mem_store(o + c * 8, 0.0); c = c + 1 }
+    let sc = mem_alloc((pos + 2) * 8)
+    let h = 0
+    while h < nh {
+        // GQA: 32 query heads over 8 KV heads, so h/4.
+        let kvh = h / (nh / nkv)
+        let mx: f64 = 0.0 - 1e300
+        let t = 0
+        while t <= pos {
+            let acc: f64 = 0.0
+            let i = 0
+            while i < hd {
+                acc = acc + f64of(mem_load(q + (h * hd + i) * 8)) * f64of(mem_load(KC + ((t * nkv + kvh) * hd + i) * 8))
+                i = i + 1
+            }
+            let s2 = acc * scale
+            mem_store(sc + t * 8, s2)
+            if s2 > mx { mx = s2 }
+            t = t + 1
+        }
+        let sum: f64 = 0.0
+        t = 0
+        while t <= pos {
+            let e = expf(f64of(mem_load(sc + t * 8)) - mx)
+            mem_store(sc + t * 8, e)
+            sum = sum + e
+            t = t + 1
+        }
+        if sum == 0.0 { return -1 }
+        t = 0
+        while t <= pos {
+            let w2 = f64of(mem_load(sc + t * 8)) / sum
+            let i = 0
+            while i < hd {
+                let cur = f64of(mem_load(o + (h * hd + i) * 8))
+                mem_store(o + (h * hd + i) * 8, cur + w2 * f64of(mem_load(VC + ((t * nkv + kvh) * hd + i) * 8)))
+                i = i + 1
+            }
+            t = t + 1
+        }
+        h = h + 1
+    }
+    return ref_matvec(ref_Wo, o, dm, nh * hd, out)
+}
+
+fn main() {
+    if gguf_load(MODEL) != 0 { print("FAIL gguf_load"); return 1 }
+    if fc_read_config() != 0 { print("FAIL fc_read_config"); return 1 }
+    if fc_kv_init(32) != 0 { print("FAIL fc_kv_init"); return 1 }
+
+    let dm = fc_d_model
+    let hd = fc_head_dim
+    let nh = fc_n_heads
+    if hd != 64 { prints("FAIL head_dim="); print(hd); return 1 }
+    if nh != 32 { prints("FAIL n_heads="); print(nh); return 1 }
+    if fc_nkv_of(2) != 8 { prints("FAIL nkv="); print(fc_nkv_of(2)); return 1 }
+
+    // The norm weights are TENSOR INDICES; this is the trap.
+    if gguf_tensor_nelements(lfm2_attn_q_norm(2)) != hd {
+        print("FAIL q_norm is not head_dim wide")
+        return 1
+    }
+
+    let x = mem_alloc(dm * 8)
+    let yA = mem_alloc(dm * 8)
+    let yB = mem_alloc(dm * 8)
+    let i = 0
+    while i < dm {
+        let v: f64 = i2f(i % 23) * 0.03125 - 0.25
+        mem_store(x + i * 8, v)
+        i = i + 1
+    }
+
+    // position 0: a single cached token, so softmax is trivially 1.0 and the
+    // output must equal out_proj @ v. Catches the projections, both norms, RoPE
+    // (a no-op at pos 0) and the output projection.
+    if ref_load(2) != 0 { print("FAIL ref_load"); return 1 }
+    let npos0 = 4
+    let KC0 = mem_alloc(npos0 * 8 * hd * 8)
+    let VC0 = mem_alloc(npos0 * 8 * hd * 8)
+    let q0 = mem_alloc(nh * hd * 8)
+    if fc_attention(2, 0, x, yA) != 0 { print("FAIL fc_attention pos0"); return 1 }
+    if ref_qkv(2, 0, x, q0, KC0, VC0) != 0 { print("FAIL ref_qkv"); return 1 }
+    if ref_attend(2, 0, q0, KC0, VC0, yB) != 0 { print("FAIL ref_attend"); return 1 }
+    let c0 = cosine(yA, yB, dm)
+    prints("cos pos0=")
+    pf64(c0)
+    print(" ")
+    if c0 < 0.9999999 { print("FAIL pos0"); return 1 }
+
+    // ---- multiple positions ----
+    // At pos 0 the softmax is trivially 1.0, so it proves nothing about the cache
+    // or the softmax. Drive 4 positions with DIFFERENT x each time: the reference
+    // keeps its own KC/VC across calls, and fc_attention uses the real cache.
+    // A mismatch here means the K/V write, the positional indexing or the causal
+    // bound is wrong -- none of which pos 0 can detect.
+    let npos = npos0
+    let KC = KC0
+    let VC = VC0
+    let worst: f64 = 1.0
+    let pos = 0
+    while pos < npos {
+        // a fresh x per position
+        let j2 = 0
+        while j2 < dm {
+            let v2: f64 = i2f((j2 + pos * 7) % 29) * 0.02 - 0.3
+            mem_store(x + j2 * 8, v2)
+            j2 = j2 + 1
+        }
+        if fc_attention(2, pos, x, yA) != 0 { prints("FAIL fc_attention pos"); print(pos); return 1 }
+        if ref_qkv(2, pos, x, q0, KC, VC) != 0 { print("FAIL ref_qkv"); return 1 }
+        if ref_attend(2, pos, q0, KC, VC, yB) != 0 { print("FAIL ref_attend"); return 1 }
+        let c2 = cosine(yA, yB, dm)
+        prints("cos pos")
+        print(pos)
+        print("=")
+        pf64(c2)
+        print(" ")
+        if c2 < worst { worst = c2 }
+        pos = pos + 1
+    }
+    prints("worst=")
+    pf64(worst)
+    print(" ")
+    if worst < 0.99999 { print("FAIL multi-pos"); return 1 }
+
+    // ---- repeated-call finiteness ----
+    // NOT a test of the max subtraction. That subtraction is what keeps the
+    // softmax finite at long context, and it IS present in fc_attention -- but it
+    // cannot be verified by a tolerance here: with d_model = 2048 the raw scores
+    // are small enough that expf(s) never overflows, so removing the max produces
+    // IDENTICAL results. Verified -- a negative that drops it passes this test.
+    //
+    // Reaching it needs an input whose scores are large, which d_model 2048 and a
+    // fresh x will not produce. Asserting it would mean a synthetic magnitude, and
+    // a synthetic magnitude would not be the real one.
+    //
+    // What this DOES check is that repeated calls stay finite and that the cache
+    // does not accumulate: an unzeroed scratch buffer produced NaN here, and this
+    // catches that.
+    let big = mem_alloc(dm * 8)
+    let i9 = 0
+    while i9 < dm { let v9: f64 = i2f(i9 % 7) * 0.05; mem_store(big + i9 * 8, v9); i9 = i9 + 1 }
+    fc_kv_reset()
+    // 12 warm-up positions. Enough for the softmax to average over a dozen
+    // cached keys -- the earlier 60 took ~30 s and blew the gate's 15 s limit,
+    // failing with rc=124 and no output at all, which is the silent-timeout
+    // failure mode this project keeps hitting. The property under test is
+    // finiteness, not a specific length.
+    let w = 0
+    while w < 12 {
+        if fc_attention(2, w, big, yA) != 0 { print("FAIL warmup"); return 1 }
+        w = w + 1
+    }
+    // the output must be finite, not NaN
+    let bad = 0
+    let c9 = 0
+    while c9 < dm {
+        let v9 = f64of(mem_load(yA + c9 * 8))
+        if v9 != v9 { bad = bad + 1 }
+        c9 = c9 + 1
+    }
+    prints("nan outputs=")
+    print(bad)
+    print(" expect 0 ")
+    if bad != 0 { print("FAIL softmax stability"); return 1 }
+
+    print("OK attn")
+    return 0
+}

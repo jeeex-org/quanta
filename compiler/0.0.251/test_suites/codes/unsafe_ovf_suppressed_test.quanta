@@ -1,0 +1,32 @@
+// A33 row 1 of 2 — the `unsafe { }` escape hatch DOES suppress the integer-overflow
+// trap, per operation.
+//
+// This row exists because the capability had NO test at all: it is load-bearing
+// (the compiler's own compute_magic() is wrapped in `unsafe { }` precisely because
+// its magic-number recovery relies on deliberate 64-bit wraparound), so if the
+// suppression ever regressed, the failure would surface as a mysteriously broken
+// self-host, not as a test.
+//
+// The companion row unsafe_ovf_trap_test.quanta is the OTHER direction: the same
+// overflow WITHOUT `unsafe { }` must SIGILL (exit 132). A one-sided test would pass
+// if the trap were removed globally, which is the failure mode being guarded.
+//
+// Hand-derived golden, two's complement, exact:
+//   i64::MAX = 2^63 - 1. Adding it five times:
+//     1: 2^63-1
+//     2: 2^64-2        -> wraps to -2
+//     3: 2^63-3
+//     4: 2^64-4        -> wraps to -4
+//     5: 2^63-5  = 9223372036854775803
+//   so `s - 9223372036854775803` is exactly 0, and an exit code of 0 proves BOTH
+//   that no SIGILL fired and that the arithmetic wrapped to the documented value.
+fn main() {
+    let s = 0
+    let i = 0
+    while i < 5 {
+        unsafe { s = s + 9223372036854775807 }
+        i = i + 1
+    }
+    s = s - 9223372036854775803
+    return s
+}

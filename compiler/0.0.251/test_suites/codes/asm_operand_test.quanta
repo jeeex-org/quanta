@@ -1,0 +1,52 @@
+// asm_operand_test -- Phase C2 (0.0.232): asm! operands and constraints.
+//
+// Each case passes a value THROUGH the operand machinery and asserts the
+// observed result. RAX remains the result register; %N substitution brings
+// operand values into the template.
+//
+//   1. "r" input: `mov rax, %0` with %0 bound to a runtime local — the result
+//      is the local's value, NOT a compile-time constant (proves the operand
+//      was materialized from its spill home)
+//   2. "=r" output: `mov %0, 99` writes the bound register; the output vreg
+//      reads back 99
+//   3. "+r" read-write: `add %0, 5` — the output sees input+5
+//   4. "i" immediate: `mov rax, %0` with an immediate operand
+//   5. hex path regression: plain hex still works
+//   6. rejection regression: garbage still fails (gate Stage 16 covers it)
+
+fn main() -> i64 {
+    let fails = 0
+
+    // 1. "r" input — runtime value flows in
+    let src = 1234
+    let a = asm!("mov rax, %0"
+        : "r"(src))
+    if a != 1234 { print("FAIL r input: got "); print(a); print("\n"); fails = fails + 1 }
+
+    // 2. "=r" output — asm writes the bound register, vreg reads it back
+    let out = 0
+    let b = asm!("mov %0, 99"
+        : "=r"(out))
+    if out != 99 { print("FAIL =r output: got "); print(out); print("\n"); fails = fails + 1 }
+    if b != 99 { print("FAIL =r result: got "); print(b); print("\n"); fails = fails + 1 }
+
+    // 3. "+r" read-write
+    let rw = 40
+    let c = asm!("add %0, 5"
+        : "+r"(rw))
+    if rw != 45 { print("FAIL +r rw: got "); print(rw); print("\n"); fails = fails + 1 }
+    if c != 45 { print("FAIL +r result: got "); print(c); print("\n"); fails = fails + 1 }
+
+    // 4. "i" immediate
+    let d = asm!("mov rax, %0"
+        : "i"(77))
+    if d != 77 { print("FAIL i imm: got "); print(d); print("\n"); fails = fails + 1 }
+
+    // 5. hex regression
+    let e = asm!("b8 2b 00 00 00")
+    if e != 43 { print("FAIL hex: got "); print(e); print("\n"); fails = fails + 1 }
+
+    if fails == 0 { print("asm_operand: all pass\n"); return 0 }
+    print("asm_operand: FAILURES\n")
+    return 1
+}

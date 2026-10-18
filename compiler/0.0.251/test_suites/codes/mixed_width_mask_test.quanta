@@ -1,0 +1,31 @@
+// Regression test for P6.1b width-mask bug: when a width-typed var of one
+// type precedes an arithmetic op on a DIFFERENT width type, the ADD/SUB/MUL
+// result may be allocated to an extended register (r8-r15). The mask emit must
+// use REX.B for those registers or it silently masks the wrong register and the
+// truncation is lost. Also covers const-folded width arithmetic (e.g. two
+// literal width-typed operands), which must wrap at compile time too.
+fn main() {
+  // u8 declared first, then u16 add (the originally-failing layout)
+  let a: u8 = 200
+  let b: u8 = 100
+  let c = a + b            // expect 44   (200+100 wrap)
+  let d: u16 = 60000
+  let e: u16 = 10000
+  let f = d + e            // expect 4464 (70000 wrap)
+  let g: u8 = 255
+  let h: u8 = 1
+  let i = g + h            // expect 0    (255+1 wrap)
+  if c != 44 { exit(101) }
+  if f != 4464 { exit(102) }
+  if i != 0 { exit(103) }
+  // reversed layout (u16 first, u8 last) must also mask correctly
+  let p: u16 = 65000
+  let q: u16 = 5000
+  let r = p + q            // 70000 -> expect 4464 (const-folded path)
+  let s: u8 = 250
+  let t: u8 = 10
+  let u = s + t            // expect 4    (250+10 wrap)
+  if r != 4464 { exit(104) }
+  if u != 4 { exit(105) }
+  exit(7)                  // all correct
+}

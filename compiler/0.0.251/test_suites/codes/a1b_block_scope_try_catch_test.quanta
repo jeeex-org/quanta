@@ -1,0 +1,36 @@
+// A1b (0.0.237): the `catch` binder is scoped to the HANDLER, and a binding
+// made inside the handler must not outlive it. The binder used to be recorded
+// one level OUT, so `try {} catch e {}` left `e` resolvable for the rest of the
+// enclosing function -- the same silent-rebind shape as an inner `let`.
+//
+// Using the binder and handler-local bindings INSIDE the handler still works
+// (checked here, so the scoping change cannot silently break try/catch). Using
+// them after the handler is a compile error -- asserted in WIP.md, since this
+// harness runs binaries and cannot assert a compile failure.
+//
+// The deliverable of the catch payload is a SEPARATE, pre-existing defect: on
+// 0.0.236 and on this build alike, `print(e)` in a handler yields a garbage word
+// rather than the thrown value (measured: 4195119 for `throw 7`). This row
+// deliberately does not assert on that value.
+fn main() {
+    let got = 0
+    try {
+        got = 1
+        throw 7
+        got = 2
+    } catch e {
+        // handler-local binding, used inside the handler
+        let t = 21
+        t = t * 2
+        got = 3
+        if t != 42 { got = 9 }
+    }
+    if got != 3 { exit(1) }
+    // a second try/catch in the same function re-uses the binder name
+    let got2 = 0
+    try { throw 1 } catch e {
+        let u = e
+        got2 = 4 }
+    if got2 != 4 { exit(2) }
+    exit(42)
+}

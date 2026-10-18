@@ -1,0 +1,36 @@
+// A1b (0.0.237): a `let` inside a loop body must still INITIALISE ON EVERY
+// ITERATION. This is the semantics a failed earlier attempt broke by hoisting
+// declarations to function scope: `let x = f()` inside a loop, hoisted, runs
+// once instead of per iteration, so the loop accumulates one value.
+//
+// This row guards the phase-B migration: a per-site fix hoists a declaration
+// only where the initialiser keeps running where it is, or turns `let x = e`
+// inside the block into `x = e` so the initialiser stays in place.
+//
+// exits 42 while initialisation is per iteration; a hoisted `let v = i * 10`
+// would make sum 0 and exit 1 here.
+fn next(n) { return n + 1 }
+fn main() {
+    let sum = 0
+    let i = 0
+    while i < 4 { let v = i * 10
+        sum = sum + v
+        i = i + 1 }
+    if sum != 60 { exit(1) }
+    // same shape with a CALL in the initialiser (5 + 10 + 15 = 30)
+    let acc = 0
+    let j = 0
+    while j < 3 { let w = next(j) * 5
+        acc = acc + w
+        j = j + 1 }
+    if acc != 30 { exit(2) }
+    // a binding that must be re-zeroed each iteration (0 + 7 + 0 = 7)
+    let zeros = 0
+    let m = 0
+    while m < 3 { let z = 0
+        if m == 1 { z = 7 }
+        zeros = zeros + z
+        m = m + 1 }
+    if zeros != 7 { exit(3) }
+    exit(42)
+}

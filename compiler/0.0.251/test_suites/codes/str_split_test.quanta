@@ -1,0 +1,33 @@
+// 0.0.104: str_split(s, sep) — split a string on a single-byte separator.
+// Returns a qword array of N string-ptr elements; each element is an
+// independent string header (own mmap, [hdr]=len, bytes at hdr+8).
+// Verifies: part count, per-part length (len), and per-part byte content
+// (via str_eq against expected literals), plus edge cases.
+fn main() {
+  let ok = 0
+  // --- basic 3-part split ---
+  let parts = str_split("a,b,c", ",")
+  if len(parts) != 3 { exit(1) }
+  if len(parts[0]) != 1 { exit(2) }
+  if len(parts[1]) != 1 { exit(3) }
+  if len(parts[2]) != 1 { exit(4) }
+  if str_eq(parts[0], "a") == 0 { exit(5) }
+  if str_eq(parts[1], "b") == 0 { exit(6) }
+  if str_eq(parts[2], "c") == 0 { exit(7) }
+  // --- multi-byte segments ---
+  let p2 = str_split("hello,world", ",")
+  if len(p2) != 2 { exit(8) }
+  if len(p2[0]) != 5 { exit(9) }
+  if len(p2[1]) != 5 { exit(10) }
+  if str_eq(p2[0], "hello") == 0 { exit(11) }
+  if str_eq(p2[1], "world") == 0 { exit(12) }
+  // --- edge: no separator -> single part = whole string ---
+  let p3 = str_split("nomatch", ",")
+  if len(p3) != 1 { exit(13) }
+  if str_eq(p3[0], "nomatch") == 0 { exit(14) }
+  // --- edge: empty string -> single empty part ---
+  let p4 = str_split("", ",")
+  if len(p4) != 1 { exit(15) }
+  if len(p4[0]) != 0 { exit(16) }
+  exit(0)
+}

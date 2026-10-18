@@ -1,0 +1,201 @@
+// tests/lfm2_attn_perlayer_norm_test.quanta -- regression guard for the
+// per-layer attn_q_norm / attn_k_norm reload in fc_attention.
+//
+// THE DEFECT IT PINS (measured; see docs/research/lfm2-perlayer-norm-defect.md):
+// fc_attention allocated fc_at_qn / fc_at_kn and read the per-layer tensors inside
+// `if fc_at_q == 0`, i.e. on the FIRST attention layer only. Every later
+// attention layer then reused layer 2's weights. Measured, the stored K rows for
+// layers 5,9,13,17,21,24,27 were bit-for-bit what LAYER 2's k_norm produces
+// (|native - reference with layer 2's k_norm)| = 5.3e-15 while |native - reference with that
+// layer's OWN k_norm)| = 12.5..19.6). It is invisible at position 0 -- the
+// softmax is over one cached position, so the attention output is just v whatever
+// q and k are -- and from position 1 on it grows as the wrongly-normed keys
+// accumulate in the K cache, which is why the forward's logits drifted from
+// llama.cpp (corr 0.9997 at pos 0 -> 0.6881 at pos 4) while mean and sd stayed
+// right.
+//
+// WHY THE EXISTING stdlib_lfm2_attn_test DOES NOT CATCH IT: it exercises ONE
+// attention layer, so "reload when the layer changes" never fires, and its
+// reference reads the SAME layer's norm tensors -- it agrees whether the reload
+// exists or not. A guard must call TWO attention layers and check the SECOND
+// against ITS OWN norm, which is what this does.
+//
+// Cost: two attention-layer calls at pos 0 plus one hand K row. Needs the model
+// (the norms are real per-layer weights). Expected gate row, to be registered in
+// test_suites/EXPECTED_STDLIB.tsv with this file copied to test_suites/codes/:
+//     stdlib_lfm2_attn_perlayer_norm_test.quanta	0	/opt/ai/models/quanta/QUANTA-LFM2.5-2.6Bv1-Q4_K_M.gguf
+//
+// Build:  compiler/<ver>/bin/x86/qc tests/lfm2_attn_perlayer_norm_test.quanta <bin>
+// Run:    ./scripts/quanta_run.sh <bin> </dev/null      (rc 0 = pass)
+import std/gguf
+import std/lfm2_forward
+import std/lfm2_model
+import std/gguf_mm
+import std/math
+
+let MODEL = "/opt/ai/models/quanta/QUANTA-LFM2.5-2.6Bv1-Q4_K_M.gguf"
+let NCTX = 16
+let TOL = 0.000000001        // 1e-9: an f64 round-off budget
+let L_A = 2                  // the first attention layer (whose weights used to leak)
+let L_B = 5                  // the first attention layer AFTER it
+
+fn fill_x(x, n) {
+    // deterministic, non-degenerate: values in [-1.25, 1.25], never all equal
+    let i = 0
+    while i < n { mem_store(x + i * 8, i2f((i * 7) % 11 - 5) * 0.25); i = i + 1 }
+    return 0
+}
+
+fn maxdiff(a: u64, b: u64, n: i64) -> f64 {
+    let m: f64 = 0.0
+    let i = 0
+    while i < n {
+        let d: f64 = f64of(mem_load(a + i * 8)) - f64of(mem_load(b + i * 8))
+        if d < 0.0 { if (0.0 - d) > m { m = 0.0 - d } } else { if d > m { m = d } }
+        i = i + 1
+    }
+    return m
+}
+
+// Hand K row (head-major) for attention layer L at pos 0: read every k_proj row
+// whole, dot by hand, per-head RMSNorm with THAT LAYER'S k_norm. RoPE at pos 0 is
+// the identity (theta = 0), so it is correctly omitted.
+fn k_row_ref(L, x: u64, wbuf: u64, knbuf: u64, out: u64) -> i64 {
+    let dm = fc_d_model
+    let hd = fc_head_dim
+    let nkv = fc_nkv_of(L)
+    if read_tensor_f64(lfm2_attn_k(L), wbuf) < 0 { return -1 }
+    if read_tensor_f64(lfm2_attn_k_norm(L), knbuf) < 0 { return -1 }
+    let r = 0
+    while r < nkv * hd {
+        let acc: f64 = 0.0
+        let c = 0
+        while c < dm {
+            acc = acc + f64of(mem_load(wbuf + (r * dm + c) * 8)) * f64of(mem_load(x + c * 8))
+            c = c + 1
+        }
+        mem_store(out + r * 8, acc)
+        r = r + 1
+    }
+    let h = 0
+    while h < nkv {
+        let ss: f64 = 0.0
+        let j = 0
+        while j < hd {
+            let v = f64of(mem_load(out + (h * hd + j) * 8))
+            ss = ss + v * v
+            j = j + 1
+        }
+        let inv: f64 = 1.0 / sqrt(ss / i2f(hd) + fc_rms_eps)
+        j = 0
+        while j < hd {
+            let v = f64of(mem_load(out + (h * hd + j) * 8))
+            mem_store(out + (h * hd + j) * 8,
+                      v * inv * f64of(mem_load(knbuf + j * 8)))
+            j = j + 1
+        }
+        h = h + 1
+    }
+    return 0
+}
+
+// Copy the layer's OWN k_norm tensor into dst (hd values).
+fn knorm_ref(L, dst) {
+    let hd = fc_head_dim
+    read_tensor_f64(lfm2_attn_k_norm(L), dst)
+    return 0
+}
+
+// Copy the KV row of layer L, pos 0, out of the cache into `dst` (flat, nkv*hd).
+fn kv_row(L, dst) {
+    let hd = fc_head_dim
+    let h = 0
+    while h < fc_nkv_of(L) {
+        let j = 0
+        while j < hd {
+            mem_store(dst + (h * hd + j) * 8, fc_kv_get(L, 0, 0, h, j))
+            j = j + 1
+        }
+        h = h + 1
+    }
+    return 0
+}
+
+fn main() {
+    prints("=== lfm2 attn per-layer norm test ===\n")
+    if gguf_load(MODEL) != 0 { prints("FAIL gguf_load\n"); return 1 }
+    if fc_read_config() != 0 { prints("FAIL fc_read_config\n"); return 1 }
+    if fc_kv_init(NCTX) != 0 { prints("FAIL fc_kv_init\n"); return 1 }
+
+    let dm = fc_d_model
+    let hd = fc_head_dim
+    let nkv = fc_nkv_of(L_B)
+    let fails = 0
+
+    let x = mem_alloc(dm * 8)
+    fill_x(x, dm)
+    let out = mem_alloc(dm * 8)
+    let wbuf = mem_alloc(nkv * hd * dm * 8)
+    let knbuf = mem_alloc(hd * 8)
+    let knA = mem_alloc(hd * 8)
+    let refbuf = mem_alloc(nkv * hd * 8)
+    let got = mem_alloc(nkv * hd * 8)
+
+    // the two layers' k_norms must DIFFER, or the guard cannot bite
+    knorm_ref(L_A, knA)
+    knorm_ref(L_B, knbuf)
+    let d_norm = maxdiff(knA, knbuf, hd)
+    prints("L"); print(L_A); prints(" vs L"); print(L_B)
+    prints(" k_norm max|delta| = "); pf64(d_norm); newline()
+    if d_norm <= TOL {
+        prints("FAIL: the two layers' k_norm tensors are identical -- guard vacuous\n")
+        return 1
+    }
+
+    // call the FIRST attention layer, then a LATER one. The later call must
+    // reload its own q_norm/k_norm; that is the whole point.
+    if fc_attention(L_A, 0, x, out) != 0 { prints("FAIL fc_attention A\n"); return 1 }
+    if fc_attention(L_B, 0, x, out) != 0 { prints("FAIL fc_attention B\n"); return 1 }
+
+    // the stored K row of L_B must be the one ITS OWN k_norm makes
+    if k_row_ref(L_B, x, wbuf, knbuf, refbuf) != 0 { prints("FAIL k_row_ref B\n"); return 1 }
+    kv_row(L_B, got)
+    let e_own = maxdiff(got, refbuf, nkv * hd)
+    if k_row_ref(L_A, x, wbuf, knA, refbuf) != 0 { prints("FAIL k_row_ref A\n"); return 1 }
+    let e_other = maxdiff(got, refbuf, nkv * hd)
+
+    prints("K row L"); print(L_B); prints(" pos0: |stored - reference(own k_norm)| = "); pf64(e_own)
+    prints("   |stored - reference L"); print(L_A); prints(" k_norm)| = "); pf64(e_other); newline()
+    if e_own > TOL {
+        prints("FAIL: the stored K row is not the one layer ")
+        print(L_B); prints("'s OWN k_norm produces\n")
+        fails = fails + 1
+    }
+    if e_other <= TOL {
+        prints("FAIL: the stored K row matches layer ")
+        print(L_A); prints("'s k_norm -- the per-layer reload is broken\n")
+        fails = fails + 1
+    }
+
+    // the module's live norm buffers must hold L_B's weights, not L_A's
+    let d_live = maxdiff(fc_at_kn, knbuf, hd)
+    prints("live fc_at_kn vs L"); print(L_B); prints(" k_norm: max|delta| = "); pf64(d_live); newline()
+    if d_live > TOL {
+        prints("FAIL: fc_at_kn still holds another layer's k_norm after fc_attention(L")
+        print(L_B); prints(")\n")
+        fails = fails + 1
+    }
+    // ... and the same for q_norm, which no K-row check can see
+    read_tensor_f64(lfm2_attn_q_norm(L_B), knA)
+    let d_liveq = maxdiff(fc_at_qn, knA, hd)
+    prints("live fc_at_qn vs L"); print(L_B); prints(" q_norm: max|delta| = "); pf64(d_liveq); newline()
+    if d_liveq > TOL {
+        prints("FAIL: fc_at_qn still holds another layer's q_norm after fc_attention(L")
+        print(L_B); prints(")\n")
+        fails = fails + 1
+    }
+
+    if fails == 0 { prints("PASS: per-layer attn_q_norm/attn_k_norm reload\n"); return 0 }
+    prints("FAILURES: "); print(fails); newline()
+    return 1
+}

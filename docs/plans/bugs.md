@@ -1318,7 +1318,7 @@ This is why `float` (**127 vs 8 = 15.9x**) and `heavy_float` (**65 vs 6 = 10.8x*
 *honest* rows in the suite: both sides are scalar with no vectorisation, so the entire gap is
 allocation and marshalling.
 
-### A33 · OPEN (compiler, 0.0.248) · `loop_depth` is never incremented, so the integer-overflow trap fires in every loop
+### A33 · **FIXED (0.0.251)** (compiler) · `loop_depth` was never incremented, so the integer-overflow trap fired in every loop
 
 `codegen.quanta:1446` declares `let loop_depth = 0` and **nothing ever increments it** (grep finds
 only reads, at `:1520` and `:1894`). The guard's intent was to skip the overflow trap inside loops;
@@ -1364,6 +1364,23 @@ So the work is not a new region type, it is:
 
 **Never wire `loop_depth` up** — that would silently re-enable the suppression the author never
 asked for, and the flag is dead for a reason.
+
+**LANDED (0.0.251).** Both halves of the resolution were done, in that order.
+(a) The escape hatch is now tested, in BOTH directions, by two new gate rows:
+`test_suites/codes/unsafe_ovf_suppressed_test.quanta` — `i64::MAX` added five times inside
+`unsafe { }`, wrapping to exactly `9223372036854775803`, and `s - 9223372036854775803` returned as
+the exit code: **exit 0**, so no SIGILL fired AND the wrapped value is the documented one; and
+`test_suites/codes/unsafe_ovf_trap_test.quanta` — the identical statement WITHOUT `unsafe { }`:
+**exit 132** (SIGILL). The second row is what stops the first from being satisfiable by deleting
+the trap globally.
+(b) The constant-true guard is deleted: `let loop_depth = 0` is gone and the four
+`if loop_depth == 0 { ovf_trap_emit(ii) }` sites are plain `ovf_trap_emit(ii)` (integer
+add/sub/mul/neg). **Proven a no-op on codegen the only way it can be: all 240 gate rows compile
+byte-identically under 0.0.250 and 0.0.251** (0 differing, 0 compile-fail), so the guard was
+constant-true as claimed and nothing but the compiler's own object code changed.
+(c) `unchecked { }` as a second spelling was **not** added: the existing `unsafe { }` already
+covers the narrow arithmetic case per operation, and two spellings for one IR flag is a language
+decision the author has not asked for. The warning above still stands.
 
 ### A34 · OPEN (lib/std) · `f32_to_f64` is a hand-rolled per-element software conversion — measured 78-363 ns/element
 
