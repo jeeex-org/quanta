@@ -1275,7 +1275,7 @@ Expected: exact nearest-even conversion for every literal length the lexer accep
 a generated set). Not fixed in 0.0.248 — it is a front-end conversion lever of its own, and fixing
 it inside the f16/f32 work would mix two subjects in one version.
 
-### A29 · OPEN (compiler, 0.0.248) · `adistinct` writes back the home slot of every operand it evicts — ~50% of a hot loop is marshalling
+### A31 · OPEN (compiler, 0.0.248) · `adistinct` writes back the home slot of every operand it evicts — ~50% of a hot loop is marshalling
 
 `adistinct(res, a1, a2)` (`emitter.quanta:473-488` in 0.0.247, `:499` in 0.0.248) evicts every
 allocation entry bound to `a1` or `a2`, and for each one does
@@ -1304,7 +1304,7 @@ one sar costs.** The arithmetic is not slow; the marshalling is.
 Fix prerequisite already audited: all 20 direct `spill_home` readers in `codegen.quanta` are guarded
 (16 inside a `flush_all` scope, 2 self-protected by an explicit write-then-read) — 0 hazards.
 
-### A30 · OPEN (compiler, 0.0.248) · the float register allocator is dead code — and enabling it as written would corrupt the caller's frame
+### A32 · OPEN (compiler, 0.0.248) · the float register allocator is dead code — and enabling it as written would corrupt the caller's frame
 
 `fphys()` is defined at `emitter.quanta:786` with **zero call sites** (grep returns only the
 definition). So FP values live in general-purpose registers and round-trip through `xmm` on every
@@ -1318,7 +1318,7 @@ This is why `float` (**127 vs 8 = 15.9x**) and `heavy_float` (**65 vs 6 = 10.8x*
 *honest* rows in the suite: both sides are scalar with no vectorisation, so the entire gap is
 allocation and marshalling.
 
-### A31 · OPEN (compiler, 0.0.248) · `loop_depth` is never incremented, so the integer-overflow trap fires in every loop
+### A33 · OPEN (compiler, 0.0.248) · `loop_depth` is never incremented, so the integer-overflow trap fires in every loop
 
 `codegen.quanta:1446` declares `let loop_depth = 0` and **nothing ever increments it** (grep finds
 only reads, at `:1520` and `:1894`). The guard's intent was to skip the overflow trap inside loops;
