@@ -142,8 +142,29 @@ The corrected tool, `test_suites/scripts/objdump_seq_diff.py`, (a) compiles with
 `--emit-obj`, which does produce sections, (b) REFUSES to report a verdict when either
 side disassembles to fewer than 10 instructions, so a vacuous pass cannot recur, and
 (c) compares instruction SEQUENCES with difflib rather than multisets, so a
-count-preserving register rename is visible. Its numbers for 0.0.251 -> 0.0.252 and for
-0.0.249 -> 0.0.250 are reported in the phase-3 summary, not guessed here.
+count-preserving register rename is visible.
+
+MEASURED with it, over all 242 gate rows (`--emit-obj`, both compilers, whole-object
+instruction / frame-store / frame-load counts):
+
+| pair | identical | differing | Σ Δinstr | Σ Δhome stores | Σ Δhome loads |
+|---|---|---|---|---|---|
+| 0.0.249 -> 0.0.250 (F2) | 10 | **232** | **-46732** | **-46732** | **0** |
+| 0.0.251 -> 0.0.252 (F3) | 5 | 237 | -29333 | -17068 | -14585 |
+
+For **F2 every one of the 232 differing rows satisfies `Δinstr == Δhome-stores` with
+`Δhome-loads == 0`** — 46732 instructions removed across the suite and every single one
+of them a frame-relative store, with not one home load added anywhere. That is the
+lever's claim stated as a measurable, per-row property, and it is the replacement for
+the withdrawn multiset line.
+
+F3's totals are NOT a pure-store identity, and the difference is explainable rather than
+hidden: -17068 stores and -14585 loads, but only -29333 instructions net, because
+materialising the terminator's operand into a register means `rr(0, rvz)` is now a real
+`mov` where the old `aphys` load went straight into `rax` — so a compensating register
+move appears. That is the shape a reorder has, not the shape a deletion has, and it is
+why F3's equivalence is carried by the behavioural oracles rather than by a
+subset property.
 
 Equivalence for this version rests on the behavioural oracles, all measured in this run:
 the gate's **242/242** exit-code match (including `question_mark.quanta`, which this

@@ -141,8 +141,14 @@ with `--emit-obj` (relocatable objects DO have sections, and that is the artefac
 `scripts/bench_instr.sh` already uses), it REFUSES to report a verdict when either side
 disassembles to fewer than 10 instructions so a vacuous pass cannot recur, and it
 compares instruction SEQUENCES with `difflib` rather than multisets so a count-preserving
-register rename is visible. Its measured result for 0.0.249 -> 0.0.250 is reported in the
-phase-3 summary; no claim here rests on it.
+register rename is visible.
+
+MEASURED with it, all 242 gate rows, `--emit-obj` both sides, whole-object counts:
+**10 identical / 232 differing, and every one of the 232 differing rows satisfies
+`Δinstr == Δhome-stores` with `Δhome-loads == 0`** — summed over the suite, **-46732
+instructions and -46732 frame-relative stores, with 0 home loads added anywhere.** That
+is the claim this version needed, restated as a per-row measurable identity, and it now
+rests on real disassembly of artefacts that have sections.
 
 What 0.0.250's equivalence actually rests on is unchanged and was measured directly:
 gate **240/240** exit-code match, all 38 benchmark outputs matching their C twins
