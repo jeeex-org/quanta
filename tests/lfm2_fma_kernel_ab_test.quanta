@@ -118,18 +118,16 @@ fn cmpall(dtype, toff, rb, cols, x, argp, acc) {
     let sgnflip = 0         // bit patterns with opposite sign bits
     let bothnan = 0         // both results are NaN (different bit patterns)
     let onenan = 0          // exactly one is NaN -- a CLASS difference, must be 0
-    // THE MAX ACCUMULATOR LIVES IN MEMORY, NOT IN A LOCAL, and that is a
-    // measurement result, not style. As a register local it read back exactly
-    // 0.0 while `bad` counted 85 differing rows in the same call -- i.e. it was
-    // destroyed. The loop body contains a `closure_call` into the JIT'd kernel,
-    // which uses every ymm/xmm register, and a float local live across it did
-    // not survive. A CONTROL probe settled the scope: an ordinary Quanta call
-    // does preserve a live f64 local across it (verified), so this is specific
-    // to the closure_call path, and NOT a property of the shipped loader, whose
-    // kernels write their result straight to memory
-    // (`mem_store(pl_y + r*8, jit_f_apply_folded(fargs))`).
-    // The model-level bound below (PART 2) has no call in its loop and was
-    // unaffected -- it reproduced identically three times.
+    // The max accumulator is a memory cell rather than a register local. That
+    // started as an attempt to explain a column that read 0.0 while `bad` counted
+    // 85 differing rows in the same call, on the theory that a float local live
+    // across the loop's `closure_call` had been destroyed. **That theory is
+    // REFUTED**: the memory cell gave the SAME 0.0 on the next run. The real
+    // explanation is below -- those rows have a NaN result in BOTH kernels, and
+    // for a NaN every one of `d < 0`, `d > prev`, `d == 0` is false. The cell is
+    // kept because it is harmless and because the integer NaN classification
+    // beside it is what actually settled the question. See
+    // docs/research/f32-fma-loader-kernels.md sections 2.3 and 8.
     mem_store(acc + 16, 0.0)
     let r = 0
     while r < NROWS {

@@ -627,21 +627,21 @@ main thread). A 17% kernel win on 56.4% of a token is a ~9.6% ceiling on the tok
 
 ## 8. Routed, not done here
 
-0. **A float local does not survive `closure_call`.** While building PART 1 of the
-   FMA harness, a `let maxd: f64 = 0.0` accumulator read back exactly `0.0` at the
-   end of a loop that had counted 85 differing rows in the same call — i.e. it was
-   destroyed. Moving the identical accumulator into MEMORY made the column report a
-   real value on the next run. A control settled the scope: **an ordinary Quanta
-   function call DOES preserve a live f64 local across it** (verified with a
-   two-function probe), so the loss is specific to the `closure_call` path. It does
-   **not** affect the shipped loader — every kernel call there writes its result
-   straight to memory (`mem_store(pl_y + r*8, jit_f_apply_folded(fargs))`) and keeps
-   no float live across the call — and it does not affect the model-level bound,
-   whose loop has no call in it. It is routed because it is a silent-wrong-number
-   class for anyone who does keep one: the fix belongs in the emitter's flush for
-   `CLOSURE_CALL`, and it should pour any live float vregs to their home slots the
-   way a normal call does.
-
+0. **A REFUTED hypothesis, recorded so nobody chases it: "a float local does not
+   survive `closure_call`".** While building PART 1 of the FMA harness, a
+   `let maxd: f64 = 0.0` accumulator read back exactly `0.0` at the end of a loop
+   that had counted 85 differing rows in the same call. The obvious reading was
+   that the accumulator had been destroyed, and the loop body does contain a
+   `closure_call` into the JIT'd kernel, which uses every ymm/xmm register.
+   **The hypothesis was tested and is FALSE**: moving the identical accumulator
+   into MEMORY (where no register allocator can touch it) gave the **same** 0.0 on
+   the next run. The real explanation is in §2.3 — the differing rows have a NaN
+   result in *both* kernels, and for a NaN every one of `d < 0`, `d > prev`,
+   `d == 0` is false, so no maximum is ever recorded. A control probe did confirm
+   that an ordinary Quanta call preserves a live f64 local, so there was never a
+   clobber to explain. **No compiler defect is filed here**, and the lesson is that
+   "a column read 0" is a symptom to be explained, not evidence for the first
+   mechanism that fits it.
 
 1. **`ret_expr_is_float()` does not know the f16/f32 conversion builtins**
    (`compiler/src/x86/funcscan.quanta`). One line: add `f16bits_to_f64`,
