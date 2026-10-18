@@ -1304,7 +1304,7 @@ one sar costs.** The arithmetic is not slow; the marshalling is.
 Fix prerequisite already audited: all 20 direct `spill_home` readers in `codegen.quanta` are guarded
 (16 inside a `flush_all` scope, 2 self-protected by an explicit write-then-read) — 0 hazards.
 
-### A32 · OPEN (compiler, 0.0.248) · the float register allocator is dead code — and enabling it as written would corrupt the caller's frame
+### A32 · **FIXED (0.0.253)** (compiler) · the float register allocator is dead code — and enabling it as written would corrupt the caller's frame
 
 `fphys()` is defined at `emitter.quanta:786` with **zero call sites** (grep returns only the
 definition). So FP values live in general-purpose registers and round-trip through `xmm` on every
@@ -1410,7 +1410,7 @@ free list, but VmSize/VmPeak only ever grow. That is the exact mechanism behind 
 space growth that was tracked for several rounds: 16 `read_tensor_f64` calls/token x 4,096 B = **64 KB
 per token, to the byte**, now measured at **0** after caching the two per-layer attn norms.
 
-### A36 · OPEN (compiler 0.0.252) · float-return inference by TOKEN SCAN misclassifies the conversion builtins — a wrapper without `-> f64` is silently inferred integer-returning
+### A36 · **FIXED (0.0.254)** (compiler) · float-return inference by TOKEN SCAN misclassifies the conversion builtins — a wrapper without `-> f64` is silently inferred integer-returning
 
 `funcscan.quanta:1414 fn ret_expr_is_float(start, end)` decides a function's return type by walking
 **every token** of its body looking for floatness markers. The conversion builtins are **not in that
