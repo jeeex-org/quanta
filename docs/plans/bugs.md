@@ -1274,3 +1274,59 @@ Expected: exact nearest-even conversion for every literal length the lexer accep
 17-digit case included in a fixture-driven row (compare against the host compiler's own strtod over
 a generated set). Not fixed in 0.0.248 — it is a front-end conversion lever of its own, and fixing
 it inside the f16/f32 work would mix two subjects in one version.
+
+### A29 · OPEN (compiler, 0.0.248) · `adistinct` writes back the home slot of every operand it evicts — ~50% of a hot loop is marshalling
+
+`adistinct(res, a1, a2)` (`emitter.quanta:473-488` in 0.0.247, `:499` in 0.0.248) evicts every
+allocation entry bound to `a1` or `a2`, and for each one does
+`if r8(vr_init+ev_vr)!=0 { wbp(spill_home(ev_vr), pr) }` — it **stores the operand's live value to its
+home slot**. 36 call sites in `codegen.quanta`.
+
+The operands are still live, nothing clobbers their registers, and nothing reads those slots before
+the next write — so the stores are dead, and the operands' next use simply reloads them.
+
+Emitted-byte evidence (`arith`, `i*7`): stores to both operand homes at `0x14b`/`0x153`, `imul` at
+`0x15e`, later reload of `i`. Not read from source — read from the object.
+
+Measured: **loop-restricted home-op share 33-59%, median 50.7%, against 0.0% in every C twin**, and
+**30-67% of those stores are provably dead** (cyclic dead-store walk: arith 15/26, div_const 18/29,
+heavy_div 10/17, heavy_float 8/21, float 13/43, regpressure 68/101).
+
+This also corrects a recorded belief: the register pool never fills *because this empties the map on
+every binary op*, so residency never accumulates. The lever is "stop evicting live operands", not
+"choose better victims".
+
+Decisive control experiment: `s+i*7`, `s+i*8`, `s+i*3` and `s+i/8` all emit **exactly 45
+instructions** — the three multiplies are byte-identical apart from the immediate (normalised md5
+`1a89553d7e`) and the divide differs only by `sar` vs `imul`. **One add costs what one mul costs what
+one sar costs.** The arithmetic is not slow; the marshalling is.
+
+Fix prerequisite already audited: all 20 direct `spill_home` readers in `codegen.quanta` are guarded
+(16 inside a `flush_all` scope, 2 self-protected by an explicit write-then-read) — 0 hazards.
+
+### A30 · OPEN (compiler, 0.0.248) · the float register allocator is dead code — and enabling it as written would corrupt the caller's frame
+
+`fphys()` is defined at `emitter.quanta:786` with **zero call sites** (grep returns only the
+definition). So FP values live in general-purpose registers and round-trip through `xmm` on every
+operation — 17 such round trips in `float`'s hot loop alone.
+
+Worse, it cannot simply be switched on: **`fspill_home` writes ~8 KB below `%rbp` while the frame
+reserves 1120 bytes**, so enabling the float allocator as written writes outside the frame. The
+frame/offset mismatch is the prerequisite.
+
+This is why `float` (**127 vs 8 = 15.9x**) and `heavy_float` (**65 vs 6 = 10.8x**) are the worst
+*honest* rows in the suite: both sides are scalar with no vectorisation, so the entire gap is
+allocation and marshalling.
+
+### A31 · OPEN (compiler, 0.0.248) · `loop_depth` is never incremented, so the integer-overflow trap fires in every loop
+
+`codegen.quanta:1446` declares `let loop_depth = 0` and **nothing ever increments it** (grep finds
+only reads, at `:1520` and `:1894`). The guard's intent was to skip the overflow trap inside loops;
+with `loop_depth` stuck at 0 it never suppresses, so `jno; ud2` is emitted on every integer
+add/sub/mul/neg — measured at 21% of `regpressure`'s loop body.
+
+**This is a SEMANTICS decision, not a plain fix.** The trap exists to catch real overflow; deleting it
+would trade correctness for speed, which is the opposite of this project's standing. The right shape
+is a language-level *unchecked* region so the author can state "this cannot overflow here" — tracked
+as `docs/plans/language-capabilities.md` #18, and it follows from the standing policy that the
+LANGUAGE capability ships first rather than the trap being quietly removed.
