@@ -96,7 +96,7 @@ run_arm () {
     printf '%s\n' "$line" > "$CONF"
     echo "=== $tag ==="
     echo "conf    : $(cat $CONF)"
-    echo "          fields: workers len1 len2 len3 mmap cache_norms ignore_eos fused_q4k fused_q6k [prof] [prof_work] [fused_chain]"
+    echo "          fields: workers len1 len2 len3 mmap cache_norms ignore_eos fused_q4k fused_q6k [prof] [prof_work] [fused_chain] [fused_glu] [fused_attn] [fused_conv]"
     echo "load_pre: $(cat /proc/loadavg)"
     echo "start   : $(date '+%F %T')"
     ( ulimit -c 0 -v 32000000; timeout 7200 nice -n 0 "$BENCH" </dev/null ) > "$log" 2>&1
