@@ -293,6 +293,16 @@ fn main() {
         arm = arm + 1
     }
     if mem_load(wfma + 8) != 1 { prints("FAIL: arm1 did not dispatch the FMA kernel\n"); return 45 }
+    // The two f32 arms must be DISTINGUISHABLE by their witnesses, or an arm that
+    // never ran the fused fold would look exactly like one that did: arm3 must
+    // report BOTH f32_used and fma_used, arm2 must report f32_used and NOT
+    // fma_used. (Measured before the witness fix: both printed fma_used=0.)
+    if mem_load(w32 + 3 * 8) != 1 || mem_load(wfma + 3 * 8) != 1 {
+        prints("FAIL: arm3 (f32+fma) did not dispatch the FUSED f32 kernel\n"); return 46
+    }
+    if mem_load(w32 + 2 * 8) != 1 || mem_load(wfma + 2 * 8) != 0 {
+        prints("FAIL: arm2 (f32 only) must dispatch the unfused f32 kernel\n"); return 47
+    }
     prints("PASS: every arm's first argmax is 597, all 25 per-step argmax and the\n")
     prints("      first 24 generated ids are IDENTICAL across all four arms, and the\n")
     prints("      f32 kernels dispatched (witnesses asserted). The logit excursions\n")

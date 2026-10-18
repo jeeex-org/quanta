@@ -2438,6 +2438,13 @@ fn pl_run_rows_map(t: i64, cell) {
             if fused32 != 0 {
                 if fusedfma != 0 {
                     mem_store(pl_y + r * 8, jit_f_apply_folded_f32_fma(fargs))
+                    // BOTH witnesses, deliberately: fma_used must be evidence
+                    // that the FUSED fold ran. Without this the f32 and the
+                    // f32+FMA arms report the SAME witnesses, so an arm that
+                    // never dispatched the fused kernel would be indistinguishable
+                    // from one that did -- measured: the 4-arm harness's arm 3
+                    // (f32=1 fma=1) printed fma_used=0 before this.
+                    mm_fused_fma_used = 1
                 } else {
                     mem_store(pl_y + r * 8, jit_f_apply_folded_f32(fargs))
                 }
@@ -2457,6 +2464,7 @@ fn pl_run_rows_map(t: i64, cell) {
             if fused32 != 0 {
                 if fusedfma != 0 {
                     mem_store(pl_y + r * 8, jit_f_apply_folded_q6k_f32_fma(fargs6))
+                    mm_fused_fma_used = 1
                 } else {
                     mem_store(pl_y + r * 8, jit_f_apply_folded_q6k_f32(fargs6))
                 }
