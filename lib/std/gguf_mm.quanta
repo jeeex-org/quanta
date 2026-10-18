@@ -1466,6 +1466,11 @@ let pl_x = 0
 let pl_xf32 = 0
 let pl_xf32_cap = 0
 let pl_xf32_allocs = 0     // sticky evidence: how many grows this process did
+// Total ELEMENTS narrowed into the f32 buffer, so the per-token cost of this
+// route's main-thread prologue is a MEASURED number rather than an estimate. It
+// is the only work the f32 route adds on the critical path, so it must be
+// reported with the win, not hidden beside it.
+let pl_xf32_elems = 0
 let pl_rows = 0
 let pl_cols = 0
 let pl_y = 0
@@ -1506,6 +1511,7 @@ fn pl_xf32_ensure(n: i64) -> i64 {
 // f32 route move bits relative to the f64 one, and it is measured, not assumed
 // (tests/lfm2_f32_kernel_ab_test.quanta).
 fn pl_xf32_fill(x, n: i64) -> i64 {
+    pl_xf32_elems = pl_xf32_elems + n
     let c = 0
     while c < n {
         mem_store32(pl_xf32 + c * 4, f64_to_f32bits(f64of(mem_load(x + c * 8))))
@@ -1516,6 +1522,7 @@ fn pl_xf32_fill(x, n: i64) -> i64 {
 fn pl_xf32_ptr() { return pl_xf32 }
 fn pl_xf32_cap_get() { return pl_xf32_cap }
 fn pl_xf32_allocs_get() { return pl_xf32_allocs }
+fn pl_xf32_elems_get() { return pl_xf32_elems }
 
 // kind 7 (parallel attention): q/out pointers, per-worker score scratch, the KV
 // cache addressing (computed by the caller from lfm2_forward's own layout, so
