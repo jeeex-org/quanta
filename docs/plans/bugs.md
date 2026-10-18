@@ -1348,3 +1348,19 @@ So A33 is **not** "the language cannot express this". A33 is (a) the `loop_depth
 constant-true dead code that misrepresents the compiler, and (b) **nothing tests the escape
 hatch**, so it can regress silently. Design, measurement and the proposed order of work:
 **`docs/research/phase2-a33-unchecked-design.md`**. Still OPEN — not landed in 0.0.249.
+
+**RESOLUTION (measured 2026-10-18, 0.0.249): the language capability already exists — do NOT build a new one.**
+`unsafe{}` already suppresses **three** traps per operation, gated on `r8(ir_unsafe+ii)==0`:
+`ovf_trap_emit` (`emitter.quanta:250`), `shl_trap_emit` (`:256`) and `idx_trap_emit` (`:322`). The
+construct is load-bearing — `compute_magic` depends on it. Measured: wrapping one statement in
+`unsafe{}` takes a loop **39 -> 35 instructions (-10.3%)** and `main`'s `ud2` count **3 -> 1** (the
+survivor lies outside the block).
+
+So the work is not a new region type, it is:
+1. red-first rows proving the trap IS suppressed under `unsafe{}` **and** that it still SIGILLs
+   without it;
+2. **delete the constant-true `loop_depth` guard** (byte-identity must stay 239/239 identical);
+3. only then consider `unchecked{}` as a second spelling.
+
+**Never wire `loop_depth` up** — that would silently re-enable the suppression the author never
+asked for, and the flag is dead for a reason.
