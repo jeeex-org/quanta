@@ -1364,3 +1364,31 @@ So the work is not a new region type, it is:
 
 **Never wire `loop_depth` up** — that would silently re-enable the suppression the author never
 asked for, and the flag is dead for a reason.
+
+### A34 · OPEN (lib/std) · `f32_to_f64` is a hand-rolled per-element software conversion — measured 78-363 ns/element
+
+`lib/std/gguf.quanta:1592 fn f32_to_f64(ptr)` decodes IEEE-754 by hand with a per-element exponent
+loop. Measured **78-363 ns per element**, against a hardware conversion that is a single instruction
+(`cvtss2sd`) — roughly **100x**. A landmine for ANY f32/f16 tensor in a hot path.
+
+Dormant on the current model (it has no f16 tensors anywhere, and the only per-token f32 use was the
+per-layer attn-norm read, removed this round as 16 redundant calls/token), so this is not a current
+performance item — it is a PREREQUISITE. Any future f16 KV cache or f32 activation path converts per
+element and would be ~100x slower on the conversion alone.
+
+The language gained native f16/f32 types and round-to-nearest-even conversions in 0.0.247/0.248
+(bit-pinned against ggml's `fp32_to_fp16`/`fp16_to_fp32` over exhaustive coverage). `lib/std` should
+adopt them and delete the hand-rolled versions rather than keep two implementations.
+
+### A35 · OPEN (lib/std, minor) · `mm_pool_ensure`'s resize branch is unreachable and its comment is false
+
+The resize/reallocation branch cannot be reached — callers overwrite `pl_cell_cols` before its own
+check runs. Harmless at the current scratch margin (measured 1.52x), but the comment beside it claims
+a resize path that does not exist, which is worse than no comment: it invites a future reader to rely
+on it. Carpets the class of hazard, not the hazard.
+
+**Related mechanism, worth recording rather than filing as a bug:** `mem_alloc` is a raw `mmap`
+syscall and **`mem_free` only pushes a free-list node — it never unmaps**. Pages ARE reusable via the
+free list, but VmSize/VmPeak only ever grow. That is the exact mechanism behind the per-token address
+space growth that was tracked for several rounds: 16 `read_tensor_f64` calls/token x 4,096 B = **64 KB
+per token, to the byte**, now measured at **0** after caching the two per-layer attn norms.
