@@ -25,7 +25,7 @@
 #   conc      SHORT run with prof_work=1 -- pool concurrency only, times void.
 #   ab        baseline vs the change under test (conf field 12), timer OFF.
 #
-# Usage: bash tests/lfm2_prof_ab.sh exact|baseline|prof|conc|ab
+# Usage: bash tests/lfm2_prof_ab.sh exact|baseline|prof|prof_chain|conc|ab
 set -u
 cd "$(dirname "$0")/.." || exit 2
 REPO="$PWD"
@@ -110,6 +110,23 @@ run_arm () {
 stage_baseline () { bench_build; run_arm "BASELINE rate, timer OFF (canonical-ish)" "20 $LENS 1 1 1 1 1 0 0" $LOGD/prof_stage_baseline.log; }
 stage_prof     () { bench_build; run_arm "PROF phase table, timer ON, prof_work ON" "20 $LENS 1 1 1 1 1 1 1" $LOGD/prof_stage_prof.log; }
 stage_prof_nw  () { bench_build; run_arm "PROF phase table, timer ON, prof_work OFF" "20 $LENS 1 1 1 1 1 1 0" $LOGD/prof_stage_prof_nw.log; }
+# POST-CHAIN profile: field 12 (fused_chain=1) IS present, so this measures the
+# phase table AFTER the chain kernel's ~448 ms/token saving, which stage_prof
+# (11 fields, chain defaults 0) does NOT. The missing 12th field is exactly the
+# silent-wrong-arm hazard the peer hit -- the driver's run_arm prints the conf,
+# and the bench prints fused_chain_active/used so the arm is attributable.
+stage_prof_chain () { bench_build; run_arm "PROF phase table, chain ON (field12=1), timer ON, prof_work ON" "20 $LENS 1 1 1 1 1 1 1 1" $LOGD/prof_stage_prof_chain.log; }
+# GLU A/B: field 13 (fused_glu) is the change under test; chain is ON in BOTH arms
+# (field 12 = 1). Field order printed by run_arm:
+#   workers len1 len2 len3 mmap cache_norms ignore_eos fused_q4k fused_q6k prof prof_work fused_chain fused_glu
+stage_ab_glu () {
+    echo "=== STAGE ab_glu: chain=1 both arms; glu OFF vs ON; timer OFF ==="
+    bench_build
+    run_arm "A glu=0 chain=1" "20 $LENS 1 1 1 1 1 0 0 1 0" $LOGD/prof_ab_glu_A.log
+    run_arm "B glu=1 chain=1" "20 $LENS 1 1 1 1 1 0 0 1 1" $LOGD/prof_ab_glu_B.log
+}
+# GLU phase table: chain ON + glu ON, timer ON -> silu_glu's new us_tok.
+stage_prof_glu () { bench_build; run_arm "PROF chain+glu ON, timer ON, prof_work ON" "20 $LENS 1 1 1 1 1 1 1 1 1" $LOGD/prof_stage_prof_glu.log; }
 stage_conc     () { bench_build; run_arm "CONC pool concurrency, prof_work=1 (SHORT; times void)" "20 $CONC_LENS 1 1 1 1 1 1 1" $LOGD/prof_stage_conc.log; }
 
 stage_ab () {
@@ -125,9 +142,12 @@ case "${1:-}" in
     exact)    stage_exact ;;
     baseline) stage_baseline ;;
     prof)     stage_prof ;;
+    prof_chain) stage_prof_chain ;;
+    ab_glu)   stage_ab_glu ;;
+    prof_glu) stage_prof_glu ;;
     conc)     stage_conc ;;
     ab)       stage_ab ;;
-    *) echo "usage: $0 exact|baseline|prof|conc|ab"; exit 2 ;;
+    *) echo "usage: $0 exact|baseline|prof|prof_chain|ab_glu|prof_glu|conc|ab"; exit 2 ;;
 esac
 
 printf '%s\n' "$CONF_CANON" > "$CONF"

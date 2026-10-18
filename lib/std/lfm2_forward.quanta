@@ -1189,14 +1189,27 @@ fn fc_layer(L, pos, inp: u64, out: u64) -> i64 {
     if mm_matvec(ut, fc_fw_n, dff, dm, fc_ffn_f_up) != 0 { fc_prof_stop(FCP_UP); return -1 }
     fc_prof_stop(FCP_UP)
     fc_prof_begin(FCP_SILU)
-    i = 0
-    while i < dff {
-        let g = f64of(mem_load(fc_ffn_f_gate + i * 8))
-        // silu(g) = g * sigmoid(g)
-        let sg: f64 = 1.0 / (1.0 + expf(0.0 - g))
-        let uv = f64of(mem_load(fc_ffn_f_up + i * 8))
-        mem_store(fc_fw_f + i * 8, g * sg * uv)
-        i = i + 1
+    // Opt-in parallel GLU (mm_set_fused_glu, bench conf field 13). The scalar
+    // loop below is the REFERENCE; mm_glu_par runs byte-identical arithmetic on
+    // the pool in static contiguous slices (elementwise -> slicing is the correct
+    // partition, not a workaround, because there is no accumulation and no shared
+    // output word). On ANY decline -- pool not the right width, serial path -- the
+    // scalar loop runs, so the flag can only lose the optimisation, never change
+    // an answer.
+    let glu_ok = -1
+    if mm_get_fused_glu() != 0 {
+        glu_ok = mm_glu_par(fc_ffn_f_gate, fc_ffn_f_up, fc_fw_f, dff, mm_get_workers())
+    }
+    if glu_ok != 0 {
+        i = 0
+        while i < dff {
+            let g = f64of(mem_load(fc_ffn_f_gate + i * 8))
+            // silu(g) = g * sigmoid(g)
+            let sg: f64 = 1.0 / (1.0 + expf(0.0 - g))
+            let uv = f64of(mem_load(fc_ffn_f_up + i * 8))
+            mem_store(fc_fw_f + i * 8, g * sg * uv)
+            i = i + 1
+        }
     }
     fc_prof_stop(FCP_SILU)
     fc_prof_begin(FCP_DOWN)

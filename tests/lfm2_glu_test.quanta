@@ -1,0 +1,182 @@
+// tests/lfm2_glu_test.quanta
+//
+// ELEMENT-WISE BIT-EXACTNESS FOR THE PARALLEL GLU (mm_glu_par, pool kind 6).
+//
+// The logits gate (tests/lfm2_fused_logits_test.quanta pass6) proves the whole
+// MODEL is unchanged with the parallel GLU on. This test proves the OP is
+// unchanged, over a much wider input domain than any prompt reaches, and at
+// several worker counts and non-divisible lengths -- the shapes where a static
+// slice's last-worker-absorbs-remainder rule can go wrong.
+//
+// WHAT IS COMPARED: the exact scalar reference
+//     out[i] = g[i] * (1.0/(1.0 + expf(0.0 - g[i]))) * u[i]
+// evaluated on the main thread, against the pool's static contiguous slices.
+// Both sides use the SAME lib/std/math.quanta expf and the same operation
+// order, so the comparison is on raw f64 BITS and expects 0 differences.
+//
+// Also asserts the DISPATCH WITNESS (mm_get_glu_used == 1): a pass that declined
+// the pool and silently fell back to the scalar loop would match trivially.
+//
+// Build: ./compiler/0.0.247/bin/x86/qc -O tests/lfm2_glu_test.quanta <bin>
+// Run:   ( ulimit -c 0 -v 8000000; nice -n 0 <bin> </dev/null )
+//        (no model needed: this test allocates its own fixtures)
+import std/gguf
+import std/gguf_mm
+import std/math
+
+let gl_g = 0
+let gl_u = 0
+let gl_ref = 0
+let gl_par = 0
+
+// Deterministic LCG. Kept well inside i64 so the integer-overflow trap this
+// language has (where C wraps) never fires.
+fn fill(ptr, n, seedp) {
+    let i = 0
+    while i < n {
+        seedp = (seedp * 48271) % 2147483647
+        let v: f64 = i2f(seedp % 60001) / 1000.0 - 30.0
+        mem_store(ptr + i * 8, v)
+        i = i + 1
+    }
+    return seedp
+}
+
+// The REFERENCE: byte-identical to the loop in lib/std/lfm2_forward.quanta.
+fn ref_glu(g, u, out, n) {
+    let i = 0
+    while i < n {
+        let gv = f64of(mem_load(g + i * 8))
+        let sg: f64 = 1.0 / (1.0 + expf(0.0 - gv))
+        let uv = f64of(mem_load(u + i * 8))
+        mem_store(out + i * 8, gv * sg * uv)
+        i = i + 1
+    }
+    return 0
+}
+
+// Bit-exact element-wise diff. Returns mismatch count; stores the compared
+// element count and the non-zero-input count (an all-zero agreement is vacuous).
+fn diffbits(a, b, n, r) {
+    let m = 0
+    let nz = 0
+    let i = 0
+    while i < n {
+        let xa = mem_load(a + i * 8)
+        let xb = mem_load(b + i * 8)
+        if xb != xa { m = m + 1 }
+        if xb != 0 { nz = nz + 1 }
+        i = i + 1
+    }
+    mem_store(r, m)
+    mem_store(r + 8, nz)
+    return m
+}
+
+// One case: n elements, nw workers. Builds g/u, ref, then the pool path.
+fn case(n, nw, seed, r) {
+    gl_g = mem_alloc(n * 8)
+    gl_u = mem_alloc(n * 8)
+    gl_ref = mem_alloc(n * 8)
+    gl_par = mem_alloc(n * 8)
+    fill(gl_g, n, seed)
+    fill(gl_u, n, (seed * 7) % 2147483647)
+    // a couple of extremes so expf's range guards are exercised too
+    if n > 3 {
+        mem_store(gl_g + 0, 0.0)
+        mem_store(gl_g + 8, -30.0)
+        mem_store(gl_g + 16, 30.0)
+        mem_store(gl_u + 0, 1.5)
+        mem_store(gl_u + 8, -2.25)
+        mem_store(gl_u + 16, 0.75)
+    }
+    ref_glu(gl_g, gl_u, gl_ref, n)
+    // let the caller manage the pool; here we build one of exactly nw workers
+    if mm_pool_ensure(nw, 16) != 0 {
+        prints("  FAIL mm_pool_ensure n="); print(n); prints(" nw="); print(nw); newline()
+        mem_store(r, -1)
+        mem_store(r + 8, 0)
+        return -1
+    }
+    mm_set_fused_glu(1)
+    let rc = mm_glu_par(gl_g, gl_u, gl_par, n, nw)
+    let w = mm_get_glu_used()
+    if rc != 0 {
+        prints("  FAIL mm_glu_par declined n="); print(n); prints(" nw="); print(nw); newline()
+        mem_store(r, -2)
+        mem_store(r + 8, 0)
+        return -2
+    }
+    if w != 1 {
+        prints("  FAIL witness (glu not dispatched) n="); print(n); prints(" nw="); print(nw); newline()
+        mem_store(r, -3)
+        mem_store(r + 8, 0)
+        return -3
+    }
+    let m = diffbits(gl_ref, gl_par, n, r)
+    return m
+}
+
+fn report(tag, n, nw, r) {
+    prints("  "); prints(tag)
+    prints(" n="); print(n)
+    prints(" nw="); print(nw)
+    prints(" mismatch="); print(mem_load(r))
+    prints(" nonzero="); print(mem_load(r + 8))
+    newline()
+    return mem_load(r)
+}
+
+fn main() {
+    prints("=== parallel GLU (mm_glu_par / pool kind 6) element-wise bit-exactness ===\n")
+    let r = mem_alloc(16)
+    let bad = 0
+    mm_pool_begin()
+
+    // case() returns the mismatch count (>=0) or a negative error; report() and
+    // case() see the same r, so accumulating report()'s value accumulates both.
+    // the real d_ff (10752) at several worker counts
+    let n = 10752
+    case(n, 20, 12345, r)
+    bad = bad + report("dff ", n, 20, r)
+    case(n, 8, 12345, r)
+    bad = bad + report("dff ", n, 8, r)
+    case(n, 3, 12345, r)
+    bad = bad + report("dff ", n, 3, r)
+    case(n, 2, 12345, r)
+    bad = bad + report("dff ", n, 2, r)
+
+    // non-divisible lengths: the last worker absorbs the remainder
+    case(10751, 20, 555, r)
+    bad = bad + report("r-1 ", 10751, 20, r)
+    case(10757, 20, 555, r)
+    bad = bad + report("r+5 ", 10757, 20, r)
+    case(999, 16, 999, r)
+    bad = bad + report("999 ", 999, 16, r)
+
+    // n < nw: mm_glu_par MUST decline (per-slice width would be 0) and the caller
+    // keeps its scalar loop. A decline is the fail-safe contract, not a failure.
+    case(17, 20, 999, r)
+    if mem_load(r) != -2 {
+        prints("  FAIL n<nw should have DECLINED (got "); print(mem_load(r)); prints(")\n")
+        bad = bad + 1
+    } else {
+        prints("  n<nw  n=17 nw=20 declined=1 (correct: scalar fallback)\n")
+    }
+
+    // one long contiguous run (65536) to catch any per-slice seam
+    case(65536, 20, 31337, r)
+    bad = bad + report("large", 65536, 20, r)
+
+    mm_pool_end()
+
+    // q4k element coverage bound: 30 layers * dff = 322560 glus/token is a
+    // superset of the on-token count, exercised by the logits gate.
+    if bad != 0 {
+        prints("FAIL: parallel GLU differs from the scalar reference\n")
+        return 1
+    }
+    prints("PASS: parallel GLU is bit-identical to the scalar reference on every case\n")
+    prints("DONE\n")
+    return 0
+}

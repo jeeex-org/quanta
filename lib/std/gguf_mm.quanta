@@ -28,6 +28,7 @@
 // every buffer is allocated once in mm_init() and reused.
 
 import std/gguf
+import std/math
 // The folded fused Q4_K dequant-dot kernel (opt-in, see mm_fused_q4k below).
 // jit_x86_fused.quanta does NOT import jit_x86 itself -- every TU that uses it
 // imports both (see tests/jit_fold_dispatch_test.quanta), so both are imported
@@ -291,6 +292,36 @@ fn mm_matvec_par(idx: u64, x: u64, rows: i64, cols: i64, y: u64, nworkers: i64) 
     return 0
 }
 
+// mm_glu_par(g, u, out, n, nworkers) -> 0 if the live pool ran the elementwise
+// GLU out[i] = g[i]*sigmoid(g[i])*u[i], non-zero if it declined (the caller then
+// runs its own scalar loop -- a decline is a lost optimisation, never a wrong
+// answer, so the flag is fail-safe).
+//
+// DECLINES rather than building or resizing the pool. The GLU runs BETWEEN two
+// matvecs inside the pool bracket the forward already holds (fc_forward_token_ex
+// -> mm_pool_begin), so a live pool of the right width is the normal decode case;
+// `pl_size != nworkers` means the caller is not in that shape (serial, or a
+// different width) and the scalar loop is correct there. This is what keeps the
+// elementwise slice legitimate: it is a static contiguous [t*per, t*per+per) run
+// per worker, which is the RIGHT partition for an elementwise op (disjoint
+// outputs, nothing to accumulate, no atomics needed).
+fn mm_glu_par(g, u, out, n, nworkers) -> i64 {
+    if n <= 0 { return -1 }
+    if nworkers <= 1 { return -1 }
+    if n / nworkers < 1 { return -1 }
+    if pl_size != nworkers { return -1 }
+    pl_kind = 6
+    pl_g = g
+    pl_u = u
+    pl_glu_out = out
+    pl_nelems = n
+    pl_nw = nworkers
+    pl_active = nworkers
+    if pl_submit() != 0 { pl_kill(); return -1 }
+    if pl_depth == 0 { mm_pool_end() }
+    return 0
+}
+
 // y = W x. W is `rows` x `cols`; x holds cols f64 values, y receives rows.
 // Worker count for mm_matvec. 0 or 1 means the serial path, which is the
 // default so nothing changes for callers that do not opt in.
@@ -422,6 +453,51 @@ fn mm_set_fused_chain(n) {
 
 fn mm_get_fused_chain() { return mm_fused_chain }
 fn mm_get_fused_chain_used() { return mm_fused_chain_used }
+
+// ===========================================================================
+// PARALLEL GLU (silu(gate) * up) -- opt-in, DEFAULT OFF, ELEMENTWISE
+// ===========================================================================
+// WHY THIS IS NOT THE SAME CLASS AS THE MATVEC STATIC SLICE, and why it is not
+// a workaround. The pool's row partition is a static slice because there are no
+// atomics, so a work-stealing counter is unsafe. For a MATVEC that is a real
+// limitation: rows have unequal cost only by balance, but the partition is fixed.
+// For an ELEMENTWISE op there is nothing to accumulate -- element i's output
+// depends on gate[i] and up[i] alone, and no two elements ever touch the same
+// output word. A static contiguous slice is therefore the CORRECT partition, not
+// a concession: it is deterministic, needs no atomics, and every worker writes
+// only inside its own [lo,hi) range. This is the distinction the author drew
+// explicitly, so slicing silu across the pool is legitimate work, not a
+// workaround that dies when atomics land.
+//
+// THE COST IT ATTACKS. `silu_glu` is 322,560 elements/token (d_ff=10752 over 30
+// layers) and measured at ~316 ns/element -- the SAME us/token as `ffn_down`,
+// which moves 660,602,880 elements (0.155 ns/element). It is main-thread scalar
+// Quanta while 20 pool workers sit idle, and its per-element cost is dominated by
+// `expf`, which in lib/std/math.quanta is a 20-term Taylor loop in Quanta source
+// (20 iterations of `term = term*r/i2f(i)`, a division each), not a hardware
+// instruction. The arithmetic is unchanged here -- same `expf`, same division,
+// same multiply order -- so the output is BIT-IDENTICAL by construction; only the
+// thread that evaluates elements changes. There is no SIMD exp approximation and
+// none is claimed.
+//
+// BIT-EXACTNESS: tests/lfm2_fused_logits_test.quanta pass6 runs the whole model
+// with this flag ON and diffs all 128,000 logits against the shipped path;
+// tests/lfm2_glu_test.quanta diffs the elementwise output directly.
+let mm_fused_glu = 0
+let mm_glu_used = 0
+
+fn mm_set_fused_glu(n) {
+    if n < 0 { n = 0 }
+    if n != 0 { n = 1 }
+    mm_fused_glu = n
+    // reset the witness so the next forward reports whether THAT forward took
+    // the parallel GLU, not whether any earlier one did.
+    mm_glu_used = 0
+    return 0
+}
+
+fn mm_get_fused_glu() { return mm_fused_glu }
+fn mm_get_glu_used() { return mm_glu_used }
 
 // ===========================================================================
 // RESOURCE POLITENESS -- the loader must never saturate the box unattended
@@ -1110,6 +1186,10 @@ let pl_ncols = 0
 let pl_b = 1              // matmul batch (tokens per row) -- pl_run_mm only
 let pl_nw = 0            // active worker count for the current job
 let pl_active = 0
+let pl_g = 0             // kind 6 (GLU): gate input ptr (f64)
+let pl_u = 0             // kind 6 (GLU): up input ptr (f64)
+let pl_glu_out = 0       // kind 6 (GLU): output ptr (f64)
+let pl_nelems = 0        // kind 6 (GLU): element count
 
 // ===========================================================================
 // OPT-IN POOL PROFILE -- DEFAULT OFF, ZERO EFFECT WHEN OFF
@@ -1270,7 +1350,36 @@ fn pl_run(t: i64, cell) {
     if pl_kind == 3 { return pl_run_embed_b(t, cell) }
     if pl_kind == 4 { return pl_run_rows_map(t, cell) }
     if pl_kind == 5 { return pl_run_embed_map(t, cell) }
+    if pl_kind == 6 { return pl_run_glu(t, cell) }
     return pl_run_rows(t, cell)
+}
+
+// Static contiguous slice of the elementwise GLU: out[i] = g[i]*sigmoid(g[i])*u[i]
+// for i in [lo, hi). BYTE-IDENTICAL arithmetic to the main-thread loop in
+// lib/std/lfm2_forward.quanta (same expf, same division, same two multiplies in
+// the same order) -- only which thread evaluates each element changes, so the
+// output is bit-identical. No accumulation, no shared output word: worker t
+// writes ONLY [lo,hi) of `out`, which the pool handed to nobody else.
+fn pl_run_glu(t: i64, cell) {
+    // dispatch witness: any worker reaching here sets the sticky flag. All
+    // writers store the same value, so the racy multi-writer store is benign;
+    // reading it after pl_submit() proves the parallel GLU actually ran.
+    mm_glu_used = 1
+    let per = pl_nelems / pl_nw
+    let lo = t * per
+    let hi = lo + per
+    if t == pl_nw - 1 { hi = pl_nelems }
+    if hi > pl_nelems { hi = pl_nelems }
+    let i = lo
+    while i < hi {
+        let g = f64of(mem_load(pl_g + i * 8))
+        // silu(g) = g * sigmoid(g) = g / (1 + exp(-g))
+        let sg: f64 = 1.0 / (1.0 + expf(0.0 - g))
+        let uv = f64of(mem_load(pl_u + i * 8))
+        mem_store(pl_glu_out + i * 8, g * sg * uv)
+        i = i + 1
+    }
+    return hi - lo
 }
 
 // ===========================================================================
