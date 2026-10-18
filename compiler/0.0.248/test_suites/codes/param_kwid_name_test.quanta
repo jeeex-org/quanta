@@ -1,0 +1,31 @@
+// test_suites/codes/param_kwid_name_test.quanta
+//
+// RED-FIRST row for the 0.0.246 fix: a parameter whose NAME lexes as a reserved
+// keyword token must still be a real parameter.
+//
+// 0.0.245 defect: funcscan's signature scan records a parameter only when its
+// name token is TT_ID (funcscan.quanta:265). `as` lexes as TT_AS, `impl` as
+// TT_IMPL, `in` as TT_IN, so those names were SKIPPED -- and because the scan
+// then mis-numbered the list, EVERY LATER parameter shifted down one slot.
+//
+// Measured on 0.0.245 (qc 0.0.245 -O, then quanta_run.sh):
+//     kw_as_b(41, 42)  -> 41    (expected 4142)
+//     kw_as(41)        -> 0     (expected 42)
+//     kw_impl(6)       -> 0     (expected 7)
+//     kw_in(41)        -> 0     (expected 42)
+// so this program returned rc=1 on 0.0.245 and returns rc=0 after the fix.
+//
+// The effect is not cosmetic: a mis-numbered parameter list silently delivers
+// each argument to the wrong parameter, with no diagnostic.
+fn kw_as_b(as, b) -> i64 { return b * 100 + as }
+fn kw_as(as) -> i64 { return as + 1 }
+fn kw_impl(impl) -> i64 { return impl + 1 }
+fn kw_in(in) -> i64 { return in + 1 }
+
+fn main() -> i64 {
+    if kw_as_b(41, 42) != 4241 { return 1 }
+    if kw_as(41) != 42 { return 2 }
+    if kw_impl(6) != 7 { return 3 }
+    if kw_in(41) != 42 { return 4 }
+    return 0
+}

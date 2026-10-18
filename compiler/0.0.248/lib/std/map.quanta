@@ -1,0 +1,264 @@
+// std/map - string-keyed hash map (i64 values), open-addressing linear probe,
+// implemented in Quanta over mem_alloc. Uses std/str.equals for key compare.
+// Layout (header pointer):
+//   [0]  = bucket count (power of two, e.g. 1024)
+//   [8]  = element/entry size in i64 slots (2: key-ptr, value)
+//   [16] = live key count
+//   [24] = POINTER to the bucket array
+//
+// The bucket array is a SEPARATE allocation, and [24] holds it. This started as
+// inline buckets at [16], which does not work: `let p = mem_alloc(...)` is a
+// compiler-owned binding that is FREED on scope exit, so a map cannot own a
+// large allocation the way a hash table must. Holding a pointer in the header
+// also keeps the table correct across growth.
+//
+// [16] could not stay bucket 0 either -- it is where every consumer's bucket walk
+// starts -- so the header is three slots plus a pointer.
+// Import with:  import std/map
+import std/str
+
+// djb2-ish hash over the string's bytes.
+fn map_hash(s) {
+  let n = len(s)
+  let h = 0
+  let i = 0
+  while i < n {
+    h = h * 31 + mem_load8(s + 8 + i)
+    i = i + 1
+  }
+  return h
+}
+
+// WHY THE ARENA, AND WHY IT IS A MODULE GLOBAL
+//
+// `let p = mem_alloc(...)` is a compiler-owned binding FREED on scope exit, and
+// the arena descends one page per allocation inside a loop. So a hash table
+// cannot own memory with a local: the pointer dies before the table does. The
+// original code got away with a fixed 1024-bucket table only because it never
+// allocated again.
+//
+// Two earlier attempts at growth both failed, and both failures are instructive:
+//   1. nbuf as a local           -> dead on return; segfault at 717 keys.
+//   2. nbuf in ONE module global -> fine for the first growth, but the second
+//      growth overwrites it while the table is still using the first array.
+//      Measured: 3000 keys OK (two growths), 4000 keys crash (three).
+//
+// So ownership lives here: a bump arena that only ever moves forward and never
+// frees. Every table's header, every bucket array, and every growth array come
+// from it, so they outlive any scope. The cost is that a map is never reclaimed
+// -- acceptable for maps built once and kept (JSON documents, model headers),
+// and honest about the trade rather than pretending otherwise.
+let map_arena = 0
+let map_arena_used = 0
+
+let MAP_ARENA_CHUNK = 4194304        // 4 MiB per chunk
+let MAP_MAX_CHUNKS = 4096             // 16 GiB ceiling before we stop allocating
+
+fn map_arena_reset() {
+  map_arena = 0
+  map_arena_used = 0
+}
+
+fn map_alloc(nbytes: i64) -> u64 {
+  if nbytes <= 0 { return 0 }
+  if map_arena == 0 || map_arena_used + nbytes > MAP_ARENA_CHUNK {
+    if map_chunk_count() >= MAP_MAX_CHUNKS { return 0 }
+    map_next_chunk()
+    if map_arena == 0 { return 0 }
+  }
+  let p = map_arena + map_arena_used
+  map_arena_used = map_arena_used + nbytes
+  return p
+}
+
+fn map_next_chunk() {
+  map_last_chunk = mem_alloc(MAP_ARENA_CHUNK)
+  if map_last_chunk == 0 { return 0 }
+  map_arena = map_last_chunk
+  map_arena_used = 0
+  map_note_chunk(map_last_chunk)
+  return map_last_chunk
+}
+
+// Chunks are tracked in a module-global table so nothing is dropped. A single
+// global pointer was exactly the bug above, so the list is explicit.
+let map_chunk_tab = 0
+let map_chunk_n = 0
+let map_chunk_cap = 64
+let map_last_chunk = 0
+
+fn map_note_chunk(p: u64) -> i64 {
+  if map_chunk_tab == 0 {
+    map_chunk_tab = mem_alloc(map_chunk_cap * 8)
+  }
+  if map_chunk_tab == 0 { return 0 - 1 }
+  if map_chunk_n >= map_chunk_cap { return 0 - 1 }
+  mem_store(map_chunk_tab + map_chunk_n * 8, p)
+  map_chunk_n = map_chunk_n + 1
+  return 0
+}
+
+fn map_chunk_count() -> i64 {
+  return map_chunk_n
+}
+
+// Bucket array for this map, from the header. 0 before the first allocation.
+fn map_buckets(m) {
+  return mem_load(m + 24)
+}
+
+// Initial bucket count. This was a fixed 1024, which is right for a handful of
+// keys and catastrophic for thousands of SMALL maps: json_parse calls map_new
+// once per object node, and gap_specs.json has 9,026 specs, so a 16 KB table per
+// node is ~148 MB of buckets that a never-freeing arena must hold all at once.
+// That is what turned the four *_const_test gates RED.
+//
+// The table therefore starts small and grows on demand. Growth doubles, so a map
+// that really does hold 100k keys still reaches 131072 buckets in a few steps,
+// and a map holding three keys costs three slots.
+let MAP_INIT_BUCKETS = 8
+let MAP_LOAD_DEN = 10
+
+fn map_new() {
+  let m = map_alloc(32)                       // header: nb, esz, count, ptr
+  if m == 0 { return 0 }
+  mem_store(m, MAP_INIT_BUCKETS)
+  mem_store(m + 8, 2)
+  mem_store(m + 16, 0)                        // live key count
+  mem_store(m + 24, map_zeroed(MAP_INIT_BUCKETS * 2 * 8))
+  return m
+}
+
+// Allocate nbytes and CLEAR them. key==0 means "empty" to every probe in this
+// file, so an uncleared table turns map_put's `while 1` into a walk off the end
+// of the buffer. mem_alloc does NOT return zeroed memory -- the old comment here
+// assumed it did, and the same assumption in map_grow was a hard segfault at
+// exactly 717 keys (the first insert past 70% of 1024).
+fn map_zeroed(nbytes: i64) -> u64 {
+  let p = map_alloc(nbytes)
+  if p == 0 { return 0 }
+  let n = nbytes / 8
+  let i = 0
+  while i < n {
+    mem_store(p + i * 8, 0)
+    i = i + 1
+  }
+  return p
+}
+
+// Store k -> val (overwrites if key already present). Returns 0.
+//
+// GROWTH. The table used to be a FIXED 1024 buckets with no grow path, and
+// both map_put and map_get looped forever once every bucket was full --
+// `while 1` with no "table full" exit. That was not theoretical: parsing a
+// safetensors header hung, and bisecting real headers pinned it exactly --
+// 1023 tensors parsed, 1024 hung, which is map_new()'s bucket count. The LTX
+// header has 1,152 tensors and the Quanta model has 2,780, so every real
+// safetensors file hung.
+//
+// Growth is IN PLACE: the buckets are INLINE in the same allocation, right after
+// the three-slot header. So growing means rehashing from the old bucket array to
+// the new, larger one -- both live inside this one allocation, and only the
+// header's bucket count changes. The MAP POINTER ITSELF NEVER MOVES. That is
+// forced by the callers: map_put's return value is ignored everywhere, and
+// consumers read the layout straight out of the header (st_validate does
+// `mem_load(st_root)` for nb and walks slots itself). A separate bucket
+// allocation, or a returned new pointer, would leave every caller on a stale
+// table.
+//
+// Rehash is required rather than a copy: linear probing means an entry's slot
+// depends on the table size, so every key must be re-placed into the new mask.
+let MAP_LOAD_DEN = 10
+
+fn map_grow(m) -> i64 {
+  let nb = mem_load(m)
+  let esz = mem_load(m + 8) * 8
+  let nnb = nb * 2
+  let obuf = map_buckets(m)
+  // From the arena, cleared. Both properties are load-bearing:
+  //   arena -- a local `let p = mem_alloc(...)` is freed on scope exit, which
+  //            segfaulted growth at 717 keys; a single module global worked for
+  //            one growth then broke at the second (3000 keys OK, 4000 crash).
+  //   clear -- mem_alloc does NOT return zeroed memory, and key==0 is what every
+  //            probe treats as "empty", so a dirty array turns the inner `while
+  //            1` into a walk off the end of the buffer.
+  let nbuf = map_zeroed(nnb * esz)
+  if nbuf == 0 { return 0 - 1 }
+  let mask = nnb - 1
+  let i = 0
+  while i < nb {
+    let slot = obuf + i * esz
+    let k = mem_load(slot)
+    if k != 0 {
+      let v = mem_load(slot + 8)
+      let idx = map_hash(k) & mask
+      while 1 {
+        let nslot = nbuf + idx * esz
+        if mem_load(nslot) == 0 {
+          mem_store(nslot, k)
+          mem_store(nslot + 8, v)
+          break
+        }
+        idx = (idx + 1) & mask
+      }
+    }
+    i = i + 1
+  }
+  mem_store(m, nnb)                  // header now describes the doubled array
+  mem_store(m + 24, nbuf)            // and points at the new bucket array
+  return 0
+}
+
+fn map_put(m, k, val) {
+  let nb = mem_load(m)
+  let mask = nb - 1
+  let h = map_hash(k)
+  let idx = h & mask
+  let esz = mem_load(m + 8) * 8     // entry byte size
+  while 1 {
+    let slot = map_buckets(m) + idx * esz
+    let ek = mem_load(slot)
+    if ek == 0 {
+      mem_store(slot, k)
+      mem_store(slot + 8, val)
+      let live = mem_load(m + 16) + 1
+      mem_store(m + 16, live)
+      // grow when the table is 70% full, so probing stays short
+      if live * MAP_LOAD_DEN >= nb * 7 { map_grow(m) }
+      return 0
+    }
+    if equals(ek, k) == 1 {          // same key -> overwrite value
+      mem_store(slot + 8, val)
+      return 0
+    }
+    idx = (idx + 1) & mask           // linear probe
+  }
+  return 0
+}
+
+// Get value for k; returns -1 if absent.
+fn map_get(m, k) {
+  let nb = mem_load(m)
+  let mask = nb - 1
+  let h = map_hash(k)
+  let idx = h & mask
+  let esz = mem_load(m + 8) * 8
+  // Bounded by the bucket count: an empty bucket proves absence, and if we walk
+  // every bucket without finding it, it is genuinely not there. The old `while 1`
+  // could never terminate on a full table.
+  let walked = 0
+  while walked < nb {
+    let slot = map_buckets(m) + idx * esz
+    let ek = mem_load(slot)
+    if ek == 0 { return -1 }         // empty bucket -> not found
+    if equals(ek, k) == 1 { return mem_load(slot + 8) }
+    idx = (idx + 1) & mask
+    walked = walked + 1
+  }
+  return -1
+}
+
+fn map_has(m, k) {
+  if map_get(m, k) == -1 { return 0 }
+  return 1
+}

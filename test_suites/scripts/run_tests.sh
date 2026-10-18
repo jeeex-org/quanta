@@ -295,6 +295,44 @@ else
 fi
 if [ "$FBT_FAIL" -eq 0 ]; then FBT_RC=0; else FBT_RC=1; FUNCTIONAL_RC=1; fi
 
+# --- Stage 1.6d: F16C INDEPENDENCE (gating) -----------------------------------
+# 0.0.247 emitted the F16C instruction pair UNCONDITIONALLY for every f16
+# conversion, every `as f16`, every f16 buffer load and every f16 buffer store:
+# no CPUID dispatch and no integer fallback, so any binary that touched an f16
+# required the F16C feature and would take SIGILL on an x86-64 CPU without it.
+# The compiler's own runtime already did this arithmetic in integers
+# (lib/std/gguf.quanta's f16_to_f64), so the inline builtins were the only users.
+#
+# The check is MECHANICAL, not behavioural, and it has to be: this box reports
+# `f16c`, so a functional test cannot observe the dependency at all -- the code
+# simply runs. A byte scan of the emitted code can. 0.0.248 performs the f16
+# conversions in integer bit manipulation (single-rounding f64 -> f16 and exact
+# f16 -> f32), so the opcodes are absent by construction; f64 <-> f32 keeps
+# cvtsd2ss/cvtss2sd, which are SSE2 and part of the x86-64 baseline.
+#
+#   vcvtph2ps   C4 E2 79 13 /r
+#   vcvtps2ph   C4 E3 79 1D /r ib
+#
+# The corpus is the two rows that together touch every f16 code path: the f16
+# conversion/rounding row and the width row (f16 + f32 buffer load and store).
+F16C_FAIL=0
+for f16c_row in f16_single_round_test fp16f32_width_test; do
+  f16c_bin="$TEST_SUITES/bin/$f16c_row"
+  if [ ! -x "$f16c_bin" ]; then
+    echo "  FAIL f16c-independence: $f16c_bin missing (row '$f16c_row' was not built)"
+    F16C_FAIL=1
+    continue
+  fi
+  f16c_hits=$(xxd -p "$f16c_bin" | tr -d '\n' | grep -o -e 'c4e27913' -e 'c4e3791d' | wc -l)
+  if [ "$f16c_hits" -ne 0 ]; then
+    echo "  FAIL f16c-independence: $f16c_row contains $f16c_hits F16C opcode(s); that binary needs f16c to run"
+    F16C_FAIL=1
+  else
+    echo "  PASS f16c-independence: $f16c_row carries no F16C opcode (integer conversions)"
+  fi
+done
+if [ "$F16C_FAIL" -eq 0 ]; then F16C_RC=0; else F16C_RC=1; FUNCTIONAL_RC=1; fi
+
 # --- Stage 1.5: EXTERN "C" FFI (object mode + gcc link) ----------------------
 # The main loop above compiles in EXEC mode only ($QC -O), where extern "C"
 # cannot resolve libc. This stage actually links a real libc FFI test so the
@@ -873,7 +911,8 @@ echo "  output-path   : $([ $OUTGUARD_RC = 0 ] && echo GREEN || echo RED)  (qc m
 echo "  naked         : $([ $NAKED_RC = 0 ] && echo GREEN || echo RED)  (naked fn + section + no_mangle, 0.0.229 Phase B)"
 echo "  asm-assembler : $([ $ASM_RC = 0 ] && echo GREEN || echo RED)  (mnemonic asm! + rejection, 0.0.231 Phase C1)"
 echo "  bare-metal    : $([ $BM_RC = 0 ] && echo GREEN || echo RED)  (ring-0 under QEMU: PVH boot, UART + IDT/int3 handler, 0.0.233 Phase D)
-  float-print   : $([ $FPR_RC = 0 ] && echo GREEN || echo RED)  (0.0.235 A2: print/exit on an f64 is a compile error; print_f/f64bits are the routes)"
+  float-print   : $([ $FPR_RC = 0 ] && echo GREEN || echo RED)  (0.0.235 A2: print/exit on an f64 is a compile error; print_f/f64bits are the routes)
+  f16c-indep    : $([ $F16C_RC = 0 ] && echo GREEN || echo RED)  (0.0.248: no F16C opcode in an f16 program -- the emitted binary is not tied to one microarchitecture)"
 # Block promotion on a real functional/security/perf/valgrind/fuzz/diff/stdlib/mtu/qobj/verify-status
 # regression. Security KNOWN issues are surfaced by the script but do not turn
 # the gate red.
@@ -899,7 +938,7 @@ if [ $FUNCTIONAL_RC -ne 0 ] || [ $NATIVE_RC -ne 0 ] || [ $SECURITY_RC -ne 0 ] ||
    || [ $VALGRIND_RC -ne 0 ] || [ $FUZZ_RC -ne 0 ] || [ $DIFF_RC -ne 0 ] \
    || [ $GENERICS_RC -ne 0 ] || [ $STDLIB_RC -ne 0 ] || [ $MTU_RC -ne 0 ] \
    || [ $QOBJ_RC -ne 0 ] || [ $VERIFY_STATUS_RC -ne 0 ] || [ $OUTGUARD_RC -ne 0 ] || [ $NAKED_RC -ne 0 ] || [ $ASM_RC -ne 0 ] || [ $BM_RC -ne 0 ] \
-   || [ $GGUF_RC -ne 0 ] || [ $FPR_RC -ne 0 ]; then
+   || [ $GGUF_RC -ne 0 ] || [ $FPR_RC -ne 0 ] || [ $F16C_RC -ne 0 ]; then
   exit 1
 fi
 exit 0
