@@ -1,0 +1,32 @@
+// F6 companion row (0.0.255) -- a constant multiply whose CONSTANT was REASSIGNED.
+//
+// F6 decides "is this operand a constant" with op_is_iconst(vr), which scans the
+// function's IR for an IR_CONST record whose result vreg is `vr`. That is only
+// sound if a vreg is DEFINED ONCE per function (SSA-like). If the compiler reused
+// a vreg across a reassignment, `x = 7` could share x's vreg with the earlier
+// `let x = 5`, and F6 would then fold the STALE constant: `x * i` would compute
+// 5*3 instead of 7*3.
+//
+// This row pins that. It exercises both orders (const on either side) and a
+// reassigned constant before and after the multiply:
+//
+//   let x = 5 ; let a = x * 3     -> 15      (const in a0's vreg)
+//   x = 7     ; let b = x * 3     -> 21      (reassigned const)
+//   let k = 9 ; let c = 3 * k     -> 27      (const first)
+//   k = 2     ; let d = 3 * k     ->  6      (reassigned const)
+//
+// Hand-derived return: 15*1000 + 21*100 + 27*10 + 6 = 17376 -> rc 17376 % 256 = 224.
+// Measured: 224 on BOTH 0.0.254 (pre-F6) and 0.0.255 (F6) -- the lever changes
+// instructions, not values.
+fn main() {
+    let x = 5
+    let i = 3
+    let a = x * i
+    x = 7
+    let b = x * i
+    let k = 9
+    let c = i * k
+    k = 2
+    let d = i * k
+    return a * 1000 + b * 100 + c * 10 + d
+}

@@ -1,0 +1,29 @@
+// F6 red-first row (0.0.255) -- a CONSTANT multiplier uses the 3-operand imul.
+//
+// `i * 8` used to emit `mov $0x8,%eax` (the constant) + `mov %rcx,%rdx` (a copy
+// of the live multiplicand, because the 2-operand imul writes its own source) +
+// `imul %rax,%rdx`. The 3-operand form `imul rd, rsrc, imm32` reads the source
+// directly and writes rd, so the COPY disappears -- once per constant multiply.
+// The constant's own materialisation is a separate record and is NOT removed
+// here (that is a dead-const lever, not this one).
+//
+// Four constant multiplies in the body, so the loop shrinks by at least four
+// instructions: 0.0.254 = 55, 0.0.255 = 50 (measured; the extra is register
+// pressure relief). The gate reads the loop-body instruction count from the
+// emitted object -- exact bytes, load-independent, no tolerance.
+//
+// Hand-derived return: sum over i in 0..7 of (8i + 3i + 16*8i + 5*3i)
+//   = sum of i*(8 + 3 + 128 + 15) = 154 * 28 = 4312  -> rc 4312 mod 256 = 216.
+fn main() {
+    let s = 0
+    let i = 0
+    while i < 8 {
+        let a = i * 8
+        let b = i * 3
+        let c = a * 16
+        let d = b * 5
+        s = s + a + b + c + d
+        i = i + 1
+    }
+    return s
+}
