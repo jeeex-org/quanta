@@ -732,6 +732,12 @@ let fc_at_v = 0
 let fc_at_sc = 0
 let fc_at_h = 0
 let fc_at_out = 0
+// Per-worker score scratch for the opt-in parallel attention (mm_attn_par):
+// nworkers * (fc_kv_cap + 2) f64, worker t using slice t. Allocated on first use
+// and re-allocated if the worker count changes. The reference reuses ONE
+// fc_at_sc because heads run sequentially; parallel heads cannot share it.
+let fc_at_scp = 0
+let fc_at_scp_nw = 0
 // Which layer's attn_q_norm / attn_k_norm are currently in fc_at_qn / fc_at_kn.
 // -1 = nothing loaded yet.
 let fc_at_qn_L = 0 - 1
@@ -919,7 +925,33 @@ fn fc_attention(L, pos, x: u64, out: u64) {
         }
         h = h + 1
     }
+    // ---- opt-in PARALLEL attention over query heads (mm_set_fused_attn) ------
+    // Head h writes only out[h*hd..h*hd+hd) and reads only q[h] plus the
+    // read-only KV cache, so a static head slice per worker is race-free with no
+    // atomics -- the correct partition for this op, not a workaround. Per head
+    // the arithmetic is unchanged, so the result is bit-identical. Declines (and
+    // falls through to the scalar loop below) when the live pool is not the
+    // right width, so the flag can only lose the optimisation.
+    let attn_ok = -1
+    if mm_get_fused_attn() != 0 {
+        let anw = mm_get_workers()
+        if fc_at_scp == 0 || fc_at_scp_nw != anw {
+            fc_at_scp = mem_alloc(anw * (fc_kv_cap + 2) * 8)
+            fc_at_scp_nw = anw
+        }
+        if fc_at_scp != 0 {
+            // KV addressing derived from the SAME accessor the reference uses, so
+            // the worker reads exactly the bytes fc_kv_get would: kb/vb are the
+            // layer's k/v row base at pos 0 head 0, kvst is one position's stride.
+            let akb = fc_kv_at(L, 0, 0, 0)
+            let akvst = fc_kv_at(L, 0, 1, 0) - akb
+            attn_ok = mm_attn_par(fc_at_q, fc_at_out, fc_at_scp, fc_kv_cap + 2,
+                                  akb, fc_kv_at(L, 1, 0, 0), akvst,
+                                  pos, nh, nkv, hd, anw)
+        }
+    }
     h = 0
+    if attn_ok != 0 {
     while h < nh {
         // GQA: query heads 4h..4h+3 share KV head h.
         let kvh = h / (nh / nkv)
@@ -972,6 +1004,7 @@ fn fc_attention(L, pos, x: u64, out: u64) {
         fc_prof_stop(FCP_A_ACCUM)
         h = h + 1
     }
+    }   // end scalar head loop (attn_ok != 0): parallel heads already done
 
     // ---- out projection -----------------------------------------------------
     fc_prof_begin(FCP_A_OUT)

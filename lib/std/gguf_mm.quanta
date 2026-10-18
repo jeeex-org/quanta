@@ -500,6 +500,44 @@ fn mm_get_fused_glu() { return mm_fused_glu }
 fn mm_get_glu_used() { return mm_glu_used }
 
 // ===========================================================================
+// PARALLEL ATTENTION (scores + softmax + accumulate over QUERY HEADS) -- opt-in
+// ===========================================================================
+// WHY: the attention branch is the term that GROWS with context -- 12.6% of a
+// token at 128, 42.1% at 1024, ~96% at 128k. Inside it, `attn_scores` (the q.k
+// loop + running max) and `attn_accum` (the weighted sum of v) are each O(pos)
+// per head and scalar f64 with a per-element accessor call. At 1024 tokens
+// scores+accum are 647,746 us of a 1,269,151 us token (51%).
+//
+// WHY QUERY HEADS IS THE CORRECT PARTITION (same argument as the GLU, and it is
+// the SAME kind of legitimacy). Query head h writes only fc_at_out[h*hd .. h*hd+hd]
+// and reads only its own q row plus the read-only KV cache, so two heads never
+// touch the same output word and there is nothing to accumulate across heads.
+// A static contiguous slice of heads [hlo,hhi) per worker is therefore
+// deterministic and race-free with no atomics -- not a concession to the missing
+// atomics, the RIGHT partition. Each worker gets its OWN score scratch (sc is a
+// per-head temporary in the reference too; the reference reuses ONE buffer
+// because heads ran sequentially).
+//
+// BIT-EXACTNESS: per head the arithmetic is IDENTICAL to the reference -- same
+// inner-loop order (strict acc = acc + q[c]*k[c] left to right), same 1/sqrt(hd)
+// scale, same running max, same exp/sum, same cur + w*v accumulation order.
+// Only WHICH thread evaluates each head changes. tests/lfm2_fused_logits_test
+// pass7 diffs all 128,000 logits with this ON.
+let mm_fused_attn = 0
+let mm_attn_used = 0
+
+fn mm_set_fused_attn(n) {
+    if n < 0 { n = 0 }
+    if n != 0 { n = 1 }
+    mm_fused_attn = n
+    mm_attn_used = 0
+    return 0
+}
+
+fn mm_get_fused_attn() { return mm_fused_attn }
+fn mm_get_attn_used() { return mm_attn_used }
+
+// ===========================================================================
 // RESOURCE POLITENESS -- the loader must never saturate the box unattended
 // ===========================================================================
 // THE COMPLAINT, as a design requirement: the SI loop runs this loader with no
@@ -1190,6 +1228,20 @@ let pl_g = 0             // kind 6 (GLU): gate input ptr (f64)
 let pl_u = 0             // kind 6 (GLU): up input ptr (f64)
 let pl_glu_out = 0       // kind 6 (GLU): output ptr (f64)
 let pl_nelems = 0        // kind 6 (GLU): element count
+// kind 7 (parallel attention): q/out pointers, per-worker score scratch, the KV
+// cache addressing (computed by the caller from lfm2_forward's own layout, so
+// the worker needs no cross-module accessor), position and head geometry.
+let pl_a_q = 0
+let pl_a_out = 0
+let pl_a_sc = 0          // worker t's score scratch = pl_a_sc + t*pl_a_scstr
+let pl_a_scstr = 0       // f64 per worker score buffer (= fc_kv_cap + 2)
+let pl_a_kb = 0          // k row base for THIS layer at pos 0, head 0 (which=0)
+let pl_a_vb = 0          // v row base for THIS layer at pos 0, head 0 (which=1)
+let pl_a_kvstr = 0       // bytes to step one position (= nkv_max*hd*8)
+let pl_a_pos = 0
+let pl_a_nh = 0
+let pl_a_nkv = 0
+let pl_a_hd = 0
 
 // ===========================================================================
 // OPT-IN POOL PROFILE -- DEFAULT OFF, ZERO EFFECT WHEN OFF
@@ -1351,7 +1403,107 @@ fn pl_run(t: i64, cell) {
     if pl_kind == 4 { return pl_run_rows_map(t, cell) }
     if pl_kind == 5 { return pl_run_embed_map(t, cell) }
     if pl_kind == 6 { return pl_run_glu(t, cell) }
+    if pl_kind == 7 { return pl_run_attn(t, cell) }
     return pl_run_rows(t, cell)
+}
+
+// Static contiguous slice of QUERY HEADS [hlo,hhi) for the attention branch.
+// Byte-identical arithmetic to the reference head loop in lib/std/lfm2_forward:
+// same scale, same left-to-right q.k accumulation, same running max, same
+// exp/sum softmax, same cur + w*v accumulation order. Writes only its own
+// heads' slice of `out` (disjoint), reads only the read-only KV cache and its
+// own q rows -- no atomics needed, and none is used.
+fn pl_run_attn(t: i64, cell) {
+    mm_attn_used = 1
+    let nh = pl_a_nh
+    let nkv = pl_a_nkv
+    let hd = pl_a_hd
+    let pos = pl_a_pos
+    let scale: f64 = 1.0 / sqrt(i2f(hd))
+    // BALANCED static slice of heads: worker t gets heads [t*nh/nw, (t+1)*nh/nw).
+    // With nh=32 and nw=20 the pool's usual "last worker absorbs the remainder"
+    // rule would give t=19 THIRTEEN heads and the rest ONE -- a 13:1 tail that
+    // caps the speedup near 2.5x. Heads in this model have equal cost, so a
+    // quotient split is both still static/deterministic and near-perfectly
+    // balanced (sizes differ by at most one head).
+    let hlo = t * nh / pl_nw
+    let hhi = (t + 1) * nh / pl_nw
+    if hhi > nh { hhi = nh }
+    let sc = pl_a_sc + t * pl_a_scstr * 8
+    let h = hlo
+    while h < hhi {
+        // GQA: query heads share KV head kvh.
+        let kvh = h / (nh / nkv)
+        let qb = pl_a_q + h * hd * 8
+        let ob = pl_a_out + h * hd * 8
+        // ---- scores + running max ----
+        let tt = 0
+        let mx: f64 = 0.0 - 1e300
+        while tt <= pos {
+            let kp = pl_a_kb + tt * pl_a_kvstr + kvh * hd * 8
+            let acc: f64 = 0.0
+            let c = 0
+            while c < hd {
+                acc = acc + f64of(mem_load(qb + c * 8)) * f64of(mem_load(kp + c * 8))
+                c = c + 1
+            }
+            let s = acc * scale
+            mem_store(sc + tt * 8, s)
+            if s > mx { mx = s }
+            tt = tt + 1
+        }
+        // ---- exp + sum ----
+        let sum: f64 = 0.0
+        tt = 0
+        while tt <= pos {
+            let e = expf(f64of(mem_load(sc + tt * 8)) - mx)
+            mem_store(sc + tt * 8, e)
+            sum = sum + e
+            tt = tt + 1
+        }
+        // ---- weighted sum of v (accumulation order preserved) ----
+        tt = 0
+        while tt <= pos {
+            let w = f64of(mem_load(sc + tt * 8)) / sum
+            let vp = pl_a_vb + tt * pl_a_kvstr + kvh * hd * 8
+            let c = 0
+            while c < hd {
+                let cur = f64of(mem_load(ob + c * 8))
+                mem_store(ob + c * 8, cur + w * f64of(mem_load(vp + c * 8)))
+                c = c + 1
+            }
+            tt = tt + 1
+        }
+        h = h + 1
+    }
+    return 0
+}
+
+// mm_attn_par(...) -> 0 if the live pool computed the attention heads, non-zero
+// to decline (caller keeps its scalar head loop). Declines rather than building a
+// pool, like mm_glu_par. Requires the caller to have ZEROED `out` first (the
+// reference zeroes fc_at_out before its head loop; the accum is cur + w*v).
+fn mm_attn_par(q, out, sc, scstr, kb, vb, kvstr, pos, nh, nkv, hd, nworkers) -> i64 {
+    if nworkers <= 1 { return -1 }
+    if nh / nworkers < 1 { return -1 }
+    if pl_size != nworkers { return -1 }
+    pl_kind = 7
+    pl_a_q = q
+    pl_a_out = out
+    pl_a_sc = sc
+    pl_a_scstr = scstr
+    pl_a_kb = kb
+    pl_a_vb = vb
+    pl_a_kvstr = kvstr
+    pl_a_pos = pos
+    pl_a_nh = nh
+    pl_a_nkv = nkv
+    pl_a_hd = hd
+    pl_nw = nworkers
+    pl_active = nworkers
+    if pl_submit() != 0 { pl_kill(); return -1 }
+    if pl_depth == 0 { mm_pool_end() }
+    return 0
 }
 
 // Static contiguous slice of the elementwise GLU: out[i] = g[i]*sigmoid(g[i])*u[i]

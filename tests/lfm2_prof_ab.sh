@@ -127,6 +127,16 @@ stage_ab_glu () {
 }
 # GLU phase table: chain ON + glu ON, timer ON -> silu_glu's new us_tok.
 stage_prof_glu () { bench_build; run_arm "PROF chain+glu ON, timer ON, prof_work ON" "20 $LENS 1 1 1 1 1 1 1 1 1" $LOGD/prof_stage_prof_glu.log; }
+# ATTN A/B: field 14 (fused_attn) is the change; chain+glu are ON in BOTH arms.
+# Field order: workers len1 len2 len3 mmap cache igneos q4k q6k prof prof_work chain glu attn
+stage_ab_attn () {
+    echo "=== STAGE ab_attn: chain=1 glu=1 both arms; attn OFF vs ON; timer OFF ==="
+    bench_build
+    run_arm "A attn=0 chain=1 glu=1" "20 $LENS 1 1 1 1 1 0 0 1 1 0" $LOGD/prof_ab_attn_A.log
+    run_arm "B attn=1 chain=1 glu=1" "20 $LENS 1 1 1 1 1 0 0 1 1 1" $LOGD/prof_ab_attn_B.log
+}
+# ATTN phase table: chain+glu+attn ON, timer ON -> attn_all's new us_tok.
+stage_prof_attn () { bench_build; run_arm "PROF chain+glu+attn ON, timer ON, prof_work ON" "20 $LENS 1 1 1 1 1 1 1 1 1 1" $LOGD/prof_stage_prof_attn.log; }
 stage_conc     () { bench_build; run_arm "CONC pool concurrency, prof_work=1 (SHORT; times void)" "20 $CONC_LENS 1 1 1 1 1 1 1" $LOGD/prof_stage_conc.log; }
 
 stage_ab () {
@@ -145,9 +155,11 @@ case "${1:-}" in
     prof_chain) stage_prof_chain ;;
     ab_glu)   stage_ab_glu ;;
     prof_glu) stage_prof_glu ;;
+    ab_attn)  stage_ab_attn ;;
+    prof_attn) stage_prof_attn ;;
     conc)     stage_conc ;;
     ab)       stage_ab ;;
-    *) echo "usage: $0 exact|baseline|prof|prof_chain|ab_glu|prof_glu|conc|ab"; exit 2 ;;
+    *) echo "usage: $0 exact|baseline|prof|prof_chain|ab_glu|prof_glu|ab_attn|prof_attn|conc|ab"; exit 2 ;;
 esac
 
 printf '%s\n' "$CONF_CANON" > "$CONF"
