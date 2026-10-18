@@ -352,13 +352,19 @@ gcc's equivalent for the same shapes is 4-6 instructions.
 
 ### 4.1 The decisive measurement: op *identity* does not change the cost
 
-`i*7`, `i*8`, `i*3` and `i/8` produce **byte-identical 45-instruction loop
-bodies** (235 bytes each, only the immediate differs). Different arithmetic,
-identical cost. So in the current codegen the loop cost is a function of the
-number of **IR operations** (each one doing its own operand marshalling), not of
-the arithmetic performed. That is the direct experimental confirmation of the
-handoff's headline: **the arithmetic is not slow; the marshalling is.** One `add`
-costs the same as one `mul` costs the same as one `sar`.
+`i*7`, `i*8`, `i*3` and `i/8` all emit **exactly 45-instruction loop bodies**. The
+three multiplies are **byte-identical apart from the immediate** (235 bytes each;
+normalised instruction sequences hash equal, md5 `1a89553d7e`), and the divide
+differs only in the one arithmetic instruction (`sar $0x3` where the multiplies
+have `imul`) — same count, 246 bytes. So four different source-level arithmetic
+operations cost the same 45 instructions.
+
+Verdict: in the current codegen the loop cost is a function of the number of **IR
+operations** (each doing its own operand marshalling), not of the arithmetic
+performed. That is the direct experimental confirmation of the handoff's headline:
+**the arithmetic is not slow; the marshalling is.** One `add` costs the same as one
+`mul` costs the same as one `sar`.
+
 
 ---
 

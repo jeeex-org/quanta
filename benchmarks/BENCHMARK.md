@@ -297,9 +297,10 @@ Corroborating measurements (all in `docs/research/arithmetic-codegen-defects-0.0
   listing): arith 15/26, div_const 18/29, heavy_div 10/17, heavy_float 8/21, float 13/43,
   regpressure 68/101.
 - **Operation identity does not change the loop cost.** Isolated probes of `s + i*7`, `s + i*8`,
-  `s + i*3` and `s + i/8` emit **byte-identical 45-instruction loop bodies** — only the immediate
-  differs. One `add` costs what one `mul` costs what one `sar` costs. **The arithmetic is not slow; the
-  operand marshalling is.**
+  `s + i*3` and `s + i/8` all emit **exactly 45-instruction loop bodies**; the three multiplies are
+  byte-identical apart from the immediate (normalised instruction sequences hash equal), and the
+  divide differs only in its one arithmetic instruction (`sar` vs `imul`). One `add` costs what one
+  `mul` costs what one `sar` costs. **The arithmetic is not slow; the operand marshalling is.**
 - The frame is **per-function** (`codegen.quanta:1374`: `spill_region = 48 + vreg_n*8`, floor 1024) and
   is 75-83 % unused in every normal arithmetic case (deepest slot touched: 192-328 bytes of a 1120-1136
   byte frame). The frame is not a runtime cost and `min_spill` is not a performance lever.
