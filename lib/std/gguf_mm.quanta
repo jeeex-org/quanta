@@ -252,13 +252,12 @@ fn mm_matvec_par(idx: u64, x: u64, rows: i64, cols: i64, y: u64, nworkers: i64) 
         if jit_f_setup_folded_q6k() != 0 { mm_fused_q6k = 0 }
     }
 
-    // zero y so a worker that fails leaves a detectable value rather than
-    // whatever was there before
-    let z0 = 0
-    if mm_prof_on != 0 { z0 = mm_prof_now() }
-    let r = 0
-    while r < rows { mem_store(y + r * 8, 0.0); r = r + 1 }
-    if mm_prof_on != 0 { mm_prof_add(MMP_YZERO, mm_prof_now() - z0) }
+    // NO y=0 PRE-FILL HERE. It used to be, for 927,744 rows/token. It cost
+    // 7.53 ms/token of MAIN-THREAD time while the pool was parked (measured,
+    // mm_prof slot ns_yzero, 128 tokens) and every one of those rows is written
+    // by its owning worker. It is replaced by the worker error channel in
+    // pl_submit, which detects the failure it was there for AND reports it.
+    // See pl_submit for the full measurements and the trade.
 
     // kind 4 = the mmap row path (bit-identical to kind 0, no pread): used only
     // when mm_attach_mmap() has mapped the file and the dtype is one the raw
@@ -347,6 +346,14 @@ fn mm_glu_par(g, u, out, n, nworkers) -> i64 {
 // layer output against an independently computed reference.
 let mm_fused_conv = 0
 let mm_conv_used = 0
+// MEASUREMENT KNOB (experiment only, default 0 = the shipped split rule): 1
+// selects cache-line-aligned channel-slice boundaries in pl_run_conv. It exists
+// so the aligned and unaligned rules can be interleaved in ONE process, which is
+// the only way to resolve a difference this size on a box whose ambient load
+// swings 1.5x between runs.
+let mm_cv_align = 0
+fn mm_set_conv_align(n) { if n != 0 { mm_cv_align = 1 } else { mm_cv_align = 0 } return 0 }
+fn mm_get_conv_align() { return mm_cv_align }
 
 fn mm_set_fused_conv(n) {
     if n < 0 { n = 0 }
@@ -986,12 +993,8 @@ fn mm_embed_logits_par(idx: u64, x: u64, v0: i64, vcount: i64, ncols: i64, y: u6
         return mm_embed_logits(idx, x, v0, vcount, ncols, y)
     }
 
-    // zero y so a worker failure leaves a detectable value
-    let z0 = 0
-    if mm_prof_on != 0 { z0 = mm_prof_now() }
-    let v = 0
-    while v < vcount { mem_store(y + v * 8, 0.0); v = v + 1 }
-    if mm_prof_on != 0 { mm_prof_add(MMP_YZERO, mm_prof_now() - z0) }
+    // NO y=0 PRE-FILL HERE (128,000 rows/token = ~1 ms/token on the main
+    // thread). See the note in mm_matvec_par and the error channel in pl_submit.
 
     // FAIL CLOSED for the opt-in scalar-chain route: emit the kernel ONCE here,
     // on the main thread, before any worker sees the flag, and clear the flag if
@@ -1271,6 +1274,11 @@ let pl_genp = 0          // ptr: job generation (driver writes, workers read)
 let pl_stopp = 0         // ptr: 1 = tear the pool down
 let pl_donep = 0         // ptr: nworkers completion stamps (done[t] = gen)
 let pl_slots = 0         // ptr: nworkers join slots from thread_create
+// ptr: nworkers error stamps. Worker t stores 1 here if its pl_run_* returned
+// negative, i.e. it FAILED before writing every row of its slice. The driver
+// resets the stamps when it consumes them. See the note at pl_submit on why this
+// replaces the "zero y so a failed worker leaves a detectable value" pass.
+let pl_errp = 0
 let pl_size = 0          // workers currently alive (0 = no pool)
 let pl_depth = 0         // begin/end nesting depth
 let pl_cell_cols = 0     // cols the live workers' scratch cells were sized for
@@ -1641,8 +1649,19 @@ fn pl_run_conv(t: i64, cell) {
     let y = pl_cv_y
     let kern = pl_cv_kern
     // QUOTIENT split (see pl_run_rows): channel-parallel, sizes differ by <= 1.
-    let lo = t * dm / pl_nw
-    let hi = (t + 1) * dm / pl_nw
+    // EXPERIMENT (cache-line-aligned boundaries): the in-place `state` buffer is
+    // written at (tt*dm + c)*8, so adjacent channels share a 64-byte line. A
+    // slice boundary that falls INSIDE a line makes two workers own one line.
+    let lo = 0
+    let hi = 0
+    if mm_cv_align != 0 {
+        lo = (t * dm / pl_nw + 7) / 8 * 8
+        hi = ((t + 1) * dm / pl_nw + 7) / 8 * 8
+        if hi > dm { hi = dm }
+    } else {
+        lo = t * dm / pl_nw
+        hi = (t + 1) * dm / pl_nw
+    }
     let c = lo
     while c < hi {
         let gc = f64of(mem_load(ip + c * 8)) * f64of(mem_load(ip + (2 * dm + c) * 8))
@@ -1802,7 +1821,13 @@ fn pl_worker(t: i64) -> i64 {
                     wts = mem_load(cell + 32)
                     w0 = mm_prof_now_b(wts)
                 }
-                if t < pl_active { pl_run(t, cell) }
+                if t < pl_active {
+                    // FAIL LOUD. pl_run_* returns negative when it could not
+                    // finish its slice (unreadable row, unsupported dtype).
+                    // This return used to be DISCARDED, so a failed worker
+                    // silently left part of its slice stale -- see pl_submit.
+                    if pl_run(t, cell) < 0 { mem_store(pl_errp + t * 8, 1) }
+                }
                 if mm_prof_work_on != 0 {
                     let wd = mm_prof_now_b(wts) - w0
                     mem_store(mm_prof_workp + t * 8, mem_load(mm_prof_workp + t * 8) + wd)
@@ -1858,6 +1883,45 @@ fn pl_submit() -> i64 {
         }
         t = t + 1
     }
+    // ---- worker-failure check -------------------------------------------------
+    // WHY THIS EXISTS, AND WHAT IT REPLACED. mm_matvec_par and
+    // mm_embed_logits_par used to pre-fill their whole output vector with 0.0 on
+    // the MAIN thread before waking the pool, "so a worker that fails leaves a
+    // detectable value". MEASURED, that pass is the largest single item of
+    // main-thread serial work in a decode token: the mm_prof slot
+    // `ns_yzero` reads 963,732,208 ns over 128 tokens = 7.53 ms/token, and
+    // 7,832,003,616 ns over 1024 tokens = 7.65 ms/token -- on the critical path,
+    // with every worker parked, inside a function whose whole purpose is to be
+    // parallel. That is 1.4% of a 542 ms token, for a pass whose 1,056,000 stores
+    // per token (927,744 matvec rows + 128,000 logits rows) are each overwritten
+    // by the owning worker microseconds later.
+    //
+    // It is NOT redundant, though: it was the only signal a failed worker left,
+    // because pl_worker DISCARDED pl_run's return value. So this replaces it with
+    // a real error channel: the worker records a failure, and the driver reports
+    // it here. That is strictly MORE detection than the zero pass, not less --
+    //   * a worker that failed MID-slice: caught here; the zero pass caught it
+    //     only as "some later rows read 0" and only if the caller looked.
+    //   * a worker that never started: caught in the loop above already
+    //     (pl_slots[t] == 0 -> return -1); the zero pass caught it too.
+    //   * a worker that HUNG: neither scheme catches it -- this returns the same
+    //     (the wait loop above spins forever). Unchanged.
+    // The zero pass also covered a wrong job-descriptor row range; that is a
+    // whole-call failure the caller sees as a wrong answer either way.
+    let bad = 0
+    let et = 0
+    while et < pl_size {
+        if mem_load(pl_errp + et * 8) != 0 {
+            prints("mm_pool: WORKER FAILED t="); print(et)
+            prints(" kind="); print(pl_kind)
+            prints(" rows="); print(pl_rows)
+            prints(" cols="); print(pl_cols); newline()
+            mem_store(pl_errp + et * 8, 0)
+            bad = bad + 1
+        }
+        et = et + 1
+    }
+    if bad != 0 { return -2 }
     return 0
 }
 
@@ -1910,6 +1974,7 @@ fn mm_pool_ensure(n: i64, maxcols: i64) {
     pl_stopp = mem_alloc(8)
     pl_donep = mem_alloc(n * 8)
     pl_slots = mem_alloc(n * 8)
+    pl_errp = mem_alloc(n * 8)
     // FAIL CLOSED on allocation failure: a NULL protocol word would make
     // atomic_store() write to address 0 (a process kill with no diagnostic).
     // Return -1 to the caller instead; it rebuilds on the next call.
@@ -1918,7 +1983,7 @@ fn mm_pool_ensure(n: i64, maxcols: i64) {
     // by the SI-loop peer (commit e0d766f6), it cost a whole generation run.
     // Whatever CAN be diagnosed here is printed here: the last line before a
     // silent death should name the pool size and the failed cell.
-    if pl_genp == 0 || pl_stopp == 0 || pl_donep == 0 || pl_slots == 0 {
+    if pl_genp == 0 || pl_stopp == 0 || pl_donep == 0 || pl_slots == 0 || pl_errp == 0 {
         prints("mm_pool_ensure: ALLOC FAIL n="); print(n)
         prints(" (protocol cells 8+8+"); print(n * 8); prints("+"); print(n * 8)
         prints(" bytes; next step would be "); print(n)
@@ -1936,6 +2001,7 @@ fn mm_pool_ensure(n: i64, maxcols: i64) {
     let t = 0
     while t < n {
         atomic_store(pl_donep + t * 8, 0)
+        mem_store(pl_errp + t * 8, 0)
         mem_store(pl_slots + t * 8, thread_create(pl_worker, t))
         t = t + 1
     }

@@ -1,0 +1,192 @@
+// tests/lfm2_loader_redundancy_probe.quanta -- the PER-CALL COST of the loader
+// primitives the decode path calls per layer / per token.
+//
+// WHY THIS EXISTS: the previous unit found a 20.7 ms/token redundancy of exactly
+// one shape -- `mm_load_small()` called unconditionally per conv layer even when
+// the dequantised kernel was already sitting in `fc_nc_conv` (warm cache). To
+// audit the loader for the SAME class, the per-call cost of each primitive has to
+// be a MEASUREMENT rather than an estimate, because the obvious estimate is wrong
+// by more than an order of magnitude:
+//
+//   `mem_alloc(n)` in this emitter is a RAW mmap() SYSCALL (`mov eax,9`, hint
+//   0x60000001) and `mem_free` only pushes the block onto a free list -- it does
+//   NOT munmap. So every read_tensor_f64() call BOTH costs a syscall AND leaks a
+//   whole VMA for the life of the process.
+//
+// That second fact is why this probe reports VmSize growth per call beside the
+// wall time: the same call is simultaneously a time cost and a VA cost, and the
+// VA cost is the thing the bench's vmpeak_kb column has been reporting all along.
+//
+// No model forward runs here, so this probe does not need the pool and does not
+// contend with the box beyond the mmap + dequant it is measuring.
+//
+// Usage:
+//   ./compiler/0.0.248/bin/x86/qc -O tests/lfm2_loader_redundancy_probe.quanta P
+//   ( ulimit -c 0 -v 32000000; P )
+import std/gguf
+import std/lfm2_forward
+import std/lfm2_model
+import std/gguf_mm
+import std/fs
+
+const Q4_PATH = "/opt/ai/models/quanta/QUANTA-LFM2.5-2.6Bv1-Q4_K_M.gguf"
+const NCTX = 2048
+const REPS = 2000
+
+let pr_ts = 0
+
+// Same primitive fc_prof_now() uses: one raw clock_gettime syscall into a
+// timespec allocated once. NOT clock(), which is mmap+clock_gettime+munmap per
+// call here (A27) and would dominate a microsecond-scale measurement.
+fn now_ns() -> i64 {
+    syscall(228, 1, pr_ts, 0, 0, 0)
+    return mem_load(pr_ts) * 1000000000 + mem_load(pr_ts + 8)
+}
+
+// VmSize / VmPeak out of /proc/self/status by 3-char tag (same reader the bench
+// uses). VmSize is the right instrument HERE because it can go DOWN across a
+// loop; VmPeak cannot, so it cannot answer "what does one call add".
+fn status_kb(tag0, tag1, tag2) -> i64 {
+    let fd = file_open("/proc/self/status", 0)
+    if fd < 0 { return 0 - 1 }
+    let b = mem_alloc(4096)
+    let got = read_raw(fd, b, 4095)
+    file_close(fd)
+    if got <= 0 { return 0 - 1 }
+    let i = 0
+    while i + 3 < got {
+        if mem_load8(b + i) == tag0 && mem_load8(b + i + 1) == tag1 && mem_load8(b + i + 2) == tag2 {
+            let j = i + 3
+            while j < got && mem_load8(b + j) != 0 && (mem_load8(b + j) < 48 || mem_load8(b + j) > 57) { j = j + 1 }
+            let v = 0
+            while j < got && mem_load8(b + j) >= 48 && mem_load8(b + j) <= 57 {
+                v = v * 10 + (mem_load8(b + j) - 48)
+                j = j + 1
+            }
+            return v
+        }
+        i = i + 1
+    }
+    return 0 - 1
+}
+
+fn vmsize_kb() -> i64 { return status_kb(86, 109, 83) }
+
+// Empty loop of REPS iterations: the floor any per-call figure sits on.
+fn case_floor() {
+    let t0 = now_ns()
+    let i = 0
+    while i < REPS { i = i + 1 }
+    let t1 = now_ns()
+    prints("loop_floor_empty: ns_per_iter="); print((t1 - t0) / REPS); newline()
+}
+
+// One timed case: REPS calls of `read_tensor_f64(idx, buf)`.
+fn case_read(tag, idx, buf) {
+    let v0 = vmsize_kb()
+    let t0 = now_ns()
+    let i = 0
+    while i < REPS {
+        read_tensor_f64(idx, buf)
+        i = i + 1
+    }
+    let t1 = now_ns()
+    let v1 = vmsize_kb()
+    prints(tag)
+    prints(" dtype="); print(gguf_tensor_dtype(idx))
+    prints(" nelem="); print(gguf_tensor_nelements(idx))
+    prints(" nbytes="); print(gguf_tensor_nbytes(idx))
+    prints(" ns_per_call="); print((t1 - t0) / REPS)
+    prints(" bytes_vmsize_per_call="); print((v1 - v0) * 1024 / REPS)
+    newline()
+}
+
+// Control: the SAME dequant work with NO allocation in the loop. If a
+// read_tensor_f64 case is much slower than its matching dequant-only case, the
+// difference is the alloc/copy path, not the arithmetic.
+fn case_read_into_prealloc(tag, idx, buf) {
+    let raw = mem_alloc(gguf_tensor_nbytes(idx) + 64)
+    let nb = gguf_tensor_nbytes(idx)
+    let off = gguf_tensor_offset(idx)
+    gguf_read_bytes(off, raw, nb)
+    let dt = gguf_tensor_dtype(idx)
+    let ne = gguf_tensor_nelements(idx)
+    let v0 = vmsize_kb()
+    let t0 = now_ns()
+    let i = 0
+    while i < REPS {
+        read_block_f64(dt, raw, ne, buf)
+        i = i + 1
+    }
+    let t1 = now_ns()
+    let v1 = vmsize_kb()
+    prints(tag)
+    prints(" ns_per_call="); print((t1 - t0) / REPS)
+    prints(" bytes_vmsize_per_call="); print((v1 - v0) * 1024 / REPS)
+    newline()
+}
+
+fn case_load_small(tag, idx, expect, buf) {
+    let v0 = vmsize_kb()
+    let t0 = now_ns()
+    let i = 0
+    while i < REPS {
+        mm_load_small(idx, expect, buf)
+        i = i + 1
+    }
+    let t1 = now_ns()
+    let v1 = vmsize_kb()
+    prints(tag)
+    prints(" dtype="); print(gguf_tensor_dtype(idx))
+    prints(" ns_per_call="); print((t1 - t0) / REPS)
+    prints(" bytes_vmsize_per_call="); print((v1 - v0) * 1024 / REPS)
+    newline()
+}
+
+fn main() {
+    prints("=== lfm2 loader redundancy probe ===\n")
+    pr_ts = mem_alloc(16)
+    if gguf_load(Q4_PATH) != 0 { prints("FAIL gguf_load\n"); return 1 }
+    if fc_read_config() != 0 { prints("FAIL fc_read_config\n"); return 1 }
+    if fc_kv_init(NCTX) != 0 { prints("FAIL fc_kv_init\n"); return 1 }
+    if fc_fw_init() != 0 { prints("FAIL fc_fw_init\n"); return 1 }
+    if mm_attach_mmap_fd(file_open(Q4_PATH, 0)) != 0 { prints("warn: no mmap\n") }
+
+    prints("d_model="); print(fc_d_model)
+    prints(" conv_width="); print(fc_conv_width)
+    prints(" n_layers="); print(fc_n_layers); newline()
+
+    // The query head index of the first real q_norm tensor in the file.
+    let qn = lfm2_attn_q_norm(2)
+    let kn = lfm2_attn_k_norm(2)
+    // The first conv layer's kernel.
+    let cwt = lfm2_conv_conv(1)
+    prints("q_norm_idx="); print(qn); prints(" k_norm_idx="); print(kn)
+    prints(" conv_idx="); print(cwt); newline()
+
+    let buf = mem_alloc(8 * 1024 * 1024)
+
+    case_floor()
+
+    // ---- the decode-relevant calls ----------------------------------------
+    // fc_attention() re-reads attn_q_norm / attn_k_norm ONCE PER ATTENTION LAYER
+    // PER TOKEN (16 read_tensor_f64 calls/token at 8 attention layers), guarded
+    // by `fc_at_qn_L != L` -- a guard that can never hit in decode because L
+    // increases monotonically. fc_cache_norms() caches attn_norm, ffn_norm,
+    // token_embd_norm and the conv kernel, but NOT these two.
+    case_read("read_tensor_f64 q_norm", qn, buf)
+    case_read("read_tensor_f64 k_norm", kn, buf)
+    case_read_into_prealloc("dequant-only   q_norm", qn, buf)
+
+    // The conv kernel: 6144 elements. This is the call the previous unit removed
+    // 22x/token of; here it is measured ONCE per call so the number is
+    // attributable rather than inherited.
+    let kwdm = fc_conv_width * fc_d_model
+    case_read("read_tensor_f64 conv_kernel", cwt, buf)
+    case_load_small("mm_load_small    conv_kernel", cwt, kwdm, buf)
+    case_read_into_prealloc("dequant-only   conv_kernel", cwt, buf)
+
+    prints("vmpeak_kb_end="); print(status_kb(86, 109, 80)); newline()
+    prints("DONE\n")
+    return 0
+}

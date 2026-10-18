@@ -1,0 +1,199 @@
+// tests/lfm2_token_alloc_probe.quanta -- address-space growth PER DECODE TOKEN,
+// in a controlled loop, with the conf under my own control.
+//
+// WHY: the bench's vmpeak_kb column is the sizing instrument for this project, and
+// the previous unit reported ~64.4 KB/token of VmPeak growth on the post-change
+// tree. This probe re-measures it per token rather than as one delta across a
+// whole run, and does it TWICE in one process:
+//   cache_norms=1 -> only the 16 per-layer attn_q_norm/attn_k_norm reads allocate
+//   cache_norms=0 -> those plus 61 per-token norm/kernel read_tensor_f64 calls
+// If the 16 reads really cost a page each (mem_alloc is mmap, mem_free never
+// munmaps -- measured), the second arm must grow ~4x the first, and that
+// difference is the whole attribution.
+//
+// Usage:
+//   ./compiler/0.0.248/bin/x86/qc -O tests/lfm2_token_alloc_probe.quanta P
+//   ( ulimit -c 0 -v 32000000; P )        # conf: <nw> <ntok> <cache_norms>
+import std/gguf
+import std/lfm2_forward
+import std/lfm2_model
+import std/gguf_mm
+import std/gguf_bpe
+import std/lfm2_chat
+import std/fs
+
+const Q4_PATH = "/opt/ai/models/quanta/QUANTA-LFM2.5-2.6Bv1-Q4_K_M.gguf"
+const CONF_PATH = "tests/lfm2_token_alloc_probe.conf"
+const NCTX = 2048
+const PROMPT_PATH = "tests/lfm2_prompt.txt"
+const CAP = 16384
+
+let pr_ts = 0
+let plen = 0
+fn now_ns() -> i64 {
+    syscall(228, 1, pr_ts, 0, 0, 0)
+    return mem_load(pr_ts) * 1000000000 + mem_load(pr_ts + 8)
+}
+
+// ONE persistent read buffer. mem_alloc(n) maps n*8+8 bytes (a raw mmap) and
+// mem_free never unmaps, so a per-call mem_alloc(4096) here would leak 9 pages
+// = 32 KB PER READING -- which is exactly what the bench's own status_kb /
+// rollup_kb do, and that (not the forward) is the whole of the bench's residual
+// ~112 KB per 128-token run. A probe that measures address-space growth cannot
+// itself allocate per reading.
+let alloc_buf = 0
+
+fn status_kb(tag0, tag1, tag2) -> i64 {
+    let fd = file_open("/proc/self/status", 0)
+    if fd < 0 { return 0 - 1 }
+    if alloc_buf == 0 { alloc_buf = mem_alloc(512) }
+    let b = alloc_buf
+    let got = read_raw(fd, b, 4095)
+    file_close(fd)
+    if got <= 0 { return 0 - 1 }
+    let i = 0
+    while i + 3 < got {
+        if mem_load8(b + i) == tag0 && mem_load8(b + i + 1) == tag1 && mem_load8(b + i + 2) == tag2 {
+            let j = i + 3
+            while j < got && mem_load8(b + j) != 0 && (mem_load8(b + j) < 48 || mem_load8(b + j) > 57) { j = j + 1 }
+            let v = 0
+            while j < got && mem_load8(b + j) >= 48 && mem_load8(b + j) <= 57 {
+                v = v * 10 + (mem_load8(b + j) - 48)
+                j = j + 1
+            }
+            return v
+        }
+        i = i + 1
+    }
+    return 0 - 1
+}
+fn vmsize_kb() -> i64 { return status_kb(86, 109, 83) }
+fn vmpeak_kb() -> i64 { return status_kb(86, 109, 80) }
+
+fn slurp(fd) {
+    if fd < 0 { return 0 }
+    let b = mem_alloc(CAP)
+    let got = read_raw(fd, b, CAP)
+    file_close(fd)
+    if got <= 0 { return 0 }
+    plen = got
+    return b
+}
+fn parse_first(buf) {
+    let i = 0
+    while mem_load8(buf + i) != 0 && (mem_load8(buf + i) < 48 || mem_load8(buf + i) > 57) { i = i + 1 }
+    let v = 0
+    while mem_load8(buf + i) >= 48 && mem_load8(buf + i) <= 57 { v = v * 10 + (mem_load8(buf + i) - 48); i = i + 1 }
+    return v
+}
+// nth = 0,1,2 -> the first, second, third integer on the line. CONSUMES each
+// number it passes (a skip loop that stops AT the digits never advances).
+fn parse_nth(buf, nth) {
+    let f = 0
+    let i = 0
+    while f < nth {
+        while mem_load8(buf + i) != 0 && (mem_load8(buf + i) < 48 || mem_load8(buf + i) > 57) { i = i + 1 }
+        while mem_load8(buf + i) >= 48 && mem_load8(buf + i) <= 57 { i = i + 1 }
+        f = f + 1
+    }
+    while mem_load8(buf + i) != 0 && (mem_load8(buf + i) < 48 || mem_load8(buf + i) > 57) { i = i + 1 }
+    let v = 0
+    while mem_load8(buf + i) >= 48 && mem_load8(buf + i) <= 57 { v = v * 10 + (mem_load8(buf + i) - 48); i = i + 1 }
+    return v
+}
+fn as_str(raw, n) {
+    let s = mem_alloc(n + 16)
+    mem_store(s, n)
+    let i = 0
+    while i < n { mem_store8(s + 8 + i, mem_load8(raw + i)); i = i + 1 }
+    mem_store8(s + 8 + n, 0)
+    return s
+}
+
+fn main() {
+    prints("=== lfm2 token alloc probe ===\n")
+    let nw = 20
+    let ntok = 32
+    let cachen = 1
+    let cfb = slurp(file_open(CONF_PATH, 0))
+    if cfb != 0 {
+        let a = parse_nth(cfb, 0)
+        let b = parse_nth(cfb, 1)
+        let c = parse_nth(cfb, 2)
+        if a > 0 { nw = a }
+        if b > 0 { ntok = b }
+        cachen = c
+    }
+    pr_ts = mem_alloc(16)
+    prints("conf: nw="); print(nw); prints(" ntok="); print(ntok)
+    prints(" cache_norms="); print(cachen); newline()
+
+    if gguf_load(Q4_PATH) != 0 { prints("FAIL gguf_load\n"); return 1 }
+    if fc_read_config() != 0 { prints("FAIL fc_read_config\n"); return 1 }
+    if bpe_init_from_gguf() == 0 { prints("FAIL bpe_init\n"); return 1 }
+    if fc_kv_init(NCTX) != 0 { prints("FAIL fc_kv_init\n"); return 1 }
+    if fc_fw_init() != 0 { prints("FAIL fc_fw_init\n"); return 1 }
+    if mm_attach_mmap_fd(file_open(Q4_PATH, 0)) != 0 { prints("FAIL mmap\n"); return 1 }
+    mm_set_workers_uncapped(nw)
+    mm_set_embed_workers_uncapped(nw)
+    mm_set_fused_q4k(1); mm_set_fused_q6k(1); mm_set_fused_chain(1)
+    mm_set_fused_glu(1); mm_set_fused_attn(1); mm_set_fused_conv(1)
+    if cachen != 0 { if fc_cache_norms() != 0 { prints("FAIL fc_cache_norms\n"); return 1 } }
+    prints("ground truth: fc_cache_norms called = "); print(cachen); newline()
+
+    // prompt ids, same construction as the bench
+    let rawp = slurp(file_open(PROMPT_PATH, 0))
+    prints("prompt_bytes="); print(plen); newline()
+    let user = as_str(rawp, plen)
+    let pb = mem_alloc(CAP)
+    let pbytes = chat_build(0, user, pb)
+    let ids = mem_alloc(8192 * 8)
+    mem_store(ids, bpe_bos)
+    let n = bpe_encode_special(pb, pbytes, ids + 8, 8000) + 1
+    prints("prompt_ids="); print(n); newline()
+    if n <= 1 { prints("FAIL encode\n"); return 1 }
+
+    mm_pool_begin()
+    let w0 = 0
+    while w0 < 4 {
+        // 4 warm-up forwards so the pool, the scratch and the page cache are all
+        // settled before the measurement loop: the growth we are measuring is the
+        // PER-TOKEN one, not start-up.
+        if fc_forward_token_ex(mem_load(ids + 8), 0, 1) != 0 { prints("FAIL warm\n"); return 1 }
+        w0 = w0 + 1
+    }
+    let vs0 = vmsize_kb()
+    let vp0 = vmpeak_kb()
+    prints("after_warmup vmsize_kb="); print(vs0); prints(" vmpeak_kb="); print(vp0); newline()
+
+    let pos = n
+    let k = 0
+    let t0 = now_ns()
+    while k < ntok {
+        let id = fc_argmax(fc_n_vocab)
+        if fc_forward_token_ex(id, pos, 1) != 0 { prints("FAIL decode\n"); return 1 }
+        pos = pos + 1
+        k = k + 1
+        if k == 1 || k == 4 || k == 8 || k == 16 || k == ntok {
+            let vs = vmsize_kb()
+            let vp = vmpeak_kb()
+            prints("tok="); print(k)
+            prints(" vmsize_kb="); print(vs)
+            prints(" vmpeak_kb="); print(vp)
+            prints(" vmsize_per_tok="); print((vs - vs0) / k)
+            prints(" vmpeak_per_tok="); print((vp - vp0) / k)
+            newline()
+        }
+    }
+    let t1 = now_ns()
+    prints("per_token_ns="); print((t1 - t0) / ntok); newline()
+    prints("final vmsize_per_tok="); print((vmsize_kb() - vs0) / ntok)
+    prints(" vmpeak_per_tok="); print((vmpeak_kb() - vp0) / ntok)
+    newline()
+    prints("fused_conv_used="); print(mm_get_conv_used())
+    prints(" fused_attn_used="); print(mm_get_attn_used())
+    prints(" fused_glu_used="); print(mm_get_glu_used()); newline()
+    mm_pool_end()
+    prints("DONE\n")
+    return 0
+}

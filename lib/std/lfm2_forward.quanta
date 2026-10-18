@@ -863,10 +863,22 @@ fn fc_attention(L, pos, x: u64, out: u64) {
     // the weight is 1 whatever q and k are and the attention output is just v.
     // From position 1 on it grows, because the wrongly-normed keys accumulate in
     // the K cache -- the "error grows with sequence position" signature.
-    if fc_at_qn_L != L {
-        read_tensor_f64(qn, fc_at_qn)
-        read_tensor_f64(kn, fc_at_kn)
-        fc_at_qn_L = L
+    //
+    // WITH fc_cache_norms() BOTH norms come from the warm per-layer cache and no
+    // read happens here at all; the guard below then covers the UNcached path,
+    // where it is still required for correctness. Same tensors, same
+    // read_tensor_f64, just earlier -> the values are bit-identical either way.
+    let qnp = fc_at_qn
+    let knp = fc_at_kn
+    if fc_nc_ready != 0 {
+        qnp = fc_nc_qn + L * hd * 8
+        knp = fc_nc_kn + L * hd * 8
+    } else {
+        if fc_at_qn_L != L {
+            read_tensor_f64(qn, fc_at_qn)
+            read_tensor_f64(kn, fc_at_kn)
+            fc_at_qn_L = L
+        }
     }
 
     // ---- projections -------------------------------------------------------
@@ -882,7 +894,7 @@ fn fc_attention(L, pos, x: u64, out: u64) {
     fc_prof_begin(FCP_A_QKNORM)
     let h = 0
     while h < nh {
-        if fc_rms_norm_head(fc_at_h, fc_at_q + h * hd * 8, fc_at_qn, hd) != 0 { return -1 }
+        if fc_rms_norm_head(fc_at_h, fc_at_q + h * hd * 8, qnp, hd) != 0 { return -1 }
         let c = 0
         while c < hd {
             mem_store(fc_at_q + (h * hd + c) * 8, f64of(mem_load(fc_at_h + c * 8)))
@@ -892,7 +904,7 @@ fn fc_attention(L, pos, x: u64, out: u64) {
     }
     h = 0
     while h < nkv {
-        if fc_rms_norm_head(fc_at_h, fc_at_k + h * hd * 8, fc_at_kn, hd) != 0 { return -1 }
+        if fc_rms_norm_head(fc_at_h, fc_at_k + h * hd * 8, knp, hd) != 0 { return -1 }
         let c = 0
         while c < hd {
             mem_store(fc_at_k + (h * hd + c) * 8, f64of(mem_load(fc_at_h + c * 8)))
@@ -1135,6 +1147,27 @@ let fc_nc_attn = 0    // attn_norm per layer:  fc_nc_attn + L * dm * 8
 let fc_nc_ffn = 0     // ffn_norm per layer:   fc_nc_ffn  + L * dm * 8
 let fc_nc_embd = 0    // token_embd_norm
 let fc_nc_conv = 0    // conv kernel per layer: fc_nc_conv + L * kw * dm * 8
+// attn_q_norm / attn_k_norm per layer: fc_nc_qn + L * hd * 8 (same for kn).
+//
+// WHY THESE TWO ARE HERE AND NOT IN THE ORIGINAL CACHE: fc_attention() re-read
+// them with read_tensor_f64() once per ATTENTION LAYER PER TOKEN (8 layers x 2 =
+// 16 calls/token), guarded by `fc_at_qn_L != L` -- a guard that can NEVER hit in
+// decode, because L increases monotonically through the layer loop. So that
+// guard allocates nothing and saves nothing: it is not a cache, it only keeps the
+// BUFFERS from being reallocated. This is exactly the shape of the redundant
+// per-layer mm_load_small() the previous unit removed from the conv path (a
+// per-layer read whose result is invariant across tokens, sitting next to a warm
+// cache that already holds the analogous tensors) -- the two attn norms were
+// simply the two this cache forgot.
+//
+// It is also, measured, the ONLY per-token allocation left in the decode path:
+// read_tensor_f64 does mem_alloc(n) + read + dequant + mem_free, and in this
+// emitter mem_alloc is a raw mmap() SYSCALL (mov eax,9) while mem_free only
+// pushes the block onto a free list -- it never munmaps. 16 calls x 1 page =
+// 64 KiB of address space per token, which is where the bench's post-change
+// "64.5 KB/token VmPeak growth" comes from (see the probe in tests/).
+let fc_nc_qn = 0
+let fc_nc_kn = 0
 
 fn fc_cache_norms() -> i64 {
     if fc_nc_ready != 0 { return 0 }
@@ -1142,13 +1175,16 @@ fn fc_cache_norms() -> i64 {
     let dm = fc_d_model
     let kw = fc_conv_width
     let nl = fc_n_layers
-    if dm <= 0 || kw <= 0 || nl <= 0 { return -1 }
-    let base = mem_alloc((2 * nl + 1) * dm * 8 + nl * kw * dm * 8 + 64)
+    let hd = fc_head_dim
+    if dm <= 0 || kw <= 0 || nl <= 0 || hd <= 0 { return -1 }
+    let base = mem_alloc((2 * nl + 1) * dm * 8 + nl * kw * dm * 8 + 2 * nl * hd * 8 + 64)
     if base == 0 { return -1 }
     fc_nc_attn = base
     fc_nc_ffn = base + nl * dm * 8
     fc_nc_embd = base + 2 * nl * dm * 8
     fc_nc_conv = base + (2 * nl + 1) * dm * 8
+    fc_nc_qn = base + (2 * nl + 1) * dm * 8 + nl * kw * dm * 8
+    fc_nc_kn = fc_nc_qn + nl * hd * 8
     let L = 0
     while L < nl {
         let an = lfm2_attn_norm(L)
@@ -1160,6 +1196,12 @@ fn fc_cache_norms() -> i64 {
             let cwt = lfm2_conv_conv(L)
             if cwt < 0 { return -1 }
             if read_tensor_f64(cwt, fc_nc_conv + L * kw * dm * 8) < 0 { return -1 }
+        } else {
+            let qn = lfm2_attn_q_norm(L)
+            let kn = lfm2_attn_k_norm(L)
+            if qn < 0 || kn < 0 { return -1 }
+            if read_tensor_f64(qn, fc_nc_qn + L * hd * 8) < 0 { return -1 }
+            if read_tensor_f64(kn, fc_nc_kn + L * hd * 8) < 0 { return -1 }
         }
         L = L + 1
     }

@@ -1,0 +1,376 @@
+// tests/lfm2_matvec_path_probe.quanta -- the decode matvec / conv-job path,
+// driven directly, at real tensor shapes, with the pool.
+//
+// WHY THIS EXISTS: an end-to-end token A/B at 128-1024 tokens resolves ~1% at
+// best on this box (load drifts, the governor is powersave, a peer holds cores).
+// The items this probe exists to measure are sub-1% end to end, so they are
+// measured where they live: one call of the exact function the forward calls, at
+// the exact tensor shape it calls it with, K times, with the pool up.
+//
+// It reports, per case:
+//   ns_per_call  -- wall over K calls of mm_matvec() (routing included, so
+//                   mm_matvec -> mm_matvec_par -> pool kind 4 is what runs)
+//   elems_per_s  -- from the shape, so a case is comparable to another shape
+//   submit_us / yzero_us / ensure_us -- the mm_prof slots attributed to the call
+//
+// The `y=0 poison loop` slot matters because it is MAIN-THREAD time inside
+// mm_matvec_par (it runs before the workers are woken) while 20 workers are
+// parked: it is serial work in a function whose whole purpose is to be parallel.
+//
+// The conv case drives mm_conv_par (pool kind 8) directly, which is the only way
+// to answer the "~396 us per conv job" figure without the rest of the token in
+// the way. Running it at several worker counts separates the two candidate
+// explanations for that figure:
+//   * false sharing on the in-place `state` buffer -> cost tracks the SLICE
+//     LAYOUT (cache-line-aligned vs not) and is flat in worker count
+//   * core over-subscription -> cost tracks the WORKER COUNT and explodes past
+//     the number of cores actually available to the pool
+//
+// Usage:
+//   ./compiler/0.0.248/bin/x86/qc -O tests/lfm2_matvec_path_probe.quanta P
+//   ( ulimit -c 0 -v 32000000; P )        # nw from tests/lfm2_matvec_path_probe.conf
+import std/gguf
+import std/lfm2_forward
+import std/lfm2_model
+import std/gguf_mm
+import std/fs
+
+const Q4_PATH = "/opt/ai/models/quanta/QUANTA-LFM2.5-2.6Bv1-Q4_K_M.gguf"
+const CONF_PATH = "tests/lfm2_matvec_path_probe.conf"
+const NCTX = 2048
+
+let pr_ts = 0
+
+fn now_ns() -> i64 {
+    syscall(228, 1, pr_ts, 0, 0, 0)
+    return mem_load(pr_ts) * 1000000000 + mem_load(pr_ts + 8)
+}
+
+fn slurp(fd) {
+    if fd < 0 { return 0 }
+    let b = mem_alloc(4096)
+    let got = read_raw(fd, b, 4095)
+    file_close(fd)
+    if got <= 0 { return 0 }
+    return b
+}
+
+// first integer on the line
+fn parse_first(buf) {
+    let i = 0
+    while mem_load8(buf + i) != 0 && (mem_load8(buf + i) < 48 || mem_load8(buf + i) > 57) { i = i + 1 }
+    let v = 0
+    while mem_load8(buf + i) >= 48 && mem_load8(buf + i) <= 57 {
+        v = v * 10 + (mem_load8(buf + i) - 48)
+        i = i + 1
+    }
+    return v
+}
+fn parse_second(buf) {
+    let i = 0
+    while mem_load8(buf + i) != 0 && (mem_load8(buf + i) < 48 || mem_load8(buf + i) > 57) { i = i + 1 }
+    while mem_load8(buf + i) >= 48 && mem_load8(buf + i) <= 57 { i = i + 1 }
+    while mem_load8(buf + i) != 0 && (mem_load8(buf + i) < 48 || mem_load8(buf + i) > 57) { i = i + 1 }
+    let v = 0
+    while mem_load8(buf + i) >= 48 && mem_load8(buf + i) <= 57 {
+        v = v * 10 + (mem_load8(buf + i) - 48)
+        i = i + 1
+    }
+    return v
+}
+fn parse_third(buf) {
+    let i = 0
+    let f = 0
+    while f < 2 {
+        while mem_load8(buf + i) != 0 && (mem_load8(buf + i) < 48 || mem_load8(buf + i) > 57) { i = i + 1 }
+        while mem_load8(buf + i) >= 48 && mem_load8(buf + i) <= 57 { i = i + 1 }
+        f = f + 1
+    }
+    while mem_load8(buf + i) != 0 && (mem_load8(buf + i) < 48 || mem_load8(buf + i) > 57) { i = i + 1 }
+    let v = 0
+    while mem_load8(buf + i) >= 48 && mem_load8(buf + i) <= 57 {
+        v = v * 10 + (mem_load8(buf + i) - 48)
+        i = i + 1
+    }
+    return v
+}
+
+// ---- the interleaved false-sharing A/B -------------------------------------
+// A = the shipped QUOTIENT split (a slice boundary may fall inside a 64-byte
+// line, so two workers share one line of the in-place `state`); B = cache-line
+// aligned boundaries (no line is ever owned by two workers). Arms alternate
+// A,B,A,B,... so ambient load drift is common to both and only the paired
+// difference is read. Each K is `k` jobs.
+fn case_conv_pair(name, ip, state, kout, y, kern, dm, dc, kw, pairs, k) {
+    let nw = mm_get_workers()
+    let p = 0
+    let n = k - 60
+    while p < pairs {
+        mm_set_conv_align(0)
+        let t0 = now_ns()
+        let i = 0
+        while i < n { mm_conv_par(ip, state, kout, y, kern, dm, dc, kw, nw); i = i + 1 }
+        let t1 = now_ns()
+        mm_set_conv_align(1)
+        let t2 = now_ns()
+        i = 0
+        while i < n { mm_conv_par(ip, state, kout, y, kern, dm, dc, kw, nw); i = i + 1 }
+        let t3 = now_ns()
+        prints(name); prints(" pair="); print(p)
+        prints(" nw="); print(nw)
+        prints(" A_unaligned_ns="); print((t1 - t0) / n)
+        prints(" B_aligned_ns="); print((t3 - t2) / n)
+        prints(" A_over_B_x1000="); print((t1 - t0) * 1000 / (t3 - t2))
+        newline()
+        p = p + 1
+    }
+}
+
+// Bit-exactness of the two split rules: same inputs, same channels, same
+// arithmetic -- the ONLY difference is which worker computes which channel, so
+// kout / y / state must be bit-for-bit equal (raw u64 compare, not a tolerance).
+fn case_conv_equiv(name, ip, state, kout, y, kern, dm, dc, kw) {
+    let nw = mm_get_workers()
+    let snap = mem_alloc(dc * dm * 8)
+    let i = 0
+    while i < dc * dm { mem_store(snap + i * 8, mem_load(state + i * 8)); i = i + 1 }
+    let ka = mem_alloc(dm * 8)
+    let ya = mem_alloc(dm * 8)
+    let sa = mem_alloc(dc * dm * 8)
+    mm_set_conv_align(0)
+    mm_conv_par(ip, state, kout, y, kern, dm, dc, kw, nw)
+    i = 0
+    while i < dm { mem_store(ka + i * 8, mem_load(kout + i * 8)); mem_store(ya + i * 8, mem_load(y + i * 8)); i = i + 1 }
+    i = 0
+    while i < dc * dm { mem_store(sa + i * 8, mem_load(state + i * 8)); i = i + 1 }
+    // restore the input state and rerun with the aligned rule
+    i = 0
+    while i < dc * dm { mem_store(state + i * 8, mem_load(snap + i * 8)); i = i + 1 }
+    mm_set_conv_align(1)
+    mm_conv_par(ip, state, kout, y, kern, dm, dc, kw, nw)
+    let mk = 0
+    let my = 0
+    let ms = 0
+    i = 0
+    while i < dm { if mem_load(kout + i * 8) != mem_load(ka + i * 8) { mk = mk + 1 }; i = i + 1 }
+    i = 0
+    while i < dm { if mem_load(y + i * 8) != mem_load(ya + i * 8) { my = my + 1 }; i = i + 1 }
+    i = 0
+    while i < dc * dm { if mem_load(state + i * 8) != mem_load(sa + i * 8) { ms = ms + 1 }; i = i + 1 }
+    prints(name); prints(" channels="); print(dm)
+    prints(" kout_bitdiff="); print(mk)
+    prints(" y_bitdiff="); print(my)
+    prints(" state_bitdiff="); print(ms)
+    prints(" verdict=")
+    if mk == 0 && my == 0 && ms == 0 { prints("BIT-IDENTICAL") } else { prints("DIFFERS") }
+    newline()
+    mm_set_conv_align(0)
+}
+
+fn case_matvec(tag, idx, rows, cols, x, y, k) {
+    mm_prof_reset()
+    let t0 = now_ns()
+    let i = 0
+    while i < k {
+        mm_matvec(idx, x, rows, cols, y)
+        i = i + 1
+    }
+    let t1 = now_ns()
+    let per = (t1 - t0) / k
+    let sub = mm_prof_ns(0) / k
+    let yz = mm_prof_ns(3) / k
+    let ens = mm_prof_ns(2) / k
+    prints(tag)
+    prints(" rows="); print(rows); prints(" cols="); print(cols); prints(" k="); print(k)
+    prints(" ns_per_call="); print(per)
+    prints(" elems_per_s=")
+    if per > 0 { print(rows * cols * 1000000000 / per) } else { print(0) }
+    prints(" submit_ns="); print(sub)
+    prints(" yzero_ns="); print(yz)
+    prints(" ensure_ns="); print(ens)
+    newline()
+}
+
+// One conv elementwise job: K calls of mm_conv_par (pool kind 8). `state` is
+// carried in place exactly as the forward carries it (the kernel reads and
+// rewrites it), so the memory access pattern under test is the forward's.
+fn case_conv(tag, ip, state, kout, y, kern, dm, dc, kw, k) {
+    let nw = mm_get_workers()
+    mm_prof_reset()
+    let t0 = now_ns()
+    let i = 0
+    while i < k {
+        mm_conv_par(ip, state, kout, y, kern, dm, dc, kw, nw)
+        i = i + 1
+    }
+    let t1 = now_ns()
+    let per = (t1 - t0) / k
+    prints(tag)
+    prints(" nw="); print(nw); prints(" k="); print(k)
+    prints(" ns_per_job="); print(per)
+    prints(" submit_ns="); print(mm_prof_ns(0) / k)
+    prints(" yzero_ns="); print(mm_prof_ns(3) / k)
+    prints(" used="); print(mm_get_conv_used())
+    newline()
+}
+
+// The same channels, the same arithmetic, on the MAIN thread -- the reference
+// arm the pool job is compared against.
+fn case_conv_ref(tag, ip, state, kout, y, kern, dm, dc, kw, k) {
+    let t0 = now_ns()
+    let rep = 0
+    while rep < k {
+        let c = 0
+        while c < dm {
+            let gc = f64of(mem_load(ip + c * 8)) * f64of(mem_load(ip + (2 * dm + c) * 8))
+            let acc: f64 = 0.0
+            let kk = 0
+            while kk < kw {
+                let bv: f64 = 0.0
+                if kk < dc { bv = f64of(mem_load(state + (kk * dm + c) * 8)) } else { bv = gc }
+                acc = acc + f64of(mem_load(kern + (c * kw + kk) * 8)) * bv
+                kk = kk + 1
+            }
+            mem_store(kout + c * 8, acc)
+            let tt = 0
+            while tt < dc {
+                let src = dc - 1 + tt
+                let nv: f64 = 0.0
+                if src < dc { nv = f64of(mem_load(state + (src * dm + c) * 8)) } else { nv = gc }
+                mem_store(state + (tt * dm + c) * 8, nv)
+                tt = tt + 1
+            }
+            mem_store(y + c * 8, f64of(mem_load(ip + (dm + c) * 8)) * acc)
+            c = c + 1
+        }
+        rep = rep + 1
+    }
+    let t1 = now_ns()
+    prints(tag)
+    prints(" k="); print(k)
+    prints(" ns_per_job_main="); print((t1 - t0) / k)
+    newline()
+}
+
+// DTYPE CENSUS of every tensor the decode forward touches. This matters because
+// f32_to_f64() is a hand-rolled software conversion in Quanta source (gguf.quanta
+// :1592) with a per-element exponent loop -- measured at 78-363 ns per ELEMENT,
+// 2-3 orders of magnitude above a widening load. Any f32/f16 tensor reached per
+// token is therefore a different league of cost from a Q4_K/Q6_K one, so which
+// tensors are which is grounding, not trivia.
+fn census() {
+    prints("--- dtype census (0=f32 1=f16 12=Q4_K 14=Q6_K) ---\n")
+    let L = 0
+    while L < fc_n_layers {
+        if lfm2_layer_is_attn(L) != 0 {
+            prints("C L="); print(L); prints(" attn=1")
+            prints(" q="); print(gguf_tensor_dtype(lfm2_attn_q(L)))
+            prints(" k="); print(gguf_tensor_dtype(lfm2_attn_k(L)))
+            prints(" v="); print(gguf_tensor_dtype(lfm2_attn_v(L)))
+            prints(" o="); print(gguf_tensor_dtype(lfm2_attn_output(L)))
+            prints(" qn="); print(gguf_tensor_dtype(lfm2_attn_q_norm(L)))
+            prints(" kn="); print(gguf_tensor_dtype(lfm2_attn_k_norm(L)))
+            prints(" an="); print(gguf_tensor_dtype(lfm2_attn_norm(L)))
+        } else {
+            prints("C L="); print(L); prints(" attn=0")
+            prints(" cconv="); print(gguf_tensor_dtype(lfm2_conv_conv(L)))
+            prints(" cconv_ne="); print(gguf_tensor_nelements(lfm2_conv_conv(L)))
+            prints(" cconv_nb="); print(gguf_tensor_nbytes(lfm2_conv_conv(L)))
+        }
+        prints(" gate="); print(gguf_tensor_dtype(lfm2_ffn_gate(L)))
+        prints(" down="); print(gguf_tensor_dtype(lfm2_ffn_down(L)))
+        prints(" fn="); print(gguf_tensor_dtype(lfm2_ffn_norm(L)))
+        newline()
+        L = L + 1
+    }
+    prints("C embd dtype="); print(gguf_tensor_dtype(lfm2_token_embd()))
+    prints(" embd_norm dtype="); print(gguf_tensor_dtype(lfm2_token_embd_norm()))
+    newline()
+}
+
+fn main() {
+    prints("=== lfm2 matvec path probe ===\n")
+    let nw = 20
+    let kb = 200
+    let mode = 0
+    let ks = 400
+    let cfb = slurp(file_open(CONF_PATH, 0))
+    if cfb != 0 {
+        let a = parse_first(cfb)
+        let b = parse_second(cfb)
+        let c = parse_third(cfb)
+        if a > 0 { nw = a }
+        if b > 0 { kb = b }
+        mode = c
+    }
+    pr_ts = mem_alloc(16)
+
+    if gguf_load(Q4_PATH) != 0 { prints("FAIL gguf_load\n"); return 1 }
+    if fc_read_config() != 0 { prints("FAIL fc_read_config\n"); return 1 }
+    if fc_kv_init(NCTX) != 0 { prints("FAIL fc_kv_init\n"); return 1 }
+    if fc_fw_init() != 0 { prints("FAIL fc_fw_init\n"); return 1 }
+    if mm_attach_mmap_fd(file_open(Q4_PATH, 0)) != 0 { prints("FAIL mmap\n"); return 1 }
+    mm_set_workers_uncapped(nw)
+    mm_set_embed_workers_uncapped(nw)
+    mm_set_fused_q4k(1)
+    mm_set_fused_q6k(1)
+    mm_set_fused_chain(1)
+    prints("conf: nw="); print(nw); prints(" kb="); print(kb)
+    prints(" fused_q4k_active="); print(mm_get_fused_q4k())
+    prints(" fused_q6k_active="); print(mm_get_fused_q6k()); newline()
+
+    census()
+
+    let x = mem_alloc(fc_d_model * 8)
+    let i0 = 0
+    while i0 < fc_d_model { mem_store(x + i0 * 8, 1.0); i0 = i0 + 1 }
+    let y = mem_alloc(fc_n_vocab * 8)
+
+    mm_pool_begin()
+    mm_prof_enable()
+    mm_set_prof_work(0)
+
+    // ---- the conv elementwise job (pool kind 8) ---------------------------
+    let dm = fc_d_model
+    let dc = fc_conv_width - 1
+    let kw = fc_conv_width
+    let ip = mem_alloc(3 * dm * 8)
+    let state = mem_alloc(dc * dm * 8)
+    let kout = mem_alloc(dm * 8)
+    let cy = mem_alloc(dm * 8)
+    let kern = mem_alloc(kw * dm * 8)
+    let j0 = 0
+    while j0 < 3 * dm { mem_store(ip + j0 * 8, 0.5); j0 = j0 + 1 }
+    j0 = 0
+    while j0 < dc * dm { mem_store(state + j0 * 8, 0.25); j0 = j0 + 1 }
+    if mm_load_small(lfm2_conv_conv(1), kw * dm, kern) != kw * dm { prints("FAIL kern load\n"); return 1 }
+
+    if mode == 1 {
+        // conv-only: build the pool with one matvec, then the conv cases.
+        case_matvec("pool_build    ", lfm2_ffn_gate(0), fc_d_ff, fc_d_model, x, y, 1)
+        case_conv_equiv("conv_split_equiv", ip, state, kout, cy, kern, dm, dc, kw)
+        case_conv_pair("conv_split_ab ", ip, state, kout, cy, kern, dm, dc, kw, 10, 140)
+        mm_pool_end()
+        prints("DONE\n")
+        return 0
+    }
+
+    // first call builds the pool
+    case_matvec("ffn_gate L0 ", lfm2_ffn_gate(0), fc_d_ff, fc_d_model, x, y, 1)
+    case_matvec("ffn_gate L0 ", lfm2_ffn_gate(0), fc_d_ff, fc_d_model, x, y, kb)
+    case_matvec("ffn_down L0 ", lfm2_ffn_down(0), fc_d_model, fc_d_ff, x, y, kb)
+    case_matvec("conv_inproj ", lfm2_conv_in_proj(1), 3 * fc_d_model, fc_d_model, x, y, kb)
+    case_matvec("conv_outproj", lfm2_conv_out_proj(1), fc_d_model, fc_d_model, x, y, ks)
+    case_matvec("attn_q L2   ", lfm2_attn_q(2), fc_d_model, fc_d_model, x, y, ks)
+    case_matvec("attn_k L5   ", lfm2_attn_k(5), 8 * fc_head_dim, fc_d_model, x, y, ks)
+    case_matvec("attn_out L2 ", lfm2_attn_output(2), fc_d_model, fc_d_model, x, y, ks)
+
+    case_conv_ref("conv_job MAIN  ", ip, state, kout, cy, kern, dm, dc, kw, ks)
+    case_conv("conv_job POOL  ", ip, state, kout, cy, kern, dm, dc, kw, ks)
+    case_conv_equiv("conv_split_equiv", ip, state, kout, cy, kern, dm, dc, kw)
+    case_conv_pair("conv_split_ab ", ip, state, kout, cy, kern, dm, dc, kw, 6, 140)
+
+    mm_pool_end()
+    prints("DONE\n")
+    return 0
+}
