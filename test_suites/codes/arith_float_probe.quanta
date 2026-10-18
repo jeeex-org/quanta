@@ -1,0 +1,37 @@
+// A32 red-first row (0.0.253) — the FLOAT spill region must be INSIDE the frame.
+//
+// `main` below is float-heavy and its loop cannot fold (the block-boundary and
+// terminator levers do not touch it), so `main` owns float vregs and, under
+// 0.0.253, reserves the float spill region.
+//
+// THE DEFECT (0.0.252 and earlier): fspill_home(v) placed a float home at
+//   -(48 + 8192 + (v+1)*8)     ~ 8 KB below %rbp
+// while the frame formula reserved only
+//   (48 + vreg_n*8), floored to 1024   == 1120 bytes for this program.
+// So the FIRST time a float vreg was spilled to its float home it would have
+// written ~8 KB below %rbp -- straight into the CALLER's frame. It is latent
+// today only because the float allocator (fphys/fdef/fflush_all) had zero call
+// sites (a float lived in a GPR and spilled to its INTEGER home). It is the
+// hard prerequisite for F4 (xmm-resident FP) and for the vector spill region.
+//
+// THE FIX (0.0.253): fspill_home() is re-based to sit immediately BELOW the
+// integer region (disjoint index range, derived from the SAME vreg extent), and
+// codegen reserves fspill_size() for a function that uses floats. So `main`'s
+// prologue frame GROWS by vreg_n*8 while an integer-only function's frame is
+// byte-identical to 0.0.252.
+//
+// The gate stage (spillframe-guard) reads `main`'s prologue frame from the
+// emitted object -- exact emitted bytes, load-independent, no tolerance.
+//
+// Hand-derived return (f2i truncates): sum_{i=0..63} i^2/(i+1)
+//   = sum (i-1) + sum 1/(i+1) = 2016 - 64 + H(64) ~= 1956.74 -> 1956.
+fn main() {
+    let s = i2f(0)
+    let i = 0
+    while i < 64 {
+        let x = i2f(i)
+        s = faddf(s, fdivf(fmulf(x, x), faddf(x, i2f(1))))
+        i = i + 1
+    }
+    return f2i(s)
+}

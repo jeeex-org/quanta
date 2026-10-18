@@ -513,6 +513,88 @@ else
 fi
 rm -f "$F3T_OBJ" "$F3T_DIS"
 
+# --- Stage 1.6h: A32 FLOAT SPILL-REGION FRAME GUARD (0.0.253) ------------------
+# A32 is the fspill_home frame/offset fix. Before 0.0.253 the FLOAT spill region
+# lived ~8 KB BELOW %rbp (fspill_home(v) = -(48 + 8192 + (v+1)*8)) while the
+# frame formula reserved only the integer region (48 + vreg_n*8, floored to
+# 1024). The first spilled float would therefore have written into the CALLER's
+# frame -- latent only because the FP allocator (fphys/fdef/fflush_all) had zero
+# call sites. 0.0.253 re-bases the region INSIDE the frame (immediately below
+# the integer region, a disjoint index range) and reserves it for a function
+# that uses floats.
+#
+# This stage reads main's PROLOGUE FRAME from the emitted object -- exact
+# emitted bytes, load-independent, no tolerance -- on two probes:
+#   * arith_float_probe.quanta (a float loop): its frame must GROW to cover the
+#     float region. MEASURED: 0.0.252 reserves 1104 bytes (0x450), 0.0.253
+#     reserves 1376 (0x560) [+vreg_n*8]. Threshold 1200 sits between, so the
+#     stage is RED on the pre-fix compiler and GREEN after.
+#   * arith_deadstore_probe.quanta (integer only): its frame must NOT grow
+#     (1104 both) -- proving the extra reservation is float-specific, not a
+#     global frame bloat that would underflow the stack on low-ASLR binaries.
+# Plus a containment check: the deepest frame-relative reference in the float
+# probe's main must lie inside the reserved frame.
+A32_MIN_FLOAT_FRAME=1200
+A32_MAX_INT_FRAME=1152
+A32_RC=0
+A32_F_SRC="$TEST_SUITES/codes/arith_float_probe.quanta"
+A32_I_SRC="$TEST_SUITES/codes/arith_deadstore_probe.quanta"
+A32_F_OBJ="/tmp/a32_float.o"
+A32_I_OBJ="/tmp/a32_int.o"
+A32_F_DIS="/tmp/a32_float.dis"
+A32_I_DIS="/tmp/a32_int.dis"
+# frame = the FIRST `sub $0xNNN,%rsp` in the named function; deep = the deepest
+# frame-relative displacement (magnitude) seen anywhere in that function.
+A32_AWK='
+  /^[0-9a-f]+ <.*>:/ { name=$2; gsub(/[<>:]/,"",name); infn=(name==want); seenfrm=0; next }
+  infn && /^[[:space:]]*[0-9a-f]+:/ {
+    n=split($0,a,"\t"); txt=(n>=2?a[2]:$0)
+    if (seenfrm==0 && txt ~ /sub[[:space:]]+\$0x[0-9a-f]+,%rsp/) {
+      f=txt; sub(/.*sub[[:space:]]+\$/,"",f); sub(/,%rsp.*/,"",f); frame=strtonum(f); seenfrm=1
+    }
+    if (match(txt, /-0x[0-9a-f]+\(%rbp/)) {
+      d=substr(txt, RSTART+3, RLENGTH-3); sub(/\(.*/,"",d); v=strtonum("0x" d); if (v>deep) deep=v
+    }
+  }
+  END { printf "%d %d", frame+0, deep+0 }'
+if [ ! -f "$A32_F_SRC" ]; then
+  echo "  FAIL spillframe-guard: $A32_F_SRC missing (the A32 red-first row)"
+  A32_RC=1
+elif [ ! -f "$A32_I_SRC" ]; then
+  echo "  FAIL spillframe-guard: $A32_I_SRC missing (the no-bloat companion)"
+  A32_RC=1
+elif ! "$QC" --emit-obj "$A32_F_SRC" "$A32_F_OBJ" >/dev/null 2>&1; then
+  echo "  FAIL spillframe-guard: float probe failed to compile with --emit-obj"
+  A32_RC=1
+elif ! "$QC" --emit-obj "$A32_I_SRC" "$A32_I_OBJ" >/dev/null 2>&1; then
+  echo "  FAIL spillframe-guard: int probe failed to compile with --emit-obj"
+  A32_RC=1
+else
+  objdump -d --no-show-raw-insn "$A32_F_OBJ" > "$A32_F_DIS" 2>/dev/null
+  objdump -d --no-show-raw-insn "$A32_I_OBJ" > "$A32_I_DIS" 2>/dev/null
+  read -r a32_fframe a32_fdeep <<<"$(awk -v want=main "$A32_AWK" "$A32_F_DIS")"
+  read -r a32_iframe a32_ideep <<<"$(awk -v want=main "$A32_AWK" "$A32_I_DIS")"
+  if [ "${a32_fframe:-0}" -le 0 ]; then
+    echo "  FAIL spillframe-guard: no frame in the float probe's main (frame=$a32_fframe)"
+    A32_RC=1
+  elif [ "${a32_iframe:-0}" -le 0 ]; then
+    echo "  FAIL spillframe-guard: no frame in the int probe's main (frame=$a32_iframe)"
+    A32_RC=1
+  elif [ "$a32_fframe" -lt "$A32_MIN_FLOAT_FRAME" ]; then
+    echo "  FAIL spillframe-guard: float main frame $a32_fframe < $A32_MIN_FLOAT_FRAME (the float spill region is NOT reserved -- fspill_home writes outside the frame; see A32 / 0.0.253)"
+    A32_RC=1
+  elif [ "$a32_iframe" -gt "$A32_MAX_INT_FRAME" ]; then
+    echo "  FAIL spillframe-guard: int main frame $a32_iframe > $A32_MAX_INT_FRAME (the float region leaked into an integer-only function)"
+    A32_RC=1
+  elif [ "$a32_fdeep" -gt "$a32_fframe" ]; then
+    echo "  FAIL spillframe-guard: deepest frame reference $a32_fdeep exceeds the reserved frame $a32_fframe"
+    A32_RC=1
+  else
+    echo "  PASS spillframe-guard: float main frame=$a32_fframe (>= $A32_MIN_FLOAT_FRAME) deep=$a32_fdeep; int main frame=$a32_iframe (<= $A32_MAX_INT_FRAME)"
+  fi
+fi
+rm -f "$A32_F_OBJ" "$A32_I_OBJ" "$A32_F_DIS" "$A32_I_DIS"
+
 # --- Stage 1.5: EXTERN "C" FFI (object mode + gcc link) ----------------------
 # The main loop above compiles in EXEC mode only ($QC -O), where extern "C"
 # cannot resolve libc. This stage actually links a real libc FFI test so the
@@ -1095,7 +1177,8 @@ echo "  bare-metal    : $([ $BM_RC = 0 ] && echo GREEN || echo RED)  (ring-0 und
   f16c-indep    : $([ $F16C_RC = 0 ] && echo GREEN || echo RED)  (0.0.248: no F16C opcode in an f16 program -- the emitted binary is not tied to one microarchitecture)
   marshal-guard : $([ $MARS_RC = 0 ] && echo GREEN || echo RED)  (0.0.249 F1: no operand-eviction home stores in a hot loop -- the emitted loop SHAPE, from the object bytes)
   deadstore-guard: $([ "${F2D_RC:-1}" = 0 ] && echo GREEN || echo RED)  (0.0.250 F2: the block-boundary flush stops storing dead temporaries -- the emitted loop SHAPE, from the object bytes)
-  terminator-guard: $([ "${F3T_RC:-1}" = 0 ] && echo GREEN || echo RED)  (0.0.252 F3: a block terminator's operand is not stored-and-reloaded -- the emitted loop SHAPE, from the object bytes)"
+  terminator-guard: $([ "${F3T_RC:-1}" = 0 ] && echo GREEN || echo RED)  (0.0.252 F3: a block terminator's operand is not stored-and-reloaded -- the emitted loop SHAPE, from the object bytes)
+  spillframe-guard: $([ "${A32_RC:-1}" = 0 ] && echo GREEN || echo RED)  (0.0.253 A32: a float-using function RESERVES the float spill region in its frame -- the emitted prologue frame, from the object bytes)"
 # Block promotion on a real functional/security/perf/valgrind/fuzz/diff/stdlib/mtu/qobj/verify-status
 # regression. Security KNOWN issues are surfaced by the script but do not turn
 # the gate red.
@@ -1121,7 +1204,7 @@ if [ $FUNCTIONAL_RC -ne 0 ] || [ $NATIVE_RC -ne 0 ] || [ $SECURITY_RC -ne 0 ] ||
    || [ $VALGRIND_RC -ne 0 ] || [ $FUZZ_RC -ne 0 ] || [ $DIFF_RC -ne 0 ] \
    || [ $GENERICS_RC -ne 0 ] || [ $STDLIB_RC -ne 0 ] || [ $MTU_RC -ne 0 ] \
    || [ $QOBJ_RC -ne 0 ] || [ $VERIFY_STATUS_RC -ne 0 ] || [ $OUTGUARD_RC -ne 0 ] || [ $NAKED_RC -ne 0 ] || [ $ASM_RC -ne 0 ] || [ $BM_RC -ne 0 ] \
-   || [ $GGUF_RC -ne 0 ] || [ $FPR_RC -ne 0 ] || [ $F16C_RC -ne 0 ] || [ $MARS_RC -ne 0 ] || [ "${F2D_RC:-1}" -ne 0 ] || [ "${F3T_RC:-1}" -ne 0 ]; then
+   || [ $GGUF_RC -ne 0 ] || [ $FPR_RC -ne 0 ] || [ $F16C_RC -ne 0 ] || [ $MARS_RC -ne 0 ] || [ "${F2D_RC:-1}" -ne 0 ] || [ "${F3T_RC:-1}" -ne 0 ] || [ "${A32_RC:-1}" -ne 0 ]; then
   exit 1
 fi
 exit 0
