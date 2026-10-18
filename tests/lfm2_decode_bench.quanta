@@ -132,6 +132,11 @@ fn slurp(fd) {
     return b
 }
 
+// One more than the highest field any driver writes. The output buffer is
+// sized from this and parse_ints refuses to store past it, so a future field
+// cannot be counted-and-dropped -- which has now happened TWICE.
+const CONF_MAX_FIELDS = 32
+
 fn parse_ints(buf, out) {
     let n = 0
     let cur = 0
@@ -144,12 +149,17 @@ fn parse_ints(buf, out) {
             have = 1
         } else {
             if have == 1 {
-                // STORE CAP MUST COVER EVERY FIELD A DRIVER CAN WRITE.
-                // This was 14 while the conf already had 15 fields: the 15th
-                // (fused_conv) was COUNTED but never STORED, so the bench read
-                // the leftover 0, reported success, and silently measured the
-                // conv-OFF arm. Same class as the peer's mis-counted field.
-                if n < 16 { mem_store(out + n * 8, cur) }
+                // STORE CAP MUST COVER EVERY FIELD A DRIVER CAN WRITE, and the
+                // OUTPUT BUFFER MUST COVER THE CAP. This cap was 14 while the
+                // conf already had 15 fields: the 15th (fused_conv) was COUNTED
+                // but never STORED, so the bench read the leftover 0, reported
+                // success, and silently measured the conv-OFF arm. It bit AGAIN
+                // at 16 against the 17th field (fused_f32): an eight-arm
+                // end-to-end A/B ran to COMPLETION with every f32 arm echoing
+                // fused_f32=0, i.e. it measured the f32-OFF configuration four
+                // times. The output buffer was separately only 128 bytes = 16
+                // qwords. Both are now sized from CONF_MAX_FIELDS.
+                if n < CONF_MAX_FIELDS { mem_store(out + n * 8, cur) }
                 n = n + 1
                 cur = 0
                 have = 0
@@ -157,7 +167,7 @@ fn parse_ints(buf, out) {
         }
         i = i + 1
     }
-    if have == 1 { if n < 16 { mem_store(out + n * 8, cur) }; n = n + 1 }
+    if have == 1 { if n < CONF_MAX_FIELDS { mem_store(out + n * 8, cur) }; n = n + 1 }
     return n
 }
 
@@ -271,7 +281,7 @@ fn sort_i64(buf, n) {
 fn main() {
     prints("=== lfm2 decode bench ===\n")
     let cfgb = slurp(file_open(CONF_PATH, 0))
-    let conf = mem_alloc(128)
+    let conf = mem_alloc(CONF_MAX_FIELDS * 8)
     let nw = 20
     let len1 = 128
     let len2 = 512
@@ -511,7 +521,15 @@ fn main() {
         prints(" fused_glu_used="); print(mm_get_glu_used())
         prints(" fused_attn_used="); print(mm_get_attn_used())
         prints(" fused_conv_active="); print(mm_get_fused_conv())
-        prints(" fused_conv_used="); print(mm_get_conv_used()); newline()
+        prints(" fused_conv_used="); print(mm_get_conv_used())
+        // PER-RUN f32 evidence, not just the load-time flag value: an A/B arm that
+        // echoed fused_f32_active=1 while the route never dispatched would look
+        // exactly like a slow arm. (A previous revision of this driver DID
+        // measure the f32-OFF configuration four times because the conf field was
+        // counted and dropped -- see CONF_MAX_FIELDS.)
+        prints(" fused_f32_used="); print(mm_get_fused_f32_used())
+        prints(" fma_used="); print(mm_get_fused_fma_used())
+        prints(" xf32_elems="); print(pl_xf32_elems_get()); newline()
         prints("prefill_ms="); print((tp1 - tp0) / 1000000)
         prints(" prefill_ms_per_tok="); print((tp1 - tp0) / 1000000 / n); newline()
         prints("gen_ms="); print((g1 - g0) / 1000000); newline()

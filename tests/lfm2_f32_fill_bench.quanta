@@ -1,0 +1,121 @@
+// tests/lfm2_f32_fill_bench.quanta
+//
+// WHAT THE f32 ROUTE COSTS ON THE CRITICAL PATH. The fill in pl_xf32_fill is the
+// ONE piece of work the f32 route adds, and it runs on the MAIN THREAD with the
+// pool parked, once per matvec. Its size is measurable (the decode bench prints
+// pl_xf32_elems, cumulative) but its PRICE is not, so it is timed here directly:
+// the shipped fill over the model's two column widths, N reps, best-of and total.
+//
+// The clock() unit is unverified repo-wide, so the RATIO to a reference loop is
+// printed beside the absolute ticks, and the absolute ns/element is derived from
+// a same-process ratio rather than from clock()'s nominal unit. Where a ns figure
+// is quoted in the research doc, it is derived here and the derivation is shown.
+//
+// Build: QC=$PWD/compiler/0.0.252/bin/x86/qc
+//        $QC -O tests/lfm2_f32_fill_bench.quanta /tmp/f32fill
+// Run  : ( ulimit -c 0 -v 32000000; /tmp/f32fill </dev/null )
+import std/gguf
+import std/lfm2_forward
+import std/lfm2_model
+import std/gguf_mm
+import std/gguf_bpe
+import std/lfm2_chat
+import std/fs
+
+const Q4_PATH = "/opt/ai/models/quanta/QUANTA-LFM2.5-2.6Bv1-Q4_K_M.gguf"
+const REPS = 40
+
+let dst64 = 0
+
+// A reference loop with a KNOWN instruction cost, so clock()'s unit can be
+// calibrated in-process instead of taken on faith: one f64 store per iteration
+// (mov [rdi], rsi) against the fill's load + narrow + 4-byte store.
+fn ref_store_n(n) -> i64 {
+    let t0 = clock()
+    let r = 0
+    while r < REPS {
+        let c = 0
+        while c < n {
+            mem_store(dst64 + c * 8, f64of(mem_load(dst64 + c * 8)))
+            c = c + 1
+        }
+        r = r + 1
+    }
+    return clock() - t0
+}
+
+fn timed_fill(x, n) -> i64 {
+    let t0 = clock()
+    let r = 0
+    while r < REPS {
+        pl_xf32_fill(x, n)
+        r = r + 1
+    }
+    return clock() - t0
+}
+
+fn bench(n) {
+    let x = mem_alloc(n * 8)
+    let c = 0
+    while c < n {
+        let u = i2f(c - (c / 128) * 128)
+        mem_store(x + c * 8, (u - 63.5) * 0.001953125)
+        c = c + 1
+    }
+    if pl_xf32_ensure(n) != 0 { prints("FAIL ensure\n"); return 1 }
+    let t1 = timed_fill(x, n)
+    let t2 = timed_fill(x, n)
+    let tr = ref_store_n(n)
+    prints("n="); print(n)
+    prints("  fill_ticks_best="); if t1 < t2 { print(t1) } else { print(t2) }
+    prints("  fill_over_refstore_x1000="); print(t1 * 1000 / tr)
+    prints("  reps="); print(REPS)
+    prints("  elements="); print(n * REPS)
+    newline()
+    return 0
+}
+
+fn load1_x100() -> i64 {
+    let fd = file_open("/proc/loadavg", 0)
+    if fd < 0 { return -1 }
+    let b = mem_alloc(256)
+    let got = read_raw(fd, b, 256)
+    file_close(fd)
+    if got <= 0 { return -1 }
+    let whole = 0
+    let frac = 0
+    let i = 0
+    let dot = 0
+    while i < got {
+        let ch = mem_load8(b + i)
+        if ch == 46 { dot = 1 }
+        else if ch >= 48 && ch <= 57 {
+            if dot == 0 { whole = whole * 10 + (ch - 48) }
+            else if frac < 10 { frac = frac * 10 + (ch - 48) }
+        } else if dot != 0 { i = got }
+        i = i + 1
+    }
+    return whole * 100 + frac
+}
+
+fn main() {
+    prints("=== the f32 x-buffer fill: what the route costs on the main thread ===\n")
+    prints("load at start: "); print(load1_x100() / 100); prints("."); print(load1_x100() - (load1_x100() / 100) * 100); newline()
+    if gguf_load(Q4_PATH) != 0 { prints("FAIL gguf_load\n"); return 1 }
+    if fc_read_config() != 0 { prints("FAIL config\n"); return 1 }
+    if bpe_init_from_gguf() == 0 { prints("FAIL bpe\n"); return 1 }
+    if fc_kv_init(2048) != 0 { prints("FAIL kv\n"); return 1 }
+    if fc_fw_init() != 0 { prints("FAIL fw\n"); return 1 }
+    mm_set_workers(0)
+    if mm_attach_mmap_fd(file_open(Q4_PATH, 0)) != 0 { prints("FAIL mmap\n"); return 1 }
+    if fc_cache_norms() != 0 { prints("FAIL norms\n"); return 1 }
+    dst64 = mem_alloc(10752 * 8)
+
+    // the model's two matvec column widths, and the sum over one token
+    bench(2048)
+    bench(10752)
+    prints("x32_allocs="); print(pl_xf32_allocs_get())
+    prints(" xf32_elems="); print(pl_xf32_elems_get()); newline()
+    prints("DONE\n")
+    return 0
+}
