@@ -1,0 +1,109 @@
+include "accounting_gaap_business_combination.quanta"
+// Test: Business Combination (ASC 805)
+// Verifies goodwill, bargain purchase, NCI, stock consideration, intangibles
+
+fn main() {
+    let failed = 0
+    
+    // Test: goodwill = consideration + NCI - net assets
+    let g1 = calculate_goodwill(800000, 200000, 700000)
+    if g1 != 300000 {
+        prints("FAIL: calculate_goodwill(800k,200k,700k)=")
+        printi(g1)
+        prints(" expected 300000\n")
+        failed = failed + 1
+    }
+    
+    // Test: goodwill = 0 when net assets >= total
+    let g2 = calculate_goodwill(500000, 100000, 700000)
+    if g2 != 0 {
+        prints("FAIL: calculate_goodwill no goodwill=")
+        printi(g2)
+        prints(" expected 0\n")
+        failed = failed + 1
+    }
+    
+    // Test: bargain purchase gain
+    let b1 = bargain_purchase_gain(500000, 700000)
+    if b1 != 200000 {
+        prints("FAIL: bargain_purchase_gain(500k,700k)=")
+        printi(b1)
+        prints(" expected 200000\n")
+        failed = failed + 1
+    }
+    
+    // Test: no bargain purchase gain (consideration > net assets)
+    let b2 = bargain_purchase_gain(700000, 500000)
+    if b2 != 0 {
+        prints("FAIL: bargain_purchase_gain none=")
+        printi(b2)
+        prints(" expected 0\n")
+        failed = failed + 1
+    }
+    
+    // Test: NCI proportionate
+    let n1 = nci_proportionate(1000000, 20)
+    if n1 != 200000 {
+        prints("FAIL: nci_proportionate(1M,20pct)=")
+        printi(n1)
+        prints(" expected 200000\n")
+        failed = failed + 1
+    }
+    
+    // Test: stock consideration
+    let s1 = stock_consideration(10000, 50)
+    if s1 != 500000 {
+        prints("FAIL: stock_consideration(10000,50)=")
+        printi(s1)
+        prints(" expected 500000\n")
+        failed = failed + 1
+    }
+    
+    // Test: acquisition costs - only stock issuance capitalizable
+    let ac1 = acquisition_costs_capitalizable(100000, 50000, 20000)
+    if ac1 != 20000 {
+        prints("FAIL: acquisition_costs_capitalizable=")
+        printi(ac1)
+        prints(" expected 20000\n")
+        failed = failed + 1
+    }
+    
+    // Test: recognizable intangible (separable)
+    let i1 = recognizable_intangible(1, 0)
+    if i1 != 1 {
+        prints("FAIL: recognizable_intangible separable\n")
+        failed = failed + 1
+    }
+    
+    // Test: recognizable intangible (contractual)
+    let i2 = recognizable_intangible(0, 1)
+    if i2 != 1 {
+        prints("FAIL: recognizable_intangible contractual\n")
+        failed = failed + 1
+    }
+    
+    // Test: non-recognizable intangible
+    let i3 = recognizable_intangible(0, 0)
+    if i3 != 0 {
+        prints("FAIL: recognizable_intangible none\n")
+        failed = failed + 1
+    }
+    
+    // Test: contingent consideration probability-weighted
+    let cc1 = contingent_consideration(100000, 60)
+    if cc1 != 60000 {
+        prints("FAIL: contingent_consideration(100k,60pct)=")
+        printi(cc1)
+        prints(" expected 60000\n")
+        failed = failed + 1
+    }
+    
+    if failed == 0 {
+        prints("BUSINESS COMBINATION: ALL TESTS PASSED\n")
+        return 0
+    }
+    prints("BUSINESS COMBINATION: ")
+    printi(failed)
+    prints(" TEST(S) FAILED\n")
+    return 1
+}

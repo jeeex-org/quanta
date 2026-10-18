@@ -333,6 +333,83 @@ for f16c_row in f16_single_round_test fp16f32_width_test; do
 done
 if [ "$F16C_FAIL" -eq 0 ]; then F16C_RC=0; else F16C_RC=1; FUNCTIONAL_RC=1; fi
 
+# --- Stage 1.6e: ARITHMETIC MARSHALLING GUARD (0.0.249 F1: adistinct) --------
+# A gate stage must be able to fail for the reason it exists (rule #16), and a
+# codegen lever has no functional symptom: F1 removes dead stores, it does not
+# change a value, so no exit-code row can see it. This stage measures the SHAPE
+# of the emitted hot loop instead, exactly as stage 1.6d measures an opcode's
+# absence -- by compiling one fixed kernel and reading the object bytes.
+#
+# The kernel (test_suites/codes/arith_marshalling_probe.quanta) defines a, b, c
+# and then uses each one in the next statement, so at every binary op BOTH
+# operands are registered. adistinct() used to un-map and store the home slot of
+# every operand it evicted, on every binary op -- docs/plans/bugs.md A31. That
+# put 26 home stores and 10 home loads inside this loop body. 0.0.249 F1 stops
+# evicting live operands; re-instating that loop makes this stage RED on all
+# three counts, which is the property being guarded.
+#
+# The counts come from emitted bytes, so they are exact and load-independent --
+# no wall clock, no tolerance. Thresholds sit between the two measurements:
+#   pre-fix  (0.0.248): loop=79  LOOP_HST=26  LOOP_HLD=10
+#   with F1  (0.0.249): loop=67  LOOP_HST=20  LOOP_HLD=4
+MARS_MAX_LOOP=73
+MARS_MAX_LST=23
+MARS_MAX_LLD=7
+MARS_RC=0
+MARS_SRC="$TEST_SUITES/codes/arith_marshalling_probe.quanta"
+MARS_OBJ="/tmp/mars_probe.o"
+MARS_DIS="/tmp/mars_probe.dis"
+# Same metric definition as scripts/bench_instr.sh (the instrument of record):
+# hot loop = the LARGEST-span backward branch in `main`; a home store is a
+# mov-family instruction writing -N(%rbp...), a home load one reading it.
+MARS_AWK='
+  /^[0-9a-f]+ <.*>:/ { name=$2; gsub(/[<>:]/,"",name); infn=(name==want); next }
+  infn && /^[[:space:]]*[0-9a-f]+:/ {
+    n=split($0,a,"\t"); txt=(n>=2?a[2]:$0)
+    addr=$1; sub(/:$/,"",addr); ia=strtonum("0x" addr)
+    ord[ic]=ia; ic++
+    ismov=(txt ~ /^(mov|movz|movs)/); hs=0; hl=0
+    if (ismov && txt ~ /\(%rbp/) {
+      if (txt ~ /\(%rbp[^)]*\),%/) hl=1
+      else if (txt ~ /%[a-z0-9]+,-[x0-9a-f]*\(%rbp/) hs=1
+    }
+    hst_at[ic]=hs; hld_at[ic]=hl
+    if (txt ~ /^j/) {
+      w=split(txt, b, /[[:space:]]+/)
+      if (w>=2 && b[2] ~ /^[0-9a-f]+$/) { ta=strtonum("0x" b[2]); if (ta < ia) { span=ia-ta; if (span>loopspan) { loopspan=span; lo=ta; hi=ia } } }
+    }
+  }
+  END {
+    if (loopspan>0) for (k=0;k<ic;k++) if (ord[k]>=lo && ord[k]<=hi) { loop++; lst+=hst_at[k]; lld+=hld_at[k] }
+    printf "%d %d %d", loop+0, lst+0, lld+0
+  }'
+if [ ! -f "$MARS_SRC" ]; then
+  echo "  FAIL marshalling-guard: $MARS_SRC missing (the F1 red-first row)"
+  MARS_RC=1
+elif ! "$QC" --emit-obj "$MARS_SRC" "$MARS_OBJ" >/dev/null 2>&1; then
+  echo "  FAIL marshalling-guard: probe failed to compile with --emit-obj"
+  MARS_RC=1
+else
+  objdump -d --no-show-raw-insn "$MARS_OBJ" > "$MARS_DIS" 2>/dev/null
+  read -r mars_loop mars_lst mars_lld <<<"$(awk -v want=main "$MARS_AWK" "$MARS_DIS")"
+  if [ "${mars_loop:-0}" -le 0 ]; then
+    echo "  FAIL marshalling-guard: no hot loop found in the probe (loop=$mars_loop) -- the kernel must not fold"
+    MARS_RC=1
+  elif [ "$mars_lst" -gt "$MARS_MAX_LST" ]; then
+    echo "  FAIL marshalling-guard: $mars_lst home stores in the loop body > $MARS_MAX_LST (operand eviction is back; see A31 / 0.0.249 F1)"
+    MARS_RC=1
+  elif [ "$mars_lld" -gt "$MARS_MAX_LLD" ]; then
+    echo "  FAIL marshalling-guard: $mars_lld home loads in the loop body > $MARS_MAX_LLD (operand eviction is back)"
+    MARS_RC=1
+  elif [ "$mars_loop" -gt "$MARS_MAX_LOOP" ]; then
+    echo "  FAIL marshalling-guard: loop body $mars_loop > $MARS_MAX_LOOP instructions"
+    MARS_RC=1
+  else
+    echo "  PASS marshalling-guard: loop=$mars_loop (<=$MARS_MAX_LOOP) home-stores=$mars_lst (<=$MARS_MAX_LST) home-loads=$mars_lld (<=$MARS_MAX_LLD)"
+  fi
+fi
+rm -f "$MARS_OBJ" "$MARS_DIS"
+
 # --- Stage 1.5: EXTERN "C" FFI (object mode + gcc link) ----------------------
 # The main loop above compiles in EXEC mode only ($QC -O), where extern "C"
 # cannot resolve libc. This stage actually links a real libc FFI test so the
@@ -912,7 +989,8 @@ echo "  naked         : $([ $NAKED_RC = 0 ] && echo GREEN || echo RED)  (naked f
 echo "  asm-assembler : $([ $ASM_RC = 0 ] && echo GREEN || echo RED)  (mnemonic asm! + rejection, 0.0.231 Phase C1)"
 echo "  bare-metal    : $([ $BM_RC = 0 ] && echo GREEN || echo RED)  (ring-0 under QEMU: PVH boot, UART + IDT/int3 handler, 0.0.233 Phase D)
   float-print   : $([ $FPR_RC = 0 ] && echo GREEN || echo RED)  (0.0.235 A2: print/exit on an f64 is a compile error; print_f/f64bits are the routes)
-  f16c-indep    : $([ $F16C_RC = 0 ] && echo GREEN || echo RED)  (0.0.248: no F16C opcode in an f16 program -- the emitted binary is not tied to one microarchitecture)"
+  f16c-indep    : $([ $F16C_RC = 0 ] && echo GREEN || echo RED)  (0.0.248: no F16C opcode in an f16 program -- the emitted binary is not tied to one microarchitecture)
+  marshal-guard : $([ $MARS_RC = 0 ] && echo GREEN || echo RED)  (0.0.249 F1: no operand-eviction home stores in a hot loop -- the emitted loop SHAPE, from the object bytes)"
 # Block promotion on a real functional/security/perf/valgrind/fuzz/diff/stdlib/mtu/qobj/verify-status
 # regression. Security KNOWN issues are surfaced by the script but do not turn
 # the gate red.
@@ -938,7 +1016,7 @@ if [ $FUNCTIONAL_RC -ne 0 ] || [ $NATIVE_RC -ne 0 ] || [ $SECURITY_RC -ne 0 ] ||
    || [ $VALGRIND_RC -ne 0 ] || [ $FUZZ_RC -ne 0 ] || [ $DIFF_RC -ne 0 ] \
    || [ $GENERICS_RC -ne 0 ] || [ $STDLIB_RC -ne 0 ] || [ $MTU_RC -ne 0 ] \
    || [ $QOBJ_RC -ne 0 ] || [ $VERIFY_STATUS_RC -ne 0 ] || [ $OUTGUARD_RC -ne 0 ] || [ $NAKED_RC -ne 0 ] || [ $ASM_RC -ne 0 ] || [ $BM_RC -ne 0 ] \
-   || [ $GGUF_RC -ne 0 ] || [ $FPR_RC -ne 0 ] || [ $F16C_RC -ne 0 ]; then
+   || [ $GGUF_RC -ne 0 ] || [ $FPR_RC -ne 0 ] || [ $F16C_RC -ne 0 ] || [ $MARS_RC -ne 0 ]; then
   exit 1
 fi
 exit 0
