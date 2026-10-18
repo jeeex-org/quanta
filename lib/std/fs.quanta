@@ -193,81 +193,22 @@ fn mem_load16(p) {
 //   exp==0    -> subnormal/zero: value = frac * 2^-24
 //   exp==31   -> inf (frac==0) or NaN (frac!=0)
 //   otherwise -> (-1)^sign * (1 + frac/1024) * 2^(exp-15)
-fn f16_to_f64(p) {
-  // Widen an IEEE 754 binary16 to binary64. Every binary16 is exactly
-  // representable in binary64, so this is a widening with no rounding: only
-  // exponent rebasing and a mantissa shift.
+fn f16_to_f64(p) -> f64 {
+  // A34 (fixed): was a hand-rolled software widening with an exponent loop and a
+  // NaN branch that returned a SUBNORMAL for negative NaNs (`0 - 0x7FF8...` is a
+  // two's-complement negation, not a sign-bit set -- it produced
+  // 0x8008000000000000 for all 1,023 negative-NaN patterns). Now the language's
+  // own integer f16->f32 widening followed by one exact `cvtss2sd`, which is the
+  // path pinned against libggml-base over ALL 65,536 f16 patterns
+  // (test_suites/codes/fp16_conv_oracle_test.quanta).
   //
-  // THIS FUNCTION HAD THREE DEFECTS, all of which produced plausible numbers:
+  // Every NON-NaN pattern is BIT-IDENTICAL to the deleted body, measured
+  // exhaustively (tests/lfm2_f32conv_agree_test.quanta, arm `fs=`).
   //
-  //  1. `let exp = bits / 1024` never masked to 5 bits. `bits` is 0..65535, so
-  //     bits/1024 is 0..63 and the SIGN BIT leaks into the exponent. For 0xC000
-  //     (-2.0) it gave exp = 48 instead of 16, e = 33 instead of 1, and returned
-  //     -8589934592.0 = -2 * 2^32. Every NEGATIVE half was wrong.
-  //
-  //  2. Inf and NaN were faked: `return sign * 1.0e308` for Inf and `return 0.0`
-  //     for NaN. A caller that checks for infinity with `> 1e308` works by
-  //     accident, but `Inf - Inf` does not produce NaN and `Inf * 0` does not
-  //     produce NaN, so any arithmetic on an f16 Inf silently gives a finite
-  //     number. Both are synthesised properly now.
-  //
-  //  3. The subnormal scale was the decimal literal 1e-27, which is not 2^-24
-  //     (5.9604644775390625e-08). Every subnormal half was off by 19 orders of
-  //     magnitude.
-  let bits = mem_load16(p)
-  let sign = 1.0
-  if bits >= 32768 { sign = -1.0 }
-  let exp = (bits / 1024) - ((bits / 1024) / 32) * 32   // (bits >> 10) & 31
-  let frac = bits - (bits / 1024) * 1024               // bits & 1023
-
-  if exp == 31 {
-    // Inf when frac == 0, NaN otherwise. 2^1023 is the largest finite f64, so
-    // one more doubling overflows to exactly +Inf; Inf - Inf is the canonical
-    // quiet NaN.
-    let pinf = 1.0
-    let n = 0
-    while n < 1023 { pinf = pinf * 2.0; n = n + 1 }
-    pinf = pinf * 2.0
-    if frac != 0 {
-      // Inf - Inf gives x87's indefinite value 0xC000000000000000, a NEGATIVE
-      // quiet NaN, so a positive input NaN came out with its sign flipped.
-      // Build the NaN from its bits: exponent all ones, quiet bit set, sign from
-      // the input. 0x7FF8000000000000 = 9221120237041090560. (The first constant
-      // written here was 2251799813685248 = 2^51, a small NORMAL float, not a
-      // NaN -- the exponent field was 0, not 2047.)
-      if sign < 0.0 { return f64of(0 - 9221120237041090560) }
-      return f64of(9221120237041090560)
-    }
-    if sign < 0.0 { return 0.0 - pinf }
-    return pinf
-  }
-
-  if exp == 0 {
-    // Signed zero, or a subnormal: value = sign * frac * 2^-24. Build the scale
-    // by exact halving rather than from a decimal literal.
-    if frac == 0 {
-      if sign < 0.0 { return 0.0 * -1.0 }
-      return 0.0
-    }
-    let scale = 1.0
-    let n = 0
-    while n < 24 { scale = scale / 2.0; n = n + 1 }
-    return sign * (frac * scale)
-  }
-
-  let mant = 1.0 + frac / 1024.0
-  // 2^(exp-15) by exact squaring on the integer exponent.
-  let e = exp - 15
-  let p2 = 1.0
-  if e > 0 {
-    let n = e
-    while n > 0 { p2 = p2 * 2.0; n = n - 1 }
-  }
-  if e < 0 {
-    let n = 0 - e
-    while n > 0 { p2 = p2 / 2.0; n = n - 1 }
-  }
-  return sign * mant * p2
+  // This is the copy that binds for programs importing std/gguf (which imports
+  // std/fs before defining its own f16_to_f64); see the note there.
+  let b = mem_load8(p) + mem_load8(p + 1) * 256
+  return f16bits_to_f64(b)
 }
 
 

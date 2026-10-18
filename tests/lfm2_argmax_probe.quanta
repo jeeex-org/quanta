@@ -1,0 +1,247 @@
+// tests/lfm2_argmax_probe.quanta
+//
+// A FAST, SINGLE-ANSWER harness for two questions that a 9-pass logits test is
+// too slow to answer repeatedly:
+//
+//   1. "did this change move the model's output at all?"  -- first-token argmax
+//      plus a digest over all 128,000 logits plus the first NTOK greedy ids.
+//   2. "how much did it move it, and did it stay inside the declared bar?" --
+//      the probe is driven entirely by a conf line, so ONE binary measures every
+//      arm, and the digest is compared mechanically between arms.
+//
+// The digest is  sum_i f64bits(logits[i])  (i64, wraparound), which is
+// order-agnostic but exact in every bit, plus the argmax and the id sequence.
+// That is the right shape for a bit-moving flag: it asserts BOTH that the ids
+// are unchanged (the semantic bar) and reports the size of the logit excursion
+// (the numeric bar) -- it never lets "argmax matches" stand in for "values
+// match".
+//
+// conf tests/lfm2_argmax_probe.conf, all fields positional:
+//   <nw> <fused_q4k> <fused_q6k> <fused_chain> <fused_glu> <fused_attn> <fused_conv> <fused_fma> <fused_f32>
+// A missing tail field defaults to 0, so a short conf is a valid arm.
+//
+// Build: QC=./compiler/0.0.249/bin/x86/qc ; $QC -O tests/lfm2_argmax_probe.quanta /tmp/ap
+// Run  : ( ulimit -c 0 -v 32000000; /tmp/ap </dev/null )
+import std/gguf
+import std/lfm2_forward
+import std/lfm2_model
+import std/gguf_mm
+import std/gguf_bpe
+import std/lfm2_chat
+import std/fs
+
+const Q4_PATH = "/opt/ai/models/quanta/QUANTA-LFM2.5-2.6Bv1-Q4_K_M.gguf"
+const PROMPT_PATH = "tests/lfm2_prompt.txt"
+const NCTX = 2048
+const NTOK = 24
+const CAP = 16384
+
+let plen = 0
+
+fn slurp(fd) {
+    if fd < 0 { return 0 }
+    let b = mem_alloc(CAP)
+    let got = read_raw(fd, b, CAP)
+    file_close(fd)
+    if got <= 0 { return 0 }
+    plen = got
+    return b
+}
+
+fn as_str(raw, n) {
+    let s = mem_alloc(n + 16)
+    mem_store(s, n)
+    let i = 0
+    while i < n { mem_store8(s + 8 + i, mem_load8(raw + i)); i = i + 1 }
+    mem_store8(s + 8 + n, 0)
+    return s
+}
+
+// ---- conf ------------------------------------------------------------------
+let cf = mem_alloc(32)
+let ncf = 0
+
+fn load_conf(path) {
+    let fd = file_open(path, 0)
+    if fd < 0 { return 0 }
+    let b = mem_alloc(1024)
+    let got = read_raw(fd, b, 1024)
+    file_close(fd)
+    if got <= 0 { return 0 }
+    let v = 0
+    let i = 0
+    while i < got {
+        let c = mem_load8(b + i)
+        if c >= 48 && c <= 57 {
+            v = v * 10 + (c - 48)
+        } else {
+            mem_store(cf + ncf * 8, v)
+            ncf = ncf + 1
+            v = 0
+        }
+        i = i + 1
+    }
+    mem_store(cf + ncf * 8, v)
+    ncf = ncf + 1
+    return ncf
+}
+
+fn fld(i) -> i64 {
+    if i >= ncf { return 0 }
+    return mem_load(cf + i * 8)
+}
+
+// ---- /proc/self/status ------------------------------------------------------
+// The read buffer is allocated ONCE: a per-reading mem_alloc is 9 pages, which
+// is the bench's own residual growth (A35's mechanism, measured in the loader
+// audit). Reporting a leak the probe itself caused is the trap to avoid.
+let pb = 0
+fn proc_field(tag0, tag1, tag2, tag3) -> i64 {
+    let fd = file_open("/proc/self/status", 0)
+    if fd < 0 { return -1 }
+    let got = read_raw(fd, pb, 8192)
+    file_close(fd)
+    if got <= 0 { return -1 }
+    let i = 0
+    while i + 4 < got {
+        if mem_load8(pb + i) == tag0 && mem_load8(pb + i + 1) == tag1
+           && mem_load8(pb + i + 2) == tag2 && mem_load8(pb + i + 3) == tag3 {
+            let j = i + 4
+            let v = 0
+            while j < got {
+                let c = mem_load8(pb + j)
+                if c >= 48 && c <= 57 { v = v * 10 + (c - 48) }
+                j = j + 1
+                if j > i + 4 && (c < 48 || c > 57) && v > 0 { return v }
+            }
+            return v
+        }
+        i = i + 1
+    }
+    return -1
+}
+
+fn main() {
+    pb = mem_alloc(2048)
+    if load_conf("tests/lfm2_argmax_probe.conf") <= 0 { prints("FAIL conf\n"); return 1 }
+    let nw = fld(0)
+    if nw < 1 { nw = 1 }
+
+    prints("conf: nw="); print(nw)
+    prints(" f4="); print(fld(1))
+    prints(" f6="); print(fld(2))
+    prints(" fch="); print(fld(3))
+    prints(" fglu="); print(fld(4))
+    prints(" fattn="); print(fld(5))
+    prints(" fcv="); print(fld(6))
+    prints(" ffma="); print(fld(7))
+    prints(" ff32="); print(fld(8))
+    newline()
+
+    if gguf_load(Q4_PATH) != 0 { prints("FAIL gguf_load\n"); return 1 }
+    if fc_read_config() != 0 { prints("FAIL fc_read_config\n"); return 1 }
+    if bpe_init_from_gguf() == 0 { prints("FAIL bpe_init\n"); return 1 }
+    if fc_kv_init(NCTX) != 0 { prints("FAIL fc_kv_init\n"); return 1 }
+    if fc_fw_init() != 0 { prints("FAIL fc_fw_init\n"); return 1 }
+    mm_set_workers_uncapped(nw)
+    mm_set_embed_workers_uncapped(nw)
+    if mm_attach_mmap_fd(file_open(Q4_PATH, 0)) != 0 { prints("FAIL mm_attach_mmap\n"); return 1 }
+    if fc_cache_norms() != 0 { prints("FAIL fc_cache_norms\n"); return 1 }
+
+    mm_set_fused_q4k(fld(1))
+    mm_set_fused_q6k(fld(2))
+    mm_set_fused_chain(fld(3))
+    mm_set_fused_glu(fld(4))
+    mm_set_fused_attn(fld(5))
+    mm_set_fused_conv(fld(6))
+    mm_set_fused_fma(fld(7))
+
+    let rawprompt = slurp(file_open(PROMPT_PATH, 0))
+    if rawprompt == 0 { prints("FAIL read prompt\n"); return 1 }
+    let user = as_str(rawprompt, plen)
+    let pbb = mem_alloc(CAP)
+    let pbytes = chat_build(0, user, pbb)
+    let ids = mem_alloc(8192 * 8)
+    mem_store(ids, bpe_bos)
+    let n = bpe_encode_special(pbb, pbytes, ids + 8, 8000) + 1
+    prints("prompt_ids="); print(n); newline()
+
+    let vssize = proc_field(86, 109, 83, 105)     // "VmSize"
+    let vpeak  = proc_field(86, 109, 80, 101)     // "VmPeak"
+    let rss    = proc_field(86, 109, 82, 83)      // "VmRSS"
+    prints("vm_start_kb="); print(vssize)
+    prints(" vmpeak_start_kb="); print(vpeak)
+    prints(" rss_start_kb="); print(rss); newline()
+
+    mm_pool_begin()
+
+    let t0 = clock()
+    let i = 0
+    while i < n {
+        let want = 0
+        if i == n - 1 { want = 1 }
+        if fc_forward_token_ex(mem_load(ids + i * 8), i, want) != 0 { prints("FAIL prefill\n"); return 1 }
+        i = i + 1
+    }
+    let am0 = fc_argmax(fc_n_vocab)
+
+    // Digest of the whole logits vector. BOTH accumulators are chosen so they
+    // CANNOT overflow, and that is not a style preference: the first version
+    // summed the raw f64 bit patterns into an i64 and the value is ~4.6e18 per
+    // logit, so 128,000 of them overflow -- which is an armed `ud2` trap on this
+    // tree, and the probe died with SIGILL on BOTH arms before printing a single
+    // result. The traps are on by default here; a harness that can trap on its
+    // own digest cannot be trusted to report a failure honestly.
+    //   logits_xor : exact in every bit, order-agnostic
+    //   exp_sum    : sum of the 11-bit exponent fields, <= 128000*2047 = 2.6e8
+    let logits_xor = 0
+    let exp_sum = 0
+    let v = 0
+    while v < fc_n_vocab {
+        let b = mem_load(fc_fw_logits + v * 8)
+        logits_xor = logits_xor ^ b
+        let a = b
+        if a < 0 { a = a - (0 - 9223372036854775807 - 1) }
+        let e = a / 4503599627370496
+        exp_sum = exp_sum + (e - (e / 2048) * 2048)
+        v = v + 1
+    }
+
+    let gen = mem_alloc((NTOK + 4) * 8)
+    mem_store(gen, am0)
+    let step = 1
+    while step <= NTOK {
+        let tok = fc_argmax(fc_n_vocab)
+        mem_store(gen + step * 8, tok)
+        if fc_forward_token_ex(tok, n - 1 + step, 1) != 0 { prints("FAIL step\n"); return 1 }
+        step = step + 1
+    }
+    let t1 = clock()
+
+    mm_pool_end()
+
+    prints("first_argmax="); print(am0); newline()
+    prints("ids: ")
+    let q = 1
+    while q <= NTOK { print(mem_load(gen + q * 8)); prints(" "); q = q + 1 }
+    newline()
+    prints("logits_xor_bits="); print(logits_xor)
+    prints(" exp_sum="); print(exp_sum); newline()
+    prints("witness q4k="); print(mm_get_fused_used())
+    prints(" q6k="); print(mm_get_fused_q6k_used())
+    prints(" chain="); print(mm_get_fused_chain_used())
+    prints(" glu="); print(mm_get_glu_used())
+    prints(" attn="); print(mm_get_attn_used())
+    prints(" conv="); print(mm_get_conv_used())
+    prints(" fma="); print(mm_get_fused_fma())
+    prints(" fma_used="); print(mm_get_fused_fma_used())
+    newline()
+    let vse = proc_field(86, 109, 83, 105)
+    let rss2 = proc_field(86, 109, 82, 83)
+    prints("vm_end_kb="); print(vse)
+    prints(" rss_end_kb="); print(rss2)
+    prints(" elapsed_ms="); print((t1 - t0) / 1000000)
+    newline()
+    prints("DONE\n")
+    return 0
+}

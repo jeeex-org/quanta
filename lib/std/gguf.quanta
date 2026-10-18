@@ -1589,77 +1589,38 @@ fn read_tensor_f64_prefix(idx, buf, nprobe) {
     return 1
 }
 
-fn f32_to_f64(ptr) {
-    let b0 = mem_load8(ptr)
-    let b1 = mem_load8(ptr + 1)
-    let b2 = mem_load8(ptr + 2)
-    let b3 = mem_load8(ptr + 3)
-    
-    // f32 layout: sign = b3 bit 7; exp = b3 bits 0-6 | b2 bit 7;
-    // mant = b2 bits 0-6 | b1 | b0.
-    let sign = i2f(b3 / 128)
-    let exp32 = i2f(b3 - (b3 / 128) * 128) * i2f(2) + i2f(b2 / 128)
-    let mant32 = i2f(b2 - (b2 / 128) * 128) * i2f(65536) + i2f(b1) * i2f(256) + i2f(b0)
-    
-    let two = i2f(2)
-    let one = i2f(1)
-    let zero = i2f(0)
-    
-    if exp32 == zero {
-        // exp == 0: signed zero, or a subnormal. This used to return 0 for
-        // both, which silently discarded every subnormal weight. A subnormal
-        // f32 has value mant32 * 2^-149, exactly representable in f64.
-        if mant32 == zero {
-            // Signed zero. This returned `fsub(zero, zero)`, but that is
-            // +0.0 - +0.0 = +0.0 under round-to-nearest -- so every -0.0f32
-            // weight came back as +0.0 and the sign bit was simply lost.
-            // Negating the ZERO VARIABLE is what produces -0.0: 0.0 * -1.0 is
-            // -0.0 exactly, because the sign is applied to the zero itself.
-            if sign == one { return fmul(zero, i2f(0-1)) }
-            return zero
-        }
-        let sub = one
-        let si = 0
-        while si < 149 { sub = fdiv(sub, two); si = si + 1 }
-        let subv = fmul(mant32, sub)
-        if sign == one { return fsub(zero, subv) }
-        return subv
-    }
-    
-    if exp32 == i2f(255) {
-        // exp == 255: Inf when mant == 0, NaN otherwise. This used to return 0
-        // for both, so an Inf or NaN weight became a zero weight.
-        // 2^1023 is the largest finite f64, so one more doubling overflows to
-        // exactly +Inf. Keep the loop to 1023 iterations -- a 1024-iteration
-        // one kept doubling a value that was already Inf.
-        let pinf = one
-        let pi = 0
-        while pi < 1023 { pinf = fmul(pinf, two); pi = pi + 1 }
-        pinf = fmul(pinf, two)
-        if mant32 != zero {
-            // NaN: Inf - Inf is the canonical quiet NaN.
-            return fsub(pinf, pinf)
-        }
-        if sign == one { return fsub(zero, pinf) }
-        return pinf
-    }
-    
-    let new_exp = f2i(exp32 - i2f(127))
-    let mant_frac = fdiv(mant32, i2f(8388608))
-    let one_plus_mant = fadd(one, mant_frac)
-    
-    let pow2 = one
-    let i = 0
-    if new_exp >= 0 {
-        while i < new_exp { pow2 = fmul(pow2, two); i = i + 1 }
-    } else {
-        let neg = 0 - new_exp
-        while i < neg { pow2 = fdiv(pow2, two); i = i + 1 }
-    }
-    
-    let result = fmul(pow2, one_plus_mant)
-    if sign == one { result = fsub(zero, result) }
-    return result
+// f32_to_f64(ptr): widen an IEEE 754 binary32 at `ptr` to binary64.
+//
+// A34 (fixed). This was a hand-rolled software conversion in Quanta source --
+// four byte loads, sign/exponent/mantissa reassembly, and a `while` loop whose
+// trip count was the exponent magnitude. Measured 78 ns/element at 64 elements
+// and 363 ns/element at 6144; ~100x a single `cvtss2sd`, and a landmine under
+// every f32 path.
+//
+// It now calls the language's own conversion builtin, `f32bits_to_f64`, which
+// the emitter realises as one `movd` + one `cvtss2sd` (SSE2, x86-64 baseline).
+// The builtin is not a convenience wrapper: it is the path pinned with zero
+// tolerance against libggml-base over 65,536 f64->f32 cases and all 65,536 f16
+// patterns (test_suites/codes/fp16_conv_oracle_test.quanta).
+//
+// AGREEMENT WITH THE DELETED BODY, measured, not assumed:
+// tests/lfm2_f32conv_agree_test.quanta compares this exact form against a
+// VERBATIM copy of the old body. Every NON-NaN input -- both zeros, every
+// subnormal, every normal, both infinities -- is BIT-IDENTICAL (exhaustive for
+// f16, all 2^32 patterns for f32). Only NaN inputs differ, and there the old
+// body was WRONG in one specific way worth recording: it synthesised `Inf - Inf`
+// for a NaN, and that yields x87's "indefinite" value -- ALWAYS the NEGATIVE
+// quiet NaN 0xFFF8000000000000 -- so a positive NaN weight came back with its
+// sign flipped, and the payload was dropped. The builtin propagates the payload
+// and preserves the sign. No finite value moves, which is why the loader's
+// 128,000-logit bit-exact gate is unaffected.
+//
+// The byte gather is mem_load8 rather than mem_load32: std/fs DEFINES a function
+// of that name and a user-defined name shadows the builtin. Four movzx + adds is
+// two orders of magnitude under the loop it replaces; it is not the bottleneck.
+fn f32_to_f64(ptr) -> f64 {
+    let b = mem_load8(ptr) + mem_load8(ptr + 1) * 256 + mem_load8(ptr + 2) * 65536 + mem_load8(ptr + 3) * 16777216
+    return f32bits_to_f64(b)
 }
 
 // --------------------------------------------------------------- F32 (type 0)
@@ -1716,79 +1677,35 @@ fn dequant_f32(raw, nelements, out) {
 //
 // ggml's GGML_FP16_TO_FP32 is POWER8 inline assembly (mtfprd / xscvhpdp) in
 // ggml-impl.h, so it cannot be used directly here.
-fn f16_to_f64(ptr) {
-    let lo = mem_load8(ptr)
-    let hi = mem_load8(ptr + 1)
-
-    let sign = hi / 128                                  // 0 or 1
-    let hib = hi - sign * 128                            // bits 0..6 of hi
-    let exp = hib / 4                                    // (hi >> 2) & 31
-    let mant = lo + (hib - (hib / 4) * 4) * 256          // lo | ((hi & 3) << 8)
-
-    let two = i2f(2)
-    let one = i2f(1)
-    let zero = i2f(0)
-
-    if exp == 0 {
-        if mant == 0 {
-            // Signed zero. Negating the zero variable produces -0.0 exactly. The
-            // sign is applied to the zero itself, not to a subtraction, because
-            // 0.0 - 0.0 is +0.0 under round-to-nearest.
-            if sign == 1 { return fmul(zero, i2f(0 - 1)) }
-            return zero
-        }
-        // Subnormal: value = mant * 2^-24. Build the scale by repeated halving
-        // and multiply the integer mantissa in. A plain (exp - 15) rebasing
-        // returns 0 for every subnormal, which is a real defect class -- f32's
-        // own converter had it and it silently discarded subnormal weights.
-        let scale = one
-        let i = 0
-        while i < 24 { scale = fdiv(scale, two); i = i + 1 }
-        let v = fmul(i2f(mant), scale)
-        if sign == 1 { return fsub(zero, v) }
-        return v
-    }
-
-    if exp == 31 {
-        // Inf when mant == 0, NaN otherwise. 2^1023 is the largest finite f64, so
-        // one more doubling overflows to exactly +Inf.
-        let pinf = one
-        let i = 0
-        while i < 1023 { pinf = fmul(pinf, two); i = i + 1 }
-        pinf = fmul(pinf, two)
-        if mant != 0 {
-            // Inf - Inf produces x87's "indefinite" value 0xC000000000000000,
-            // which is a NEGATIVE quiet NaN -- so a positive input NaN came out
-            // with its sign flipped. Build the NaN from its bits instead:
-            // exponent all ones, quiet bit set, sign copied from the input. That
-            // is deterministic and matches what a widening conversion owes the
-            // caller (IEEE does not fix the payload, but it does fix the class
-            // and the sign).
-            let nanpat = 9221120237041090560    // 0x7FF8000000000000, quiet NaN
-            if sign == 1 { return f64of(0 - nanpat) }
-            return f64of(nanpat)
-        }
-        if sign == 1 { return fsub(zero, pinf) }
-        return pinf
-    }
-
-    // Normal: value = (1 + mant/1024) * 2^(exp - 15). Since f16 and f64 share a
-    // biased-exponent convention with the same bias offset relationship here,
-    // the exponent shift is exp - 15 + 1023 applied to the f64 exponent field;
-    // done here by multiplying out a power of two, which is exact.
-    let leading = fadd(one, fdiv(i2f(mant), i2f(1024)))
-    let e = exp - 15
-    let pow2 = one
-    let i = 0
-    if e >= 0 {
-        while i < e { pow2 = fmul(pow2, two); i = i + 1 }
-    } else {
-        let neg = 0 - e
-        while i < neg { pow2 = fdiv(pow2, two); i = i + 1 }
-    }
-    let v = fmul(leading, pow2)
-    if sign == 1 { return fsub(zero, v) }
-    return v
+// f16_to_f64(ptr): widen an IEEE 754 binary16 at `ptr` to binary64.
+//
+// A34 (fixed), the f16 half. Every binary16 is exactly representable in
+// binary32 and binary64, so this is a widening with nothing to round -- and the
+// builtin `f16bits_to_f64` is exactly that, integer f16->f32 followed by one
+// `cvtss2sd`. It is the same path the f16 oracle pins over ALL 65,536 patterns.
+//
+// AGREEMENT WITH THE DELETED BODY, measured (`tests/lfm2_f32conv_agree_test.quanta`,
+// verbatim old body vs this form, exhaustive over all 65,536 patterns):
+//   non-NaN inputs (incl. both zeros, subnormals, both infinities): 0 bit-diffs
+//   NaN inputs: 2,046 patterns, 2,045 differ, and in 1,023 of them the OLD body
+//   did not even return a NaN.
+// That last number is a real defect in the deleted code, not a rounding
+// difference: the old NaN branch did `f64of(0 - 0x7FF8000000000000)`, and
+// `0 - pattern` is a TWO'S-COMPLEMENT NEGATION, not a sign-bit set. It yields
+// 0x8008000000000000 -- exponent 0, mantissa 0x8000000000000 -- i.e. a
+// SUBNORMAL of value 2^-1023, for every one of the 1,023 negative NaN patterns.
+// A NaN weight silently became a finite one. The builtin returns a proper NaN
+// with the sign and payload preserved.
+//
+// NOTE: this name is defined in std/fs as well. By Quanta's
+// first-definition-wins rule (measured: `import a; import b` then calling a
+// name both define calls a's) and because gguf.quanta imports std/fs before
+// defining its own, the std/fs copy is the one a program compiles to. Both were
+// replaced with the identical native form and both are covered by the
+// agreement row, so which one binds does not change the result.
+fn f16_to_f64(ptr) -> f64 {
+    let b = mem_load8(ptr) + mem_load8(ptr + 1) * 256
+    return f16bits_to_f64(b)
 }
 
 // -------------------------------------------------------------- Q6_K (type 14)

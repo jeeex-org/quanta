@@ -1,0 +1,591 @@
+// tests/lfm2_f32conv_agree_test.quanta
+//
+// A34: the hand-rolled software float widening in lib/std vs the language's
+// native conversion builtins -- agreed over an exhaustive sweep BEFORE the
+// hand-rolled bodies are deleted.
+//
+// WHY THIS FILE CONTAINS THE OLD CODE. The hand-rolled `f32_to_f64`
+// (lib/std/gguf.quanta; 78-363 ns/element because its exponent loop runs once
+// per unit of exponent magnitude) and `f16_to_f64` (defined TWICE in the tree:
+// lib/std/gguf.quanta and lib/std/fs.quanta -- and by Quanta's
+// first-definition-wins rule for duplicate names, the one a program actually
+// calls is whichever was expanded first, so BOTH copies are compared here) are
+// transcribed VERBATIM from git 4f3d88fa so this row is the proof rather than a
+// claim about one. Renamed old_*; bodies byte-identical. Diff them with:
+//   git show HEAD:lib/std/gguf.quanta | sed -n '1592,1663p'   # old_f32_to_f64
+//   git show HEAD:lib/std/gguf.quanta | sed -n '1719,1792p'   # old_f16_to_f64
+//   git show HEAD:lib/std/fs.quanta   | sed -n  '196,271p'    # old_fs_f16_to_f64
+//
+// THE REPLACEMENT is two short functions, and it is the native path that is
+// already pinned with ZERO TOLERANCE against libggml-base's ggml_fp16_to_fp32 /
+// ggml_fp32_to_fp16 and the host (float) cast over all 65,536 f16 patterns and
+// 131,072 f32->f16 cases (test_suites/codes/fp16_conv_oracle_test.quanta). This
+// row asks the DIFFERENT question: does adopting the native conversion MOVE A
+// BIT PATTERN the loader already depended on?
+//
+// EXPANSION ORDER MATTERS and is why `import std/fs` is the only import here:
+// f32_to_f64 / f16_to_f64 are the names under test, so nothing else may define
+// them. (Measured: a function defined in an importing file does NOT override an
+// imported one -- `import a; import b; fn foo(){...}` still calls a's foo.)
+//
+// TWO MEASUREMENT FAULTS were hit and are recorded because each produced a
+// plausible wrong number:
+//   1. NaN classified as `v != v`. On this tree that reported every f16 NaN
+//      payload difference as a VALUE failure.
+//   2. The bit readout nested as `f(x) -> f64bits(...)`. `f64bits` is
+//      documented in the emitter as reading the marshalled %rdi and is
+//      FLOAT-TAGGED, so it both clobbers inside an expression and makes a
+//      variable unprintable. The readout here is store-to-memory then
+//      mem_load, which is how the loader itself moves f64 values.
+//
+// Modes (tests/lfm2_f32conv_agree_test.conf, one integer):
+//   0  structured f32 sweep: all 512 (sign,exponent) x 4096 strided mantissas
+//      + 13 boundary mantissas each + the EXHAUSTIVE 65,536-pattern f16 sweep.
+//   1  FULL f32 sweep: all 2^32 patterns (the only mode reportable as
+//      "exhaustive" for f32). Slow by construction -- run it in the background.
+//   2  conversion rate: ns/element, old vs new, on the 6144-element per-layer
+//      conv kernel (the shape dequant_f32 sees on this model).
+//
+// Build: QC=./compiler/0.0.249/bin/x86/qc ; $QC -O tests/lfm2_f32conv_agree_test.quanta /tmp/fagree
+// Run:   printf '0\n' > tests/lfm2_f32conv_agree_test.conf ; /tmp/fagree
+import std/fs
+
+fn load_mode(path) -> i64 {
+    let fd = file_open(path, 0)
+    if fd < 0 { return 0 }
+    let b = mem_alloc(64)
+    let got = read_raw(fd, b, 64)
+    file_close(fd)
+    if got <= 0 { return 0 }
+    let v = 0
+    let i = 0
+    while i < got {
+        let c = mem_load8(b + i)
+        if c >= 48 && c <= 57 { v = v * 10 + (c - 48) }
+        i = i + 1
+    }
+    return v
+}
+
+// ============ VERBATIM: the pre-adoption bodies (git 4f3d88fa) ============
+fn old_f32_to_f64(ptr) {
+    let b0 = mem_load8(ptr)
+    let b1 = mem_load8(ptr + 1)
+    let b2 = mem_load8(ptr + 2)
+    let b3 = mem_load8(ptr + 3)
+    
+    // f32 layout: sign = b3 bit 7; exp = b3 bits 0-6 | b2 bit 7;
+    // mant = b2 bits 0-6 | b1 | b0.
+    let sign = i2f(b3 / 128)
+    let exp32 = i2f(b3 - (b3 / 128) * 128) * i2f(2) + i2f(b2 / 128)
+    let mant32 = i2f(b2 - (b2 / 128) * 128) * i2f(65536) + i2f(b1) * i2f(256) + i2f(b0)
+    
+    let two = i2f(2)
+    let one = i2f(1)
+    let zero = i2f(0)
+    
+    if exp32 == zero {
+        // exp == 0: signed zero, or a subnormal. This used to return 0 for
+        // both, which silently discarded every subnormal weight. A subnormal
+        // f32 has value mant32 * 2^-149, exactly representable in f64.
+        if mant32 == zero {
+            // Signed zero. This returned `fsub(zero, zero)`, but that is
+            // +0.0 - +0.0 = +0.0 under round-to-nearest -- so every -0.0f32
+            // weight came back as +0.0 and the sign bit was simply lost.
+            // Negating the ZERO VARIABLE is what produces -0.0: 0.0 * -1.0 is
+            // -0.0 exactly, because the sign is applied to the zero itself.
+            if sign == one { return fmul(zero, i2f(0-1)) }
+            return zero
+        }
+        let sub = one
+        let si = 0
+        while si < 149 { sub = fdiv(sub, two); si = si + 1 }
+        let subv = fmul(mant32, sub)
+        if sign == one { return fsub(zero, subv) }
+        return subv
+    }
+    
+    if exp32 == i2f(255) {
+        // exp == 255: Inf when mant == 0, NaN otherwise. This used to return 0
+        // for both, so an Inf or NaN weight became a zero weight.
+        // 2^1023 is the largest finite f64, so one more doubling overflows to
+        // exactly +Inf. Keep the loop to 1023 iterations -- a 1024-iteration
+        // one kept doubling a value that was already Inf.
+        let pinf = one
+        let pi = 0
+        while pi < 1023 { pinf = fmul(pinf, two); pi = pi + 1 }
+        pinf = fmul(pinf, two)
+        if mant32 != zero {
+            // NaN: Inf - Inf is the canonical quiet NaN.
+            return fsub(pinf, pinf)
+        }
+        if sign == one { return fsub(zero, pinf) }
+        return pinf
+    }
+    
+    let new_exp = f2i(exp32 - i2f(127))
+    let mant_frac = fdiv(mant32, i2f(8388608))
+    let one_plus_mant = fadd(one, mant_frac)
+    
+    let pow2 = one
+    let i = 0
+    if new_exp >= 0 {
+        while i < new_exp { pow2 = fmul(pow2, two); i = i + 1 }
+    } else {
+        let neg = 0 - new_exp
+        while i < neg { pow2 = fdiv(pow2, two); i = i + 1 }
+    }
+    
+    let result = fmul(pow2, one_plus_mant)
+    if sign == one { result = fsub(zero, result) }
+    return result
+}
+
+fn old_f16_to_f64(ptr) {
+    let lo = mem_load8(ptr)
+    let hi = mem_load8(ptr + 1)
+
+    let sign = hi / 128                                  // 0 or 1
+    let hib = hi - sign * 128                            // bits 0..6 of hi
+    let exp = hib / 4                                    // (hi >> 2) & 31
+    let mant = lo + (hib - (hib / 4) * 4) * 256          // lo | ((hi & 3) << 8)
+
+    let two = i2f(2)
+    let one = i2f(1)
+    let zero = i2f(0)
+
+    if exp == 0 {
+        if mant == 0 {
+            // Signed zero. Negating the zero variable produces -0.0 exactly. The
+            // sign is applied to the zero itself, not to a subtraction, because
+            // 0.0 - 0.0 is +0.0 under round-to-nearest.
+            if sign == 1 { return fmul(zero, i2f(0 - 1)) }
+            return zero
+        }
+        // Subnormal: value = mant * 2^-24. Build the scale by repeated halving
+        // and multiply the integer mantissa in. A plain (exp - 15) rebasing
+        // returns 0 for every subnormal, which is a real defect class -- f32's
+        // own converter had it and it silently discarded subnormal weights.
+        let scale = one
+        let i = 0
+        while i < 24 { scale = fdiv(scale, two); i = i + 1 }
+        let v = fmul(i2f(mant), scale)
+        if sign == 1 { return fsub(zero, v) }
+        return v
+    }
+
+    if exp == 31 {
+        // Inf when mant == 0, NaN otherwise. 2^1023 is the largest finite f64, so
+        // one more doubling overflows to exactly +Inf.
+        let pinf = one
+        let i = 0
+        while i < 1023 { pinf = fmul(pinf, two); i = i + 1 }
+        pinf = fmul(pinf, two)
+        if mant != 0 {
+            // Inf - Inf produces x87's "indefinite" value 0xC000000000000000,
+            // which is a NEGATIVE quiet NaN -- so a positive input NaN came out
+            // with its sign flipped. Build the NaN from its bits instead:
+            // exponent all ones, quiet bit set, sign copied from the input. That
+            // is deterministic and matches what a widening conversion owes the
+            // caller (IEEE does not fix the payload, but it does fix the class
+            // and the sign).
+            let nanpat = 9221120237041090560    // 0x7FF8000000000000, quiet NaN
+            if sign == 1 { return f64of(0 - nanpat) }
+            return f64of(nanpat)
+        }
+        if sign == 1 { return fsub(zero, pinf) }
+        return pinf
+    }
+
+    // Normal: value = (1 + mant/1024) * 2^(exp - 15). Since f16 and f64 share a
+    // biased-exponent convention with the same bias offset relationship here,
+    // the exponent shift is exp - 15 + 1023 applied to the f64 exponent field;
+    // done here by multiplying out a power of two, which is exact.
+    let leading = fadd(one, fdiv(i2f(mant), i2f(1024)))
+    let e = exp - 15
+    let pow2 = one
+    let i = 0
+    if e >= 0 {
+        while i < e { pow2 = fmul(pow2, two); i = i + 1 }
+    } else {
+        let neg = 0 - e
+        while i < neg { pow2 = fdiv(pow2, two); i = i + 1 }
+    }
+    let v = fmul(leading, pow2)
+    if sign == 1 { return fsub(zero, v) }
+    return v
+}
+
+fn old_fs_f16_to_f64(p) {
+  // Widen an IEEE 754 binary16 to binary64. Every binary16 is exactly
+  // representable in binary64, so this is a widening with no rounding: only
+  // exponent rebasing and a mantissa shift.
+  //
+  // THIS FUNCTION HAD THREE DEFECTS, all of which produced plausible numbers:
+  //
+  //  1. `let exp = bits / 1024` never masked to 5 bits. `bits` is 0..65535, so
+  //     bits/1024 is 0..63 and the SIGN BIT leaks into the exponent. For 0xC000
+  //     (-2.0) it gave exp = 48 instead of 16, e = 33 instead of 1, and returned
+  //     -8589934592.0 = -2 * 2^32. Every NEGATIVE half was wrong.
+  //
+  //  2. Inf and NaN were faked: `return sign * 1.0e308` for Inf and `return 0.0`
+  //     for NaN. A caller that checks for infinity with `> 1e308` works by
+  //     accident, but `Inf - Inf` does not produce NaN and `Inf * 0` does not
+  //     produce NaN, so any arithmetic on an f16 Inf silently gives a finite
+  //     number. Both are synthesised properly now.
+  //
+  //  3. The subnormal scale was the decimal literal 1e-27, which is not 2^-24
+  //     (5.9604644775390625e-08). Every subnormal half was off by 19 orders of
+  //     magnitude.
+  let bits = mem_load16(p)
+  let sign = 1.0
+  if bits >= 32768 { sign = -1.0 }
+  let exp = (bits / 1024) - ((bits / 1024) / 32) * 32   // (bits >> 10) & 31
+  let frac = bits - (bits / 1024) * 1024               // bits & 1023
+
+  if exp == 31 {
+    // Inf when frac == 0, NaN otherwise. 2^1023 is the largest finite f64, so
+    // one more doubling overflows to exactly +Inf; Inf - Inf is the canonical
+    // quiet NaN.
+    let pinf = 1.0
+    let n = 0
+    while n < 1023 { pinf = pinf * 2.0; n = n + 1 }
+    pinf = pinf * 2.0
+    if frac != 0 {
+      // Inf - Inf gives x87's indefinite value 0xC000000000000000, a NEGATIVE
+      // quiet NaN, so a positive input NaN came out with its sign flipped.
+      // Build the NaN from its bits: exponent all ones, quiet bit set, sign from
+      // the input. 0x7FF8000000000000 = 9221120237041090560. (The first constant
+      // written here was 2251799813685248 = 2^51, a small NORMAL float, not a
+      // NaN -- the exponent field was 0, not 2047.)
+      if sign < 0.0 { return f64of(0 - 9221120237041090560) }
+      return f64of(9221120237041090560)
+    }
+    if sign < 0.0 { return 0.0 - pinf }
+    return pinf
+  }
+
+  if exp == 0 {
+    // Signed zero, or a subnormal: value = sign * frac * 2^-24. Build the scale
+    // by exact halving rather than from a decimal literal.
+    if frac == 0 {
+      if sign < 0.0 { return 0.0 * -1.0 }
+      return 0.0
+    }
+    let scale = 1.0
+    let n = 0
+    while n < 24 { scale = scale / 2.0; n = n + 1 }
+    return sign * (frac * scale)
+  }
+
+  let mant = 1.0 + frac / 1024.0
+  // 2^(exp-15) by exact squaring on the integer exponent.
+  let e = exp - 15
+  let p2 = 1.0
+  if e > 0 {
+    let n = e
+    while n > 0 { p2 = p2 * 2.0; n = n - 1 }
+  }
+  if e < 0 {
+    let n = 0 - e
+    while n > 0 { p2 = p2 / 2.0; n = n - 1 }
+  }
+  return sign * mant * p2
+}
+
+// ============ THE ADOPTED NATIVE FORM ============
+// The byte gather is mem_load8 rather than mem_load32/mem_load16 for one
+// reason: fs.quanta DEFINES functions with those exact names, and a
+// user-defined name shadows the builtin (which is how fs's own mem_load16 works
+// today). Four movzx + adds is still ~100x under the loop it replaces.
+fn new_f32_to_f64(ptr) {
+    let b = mem_load8(ptr) + mem_load8(ptr + 1) * 256 + mem_load8(ptr + 2) * 65536 + mem_load8(ptr + 3) * 16777216
+    return f32bits_to_f64(b)
+}
+
+fn new_f16_to_f64(ptr) {
+    let b = mem_load8(ptr) + mem_load8(ptr + 1) * 256
+    return f16bits_to_f64(b)
+}
+
+// ---------------------------------------------------------------------------
+// f64 bit readout as INTEGER: exponent field and mantissa-nonzero. Operates on
+// a bit pattern passed as an integer, so it never sees a float-typed value.
+//
+// THE SIGN IS STRIPPED FIRST, and that is not cosmetic. A negative bit pattern
+// (any value with the sign bit set -- i.e. -0.0, every negative normal, and
+// every negative NaN) is a NEGATIVE i64, and floor division by 2^52 then
+// borrows: -0xFFF8000000000000 / 2^52 floors to -2048, not -2047, so
+// `e - (e/2048)*2048` returned 0 while the true exponent field was 2047. The
+// first run of this row classified 1,023 negative f16 NaNs as "the old
+// conversion produced a subnormal" -- a false correctness failure produced
+// entirely by the probe. f32 bit patterns are built as positive i64s
+// (0..2^32-1), which is exactly why only the f16 arm was affected.
+// f64 bit readout as INTEGER, from a bit pattern passed as an integer (never a
+// float-typed value). THE SIGN IS CLEARED BY SUBTRACTING INT64_MIN, which is the
+// only way to reach bit 63 without an unsigned shift: for a negative pattern
+// v = P - 2^64, `v + 2^63 = P - 2^63` is exactly P with the sign bit cleared.
+//
+// TWO WRONG VERSIONS PRECEDED THIS ONE, and both produced plausible numbers:
+//   * floor division straight on the signed carrier: -0xFFF8000000000000 / 2^52
+//     floors to -2048, so `e - (e/2048)*2048` returned 0 while the true exponent
+//     field was 2047. That reported 1,023 negative f16 NaNs as "the old
+//     conversion produced a subnormal".
+//   * negating the carrier (`if v<0 { 0-v }`): that is a two's-complement
+//     negation, not a sign-bit clear. For -1.0 it yields 1025, not 1023.
+fn strip_bits(v) -> i64 {
+    if v < 0 { return v - (0 - 9223372036854775807 - 1) }
+    return v
+}
+fn exp_bits(v) -> i64 {
+    let a = strip_bits(v)
+    let e = a / 4503599627370496
+    return e - (e / 2048) * 2048
+}
+fn mant_nz(v) -> i64 {
+    let a = strip_bits(v)
+    if a - (a / 4503599627370496) * 4503599627370496 != 0 { return 1 }
+    return 0
+}
+fn isnan_bits(v) -> i64 {
+    if exp_bits(v) == 2047 && mant_nz(v) != 0 { return 1 }
+    return 0
+}
+fn sign_bits(v) -> i64 { if v < 0 { return 1 } return 0 }
+
+fn put16(p, v) {
+    mem_store8(p, v - (v / 256) * 256)
+    mem_store8(p + 1, v / 256)
+}
+
+fn put32(p, v) {
+    let b0 = v - (v / 256) * 256
+    let v1 = v / 256
+    let b1 = v1 - (v1 / 256) * 256
+    let v2 = v1 / 256
+    let b2 = v2 - (v2 / 256) * 256
+    let b3 = v2 / 256
+    mem_store8(p, b0)
+    mem_store8(p + 1, b1)
+    mem_store8(p + 2, b2)
+    mem_store8(p + 3, b3)
+}
+
+// THE CRITERION IS ON THE INPUT PATTERN, not on classifying the outputs. An
+// input is a NaN iff its own exponent field is all ones and its mantissa is
+// non-zero -- pure integer arithmetic on the pattern, with no dependence on how
+// either converter behaved. That makes the two arms:
+//   non-NaN input : old and new MUST be bit-identical            -> g_bad
+//   NaN input     : old and new differ (payload, and for the f16 negative
+//                   NaNs the CLASS -- see the writeup)            -> g_nan, reported
+let g_bad = 0        // gguf f16 copy: non-NaN input, bits differ  (must be 0)
+let g_nan = 0        // gguf f16 copy: NaN input, bits differ
+let g_bad2 = 0       // fs f16 copy
+let g_nan2 = 0
+let g_bad32 = 0      // f32
+let g_nan32 = 0
+let g_first = -1
+let g_first_val = 0
+let g_w = 0          // 16-byte readout cell
+let g_nan_in = 0     // f16: NaN input patterns seen
+let g_defect = 0     // f16: NaN inputs where the OLD result is not even a NaN
+let g_f32_in = 0     // f32: NaN input patterns seen
+let g_f32_defect = 0 // f32: NaN inputs where the OLD result is not a NaN
+
+// One f32 pattern: build it at `p`, convert both ways, compare BIT-EXACTLY,
+// and bucket by whether the INPUT was a NaN.
+fn f32_one(p) {
+    let pat = mem_load8(p) + mem_load8(p + 1) * 256 + mem_load8(p + 2) * 65536 + mem_load8(p + 3) * 16777216
+    let inp_nan = 0
+    let e = (pat / 8388608) - ((pat / 8388608) / 256) * 256
+    if e == 255 && pat - (pat / 8388608) * 8388608 != 0 { inp_nan = 1 }
+    let a = old_f32_to_f64(p)
+    let b = new_f32_to_f64(p)
+    mem_store(g_w, a)
+    mem_store(g_w + 8, b)
+    let ba = mem_load(g_w)
+    let bb = mem_load(g_w + 8)
+    if inp_nan != 0 {
+        g_f32_in = g_f32_in + 1
+        if ba != bb {
+            g_nan32 = g_nan32 + 1
+            if isnan_bits(ba) == 0 { g_f32_defect = g_f32_defect + 1 }
+        }
+    } else {
+        if ba != bb {
+            g_bad32 = g_bad32 + 1
+            if g_first < 0 { g_first = 1; g_first_val = pat }
+        }
+    }
+}
+
+fn main() -> i64 {
+    let mode = load_mode("tests/lfm2_f32conv_agree_test.conf")
+    let s = mem_alloc(2)          // 16 bytes of pattern scratch
+    g_w = mem_alloc(2)            // 16 bytes of bit readout
+    print("mode=")
+    println(mode)
+
+    // ================= f16: EXHAUSTIVE, all 65,536 patterns =================
+    let i = 0
+    while i < 65536 {
+        put16(s, i)
+        // the INPUT's own NaN test: exponent field 15 all ones, mantissa != 0
+        let inp_nan = 0
+        let e16 = (i / 1024) - ((i / 1024) / 32) * 32
+        if e16 == 31 && i - (i / 1024) * 1024 != 0 { inp_nan = 1 }
+        let b = new_f16_to_f64(s)
+        mem_store(g_w + 8, b)
+        let bb = mem_load(g_w + 8)
+        let a = old_f16_to_f64(s)          // arm 1: gguf.quanta's hand-rolled copy
+        mem_store(g_w, a)
+        let ba = mem_load(g_w)
+        if inp_nan != 0 {
+            g_nan_in = g_nan_in + 1
+            if ba != bb {
+                g_nan = g_nan + 1
+                if isnan_bits(ba) == 0 { g_defect = g_defect + 1 }
+            }
+        } else {
+            if ba != bb {
+                g_bad = g_bad + 1
+                if g_first < 0 { g_first = 1; g_first_val = i }
+            }
+        }
+        let c = old_fs_f16_to_f64(s)       // arm 2: fs.quanta's copy (likely live)
+        mem_store(g_w, c)
+        let bc = mem_load(g_w)
+        if inp_nan != 0 { if bc != bb { g_nan2 = g_nan2 + 1 } }
+        else { if bc != bb { g_bad2 = g_bad2 + 1 } }
+        i = i + 1
+    }
+    print("f16 exhaustive 65536: non-NaN-input bit-diffs: gguf=")
+    print(g_bad)
+    print(" fs=")
+    print(g_bad2)
+    print("  | NaN inputs=")
+    print(g_nan_in)
+    print(" differing=")
+    print(g_nan)
+    print(" where the OLD result is NOT a NaN=")
+    println(g_defect)
+
+    // ================= f32 (structured in every non-full mode) ==============
+    let se = 0
+    let ncase = 0
+    while se < 512 {
+        let ex = se - (se / 256) * 256
+        let base = (se / 256) * 2147483648 + ex * 8388608
+        let m = 0
+        while m < 8388608 {
+            put32(s, base + m)
+            f32_one(s)
+            ncase = ncase + 1
+            m = m + 2048
+        }
+        let b = 0
+        while b < 5 {
+            put32(s, base + b)
+            f32_one(s); ncase = ncase + 1
+            b = b + 1
+        }
+        put32(s, base + 4194302); f32_one(s); ncase = ncase + 1
+        put32(s, base + 4194303); f32_one(s); ncase = ncase + 1
+        put32(s, base + 4194304); f32_one(s); ncase = ncase + 1
+        put32(s, base + 4194305); f32_one(s); ncase = ncase + 1
+        put32(s, base + 8388604); f32_one(s); ncase = ncase + 1
+        put32(s, base + 8388605); f32_one(s); ncase = ncase + 1
+        put32(s, base + 8388606); f32_one(s); ncase = ncase + 1
+        put32(s, base + 8388607); f32_one(s); ncase = ncase + 1
+        se = se + 1
+    }
+    print("f32 structured: cases=")
+    print(ncase)
+    print(" non-NaN-input bit-diffs=")
+    print(g_bad32)
+    print(" | NaN inputs=")
+    print(g_f32_in)
+    print(" differing=")
+    print(g_nan32)
+    print(" where the OLD result is NOT a NaN=")
+    println(g_f32_defect)
+    if g_bad32 != 0 { print("  first bad f32 pattern: "); println(g_first_val) }
+
+    // ================= FULL 2^32 (mode 1) =================
+    if mode == 1 {
+        print("f32 FULL 2^32 starting...\n")
+        let pat = 0
+        while pat < 4294967296 {
+            put32(s, pat)
+            f32_one(s)
+            pat = pat + 1
+        }
+        print("f32 FULL 2^32: patterns=")
+        print(pat)
+        print(" non-NaN-input bit-diffs=")
+        print(g_bad32)
+        print(" | NaN inputs=")
+        print(g_f32_in)
+        print(" differing=")
+        print(g_nan32)
+        print(" where the OLD result is NOT a NaN=")
+        println(g_f32_defect)
+        if g_bad32 != 0 { print("  first bad f32 pattern: "); println(g_first_val) }
+    }
+
+    // ================= rate (mode 2) =================
+    if mode == 2 {
+        let n = 6144                       // the model's per-layer conv kernel
+        let buf = mem_alloc(n * 2)
+        let p = 0
+        while p < n * 4 {
+            mem_store8(buf + p, (p * 37 + 11) - ((p * 37 + 11) / 256) * 256)
+            p = p + 1
+        }
+        let reps = 2000
+        let acc1 = 0
+        let r = 0
+        let t0 = clock()
+        while r < reps {
+            let q = 0
+            while q < n {
+                acc1 = acc1 + f2i(old_f32_to_f64(buf + q * 4))
+                q = q + 1
+            }
+            r = r + 1
+        }
+        let t1 = clock()
+        let acc2 = 0
+        let r2 = 0
+        while r2 < reps {
+            let q = 0
+            while q < n {
+                acc2 = acc2 + f2i(new_f32_to_f64(buf + q * 4))
+                q = q + 1
+            }
+            r2 = r2 + 1
+        }
+        let t2 = clock()
+        let no = reps * n
+        print("rate n=")
+        print(n)
+        print(" reps=")
+        println(reps)
+        print("old_f32_to_f64 ns/elem(x1000)=")
+        println((t1 - t0) / no * 1000)
+        print("new_f32_to_f64 ns/elem(x1000)=")
+        println((t2 - t1) / no * 1000)
+        print("sink1=")
+        print(acc1)
+        print(" sink2=")
+        println(acc2)
+    }
+
+    print("RESULT ")
+    if g_bad != 0 || g_bad2 != 0 || g_bad32 != 0 {
+        println("FAIL: a non-NaN input converted differently")
+        return 1
+    }
+    println("PASS: every non-NaN input is bit-identical old-vs-native")
+    return 0
+}
