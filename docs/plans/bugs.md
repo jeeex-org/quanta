@@ -1409,3 +1409,30 @@ syscall and **`mem_free` only pushes a free-list node — it never unmaps**. Pag
 free list, but VmSize/VmPeak only ever grow. That is the exact mechanism behind the per-token address
 space growth that was tracked for several rounds: 16 `read_tensor_f64` calls/token x 4,096 B = **64 KB
 per token, to the byte**, now measured at **0** after caching the two per-layer attn norms.
+
+### A36 · OPEN (compiler 0.0.252) · float-return inference by TOKEN SCAN misclassifies the conversion builtins — a wrapper without `-> f64` is silently inferred integer-returning
+
+`funcscan.quanta:1414 fn ret_expr_is_float(start, end)` decides a function's return type by walking
+**every token** of its body looking for floatness markers. The conversion builtins are **not in that
+list** — verified: `f16bits_to_f64` 0 occurrences, `f32bits_to_f64` 0, `f32_to_f64` 0. So
+
+    fn cvt(p) { return f32bits_to_f64(p) }      // no "-> f64"
+
+is inferred **integer**-returning, and every caller mistreats a perfectly good f64 as an integer.
+
+Found while adopting the native f16/f32 conversions in `lib/std`: adopting them *without* an explicit
+`-> f64` **silently broke the UNFUSED decode path** — flags-OFF argmax **25438** against the oracle
+**597**, with all 128,000 logits different — while every fused flag stayed bit-exact, which is exactly
+why it was not obvious. Bisected against a pristine `git worktree` of HEAD with the identical pinned
+compiler; the competing value hypothesis was killed separately (restoring the old `exp==31` behaviour
+changed nothing).
+
+Local mitigation shipped in `lib/std`: explicit `-> f64` on the wrappers. **That is a workaround, and
+under the standing policy the language fix ships too** — add the conversion builtins to
+`ret_expr_is_float`'s marker list. Routed to the compiler unit.
+
+**This is the SECOND silent misclassification from the same mechanism**, and the function's own
+comment documents the first: a body of `f2i(f64of(n) * 0.5)` was concluded "returns float", so
+downstream integer operations took the float path and yielded bit patterns instead of values. Two
+instances, both *silent*, both requiring a bisect to find. **Inference by token scan is the defect
+class** — a marker list is a list of things someone remembered.
