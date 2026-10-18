@@ -16,7 +16,7 @@
 set -u
 cd "$(dirname "$0")/.." || exit 1
 
-QC=${QC:-$PWD/compiler/0.0.252/bin/x86/qc}
+QC=${QC:-$PWD/compiler/0.0.255/bin/x86/qc}
 BIN=${BIN:-/tmp/lfm2_f32_ab_bench}
 CONF=tests/lfm2_decode_bench.conf
 LOG="${PROF_SCRATCH:-/tmp}/lfm2_f32_ab"
@@ -24,9 +24,17 @@ mkdir -p "$LOG"
 
 # lens 64/64/64 keeps one invocation ~1.5 min so eight arms fit in a session and
 # every arm sees a comparable load band. All other flags at the SHIPPED settings.
-COMMON="20 64 64 64 1 1 1 1 1 0 0 1 1 1 1"
+# LENS is a parameter because the arms must be SHORT enough to interleave: an
+# arm whose own three runs take 2.5 minutes cannot resolve an effect on a box
+# whose available core count swings by 2.5x inside one arm. Measured: the same
+# eight-arm palindrome at LENS=64 produced arm means spread 1.93-4.96 tok/s
+# that did NOT track loadavg at all.
+LENS=${LENS:-64}
+COMMON="20 $LENS $LENS $LENS 1 1 1 1 1 0 0 1 1 1 1"
 
-echo "=== lfm2 f32 end-to-end A/B (palindrome off,f64fma,f32,f32fma,f32fma,f32,f64fma,off) ==="
+echo "=== lfm2 f32 end-to-end A/B (palindrome off,f64fma,f32,f32fma,f32fma,f32,f64fma,off) LENS=$LENS ==="
+echo "NOTE: read the PALINDROME PAIRS and the MIN over each arm's runs, not one"
+echo "      number: this box's available cores swing inside a single arm."
 echo "compiler: $QC"
 md5sum "$QC"
 echo "common conf: $COMMON <fma> <f32>"

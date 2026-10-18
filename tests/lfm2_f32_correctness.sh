@@ -17,7 +17,7 @@
 # Usage: bash tests/lfm2_f32_correctness.sh
 set -u
 cd "$(dirname "$0")/.." || exit 1
-QC=${QC:-$PWD/compiler/0.0.252/bin/x86/qc}
+QC=${QC:-$PWD/compiler/0.0.255/bin/x86/qc}
 VP="ulimit -c 0 -v 32000000;"
 
 echo "=== f32 correctness rows ==="
