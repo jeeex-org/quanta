@@ -1119,7 +1119,7 @@ deliberately handles only keyword tokens that `vfind()` resolves to a bound name
 falls through to a path with no atom branch and no error. Out of scope for A23, recorded so the
 diagnostic gap is not lost. Expected behaviour: a located "undeclared name" error.
 
-### A26 · OPEN (compiler 0.0.247) · f16/f32 parameter and return annotations are SILENTLY IGNORED — every function boundary re-widens to f64
+### A26 · FIXED (0.0.248) · f16/f32 parameter and return annotations were SILENTLY IGNORED — every function boundary re-widened to f64
 
 Same failure class as A23: a declared type is dropped without an error, and the divergence is
 invisible at the call site.
@@ -1147,7 +1147,36 @@ crosses a function boundary — the callee computes in f64. The loader's f32 ker
 from ggml's f32 path with no visible cause. Blocks adopting f16/f32 across any call boundary, which
 is every real use (e.g. a KV writer taking an `f16` value).
 
-Completion is tracked as `docs/plans/language-capabilities.md` #11; scoped into 0.0.248.
+**FIXED in 0.0.248.** The declared type is now recorded and applied at both ends of the boundary:
+
+- `scanfns` writes `fn_parft` (1 = f32, 2 = f16) from the parameter annotation; the new
+  `scan_floattypes()` writes `fn_retft` from `fn_rettype_name` (the token after `->`, the same
+  (offset,len) pair `scan_retstructs`/`scan_retbig` read, so the index cannot drift).
+- codegen's `IR_PARAM` narrows the incoming value in the CALLEE (single RNE rounding) and tags the
+  parameter vreg; `IR_RET` narrows a declared return in the callee; `parse_call_impl` and the
+  post-aclr re-derivation tag a call result with the callee's declared float type so chained
+  arithmetic stays in binary32.
+
+THE CALLING CONVENTION (the design point this bug forced, now documented and pinned): an f16/f32
+argument crosses the boundary as its **widened f64 carrier** in the ordinary ABI register — rdi,
+rsi, rdx, rcx, r8, r9, then the stack from arg 6 — and the callee narrows it once. Narrowing in the
+callee is not a stylistic choice: parse and emit are fused per function and a callee can be emitted
+before any call site exists, so the declared signature is the only sound source of truth. A return
+is narrowed in the callee and comes back the same way in rax. Nothing sub-word is ever in flight, so
+caller and callee have no width to disagree about. `test_suites/codes/f32_f16_calling_convention_test.quanta`
+pins it on RAW 64-bit patterns (read with `f64bits`, no arithmetic) in every register slot and on
+the stack, with the mixed f64/f32 calls asserting the neighbours are untouched, and with the width
+discriminators named explicitly (a 4-byte convention would deliver 0; a raw-bits convention would
+deliver 1065353217 where the carrier 4607182419336888320 belongs).
+
+Red first, on the same rows:
+
+    0.0.247   a26_f32_f16_paramret_test          exit 4     (param not narrowed)
+              f32_f16_calling_convention_test    exit 10
+              f16_single_round_test              exit 11
+    0.0.248   all three                         exit 0
+
+Completion is tracked as `docs/plans/language-capabilities.md` #11; landed in 0.0.248.
 
 ### A27 · OPEN (compiler 0.0.247) · `clock()` costs 5,148 ns per call — it mmaps, syscalls and munmaps every time
 
@@ -1184,3 +1213,64 @@ happened to compile against that function.
 Same family as A26: a type tag travelling where the source does not say it does. Expected: a
 function's return type is determined by its declaration or its returned expression, not by an
 unrelated local's inferred format.
+
+### A29 · OPEN (compiler, all versions up to 0.0.248) · a HEX literal with more than 8 digits is SILENTLY WRONG
+
+Found while writing the f16 rounding constant `2^41 - 1` as `0x1FFFFFFFFF`. The compiler emitted
+`movabs $0x1fffffff000000ff` instead, so the rounding mask was wrong — a silently wrong constant in
+exactly the kind of code that must be bit-exact.
+
+Measured on 0.0.247 (0.0.248 is the same code path; this is not a regression introduced by 0.0.248):
+
+    println(0xFFFFFFF)       -> 268435455              correct (7 digits)
+    println(0xFFFFFFFF)      -> 4294967295             correct (8 digits)
+    println(0x100000000)     -> 1152921504606846976    want 4294967296       (0x1000000000000000)
+    println(0x1FFFFFFFFF)    -> 2305843004918726911    want 2199023255551    (0x1fffffff000000ff)
+    println(0x123456789A)    -> 1311768464867721370    want 78187493530      (0x123456780000009a)
+    println(2199023255551)   -> 2199023255551          correct (the DECIMAL path is fine)
+
+The pattern is exact and mechanical: the first 8 hex digits are placed in the HIGH 32 bits and the
+remaining digits in the LOW bits (`1FFFFFFFFF` -> `1FFFFFFF` << 32 | `FF`), i.e. the accumulator is
+not multiplied by 16 per digit past the eighth. No diagnostic, and `0x100000000` — the smallest
+9-digit case, the one a user is most likely to write — is wrong too.
+
+Impact: any >32-bit hex constant in user code is silently wrong. Same class as the f16 casts and
+the dropped declarations this version is about: the value is plausible, the compile is clean, and
+nothing points at the literal. The workaround in-tree is to build large constants from shifts
+(`ri(0,1); rshl_imm(0,41); rdec(0)` in the 0.0.248 f16 routine), which is exactly the kind of
+workaround the language should not require.
+
+Expected: match the decimal path — an exact accumulation, with the >INT64_MAX case failing closed
+as TT_BIGNUM (the lexer already has that path). Fixing it needs its own red-first row and its own
+version; it was NOT fixed in 0.0.248 because it is a separate lexer lever and this version's subject
+is the f16/f32 boundary.
+
+### A30 · OPEN (compiler, all versions up to 0.0.248) · one 17-digit decimal literal does not round to the nearest f64 (1 ULP low)
+
+Found while hunting a witness for the f16 double-rounding defect: the f64 value had to be pinned by
+its bit pattern first, and the pattern did not match the correctly rounded one.
+
+Measured on 0.0.247 (same path on 0.0.248; not a regression):
+
+    f64bits(4997.9998123605865)  -> 4662217373610405594   (0x40B385FFF3B3EEDA)
+    correctly rounded f64        -> 4662217373610405595   (0x40B385FFF3B3EEDB)   1 ULP HIGH
+    f64bits(0.30000000000000004) -> 4599075939470750516   correct
+    f64bits(1.0000000000000002)  -> 4607182418800017409   correct
+    f64bits(1234567890123456.0)  -> 4832797072101665536   correct
+    f64bits(0.1)                 -> 4591870180066957722   correct
+
+So this is not a blanket "17 significant digits are truncated" limit (three other 17-digit literals
+round correctly); it is a specific input where the decimal -> binary conversion loses the last bit.
+The correct expectation is the nearest f64, round-half-even, which is what every C/Rust/Python
+`strtod` produces and what the compiler's own `fl_dexp2f64` produces for the other cases above.
+
+Impact: a literal can differ from the value the source says by 1 ULP, silently — the hardest kind of
+numeric bug to attribute, and it invalidates any test that uses a long decimal literal as an exact
+oracle. The 0.0.248 f16 tests therefore build their witnesses from bit patterns
+(`f16bits_to_f64`) and exact powers of two rather than from long decimals, and assert every literal
+they do use against `f64bits` first.
+
+Expected: exact nearest-even conversion for every literal length the lexer accepts, with the
+17-digit case included in a fixture-driven row (compare against the host compiler's own strtod over
+a generated set). Not fixed in 0.0.248 — it is a front-end conversion lever of its own, and fixing
+it inside the f16/f32 work would mix two subjects in one version.

@@ -1,0 +1,68 @@
+// 0.0.248: the EXACT semantics of a typed buffer's declared `[N]`, pinned.
+//
+// The question this row answers, because a user reading `let b: f32[N]` is
+// entitled to know: is N a bound the runtime checks? Measured answer, in two
+// parts, both asserted below:
+//
+//   1. `let b: T[N] = <initialiser>`  -- N is INFORMATIONAL. It is parsed and
+//      discarded; the storage comes from the initialiser, and the length the
+//      runtime checks against is the COUNT THE ALLOCATOR (or array constructor)
+//      WROTE INTO THE HEADER at [base]. So `let b: f32[2] = mem_alloc(8)` gives
+//      a buffer whose indices 0..7 are legal, i.e. the declared 2 is neither an
+//      upper bound nor a size. The element STRIDE does come from the declared
+//      element type (4 bytes for f32, 2 for f16) -- that part is real, and it is
+//      what fp16f32_width_test proves byte by byte.
+//
+//   2. `let d: T[N]` with NO initialiser -- N IS the allocation. IR_ARRNEW is
+//      built with N elements and the header says N. This is the "declared
+//      storage" form lib/std/ai.quanta relies on (`let data: i64[1]`).
+//
+// The enforced bound in both cases is therefore the same one check: index <
+// [base]. f32_buffer_bound_trap_test is the second half of the pin -- it takes
+// the SAME declaration with a smaller allocator and traps, which is what shows
+// the bound is the allocator's count and not the declared N.
+//
+// NOT a red-first row: this is a semantics decision, measured, not a defect
+// repair. It passes identically on 0.0.247 and 0.0.248, and its purpose is to
+// make the semantics verifiable rather than assumed -- the alternative was to
+// leave a user believing a bound is checked when it is not.
+fn main() -> i64 {
+    // ---- (1) the declared [N] does not bound an initialised buffer ----
+    let b: f32[2] = mem_alloc(8)
+    b[0] = 1.25
+    b[5] = 2.5                       // index 5 > the declared 2: legal
+    if mem_load32(b + 8) != 1067450368 { exit(11) }          // 1.25 as binary32
+    if mem_load32(b + 8 + 5*4) != 1075838976 { exit(12) }    // 2.5 at the 4-byte stride
+    if mem_load(b) != 8 { exit(13) }                         // the header = the allocator's count
+
+    // ---- the same declaration with a smaller allocator: the header is the bound ----
+    let c: f32[8] = mem_alloc(2)
+    c[0] = 1.5
+    c[1] = 0.0 - 1.5
+    if mem_load(b) != 8 { exit(14) }
+    if mem_load(c) != 2 { exit(15) }                         // NOT 8: the declared [8] is informational
+    if mem_load32(c + 8) != 1069547520 { exit(16) }          // 1.5
+    if mem_load32(c + 12) != 3217031168 { exit(17) }         // -1.5 (0xBFC00000)
+
+    // ---- f16 elements: 2-byte stride, same rule ----
+    let h: f16[3] = mem_alloc(6)
+    h[0] = 1.5
+    h[4] = 0.0 - 2.0                 // index 4 > the declared 3: legal (the header says 6)
+    if mem_load16(h + 8) != 15872 { exit(20) }               // 0x3E00
+    if mem_load16(h + 8 + 4*2) != 49152 { exit(21) }         // 0xC000
+    if mem_load(h) != 6 { exit(22) }
+    if mem_load16(h + 8 + 2) != 0 { exit(23) }               // untouched element
+
+    // ---- (2) the no-initialiser form: the declared [N] IS the allocation ----
+    let d: f32[4]
+    if mem_load(d) != 4 { exit(30) }                         // IR_ARRNEW with count 4
+    d[0] = 1.5
+    d[3] = 0.25
+    if mem_load32(d + 8) != 1069547520 { exit(31) }          // 1.5
+    if mem_load32(d + 8 + 3*4) != 1048576000 { exit(32) }    // 0.25 (0x3E800000)
+    let e: f16[8]
+    if mem_load(e) != 8 { exit(33) }
+    e[7] = 1.5
+    if mem_load16(e + 8 + 7*2) != 15872 { exit(34) }
+    return 0
+}
