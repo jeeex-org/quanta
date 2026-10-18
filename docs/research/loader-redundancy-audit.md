@@ -32,8 +32,10 @@ Three findings, one of them much larger than the case that motivated the audit:
 | - | a suspected pool worker-scratch overrun found while auditing allocations | none | **false alarm, killed by re-reading the source; the 8x in `mem_alloc` is the trap** (§2.5) |
 
 And the negative result the brief asked for: **the conv false sharing the previous unit
-suspected is REFUTED, by measurement** (§3), together with the four places that were
-checked and found clean (§2.4).
+suspected is REFUTED, by measurement — and the remedy it proposed is measurably slightly
+HARMFUL** (median ratio 0.978, 8 of 10 interleaved pairs, because cache-line alignment
+coarsens the slice balance; §3) — together with the seven places that were checked and
+found clean (§2.3, §2.5).
 
 ## 1. The instrument, and the primitive cost it starts from
 
@@ -126,7 +128,7 @@ them when `fc_nc_ready != 0`; the uncached path is untouched.
 |---|---|
 | 16 `read_tensor_f64`/token = 8 x 2, guarded by a never-hitting flag | 0 reads/token from the warm cache |
 | cost, measured: 16 x 7,433-7,896 ns = **119-126 us/token** (0.023 % of 542 ms) | 0 |
-| VA, measured: 16 x 4,114 B = **65,824 B/token** | **0 B/token** |
+| VA: 16 x 4,096 B = **64 KB/token** exactly (the probe reads 4,114 B/call, which includes ~18 B/call of drift from its own `/proc` reader — the dequant-only control allocates nothing and still reads 18 B/call) | **0 B/token** |
 
 The time is negligible. **The address space is not**, and it is verified twice over.
 
@@ -235,11 +237,18 @@ Named because a negative result is worth as much as the positive one:
    `fc_nc_ready != 0`; no `read_tensor_f64` is reached from `fc_layer` or
    `fc_forward_token_body`. **Clean** (this is what made finding 2.1 stand out: it was the
    only one of the six that did not).
-3. **Weight re-reads.** Every weight row is read exactly once per token. Summing the
-   rows per token over the 166 matvecs gives 927,744, and 927,744 x 2048 = 1,900 G
-   elements, matching `pool_n_elems_matvec` 2,415,772,000 minus the 3*d_model-wide
-   in_proj rows — i.e. there is **no duplicated dequant or duplicated row read** between
-   the embed, matvec and conv paths. **Clean.**
+3. **Weight re-reads.** Every weight row is read exactly once per token, and the check is
+   an element identity rather than a spot check. Rows per token over the 166 matvecs:
+   22 x (6144 + 2048) + 8 x (2048 + 512 + 512 + 2048) + 30 x (10752 + 10752 + 2048) =
+   **927,744**. Elements per token, by tensor: conv in_proj 22 x 3dd = 276,824,064;
+   conv out 22 x d^2 = 92,274,688; attn q 8 x d^2 = 33,554,432, k 8 x 512d = 8,388,608,
+   v 8,388,608, out 33,554,432; ffn gate 30 x d_ff d = 660,602,880 and up the same;
+   ffn down 30 x d d_ff = 660,602,880 — total **2,434,793,472**, which is the inherited
+   GGUF figure to the unit. There is therefore **no duplicated dequant and no duplicated
+   row read** between the embed, matvec and conv paths, and the bench's own counter agrees
+   once its documented 0.8 % deficit is applied (2,415,771,648/token at 128 tokens;
+   2,434,793,472 / 2,415,771,648 = 1.00787 = 128/127, because the last decode iteration
+   has no forward). **Clean.**
 4. **Per-call `mem_alloc` in the decode path.** Enumerated every `mem_alloc` in
    `lfm2_forward.quanta`; all are behind `if <global> == 0` one-time guards except the 16
    `read_tensor_f64` calls of 2.1. **Clean apart from 2.1** — which is what makes the
@@ -331,11 +340,21 @@ conv_split_ab  pair=9 nw=20 A_unaligned_ns=41073  B_aligned_ns=42011  A_over_B_x
 * **Bit-exactness of the aligned rule: `kout_bitdiff=0 y_bitdiff=0 state_bitdiff=0`** over
   2,048 channels and both state words — raw u64 compare. The split only changes which
   thread evaluates which channel.
-* **The verdict is in the medians, not the means.** Per-arm means (A 56,993, B 79,803)
-  are dragged by three outliers (B 193,448 / 159,217 and A 109,580 / 109,709) — a **4.8x
-  spread within one arm in one process**. Medians: **A 43,463 ns, B 43,519 ns, ratio
-  0.999**. Removing a possible shared line per worker boundary changes the job by
-  0.1 % — i.e. nothing. **False sharing is refuted.**
+* **Both the means and the medians must be read, and they disagree in sign, which is
+  itself the answer.** Per-arm means: A 56,493, B 79,803 (ratio 0.708) — dragged almost
+  entirely by three outliers (B 193,448 / 159,217, A 109,580 / 109,709) inside a **5.2x
+  spread within one arm in one process**. Medians: **A 43,463 ns vs B 44,460 ns, ratio
+  0.978**. So alignment is not neutral: the four quiet consecutive pairs (6-9, all in the
+  40-46 us band where the measurement is most trustworthy) are **-2.3 %, -4.7 %, -6.0 %,
+  -2.3 %**, and 8 of the 10 interleaved pairs have the aligned arm slower.
+* **So: false sharing is refuted, and the proposed remedy is measurably slightly worse,
+  for a reason that is arithmetic rather than exotic.** The quotient split of 2,048
+  channels over 20 workers gives slices of 102 or 103 channels — a <=1 % imbalance.
+  Cache-line alignment rounds each boundary up to a multiple of 8 channels, so the slices
+  become 96 or 104 — up to 8 % imbalance, worse than the <=1 % the quotient split
+  guarantees. It removes at most one shared 64-byte line per worker boundary (19 lines out
+  of the 512 the 2 x 2048-f64 state buffer spans, i.e. 3.7 %) and pays for it with a
+  coarser balance. **Do not align these slices.**
 
 **What the ~396 us actually is: core over-subscription.** The job's wall tracks the
 *worker count* and rises with it, which false sharing cannot do (its cost is set by line
@@ -358,10 +377,11 @@ it is scheduler latency on an over-subscribed box, not a memory effect. The job'
 arithmetic (2,048 channels x ~3 MACs) is ~10-20 us; at nw=8 the wall is 45 us, i.e.
 dispatch plus ramp.
 
-**Consequence, stated because it changes what a next unit should do:** the conv
-elementwise job wants *fewer* workers, not better slice alignment. Anything that makes a
-20-worker pool cheaper for a small job (a smaller `pl_active` for small jobs, or
-dispatching the conv block to a worker subset) is worth more than any cache-line work.
+**Consequence, stated because it changes what a next unit should do:** the conv job wants
+*fewer* workers, not better slice alignment, and the alignment experiment above shows
+alignment actively costs balance. Anything that makes a 20-worker pool cheaper for a small
+job — a smaller `pl_active` for small jobs, or dispatching the conv block to a worker
+subset — is worth more than any cache-line work, and is the only lever §3 supports.
 
 The knob is kept, default 0, documented as a measurement knob, because it is how the above
 is reproducible; it costs one global load per worker per conv job.
@@ -421,8 +441,11 @@ microsecond figures in §2.1/§2.2 are the ones to quote for the mechanism.
 
 ## 5. Bit-exactness (asserted BEFORE any timing)
 
-`tests/lfm2_fused_logits_test.quanta`, all 128,000 logits, 9 passes in one process,
-against the new tree (both changes):
+`tests/lfm2_fused_logits_test.quanta`, all 128,000 logits, 9 passes in one process. Run
+TWICE, so each change is attributable on its own as well as the pair:
+
+* `logs/mine_exact_qncache.log` — finding 2.1 alone (the norm cache). 9 passes, all zeros.
+* `logs/mine_exact_final.log` — BOTH changes, i.e. the pushed tree. 9 passes, all zeros:
 
 ```
 CONTROL pass1-vs-pass0 : logit_mism=0 argmax_mism=0
