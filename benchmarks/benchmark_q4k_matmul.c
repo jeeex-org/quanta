@@ -16,7 +16,7 @@ int f16_to_q8(int f16) {
 }
 void dequant_q4k(unsigned char *W, long *out) {
     int scale_q8 = f16_to_q8(W[0] + W[1] * 256);
-    for (int qi = 0; qi < 256; qi++) {
+    for (long qi = 0; qi < 256; qi++) {
         int sub_q8 = W[2 + qi / 16];
         int byte_val = W[18 + qi / 2];
         int nibble = (qi % 2 == 0) ? (byte_val % 16) : (byte_val / 16);
@@ -27,13 +27,13 @@ int main() {
     unsigned char W[256];
     memset(W, 0, 256);
     W[0] = 0; W[1] = 60;
-    for (int i = 0; i < 16; i++) W[2 + i] = 1;
-    for (int i = 0; i < 128; i++) W[18 + i] = 0x97;
+    for (long i = 0; i < 16; i++) W[2 + i] = 1;
+    for (long i = 0; i < 128; i++) W[18 + i] = 0x97;
     long x[256], dequant[256];
-    for (int i = 0; i < 256; i++) x[i] = 128;
+    for (long i = 0; i < 256; i++) x[i] = 128;
     dequant_q4k(W, dequant);
     long sum = 0;
-    for (int j = 0; j < 256; j++) sum += dequant[j] * x[j] / Q8_SCALE;
+    for (long j = 0; j < 256; j++) sum += dequant[j] * x[j] / Q8_SCALE;
     printf("result=%ld\n", sum);
     printf("%s\n", sum == 0 ? "PASS" : "FAIL (expected 0)");
     return 0;

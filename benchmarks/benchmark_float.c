@@ -3,7 +3,7 @@
 #include <stdio.h>
 int main() {
     double sum = 0;
-    for (int i = 0; i < 5000000; i++) {
+    for (long i = 0; i < 5000000; i++) {
         double x = (double)i;
         sum += x * x;
         sum += x / (x + 1);

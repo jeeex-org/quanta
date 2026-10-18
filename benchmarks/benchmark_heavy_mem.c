@@ -4,9 +4,9 @@
 int main() {
     int N = 1000000;
     long *arr = malloc(N * 8);
-    for (int i = 0; i < N; i++) arr[i] = i;
+    for (long i = 0; i < N; i++) arr[i] = i;
     long sum = 0;
-    for (int i = 0; i < N; i++) sum += arr[i];
+    for (long i = 0; i < N; i++) sum += arr[i];
     printf("sum=%ld\n", sum);
     free(arr);
     return 0;

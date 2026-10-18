@@ -2,8 +2,9 @@
 
 **Run:** `bash scripts/bench.sh` — `--md` for a markdown table, `--runs N` for more repetitions.
 Both sides are compiled fresh each run and executed through `scripts/qcrun.sh` (hard memory cap, nice,
-timeout), alternating, best-of-N. Current VERSION: **0.0.247** (the tables below are
-0.0.237/0.0.238 history; the current baseline is table 4 and table 5).
+timeout), alternating, best-of-N. Current VERSION: **0.0.248** (the tables below are
+0.0.237/0.0.238 history; the current baseline is table 4, table 5 and **table 6, the width-fair
+re-baseline**).
 
 **Load-independent metrics:** `bash scripts/bench_instr.sh <qc> [--only a,b] [--fn name] [--tsv FILE]`
 compiles every Quanta twin with `--emit-obj` (which carries a symbol table) and every C twin with
@@ -507,3 +508,33 @@ readers that rely on "home is always current") and a first measurable step named
   match-heavy dispatch, allocation-heavy patterns, struct-heavy mutation in a loop, FFI call cost.
 - **Every row under 30 ms is noise-dominated** even with best-of-15 (table 4's `best-of-15 (<30ms row)`
   tag). Quote those rows as "at the resolution floor", never as parity.
+
+## Table 6 — the width-fair re-baseline (0.0.248 + twin-width fix), and the end of the "vectorised twin"
+
+**This table supersedes tables 1-5 as the baseline to measure against.** Before it, 21 of the 30
+looped C twins declared `for (int i ...)` against Quanta's i64 `let i = 0`, and a 32-bit counter is
+exactly what licenses gcc's 8-wide `vpaddd`/`vpmuldq` at `-O2`. Those rows compared scalar i64
+codegen against 8-lane i32 SIMD. All loop counters (including the inner `j`/`qi`/`bi`) are now
+`long`, matching the width Quanta actually computes in.
+
+- Q-side codegen is **untouched**: every `q_*` column of `bench_instr.sh` is byte-identical on all 38
+  rows before vs after. Only the C side moved (**12 of 38** C twins changed codegen).
+- Every output still matches: `bench.sh` prints
+  `# OK: every row compiled and every C twin kept its loop.` with 0 MISMATCH.
+- The 8-wide **int32** lane forms are gone from every twin. The 9 twins that still use `%ymm`
+  (`big_array fileio heavy_mem heavy_recursion mem mem_ops q4k q4k_heavy q4k_matmul`) use **4-wide
+  i64-lane** forms (`vpaddq`/`vpsllq`/`vpsubq`) — legitimate on a width-fair twin, and tagged below.
+- **Never quote:** `float_ops` (C twin constant-folded to a `movabs`) and `regpressure` (gcc
+  algebraically collapsed all 16 affine temps). **Excluded as no-loop rows** whose ratio is printed
+  only because `scripts/bench.sh`'s fold guard is skipped for a C source with no `for`/`while`:
+  `enum`, `string` (no loop either side) and `fib_recursive`, `float_ops`, `int_ops`, `nested_calls`,
+  `struct` (C side has no loop, Quanta side does).
+
+Authoritative table, full provenance and raw TSVs:
+**`docs/research/phase2-arith-baseline-0.0.248.md`** plus
+`docs/research/phase2-baseline-{before,after}.tsv` and `docs/research/phase2-bench-after.txt`.
+
+The one number that did not move: **the loop-restricted home-op share of a Quanta hot loop is
+33.1-58.7 %, median 50.8 %, against 0.0 % in every one of the 38 C twins.** Not one C twin performs
+a frame-relative load or store inside its hot loop. That is the marshalling cost the phase-2 codegen
+levers (F1 `adistinct` first) are aimed at, and it survives the fair baseline intact.

@@ -8,7 +8,7 @@ long fact(long n) {
 
 int main() {
     long sum = 0;
-    for (int i = 0; i < 1000; i++) {
+    for (long i = 0; i < 1000; i++) {
         sum += fact(10);
     }
     printf("%ld\n", sum);

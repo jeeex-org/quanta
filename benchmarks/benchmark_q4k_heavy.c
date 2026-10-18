@@ -29,7 +29,7 @@ int f16_to_q8(int f16) {
 }
 void dequant_q4k(unsigned char *W, long *out) {
     int scale_q8 = f16_to_q8(W[0] + W[1] * 256);
-    for (int qi = 0; qi < 256; qi++) {
+    for (long qi = 0; qi < 256; qi++) {
         int sub_q8 = W[2 + qi / 16];
         int byte_val = W[18 + qi / 2];
         int nibble = (qi % 2 == 0) ? (byte_val % 16) : (byte_val / 16);
@@ -39,11 +39,11 @@ void dequant_q4k(unsigned char *W, long *out) {
 void matvec_q4k(unsigned char *W, long *x, int rows, int cols, long *y) {
     int n_blocks = cols / 256;
     long dequant[256];
-    for (int i = 0; i < rows; i++) {
+    for (long i = 0; i < rows; i++) {
         long sum = 0;
-        for (int bi = 0; bi < n_blocks; bi++) {
+        for (long bi = 0; bi < n_blocks; bi++) {
             dequant_q4k(W + (i * n_blocks + bi) * 144, dequant);
-            for (int j = 0; j < 256; j++) {
+            for (long j = 0; j < 256; j++) {
                 sum += qdiv(dequant[j] * x[bi * 256 + j], Q8_SCALE);
             }
         }
@@ -55,7 +55,7 @@ int main() {
     unsigned char *W = malloc(rows * n_blocks * 144);
     long *x = malloc(cols * 8), *y = malloc(rows * 8);
     memset(W, 0x97, rows * n_blocks * 144);
-    for (int i = 0; i < cols; i++) x[i] = 128;
+    for (long i = 0; i < cols; i++) x[i] = 128;
     matvec_q4k(W, x, rows, cols, y);
     printf("result[0]=%ld\n", y[0]);
     free(W); free(x); free(y);

@@ -7,7 +7,7 @@ const char* classify(int n) {
 }
 int main() {
     int vals[] = {-3, 0, 5, -1, 10};
-    for (int i = 0; i < 5; i++) {
+    for (long i = 0; i < 5; i++) {
         printf("classify(%d)=%s\n", vals[i], classify(vals[i]));
     }
     return 0;
