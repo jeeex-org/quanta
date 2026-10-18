@@ -1330,3 +1330,21 @@ would trade correctness for speed, which is the opposite of this project's stand
 is a language-level *unchecked* region so the author can state "this cannot overflow here" — tracked
 as `docs/plans/language-capabilities.md` #18, and it follows from the standing policy that the
 LANGUAGE capability ships first rather than the trap being quietly removed.
+
+**CORRECTION (phase 2, measured on 0.0.249) — the capability already exists, and the dead guard is the
+defect.** `unsafe{}` already suppresses this trap AND the shift-count and index traps, per
+*operation*: `ovf_trap_emit` / `shl_trap_emit` / `idx_trap_emit` are all gated on
+`r8(ir_unsafe+ii)==0` (`emitter.quanta:250/256/322`), and `helpers.quanta:420` records
+`unsafe_depth` for every IR op emitted inside a `unsafe{}` block. It is load-bearing today: the
+compiler's own `compute_magic()` is wrapped in `unsafe{}` because its magic-number recovery does
+deliberate 64-bit wraparound.
+
+MEASURED, same probe with one line wrapped: loop body **39 -> 35 instructions (-10.3 %)** and
+`ud2` in `main` **3 -> 1** (the survivor is `i = i + 1`, outside the block — the scope is exact).
+The audit's 21 % of `regpressure`'s loop is the prize when the whole body is wrapped, and it is
+available now.
+
+So A33 is **not** "the language cannot express this". A33 is (a) the `loop_depth` guard is
+constant-true dead code that misrepresents the compiler, and (b) **nothing tests the escape
+hatch**, so it can regress silently. Design, measurement and the proposed order of work:
+**`docs/research/phase2-a33-unchecked-design.md`**. Still OPEN — not landed in 0.0.249.
