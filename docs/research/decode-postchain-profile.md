@@ -254,24 +254,43 @@ one-time allocation.
 
 ## 5. Cumulative effect and the honest gap
 
-| configuration (all @128 tokens unless noted) | tok/s | source |
+| configuration (all @128 tokens) | tok/s | source |
 |---|---|---|
-| baseline, no fusion (peer measurement) | 0.281 | q4k/q6k docs |
-| + Q4_K + Q6_K fused matvecs | 0.872 | q4k/q6k docs |
-| + chain kernel (tied projection) | **1.397** | decode-phase-profile.md |
-| + parallel GLU (this work, 1.09x) | ~1.53 | ab_glu A/B |
-| + parallel attention (this work, ~1.20x) | **1.68** (interleaved-128 arm B, 595.5 ms) | ab_attn interleaved |
+| baseline, no fusion | 0.281 | q4k/q6k docs (peer) |
+| + Q4_K + Q6_K fused matvecs | 0.872 | q4k/q6k docs (peer) |
+| + chain kernel (tied projection) | **1.397** | decode-phase-profile.md (peer) |
+| + parallel GLU + parallel attention | **~1.65-1.77** | this work, see below |
 
-**Do not multiply the levers** -- individual ratios on a shared path do not compose
-(this project has been burned by that). The 1.68 figure is a MEASURED same-session arm,
-not a product: in the interleaved-128 session arm A (chain+glu) was 735.7 ms and arm B
-(chain+glu+attn) 594.8-595.5 ms, so the measured B-rate is 1.68 tok/s **in that
-session's frequency regime**. The box's ~1.24x frequency swing between sessions means
-the absolute tok/s must always be read beside its own A arm.
+**Direct same-session, interleaved measurement of the two levers together.** Two
+interleaved A/B pairs at 128 tokens, each arm 3 runs, same binary, conf
+`20 128 128 128 1 1 1 1 1 0 0 1 G A` with (G,A) = (0,0) for arm A (chain only) and
+(1,1) for arm B (chain + glu + attn), witnesses printed per run:
 
-**Gap at 128 tokens:** 1.68 tok/s against the target **15** is **8.9x**; against
-llama.cpp's measured **17.32** on this model/box it is **10.3x**. (At the task's
-chain-only 1.397 baseline it was 10.7x / 12.4x.)
+| pair | A chain-only med ms | B chain+glu+attn med ms | A tok/s | B tok/s | **B/A** |
+|---|---|---|---|---|---|
+| 1 | 762.80 | 603.42 | 1.312 | **1.657** | **1.264x** |
+| 2 | 776.72 | 611.50 | 1.288 | **1.635** | **1.270x** |
+
+So the two levers together are **1.264-1.270x** measured end to end. Note this is LESS
+than the product of the individual ratios (1.093 x 1.20 = 1.31) -- the levers touch
+overlapping fixed costs, which is the standing "do not multiply levers" warning here.
+
+**Absolute tok/s is frequency-dependent and must be read against its own A arm.** This
+session's chain-only arm was 762-777 ms; an earlier session measured the same
+configuration at 712 ms. The RATIO is stable (1.264 / 1.270 across two pairs); the
+tok/s is not. Scaled onto the task's chain-only baseline of **1.397 tok/s**, the
+composed 1.267x gives **~1.77 tok/s at 128 tokens**; measured directly in this session,
+arm B is **1.64-1.66 tok/s**.
+
+**Gap at 128 tokens:** against the target **15 tok/s** that is **8.5x** (ratio-scaled
+1.77) to **9.1x** (this session's measured 1.65); against llama.cpp's measured **17.32**
+on this model and box, **9.8x to 10.5x**. The task's chain-only baseline sat at
+10.7x / 12.4x, so this work closed roughly 20% of the remaining distance to the target.
+
+**Where the time still is (128 tokens, chain ON):** FFN gate/up/down + silu together
+58.8%, attention 20.0%, conv 14.6%, tied projection 5.9%. At 1024 the single largest
+term is attention (56.3%), which is exactly the term this work parallelised and the
+reason the attention ratio grows with context (1.15x at 96 -> 1.27x at 128 and up).
 
 ## 6. Next arithmetic lever: FMA (queued, NOT attempted here)
 
