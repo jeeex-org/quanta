@@ -300,7 +300,7 @@ Corroborating measurements (all in `docs/research/arithmetic-codegen-defects-0.0
   `s + i*3` and `s + i/8` emit **byte-identical 45-instruction loop bodies** — only the immediate
   differs. One `add` costs what one `mul` costs what one `sar` costs. **The arithmetic is not slow; the
   operand marshalling is.**
-- The frame is **per-function** (`codegen.quanta:1369`: `spill_region = 48 + vreg_n*8`, floor 1024) and
+- The frame is **per-function** (`codegen.quanta:1374`: `spill_region = 48 + vreg_n*8`, floor 1024) and
   is 75-83 % unused in every normal arithmetic case (deepest slot touched: 192-328 bytes of a 1120-1136
   byte frame). The frame is not a runtime cost and `min_spill` is not a performance lever.
 - **`loop_depth` (`codegen.quanta:1433`) is never incremented**, so the `if loop_depth == 0` guard on

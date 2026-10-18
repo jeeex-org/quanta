@@ -71,7 +71,7 @@ framing are also measured below.
 
 ### 2.1 The frame (question (a): per-function or per-vreg?)
 
-`codegen.quanta:1369-1385`:
+`codegen.quanta:1374-1385`:
 
 ```quanta
 let spill_region = 48 + vreg_n * 8          // vreg_n = the FUNCTION's total vreg count
@@ -404,7 +404,7 @@ gcc: `vaddsd %xmm1,%xmm0,%xmm0`. Measured XMM↔GPR moves per hot loop: `float`
 
 **Latent landmine in the same block.** `fspill_home(v) = -(48 + 8192 + (v+1)*8)`
 puts float homes ~8 KB below `%rbp`, but the frame formula
-(`codegen.quanta:1369`) reserves `48 + vreg_n*8` with a 1024 floor and **does not
+(`codegen.quanta:1374`) reserves `48 + vreg_n*8` with a 1024 floor and **does not
 add the 8192**. Today that is harmless only because `fphys` is never called. The
 moment the float allocator is wired up, the first spilled float writes ~8 KB
 below `%rbp` — into the caller's frame. **Enabling D2's fix requires growing the
@@ -612,7 +612,7 @@ etc. This removes the GPR↔XMM round-trip (`movq %rax,%xmm0` /
 `movq %xmm0,%rdx`) and the operand staging for FP builtins.
 
 **Prerequisite, in the language/compiler, not optional:** the frame formula
-(`codegen.quanta:1369`) does not reserve `fspill_home`'s 8192-byte region. Wiring
+(`codegen.quanta:1374`) does not reserve `fspill_home`'s 8192-byte region. Wiring
 the float allocator before fixing that writes 8 KB below `%rbp` on the first
 spilled float. Either grow the frame by 8192 for functions with float vregs, or
 re-base float homes into the same region as integer homes at a disjoint index
@@ -694,18 +694,74 @@ fixpoint and `verify-release` green.
 
 ---
 
-## 8. Phase-2 state
+### F1 PREREQUISITE — AUDITED (done here, read-only, so F1 does not stall)
 
-- `compiler/0.0.248/` exists as an **untracked** directory and `VERSION` is still
-  **0.0.247** at the time of writing, so **0.0.248 has not landed**. Phase 2
-  (any `compiler/**` edit) was therefore not started, per the sequencing
-  constraint. No competing version tree was created.
-- The tree was dirty on arrival with a peer's work; it was left untouched:
-  `M tests/lfm2_decode_bench.conf`, `?? compiler/0.0.248/`,
-  `?? test_suites/codes/a26_f32_f16_paramret_test.quanta`,
-  `?? test_suites/codes/zz_f16_scratch_probe.quanta`. Consequently
-  `git pull --rebase` could not run ("cannot pull with rebase: You have unstaged
-  changes") and HEAD stayed at `9c1e96ef`. This phase's commits are local; the
-  parent must pull/rebase once the peer's work is committed.
-- No gate run was performed (a peer owns the compiler and the gate is a
-  capacity-1 resource). No compiler edit was made, so no gate result is owed.
+F1's risk is a *stale home read*: any reader that goes straight to `spill_home()`
+instead of through `loadhome()` (`emitter.quanta:540` / `:566`) or `aphys()` would
+see a home slot that the 0.0.245 invariant no longer keeps current for a **mapped**
+vreg. Measured, in `codegen.quanta`:
+
+- **20** direct reads of the form `rbp(reg, spill_home(...))` (there are **87**
+  direct `spill_home` reads in `codegen.quanta` + `emitter.quanta` in total,
+  against only **13** calls to the safe `loadhome()`).
+- **16 of the 20 sit inside a `flush_all()` scope** — they are the memory-builtin
+  and call-argument paths, and `flush_all` stores every mapped vreg, so their home
+  slots are current by construction. (5 share the flush at `codegen.quanta:2066`;
+  3 share the one documented at `:2786`, "flush_all() above spilled every live vreg
+  to its home"; the rest have their own.)
+- **2 (`:1823`, `:1882`, the div/mod floor-correction paths) are self-protected**:
+  each is preceded by an explicit `wbp(spill_home(res), 0)` that writes the home
+  slot before reading it back (`// res home = q`).
+- **0 of the 20 read a mapped vreg's home without one of those two guards.**
+
+So F1's hazard list on the codegen side is **closed**: no direct reader depends on
+a home slot that F1 would allow to go stale. The remaining 67 direct reads live in
+`emitter.quanta` inside the emitter's own builtin sequences, which the same audit
+pattern should spot-check per builtin — that is the one piece of F1 prerequisite
+work still open, and it is bounded.
+
+## 8. State at hand-off: 0.0.248 landed, and every defect carries forward unchanged
+
+`VERSION` was bumped to **0.0.248** by a peer unit while this phase ran
+(commit `acfd5822`, "feat(f16/f32): type parameters and returns…"). Every defect
+above was re-located in `compiler/0.0.248/src/x86/` and **all of them are still
+present, unchanged**:
+
+| defect | 0.0.247 | 0.0.248 | still present? |
+|---|---|---|---|
+| `adistinct()` operand eviction | `emitter.quanta:473`, eviction comment `:475` | `:499`, `:501` | **yes**, identical body |
+| float allocator dead (`fphys` call sites) | `emitter.quanta:760`, 0 calls | `:786`, **0 calls** | **yes** |
+| `fspill_home` 8192 region unre- served by the frame | `emitter.quanta:758` vs `codegen.quanta:1374` | `:784` vs `:1387` | **yes** |
+| `loop_depth` never incremented | `codegen.quanta:1433`, 0 increments | `:1446`, **0 increments** | **yes** |
+| comparison result spilled | `codegen.quanta:1597-1627` | +13 lines | **yes** |
+| `loadhome` (the safe reader) | `emitter.quanta:540` | `:566` | unchanged |
+
+Line-number mapping for phase 2: **`emitter.quanta` +26 lines, `codegen.quanta`
++13 lines** from 0.0.247 to 0.0.248. All disassembly byte offsets in this document
+are from **0.0.247** (`./compiler/0.0.247/bin/x86/qc`, pinned explicitly) and are
+not affected by the bump.
+
+- **`VERSION` is 0.0.248 and HEAD moved from `9c1e96ef` → `90635f1e` during this
+  phase** (peers landed `acfd5822` and later commits). Phase 2 (any `compiler/**`
+  edit) was **not** started, because the brief reserved the compiler slot and the
+  version-tree work for a re-dispatch. No competing version tree was created.
+  **The phase-2 gate is now OPEN** — `compiler/0.0.248/` is present, tracked and
+  built (`compiler/0.0.248/bin/x86/qc`), and `VERSION` names it.
+- The tree was dirty with peer work the whole time and it was left untouched: on
+  arrival `M tests/lfm2_decode_bench.conf`, `?? compiler/0.0.248/`; during the run
+  `M lib/std/gguf_mm.quanta`, `?? tests/lfm2_pool_dispatch_probe.quanta`, and an
+  intermittent `.git/index.lock` from a peer's own commit. Two peer commits landed
+  while this phase ran, which is also why `git pull --rebase` could not be used
+  mid-phase; the phase-1 commit was pushed **fast-forward** (4 ahead / 0 behind)
+  and `origin/main` was read back to confirm it (`origin/main == 3b0e7336`).
+- This phase's commit: **`3b0e7336`**, 6 files, verified with
+  `git show --name-status` to contain only `benchmarks/BENCHMARK.md` and the five
+  `docs/research/` artefacts — no peer path was swept.
+- **One untracked file is not mine and was left alone:**
+  `docs/research/suite_instr_247.txt` (4950 bytes, byte-identical to the committed
+  `docs/research/suite-instr-0.0.247.txt`, mtime 11:55 — i.e. written before this
+  phase's own copy at 13:04, so it is most likely a peer's identically-named
+  artefact). Preserved rather than deleted; the owner should confirm or drop it.
+- No gate run was performed (the gate is a capacity-1 resource and the brief
+  reserved it). No compiler edit was made, so no gate result is owed.
+
