@@ -1223,6 +1223,38 @@ else
   A41_RC=1
 fi
 
+# --- Stage 1.6p: WORK-STEALING EXACTNESS GUARD (0.0.259 atomics + loader pool) ---
+# The loader's decode pool partitions rows across workers. Before 0.0.259 the
+# only safe spelling was a STATIC row slice; an attempt at a stolen (dynamic)
+# claim measured 931 of 2048 rows silently wrong, and another shape hung
+# (rc 124). That was NOT a race and NOT a missing capability. It was A39, a
+# `&global` MISCOMPILE: `&global` returned the address of an IR_LOADG TEMPORARY,
+# so `atomic_add(&g, 1)` returned 0 on EVERY call and left `g` at 0 -- a claimed
+# row was never written, and a claim loop could not terminate. 0.0.259 fixed
+# address-of resolution in the parser (`gfind` -> `IR_PTR_CAST.a1`), and the
+# static slice turned out to be a workaround for that miscompile rather than a
+# property of the atomics.
+#
+# RED-FIRST: on 0.0.258 / any pre-A39 spelling this test's Part A reports rows
+# claimed 0 times or twice, and Part B's diff_bits are non-zero. On 0.0.259+
+# every row is claimed exactly once, and the stolen partition is BIT-IDENTICAL
+# to the static one and to the reference.
+#
+# Hard assertions, not ratios: for every arm, 2048 rows, diff_bits all zero
+# between reference/static/stolen in raw u64, and a claim counter that advances
+# by exactly the rows claimed.
+WSX_RC=0
+if [ -f "$TEST_SUITES/scripts/ws_exactness_gate.sh" ]; then
+  if QC="$QC" bash "$TEST_SUITES/scripts/ws_exactness_gate.sh"; then
+    WSX_RC=0
+  else
+    WSX_RC=1
+  fi
+else
+  echo "  FAIL ws-exactness: ws_exactness_gate.sh missing"
+  WSX_RC=1
+fi
+
 if [ -f "$TEST_SUITES/scripts/qobj_gate.sh" ]; then
   if ! QC="$QC" bash "$TEST_SUITES/scripts/qobj_gate.sh"; then
     QOBJ_RC=1
@@ -1484,6 +1516,7 @@ echo "  bare-metal    : $([ $BM_RC = 0 ] && echo GREEN || echo RED)  (ring-0 und
   immconst-guard : $([ "${F1I_RC:-1}" = 0 ] && echo GREEN || echo RED)  (0.0.256 V1: a single-use constant is folded into an immediate and never materialised -- the emitted loop SHAPE, from the object bytes)
   cache-precond-guard: $([ "${CAPG_RC:-1}" = 0 ] && echo GREEN || echo RED)  (0.0.257: the cache path fits the real compiler ceiling, a failed cache write is LOUD, and a truncated cache is refused -- raw rc/byte evidence, under a forced ulimit -v)
   va-reclaim     : $([ "${VARG_RC:-1}" = 0 ] && echo GREEN || echo RED)  (0.0.259/0.0.260 VA: the compiler SELF-COMPILES under a 1,572,864 KB address-space cap and writes a binary -- raw rc + bytes, under a forced ulimit -v; the up-front arenas are sized from a measured high-water, not from "big enough")
+  ws-exactness   : $([ "${WSX_RC:-1}" = 0 ] && echo GREEN || echo RED)  (0.0.259/0.0.261 A39 fix: the loader's work-stealing claim is BIT-EXACT at 2048 rows -- every arm diff_bits=0, claim counters exact; 931 of 2048 was a &global miscompile, not a race; red-first on pre-0.0.259)
   csave-guard    : $([ "${CS1_RC:-1}" = 0 ] && echo GREEN || echo RED)  (0.0.258 CS1: a callee-saved register the function never writes is neither pushed nor popped -- the emitted prologue/epilogue bytes, from the object bytes)"
 # Block promotion on a real functional/security/perf/valgrind/fuzz/diff/stdlib/mtu/qobj/verify-status
 # regression. Security KNOWN issues are surfaced by the script but do not turn
@@ -1510,7 +1543,7 @@ if [ $FUNCTIONAL_RC -ne 0 ] || [ $NATIVE_RC -ne 0 ] || [ $SECURITY_RC -ne 0 ] ||
    || [ $VALGRIND_RC -ne 0 ] || [ $FUZZ_RC -ne 0 ] || [ $DIFF_RC -ne 0 ] \
    || [ $GENERICS_RC -ne 0 ] || [ $STDLIB_RC -ne 0 ] || [ $MTU_RC -ne 0 ] \
    || [ $QOBJ_RC -ne 0 ] || [ $VERIFY_STATUS_RC -ne 0 ] || [ $OUTGUARD_RC -ne 0 ] || [ $NAKED_RC -ne 0 ] || [ $ASM_RC -ne 0 ] || [ $BM_RC -ne 0 ] \
-   || [ $GGUF_RC -ne 0 ] || [ $FPR_RC -ne 0 ] || [ $F16C_RC -ne 0 ] || [ $MARS_RC -ne 0 ] || [ "$A41_RC" -ne 0 ] || [ "${F2D_RC:-1}" -ne 0 ] || [ "${F3T_RC:-1}" -ne 0 ] || [ "${A32_RC:-1}" -ne 0 ] || [ "${F6C_RC:-1}" -ne 0 ] || [ "${F1I_RC:-1}" -ne 0 ] || [ "${CAPG_RC:-1}" -ne 0 ] || [ "${CS1_RC:-1}" -ne 0 ] || [ "${VARG_RC:-1}" -ne 0 ]; then
-  exit 1
-fi
-exit 0
+     || [ $GGUF_RC -ne 0 ] || [ $FPR_RC -ne 0 ] || [ $F16C_RC -ne 0 ] || [ $MARS_RC -ne 0 ] || [ "$A41_RC" -ne 0 ] || [ "${F2D_RC:-1}" -ne 0 ] || [ "${F3T_RC:-1}" -ne 0 ] || [ "${A32_RC:-1}" -ne 0 ] || [ "${F6C_RC:-1}" -ne 0 ] || [ "${F1I_RC:-1}" -ne 0 ] || [ "${CAPG_RC:-1}" -ne 0 ] || [ "${CS1_RC:-1}" -ne 0 ] || [ "${VARG_RC:-1}" -ne 0 ] || [ "${WSX_RC:-1}" -ne 0 ]; then
+     exit 1
+   fi
+   exit 0

@@ -69,8 +69,15 @@ fi
 # there is no code path here that reports success without the binary having run.
 #
 # It also enforces the invariants that a hand-rolled invocation drops:
-#   * the compiler gets COMPILER_MEM_MB (below ~6 GB it dies SILENTLY: no
-#     output, no binary, exit 0)
+#   * the compiler gets COMPILER_MEM_MB (bisected minimum 1,006,640 KB for the
+#     compiler's own source; the project ships 1,536 MB = 1,572,864 KB with a 56%
+#     margin. The old claim "below ~6 GB it dies SILENTLY" was falsified by the
+#     0.0.259/0.0.260 reclaim: the up-front arenas were sized "big enough" rather
+#     than from a measured high-water, reserving 4.90 GB of address space while
+#     RSS stayed ~180 MB. The reservation, not memory, was what the ceiling
+#     constrained. A compiler that runs out of address space dies SILENTLY: exit
+#     0, no binary, no diagnostic -- which is exactly what the va-reclaim guard
+#     row tests at 1,572,864 KB.)
 #   * the compiled binary gets the much lower MEM_LIMIT_MB
 #   * a missing binary, or a compile failure, is a non-zero exit -- never a pass
 # =====================================================================

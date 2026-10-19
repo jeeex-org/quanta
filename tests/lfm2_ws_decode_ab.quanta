@@ -1,0 +1,201 @@
+// tests/lfm2_ws_decode_ab.quanta
+//
+// END-TO-END decode A/B for the work-stealing claim (mm_set_ws).
+// Method: 21 cycles, arms interleaved inside one process, taskset-pinned,
+// reporting min-of-21 AND sum-of-21 ms/token with loadavg for each absolute.
+//
+// Build: ./compiler/0.0.260/bin/x86/qc -O tests/lfm2_ws_decode_ab.quanta <bin>
+// Run:   taskset -c 3 ( ulimit -c 0 -v 32000000; <bin> </dev/null )
+import std/gguf
+import std/lfm2_forward
+import std/lfm2_model
+import std/gguf_mm
+import std/gguf_bpe
+import std/lfm2_chat
+import std/fs
+
+const Q4_PATH = "/opt/ai/models/quanta/QUANTA-LFM2.5-2.6Bv1-Q4_K_M.gguf"
+const NCTX = 2048
+const NTOK = 32
+const PROMPT_PATH = "tests/lfm2_prompt.txt"
+
+let pr_ts = 0
+let pr_cycles = 21
+let pr_ntok = NTOK
+let pr_len = 0
+
+fn pr_now() -> i64 {
+    syscall(228, 1, pr_ts, 0, 0, 0)
+    return mem_load(pr_ts) * 1000000000 + mem_load(pr_ts + 8)
+}
+
+fn load1() -> i64 {
+    let fd = file_open("/proc/loadavg", 0)
+    if fd < 0 { return 0 }
+    let b = mem_alloc(64)
+    let got = read_raw(fd, b, 63)
+    file_close(fd)
+    if got <= 0 { return 0 }
+    let v = 0
+    let i = 0
+    while i < got && mem_load8(b + i) >= 48 && mem_load8(b + i) <= 57 {
+        v = v * 10 + (mem_load8(b + i) - 48)
+        i = i + 1
+    }
+    return v
+}
+
+fn slurp(fd) {
+    if fd < 0 { return 0 }
+    let b = mem_alloc(16384)
+    let got = read_raw(fd, b, 16383)
+    file_close(fd)
+    if got <= 0 { return 0 }
+    pr_len = got
+    return b
+}
+
+fn as_str(raw, n) {
+    let s = mem_alloc(n + 16)
+    mem_store(s, n)
+    let i = 0
+    while i < n { mem_store8(s + 8 + i, mem_load8(raw + i)); i = i + 1 }
+    mem_store8(s + 8 + n, 0)
+    return s
+}
+
+fn setup_flags(ws) {
+    mm_set_workers_uncapped(20)
+    mm_set_embed_workers_uncapped(20)
+    mm_set_fused_q4k(1)
+    mm_set_fused_q6k(1)
+    mm_set_fused_chain(1)
+    mm_set_fused_glu(1)
+    mm_set_fused_attn(1)
+    mm_set_fused_conv(1)
+    mm_set_ws(ws)
+    mm_set_ws_chunk(16)
+    return 0
+}
+
+// One arm: NTOK decode tokens, returns ms/token (wall).
+// Runs the full prefill once, then NTOK decode steps.
+fn run_arm(ids, n, ws) -> i64 {
+    setup_flags(ws)
+    if fc_fw_reset() != 0 { return -1 }
+    mm_pool_begin()
+    // prefill
+    if fc_forward_token_ex(mem_load(ids + 8), 0, 1) != 0 { return -1 }
+    // decode
+    let pos = n
+    let t0 = pr_now()
+    let k = 0
+    while k < pr_ntok {
+        let id = fc_argmax(fc_n_vocab)
+        if fc_forward_token_ex(id, pos, 1) != 0 { return -1 }
+        pos = pos + 1
+        k = k + 1
+    }
+    let t1 = pr_now()
+    mm_pool_end()
+    let ns = t1 - t0
+    return ns / pr_ntok / 1000000  // ms/token (integer)
+}
+
+fn main() {
+    prints("=== lfm2 work-stealing decode A/B (21 cycles, interleaved) ===\n")
+    prints("compiler: ./compiler/0.0.260/bin/x86/qc\n")
+
+    pr_ts = mem_alloc(16)
+
+    if gguf_load(Q4_PATH) != 0 { prints("FAIL gguf_load\n"); return 1 }
+    if fc_read_config() != 0 { prints("FAIL fc_read_config\n"); return 1 }
+    if bpe_init_from_gguf() == 0 { prints("FAIL bpe_init\n"); return 1 }
+    if fc_kv_init(NCTX) != 0 { prints("FAIL fc_kv_init\n"); return 1 }
+    if fc_fw_init() != 0 { prints("FAIL fc_fw_init\n"); return 1 }
+    if mm_attach_mmap_fd(file_open(Q4_PATH, 0)) != 0 { prints("FAIL mmap\n"); return 1 }
+    if fc_cache_norms() != 0 { prints("FAIL fc_cache_norms\n"); return 1 }
+
+    let rawp = slurp(file_open(PROMPT_PATH, 0))
+    let user = as_str(rawp, pr_len)
+    let pb = mem_alloc(16384)
+    let pbytes = chat_build(0, user, pb)
+    let ids = mem_alloc(8192 * 8)
+    mem_store(ids, bpe_bos)
+    let n = bpe_encode_special(pb, pbytes, ids + 8, 8000) + 1
+    prints("prompt_ids="); print(n); newline()
+
+    // warm-up: one arm 0 to settle pool/scratch/caches
+    prints("warm-up ws=0 ...\n")
+    let wu = run_arm(ids, n, 0)
+    prints("warm-up ms/tok="); print(wu); newline()
+
+    // 21 cycles: alternating ws=0, ws=1, ws=1, ws=0 ...
+    let ws0 = mem_alloc(pr_cycles * 8)
+    let ws1 = mem_alloc(pr_cycles * 8)
+    let lw0 = mem_alloc(pr_cycles * 8)
+    let lw1 = mem_alloc(pr_cycles * 8)
+    let c = 0
+    while c < pr_cycles {
+        let ws = 0
+        if c % 2 == 1 { ws = 1 }  // 0,1,1,0,0,1,1,0...
+        if c > 0 && c % 2 == 0 && (c-1)%2==1 { ws = 0 }
+        if c > 0 && c % 2 == 1 && (c-1)%2==0 { ws = 1 }
+        // palindrome: 0,1, 1,0, 0,1, 1,0 ...
+        if (c / 2) % 2 == 0 { ws = c % 2 } else { ws = 1 - (c % 2) }
+
+        let l0 = load1()
+        let m = run_arm(ids, n, ws)
+        let l1 = load1()
+        if ws == 0 {
+            mem_store(ws0 + c * 8, m)
+            mem_store(lw0 + c * 8, l0)
+        } else {
+            mem_store(ws1 + c * 8, m)
+            mem_store(lw1 + c * 8, l1)
+        }
+        prints("c="); print(c); prints(" ws="); print(ws)
+        prints(" ms/tok="); print(m); prints(" load="); print(l0); prints("->"); print(l1)
+        if m < 0 { prints(" FAIL"); }
+        newline()
+        c = c + 1
+    }
+
+    // stats
+    let sum0 = 0
+    let sum1 = 0
+    let min0 = 999999999
+    let min1 = 999999999
+    let max0 = 0
+    let max1 = 0
+    let n0 = 0
+    let n1 = 0
+    c = 0
+    while c < pr_cycles {
+        let m0 = mem_load(ws0 + c * 8)
+        let m1 = mem_load(ws1 + c * 8)
+        if m0 >= 0 { sum0 = sum0 + m0; if m0 < min0 { min0 = m0 }; if m0 > max0 { max0 = m0 }; n0 = n0 + 1 }
+        if m1 >= 0 { sum1 = sum1 + m1; if m1 < min1 { min1 = m1 }; if m1 > max1 { max1 = m1 }; n1 = n1 + 1 }
+        c = c + 1
+    }
+
+    prints("--- 21-cycle summary (ms/token) ---\n")
+    prints("ws=0: n="); print(n0); prints(" min="); print(min0); prints(" max="); print(max0); prints(" sum="); print(sum0)
+    prints(" avg="); print(sum0 / n0); newline()
+    prints("ws=1: n="); print(n1); prints(" min="); print(min1); prints(" max="); print(max1); prints(" sum="); print(sum1)
+    prints(" avg="); print(sum1 / n1); newline()
+    prints("ratio ws0/ws1 (min)   x1000: "); print(min0 * 1000 / min1); newline()
+    prints("ratio ws0/ws1 (avg)   x1000: "); print((sum0/n0) * 1000 / (sum1/n1)); newline()
+    prints("ratio ws0/ws1 (sum)   x1000: "); print(sum0 * 1000 / sum1); newline()
+
+    prints("loadavg per cycle:\n")
+    c = 0
+    while c < pr_cycles {
+        prints("c="); print(c); prints(" ws=0 load="); print(mem_load(lw0 + c * 8))
+        prints(" ws=1 load="); print(mem_load(lw1 + c * 8)); newline()
+        c = c + 1
+    }
+
+    prints("DONE\n")
+    return 0
+}

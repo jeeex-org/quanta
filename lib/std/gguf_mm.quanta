@@ -29,6 +29,10 @@
 
 import std/gguf
 import std/math
+// The atomic ORDERING ORDINALS (0.0.259). The loader's work-stealing claim is the
+// consumer this module was written for: `atomic_add(&pl_next, chunk, ORD_RELAXED)`
+// says in the source that the claim needs uniqueness and NOT ordering.
+import std/atomic
 // The folded fused Q4_K dequant-dot kernel (opt-in, see mm_fused_q4k below).
 // jit_x86_fused.quanta does NOT import jit_x86 itself -- every TU that uses it
 // imports both (see tests/jit_fold_dispatch_test.quanta), so both are imported
@@ -1529,6 +1533,47 @@ let pl_u = 0             // kind 6 (GLU): up input ptr (f64)
 let pl_glu_out = 0       // kind 6 (GLU): output ptr (f64)
 let pl_nelems = 0        // kind 6 (GLU): element count
 
+// ===========================================================================
+// WORK-STEALING CLAIM -- the static row slice's replacement (0.0.259 ATOMICS)
+// ===========================================================================
+//
+// WHAT THIS REPLACES, AND WHY IT COULD NOT BE WRITTEN BEFORE. Every worker above
+// owned a DISJOINT STATIC slice `[t*N/nw, (t+1)*N/nw)`. That is balanced (sizes
+// differ by at most one) but it has no way to absorb a straggler: the driver
+// waits for every worker, so the job's wall is set by the worker the scheduler
+// served worst. The measured shape of that on this box is
+// docs/research/loader-resource-politeness.md and
+// docs/research/pool-partition-dispatch-and-conv.md: the pool runs at 7.2-11.2 of
+// 20 achieved concurrency with ~8 of 20 cores held by the agent host, i.e. MORE
+// WORKERS THAN FREE CORES, which is exactly the regime a static partition pays
+// for and a claim does not.
+//
+// It could not be written before 0.0.259 for a measured reason: `&global`
+// returned the address of a TEMPORARY, so `atomic_add(&next, 1)` incremented a
+// private scratch cell. The work-stealing attempt measured **931 of 2048 rows
+// wrong** -- a miscompile, not a race -- and the static slice was kept with the
+// reason written down rather than hand-tuned (docs/research/decode-phase-profile.md
+// section 5). 0.0.259 fixed `&global` (atomic_addrglobal_test) and added the
+// ordering model, so the claim below is the intended spelling, not a workaround.
+//
+// THE CLAIM IS RELAXED, AND THAT IS A CLAIM ABOUT THE ALGORITHM, NOT A SHORTCUT.
+// What the counter needs is UNIQUENESS: two workers must never receive the same
+// index. That is a property of `lock xadd` itself. The values a worker writes
+// into `pl_y` are published by its own `atomic_store(pl_donep + t*8, g)`
+// (seq_cst -> locked `xchg`) followed by `futex_wake`, and the driver's
+// `atomic_load(pl_donep + t*8)` + `futex_wait` is the matching acquire side, so
+// the result-publication chain is unchanged and needs no order from the claim.
+// On x86-64 every order emits the same `lock xadd` anyway (docs/research/
+// atomics-0.0.259.md section 3), so the argument costs nothing -- and saying
+// `ORD_RELAXED` is exactly the "write the order you mean" the module exists for.
+let pl_ws = 1            // 1 = dynamic claim (default), 0 = the static slice
+let pl_ws_chunk = 16     // work items claimed per atomic_add (see pl_claim)
+let pl_next = 0          // THE CLAIM COUNTER. A module GLOBAL, so `&pl_next` is
+                         // the global's storage -- the exact shape measured wrong
+                         // before 0.0.259.
+let pl_ws_used = 0       // sticky dispatch witness: 1 once a worker claimed
+let pl_it_align = 0      // kind 8 only: the mm_cv_align experiment, per job
+
 // ---- the grow-only f32 activation buffer -----------------------------------
 // Ensure pl_xf32 can hold `n` f32 elements. GROW-ONLY, and deliberately:
 // mem_free never unmaps (A35), so a per-matvec alloc/free pair is permanent
@@ -1709,44 +1754,160 @@ fn mm_prof_label(slot) -> i64 {
     return "UNKNOWN_SLOT"
 }
 
-// Static row slice, BYTE-IDENTICAL arithmetic to the old pm_worker: same reads
-// (mm_load_row_s), same summation order (mm_dot4_s). The partition rule is the
-// QUOTIENT split (worker t owns [t*N/nw, (t+1)*N/nw)), generalised from the
-// attention kernel to every kind -- see pl_run_rows.
-fn pl_run_rows(t: i64, cell) {
-    // QUOTIENT split: worker t owns [t*N/nw, (t+1)*N/nw). Sizes differ by at
-    // most one. The old rule ("the last worker absorbs the remainder") gave the
-    // tail worker up to 2x its share on small row counts and, at 32 attention
-    // heads over 20 workers, THIRTEEN of them to one worker -- see pl_run_attn.
-    let lo = t * pl_rows / pl_nw
-    let hi = (t + 1) * pl_rows / pl_nw
-    let r = lo
-    while r < hi {
-        if mm_load_row_s(pl_idx, r, pl_cols, cell) != 0 { return -1 }
-        mem_store(pl_y + r * 8, mm_dot4_s(mem_load(cell + 8), pl_x, pl_cols, mem_load(cell + 16)))
-        r = r + 1
+// ===========================================================================
+// THE WORK-STEALING PARTITION RULE, IN ONE PLACE
+// ===========================================================================
+// Every kind below used to open with its own copy of
+//     let lo = t * N / pl_nw ; let hi = (t + 1) * N / pl_nw
+// and the tests below still read that way. ONE place decides the rule, so the
+// static slice and the claim cannot drift apart per kind -- the "two divergent
+// scans of one fact" defect this tree has paid for more than any other.
+//
+// Usage in a worker (see pl_run_rows):
+//     pl_iter_begin(t, limit, cell, 0)
+//     let lo = mem_load(cell + PL_ITER_CELL)
+//     while lo < limit {
+//         let hi = pl_iter_hi(t, lo, limit, 0)
+//         ... body over [lo, hi) ...
+//         lo = pl_iter_step(t, cell, lo, limit)
+//     }
+const PL_ITER_CELL = 40   // qword 5 of the worker's scratch cell = its cursor
+
+// One chunk of work, taken with `lock xadd`. Returns a base index in [0, limit)
+// or >= limit when the job is exhausted (the "terminating claim", which is the
+// fingerprint the exactness row checks).
+//
+// WHY CHUNKS AND NOT ONE ROW PER CLAIM. A `lock xadd` on a line 20 cores are
+// hammering is a cache-line transfer, not an L1 op, and the matvec path issues
+// 927,744 rows per decode token (docs/research/loader-redundancy-audit.md
+// section 2.3). At chunk=1 that is ~1M contended RMWs per token for a balance
+// gain over the static slice of at most one row per worker (~0.2%). The chunk is
+// the knob that trades claimed-work granularity for claim traffic, and
+// mm_set_ws_chunk() is how it is swept; 16 is the shipped default.
+fn pl_ceff() -> i64 {
+    if pl_ws_chunk < 1 { return 1 }
+    return pl_ws_chunk
+}
+
+fn pl_claim(limit: i64) -> i64 {
+    // The witness is written by whoever claimed, and every writer stores the
+    // same value, so the racy multi-writer store is benign -- the same argument
+    // mm_glu_used / mm_conv_used use.
+    pl_ws_used = 1
+    return atomic_add(&pl_next, pl_ceff(), ORD_RELAXED)
+}
+
+// Set this worker's first range. Static: worker t's quotient slice [t*N/nw,
+// (t+1)*N/nw) -- unchanged from before this unit, and still what runs when
+// mm_set_ws(0). Dynamic: the first claimed chunk. `al` is the kind-8 alignment
+// EXPERIMENT knob (mm_cv_align, default 0) and is 0 for every other kind.
+fn pl_iter_begin(t: i64, limit: i64, cell, al: i64) -> i64 {
+    if pl_ws != 0 { mem_store(cell + PL_ITER_CELL, pl_claim(limit)); return 0 }
+    let lo = t * limit / pl_nw
+    if al != 0 {
+        lo = (lo + 7) / 8 * 8
+        if lo > limit { lo = limit }
     }
-    return hi - lo
+    mem_store(cell + PL_ITER_CELL, lo)
+    return 0
+}
+
+// End of the range that starts at `lo`.
+fn pl_iter_hi(t: i64, lo: i64, limit: i64, al: i64) -> i64 {
+    if pl_ws == 0 {
+        let h = (t + 1) * limit / pl_nw
+        if al != 0 {
+            h = (h + 7) / 8 * 8
+            if h > limit { h = limit }
+        }
+        return h
+    }
+    let h = lo + pl_ceff()
+    if h > limit { h = limit }
+    return h
+}
+
+// Advance to this worker's next range and return its start. Static returns
+// `limit` (one range, loop ends); dynamic claims the next chunk.
+fn pl_iter_step(t: i64, cell, lo: i64, limit: i64) -> i64 {
+    if pl_ws == 0 { return limit }
+    let b = pl_claim(limit)
+    mem_store(cell + PL_ITER_CELL, b)
+    return b
+}
+
+// ---- the knobs and the witnesses -------------------------------------------
+// mm_set_ws(0) selects the static quotient slice; 1 (the default) selects the
+// claim. Both are kept because an A/B must be measurable INSIDE ONE PROCESS on
+// this box -- sequential arms across processes are defeated by a loadavg that
+// swings 1.24x for the same binary (docs/research/loader-resource-politeness.md).
+fn mm_set_ws(n) -> i64 { if n != 0 { pl_ws = 1 } else { pl_ws = 0 }; return 0 }
+fn mm_get_ws() -> i64 { return pl_ws }
+fn mm_set_ws_chunk(n) -> i64 { if n < 1 { n = 1 }; pl_ws_chunk = n; return 0 }
+fn mm_get_ws_chunk() -> i64 { return pl_ws_chunk }
+// Dispatch witnesses. `used` is per job (reset by pl_submit, set by any worker
+// that took the claim); `next` is the final counter value. For chunk c and
+// limit N the counter must end at exactly ((N + c - 1)/c)*c + nw*c: the bases
+// handed out are multiples of c, every base below N owns a distinct clamped
+// range, and each of the nw workers issues exactly one terminating claim. That
+// is a closed-form CHECK, not a tolerance -- see tests/lfm2_worksteal_test.quanta.
+fn mm_get_ws_used() -> i64 { return pl_ws_used }
+fn mm_get_ws_next() -> i64 { return pl_next }
+
+// Static row slice (mm_set_ws(0)) or claimed chunks (mm_set_ws(1)),
+// BYTE-IDENTICAL arithmetic to the old pm_worker either way: same reads
+// (mm_load_row_s), same summation order (mm_dot4_s). The partition rule lives in
+// pl_iter_begin / pl_iter_hi / pl_iter_step and nowhere else.
+fn pl_run_rows(t: i64, cell) {
+    // QUOTIENT split when mm_set_ws(0): worker t owns [t*N/nw, (t+1)*N/nw).
+    // Sizes differ by at most one. The old rule ("the last worker absorbs the
+    // remainder") gave the tail worker up to 2x its share on small row counts
+    // and, at 32 attention heads over 20 workers, THIRTEEN of them to one
+    // worker -- see pl_run_attn. With mm_set_ws(1) (the default) the range comes
+    // from pl_claim instead; both are computed in ONE place (pl_iter_*).
+    let limit = pl_rows
+    pl_iter_begin(t, limit, cell, 0)
+    let done = 0
+    let lo = mem_load(cell + PL_ITER_CELL)
+    while lo < limit {
+        let hi = pl_iter_hi(t, lo, limit, 0)
+        let r = lo
+        while r < hi {
+            if mm_load_row_s(pl_idx, r, pl_cols, cell) != 0 { return -1 }
+            mem_store(pl_y + r * 8, mm_dot4_s(mem_load(cell + 8), pl_x, pl_cols, mem_load(cell + 16)))
+            r = r + 1
+        }
+        done = done + (hi - lo)
+        lo = pl_iter_step(t, cell, lo, limit)
+    }
+    return done
 }
 
 // Static slice of [v0, v0+vcount), byte-identical to the old pem_worker.
 fn pl_run_embed(t: i64, cell) {
-    // QUOTIENT split (see pl_run_rows)
-    let lo = t * pl_vcount / pl_nw
-    let hi = (t + 1) * pl_vcount / pl_nw
-    let v = lo
-    while v < hi {
-        if mm_load_row_s(pl_idx, pl_v0 + v, pl_ncols, cell) != 0 { return -1 }
-        let acc: f64 = 0.0
-        let c = 0
-        while c < pl_ncols {
-            acc = acc + f64of(mem_load(mem_load(cell + 8) + c * 8)) * f64of(mem_load(pl_x + c * 8))
-            c = c + 1
+    // claimed chunks / QUOTIENT split (see pl_run_rows and the pl_iter_* block)
+    let limit = pl_vcount
+    pl_iter_begin(t, limit, cell, 0)
+    let done = 0
+    let lo = mem_load(cell + PL_ITER_CELL)
+    while lo < limit {
+        let hi = pl_iter_hi(t, lo, limit, 0)
+        let v = lo
+        while v < hi {
+            if mm_load_row_s(pl_idx, pl_v0 + v, pl_ncols, cell) != 0 { return -1 }
+            let acc: f64 = 0.0
+            let c = 0
+            while c < pl_ncols {
+                acc = acc + f64of(mem_load(mem_load(cell + 8) + c * 8)) * f64of(mem_load(pl_x + c * 8))
+                c = c + 1
+            }
+            mem_store(pl_y + (pl_v0 + v) * 8, acc)
+            v = v + 1
         }
-        mem_store(pl_y + (pl_v0 + v) * 8, acc)
-        v = v + 1
+        done = done + (hi - lo)
+        lo = pl_iter_step(t, cell, lo, limit)
     }
-    return hi - lo
+    return done
 }
 
 fn pl_run(t: i64, cell) {
@@ -1774,18 +1935,25 @@ fn pl_run_attn(t: i64, cell) {
     let hd = pl_a_hd
     let pos = pl_a_pos
     let scale: f64 = 1.0 / sqrt(i2f(hd))
-    // BALANCED static slice of heads: worker t gets heads [t*nh/nw, (t+1)*nh/nw).
-    // With nh=32 and nw=20 the pool's usual "last worker absorbs the remainder"
-    // rule would give t=19 THIRTEEN heads and the rest ONE -- a 13:1 tail that
-    // caps the speedup near 2.5x. Heads in this model have equal cost, so a
-    // quotient split is both still static/deterministic and near-perfectly
-    // balanced (sizes differ by at most one head).
-    let hlo = t * nh / pl_nw
-    let hhi = (t + 1) * nh / pl_nw
-    if hhi > nh { hhi = nh }
-    let sc = pl_a_sc + t * pl_a_scstr * 8
-    let h = hlo
-    while h < hhi {
+    // BALANCED slice of heads when mm_set_ws(0): worker t gets heads
+    // [t*nh/nw, (t+1)*nh/nw). With nh=32 and nw=20 the pool's usual "last worker
+    // absorbs the remainder" rule would give t=19 THIRTEEN heads and the rest
+    // ONE -- a 13:1 tail that caps the speedup near 2.5x. Heads in this model
+    // have equal cost, so a quotient split is both still static/deterministic and
+    // near-perfectly balanced (sizes differ by at most one head). With the
+    // default mm_set_ws(1) the head ranges are claimed instead -- which is the
+    // lever here, because a head's cost is NOT uniform: it is proportional to
+    // pos+1, and every worker's q/dot/softmax work per head grows with pos.
+    let limit = nh
+    pl_iter_begin(t, limit, cell, 0)
+    let done = 0
+    let lo = mem_load(cell + PL_ITER_CELL)
+    while lo < limit {
+        let hi = pl_iter_hi(t, lo, limit, 0)
+        if hi > nh { hi = nh }
+        let sc = pl_a_sc + t * pl_a_scstr * 8
+        let h = lo
+        while h < hi {
         // GQA: query heads share KV head kvh.
         let kvh = h / (nh / nkv)
         let qb = pl_a_q + h * hd * 8
@@ -1829,8 +1997,11 @@ fn pl_run_attn(t: i64, cell) {
             tt = tt + 1
         }
         h = h + 1
+        }
+        done = done + (hi - lo)
+        lo = pl_iter_step(t, cell, lo, limit)
     }
-    return 0
+    return done
 }
 
 // mm_attn_par(...) -> 0 if the live pool computed the attention heads, non-zero
@@ -1871,19 +2042,26 @@ fn pl_run_glu(t: i64, cell) {
     // writers store the same value, so the racy multi-writer store is benign;
     // reading it after pl_submit() proves the parallel GLU actually ran.
     mm_glu_used = 1
-    // QUOTIENT split (see pl_run_rows)
-    let lo = t * pl_nelems / pl_nw
-    let hi = (t + 1) * pl_nelems / pl_nw
-    let i = lo
-    while i < hi {
-        let g = f64of(mem_load(pl_g + i * 8))
-        // silu(g) = g * sigmoid(g) = g / (1 + exp(-g))
-        let sg: f64 = 1.0 / (1.0 + expf(0.0 - g))
-        let uv = f64of(mem_load(pl_u + i * 8))
-        mem_store(pl_glu_out + i * 8, g * sg * uv)
-        i = i + 1
+    // claimed chunks / QUOTIENT split (see pl_run_rows and the pl_iter_* block)
+    let limit = pl_nelems
+    pl_iter_begin(t, limit, cell, 0)
+    let done = 0
+    let lo = mem_load(cell + PL_ITER_CELL)
+    while lo < limit {
+        let hi = pl_iter_hi(t, lo, limit, 0)
+        let i = lo
+        while i < hi {
+            let g = f64of(mem_load(pl_g + i * 8))
+            // silu(g) = g * sigmoid(g) = g / (1 + exp(-g))
+            let sg: f64 = 1.0 / (1.0 + expf(0.0 - g))
+            let uv = f64of(mem_load(pl_u + i * 8))
+            mem_store(pl_glu_out + i * 8, g * sg * uv)
+            i = i + 1
+        }
+        done = done + (hi - lo)
+        lo = pl_iter_step(t, cell, lo, limit)
     }
-    return hi - lo
+    return done
 }
 
 // Static CHANNEL slice of the entire elementwise short-conv block.
@@ -1918,44 +2096,47 @@ fn pl_run_conv(t: i64, cell) {
     let kout = pl_cv_kout
     let y = pl_cv_y
     let kern = pl_cv_kern
-    // QUOTIENT split (see pl_run_rows): channel-parallel, sizes differ by <= 1.
-    // EXPERIMENT (cache-line-aligned boundaries): the in-place `state` buffer is
-    // written at (tt*dm + c)*8, so adjacent channels share a 64-byte line. A
-    // slice boundary that falls INSIDE a line makes two workers own one line.
-    let lo = 0
-    let hi = 0
-    if mm_cv_align != 0 {
-        lo = (t * dm / pl_nw + 7) / 8 * 8
-        hi = ((t + 1) * dm / pl_nw + 7) / 8 * 8
-        if hi > dm { hi = dm }
-    } else {
-        lo = t * dm / pl_nw
-        hi = (t + 1) * dm / pl_nw
-    }
-    let c = lo
-    while c < hi {
-        let gc = f64of(mem_load(ip + c * 8)) * f64of(mem_load(ip + (2 * dm + c) * 8))
-        let acc: f64 = 0.0
-        let k = 0
-        while k < kw {
-            let bv: f64 = 0.0
-            if k < dc { bv = f64of(mem_load(st + (k * dm + c) * 8)) } else { bv = gc }
-            acc = acc + f64of(mem_load(kern + (c * kw + k) * 8)) * bv
-            k = k + 1
+    // claimed chunks / QUOTIENT split (see pl_run_rows and the pl_iter_* block).
+    // EXPERIMENT (cache-line-aligned boundaries, mm_cv_align, default 0): the
+    // in-place `state` buffer is written at (tt*dm + c)*8, so adjacent channels
+    // share a 64-byte line and a slice boundary inside a line makes two workers
+    // own one line. The knob is only honoured on the STATIC path (al); the claim
+    // path at chunk=16 hands out 16 channels at a time and the boundary is not a
+    // designed quantity there. It is kept because it is how the refutation in
+    // docs/research/loader-redundancy-audit.md section 3 is reproducible.
+    let limit = dm
+    pl_iter_begin(t, limit, cell, mm_cv_align)
+    let done = 0
+    let l0 = mem_load(cell + PL_ITER_CELL)
+    while l0 < limit {
+        let hi = pl_iter_hi(t, l0, limit, mm_cv_align)
+        let c = l0
+        while c < hi {
+            let gc = f64of(mem_load(ip + c * 8)) * f64of(mem_load(ip + (2 * dm + c) * 8))
+            let acc: f64 = 0.0
+            let k = 0
+            while k < kw {
+                let bv: f64 = 0.0
+                if k < dc { bv = f64of(mem_load(st + (k * dm + c) * 8)) } else { bv = gc }
+                acc = acc + f64of(mem_load(kern + (c * kw + k) * 8)) * bv
+                k = k + 1
+            }
+            mem_store(kout + c * 8, acc)
+            let tt = 0
+            while tt < dc {
+                let src = dc - 1 + tt
+                let nv: f64 = 0.0
+                if src < dc { nv = f64of(mem_load(st + (src * dm + c) * 8)) } else { nv = gc }
+                mem_store(st + (tt * dm + c) * 8, nv)
+                tt = tt + 1
+            }
+            mem_store(y + c * 8, f64of(mem_load(ip + (dm + c) * 8)) * acc)
+            c = c + 1
         }
-        mem_store(kout + c * 8, acc)
-        let tt = 0
-        while tt < dc {
-            let src = dc - 1 + tt
-            let nv: f64 = 0.0
-            if src < dc { nv = f64of(mem_load(st + (src * dm + c) * 8)) } else { nv = gc }
-            mem_store(st + (tt * dm + c) * 8, nv)
-            tt = tt + 1
-        }
-        mem_store(y + c * 8, f64of(mem_load(ip + (dm + c) * 8)) * acc)
-        c = c + 1
+        done = done + (hi - l0)
+        l0 = pl_iter_step(t, cell, l0, limit)
     }
-    return hi - lo
+    return done
 }
 
 // ===========================================================================
@@ -2004,21 +2185,28 @@ fn mm_matmul_ser(idx, x, rows, cols, B, y) -> i64 {
 // Worker slice: static rows, one read per row, B dots. Same partition rule and
 // the same primitives as pl_run_rows, so the arithmetic is unchanged.
 fn pl_run_mm(t: i64, cell) {
-    // QUOTIENT split (see pl_run_rows)
-    let lo = t * pl_rows / pl_nw
-    let hi = (t + 1) * pl_rows / pl_nw
-    let r = lo
-    while r < hi {
-        if mm_load_row_s(pl_idx, r, pl_cols, cell) != 0 { return -1 }
-        let b = 0
-        while b < pl_b {
-            mem_store(pl_y + (b * pl_rows + r) * 8,
-                      mm_dot4_s(mem_load(cell + 8), pl_x + b * pl_cols * 8, pl_cols, mem_load(cell + 16)))
-            b = b + 1
+    // claimed chunks / QUOTIENT split (see pl_run_rows and the pl_iter_* block)
+    let limit = pl_rows
+    pl_iter_begin(t, limit, cell, 0)
+    let done = 0
+    let lo = mem_load(cell + PL_ITER_CELL)
+    while lo < limit {
+        let hi = pl_iter_hi(t, lo, limit, 0)
+        let r = lo
+        while r < hi {
+            if mm_load_row_s(pl_idx, r, pl_cols, cell) != 0 { return -1 }
+            let b = 0
+            while b < pl_b {
+                mem_store(pl_y + (b * pl_rows + r) * 8,
+                          mm_dot4_s(mem_load(cell + 8), pl_x + b * pl_cols * 8, pl_cols, mem_load(cell + 16)))
+                b = b + 1
+            }
+            r = r + 1
         }
-        r = r + 1
+        done = done + (hi - lo)
+        lo = pl_iter_step(t, cell, lo, limit)
     }
-    return hi - lo
+    return done
 }
 
 // y[(b * rows + r)] = row_r(W) . x_b   for b in 0..B-1
@@ -2139,6 +2327,16 @@ fn mm_pool_begin() {
 // slice itself allocates nothing, so that needs a trap -- which would kill the
 // serial path loudly too.
 fn pl_submit() -> i64 {
+    // ---- RESET THE CLAIM COUNTER, BEFORE THE JOB IS PUBLISHED -----------------
+    // Every worker is parked here (pl_submit only returns after all of them
+    // stamped done for the previous generation), so the reset is not racing
+    // anyone. It is ordered before the publication by the `fence()` + the
+    // seq_cst `atomic_store(pl_genp, g)` below, which is the same release edge
+    // the workers already acquire on. RELAXED is the right order on the writer
+    // side of that edge: the counter's own value needs no ordering, only
+    // uniqueness (see pl_claim).
+    atomic_store(&pl_next, 0, ORD_RELAXED)
+    pl_ws_used = 0
     fence()
     let g = atomic_load(pl_genp) + 1
     atomic_store(pl_genp, g)
@@ -2410,11 +2608,10 @@ fn mm_deq_row_raw(dtype, raw: u64, elems: i64, dst: u64) -> i64 {
 //      reaches <= 1 cycle/element is the fused register-resident builtin
 //      spec'd in docs/research/decode-fused-dot.md section 3.
 fn pl_run_rows_map(t: i64, cell) {
-    // QUOTIENT split (see pl_run_rows): this is the decode hot path (FFN gate/up/
-    // down, attn q/k/v/out, conv in/out proj), and its small-row tensors (512-row
-    // k/v projections) previously handed the tail worker 32 rows against 25.
-    let lo = t * pl_rows / pl_nw
-    let hi = (t + 1) * pl_rows / pl_nw
+    // claimed chunks / QUOTIENT split (see pl_run_rows and the pl_iter_* block):
+    // this is the decode hot path (FFN gate/up/down, attn q/k/v/out, conv in/out
+    // proj), and its small-row tensors (512-row k/v projections) previously handed
+    // the tail worker 32 rows against 25.
     let dtype = gguf_tensor_dtype(pl_idx)
     let rb = mm_row_bytes(dtype, pl_cols)
     if rb <= 0 { return -1 }
@@ -2465,8 +2662,14 @@ fn pl_run_rows_map(t: i64, cell) {
     // (or no matvec has needed the buffer yet), in which case the f64 kernel runs.
     if mm_fused_f32 != 0 && (fused != 0 || fused6 != 0) && pl_xf32 != 0 { fused32 = 1 }
 
-    let r = lo
-    while r < hi {
+    let limit = pl_rows
+    pl_iter_begin(t, limit, cell, 0)
+    let done = 0
+    let lo = mem_load(cell + PL_ITER_CELL)
+    while lo < limit {
+        let hi = pl_iter_hi(t, lo, limit, 0)
+        let r = lo
+        while r < hi {
         let raw = mm_map_base + toff + r * rb
         if fused != 0 {
             mem_store(fargs + 0, raw)               // W: this row's quant bytes
@@ -2525,8 +2728,11 @@ fn pl_run_rows_map(t: i64, cell) {
             mem_store(pl_y + r * 8, mm_dot4_s(f64b, pl_x, pl_cols, acc))
         }
         r = r + 1
+        }
+        done = done + (hi - lo)
+        lo = pl_iter_step(t, cell, lo, limit)
     }
-    return hi - lo
+    return done
 }
 
 // Pool kind 5 worker: the tied output projection (embed logits) from the
@@ -2534,9 +2740,7 @@ fn pl_run_rows_map(t: i64, cell) {
 // pl_run_embed -- bit-identical by construction. (The multi-lane dot is NOT
 // an option here either -- see the note on pl_run_rows_map.)
 fn pl_run_embed_map(t: i64, cell) {
-    // QUOTIENT split (see pl_run_rows)
-    let lo = t * pl_vcount / pl_nw
-    let hi = (t + 1) * pl_vcount / pl_nw
+    // claimed chunks / QUOTIENT split (see pl_run_rows and the pl_iter_* block)
     let dtype = gguf_tensor_dtype(pl_idx)
     let rb = mm_row_bytes(dtype, pl_ncols)
     if rb <= 0 { return -1 }
@@ -2563,8 +2767,14 @@ fn pl_run_embed_map(t: i64, cell) {
     // wrong bytes and produce a plausible wrong number.
     let cf32 = 0
     if fusedc != 0 && mm_fused_chain_f32 != 0 && pl_xf32 != 0 { cf32 = 1 }
-    let v = lo
-    while v < hi {
+    let limit = pl_vcount
+    pl_iter_begin(t, limit, cell, 0)
+    let done = 0
+    let lo = mem_load(cell + PL_ITER_CELL)
+    while lo < limit {
+        let hi = pl_iter_hi(t, lo, limit, 0)
+        let v = lo
+        while v < hi {
         let raw = mm_map_base + toff + (pl_v0 + v) * rb
         if fusedc != 0 {
             // THIS worker's own args area (cell+24), allocated once at spawn --
@@ -2596,8 +2806,11 @@ fn pl_run_embed_map(t: i64, cell) {
             mem_store(pl_y + (pl_v0 + v) * 8, acc)
         }
         v = v + 1
+        }
+        done = done + (hi - lo)
+        lo = pl_iter_step(t, cell, lo, limit)
     }
-    return hi - lo
+    return done
 }
 
 // ---- the multi-cell dot: built, measured, DELETED --------------------------

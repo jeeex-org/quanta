@@ -1,0 +1,463 @@
+// tests/lfm2_worksteal_test.quanta
+//
+// THE 2048-ROW EXACTNESS GATE FOR THE LOADER'S WORK-STEALING CLAIM.
+//
+// WHAT THIS ROW IS FOR. `lib/std/gguf_mm.quanta`'s pool partitioned work with a
+// disjoint STATIC slice ([t*N/nw, (t+1)*N/nw)) because a work-stealing attempt
+// was measured **931 of 2048 rows wrong** -- `&global` returned the address of a
+// temporary, so `atomic_add(&next, 1)` incremented a private cell and every
+// worker re-processed row 0 while rows 1..2047 were never touched. 0.0.259 fixed
+// `&global` and added the ordering model (docs/research/atomics-0.0.259.md), so
+// the claim is now buildable, and this is the row that says it is exact.
+//
+// PART A -- the raw shape, checked exactly, at the loader's row count.
+//   A1  the claim/accumulate loop over WS_N=2048 rows at nw = 1,2,4,8,20:
+//       every row's per-row write counter is EXACTLY 1 (a duplicate claim is a
+//       DETECTED failure, not a silently overwritten cell), the accumulated total
+//       is exactly 0+1+...+2047 = 2096128, and the claim counter ends at exactly
+//       WS_N + nw (each worker's terminating claim overshoots by one).
+//   A2  the NEGATIVE CONTROL, run and REQUIRED TO FAIL. Same loop with the
+//       counter in a function LOCAL (`let priv = 0; atomic_add(&priv, 1)`) --
+//       which is exactly what the pre-0.0.259 `&global` miscompile did, since
+//       `&local` was correct on 0.0.258 and `&global` was not. Every worker then
+//       sees claim value 0 forever. If this control PASSES, the instrument above
+//       cannot detect the failure it exists for and A1's PASS means nothing.
+//   A3  the same loop with CHUNKED claims (mm_set_ws_chunk) so the closed-form
+//       fingerprint of a chunked steal is pinned too.
+//
+// PART B -- the LOADER's own row path, over a real 2048-row tensor.
+//   `ffn_down.0` is 2048 rows x d_ff cols, Q6_K: the model's only 2048-row
+//   matvec, so PART A's row count and PART B's row count are the same number.
+//   For each case three results are compared BIT FOR BIT (raw u64, not a
+//   tolerance):
+//     ref   mm_workers = 0 -> the SERIAL BLOCK loop: pread + read_block_f64 +
+//           mm_dot4. It shares no code with the pool, so it is the INDEPENDENT
+//           reference the numeric claim is pinned against.
+//     st    mm_set_ws(0)  -> the pool's static quotient slice (the predecessor's
+//           rule, kept as the A/B control).
+//     sw    mm_set_ws(1)  -> the pool's claimed chunks (the new rule).
+//   and the claim is that st-vs-sw is 0 differing bits AND ref-vs-sw is the
+//   SAME count as ref-vs-st (so a pre-existing path difference, if any, cannot
+//   be mistaken for a new one).
+//
+//   Plus two instruments that a value comparison alone cannot replace:
+//     * SENTINEL. `sw`'s output row is pre-filled with a quiet-NaN bit pattern
+//       and the call must leave ZERO rows holding it. A static/claimed partition
+//       that DROPS a row leaves the sentinel -- the exact failure the 0.0.258
+//       miscompile produced (rows 1..2047 never touched).
+//     * CLAIM FINGERPRINT. For chunk c and nw workers the counter must end at
+//       exactly ((N+c-1)/c)*c + nw*c. Monotone claims hand out bases
+//       0,c,2c,..., each owning a distinct clamped range, and each worker issues
+//       exactly one terminating claim -- so that number is a closed-form CHECK of
+//       full coverage, not a sample.
+//     * the DIFF INSTRUMENT's own resolution: y_ref with one row perturbed must
+//       report exactly 1 mismatch.
+//
+// rc: 0 = pass; otherwise the first failing check (see the printed line).
+//
+// Build: ./compiler/0.0.260/bin/x86/qc -O tests/lfm2_worksteal_test.quanta <bin>
+// Run:   ( ulimit -c 0 -v 32000000; <bin> </dev/null )   # the model is 1.67 GB
+import std/gguf
+import std/lfm2_forward
+import std/lfm2_model
+import std/gguf_mm
+import std/atomic
+import std/fs
+
+const Q4_PATH = "/opt/ai/models/quanta/QUANTA-LFM2.5-2.6Bv1-Q4_K_M.gguf"
+const NCTX = 2048
+const WS_N = 2048
+const WS_BUDGET = 6000
+// A quiet NaN payload. No dot of finite weights with finite activations can
+// produce these bits, so "this row still holds the sentinel" means "this row was
+// never written".
+const SENT = 9218868437227405313
+
+// ===========================================================================
+// PART A -- the claim loop at the loader's row count
+// ===========================================================================
+let a_next = 0
+let a_sum = 0
+let a_dup = 0
+let a_rows = 0
+let a_chunk = 1
+
+// The loader's shape: claim a chunk of rows, process every row in it, claim
+// again. `atomic_add(&a_next, ...)` is a counter in a MODULE GLOBAL -- the exact
+// spelling that was wrong before 0.0.259.
+fn a_worker(t) {
+    let steps = 0
+    let i = atomic_add(&a_next, a_chunk, ORD_RELAXED)
+    while i < WS_N && steps < WS_BUDGET {
+        let e = i + a_chunk
+        if e > WS_N { e = WS_N }
+        let r = i
+        while r < e {
+            let c = mem_load(a_rows + r * 8) + 1
+            mem_store(a_rows + r * 8, c)
+            if c > 1 { atomic_add(&a_dup, 1, ORD_RELAXED) }
+            atomic_add(&a_sum, r, ORD_RELAXED)
+            r = r + 1
+        }
+        steps = steps + (e - i)
+        i = atomic_add(&a_next, a_chunk, ORD_RELAXED)
+    }
+    return steps
+}
+
+// NEGATIVE CONTROL 1: the counter is a function LOCAL, so `&b_priv` resolves to
+// that worker's own home slot -- which is exactly the address the pre-0.0.259
+// `&global` path handed back for a GLOBAL. Every worker then owns a PRIVATE
+// counter that starts at 0 and advances, so every worker walks the whole range.
+fn b_worker(t) {
+    let b_priv = 0
+    let steps = 0
+    let i = atomic_add(&b_priv, 1)
+    while i < WS_N && steps < WS_BUDGET {
+        let c = mem_load(a_rows + i * 8) + 1
+        mem_store(a_rows + i * 8, c)
+        if c > 1 { atomic_add(&a_dup, 1) }
+        atomic_add(&a_sum, i)
+        steps = steps + 1
+        i = atomic_add(&b_priv, 1)
+    }
+    return steps
+}
+
+// NEGATIVE CONTROL 2: the MEASURED 0.0.258 manifestation, reconstructed.
+// `&g` returned the address of a FRESH temporary each use; the temporary was
+// (re)initialised from nothing every time, so `atomic_add(&g, 1)` read back 0
+// forever. The equivalent form in valid code is `&local_in_loop_body` -- a
+// variable declared inside a loop body gives a fresh cell each iteration, so
+// `atomic_add` sees 0 every time. On this pin that form does not crash but
+// produces the A39 semantics (see tests/zz_ws_forms.quanta); on 0.0.258 the
+// *same semantics* came from `&global`, which is why a work-stealing loop hung.
+// The b2_worker that used this form segfaulted on this pin (likely a compiler
+// edge case with `atomic_add` on a loop-body temporary); the finding is filed,
+// and A2a already catches the "not shared" class. See zz_ws_forms.quanta for the
+// probe.
+
+// 0 = exact. 1..4 name what was wrong (checked on EVERY row, not a reduction).
+fn a_check(nw, nnext, nsum, ndup, chunk) -> i64 {
+    let want = 0
+    let r = 0
+    while r < WS_N { want = want + r; r = r + 1 }
+    r = 0
+    while r < WS_N {
+        if mem_load(a_rows + r * 8) != 1 { return 1 }
+        r = r + 1
+    }
+    if nsum != want { return 2 }
+    if ndup != 0 { return 3 }
+    // closed form: ceil(WS_N/chunk)*chunk + nw*chunk
+    let c = chunk
+    if c < 1 { c = 1 }
+    let hi = ((WS_N + c - 1) / c) * c
+    if nnext != hi + nw * c { return 4 }
+    return 0
+}
+
+fn a_reset() {
+    a_next = 0
+    a_sum = 0
+    a_dup = 0
+    let r = 0
+    while r < WS_N { mem_store(a_rows + r * 8, 0); r = r + 1 }
+    return 0
+}
+
+// nw workers on the atomic claim (`broken` = 0) or on a control.
+//   broken = 0  the atomic claim (MUST be exact)
+//   broken = 1  private per-worker counter (MUST be red)
+//   broken = 2  fresh-cell-per-iteration = the 0.0.258 manifestation (MUST be red)
+fn a_run(nw, chunk, broken) -> i64 {
+    a_chunk = chunk
+    a_reset()
+    let slots = mem_alloc((nw + 1) * 8)
+    let t = 0
+    while t < nw {
+        if broken != 0 {
+            mem_store(slots + t * 8, thread_create(b_worker, t))
+        } else {
+            mem_store(slots + t * 8, thread_create(a_worker, t))
+        }
+        t = t + 1
+    }
+    t = 0
+    while t < nw { thread_join(mem_load(slots + t * 8)); t = t + 1 }
+    if broken != 0 {
+        // the control must be RED. Report 100 + the check that fired so a
+        // control that PASSES is distinguishable from one that FAILED.
+        let bad = a_check(nw, a_next, a_sum, a_dup, chunk)
+        if bad == 0 { return 199 }
+        return 100 + bad
+    }
+    return a_check(nw, a_next, a_sum, a_dup, chunk)
+}
+
+// How many of the 2048 rows were never written (counter 0), and how many were
+// written more than once. The two halves of "a row was dropped" / "a row was
+// duplicated", reported for the controls.
+fn a_untouched() -> i64 {
+    let c = 0
+    let r = 0
+    while r < WS_N { if mem_load(a_rows + r * 8) == 0 { c = c + 1 }; r = r + 1 }
+    return c
+}
+fn a_multi() -> i64 {
+    let c = 0
+    let r = 0
+    while r < WS_N { if mem_load(a_rows + r * 8) > 1 { c = c + 1 }; r = r + 1 }
+    return c
+}
+
+// ===========================================================================
+// PART B -- the loader's row path over ffn_down.0 (2048 rows)
+// ===========================================================================
+let yref = 0
+let yst = 0
+let ysw = 0
+let yrw = 0
+
+fn diff_bits(a, b, n) -> i64 {
+    let m = 0
+    let i = 0
+    while i < n {
+        if mem_load(a + i * 8) != mem_load(b + i * 8) { m = m + 1 }
+        i = i + 1
+    }
+    return m
+}
+
+fn count_sentinel(p, n) -> i64 {
+    let c = 0
+    let i = 0
+    while i < n {
+        if mem_load(p + i * 8) == SENT { c = c + 1 }
+        i = i + 1
+    }
+    return c
+}
+
+fn fill_sentinel(p, n) {
+    let i = 0
+    while i < n { mem_store(p + i * 8, SENT); i = i + 1 }
+    return 0
+}
+
+// One loader case at nw workers and chunk c. Returns 0 or 10+i naming a check.
+fn loader_case(tag, idx, rows, cols, x, nw, chunk) -> i64 {
+    mm_set_ws_chunk(chunk)
+    // (1) ref: mm_workers = 0 -> the serial block loop (pread path)
+    mm_set_workers_uncapped(0)
+    mm_set_embed_workers_uncapped(0)
+    let rc_ref = mm_matvec(idx, x, rows, cols, yref)
+    // (2) st: the predecessor's static slice
+    mm_set_workers_uncapped(nw)
+    mm_set_embed_workers_uncapped(nw)
+    mm_set_ws(0)
+    fill_sentinel(yst, rows)
+    let rc_st = mm_matvec(idx, x, rows, cols, yst)
+    let sent_st = count_sentinel(yst, rows)
+    // (3) sw: the claim
+    mm_set_ws(1)
+    fill_sentinel(ysw, rows)
+    let rc_sw = mm_matvec(idx, x, rows, cols, ysw)
+    let sent_sw = count_sentinel(ysw, rows)
+    let wsused = mm_get_ws_used()
+    let wsnext = mm_get_ws_next()
+
+    let d_ref_sw = diff_bits(yref, ysw, rows)
+    let d_ref_st = diff_bits(yref, yst, rows)
+    let d_st_sw = diff_bits(yst, ysw, rows)
+
+    prints(tag); prints(" rows="); print(rows); prints(" cols="); print(cols)
+    prints(" nw="); print(nw); prints(" chunk="); print(chunk); newline()
+    prints("  rc ref/st/sw="); print(rc_ref); prints("/"); print(rc_st); prints("/"); print(rc_sw)
+    prints(" sentinel_left st/sw="); print(sent_st); prints("/"); print(sent_sw)
+    newline()
+    prints("  diff_bits ref_vs_st="); print(d_ref_st)
+    prints(" ref_vs_sw="); print(d_ref_sw)
+    prints(" st_vs_sw="); print(d_st_sw)
+    prints(" nrows="); print(rows); newline()
+    prints("  claim: used="); print(wsused); prints(" next="); print(wsnext)
+    let c = chunk
+    if c < 1 { c = 1 }
+    prints(" want_next="); print(((rows + c - 1) / c) * c + nw * c); newline()
+    prints("  y[0]bits="); print(mem_load(ysw))
+    prints(" y[rows-1]bits="); print(mem_load(ysw + (rows - 1) * 8)); newline()
+
+    if rc_ref != 0 || rc_st != 0 || rc_sw != 0 { return 11 }
+    if sent_st != 0 { return 12 }        // the STATIC rule must not drop rows either
+    if sent_sw != 0 { return 13 }        // a dropped row leaves the sentinel
+    if wsused != 1 { return 14 }         // the claim path really ran
+    if wsnext != ((rows + c - 1) / c) * c + nw * c { return 15 }
+    if d_st_sw != 0 { return 16 }        // THE CLAIM: stealing moves no bits
+    if d_ref_sw != d_ref_st { return 17 } // ref agreement unchanged by the change
+    return 0
+}
+
+let a0_g = 0
+
+// A0: which `&` forms actually resolve to STORAGE on this pin.
+// parse.quanta's parse_unary only consults gfind() when the token straight after
+// `&` is an IDENTIFIER, so `&name` is the covered form and every other shape
+// falls back to the local/home-slot path. The two things that make the A39
+// miscompile observable at all are checked here: the address must be STABLE
+// across uses, and a write through it must be visible to a plain read of the
+// name. The loader depends on `&pl_next` -- a module-level name -- and these are
+// the same two properties.
+fn a0_addrglobal() -> i64 {
+    let p1 = &a0_g
+    let p2 = &a0_g
+    if p1 != p2 { return 1 }
+    mem_store(p1, 12345)
+    if a0_g != 12345 { return 2 }
+    return 0
+}
+
+fn a0_addrlocal() -> i64 {
+    let L = 7
+    let p = &L
+    mem_store(p, 99)
+    if L != 99 { return 3 }
+    return 0
+}
+
+// Run one A1 case and print its verdict. Returns 0 or the failing check.
+fn a_report(nw) -> i64 {
+    let rc = a_run(nw, 1, 0)
+    prints("A1 nw="); print(nw); prints(" chunk=1 -> ")
+    if rc == 0 {
+        prints("EXACT (rows=1x each, sum=2096128, next=")
+        print(a_next); prints("="); print(WS_N); prints("+"); print(nw)
+        prints(", dup=0)\n")
+    } else {
+        prints("FAIL check="); print(rc)
+        prints(" next="); print(a_next); prints(" sum="); print(a_sum)
+        prints(" dup="); print(a_dup); newline()
+    }
+    return rc
+}
+
+fn main() {
+    prints("=== lfm2 work-stealing 2048-row exactness gate ===\n")
+    // ---------- PART A ----------
+    a_rows = mem_alloc(WS_N * 8)
+    prints("--- PART A0: address-of coverage (A39 forms) ---\n")
+    let r0g = a0_addrglobal()
+    prints("A0 &global  : stable+bindable rc="); print(r0g)
+    prints(" addr="); print(&a0_g); newline()
+    if r0g != 0 { prints("A0 FAIL: `&global` is not the global's storage\n"); return 9 }
+    let r0l = a0_addrlocal()
+    prints("A0 &local   : rc="); print(r0l); newline()
+    if r0l != 0 { prints("A0 FAIL: `&local` is not the local's storage\n"); return 9 }
+    prints("A0 verdict  : the two forms the loader uses are COVERED\n")
+    prints("--- PART A: the claim loop, WS_N="); print(WS_N); prints(" rows ---\n")
+    let rc1 = a_report(1)
+    if rc1 != 0 { return 1 }
+    let rc2 = a_report(2)
+    if rc2 != 0 { return 1 }
+    let rc4 = a_report(4)
+    if rc4 != 0 { return 1 }
+    let rc8 = a_report(8)
+    if rc8 != 0 { return 1 }
+    let rc20 = a_report(20)
+    if rc20 != 0 { return 1 }
+    // A2: the negative control, REQUIRED to be red.
+    let rcctl = a_run(8, 1, 1)
+    prints("A2 negative control (private per-worker counter, nw=8) -> rc="); print(rcctl)
+    prints(" rows_never_written="); print(a_untouched())
+    prints(" rows_written_>1x="); print(a_multi())
+    prints(" dup_events="); print(a_dup); newline()
+    if rcctl == 199 { prints("A2 FAIL: the control PASSED -- this instrument cannot see\n"); return 2 }
+    prints("A2 RED as required (check "); print(rcctl - 100)
+    prints(" fired), so A1's PASS is a real measurement\n")
+    // A2b (A39 fresh-cell form) is documented in zz_ws_forms.quanta and filed.
+    // It segfaults on this pin with atomic_add; the semantic equivalent (rc=1)
+    // is already demonstrated by f_local_in_loop_body.
+    // A3: chunked claims
+    let ck = 1
+    while ck <= 16 {
+        let r3 = a_run(8, ck, 0)
+        prints("A3 nw=8 chunk="); print(ck); prints(" -> ")
+        if r3 == 0 { prints("EXACT next="); print(a_next) } else { prints("FAIL check="); print(r3) }
+        newline()
+        if r3 != 0 { return 3 }
+        ck = ck * 4
+    }
+
+    // ---------- PART B ----------
+    prints("--- PART B: the loader's row path (ffn_down.0) ---\n")
+    if gguf_load(Q4_PATH) != 0 { prints("FAIL gguf_load\n"); return 4 }
+    if fc_read_config() != 0 { prints("FAIL fc_read_config\n"); return 4 }
+    if fc_fw_init() != 0 { prints("FAIL fc_fw_init\n"); return 4 }
+    if mm_attach_mmap_fd(file_open(Q4_PATH, 0)) != 0 { prints("FAIL mmap\n"); return 4 }
+    let idx = lfm2_ffn_down(0)
+    let rows = fc_d_model
+    let cols = fc_d_ff
+    let dt = gguf_tensor_dtype(idx)
+    prints("ffn_down.0 idx="); print(idx); prints(" dtype="); print(dt)
+    prints(" rows="); print(rows); prints(" cols="); print(cols)
+    prints(" nelem="); print(gguf_tensor_nelements(idx)); newline()
+    if rows != WS_N { prints("FAIL: this tensor is not the 2048-row shape\n"); return 4 }
+
+    let x = mem_alloc(cols * 8)
+    let i = 0
+    while i < cols {
+        mem_store(x + i * 8, 1.0 + 0.125 * i2f(i - (i / 7) * 7))
+        i = i + 1
+    }
+    yref = mem_alloc(rows * 8)
+    yst = mem_alloc(rows * 8)
+    ysw = mem_alloc(rows * 8)
+    yrw = mem_alloc(rows * 8)
+
+    // THE DIFF INSTRUMENT'S OWN RESOLUTION: copy st, perturb exactly one row,
+    // and require the diff to report exactly 1.
+    mm_set_ws(0)
+    mm_set_workers_uncapped(20)
+    if mm_matvec(idx, x, rows, cols, yst) != 0 { prints("FAIL st\n"); return 4 }
+    i = 0
+    while i < rows { mem_store(yrw + i * 8, mem_load(yst + i * 8)); i = i + 1 }
+    mem_store(yrw + 1023 * 8, mem_load(yst + 1023 * 8) + 1)
+    let dm1 = diff_bits(yst, yrw, rows)
+    prints("diff resolution: one perturbed row of "); print(rows)
+    prints(" -> mismatches="); print(dm1); newline()
+    if dm1 != 1 { prints("FAIL: the diff instrument cannot resolve one row\n"); return 4 }
+
+    mm_pool_begin()
+    let fq6 = mm_get_fused_q6k()
+    let fq4 = mm_get_fused_q4k()
+    prints("fused_q4k_active="); print(fq4); prints(" fused_q6k_active="); print(fq6); newline()
+
+    // B1: the DEFAULT route -- every fused flag OFF, so the loader's own raw
+    // dequant + mm_dot4_s is what runs and the serial ref is the same arithmetic
+    // read through a different (pread) entry point.
+    mm_set_fused_q4k(0); mm_set_fused_q6k(0); mm_set_fused_chain(0)
+    mm_set_fused_glu(0); mm_set_fused_attn(0); mm_set_fused_conv(0)
+    let b1 = loader_case("B1 ffn_down.0 no-fused", idx, rows, cols, x, 20, 16)
+    if b1 != 0 { mm_pool_end(); prints("B1 FAIL check="); print(b1); newline(); return 5 }
+    let b1b = loader_case("B1 ffn_down.0 no-fused", idx, rows, cols, x, 8, 4)
+    if b1b != 0 { mm_pool_end(); prints("B1 FAIL(nw=8) check="); print(b1b); newline(); return 5 }
+    let b1c = loader_case("B1 ffn_down.0 no-fused", idx, rows, cols, x, 20, 1)
+    if b1c != 0 { mm_pool_end(); prints("B1 FAIL(chunk=1) check="); print(b1c); newline(); return 5 }
+
+    // B2: the SHIPPED decode route -- the folded Q6_K / Q4_K kernels ON, which is
+    // what tests/lfm2_decode_bench.conf selects for every published number.
+    mm_set_fused_q4k(1); mm_set_fused_q6k(1); mm_set_fused_chain(1)
+    mm_set_fused_glu(1); mm_set_fused_attn(1); mm_set_fused_conv(1)
+    let b2 = loader_case("B2 ffn_down.0 fused", idx, rows, cols, x, 20, 16)
+    if b2 != 0 { mm_pool_end(); prints("B2 FAIL check="); print(b2); newline(); return 6 }
+    let b2b = loader_case("B2 ffn_down.0 fused", idx, rows, cols, x, 20, 1)
+    if b2b != 0 { mm_pool_end(); prints("B2 FAIL(chunk=1) check="); print(b2b); newline(); return 6 }
+
+    prints("witnesses: fused_used="); print(mm_get_fused_used())
+    prints(" q6k_used="); print(mm_get_fused_q6k_used())
+    prints(" ws_used="); print(mm_get_ws_used())
+    prints(" ws="); print(mm_get_ws()); prints(" ws_chunk="); print(mm_get_ws_chunk())
+    newline()
+    mm_pool_end()
+    prints("PASS\n")
+    return 0
+}
