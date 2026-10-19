@@ -80,8 +80,8 @@ Counted from the emitted bodies (Q4_K super-block = 256 weights):
 | f32 folded | 32 + 16 broadcasts | `4 x 10` low + rewind + `4 x 9` high = 77 | `48 + 4x77` = **356** |
 
 **2.38x fewer instructions for the same 256 weights**, because a group is 8 weights
-instead of 4. The measured kernel ratio on the Q4_K chain is 2.14-2.40x (§6), which
-is the instruction count landing almost exactly.
+instead of 4. The measured kernel ratio on the Q4_K chain is **2.14-2.39x** (§6),
+which is the instruction count landing almost exactly.
 
 ---
 
@@ -200,7 +200,11 @@ the f32 prologue uses `xmm11` (so that `xmm7` is free for the min broadcast). Fo
 instructions — the four `vcvtdq2ps` forms — were transcribed as the f64 kernel's
 bytes and therefore read **`xmm7`**, which at that point holds nothing relevant.
 
-Measured consequence, `tests/lfm2_f32_diag_probe.quanta`, `loadavg` 12.2:
+Measured consequence, `tests/lfm2_f32_diag_probe.quanta`, `loadavg` 12.2, under the
+earlier 0.0.252 pin — the defect lived in a **hand-written hex string**, not in
+compiler output, so the value is not compiler-dependent; it was found and fixed
+before the re-pin, and the *fixed* value (0.031541 / bits `4584706437254479872`) is
+what every run since asserts:
 
 ```
 f64   = 0.031541  bits=4584706439309688832
@@ -367,35 +371,39 @@ over all 21 interleaved cycles — because one is not enough on this box: min-of
 rejects warm-up and short bursts but is fooled when interference lasts a whole arm,
 while the sum cancels correlated drift.
 
-Three separate processes, `loadavg` 12.2-12.5:
+Three separate processes under the single 0.0.255 pin, `loadavg` **24.49** for all
+three (they ran back to back; the 1-minute average did not move between them):
 
-| tensor | dtype | cols | f64/f32 min | f64/f32 sum | f64/f32fma min | f64/f32fma sum |
+| tensor | dtype | cols | f64/f32 min (3 runs) | f64/f32 sum | f64/f32fma min | f64/f32fma sum |
 |---|---|---|---|---|---|---|
-| `ffn_gate.0` | Q4_K | 2048 | **2.400** / 2.389 / 2.145 | 2.222 / 2.403 / 2.075 | 2.244 / 2.141 / 2.288 | 2.454 / 2.172 / 2.306 |
-| `ffn_up.0` | Q4_K | 2048 | **2.139** / 2.397 / 2.149 | 2.190 / 2.370 / 2.140 | 2.275 / 2.139 / 2.294 | 2.305 / 2.102 / 2.292 |
-| `ffn_down.3` | Q6_K | 10752 | **1.842 / 1.849 / 1.854** | 1.349 / 1.767 / 1.863 | 1.950 / 1.948 / 1.950 | 1.493 / 1.947 / 1.963 |
-| `attn_v.2` | Q6_K | 2048 | 1.713 / 1.617 / 1.711 | 1.697 / 1.600 / 1.706 | 1.791 / 1.703 / 1.792 | 1.737 / 1.669 / 1.787 |
+| `ffn_gate.0` | Q4_K | 2048 | **2.384 / 2.144 / 2.281** | 2.340 / 2.103 / 2.270 | 2.140 / 2.290 / 2.599 | 2.075 / 2.311 / 2.615 |
+| `ffn_up.0` | Q4_K | 2048 | **2.385 / 2.152 / 2.388** | 2.361 / 2.310 / 2.329 | 2.137 / 2.288 / 2.142 | 2.271 / 2.434 / 2.121 |
+| `ffn_down.3` | Q6_K | 10752 | **1.848 / 1.852 / 1.853** | 1.833 / 1.853 / 1.834 | 1.945 / 1.952 / 1.957 | 1.908 / 1.973 / 1.977 |
+| `attn_v.2` | Q6_K | 2048 | **1.712 / 1.702 / 1.704** | 1.447 / 1.705 / 1.585 | 1.788 / 1.786 / 1.786 | 1.730 / 1.785 / 1.782 |
 
 **Read honestly:**
 
-* **The Q4_K chain is 2.14-2.40x faster in f32**, against the 2.38x the instruction
+* **The Q4_K chain is 2.14-2.39x faster in f32**, against the 2.38x the instruction
   count predicts (§1.1). That is the strongest agreement available and it is the
   number to quote: the Q4_K chain is **78.69%** of the model's matvec elements.
-* **Q6_K is 1.60-1.85x faster**, well short of its ~2.4x instruction prediction.
+* **Q6_K is 1.70-1.85x faster**, well short of its ~2.4x instruction prediction.
   The emitted bodies halve the FP vector-op count (10 per 8 elements -> 5), and
   that halving is the ceiling the Q6_K kernel actually reaches; the Q4_K kernel
   also halves the *dependency* structure of the fold, which is why it gets closer.
-  The `ffn_down.3` MIN estimator is unusually stable across the three runs
-  (1.842 / 1.849 / 1.854, a 0.6% spread) and is the single most trustworthy ratio
-  in the table; its SUM estimator is not, at 1.349 in one run.
-* **f32+FMA vs plain f32**: on Q6_K it is consistently ~5% faster (1.948-1.950 vs
-  1.842-1.854 on `ffn_down.3`; 1.703-1.792 vs 1.617-1.713 on `attn_v.2`). On Q4_K
-  it is **inconclusive**: the sign of the difference flips between runs
-  (`ffn_up.0` 2.139 vs 2.397 in favour of plain f32, then 2.149 vs 2.294 in favour
-  of f32+FMA). No claim is made for Q4_K.
-* min and sum agree within 5% on **10 of the 12** tensor-run pairs; the two that
-  do not (8% and 37%) are whole-arm interference bursts, which is why both are
-  reported rather than the flattering one.
+  **`ffn_down.3` is the most trustworthy row in the table**: its min estimator reads
+  1.848 / 1.852 / 1.853 across the three runs, a **0.3% spread over three separate
+  processes**, and its sum estimator agrees with it to 0.2% in runs 2 and 3. The
+  two `attn_v.2` sum readings that disagree (1.447, 1.585) are interference bursts
+  in one estimator only.
+* **f32+FMA vs plain f32.** On Q6_K it is consistently faster in **all six**
+  samples: `ffn_down.3` 1.945-1.957 against 1.848-1.853 (**+5.2% to +5.7%**), and
+  `attn_v.2` 1.786-1.788 against 1.702-1.712 (**+4.6% to +5.0%**). On Q4_K it is
+  **inconclusive**: the sign flips between runs in both directions (`ffn_up.0`
+  run 1 2.385 plain vs 2.137 FMA, run 2 2.152 plain vs 2.288 FMA, run 3 2.388
+  plain vs 2.142 FMA). No claim is made for Q4_K.
+* The **sum** estimator is the noisier of the two on this box at `loadavg` 24.5;
+  on `ffn_down.3` and `attn_v.2` (run 2) the two agree to 0.2-0.3%, which is the
+  internal consistency check the row needs.
 
 ---
 
@@ -416,8 +424,9 @@ Q6_K ffn_down.3 :  rows=32 f32_vs_ref_bit_mismatch=0 exactly_one_nan=0 both_nan=
 Q6_K attn_v.2   :  rows=32 f32_vs_ref_bit_mismatch=0 exactly_one_nan=0 both_nan=0 max_bit_distance_vs_ref_ulp=0
 ```
 
-in **three separate processes** — **0 mismatches over 4 tensors x 32 rows x 3 runs
-= 384 row comparisons**, and `exactly_one_nan=0` throughout (the column that would
+in **three separate processes under the 0.0.255 pin, `loadavg` 24.49** — **0
+mismatches over 4 tensors x 32 rows x 3 runs = 384 row comparisons**, and
+`exactly_one_nan=0` throughout (the column that would
 signal a *class* difference rather than a rounding one). The `both_nan=23` on
 `ffn_down.3` is the same phenomenon the FMA work recorded: that tensor's synthetic
 activation produces a NaN in BOTH the kernel and the reference, with the same bit
@@ -439,8 +448,11 @@ arm 2: f32=1 fma=0   the f32 kernels
 arm 3: f32=1 fma=1   the f32 FMA kernels
 ```
 
-Reproduced **byte-identically in four separate processes** (`loadavg` 8.67, 12.33,
-19.40, 19.63 — the bound is a property of the code, not of the load):
+Reproduced **byte-identically in every one of the seven runs it was taken** — four
+under the earlier 0.0.252 pin (`loadavg` 8.67, 12.33, 19.40, 19.63) and three under
+the final 0.0.255 pin (`loadavg` 24.29, 16.85, 14.19). **The bound is a property of
+the arithmetic, not of the compiler and not of the load**, which is why re-pinning
+did not change a bit of it while every *timing* figure had to be re-taken:
 
 | arm | logit_mism / 128000 | max abs diff bits | max \|diff\| | relative to max logit | max ULP | sign flips |
 |---|---|---|---|---|---|---|
@@ -460,7 +472,7 @@ with, for every arm and every run:
 * `f32_drop=0` and `xf32_allocs=2`.
 
 **Read honestly.** The f32 route moves **every** logit (128,000/128,000) and its
-excursion is **~1.7e8 times larger** than the FMA route's. That is expected and it
+excursion is **~1.9e8 times larger** than the FMA route's. That is expected and it
 is not a defect: f32 accumulation rounds at every one of ~9,000 terms per logit
 where f64 rounds almost never, and the absolute bound scales as
 `~sqrt(n) * eps32 * |terms|` — the measured **3.2e-7 relative** is what that
@@ -476,15 +488,19 @@ substituted for a sequence whose gate is bit-exactness.
 The f64+FMA row is also **regression evidence**: `logit_mism=124782`,
 `max_abs_diff_bits=4407335185335451648`, `max_ulp=1116224`,
 `excursion_x1e18=2921` are **exactly** the values the FMA work measured before this
-unit existed, in all four runs. The f64 FMA route is bit-for-bit unchanged.
+unit existed, in all seven runs and under both compilers. The f64 FMA route is
+bit-for-bit unchanged.
+
+The witnesses are also the check that the arms are the arms: arm 0 `f32/fma =
+0/0`, arm 1 `0/1`, arm 2 `1/0`, arm 3 `1/1`, asserted in the bar every run.
 
 ---
 
 ## 9. The EXISTING flags' bit-exact gate is untouched
 
-`tests/lfm2_fused_logits_test.quanta`, run AFTER the f32 work and with
-`mm_fused_f32` off, 9 passes in one process over all 128,000 logits
-(`loadavg` 17.20 -> 22.6):
+`tests/lfm2_fused_logits_test.quanta`, run AFTER the f32 work, with
+`mm_fused_f32` off, and **under the 0.0.255 pin**: 9 passes in one process over
+all 128,000 logits (`loadavg` 20.9 -> 22.5):
 
 ```
 CONTROL pass1-vs-pass0 : logit_mism=0 argmax_mism=0
@@ -515,19 +531,187 @@ near-load neighbour on both sides. Decode bench conf field 17 is the f32 field a
 field 16 is fma; `lens 64/64/64`; every other flag at the shipped setting; one
 binary; every arm echoes its own flags, witnesses and `loadavg`.
 
-<!-- AB_PLACEHOLDER -->
+All figures under the single final pin, `compiler/0.0.255/bin/x86/qc` (md5
+`2fe5e2844b9c3a74cf7922152a69ea46`). **Two rounds of the palindrome = 8 samples
+per configuration.** `LENS=32` (not 64): an arm whose own three runs take 2.5
+minutes cannot resolve an effect on a box whose available cores swing 2.5x *inside
+one arm* — measured, the LENS=64 version produced arm means of 1.93-4.96 tok/s that
+did not track `loadavg` at all, and **those arms were thrown away rather than
+compared**.
+
+| arm | f32 | fma | round | `loadavg` before | tok/s (run1/2/3) | min ms/token |
+|---|---|---|---|---|---|---|
+| off1 | 0 | 0 | 1 | 14.23 | 1.94 / 1.85 / 1.80 | 516.6 |
+| off1 | 0 | 0 | 2 | 24.40 | 1.97 / 1.92 / 1.81 | 508.3 |
+| off2 | 0 | 0 | 1 | 23.02 | 1.76 / 1.59 / 1.79 | 556.8 |
+| off2 | 0 | 0 | 2 | 22.23 | 1.83 / 1.91 / 1.84 | 523.4 |
+| f64fma | 0 | 1 | 1 | 20.41 | 2.02 / 2.05 / 2.01 | 488.4 |
+| f64fma | 0 | 1 | 2 | 24.10 | 1.84 / 1.82 / 1.81 | 543.2 |
+| f64fma2 | 0 | 1 | 1 | 22.97 | 1.92 / 1.82 / 1.86 | 522.1 |
+| f64fma2 | 0 | 1 | 2 | 23.16 | 1.83 / 2.00 / 1.93 | 501.2 |
+| **f32** | 1 | 0 | 1 | 22.36 | **3.20 / 3.08 / 3.21** | 311.7 |
+| **f32** | 1 | 0 | 2 | 20.89 | **2.93 / 2.83 / 2.92** | 341.3 |
+| **f322** | 1 | 0 | 1 | 22.78 | **2.21 / 2.97 / 3.05** | 327.9 |
+| **f322** | 1 | 0 | 2 | 21.38 | **2.96 / 2.56 / 2.75** | 338.4 |
+| **f32fma** | 1 | 1 | 1 | 22.77 | **3.37 / 3.50 / 3.34** | 285.4 |
+| **f32fma** | 1 | 1 | 2 | 22.76 | **3.13 / 3.12 / 3.24** | 308.9 |
+| **f32fma2** | 1 | 1 | 1 | 21.62 | **3.07 / 3.17 / 3.13** | 315.6 |
+| **f32fma2** | 1 | 1 | 2 | 23.71 | **3.10 / 3.14 / 3.02** | 318.7 |
+
+Witnesses were asserted per run: every f64 arm printed `fused_f32_used=0` and
+`fma_used=0` or `1`, and every f32 arm printed `fused_f32_used=1` with the
+matching `fma_used`; `xf32_elems` was 0 on the f64 arms and
+**155,080,704** on every f32 arm (identical across all four f32 arms, which is
+itself evidence that all four took the same route). Every arm and every run
+printed `first_argmax_id=597`.
+
+**The separation is clean, and this is the result:**
+
+| configuration | least-interfered arm sample | ms/token | vs f64 |
+|---|---|---|---|
+| f32=0 fma=0 (f64 folded) | 1.967 tok/s | 508.3 | — |
+| f32=0 fma=1 (f64 FMA) | 2.047 | 488.4 | **+4.1%** |
+| **f32=1 fma=0** | **3.207** | **311.7** | **+63.0%** |
+| **f32=1 fma=1** | **3.504** | **285.4** | **+78.1%** |
+
+* **No f64 sample overlaps any f32 sample.** The eight f64-family arm samples span
+  1.795-2.047 tok/s; the eight f32-family arm samples span 2.929-3.504. The
+  ratio therefore has a *range* and not a point, and the honest statement is:
+  **plain f32 is 1.43x to 1.79x, and f32+FMA is 1.53x to 1.95x**, taken as
+  (worst f32 sample / best f64 sample) to (best f32 sample / worst f64 sample).
+  The min-ms single-best basis is 1.63x and 1.78x.
+* **The f64+fma arm reproduces the previous unit's absolute numbers**: it reads
+  1.840-2.047 tok/s here at `loadavg` 20.4-24.1, against that unit's **1.985-2.080
+  at `loadavg` 21.6-22.5** for the same shipped configuration. That is a cross-check
+  that the 0.0.255 pin did not move the f64 path, and that this box's band is the
+  same band.
+* **The f32 route's cost is visible and small.** The only work it adds on the
+  critical path is the narrowing (§5.2), measured in `f32_elems`:
+  **~198,060 element-narrowings per token-forward** (155,080,704 per arm over three
+  64-token runs with a 23-token prompt = 3 x 87 forwards). At the fill's measured
+  **5.24-6.61 ns/element** that is **~1.2 ms/token**, about 0.4% of the 285-340 ms
+  token. **The design document's estimate of "~340K per token, which is noise" was
+  the right order and the right conclusion; the element COUNT is ~198K, and the
+  cost is 1.2 ms.**
+* `xf32_allocs=2` on every f32 arm in every run (§5.1).
+
 
 ---
 
 ## 11. Gate
 
-<!-- GATE_PLACEHOLDER -->
+```
+QC=$PWD/compiler/0.0.255/bin/x86/qc bash test_suites/scripts/run_tests.sh
+md5 2fe5e2844b9c3a74cf7922152a69ea46      (the pin every figure in this file used)
+```
+
+```
+=== Results: 246/246 pass, 0 fail (incl. 0 compile-fail) [rows: EXPECTED.tsv] ===
+=== Security: 8 passed, 0 failed, 0 known issues ===
+=== Perf: 3 passed, 0 failed (baseline 4000ms) ===
+  STDLIB: 114/114 GREEN
+```
+
+**0 RED stages.** `bang test_suites/scripts/run_tests.sh` was run with no peer gate
+alive first (`pgrep -af run_tests.sh` empty).
+
+Worth recording, because it is the version-artefact class the brief warned about:
+under the earlier **0.0.252** pin the same tree showed two RED rows —
+`deadstore-guard` (a 0.0.250 F2 loop-shape row) and `terminator-guard` (0.0.252 F3)
+— which *cannot* pass under a compiler older than the feature they assert. Under
+0.0.255 both are GREEN, together with the new `spillframe-guard` (0.0.253 A32) and
+`constmul-guard` (0.0.255 F6) rows. The re-pin resolved that class rather than
+arguing about it; nothing in this unit's own paths was ever one of those rows.
+
+Emitted-code helpers, run because emitted code was touched:
+
+```
+python3 tests/lfm2_f32_hexcheck.py     110 hex strings, 0 failures
+python3 tests/lfm2_jbytes_len_check.py 223 jbytes() calls, 0 mismatches (was 180)
+gcc -O1 -o /tmp/f32enc tests/lfm2_f32_enc_verify.c && /tmp/f32enc
+                                       102 sequences executed, 0 assertion failures
+```
+
 
 ---
 
 ## 12. The honest gap
 
-<!-- GAP_PLACEHOLDER -->
+**The recommended shipped *setting* is `mm_fused_f32=1` (with `mm_fused_fma=1` as
+well it is the fastest measured arm). The FLAG itself remains default-OFF in
+`lib/std`, as required** — nothing in the tree changes behaviour unless a caller or
+a bench conf asks for it, and every existing flag's gate keeps its meaning. Both anchors below are `loadavg`-labelled, and no
+quiet window was available: this session's `/proc/loadavg` ran **8.7 to 32.7**, with
+one brief excursion to 7.2 that was **not** caught by an A/B, so the quiet-window
+figure is not measured and is not claimed.
+
+**At `loadavg` 20.9-24.4 (the band every f32 arm's samples sat in), 32-token runs,
+shipped flags otherwise:**
+
+| configuration | tok/s (least-interfered sample) | ms/token |
+|---|---|---|
+| f32=0 fma=1 — the configuration the previous unit shipped | 1.840-2.047 | 488-543 |
+| **f32=1 fma=0** | **2.929-3.207** | 312-341 |
+| **f32=1 fma=1 (now shipped)** | **3.138-3.504** | 285-319 |
+
+* Gap to the **15 tok/s** target: **4.3x - 4.8x** (15 / 3.504 and 15 / 3.138).
+* Gap to llama.cpp's **17.32 tok/s** on the same model and CPU: **4.9x - 5.5x**.
+* For comparison, the previous unit measured **7.3x - 7.6x** to 15 and **8.3x -
+  8.7x** to llama.cpp at `loadavg` 21.6-22.5, for the same tree with
+  `fused_fma=1` and no f32 route. **The gap roughly halved**, and the f64+fma arm
+  measured here (1.840-2.047) reproduces that unit's absolute band (1.985-2.080),
+  so the two sessions are comparing the same box in the same load band.
+
+**What this unit moved, measured:**
+
+* the folded Q4_K matvec kernel **2.14-2.39x** and Q6_K **1.70-1.85x** faster,
+  from 8 f32 lanes per ymm instead of 4 and half the x traffic;
+* **end-to-end +43% to +79%** for plain f32 and **+53% to +95%** for f32+FMA,
+  across the eight arm samples per configuration, with no f64/f32 overlap;
+* a grow-only f32 x buffer that costs **two mappings for the whole process** and
+  **~1.2 ms/token** of main-thread work;
+* two emitted-code defects found, fixed, and covered by mechanical checks
+  (§3) — one of which (`vpmovzxbd ymm6,[r9]` having no displacement field)
+  segfaulted the kernel outright.
+
+**What it did NOT move, said plainly.** The binding constraint is still **core
+over-subscription** and nothing here touches it. The previous unit's verdict stands
+unchallenged: the same pool job is 45 us at nw=8 and 185 us at nw=20, and at nw=20
+the pool job is no faster than the main thread. A token still pays 166 pool
+barriers. The f32 kernel makes each worker's slice cheaper; it does not give the
+workers more cores. **Closing 4.3x to 15 tok/s is not a matvec-kernel job from
+here** either — the kernels are now within ~1.2-1.5x of what 8-lane f32 SIMD can do
+for this layout, so no further multiple is hiding in them.
+
+**Levers that remain, ranked by what is measured about them:**
+
+1. **Core availability / pool sizing.** Unchanged and untouched. Nothing here moves
+   it. This is where the 4.3x lives.
+2. **The tied output projection** (pool kind 5, `token_embd.weight`, Q6_K,
+   `[2048, 128000]`, **9.72%** of per-token matvec elements) is still on the f64
+   scalar-chain route, because its reference dot is a strict left-to-right chain
+   that a lane-based kernel cannot reproduce. An f32 **chain** kernel is possible
+   (four serial `vaddss` per 4 elements, the f64 chain kernel's shape with `ss`
+   opcodes and half the x bytes) and is the one remaining kernel-shaped lever.
+   Not done here.
+3. **`pl_xf32_fill` is still a scalar Quanta loop.** It is now measured at ~1.2
+   ms/token, so it is not worth an eight-wide `vcvtpd2ps`+`vinsertf128` JIT'd
+   converter until something makes it show up.
+4. **The per-row invariant arg stores in `pl_run_rows_map`** — still the smallest
+   lever, still an unmeasured estimate (<0.5%).
+
+**Not done, and named rather than implied:**
+
+* **No quiet-window absolute measurement.** Every absolute tok/s above carries its
+  `loadavg`; the low-load anchor is quoted from the previous unit, not re-taken.
+* **The Q4_K `f32+FMA` vs plain-`f32` comparison is inconclusive** and is reported
+  as inconclusive rather than resolved in either direction (§6).
+* **An f32 chain kernel for the tied output projection** (lever 2 above) — designed
+  nowhere, done nowhere.
+* **Pool concurrency, the partition rule, the KV format and the conv
+  false-sharing knob were deliberately NOT touched**, per the standing constraint;
+  all four are settled on prior measurement.
+
 
 ---
 

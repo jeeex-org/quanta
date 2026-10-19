@@ -9,7 +9,12 @@ its least-interfered sample, plus the mean for the record) and the PAIRS of the
 palindrome are compared, because the two members of a pair bracket each other in
 time.
 
-Usage: python3 tests/lfm2_f32_ab_analyze.py <logdir> [<logdir> ...]
+The driver's own stdout carries the load_before for each arm (the ARM log does not
+-- it holds only the binary's output), so a driver log can be given per directory
+with `--loads <driverlog>` and is optional.
+
+Usage: python3 tests/lfm2_f32_ab_analyze.py <armdir> [<armdir> ...]
+       python3 tests/lfm2_f32_ab_analyze.py --loads <driverlog> <armdir> [...]
 """
 import re
 import sys
@@ -17,6 +22,17 @@ import os
 from collections import OrderedDict
 
 ARMS = ["off1", "f64fma", "f32", "f32fma", "f32fma2", "f322", "f64fma2", "off2"]
+
+
+LOADMAP = {}
+
+
+def scan_driver_log(p):
+    if not p or not os.path.exists(p):
+        return
+    for a, l in re.findall(r'^--- arm (\S+)\s+.*load_before=([\d.]+)', open(p).read(),
+                           re.M):
+        LOADMAP.setdefault(a, []).append(float(l))
 
 
 def load_dir(d, out):
@@ -33,6 +49,8 @@ def load_dir(d, out):
         tok = [int(x) for x in re.findall(r'tok_per_s_x1000=(\d+)', t)]
         ms = [int(x) for x in re.findall(r'ms_per_token_x100=(\d+)', t)]
         lab = [float(x) for x in re.findall(r'^--- arm .*load_before=([\d.]+)', t, re.M)]
+        if not lab and LOADMAP.get(a):
+            lab = list(LOADMAP[a])
         if not tok:
             continue
         out.append(dict(dir=d, arm=a,
@@ -44,8 +62,13 @@ def load_dir(d, out):
 
 
 def main():
+    args = sys.argv[1:]
+    while "--loads" in args:
+        i = args.index("--loads")
+        scan_driver_log(args[i + 1])
+        del args[i:i + 2]
     rows = []
-    for d in sys.argv[1:]:
+    for d in args:
         load_dir(d, rows)
     if not rows:
         print("no arm logs found")
