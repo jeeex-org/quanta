@@ -10,7 +10,9 @@ projected. The one figure this unit CORRECTS in an earlier document is called ou
 
 Compiler pinned for every figure: **`compiler/0.0.256/bin/x86/qc`, md5
 `21c868f418797c86d7db68728ed01917`** (the golden the task named). **A newer release
-landed mid-unit** (`0.0.257` committed, `0.0.258` built but uncommitted) so every
+landed mid-unit** (`0.0.257` committed as `b72f3c3d`; `0.0.258` was an uncommitted
+build when this unit's cross-pin set was taken and was **promoted during the unit as
+`1b69c028`**) so every
 RATIO was RE-TAKEN under `0.0.258` (md5 `e7fc8cd4430ef3d4ef8e99067354bfcf`) as a
 pin-advance check, and **no arm data was spliced across the two pins**: §5, §6.1 and
 §8 each carry both pins side by side. *Rationale for not discarding the 0.0.256 set:
@@ -479,7 +481,10 @@ route.
 ### 8.4 The pin-advance cross-check (0.0.258), NOT spliced
 
 A reduced 2-configuration palindrome (`off, f32fma, f32fma, off`), one binary built by
-`0.0.258` (md5 `e7fc8cd4`), `LENS=32`, `loadavg` 17.4 -> 19.0 across the pair:
+`0.0.258` (md5 `e7fc8cd4`), `LENS=32`, `loadavg` 17.4 -> 19.0 across the pair. **The md5 of
+the bin measured here is byte-identical to the md5 of the 0.0.258 bin that was committed as
+`1b69c028`** (which names a codegen change — the CS1 callee-saved elision), so this is the
+SHIPPED 0.0.258 and not a stale build.
 
 | arm | f32 | fma | tok/s (run1/2/3) | min ms/token | chain_f32_used | xf32_elems | argmax |
 |---|---|---|---|---|---|---|---|
