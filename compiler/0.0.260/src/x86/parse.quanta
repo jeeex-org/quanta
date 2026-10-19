@@ -1,0 +1,2664 @@
+// === PARSER STATE ===
+fn peek() { if tokp>=tokc { return TT_EOF }; return tokt(tokp) }
+fn pval() { if tokp>=tokc { return 0 }; return tokv(tokp) }
+fn plen() { if tokp>=tokc { return 0 }; return tokln(tokp) }
+fn adv() { if tokp<tokc { tokp=tokp+1 } }
+
+fn mkw(h) {
+    if peek()!=TT_KEY { return 0 }
+    if khash(pval(),plen())!=h { return 0 }; adv(); return 1
+}
+
+fn mpnct(v) {
+    if peek()!=TT_PNCT||pval()!=v { return 0 }; adv(); return 1
+}
+
+fn mop(v) {
+    if peek()!=TT_OP||pval()!=v { return 0 }; adv(); return 1
+}
+
+// === OPERATOR OVERLOADING (0.0.97) ===
+// A user-defined `fn +(a,b)` / `fn -(a,b)` / `fn *(a,b)` / `fn /(a,b)` /
+// `fn %(a,b)` / `fn ==(a,b)` / `fn !=(a,b)` / `fn <(a,b)` / `fn >(a,b)` /
+// `fn <=(a,b)` / `fn >=(a,b)` shadows the builtin IR op at the call site.
+// scanfns() runs before ci_func(), so findfn is valid here. Returns the
+// result vreg of the user call, or -1 if no user op is defined (caller
+// emits the builtin IR). The name-injection helpers (inj_name/op_inj_name)
+// live in globals.quanta so both scanfns and the call sites share them.
+fn user_binop(opval, l, r) {
+    if overload_suppressed == 1 { return -1 }   // inside an operator fn: use builtin primitive
+    // 0.0.97: route operator overloads through the OPFN fn-index table (no src
+    // name injection ? corruption-proof). OPFN[opval] holds the fn index if the
+    // user defined `fn +(a,b)`, else -1 and we fall back to the builtin primitive.
+    let fi = r64(OPFN + opval*8) - 1   // decode (stored as fi+1; 0 => no overload)
+    if fi < 0 { return -1 }
+    let cavs = irc
+    let ca = nv(); iremit(IR_MOV, ca, l, 0, 0)
+    let cb = nv(); iremit(IR_MOV, cb, r, 0, 0)
+    let cr = nv(); iremit(IR_CALL_IDX, cr, fi, 2, cavs)
+    return cr
+}
+
+// 0.0.114 `big` arbitrary-precision int support --------------------------------
+// A vreg holds a `big` when vreg_is_big[vreg]==1 (a pointer to the std/big limb
+// array). Big literals (TT_BIGNUM) and `let x: big = ...` bindings tag their
+// vreg; binary ops with at least one big operand route to the std/big fns.
+//
+// big_nm: inject a std/big callee name (<=7 bytes) into src at srclen, null-
+// terminate, reserve the slot, return its offset. (big_from_i64 is 12 bytes and
+// is injected inline in big_promote instead.)
+fn big_nm(b0,b1,b2,b3,b4,b5,b6,ln) {
+    let cnm = srclen
+    w8(src+cnm,b0); w8(src+cnm+1,b1); w8(src+cnm+2,b2); w8(src+cnm+3,b3)
+    w8(src+cnm+4,b4); w8(src+cnm+5,b5); w8(src+cnm+6,b6)
+    w8(src+cnm+ln,0)
+    srclen = cnm + ln + 1
+    return cnm
+}
+
+// big_promote: return v unchanged if it is already big; else wrap an int vreg
+// via big_from_i64(v) and tag the result big.
+// ===========================================================================
+// 0.0.247: parser-side plumbing for the f16/f32 float types.
+//
+// ft_name: write a BUILTIN name into src at srclen and return its offset.
+// Builtins are not in the function table, so parse-time code reaches them the
+// same way big_promote reaches "big_from_i64": by putting the name where
+// IR_CALL's (offset,len) pair can point at it. Fixed 10-byte arity; pass 0 for
+// the bytes past `ln` (the longest builtin name here is 10 chars).
+fn ft_name(b0,b1,b2,b3,b4,b5,b6,b7,b8,b9,ln) {
+    let o = srclen
+    w8(src+o+0,b0); w8(src+o+1,b1); w8(src+o+2,b2); w8(src+o+3,b3); w8(src+o+4,b4)
+    w8(src+o+5,b5); w8(src+o+6,b6); w8(src+o+7,b7); w8(src+o+8,b8); w8(src+o+9,b9)
+    w8(src+o+ln,0)
+    srclen = o + ln + 1
+    return o
+}
+
+// ft_bcall1 / ft_bcall2: emit `name(a)` / `name(a,b)` as a real builtin call.
+// The argument records MUST be contiguous and immediately before the IR_CALL
+// (codegen reads them via irres(avs+i)), which is why they are emitted here in
+// one place rather than at each call site.
+fn ft_bcall1(nmo, nl, a) {
+    let cavs = irc
+    let ca = nv(); iremit(IR_MOV, ca, a, 0, 0)
+    let cr = nv(); iremit(IR_CALL, cr, nmo, 1, cavs)
+    return cr
+}
+fn ft_bcall2(nmo, nl, a, b) {
+    let cavs = irc
+    let ca = nv(); iremit(IR_MOV, ca, a, 0, 0)
+    let cb = nv(); iremit(IR_MOV, cb, b, 0, 0)
+    let cr = nv(); iremit(IR_CALL, cr, nmo, 2, cavs)
+    return cr
+}
+
+// ft_narrow(a, ft): emit `f64_to_f32(a)` / `f64_to_f16(a)` and tag the result.
+// A binding annotated f32/f16 must HOLD the correctly rounded narrow value;
+// tagging without narrowing would claim a format the payload does not satisfy.
+fn ft_narrow(a, ft) {
+    if ft==1 {
+        let nmo = ft_name(102,54,52,95,116,111,95,102,51,50, 10)   // "f64_to_f32"
+        let cr = ft_bcall1(nmo, 10, a)
+        w64(vreg_ftype + cr*8, 1)
+        w8(vfloat + cr, 1)
+        return cr
+    }
+    let nmo = ft_name(102,54,52,95,116,111,95,102,49,54, 10)       // "f64_to_f16"
+    let cr = ft_bcall1(nmo, 10, a)
+    w64(vreg_ftype + cr*8, 2)
+    w8(vfloat + cr, 1)
+    return cr
+}
+
+// ft_arith(op, l, r): route `+ - * /` (op 0..3) on two TYPED FLOAT operands into
+// the f32 arithmetic builtins, which is what makes f32 a compute type rather
+// than a storage label. Returns the result vreg, or -1 when either operand is
+// untyped (the caller then takes the ordinary f64/integer path).
+//
+// PROMOTION RULE (explicit, and the reason f16 computes in f32):
+//   f16 < f32 < f64, and an integer operand ranks as f64 (an i64 does not fit
+//   an f32 significand, so silently ranking it f32 would lose bits). Any
+//   mixture with f64 -- or with an integer -- is f64 arithmetic. A mixture of
+//   f16 and f32, or of two f16s, is computed in f32 PRECISION, because this
+//   target (avx2 + f16c + fma, no AVX512-FP16) has no hardware binary16
+//   arithmetic: f16 is a STORAGE format here and promotes to f32 to compute.
+//   The result is therefore typed f32, not f16 -- rounding binary16 arithmetic
+//   back to f16 happens when the value is stored into an f16 buffer.
+fn ft_arith(op, l, r) {
+    if r64(vreg_ftype + l*8)==0 { return 0 - 1 }
+    if r64(vreg_ftype + r*8)==0 { return 0 - 1 }
+    let nmo = 0
+    if op==0 { nmo = ft_name(102,97,100,100,51,50,0,0,0,0, 6) }        // fadd32
+    else if op==1 { nmo = ft_name(102,115,117,98,51,50,0,0,0,0, 6) }   // fsub32
+    else if op==2 { nmo = ft_name(102,109,117,108,51,50,0,0,0,0, 6) }  // fmul32
+    else if op==3 { nmo = ft_name(102,100,105,118,51,50,0,0,0,0, 6) }  // fdiv32
+    else { nmo = ft_name(102,99,109,112,51,50,0,0,0,0, 6) }            // fcmp32
+    let cr = ft_bcall2(nmo, 6, l, r)
+    if op==4 { return cr }        // fcmp32 yields an i64 (-1/0/1), not a float
+    w64(vreg_ftype + cr*8, 1)
+    w8(vfloat + cr, 1)
+    return cr
+}
+
+// ft_cmp(cv, v): route a comparison OPERATOR on two typed-float operands.
+// cv is the operator's token value; the f32 compare primitive is ft_arith(4,..)
+// (fcmp32), so every ordering and equality test derives from one instruction
+// sequence rather than six. Returns the i64 boolean vreg, or -1 to fall back.
+fn ft_cmp(cv, l, r) {
+    if r64(vreg_ftype + l*8)==0 { return 0 - 1 }
+    if r64(vreg_ftype + r*8)==0 { return 0 - 1 }
+    let nmo = 0
+    if cv==61 { nmo = ft_name(102,101,113,51,50,0,0,0,0,0, 5) }              // feq32
+    else if cv==33*256+61 { nmo = ft_name(102,110,101,51,50,0,0,0,0,0, 5) }  // fne32
+    else if cv==60 { nmo = ft_name(102,108,116,51,50,0,0,0,0,0, 5) }         // flt32
+    else if cv==62 { nmo = ft_name(102,103,116,51,50,0,0,0,0,0, 5) }         // fgt32
+    else if cv==60*256+61 { nmo = ft_name(102,108,101,51,50,0,0,0,0,0, 5) }  // fle32
+    else if cv==62*256+61 { nmo = ft_name(102,103,101,51,50,0,0,0,0,0, 5) }  // fge32
+    else { return 0 - 1 }
+    return ft_bcall2(nmo, 5, l, r)
+}
+
+// big_promote: return v unchanged if it is already big; else wrap an int vreg
+// via big_from_i64(v) and tag the result big.
+fn big_promote(v) {
+    if r64(vreg_is_big + v*8)==1 { return v }
+    let cnm = srclen
+    w8(src+cnm,98); w8(src+cnm+1,105); w8(src+cnm+2,103); w8(src+cnm+3,95)    // "big_"
+    w8(src+cnm+4,102); w8(src+cnm+5,114); w8(src+cnm+6,111); w8(src+cnm+7,109) // "from"
+    w8(src+cnm+8,95); w8(src+cnm+9,105); w8(src+cnm+10,54); w8(src+cnm+11,52) // "_i64"
+    w8(src+cnm+12,0)
+    srclen = cnm + 13
+    let fi = resolve_fn(cnm, 12, FI_GLOBAL)
+    if fi < 0 { compile_error(0, cnm, 12) }
+    let cavs = irc
+    let ca = nv(); iremit(IR_MOV, ca, v, 0, 0)
+    let cr = nv(); iremit(IR_CALL, cr, cnm, 1, cavs)
+    w64(vreg_is_big + cr*8, 1)
+    return cr
+}
+
+// big_binop_call: emit big_op(l, r). Both operands are promoted to big first
+// (int operands wrapped via big_from_i64). tag_res==1 tags the result big
+// (arithmetic); tag_res==0 leaves it a plain int (big_eq comparison result).
+fn big_binop_call(cnm, cnl, l, r, tag_res) {
+    let fi = resolve_fn(cnm, cnl, FI_GLOBAL)
+    if fi < 0 { compile_error(0, cnm, cnl) }
+    let pl = big_promote(l)
+    let pr = big_promote(r)
+    let cavs = irc
+    let ca = nv(); iremit(IR_MOV, ca, pl, 0, 0)
+    let cb = nv(); iremit(IR_MOV, cb, pr, 0, 0)
+    let cr = nv(); iremit(IR_CALL, cr, cnm, 2, cavs)
+    if tag_res==1 { w64(vreg_is_big + cr*8, 1) }
+    return cr
+}
+
+// big_shift_call: emit big_shl_signed(big_l, n) / big_shr_signed(big_l, n).
+// Only the LEFT operand is promoted to big (the shift amount `n` stays a raw
+// i64). which: 0 => shl, 1 => shr.
+fn big_shift_call(which, l, r) {
+    let cnm = srclen
+    if which==0 {
+        w8(src+cnm,98);w8(src+cnm+1,105);w8(src+cnm+2,103);w8(src+cnm+3,95)   // "big_"
+        w8(src+cnm+4,115);w8(src+cnm+5,104);w8(src+cnm+6,108);w8(src+cnm+7,95) // "shl_"
+        w8(src+cnm+8,115);w8(src+cnm+9,105);w8(src+cnm+10,103);w8(src+cnm+11,110)
+        w8(src+cnm+12,101);w8(src+cnm+13,100)                                 // "signed"
+    } else {
+        w8(src+cnm,98);w8(src+cnm+1,105);w8(src+cnm+2,103);w8(src+cnm+3,95)   // "big_"
+        w8(src+cnm+4,115);w8(src+cnm+5,104);w8(src+cnm+6,114);w8(src+cnm+7,95) // "shr_"
+        w8(src+cnm+8,115);w8(src+cnm+9,105);w8(src+cnm+10,103);w8(src+cnm+11,110)
+        w8(src+cnm+12,101);w8(src+cnm+13,100)                                 // "signed"
+    }
+    w8(src+cnm+14,0)
+    srclen = cnm + 15
+    let cnl = 14
+    let fi = resolve_fn(cnm, cnl, FI_GLOBAL)
+    if fi < 0 { compile_error(0, cnm, cnl) }
+    let pl = big_promote(l)
+    let cavs = irc
+    let ca = nv(); iremit(IR_MOV, ca, pl, 0, 0)
+    let cb = nv(); iremit(IR_MOV, cb, r, 0, 0)
+    let cr = nv(); iremit(IR_CALL, cr, cnm, 2, cavs)
+    w64(vreg_is_big + cr*8, 1)
+    return cr
+}
+
+// big_call_named: emit <14-char-stdlib-fn>(big_l, big_r), promoting both to big.
+// Used for add/sub/mul SIGNED wrappers (big_add_signed etc., 14 bytes each).
+fn big_call_named(b0,b1,b2,b3,b4,b5,b6,b7,b8,b9,b10,b11,b12,b13, l, r) {
+    let cnm = srclen
+    w8(src+cnm,b0);w8(src+cnm+1,b1);w8(src+cnm+2,b2);w8(src+cnm+3,b3)
+    w8(src+cnm+4,b4);w8(src+cnm+5,b5);w8(src+cnm+6,b6);w8(src+cnm+7,b7)
+    w8(src+cnm+8,b8);w8(src+cnm+9,b9);w8(src+cnm+10,b10);w8(src+cnm+11,b11)
+    w8(src+cnm+12,b12);w8(src+cnm+13,b13)
+    w8(src+cnm+14,0)
+    srclen = cnm + 15
+    let cnl = 14
+    let fi = resolve_fn(cnm, cnl, FI_GLOBAL)
+    if fi < 0 { compile_error(0, cnm, cnl) }
+    let pl = big_promote(l)
+    let pr = big_promote(r)
+    let cavs = irc
+    let ca = nv(); iremit(IR_MOV, ca, pl, 0, 0)
+    let cb = nv(); iremit(IR_MOV, cb, pr, 0, 0)
+    let cr = nv(); iremit(IR_CALL, cr, cnm, 2, cavs)
+    w64(vreg_is_big + cr*8, 1)
+    return cr
+}
+
+// === PARSE BLOCK ? IR ===
+let lbl_brk = mmap(800); let lbl_cont = mmap(800); let lbl_stk = 0
+// P2 ownership: per-loop scope-count stack for break/continue (free the loop
+// body scope + nested scopes when jumping out).
+let loop_scope_stk = mmap(256*8); let loop_scope_top = 0
+
+fn parse_block() {
+    let my_scope = owned_sctop
+    owned_scope_push()
+    // A1b: save the binding-stack watermark on block entry ...
+    let my_varc = a1b_enter()
+    // P7: track block nesting depth (function body = 1, nested blocks > 1) so
+    // match-as-last-statement only emits IR_RET at the function-body level.
+    let was_fn = in_fn_body
+    if in_fn_body==0 { in_fn_body = 1 }
+    blk_depth = blk_depth + 1
+    while true {
+        if peek()==TT_EOF { break }
+        if peek()==TT_PNCT&&pval()==125 { break }
+        if peek()==TT_PNCT&&pval()==59 { adv(); continue }
+        let t=peek(); let v=pval(); let ln=plen()
+        if t==TT_TYPE { parse_type() }       // 0.0.77: type MyInt = int
+        else if t==TT_MUT {
+            // 0.0.76: `mut x = expr` ? mutable local binding
+            adv(); parse_mut_flag = 1; parse_let()
+        } else if t==TT_REF {
+            // 0.0.94: `ref r = &x` ? borrow-binding (alias of x). Recorded with
+            // ownership tag 2 so later passes can enforce borrow rules. The RHS is
+            // emitted as a normal address-of + MOV; semantics identical to `let`.
+            adv(); parse_ref_flag = 1; parse_let()
+        } else if t==TT_ID && (ktext(v,ln)==H_NAKED || ktext(v,ln)==H_SECTION || ktext(v,ln)==H_NOMANGLE) {
+            // 0.0.229 Phase B (B2/B4): attribute-prefixed nested fn. CONTEXT
+            // keywords: the lexer emits TT_ID for naked/section/no_mangle (they
+            // are common identifier names — config.quanta uses `section` as a
+            // parameter), so the attribute position is verified by LOOKAHEAD:
+            // walk the chain; if it does not lead to `fn`, fall through to the
+            // normal TT_ID statement handling below.
+            let ap = tokp
+            let al = 0
+            while ap < tokc && tokt(ap)==TT_ID {
+                let ak = ktext(tokv(ap),tokln(ap))
+                if ak!=H_NAKED && ak!=H_SECTION && ak!=H_NOMANGLE { break }
+                al = al + 1
+                ap = ap + 1
+                // section("NAME") — four tokens
+                if al > 0 && ap<tokc && tokt(ap)==TT_PNCT && tokv(ap)==40 {
+                    let is_sec = 0
+                    if ap>0 { let pk=ktext(tokv(ap-1),tokln(ap-1)); if pk==H_SECTION { is_sec=1 } }
+                    if is_sec==1 && ap+1<tokc && tokt(ap+1)==TT_STR && ap+2<tokc && tokt(ap+2)==TT_PNCT && tokv(ap+2)==41 {
+                        ap = ap + 3
+                    } else { break }
+                }
+            }
+            if al > 0 && ap<tokc && tokt(ap)==TT_KEY && ktext(tokv(ap),tokln(ap))==1 {
+            // Confirmed attribute chain + fn: skip the whole definition (same
+            // three ordered steps as the nested-fn path in TT_KEY).
+            while tokp < ap { adv() }
+            adv()  // consume 'fn'
+            while peek()!=TT_PNCT { if peek()==TT_EOF { break }; adv() }
+            if peek()==TT_PNCT && pval()==60 {
+                let g_sk = 1
+                adv()
+                while g_sk>0 && peek()!=TT_EOF {
+                    if peek()==TT_PNCT && pval()==60 { g_sk=g_sk+1 }
+                    else if peek()==TT_PNCT && pval()==62 { g_sk=g_sk-1 }
+                    adv()
+                }
+            }
+            if peek()==TT_PNCT && pval()==40 {
+                let p_sk = 1
+                adv()
+                while p_sk>0 && peek()!=TT_EOF {
+                    if peek()==TT_PNCT && pval()==40 { p_sk=p_sk+1 }
+                    else if peek()==TT_PNCT && pval()==41 { p_sk=p_sk-1 }
+                    adv()
+                }
+            }
+            while peek()!=TT_EOF {
+                if peek()==TT_PNCT && (pval()==123 || pval()==59) { break }
+                adv()
+            }
+            if peek()==TT_PNCT && pval()==123 {
+                let b_sk = 1
+                adv()
+                while b_sk>0 && peek()!=TT_EOF {
+                    if peek()==TT_PNCT && pval()==123 { b_sk=b_sk+1 }
+                    else if peek()==TT_PNCT && pval()==125 { b_sk=b_sk-1 }
+                    adv()
+                }
+            }
+            } else {
+                // Plain identifier that happens to spell an attribute word:
+                // handle as a normal statement by re-dispatching to the TT_ID
+                // path. Simplest sound approach: let the TT_ID branch below
+                // handle it — but this IS the dispatch; so treat it as an
+                // expression statement via parse_assign (mirrors the TT_ID
+                // identifier-statement path).
+                let nxt2 = tokp+1
+                if nxt2<tokc && tokt(nxt2)==TT_PNCT && tokv(nxt2)==61 {
+                    vadd(v, ln, nv())
+                    adv()
+                    parse_assign()
+                } else {
+                    let ex = parse_expr()
+                    if in_fn_body==1 && blk_depth==1 && peek()==TT_PNCT && pval()==125 { iremit(IR_RET,0,ex,0,0) }
+                }
+            }
+        } else if t==TT_KEY {
+            // 0.0.96: try/catch/throw ? handled via a PLAIN `if` pre-check (not an
+            // else-if in the h== chain) because the 0.0.95 seed's codegen corrupts
+            // any function with a 24th else-if branch. try=59, throw=61 (ktext IDs).
+            let hk0 = ktext(v, ln)
+            // NOTE: no `return` after parse_try()/throw ? parse_block's loop must
+            // continue to the NEXT token so trailing statements in the same block
+            // (e.g. code after a `try {} catch {}`) are still parsed. Sibling
+            // keyword handlers (parse_if/parse_while/...) do not return either.
+            // 0.0.225: `try` is a CONTEXT keyword -- `try { } catch { }` is a
+            // statement, `fn try()` is a definition. Deciding from the text alone
+            // routed `fn try()` into parse_try(), which consumed the entire
+            // function definition and left nothing to emit. Require the `{` that
+            // makes it a statement. Verified: the statement form still compiles
+            // and `fn try()` now compiles.
+            let try_is_stmt = 0
+            if hk0==59 && tokp+1<tokc && tokt(tokp+1)==TT_PNCT && tokv(tokp+1)==123 { try_is_stmt = 1 }
+            if try_is_stmt==1 { parse_try(); continue }   // consumes whole `try{}catch{}`; re-read fresh token
+            // 0.0.225: same context rule. `throw` is a statement only when an
+            // expression FOLLOWS it; `fn throw()` is a definition.
+            else if hk0==61 && !(tokp+1<tokc && tokt(tokp+1)==TT_PNCT && tokv(tokp+1)==40) {
+                adv()   // consume 'throw'
+                if peek()==TT_PNCT && (pval()==59 || pval()==125) {
+                    let sv = nv(); iremit(IR_CONST, sv, -1, 0, 0)
+                    iremit(IR_THROW, 0, sv, 0, 0)
+                } else { let vv = parse_expr(); iremit(IR_THROW, 0, vv, 0, 0) }
+                // `continue` is REQUIRED: parse_expr consumed past `throw`, so v/ln are
+                // stale. Without continue, line 65 re-dispatches the stale `throw` token
+                // (ktext=61), hits `else { adv() }` at the bottom, and eats the body's `}`,
+                // making the body parse_block over-consume into `catch { ... }`.
+                continue
+            }
+            let h=ktext(v,ln)
+            if h==16 { parse_ret() }
+            else if h==2 { parse_let() }
+            else if h==57 { parse_const() }   // F7: const NAME = EXPR
+            else if h==1 {
+                // Nested `fn name(){}` definition: already registered by scanfns.
+                // Skip the whole definition so the parser does not try to treat
+                // it as a statement.
+                //
+                // The previous version walked forward with
+                //     while peek()!=TT_PNCT || (pval()!=123 && pval()!=41)
+                // and then conditionally consumed '(' and '{'. The loop's stop
+                // set did not include '(' , so it CONSUMED the signature's
+                // opening paren and stopped on the ')'. The follow-up
+                // `if pval()==40` test was then false -- the paren was already
+                // gone -- so neither the signature nor the body was skipped and
+                // the nested function's statements were parsed as part of the
+                // ENCLOSING function. That is why
+                //     fn outer() { fn a() -> int { return 7 } }
+                // killed the compiler with SIGILL: the outer's IR picked up
+                // the inner's `return 7` and the stray `-> int {` was consumed
+                // as an expression.
+                //
+                // The skip is now structured in three ordered steps, each with
+                // its own depth counter, and none of which consume the token
+                // they test for:
+                //   1. skip the name and any generic parameter list
+                //   2. consume the balanced '(' ... ')' signature
+                //   3. consume the balanced '{' ... '}' body
+                // so no token can be eaten by a stop condition that a later step
+                // expects to see. A bodiless declaration (`fn name();`) ends at
+                // the ';' and is left for step 3 to skip.
+                adv()  // consume 'fn'
+                // 1. skip name + generics, stopping ON the first punct
+                while peek()!=TT_PNCT {
+                    if peek()==TT_EOF { break }
+                    adv()
+                }
+                // generic parameter list `<T, U>` is punct-delimited, so step 1
+                // has already passed it; step 2's '(' search must skip over it.
+                if peek()==TT_PNCT && pval()==60 {
+                    let g_sk = 1
+                    adv()
+                    while g_sk>0 && peek()!=TT_EOF {
+                        if peek()==TT_PNCT && pval()==60 { g_sk=g_sk+1 }
+                        else if peek()==TT_PNCT && pval()==62 { g_sk=g_sk-1 }
+                        adv()
+                    }
+                }
+                // 2. balanced '(' ... ')' parameter list
+                if peek()==TT_PNCT && pval()==40 {
+                    let p_sk = 1
+                    adv()
+                    while p_sk>0 && peek()!=TT_EOF {
+                        if peek()==TT_PNCT && pval()==40 { p_sk=p_sk+1 }
+                        else if peek()==TT_PNCT && pval()==41 { p_sk=p_sk-1 }
+                        adv()
+                    }
+                }
+                // 3. return type, then the body. `-> i64`, `-> C` and `-> [4]int`
+                // all sit between the ')' and the '{'; a bodiless declaration
+                // stops at ';'.
+                while peek()!=TT_EOF {
+                    if peek()==TT_PNCT && (pval()==123 || pval()==59) { break }
+                    adv()
+                }
+                if peek()==TT_PNCT && pval()==123 {
+                    let b_sk = 1
+                    adv()
+                    while b_sk>0 && peek()!=TT_EOF {
+                        if peek()==TT_PNCT && pval()==123 { b_sk=b_sk+1 }
+                        else if peek()==TT_PNCT && pval()==125 { b_sk=b_sk-1 }
+                        adv()
+                    }
+                }
+            }
+            else if h==3 { parse_if() }
+            else if h==6 { parse_while() }
+            else if h==5 { parse_loop() }
+            else if h==7 { parse_for() }
+            else if h==8 {
+                adv()
+                if lbl_stk>0 { owned_pop_to(r64(loop_scope_stk+(loop_scope_top-1)*8)); let lb=r64(lbl_brk+(lbl_stk-1)*8); iremit(IR_JMP,0,lb,0,0) }
+            } else if h==9 {
+                adv()
+                if lbl_stk>0 { owned_pop_to(r64(loop_scope_stk+(loop_scope_top-1)*8)); let lb=r64(lbl_cont+(lbl_stk-1)*8); iremit(IR_JMP,0,lb,0,0) }
+            } else if h==17 { adv(); adv(); adv(); adv() }   // t6: alias NAME = FNNAME (skip; registered by scan_aliases)
+            else if h==18 { parse_unsafe() }   // G1: unsafe { ... } block (safe-by-default fence)
+            else if h==H_TYPE { parse_type() }   // 0.0.77: type MyInt = int
+            else if h==22 { 
+                let mv = parse_match()
+                // P7: implicit return ? if this match is the last statement of a
+                // function body (next token is '}' closing the body), emit IR_RET
+                // with the match result. Without this, the function-end IR_RET -1
+                // relies on "last op leaves result in rax", which match breaks
+                // (arms store res_vr then jmp to the shared end label).
+                if in_fn_body==1 && blk_depth==1 && peek()==TT_PNCT && pval()==125 { iremit(IR_RET,0,mv,0,0) }
+            }
+            else if h==H_DEFER { parse_defer(my_scope) }
+            // 0.0.225: a keyword-named VARIABLE at statement level. `let try = 5`
+            // lexes `try` as TT_KEY, so it entered this chain, matched none of
+            // the keyword handlers, and fell through to a bare adv() that skipped
+            // the name and left `= 5` to be parsed as a stray assignment (rc=7).
+            // When an '=' follows, this is a declaration: bind the name, then
+            // parse the value.
+            else if tokp+1<tokc && tokt(tokp+1)==TT_PNCT && tokv(tokp+1)==61 {
+                let bn2 = pval(); let bl2 = plen(); adv()
+                vadd(bn2, bl2, nv())
+                adv()   // consume '='
+                parse_assign()
+            }
+            else { adv() }
+        } else if t==TT_MATCH {
+            let mv = parse_match()
+            // P7: implicit return (same as the h==22 keyword path): if this match
+            // is the last statement of the function body, return its value.
+            if in_fn_body==1 && blk_depth==1 && peek()==TT_PNCT && pval()==125 { iremit(IR_RET,0,mv,0,0) }
+        } else if t==TT_ID {
+            let nxt=tokp+1
+            // G2: a[idx] = v  (subscript assignment) ? look past one [..] bracket
+            if nxt<tokc&&tokt(nxt)==TT_PNCT&&tokv(nxt)==91 {
+                let close=tokp+2; let depth=1
+                while close<tokc&&depth>0 { if tokt(close)==TT_PNCT&&tokv(close)==91 { depth=depth+1 } else if tokt(close)==TT_PNCT&&tokv(close)==93 { depth=depth-1 }; close=close+1 }
+                if close<tokc&&tokt(close)==TT_OP&&tokv(close)==61 { parse_assign() }
+                else { let ev=parse_expr(); if in_fn_body==1&&blk_depth==1&&peek()==TT_PNCT&&pval()==125 { iremit(IR_RET,0,ev,0,0) } }
+            } else if nxt<tokc&&tokt(nxt)==TT_OP&&tokv(nxt)==61 { parse_assign() }
+            else { let ev=parse_expr(); if in_fn_body==1&&blk_depth==1&&peek()==TT_PNCT&&pval()==125 { iremit(IR_RET,0,ev,0,0) } }
+        } else if t==TT_DOLLAR {
+            // ${name}: read-only GLOBAL handle. Writing ${name} = x is forbidden
+            // (use `global name` to declare a writable global, or a local). A bare
+            // ${name} expression statement is parsed and its value discarded.
+            let nxt=tokp+1
+            if nxt<tokc&&tokt(nxt)==TT_OP&&tokv(nxt)==61 {
+                let nm=pval(); let nl=plen()
+                compile_error(1, nm, nl)
+            } else { let ev=parse_expr() }
+        } else if t==TT_LOCAL {
+            // $[name]: read-only LOCAL handle. Writing $[name] = x is forbidden
+            // (assign to the local via `name = x`). A bare $[name] expression
+            // statement is parsed and its value discarded.
+            let nxt=tokp+1
+            if nxt<tokc&&tokt(nxt)==TT_OP&&tokv(nxt)==61 {
+                let nm=pval(); let nl=plen()
+                compile_error(1, nm, nl)
+            } else { let ev=parse_expr() }
+        } else if t==TT_CALL {
+            // $(func) explicit external call as a statement ? parse and discard result.
+            let ev=parse_expr()
+            if in_fn_body==1 && blk_depth==1 && peek()==TT_PNCT && pval()==125 { iremit(IR_RET,0,ev,0,0) }
+        } else if t==TT_PNCT&&v==123 {    // nested bare block: { ... }
+            adv(); parse_block(); mpnct(125)
+        } else if t==TT_VOLATILE {
+            // P6: `volatile *p = v` / `volatile *p` statement prefix. `volatile`
+            // is lexed as TT_VOLATILE (34), NOT TT_KEY, so it must be routed to
+            // parse_expr explicitly or the whole statement is silently dropped
+            // (the `else { break }` at the bottom would swallow it).
+            let ev=parse_expr()
+            if in_fn_body==1 && blk_depth==1 && peek()==TT_PNCT && pval()==125 { iremit(IR_RET,0,ev,0,0) }
+        } else if t==TT_NUM||t==TT_STR||t==TT_OP||t==TT_PNCT||t==TT_ASM {
+            let ev=parse_expr()
+            // Implicit return: a bare trailing expression statement as the last
+            // statement of a function body IS the return value (e.g. `x * 2`,
+            // `a + b`). Without this, the value is computed then discarded and
+            // the epilogue IR_RET -1 returns garbage. Mirrors the match case.
+            if in_fn_body==1 && blk_depth==1 && peek()==TT_PNCT && pval()==125 { iremit(IR_RET,0,ev,0,0) }
+        } else { break }
+    }
+    defer_replay_range(my_scope)
+    owned_scope_pop_one(my_scope)
+    // A1b: ... and drop this block's bindings on the single exit. This is the
+    // only exit: break/continue/return emit their jump and return to the loop
+    // above, so the block is always fully parsed.
+    a1b_leave(my_varc)
+    blk_depth = blk_depth - 1
+    if was_fn==0 { in_fn_body = 0 }
+}
+
+fn parse_unsafe() {
+    // G1/G2: `unsafe { ... }` ? the opt-in escape for low-level primitives AND
+    // the opt-OUT of runtime safety checks (overflow trap). Sets unsafe_depth so
+    // every IR op emitted while parsing the inner block is flagged in ir_unsafe
+    // and the overflow trap is suppressed for it. User code outside unsafe{} stays
+    // trapped (secure by default). The compiler wraps its own deliberate-overflow
+    // internals (compute_magic, loop-strength) in unsafe{} so self-host stays green.
+    adv()                                   // consume `unsafe`
+    unsafe_count = unsafe_count + 1
+    if !(peek()==TT_PNCT && pval()==123) {  // require `{`
+        let mb = "error: malformed 'unsafe' ? expected '{'\n"
+        file_write(2, mb+8, len(mb)); had_error = 1
+        return
+    }
+    adv()                                    // consume `{`
+    unsafe_depth = unsafe_depth + 1
+    parse_block()                            // parse inner statements (flagged)
+    mpnct(125)                               // consume `}`
+    unsafe_depth = unsafe_depth - 1
+}
+
+fn parse_ret() {
+  adv()
+  // P2 ownership: return exits the function -> free ALL compiler-owned bindings
+  // (every live scope). Idempotent: the function-body block's trailing pop then
+  // becomes a no-op.
+  // F6: replay deferred statements (outermost first) before returning.
+  defer_replay_range(0)
+  owned_pop_all()
+  // bare 'return;' or 'return}' (no expression) -> IR_RET with no value (-1)
+  if peek()==TT_PNCT&&(pval()==59||pval()==125) { iremit(IR_RET,0,-1,0,0); return }
+  // t7: multiple-return: `return a, b, c` packs values into a tuple and
+  // returns the pointer. This comma path never runs during self-host
+  // (compiler source uses single-value returns), so it is hazard-safe.
+  let e0=parse_expr(); let vals=e0; let cnt=1
+  if peek()==TT_PNCT&&pval()==44 {
+    let arr=mmap(8000)
+    w64(arr+0*8, e0); let acc=1
+    while peek()==TT_PNCT&&pval()==44 {
+      adv(); let ev=parse_expr(); w64(arr+acc*8, ev); acc=acc+1
+    }
+    vals=arr; cnt=acc
+  }
+  if cnt>1 {
+    let tr=nv(); iremit(IR_TALLOC,tr,cnt,0,0)   // tr = mem_alloc(cnt)
+    let ci=0
+    while ci<cnt {
+      let vv=r64(vals+ci*8); let fi=nv(); iremit(IR_CONST,fi,ci,0,0)
+      iremit(IR_ISTORE,0,tr,fi,vv)
+      ci=ci+1
+    }
+    iremit(IR_RET,0,tr,0,0)
+  } else {
+    escape_record(e0)              // 0.0.121: defer escape check (captures resolve later)
+    iremit(IR_RET,0,e0,0,0)
+  }
+}
+
+// === F7: compile-time constants ===
+//
+// A const entry is 32 bytes:
+//   +0  name ptr into src
+//   +8  name len
+//   +16 value  (integer, or a POINTER INTO src when kind==1)
+//   +24 kind   (0 = integer, 1 = string)
+//
+// The kind field is what makes string consts work. Before it existed, a const
+// entry had no type information at all, so `const P = "/some/path"` stored the
+// result of eval_const(), which only understands arithmetic -- and a string
+// literal is not an operand it can evaluate, so the value silently became the
+// integer 0. Using P then passed a null pointer where a string was expected
+// and segfaulted, while `P` printed as "0" and a plain literal worked, which
+// made it look like a caller bug rather than a compiler bug.
+//
+// A string const's value is the offset of its opening quote in src, and the
+// existing TT_STR path already knows how to turn such an offset into a proper
+// string vreg (it emits IR_STR with the same value). So a string const is not a
+// new mechanism -- it reuses the literal path through a tagged lookup.
+fn ckind(i) { if i<0 { return 0 }; return r64(consts + i*32 + 24) }
+fn cval(i)  { if i<0 { return 0 }; return r64(consts + i*32 + 16) }
+
+// cfind: lookup a const name -> its index in the consts table (or -1 if absent).
+// Callers that want the VALUE use cval(cfind(...)); the index form is what lets
+// IR_CONST and IR_STR be chosen from ckind() instead of guessing.
+fn cfind(nm,nl) {
+  let i = constc-1
+  while i>=0 {
+    let cnm = r64(consts + i*32)
+    let cnl = r64(consts + i*32 + 8)
+    if cnl==nl {
+      let ok=1; let j=0
+      while j<nl { if r8(src+cnm+j)!=r8(src+nm+j){ok=0;break}; j=j+1 }
+      if ok==1 { return i }
+    }
+    i=i-1
+  }
+  return -1
+}
+
+// eval_const: recursive-descent evaluator over the MAIN token stream.
+// Consumes tokens for a constant arithmetic expression and returns its integer
+// value. Supports: literals, ( ), + - * / %, unary -, and const-name references.
+fn eval_const() {
+  return ec_expr()
+}
+fn ec_expr() {
+  let v = ec_term()
+  while true {
+    if peek()==TT_OP && pval()==43 { adv(); let r=ec_term(); v=v+r }
+    else if peek()==TT_OP && pval()==45 { adv(); let r=ec_term(); v=v-r }
+    else { break }
+  }
+  return v
+}
+fn ec_term() {
+  let v = ec_factor()
+  while true {
+    if peek()==TT_OP && pval()==42 { adv(); let r=ec_factor(); v=v*r }
+    else if peek()==TT_OP && pval()==47 { adv(); let r=ec_factor(); v=v/r }
+    else if peek()==TT_OP && pval()==37 { adv(); let r=ec_factor(); v=v%r }
+    else { break }
+  }
+  return v
+}
+fn ec_factor() {
+  if peek()==TT_OP && pval()==45 { adv(); return 0 - ec_factor() }   // unary minus
+  if peek()==TT_PNCT && pval()==40 { adv(); let v=eval_const(); mpnct(41); return v }  // ( )
+  if peek()==TT_NUM { let v=pval(); adv(); return v }
+  if peek()==TT_STR { return 0 }   // a bare string is not arithmetic; see parse_const
+  if peek()==TT_ID {
+    let nm=pval(); let nl=plen(); adv()
+    let ci = cfind(nm,nl)
+    if ci>=0 { return cval(ci) }  // cfind returns an INDEX now, not a value
+    compile_error(1, nm, nl)   // const used before declaration (or not a const)
+  }
+  // F7: not an arithmetic operand (e.g. a following keyword/newline) -> stop.
+  // Newlines are not tokens, so eval_const must terminate here rather than
+  // swallowing the next statement as more arithmetic.
+  return 0
+}
+
+// parse_const: `const NAME = EXPR` ? evaluate EXPR at compile time, store value.
+fn parse_const() {
+  adv()                                  // consume 'const'
+  let nm=pval(); let nl=plen(); adv()     // NAME
+  // 0.0.75: reject const redefinition (silently took the second value before)
+  if cfind(nm,nl)>=0 {
+    compile_error(1, nm, nl)  // const already defined
+  } else {
+    mop(61)                                // '='
+    // A string literal is not an arithmetic operand, so eval_const() cannot
+    // produce it -- it fell through its "not an operand" branch and returned 0.
+    // That silently turned every string const into the integer 0, which then
+    // segfaulted wherever a real pointer was expected. Detect the literal here,
+    // BEFORE eval_const consumes it, and record kind=1 with the quote offset.
+    let kind = 0
+    let val = 0
+    if peek()==TT_STR {
+      kind = 1
+      val = pval()          // offset of the opening quote in src
+      adv()
+    } else if peek()==TT_FNUM {
+      // A top-level const with a FLOAT initialiser.
+      //
+      // This used to fall through to eval_const(), which understands only
+      // INTEGER arithmetic: ec_factor()'s literal branch tests `peek()==TT_NUM`,
+      // and the lexer emits a float literal as TT_FNUM (7), NOT TT_NUM (2). So
+      // eval_const returned 0 WITHOUT consuming the token and the const silently
+      // became the integer 0 -- `const CF = 2.5` made every use of CF a 0.0.
+      // Measured on the golden compiler: `f64bits(CF) == 0`, and a softmax
+      // sentinel built from such a const was silently 0.0 (lib/std/sampling.quanta
+      // worked around it by inlining the literal).
+      //
+      // Store the EXACT IEEE-754 bit pattern, computed at parse time by the same
+      // helper the ordinary float-literal path uses (fconst.quanta:fl_dexp2f64),
+      // and record kind=2. The const-use sites then emit IR_FCONST -- the float
+      // constant opcode -- instead of IR_CONST, which is what makes the value a
+      // float vreg rather than an integer holding a float's bits.
+      //
+      // The decimal exponent lives in the token's SIDE WORD and must be read
+      // BEFORE adv(), while tokp still points at the float token. Reading it
+      // afterwards picks up the next token's (always zero) side word -- the same
+      // trap method.quanta's TT_FNUM branch documents.
+      let exp10 = toke(tokp)
+      let enc = pval()          // (M << 8) | frac_digits
+      adv()
+      // Only a BARE float literal is evaluated here. A float EXPRESSION
+      // (`const X = 2.5 * 4.0`) needs a float evaluator, which eval_const is not;
+      // silently taking just `2.5` and leaving `* 4.0` unparsed would desync the
+      // token stream, which is worse than the 0 this replaces. Fail closed.
+      if peek()==TT_OP { compile_error(1, nm, nl) }
+      kind = 2
+      val = fl_dexp2f64(enc >> 8, enc & 255, exp10)
+    } else {
+      val = eval_const()    // compile-time evaluate
+    }
+    // store in consts table
+    w64(consts + constc*32, nm)
+    w64(consts + constc*32 + 8, nl)
+    w64(consts + constc*32 + 16, val)
+    w64(consts + constc*32 + 24, kind)
+    constc = constc + 1
+  }
+}
+
+fn parse_type() {
+    adv()                                  // consume 'type'
+    let nm=pval(); let nl=plen(); adv()    // NAME
+    mop(61)                                // '='
+    if peek()==TT_KEY {
+        let hk=ktext(pval(),plen())
+        // Map type keyword ? vtype code
+        let vt = 0
+        if hk==44 { vt=1 } else if hk==45 { vt=2 } else if hk==46 { vt=3 }
+        else if hk==47 { vt=4 } else if hk==48 { vt=5 } else if hk==49 { vt=6 }
+        else if hk==50 { vt=7 } else if hk==51 { vt=8 } else if hk==52 { vt=9 }
+        else if hk==53 { vt=10 } else if hk==54 { vt=11 } else if hk==55 { vt=0 }
+        else { vt = 0 }
+        // 0.0.77: register alias NAME -> vt
+        w64(type_aliases + type_aliasc*24, nm)
+        w64(type_aliases + type_aliasc*24 + 8, nl)
+        w64(type_aliases + type_aliasc*24 + 16, vt)
+        type_aliasc = type_aliasc + 1
+        adv()  // consume type keyword
+    } else {
+        adv()
+    }
+}
+
+fn find_type_alias(nm,nl) {
+    let i = type_aliasc-1
+    while i>=0 {
+        let anm = r64(type_aliases + i*24)
+        let anl = r64(type_aliases + i*24 + 8)
+        if anl==nl {
+            let ok=1; let j=0
+            while j<nl { if r8(src+anm+j)!=r8(src+nm+j) { ok=0; break }; j=j+1 }
+            if ok==1 { return r64(type_aliases + i*24 + 16) }
+        }
+        i = i-1
+    }
+    return -1
+}
+
+fn parse_let() {
+    // 0.0.76: handle `let x = 5` and `mut x = 5`; 0.0.94: also `ref x = &y`.
+    let is_mut = parse_mut_flag
+    let is_ref = parse_ref_flag
+    parse_mut_flag = 0
+    parse_ref_flag = 0
+    if is_mut==0 && is_ref==0 { adv() }   // consume 'let' (mut/ref already consumed)
+    let own = 0
+    if is_mut==1 { own = 1 }
+    else if is_ref==1 { own = 2 }
+    // 0.0.221: reject a reserved type/keyword as a binding name.
+    //
+    // `let u32 = ...` lexes `u32` as TT_KEY (a type keyword), NOT TT_ID. The
+    // name below is read with pval()/plen(), which for a TT_KEY returns the
+    // keyword's small integer id instead of a source offset. The local was then
+    // registered under a garbage name, every read of it resolved to nothing, and
+    // the binding silently evaluated to 0 -- no error, wrong code. That is how
+    // tests/test_f32_conv.quanta produced u32=0 for bytes 00 00 80 3f.
+    //
+    // Anything that is not a plain identifier cannot be a binding name. Report
+    // it here, at the name, instead of compiling a silently-wrong program.
+    {
+        let ntk = peek()
+        if ntk != TT_ID {
+            compile_error(8, pval(), plen())
+        }
+    }
+    let nm=pval(); let nl=plen(); adv()
+    // t7: multiple-return destructuring: `let a, b, c = f()` binds each name
+    // to tup.<i>. This comma path never runs during self-host (compiler source
+    // uses single-name let), so it is hazard-safe.
+    // Comma-separated TYPED declarations: `let a: T, b: T = ...`
+    //
+    // The tuple form below guards on `peek()==','`, but in the TYPED form the
+    // current token is ':' -- the comma comes later, after the type and an
+    // optional `[N]`. So that guard never fired, control fell through to the
+    // single-binding type path, it consumed `: T`, and then hit the trailing
+    // comma with nothing left to do with it. The parser desynchronised and the
+    // compiler died with SIGILL.
+    //
+    // Impact: lib/std/ai.quanta opens every test function with a comma-separated
+    // TYPED declaration (`let data: i64[1], shape: i64[1], ...`). That is why
+    // ai.quanta crashed the compiler, and why native_inference.quanta -- which
+    // has the same shape -- silently produced no binary: the missing std/mem
+    // was the error it finally reported, but the parser desync came first.
+    //
+    // Detect it by scanning the TOKEN ARRAY for a ',' ahead of the '='. Reading
+    // by index consumes nothing, so there is no rewind to get wrong -- an
+    // earlier attempt used peek()/adv() for this and corrupted the stream.
+    // Is this a comma-separated list of BINDINGS? `let a: T, b: T` and
+    // `let a: T = x, b: T = y` are both lists, and the second form is what
+    // lib/std/ai.quanta writes.
+    //
+    // The scan cannot stop at the first '=': in `let a: i64[2] = { 2, 3 },
+    // b: i64[2] = { 3, 2 }` that '=' belongs to the FIRST binding, and stopping
+    // there hid the separator that follows, so the line parsed as one binding and
+    // the leftover tokens desynchronised into SIGILL.
+    //
+    // So track bracket depth and treat a ',' as a separator only at depth 0.
+    // Depth counts (), [], {} and the closure '|' -- each of which encloses
+    // commas that belong to something other than the binding list. Four
+    // constructs were caught by the gate for exactly this reason:
+    //   `let p = P(1, 2)`             comma in a constructor's argument list
+    //   `let f = |x, y| { ... }`     comma in a closure's parameter list
+    //   `let a: T = { 2, 3 }`        comma inside a brace initialiser
+    //   `let p: *u64 = &x`           44 is also a multichar operator's value, so
+    //                                 a comma must be matched on TT_PNCT(5), not
+    //                                 on the value alone -- while '=' is TT_OP(4)
+    //                                 and must be matched on the value
+    //
+    // '=', '}' and ';' end a binding's VALUE, not the list, so keep scanning; a
+    // newline or end-of-input ends the whole declaration.
+    //
+    // Reading the token array rather than peek()/adv() consumes nothing, so there
+    // is no rewind to get wrong. Token facts confirmed with an in-compiler probe
+    // printing (index, type, value).
+    let lstyped = 0
+    {
+        // Scan AHEAD for a top-level ',' that separates BINDINGS. This must
+        // terminate at the END OF THE STATEMENT, not run on.
+        //
+        // The scan previously stopped only on a newline (10) or ';', but the
+        // lexer does NOT emit newline tokens, so neither ever appeared: the scan
+        // walked straight past the '}' that closes the current block and into the
+        // NEXT function, where a parameter list such as `fn b(x: i64, y: i64)`
+        // supplies a depth-0 ','. That made a plain `let p = P ( 1 )` take the
+        // multi-binding path, which propagates only string/big tags -- never
+        // vreg_struct -- so the binding lost its struct type and the following
+        // `p.f1` fell through to method-call resolution: "call to undeclared
+        // function: f1".
+        //
+        // WHICH grammar. A comma-separated `let` has two, and they are told apart
+        // by the ORDER of the first top-level ',' and the first top-level '=':
+        //
+        //   `let a: P = P{f0:1}, b: P = P{f0:2}`    '=' BEFORE ',' -- each binding
+        //       brings its own ':' and its own '='. THIS branch's business.
+        //
+        //   `let a, b = 1, 2`                     ',' BEFORE '=' -- the names all
+        //   `let a: i64, b: i64 = 1, 2`           come first, then ONE '=', then one
+        //       value per name. NOT this branch's business: the handler below,
+        //       which destructures a tuple initialiser, owns it.
+        //
+        // The distinction is not cosmetic. This branch used to take BOTH, and for
+        // the names-first form it bound a name and then immediately consumed the
+        // value belonging to the NEXT name. `let a, b = 1, 2` therefore compiled
+        // cleanly, emitted nothing usable, and evaluated to `0 0` -- a wrong answer
+        // with no diagnostic, the worst thing a compiler can do. Worse, stealing
+        // that input desynchronised the parse on some inputs, which surfaced as the
+        // compiler dying with SIGILL at a null call target.
+        //
+        // `let a, b` with no initialiser has NO '=' at all, so it is names-first
+        // too, and that handler is the one that must see it.
+        let si = tokp
+        let steps = 0
+        let depth = 0
+        let first_comma = 0-1
+        let first_eq = 0-1
+        while steps < 256 && si < tokc {
+            let tk = tokt(si)
+            let tv = tokv(si)
+            if tk==TT_OP && tv==124 { depth = depth + 1 }               // closure '|'
+            if tk==TT_PNCT {
+                if tv==91 || tv==123 || tv==40 { depth = depth + 1 }    // '[' '{' '('
+                if tv==93 || tv==125 || tv==41 {
+                    if tv==125 && depth == 0 { si = tokc }             // '}' closes the block
+                    depth = depth - 1                                   // ']' '}' ')'
+                    if depth < 0 { si = tokc }                          // left the construct
+                }
+                if tv==44 && depth==0 && first_comma < 0 { first_comma = si }   // top-level ','
+                if tv==59 { si = tokc }                                 // ';' ends it
+            }
+            // '=' is always TT_OP, so it must be matched on the TYPE as well as the
+            // value -- a punctuation-only scan never sees it.
+            if tk==TT_OP && tv==61 && depth==0 && first_eq < 0 { first_eq = si }
+            if first_comma >= 0 && first_eq >= 0 { si = tokc }         // both known
+            si = si + 1
+            steps = steps + 1
+        }
+        //
+        // Only the per-binding grammar is this branch's business.
+        //
+        // '=' before ',' decides the initialised cases, but it is NOT sufficient on
+        // its own, because `first_eq` may come from the statement AFTER this one.
+        // The scan is bounded by 256 tokens and a ';' or a closing '}', not by a
+        // newline -- the lexer emits no newline token -- so with the semicolons
+        // optional a declaration that ends in ']' has nothing at all to stop on:
+        //
+        //     let d: i64[1], e: i64[1]
+        //     d[0] = 5
+        //
+        // has its '=' AFTER the comma, from `d[0]=5`, and this test alone therefore
+        // called it names-first. The shape-A handler then collected `d` and `e` as
+        // names awaiting values, consumed `d [ 0 ]` as the first value, and bound
+        // nothing usable: "undeclared variable: d" followed by a compiler SIGILL.
+        //
+        // The remaining ambiguity is exactly one shape: a comma BEFORE any '=' where
+        // the SECOND binding carries its own annotation. Both grammars look alike
+        // there, and they part ways on one token -- what follows that annotation.
+        //
+        //     '='   the shared initialiser, so names-first:  let a: i64, b: i64 = 1, 2
+        //     ','   another binding follows
+        //     other the declaration ended with no initialiser, so per-binding owns
+        //          these uninitialised names:            let d: i64[1], e: i64[1]
+        //
+        // That third case is the only local, escape-proof discriminator there is.
+        // `let a, b = 1, 2` never reaches it -- the second name is unannotated, and
+        // the per-binding grammar requires an annotation on every binding.
+        let comma_shape = 0
+        if first_comma >= 0 && first_eq >= 0 && first_eq > first_comma {
+            let m = first_comma + 1
+            if m < tokc && (tokt(m)==TT_ID || tokt(m)==TT_KEY) {
+                let k = m + 1
+                if k < tokc && tokt(k)==TT_PNCT && tokv(k)==58 {
+                    k = k + 1
+                    if k < tokc && tokt(k)==TT_OP && tokv(k)==42 { k = k + 1 }
+                    if k < tokc && (tokt(k)==TT_ID || tokt(k)==TT_KEY || tokt(k)==TT_MUT) { k = k + 1 }
+                    // sized array `T[N]`. k_d starts at 0 because the walk begins AT
+                    // the opening bracket; starting at 1 double-counted it and the
+                    // walk never closed. EVERY bracket counts, so a value like
+                    // `{1,2}` or a call `f(a,b)` cannot unbalance it.
+                    if k < tokc && tokt(k)==TT_PNCT && tokv(k)==91 {
+                        let k_d = 0
+                        while k < tokc {
+                            if tokt(k)==TT_PNCT {
+                                if tokv(k)==91 || tokv(k)==123 || tokv(k)==40 { k_d = k_d + 1 }
+                                if tokv(k)==93 || tokv(k)==125 || tokv(k)==41 {
+                                    k_d = k_d - 1
+                                    if k_d == 0 { k = k + 1; break }
+                                }
+                                if tokv(k)==59 { break }
+                            }
+                            k = k + 1
+                        }
+                    }
+                    if k >= tokc || !(tokt(k)==TT_OP && tokv(k)==61) { comma_shape = 1 }
+                }
+            }
+        }
+        if first_comma >= 0 && (first_eq < 0 || first_eq < first_comma || comma_shape == 1) { lstyped = 1 }
+    }
+    if lstyped == 1 {
+        // One binding per name: NAME [':' type] '=' expr, repeated while a comma
+        // follows. Each name is bound independently; this is NOT destructuring.
+        let bn = nm
+        let bl = nl
+        let more = 1
+        while more == 1 {
+            let btv = 0
+            let barsz = 0
+            let bsidx = 0
+            if peek()==TT_PNCT && pval()==58 {
+                adv()
+                if peek()==TT_KEY || peek()==TT_ID {
+                    // The type name's OWN token values, captured BEFORE adv().
+                    // Reading pval() after adv() picks up whatever token follows the
+                    // annotation and resolves the wrong type -- or none.
+                    let btn = pval(); let btl = plen()
+                    let hk = ktext(btn, btl)
+                    if hk==44 { btv = 1 } else if hk==45 { btv = 2 }
+                    else if hk==46 { btv = 3 } else if hk==47 { btv = 4 }
+                    else if hk==48 { btv = 5 } else if hk==49 { btv = 6 }
+                    else if hk==50 { btv = 7 } else if hk==51 { btv = 8 }
+                    else if hk==35 { btv = 9 } else if hk==55 { btv = 0 }
+                    else { let ai = find_type_alias(btn, btl); if ai>=0 { btv = ai } else { btv = 0 } }
+                    // A DECLARED STRUCT is not a primitive and not an alias, so
+                    // `find_type_alias` returns -1 for it and btv stays 0. Look the
+                    // name up as a struct too, from the same pre-adv() token: the
+                    // resulting index is what makes `tb.f0` resolve as a FIELD
+                    // access instead of falling through to method-call resolution,
+                    // which reported the misleading "call to undeclared function:
+                    // f0" for a binding that was perfectly well declared.
+                    bsidx = findstruct(btn, btl)
+                    adv()
+                }
+                if peek()==TT_PNCT && pval()==91 {  // '[' -- sized or empty array type
+                    adv()
+                    if peek()==TT_PNCT && pval()==93 {
+                        barsz = 0                                // unsized: no storage
+                        adv()
+                    } else {
+                        // Keep the count. It has to come from the TOKEN: parse_expr
+                        // returns a vreg (0 for the first expression in a
+                        // function), which is not the size -- storing that left
+                        // `let a: i64[2], b: i64[3]` allocating nothing, so
+                        // `a[0] = 1` wrote through a null handle.
+                        if peek()==TT_NUM { barsz = pval(); adv() } else { barsz = parse_expr() }
+                        if peek()==TT_PNCT && pval()==59 { adv() }  // optional ';'
+                        if peek()==TT_PNCT && pval()==93 { adv() }  // ']'
+                    }
+                    btv = 11  // VT_ARRAY
+                }
+            }
+            // Same defect as the single-binding path, fixed there first: mop is
+            // "maybe operator", so a `let a: i64` with NO initialiser left the
+            // '=' absent, and calling parse_expr() regardless swallowed the next
+            // token and never bound the name -- `let a: i64, b: i64` bound `a`
+            // only, and `b = 5` then failed with "undeclared variable: b".
+            let bh = mop(61)
+            let bvr = 0
+            if bh == 1 {
+                let bv = parse_expr()
+                bvr = nv(); iremit(IR_MOV, bvr, bv, 0, 0); vadd(bn, bl, bvr)
+                if btv > 0 { w64(vreg_type + bvr*8, btv) }
+                if bsidx >= 0 { w64(vreg_struct + bvr*8, bsidx) }
+                if r64(vreg_is_str + bv*8) >= 0 { w64(vreg_is_str + bvr*8, r64(vreg_is_str + bv*8)) }
+                if r64(vreg_is_big + bv*8) >= 0 { w64(vreg_is_big + bvr*8, r64(vreg_is_big + bv*8)) }
+            } else {
+                // No initialiser. Zero with a real STORE (MOV from a constant
+                // zero), not `IR_CONST`: IR_CONST marks the destination as
+                // compile-time-constant, so the later `b = 2` was dropped as a
+                // redundant store and reads saw 0 -- and omitting the store
+                // entirely leaves the value slot uninitialised, so an
+                // unassigned read returns garbage rather than 0. Same reasoning
+                // as the single-binding path; `let a: i64, b: i64` followed by
+                // `a=1; b=2` is the exact shape lib/std/ai.quanta uses.
+                let bz = nv(); iremit(IR_CONST, bz, 0, 0, 0)
+                if btv == 11 && barsz > 0 {
+                    // Sized array annotation: allocate the declared storage.
+                    //
+                    // IR_ARRNEW reads the count from the SLOT of vreg a0
+                    // (spill_home(a0)), and IR_MOV reads a1 the same way, so
+                    // `IR_MOV(bsz, 3)` would copy whatever is in vreg 3 rather
+                    // than the literal 3. Put the count in the vreg with
+                    // IR_CONST and hand THAT vreg to IR_ARRNEW.
+                    // Same defect as the single-binding path, fixed there
+                    // first: IR_CONST does not store, so the count slot stayed
+                    // uninitialised and IR_ARRNEW read it as a wild size. MOV
+                    // from a constant source so the vreg really holds the count.
+                    let baszsrc = nv(); iremit(IR_CONST, baszsrc, barsz, 0, 0)
+                    let bsz = nv(); iremit(IR_MOV, bsz, baszsrc, 0, 0)
+                    bvr = nv(); iremit(IR_ARRNEW, bvr, bsz, 0, 0)
+                    w64(vreg_type + bvr*8, 11)
+                } else {
+                    bvr = nv(); iremit(IR_MOV, bvr, bz, 0, 0)
+                    if btv > 0 { w64(vreg_type + bvr*8, btv) }
+                }
+                // An annotation naming a struct with NO initialiser has to get real
+                // struct storage, not an integer zero: a zero is not a handle, and
+                // reading a field through it SIGILLs. zero_struct walks the declared
+                // fields recursively so a nested struct's own storage exists too.
+                if bsidx >= 0 {
+                    zero_struct(bsidx, 0)
+                    w64(vreg_struct + bvr*8, bsidx)
+                }
+                vadd(bn, bl, bvr)
+            }
+            if peek()==TT_PNCT && pval()==44 {
+                adv()
+                // TT_KEY as well as TT_ID, matching the per-name collection
+                // above: a name that lexes as a keyword-class token still belongs
+                // to the list, and dropping it ends the declaration early.
+                if peek()==TT_ID || peek()==TT_KEY { bn = pval(); bl = plen(); adv() }
+                more = 1
+            } else {
+                more = 0
+            }
+        }
+        return
+    }
+    // Only relevant if the per-binding branch above did NOT already take this
+    // declaration. That branch owns `let a: T, b: T = ...` and `let a: T, b: T`,
+    // including the no-initializer shape, and it binds the names itself; letting
+    // this handler also run would leave the names unbound ("undeclared variable")
+    // and swallow the following statement.
+    let p_ann0 = 0
+    if peek()==TT_PNCT && pval()==58 {
+        let p_si = tokp
+        let p_st = 0
+        let p_d = 0
+        let p_comma = 0
+        let p_eq = 0
+        while p_st < 256 && p_si < tokc {
+            let p_tk = tokt(p_si)
+            let p_tv = tokv(p_si)
+            if p_tk==TT_PNCT {
+                if p_tv==91 || p_tv==123 || p_tv==40 { p_d = p_d + 1 }
+                if p_tv==93 || p_tv==125 || p_tv==41 {
+                    if p_tv==125 && p_d == 0 { p_si = tokc }
+                    p_d = p_d - 1
+                    if p_d < 0 { p_si = tokc }
+                }
+                if p_tv==44 && p_d==0 && p_comma == 0 { p_comma = p_si }
+                if p_tv==59 { p_si = tokc }
+            }
+            if p_tk==TT_OP && p_tv==61 && p_d==0 && p_eq == 0 { p_eq = p_si }
+            if p_comma != 0 && p_eq != 0 { p_si = tokc }
+            p_si = p_si + 1
+            p_st = p_st + 1
+        }
+        if p_comma != 0 && (p_eq == 0 || p_eq > p_comma) { p_ann0 = 1 }
+    }
+    if peek()==TT_PNCT&&pval()==44 || p_ann0 == 1 {
+        //
+        // Names first, then an OPTIONAL `: T` per name, then one shared '='.
+        // `let a: i64, b: i64 = 4, 5` is the same grammar as `let a, b = 1, 2`
+        // with an annotation attached to each name, so the annotation has to be
+        // consumed HERE, while collecting -- it sits between the name and the
+        // comma, and there is no second chance to reach it once the values start.
+        //
+        // The annotation is recorded two ways. `akinds` holds the declared-struct
+        // INDEX when the annotation named a struct, -1 when it named something
+        // else, and -2 when the name had no annotation at all. `aszs` holds the
+        // element count of a sized `T[N]`, else 0.
+        //
+        // The struct index is what makes `a.f0` resolve as a field access instead
+        // of falling through to method-call resolution, which is what produced the
+        // misleading `call to undeclared function: f0`.
+        let names=mmap(8000); let lens=mmap(8000); let akinds=mmap(8000); let aszs=mmap(8000)
+        w64(names+0*8,nm); w64(lens+0*8,nl); w64(akinds+0*8,0-2); w64(aszs+0*8,0)
+        // Name 0's own annotation, consumed here because the entry guard above had
+        // to inspect it before deciding which grammar this is. `findstruct` is
+        // called with the type name's OWN token values, captured before adv() --
+        // reading pval() after adv() picks up whatever token follows the
+        // annotation and resolves the wrong struct, or none.
+        if p_ann0 == 1 {
+            if peek()==TT_PNCT && pval()==58 {
+                adv()
+                if peek()==TT_ID || peek()==TT_KEY {
+                    let p_tn = pval(); let p_tl = plen(); adv()
+                    w64(akinds+0*8, findstruct(p_tn, p_tl))
+                    if peek()==TT_PNCT && pval()==91 {
+                        adv()
+                        if peek()==TT_PNCT && pval()==93 { adv() }
+                        else {
+                            w64(aszs+0*8, parse_expr())
+                            if peek()==TT_PNCT && pval()==93 { adv() }
+                        }
+                    }
+                }
+            }
+        }
+        let nc=1
+        while peek()==TT_PNCT&&pval()==44 {
+            adv()
+            // TT_KEY as well as TT_ID: a name that collides with a keyword-class
+            // token still has to be collected, or the list terminates early.
+            if peek()==TT_ID || peek()==TT_KEY {
+                let nn=pval(); let nl2=plen(); adv()
+                w64(names+nc*8,nn); w64(lens+nc*8,nl2)
+                w64(akinds+nc*8,0-2); w64(aszs+nc*8,0)
+                // optional `: T`
+                if peek()==TT_PNCT && pval()==58 {
+                    adv()
+                    // TT_KEY as well as TT_ID: primitive type names such as `i64`
+                    // lex as TT_KEY, so a TT_ID-only guard silently skips the
+                    // whole annotation, leaving `:` and the type tokens unconsumed
+                    // and desynchronising the parse into a compiler SIGILL.
+                    if peek()==TT_ID || peek()==TT_KEY {
+                        // Read the type name's OWN token values. findstruct must be
+                        // called with these, not with `pval()` AFTER adv(), which
+                        // would read whatever token follows the annotation and
+                        // return the wrong struct -- or none at all.
+                        let tnm=pval(); let tnl=plen(); adv()
+                        let ak = findstruct(tnm, tnl)
+                        w64(akinds+nc*8, ak)
+                        // sized array `T[N]`
+                        if peek()==TT_PNCT && pval()==91 {
+                            adv()
+                            if peek()==TT_PNCT && pval()==93 { adv() }
+                            else {
+                                w64(aszs+nc*8, parse_expr())
+                                if peek()==TT_PNCT && pval()==93 { adv() }
+                            }
+                        }
+                    }
+                }
+                nc=nc+1
+            }
+        }
+        mop(61)
+        let rv=parse_expr()   // rv = the tuple pointer returned by f()
+        //
+        // Two different things share `let a, b = <expr>`:
+        //
+        //   `let a, b = f()` where f() returns a tuple/struct: `rv` is an AGGREGATE
+        //       POINTER and each name is bound to field `ci` of it. That is what
+        //       the emit below does.
+        //
+        //   `let a, b = 1, 2` where each name takes its own scalar: `rv` is only
+        //       the FIRST value (an i64). Field-indexing it read 8 bytes at offset
+        //       0 and 8 at offset 8 of a single integer, so both names came out 0
+        //       -- silently wrong, with no diagnostic.
+        //
+        // The ONLY thing that separates them is whether a top-level ',' follows
+        // the first expression. `f()` is followed by ';' or the end of the
+        // statement; `1` is followed by ',' because a second value is coming.
+        if !(peek()==TT_PNCT && pval()==44) {
+            let ci=0
+            while ci<nc {
+                let nn=r64(names+ci*8); let nl2=r64(lens+ci*8)
+                let vr=nv(); let fi=nv(); iremit(IR_CONST,fi,ci,0,0)
+                iremit(32,vr,rv,fi,0); vadd(nn,nl2,vr)
+                ci=ci+1
+            }
+            return
+        }
+        // Names-first value RUN: name 0 takes the expression just parsed, then keep
+        // collecting `, <expr>` pairs for the rest.
+        let nn0=r64(names+0*8); let nl0=r64(lens+0*8)
+        vadd(nn0,nl0,rv)
+        // Stamp name 0's annotation onto the vreg it just bound. An index >= 0 is
+        // a declared struct; -1 and -2 leave the initializer's own tag standing,
+        // which is what makes the unannotated `let a, b = P{..}, P{..}` work.
+        let p_k0 = r64(akinds+0*8)
+        if p_k0 >= 0 { w64(vreg_struct + rv*8, p_k0) }
+        let p_z0 = r64(aszs+0*8)
+        if p_z0 > 0 { w64(g_arrsz, p_z0) }
+        let ci=1
+        while ci<nc {
+            if peek()==TT_PNCT && pval()==44 { adv() }
+            // Does another value follow? An int literal is TT_NUM (2), a float is
+            // TT_FNUM (7), a string is TT_STR, a call or variable is TT_ID, a
+            // negative number arrives as TT_OP('-'), and an array/struct literal
+            // opens with '[' or '{'.
+            //
+            // Checking token CLASSES rather than guessing at values is the point:
+            // an earlier attempt enumerated only TT_ID/TT_PNCT/TT_OP, which MISSED
+            // TT_NUM, so every `= 1, 2` run silently dropped the rest of the list
+            // and the compiler died on the desynchronised parse.
+            let tk2 = peek()
+            let has_val = 0
+            if tk2==TT_NUM || tk2==TT_FNUM || tk2==TT_STR || tk2==TT_ID { has_val = 1 }
+            if tk2==TT_OP && (pval()==45 || pval()==43) { has_val = 1 }    // '-' '+'
+            if tk2==TT_PNCT && (pval()==91 || pval()==123) { has_val = 1 } // '[' '{'
+            if tk2==TT_OP && pval()==38 { has_val = 1 }                  // '&'
+            if has_val == 1 {
+                let vv=parse_expr()
+                let bn2=r64(names+ci*8); let bl2=r64(lens+ci*8)
+                vadd(bn2,bl2,vv)
+                let p_kk = r64(akinds+ci*8)
+                if p_kk >= 0 { w64(vreg_struct + vv*8, p_kk) }
+                let p_zz = r64(aszs+ci*8)
+                if p_zz > 0 { w64(g_arrsz, p_zz) }
+                ci=ci+1
+            } else {
+                ci=nc
+            }
+        }
+        return
+    }
+    
+    // P6.1b: optional type annotation after name: `let x: u64 = 5`
+    // Must check for type annotation BEFORE consuming '=' and parsing expression
+    let vtype = 0
+    let pointee_type = 0  // store pointee type for raw pointers
+    // 0.0.247: the ELEMENT float type of a typed `f32[N]` / `f16[N]` buffer
+    // annotation: 0 = not a float element, 1 = f32, 2 = f16. The `[]` suffix
+    // below overwrites `vtype` with VT_ARRAY, so the element type has to be
+    // remembered separately or the width is lost exactly where it is needed.
+    let felem = 0
+    // Element count from a sized `T[N]`, carried across the nested type block in
+    // g_arrsz. Read it after the annotation is parsed, below, where it is used.
+    let arrsz = 0
+    if peek()==TT_PNCT && pval()==58 {
+        adv()  // consume ':'
+        // P6: raw pointer type annotation: *u64 or *mut u64
+        if peek()==TT_OP && pval()==42 {  // '*'
+            adv()
+            let is_mut = 0
+            // "mut" tokenizes as TT_MUT (31), not TT_KEY
+            if peek()==TT_MUT {
+                is_mut = 1
+                adv()
+            }
+            if peek()==TT_KEY {
+                let hk = ktext(pval(), plen())
+                // u8=44, u16=45, u32=46, u64=47, usize=48, bool=49, char=50, byte=51
+                if hk>=44 && hk<=51 {
+                    if is_mut==1 { vtype = IR_MUT_PTR } else { vtype = IR_RAW_PTR }
+                    pointee_type = hk  // store pointee type for later tagging
+                }
+            }
+            adv()  // consume pointee type keyword
+        } else if peek()==TT_KEY || peek()==TT_ID {
+            let hk = ktext(pval(), plen())
+            // ktext returns small keyword IDs: u8=44, u16=45, u32=46, u64=47, usize=48, bool=49, char=50, byte=51, mut=35
+            if hk==44 { vtype = 1 }
+            else if hk==45 { vtype = 2 }
+            else if hk==46 { vtype = 3 }
+            else if hk==47 { vtype = 4 }
+            else if hk==48 { vtype = 5 }
+            else if hk==49 { vtype = 6 }
+            else if hk==50 { vtype = 7 }
+            else if hk==51 { vtype = 8 }
+            else if hk==35 { vtype = 9 }  // mut
+            else if hk==55 { vtype = 0 }  // int -> signed default (vtype 0)
+            else if hk==62 { vtype = 12 } // 0.0.114: big -> VT_BIG (arbitrary-precision int)
+            // 0.0.247: first-class f16/f32/f64 float types. 13/14/15 are new
+            // and inert to every pre-existing vreg_type consumer (which only
+            // masks widths for 1-3/7/8 and tests 10/11), so f64 -- which used to
+            // land in the `else` below as vtype 0 -- is given its own code. The
+            // VALUE semantics live in vreg_ftype, not vreg_type.
+            else if hk==67 { vtype = 13; felem = 1 } // f32
+            else if hk==68 { vtype = 14; felem = 2 } // f16
+            else if hk==69 { vtype = 15 }            // f64 (explicit)
+            else {
+                // 0.0.77: check if it's a type alias
+                let ai = find_type_alias(pval(), plen())
+                if ai>=0 { vtype = ai } else { vtype = 0 }
+            }
+            adv()  // consume type keyword
+            // 0.0.110: typed array / slice suffix `T[]` (e.g. `let a: i64[]`).
+            // The element type above (i64/u8/...) sets the base vtype; the `[]`
+            // suffix marks the binding as an array. Runtime array access (a[idx])
+            // already works via IR_IDX; this annotation just records the type.
+            if peek()==TT_PNCT && pval()==91 {  // '['
+                // Array type. The size is OPTIONAL: `T[]`, `T[N]` and the
+                // C-style `[T; N]` all land here.
+                //
+                // Only the EMPTY form was handled -- '[' then immediately ']'. A
+                // SIZED form left the `N]` in the token stream, the parser
+                // desynchronised, and the compiler died with SIGILL. Every
+                // `let a: T[N]` crashed regardless of element type or length,
+                // and regardless of whether the binding was used at all,
+                // because the failure is in parsing.
+                //
+                // The old comment here read "malformed `T[x]` -- not supported",
+                // which is precisely what left the tokens behind: T[x] is not
+                // malformed, it is the ordinary sized-array annotation.
+                //
+                // The size is consumed and discarded. VT_ARRAY is a single tag
+                // and the element count comes from the initialiser at runtime,
+                // which is how every other container in the language works.
+                adv()
+                if peek()==TT_PNCT && pval()==93 {  // ']' -- unsized: no storage
+                    w64(g_arrsz, 0)
+                    adv()
+                } else {
+                    // Keep the size. `T[N]` declares N elements of storage, and
+                    // without it the binding is a NULL handle: `let d: i64[1]`
+                    // followed by `d[0] = 42` wrote through address 0 and
+                    // segfaulted. Discarding the size here is why every
+                    // ai.quanta test died at runtime.
+                    // parse_expr returns a VREG (0 for the first expression in a
+                    // function), not the literal value, so it cannot be stored as
+                    // the count. Materialise the value instead: if the size is a
+                    // bare number literal, take it straight from the token.
+                    let szsz = 0
+                    if peek()==TT_NUM { szsz = pval(); adv() } else { szsz = parse_expr() }
+                    w64(g_arrsz, szsz)
+                    if peek()==TT_PNCT && pval()==59 { adv() }  // optional ';' as in [T;N]
+                    if peek()==TT_PNCT && pval()==93 { adv() }  // ']'
+                }
+                vtype = 11  // VT_ARRAY (supersedes element vtype; array is its own tag)
+            }
+        } else if peek()==TT_STRING {
+            // 0.0.95: `String` type annotation (lexed as TT_STRING, not TT_KEY).
+            vtype = 10  // VT_STRING
+            adv()  // consume 'String'
+        }
+    }
+    
+    // `v` and `vr` must be in scope for BOTH paths: the tag-propagation block
+    // below (ownership, struct, string, big) reads them unconditionally. Declaring
+    // them inside the initialised branch left those reads dangling in the
+    // uninitialised one, which tagged a garbage vreg and corrupted the binding.
+    arrsz = r64(g_arrsz)     // sized `T[N]` element count, or 0 when unsized
+    let v = 0
+    let vr = 0
+    let mop2 = mop(61)      // 1 when an initialiser was present
+    if mop2 == 1 {
+        v = parse_expr(); vr = nv(); iremit(IR_MOV, vr, v, 0, 0); vadd(nm, nl, vr)
+        // 0.0.117: `let x: big = <int-expr>` must PROMOTE the RHS to a big when it
+        // is not already big-tagged (previously the vreg was tagged big but held a
+        // raw i64, so any big-op on it dereferenced garbage). big_promote is a no-op
+        // if v is already big.
+        if vtype==12 && r64(vreg_is_big + vr*8)!=1 {
+            vr = big_promote(vr)
+            vadd(nm,nl,vr)
+        }
+    } else {
+        // No initialiser: `let a: i64` or a bare `let a`. This IS a declaration and
+        // `a` must exist afterwards -- typed, and zero-initialised so a later
+        // `a = 1` resolves and a bare read sees 0.
+        //
+        // `mop` is "maybe operator": it consumes '=' and returns 1, or returns 0
+        // when it is absent. The old code called parse_expr() unconditionally, so
+        // with no '=' it swallowed whatever token came next as the initialiser and
+        // never established the binding at all -- `let a: i64` followed by `a = 1`
+        // failed with "undeclared variable: a", and a bare `let a` had the very
+        // same defect with no type annotation involved.
+        //
+        // This is what lib/std/ai.quanta relies on: its test functions open with
+        // declarations like `let data: i64[1], shape: i64[1]` and then assign
+        // into them.
+        // Zero the binding with a real STORE, not `IR_CONST`.
+        //
+        // `IR_CONST` marks the destination as holding a compile-time constant
+        // (`op_is_const` in codegen.quanta), so a later `a = 1` -- which
+        // correctly emits IR_MOV into that same vreg -- was dropped as a
+        // redundant store and every read saw 0. That is why `return a` and
+        // `printi(a)` disagreed with `a * 1` and `a * a`.
+        //
+        // Nor can the store simply be omitted: `nv()` only initialises vreg
+        // METADATA, so the value slot still holds whatever the page had and an
+        // unassigned read returned garbage (144, 140 -- not 0).
+        //
+        // So: MOV the destination from a constant-zero source. The destination
+        // is not itself marked constant, so later assignments to it survive.
+        // `vr` MUST alias the vreg actually bound. The tag-propagation block
+        // below indexes vreg_*[vr*8], and with vr left at 0 it stamped
+        // vreg slot 0 -- a live temp -- with this binding's struct/string/big
+        // tags. The next load out of that slot then read garbage: `return 0 + a`
+        // was correct (a is the right operand, already in a register) while
+        // `return a + 0` came back 0, because there `a` is loaded from the
+        // poisoned slot.
+        //
+        // A1b: each arm below sets `vr = zr` ITSELF. The redundant `vr = zr`
+        // that used to sit after the if/else was dead in both arms and only
+        // compiled because a block's bindings were never popped -- `zr` is
+        // declared INSIDE each arm, so that line resolved to the arm's leaked
+        // binding. Deleted rather than hoisted: zr is the arm's freshly
+        // allocated vreg and has no meaning outside the arm that made it.
+        if vtype==11 && arrsz>0 {
+            // A SIZED array annotation declares storage. `let d: i64[1]` means
+            // one element exists, and indexing it must reach memory -- with a
+            // null handle `d[0] = 42` wrote through address 0 and segfaulted.
+            //
+            // IR_ARRNEW takes the element count as the VALUE of the vreg in a0,
+            // not as a literal in the IR slot, so route the parsed size through
+            // a MOV to guarantee it is a vreg holding the count.
+            // IR_ARRNEW reads the count from vreg a0's slot, so the count must
+            // be a vreg holding it -- IR_CONST, not IR_MOV, whose a1 is also read
+            // as a vreg.
+            //
+            // UNINITIALISED COUNT SLOT. The vreg handed to IR_ARRNEW must HOLD
+            // the element count at run time, because IR_ARRNEW reads it from
+            // spill_home(a0) -- the register's value slot, not the IR literal.
+            // IR_CONST does NOT store: it marks the destination as a
+            // compile-time constant, so codegen emits no runtime write and the
+            // slot keeps whatever the page held. IR_ARRNEW then allocated
+            // from that garbage as a size and every `let x: T[N]` with no
+            // initialiser read wild memory -- a bare `let q: i64[1]` in main
+            // SIGSEGVed the compiler whenever an earlier function had shifted
+            // vreg numbering enough for the stale slot to look like a pointer.
+            //
+            // MOV the count from a separate constant source, exactly as the
+            // scalar branch below does. IR_MOV's a1 is also read as a vreg, so
+            // the source has to be a real vreg holding the literal: IR_CONST
+            // into the source, IR_MOV into the destination. The destination is
+            // not marked constant, so the store survives and later assignment
+            // into the array still works.
+            let aszsrc = nv(); iremit(IR_CONST, aszsrc, arrsz, 0, 0)
+            let szr = nv(); iremit(IR_MOV, szr, aszsrc, 0, 0)
+            let zr = nv(); iremit(IR_ARRNEW, zr, szr, 0, 0)
+            w64(vreg_type + zr*8, 11)
+            vadd(nm,nl,zr)
+            vr = zr
+        } else {
+            let zsrc = nv(); iremit(IR_CONST, zsrc, 0, 0, 0)
+            let zr = nv(); iremit(IR_MOV, zr, zsrc, 0, 0)
+            if vtype>0 { w64(vreg_type + zr*8, vtype) }
+            vadd(nm,nl,zr)
+            vr = zr
+        }
+        // `vr` MUST alias the vreg actually bound (see the comment above the
+        // if/else). Both arms assign it; `vr = zr` here would be dead and, since
+        // zr is arm-local, unresolvable under block scoping.
+    }
+    // 0.0.94: record ownership tag for the just-bound symbol (0 plain,1 mut,2 ref).
+    if own>0 { set_vown(nm,nl,own) }
+    // Tag propagation reads the INITIALISER's vreg. With no initialiser `v` is
+    // the placeholder 0, so these would read vreg slot 0 -- whatever live temp
+    // happens to be there -- and stamp its struct/string/big tags onto the new
+    // binding. That silently corrupted a `let a: i64`, whose `a` then read 0
+    // after a later `a = 1`. Skip the propagation when there is no initialiser;
+    // the tag the annotation itself implies is applied below regardless.
+    let hasinit = 0
+    if mop2 != 0 { hasinit = 1 }
+    if hasinit==1 {
+        let vsi = r64(vreg_struct + v*8)
+        if vsi>=0 { w64(vreg_struct + vr*8, vsi) }
+        let vss = r64(vreg_is_str + v*8)
+        if vss>=0 { w64(vreg_is_str + vr*8, vss) }
+    }
+    // 0.0.114: propagate a big RHS (big literal / big_* call result) onto the
+    // bound vreg, and honour an explicit `: big` annotation (vtype==12).
+    if hasinit==1 {
+        let vsb = r64(vreg_is_big + v*8)
+        if vsb>=0 { w64(vreg_is_big + vr*8, vsb) }
+    }
+    // 0.0.247: a typed-float RHS carries its FORMAT into the binding, so
+    // `let y = x` and `let y = <f32 call>` keep their f32/f16 identity instead
+    // of decaying to f64. Runs before the explicit `vtype==13/14` tag below, so
+    // an annotation still wins over the inferred format.
+    if hasinit==1 {
+        let vsf = r64(vreg_ftype + v*8)
+        if vsf != 0 { w64(vreg_ftype + vr*8, vsf) }
+        let vse = r64(vreg_ewidth + v*8)
+        if vse != 0 { w64(vreg_ewidth + vr*8, vse) }
+    }
+    if vtype==12 { w64(vreg_is_big + vr*8, 1) }
+    // 0.0.95: `String` annotation (vtype==10) means the RHS should be treated as a
+    // string at runtime (it is, once it holds a string-literal/concat result); tag
+    // vreg_is_str so print/concat/compare see it as a string even for a bare `let s: String = "x"`.
+    if vtype==10 { w64(vreg_is_str + vr*8, 1) }
+    // P6.1b: tag the vreg with its declared type (if any)
+    if vtype>0 { w64(vreg_type + vr*8, vtype) }
+    // 0.0.247: the FLOAT TYPE of the binding, and (for a typed buffer) its
+    // element width in bytes. A vreg_ftype tag promises the runtime value is
+    // exactly representable in that format, which is why the narrowing below
+    // runs FIRST: the tag describes the value, it does not create it.
+    if vtype==13 && r64(vreg_ftype + v*8)!=1 { vr = ft_narrow(vr, 1); vadd(nm,nl,vr) }
+    else if vtype==14 && r64(vreg_ftype + v*8)!=2 { vr = ft_narrow(vr, 2); vadd(nm,nl,vr) }
+    if vtype==13 { w64(vreg_ftype + vr*8, 1) }
+    else if vtype==14 { w64(vreg_ftype + vr*8, 2) }
+    if vtype==11 && felem>0 {
+        // `let b: f32[N]` / `let b: f16[N]`: a typed FLOAT BUFFER. 4 bytes per
+        // element, or 2. codegen's IR_IDX/IR_ISTORE read vreg_ewidth to pick
+        // the stride and the element width, which is what makes the storage
+        // actually narrower than the qword default instead of relabelled.
+        //
+        // vreg_ftype is deliberately NOT set on the BUFFER binding: `b` is a
+        // pointer, and a float tag on it would make `b + c` (two typed buffers)
+        // route into the f32 arithmetic builtins. The element type re-enters at
+        // the load, where parse_index_on and codegen's IR_IDX tag the ELEMENT.
+        w64(vreg_ewidth + vr*8, 4)
+        if felem==2 { w64(vreg_ewidth + vr*8, 2) }
+    }
+    // P6: for raw pointers, also store pointee type
+    if pointee_type>0 { w64(vreg_type + vr*8 + 8, pointee_type) }
+    // P10: fn-value binding. Tag the BOUND vreg (11) when the RHS is a fn
+    // value: either a chain (RHS vreg already tagged 11, `let g = f`) or a
+    // fresh IR_FNVAL result (`let f = double`). Tagged HERE, NOT at
+    // parse_primary's IR_FNVAL site: that site sits deep in parse_primary
+    // where live-local pressure trips the allocator's caller-saved clobber
+    // (self-host SIGSEGV; see comments ~280/~660/3176). parse_let's w64
+    // calls are proven safe (struct/str/type tags above).
+    let fvtag = r64(vreg_type + v*8)
+    if fvtag==11 { w64(vreg_type + vr*8, 11) }
+    else {
+        // The IR_MOV was just emitted, so a bare-fn-name RHS
+        // (IR_FNVAL) is the record BEFORE it: irc-2.
+        // Also check for IR_CLOSURE (closure literals).
+        let lr = irc - 2
+        if lr>=0 && (irop(lr)==IR_FNVAL || irop(lr)==IR_CLOSURE) && irres(lr)==v { w64(vreg_type + vr*8, 11) }
+    }
+    // P2 ownership: if RHS was a direct `mem_alloc(...)` call, this binding is
+    // compiler-owned -> free it automatically at scope exit. Detect by peeking
+    // the last IR record: IR_CALL whose callee name is `mem_alloc` (9 chars).
+    let last = irc - 1
+    if last>=0 {
+        let lop = irop(last)
+        if lop==IR_CALL {
+            let cnm = ira1(last); let cnl = ira2(last)
+            if cnl==9 && r8(src+cnm)=='m' && r8(src+cnm+1)=='e' && r8(src+cnm+2)=='m' && r8(src+cnm+3)=='_' && r8(src+cnm+4)=='a' && r8(src+cnm+5)=='l' && r8(src+cnm+6)=='l' && r8(src+cnm+7)=='o' && r8(src+cnm+8)=='c' {
+                w64(vreg_owned + vr*8, 1)
+                owned_add(vr)
+            }
+        }
+    }
+}
+
+fn parse_assign() {
+    let nm=pval(); let nl=plen()
+    adv()                     // consume the name
+    // G2: detect a[idx] = v  (subscript assignment, local array only)
+    if peek()==TT_PNCT&&pval()==91 {
+        adv()                     // consume '['
+        let idx=parse_expr()
+        mpnct(93)                 // ']'
+        mop(61)                   // '='
+        let v=parse_expr()
+        let f=vfind(nm,nl)
+        if f>=0 { iremit(IR_ISTORE, 0, f, idx, v); return 0 }
+        compile_error(1, nm, nl)  // undeclared base (global subscript-assign not impl)
+    }
+    mop(61); let v=parse_expr()
+    // CHAINED ASSIGNMENT: `a = b = c = expr` gives every name in the chain the
+    // value expr -- the semantics C gives.
+    //
+    // The compiler died with SIGILL on any chain before (0.0.217 through
+    // 0.0.220). parse_expr ran past the inner `=`, and parse_primary's fallback
+    // emitted CONST 0 WITHOUT advancing the cursor, so the statement loop
+    // re-entered on the same token and the desync produced corrupt IR.
+    // lib/std/rag.quanta used `cmd = cmd = cmd + "..."` in six places, which is
+    // why `import std/rag` had never compiled on any release.
+    //
+    // parse_primary now stops at `=` and returns without consuming it, so the
+    // cursor parks on the operator and this block drives the chain. `v` already
+    // holds the first link.
+    //
+    // Which requires LOOKAHEAD, and getting this wrong was the second failure:
+    // the obvious loop (`adv; nxt = parse_expr; store nxt as a link`) consumes
+    // the final VALUE as though it were a link, then parses a further expression
+    // past it. Traced on `a = b = c = 7` that gave nlinks=3 and val2=15 instead
+    // of 7. So: read a term, and only treat it as a link if another `=` follows
+    // it. Otherwise it was the value.
+    if peek()==TT_OP && pval()==61 {
+        let nlinks = 1
+        let links = mmap(CHAIN_MAX*8)
+        w64(links, v)
+        let val2 = 0
+        let more = 1
+        while more == 1 {
+            adv()                              // consume this link's '='
+            let nxt = parse_expr()             // next link, or the value
+            if peek()==TT_OP && pval()==61 {
+                if nlinks < CHAIN_MAX { w64(links + nlinks*8, nxt); nlinks = nlinks + 1 }
+            } else {
+                val2 = nxt
+                more = 0
+            }
+        }
+        let k = 0
+        while k < nlinks {
+            iremit(IR_MOV, r64(links + k*8), val2, 0, 0)
+            k = k + 1
+        }
+        // Fall THROUGH, do not return: `v` is the value, and the ordinary path
+        // below is what assigns the OUTERMOST name (`a` in `a = b = 5`).
+        // Returning here skipped it, so the leftmost name kept its old value
+        // and `a = b = 5` left a == 0.
+        v = val2
+    }
+    // 0.0.121 BY-REF WRITE: if the LHS is a capture of the current closure body,
+    // store the new value through the env pointer (mutate the enclosing local),
+    // not into the capread vreg. cap_count[c] is the slot; a1 = the value vreg.
+    if cur_clo >= 0 {
+        let cslot = cap_find(cur_clo, nm, nl)
+        if cslot >= 0 { iremit(IR_CAPWRITE, 0, cslot, v, 0); return 0 }
+    }
+    let f=vfind(nm,nl); if f>=0 {
+        iremit(IR_MOV,f,v,0,0)
+        // 0.0.114: propagate the big tag on reassignment (q = big_add(q, ONE)).
+        let vsb = r64(vreg_is_big + v*8)
+        if vsb>=0 { w64(vreg_is_big + f*8, vsb) }
+        return 0
+    }
+    let g=gfind(nm,nl); if g>=0 { escape_record(v); iremit(IR_STOREG,0,v,g); return 0 }
+    // SIMPLE-SURFACE: `=` auto-binds a NEW name when undeclared (no `let`
+    // required), bash-style. `let` stays valid for explicit declaration.
+    // Only reached for plain `name = expr` at statement level.
+    let vr=nv(); iremit(IR_MOV,vr,v,0,0); vadd(nm,nl,vr)
+    // 0.0.114: propagate big tag onto the auto-bound vreg too.
+    let vsb2 = r64(vreg_is_big + v*8)
+    if vsb2>=0 { w64(vreg_is_big + vr*8, vsb2) }
+}
+
+fn parse_if() {
+    adv(); let cv=parse_expr(); let el=nl(); let en=nl()
+    iremit(IR_BR,0,cv,el,en)
+    mpnct(123); parse_block(); mpnct(125)
+    iremit(IR_JMP,0,en,0,0); iremit(IR_LABEL,0,el,0,0)
+    if peek()==TT_KEY&&ktext(pval(),plen())==4 {
+        adv()
+        if peek()==TT_KEY&&ktext(pval(),plen())==3 { parse_if() }
+        else if peek()==TT_PNCT&&pval()==123 { mpnct(123); parse_block(); mpnct(125) }
+    }
+    iremit(IR_LABEL,0,en,0,0)
+}
+
+fn parse_while() {
+    adv()
+    let st=nl(); let en2=nl(); let ct=nl()
+    lbl_stk=lbl_stk+1; let bi=lbl_stk-1
+    // `continue` target is st, the CONDITION label, so the loop condition is
+    // re-evaluated before the next body pass. It must NOT be ct: ct is emitted
+    // immediately before the body, so jumping there re-enters the body top and
+    // skips the condition -- which re-runs any statement above the `continue`.
+    // With the increment written first that double-increments and corrupts the
+    // loop; with it written last the bug hides.
+    w64(lbl_brk+bi*8,en2); w64(lbl_cont+bi*8,st)
+    iremit(IR_LABEL,0,st,0,0); let cv=parse_expr()
+    iremit(IR_BR,0,cv,en2,ct); iremit(IR_LABEL,0,ct,0,0)
+    w64(loop_scope_stk + loop_scope_top*8, owned_sctop); loop_scope_top=loop_scope_top+1
+    mpnct(123); parse_block(); mpnct(125)
+    loop_scope_top=loop_scope_top-1
+    iremit(IR_JMP,0,st,0,0); iremit(IR_LABEL,0,en2,0,0)
+    lbl_stk=bi
+}
+
+fn parse_loop() {
+    adv(); let st=nl(); let en2=nl()
+    lbl_stk=lbl_stk+1; let bi=lbl_stk-1
+    w64(lbl_brk+bi*8,en2); w64(lbl_cont+bi*8,st)
+    iremit(IR_LABEL,0,st,0,0)
+    mpnct(123); parse_block(); mpnct(125)
+    iremit(IR_JMP,0,st,0,0); iremit(IR_LABEL,0,en2,0,0)
+    lbl_stk=bi
+}
+
+fn parse_for() {
+    adv(); let nm=pval(); let nl2=plen(); adv()
+    // P10: check for for-in syntax: `for item in arr`
+    // After the loop variable, if next token is 'in' (TT_IN), use for-in path.
+    if peek()==TT_IN {  // 'in'
+        adv()  // consume 'in'
+        // 0.0.76: detect range syntax `start..end` BEFORE parse_expr to avoid
+        // `..` being parsed as string concat (which SEGFAULTs on IR_ARRAY_LEN).
+        if peek()==TT_NUM {
+            let start_vr=nv(); iremit(IR_CONST, start_vr, pval(), 0, 0); adv()
+            if peek()==TT_OP && pval()==46*256+46 {  // '..'
+                adv()  // consume '..'
+                if peek()==TT_NUM {
+                    let end_vr=nv(); iremit(IR_CONST, end_vr, pval(), 0, 0); adv()
+                    // Range loop: for i in start..end
+                    mpnct(123)  // consume '{'
+                    let vr=nv(); vadd(nm,nl2,vr)
+                    let cond=nl(); let body=nl(); let end=nl(); let cont=nl()
+                    lbl_stk=lbl_stk+1; let bi=lbl_stk-1
+                    w64(lbl_brk+bi*8,end); w64(lbl_cont+bi*8,cont)
+                    let idx_vr=nv(); iremit(IR_MOV, idx_vr, start_vr, 0, 0)
+                    iremit(IR_JMP,0,cond,0,0)
+                    iremit(IR_LABEL,0,cond,0,0)
+                    let cmp=nv(); iremit(IR_LT, cmp, idx_vr, end_vr, 0)
+                    iremit(IR_BR,0,cmp,end,body)
+                    iremit(IR_LABEL,0,body,0,0)
+                    // Copy idx_vr into user's loop variable at start of body
+                    iremit(IR_MOV, vr, idx_vr, 0, 0)
+                    // user body
+                    w64(loop_scope_stk + loop_scope_top*8, owned_sctop); loop_scope_top=loop_scope_top+1
+                    mpnct(123); parse_block(); mpnct(125)
+                    loop_scope_top=loop_scope_top-1
+                    // increment and loop
+                    let one_vr=nv(); iremit(IR_CONST, one_vr, 1, 0, 0)
+                    let inc=nv(); iremit(IR_ADD, inc, idx_vr, one_vr, 0)
+                    iremit(IR_MOV, idx_vr, inc, 0, 0)
+                    iremit(IR_JMP,0,cond,0,0)
+                    iremit(IR_LABEL,0,end,0,0)
+                    lbl_stk=bi
+                    return
+                }
+            }
+        }
+        // Not a range ? fall back to for-in with parse_expr
+        let iter=parse_expr()  // the array/iterable expression
+        mpnct(123)  // consume '{'
+        // Register the loop variable
+        let vr=nv(); vadd(nm,nl2,vr)
+        // For-in loop: DO-WHILE pattern with condition at bottom (like while's parse_expr at label)
+        // entry: JMP -> cond
+        // cond: IR_LABEL(cond), IR_LT(idx_vr, len_vr), IR_BR -> body/end
+        // body: load element -> user body -> increment -> JMP cond
+        // end: exit
+        let cond=nl(); let body=nl(); let end=nl(); let cont=nl()
+        lbl_stk=lbl_stk+1; let bi=lbl_stk-1
+        w64(lbl_brk+bi*8,end); w64(lbl_cont+bi*8,cont)
+        // Load array length from header [base] using IR_ARRAY_LEN (op=69)
+        let len_vr=nv()
+        iremit(IR_ARRAY_LEN, len_vr, iter, 0, 0)
+        // Initialize idx_vr via MOV from zero to avoid optimizer constant-folding
+        let zero_vr=nv(); iremit(IR_CONST, zero_vr, 0, 0, 0)
+        let idx_vr=nv(); iremit(IR_MOV, idx_vr, zero_vr, 0, 0)
+        // Entry: JMP to condition check at bottom (first iteration evaluates condition)
+        iremit(IR_JMP,0,cond,0,0)
+        // Condition label - RE-EMIT condition here so JMP back re-evaluates
+        iremit(IR_LABEL,0,cond,0,0)
+        let cmp=nv(); iremit(IR_LT, cmp, idx_vr, len_vr, 0)
+        iremit(IR_BR,0,cmp,end,body)  // false -> end, true -> body
+        // Body label
+        iremit(IR_LABEL,0,body,0,0)
+        // Load element using CURRENT idx_vr (0-based element index)
+        iremit(32, vr, iter, idx_vr, 0)
+        // Parse body with owned scope
+        w64(loop_scope_stk + loop_scope_top*8, owned_sctop); loop_scope_top=loop_scope_top+1
+        let my_scope = owned_sctop
+        owned_scope_push()
+        // A1b: this body is a block, but it is an INLINE copy of parse_block's
+        // statement loop rather than a call to it, so it needs its own watermark
+        // or the for-in body leaks exactly like every other block did.
+        let my_varc = a1b_enter()
+        let was_fn = in_fn_body
+        if in_fn_body==0 { in_fn_body = 1 }
+        blk_depth = blk_depth + 1
+        while true {
+            if peek()==TT_EOF { break }
+            if peek()==TT_PNCT&&pval()==125 { break }
+            if peek()==TT_PNCT&&pval()==59 { adv(); continue }
+            let t=peek(); let v=pval(); let ln=plen()
+            if t==TT_KEY {
+                let h=ktext(v,ln)
+                if h==16 { parse_ret() }
+                else if h==2 { parse_let() }
+                else if h==3 { parse_if() }
+                else if h==6 { parse_while() }
+                else if h==5 { parse_loop() }
+                else if h==7 { parse_for() }
+                else if h==8 { adv(); if lbl_stk>0 { owned_pop_to(r64(loop_scope_stk+(loop_scope_top-1)*8)); let lb=r64(lbl_brk+(lbl_stk-1)*8); iremit(IR_JMP,0,lb,0,0) } }
+                else if h==9 { adv(); if lbl_stk>0 { owned_pop_to(r64(loop_scope_stk+(loop_scope_top-1)*8)); let lb=r64(lbl_cont+(lbl_stk-1)*8); iremit(IR_JMP,0,lb,0,0) } }
+                else if h==17 { adv(); adv(); adv(); adv() }
+                else if h==18 { parse_unsafe() }
+                else { adv() }
+            } else if t==TT_ID {
+                let nxt=tokp+1
+                if nxt<tokc&&tokt(nxt)==TT_PNCT&&tokv(nxt)==91 {
+                    let close=tokp+2; let depth=1
+                    while close<tokc&&depth>0 { if tokt(close)==TT_PNCT&&tokv(close)==91 { depth=depth+1 } else if tokt(close)==TT_PNCT&&tokv(close)==93 { depth=depth-1 }; close=close+1 }
+                    if close<tokc&&tokt(close)==TT_OP&&tokv(close)==61 { parse_assign() }
+                    else { parse_expr() }
+                } else if nxt<tokc&&tokt(nxt)==TT_OP&&tokv(nxt)==61 { parse_assign() }
+                else { parse_expr() }
+            } else if t==TT_PNCT&&v==123 {
+                adv(); parse_block(); mpnct(125)
+            } else if t==TT_NUM||t==TT_STR||t==TT_OP||t==TT_PNCT {
+                parse_expr()
+            } else { break }
+        }
+        // Increment idx_vr HERE - inside SAME owned scope as body (like while loop's user-written increment)
+        iremit(IR_LABEL,0,cont,0,0)  // continue target: run increment then re-check
+        let one=nv(); iremit(IR_CONST, one, 1, 0, 0)
+        let nidx=nv(); iremit(IR_ADD, nidx, idx_vr, one, 0)
+        let idx_vr2=nv(); iremit(IR_MOV, idx_vr2, nidx, 0, 0)
+        iremit(IR_MOV, idx_vr, idx_vr2, 0, 0)
+        // JMP back to condition check (which re-evaluates with UPDATED idx_vr)
+        iremit(IR_JMP,0,cond,0,0)
+        // Pop body scope
+        owned_scope_pop_one(my_scope)
+        // A1b: the for-in body is a block; drop its bindings here. (The loop
+        // variable itself was bound before the body's watermark, so its extent
+        // is the enclosing block -- the same choice the range and C-style forms
+        // make, and unchanged from 0.0.236.)
+        a1b_leave(my_varc)
+        blk_depth = blk_depth - 1
+        if in_fn_body==0 && was_fn==0 { in_fn_body = 0 }
+        // Close brace
+        mpnct(125)
+        iremit(IR_LABEL,0,end,0,0)
+        lbl_stk=bi
+        return
+    }
+    // C-style for loop (original implementation)
+    // Register the loop variable BEFORE parsing the init/condition/step
+    // expressions, so references to it in those expressions are not flagged
+    // as undeclared. (Same ordering fix as a `let` for an expression body.)
+    let vr=nv(); vadd(nm,nl2,vr)
+    mop(61)  // consume '=' after loop var name (for `for i = 0; ...`)
+    let sv=parse_expr(); mpnct(59)
+    let cond_pos=tokp; parse_expr(); mpnct(59)   // record + skip condition expr
+    let step_pos=tokp; adv(); mop(61); parse_expr()  // skip step expr "nm = RHS" (consume '=' like parse_assign)
+    let st=nl(); let en2=nl(); let ct=nl(); let ci=nl()
+    lbl_stk=lbl_stk+1; let bi=lbl_stk-1
+    w64(lbl_brk+bi*8,en2); w64(lbl_cont+bi*8,ci)
+    iremit(IR_MOV,vr,sv,0,0)
+    iremit(IR_LABEL,0,st,0,0)
+    // condition: re-parse each iteration; BR jumps to en2 when it is 0 (false)
+    let s1=tokp; tokp=cond_pos; let cv=parse_expr(); tokp=s1
+    iremit(IR_BR,0,cv,en2,ct)
+    iremit(IR_LABEL,0,ct,0,0)
+    w64(loop_scope_stk + loop_scope_top*8, owned_sctop); loop_scope_top=loop_scope_top+1
+    mpnct(123); parse_block(); mpnct(125)
+    loop_scope_top=loop_scope_top-1
+    iremit(IR_LABEL,0,ci,0,0)                     // continue target = increment
+    // step: re-parse each iteration; its value becomes the new loop variable
+    let s2=tokp; tokp=step_pos
+    // assignment step "nm = RHS" (skip var + '='); expr step "nm+RHS" (parse whole expression)
+    tokp=step_pos+1; let isa=0; if peek()==TT_OP&&pval()==61 { isa=1 }; tokp=step_pos
+    if isa==1 { adv(); mop(61) }
+    let ivr=parse_expr(); tokp=s2
+    iremit(IR_MOV,vr,ivr,0,0)
+    iremit(IR_JMP,0,st,0,0); iremit(IR_LABEL,0,en2,0,0)
+    lbl_stk=bi
+}
+
+// P6.1b: parse_match ? match expression with pattern matching
+fn parse_match() {
+    adv(); let disc=parse_expr()  // discriminant expression
+    mpnct(123)  // '{'
+    let end=nl()
+    // Result vreg for the match expression - allocated once, each arm writes to it
+    let res_vr = nv()
+    while true {
+        if peek()==TT_PNCT&&pval()==125 { adv(); break }
+        // match arm: pattern => expr
+        // Pattern: can be identifier (variant), wildcard '_', or literal
+            // Check for bare Some/None/Ok/Err first (built-in enum variants without prefix)
+            let hk_bare = ktext(pval(), plen())
+            if hk_bare==H_SOME || hk_bare==H_NONE || hk_bare==H_OK || hk_bare==H_ERR {
+                // Bare built-in enum variant pattern
+                let is_some_ok = 0
+                if hk_bare==H_SOME || hk_bare==H_OK { is_some_ok = 1 }
+                adv()  // consume the bare variant
+                let arm_skip=nl()
+                let zib=nv(); iremit(IR_CONST,zib,0,0,0)
+                let tag_vr=nv(); iremit(32,tag_vr,disc,zib,0)
+                let tag_c=nv(); iremit(IR_CONST,tag_c,is_some_ok,0,0)
+                let cmp=nv(); iremit(IR_EQ,cmp,tag_vr,tag_c,0)
+                iremit(IR_BR,0,cmp,arm_skip,0)
+                // Optional payload binder ( id )
+                if peek()==TT_PNCT && pval()==40 {
+                    adv()
+                    let pci=0
+                    while !(peek()==TT_PNCT && pval()==41) {
+                        if peek()==TT_ID {
+                            let pn=pval(); let pl=plen(); adv()
+                            let fld_vr=nv()
+                            let fi=nv(); iremit(IR_CONST,fi,1+pci,0,0)
+                            iremit(32,fld_vr,disc,fi,0)
+                            vadd(pn,pl,fld_vr)
+                            pci=pci+1
+                        } else { adv() }
+                        if peek()==TT_PNCT && pval()==44 { adv() }
+                    }
+                    adv()  // ')'
+                }
+                mop(61*256+62)  // '=>'
+                let arm_val=parse_expr()
+                iremit(IR_MOV,res_vr,arm_val,0,0)
+                iremit(IR_JMP,0,end,0,0)
+                iremit(IR_LABEL,0,arm_skip,0,0)
+            } else {
+            // Peek ahead to check for enum variant pattern (ID :: ID or ID . ID)
+            // without consuming tokens if it's not a known enum variant
+            let is_enum_variant = 0
+            let is_enum_variant = 0
+            if (tokp+2<tokc && tokt(tokp+1)==TT_OP && tokv(tokp+1)==58*256+58 && tokt(tokp+2)==TT_ID) ||
+               (tokp+2<tokc && tokt(tokp+1)==TT_PNCT && tokv(tokp+1)==46 && tokt(tokp+2)==TT_ID) {
+                let enum_nm = tokv(tokp); let enum_nl = tokln(tokp)
+                let variant_nm = tokv(tokp+2); let variant_nl = tokln(tokp+2)
+                let ei = findenum(enum_nm, enum_nl)
+                if ei>=0 {
+                    let vidx = evariant_idx(ei, variant_nm, variant_nl)
+                    if vidx>=0 {
+                        is_enum_variant = 1
+                    }
+                } else {
+                    // Builtin Option/Result variant pattern
+                    let hk_e = ktext(enum_nm, enum_nl)
+                    let hk_v = ktext(variant_nm, variant_nl)
+                    if hk_e==H_OPTION && (hk_v==H_SOME || hk_v==H_NONE) { is_enum_variant = 2 }
+                    if hk_e==H_RESULT && (hk_v==H_OK || hk_v==H_ERR) { is_enum_variant = 2 }
+                }
+            }
+            
+            if is_enum_variant == 2 {
+                // Builtin Option/Result pattern: tag Some/Ok=1, None/Err=0
+                let hk_v2 = ktext(tokv(tokp+2), tokln(tokp+2))
+                adv(); adv(); adv()   // consume ID sep ID
+                let btag = 0
+                if hk_v2==H_SOME || hk_v2==H_OK { btag = 1 }
+                let arm_skip=nl()
+                let zib=nv(); iremit(IR_CONST,zib,0,0,0)
+                let tag_vr=nv(); iremit(32,tag_vr,disc,zib,0)
+                let tag_c=nv(); iremit(IR_CONST,tag_c,btag,0,0)
+                let cmp=nv(); iremit(IR_EQ,cmp,tag_vr,tag_c,0)
+                iremit(IR_BR,0,cmp,arm_skip,0)
+                // Optional payload binder ( id )
+                if peek()==TT_PNCT && pval()==40 {
+                    adv()
+                    let pci=0
+                    while !(peek()==TT_PNCT && pval()==41) {
+                        if peek()==TT_ID {
+                            let pn=pval(); let pl=plen(); adv()
+                            let fld_vr=nv()
+                            let fi=nv(); iremit(IR_CONST,fi,1+pci,0,0)
+                            iremit(32,fld_vr,disc,fi,0)
+                            vadd(pn,pl,fld_vr)
+                            pci=pci+1
+                        } else { adv() }
+                        if peek()==TT_PNCT && pval()==44 { adv() }
+                    }
+                    adv()  // ')'
+                }
+                mop(61*256+62)  // '=>'
+                let arm_val=parse_expr()
+                iremit(IR_MOV,res_vr,arm_val,0,0)
+                iremit(IR_JMP,0,end,0,0)
+                iremit(IR_LABEL,0,arm_skip,0,0)
+            } else if is_enum_variant == 1 {
+                // Now consume the tokens for real
+                let enm=pval(); let enml=plen(); adv()
+                if (peek()==TT_OP && pval()==58*256+58) || (peek()==TT_PNCT && pval()==46) {
+                    adv()
+                    if peek()==TT_ID {
+                        let vnm=pval(); let vnl=plen(); adv()
+                        // Recompute ei and vidx since they were local to peek-ahead block
+                        let ei=findenum(enm,enml)
+                        let vidx=evariant_idx(ei,vnm,vnl)
+                        // Check tag: extract tag from disc, compare
+                        let arm_skip=nl()
+                        let zi0=nv(); iremit(IR_CONST,zi0,0,0,0)
+                        let tag_vr=nv(); iremit(32,tag_vr,disc,zi0,0)
+                        let tag_c=nv(); iremit(IR_CONST,tag_c,evariant_tag(ei,vidx),0,0)
+                        let cmp=nv(); iremit(IR_EQ,cmp,tag_vr,tag_c,0)
+                        iremit(IR_BR,0,cmp,arm_skip,0)
+                        // Payload pattern: optional ( id, id, ... ) ? bind each field
+                        if peek()==TT_PNCT && pval()==40 {
+                            adv()
+                            let pci=0
+                            while !(peek()==TT_PNCT && pval()==41) {
+                                if peek()==TT_ID {
+                                    let pn=pval(); let pl=plen(); adv()
+                                    let fld_vr=nv()
+                                    let fi=nv(); iremit(IR_CONST,fi,1+pci,0,0)
+                                    iremit(32,fld_vr,disc,fi,0)
+                                    vadd(pn,pl,fld_vr)
+                                    pci=pci+1
+                                } else { adv() }
+                                if peek()==TT_PNCT && pval()==44 { adv() }
+                            }
+                            adv()  // ')'
+                        }
+                        mop(61*256+62)  // '=>'
+                        let arm_val=parse_expr()
+                        iremit(IR_MOV,res_vr,arm_val,0,0)
+                        iremit(IR_JMP,0,end,0,0)
+                        iremit(IR_LABEL,0,arm_skip,0,0)
+                    }
+                }
+            } else {
+                // Literal pattern: 1 => ...  or  "x" => ...
+                if peek()==TT_NUM {
+                    let lit = pval(); adv()
+                    let arm_skip=nl()
+                    let lv=nv(); iremit(IR_CONST,lv,lit,0,0)
+                    let cmp=nv(); iremit(IR_EQ,cmp,disc,lv,0)
+                    iremit(IR_BR,0,cmp,arm_skip,0)
+                    mop(61*256+62)  // '=>'
+                    let arm_val=parse_expr()
+                    iremit(IR_MOV,res_vr,arm_val,0,0)
+                    iremit(IR_JMP,0,end,0,0)
+                    iremit(IR_LABEL,0,arm_skip,0,0)
+                } else if peek()==TT_STR {
+                    // String literal pattern: compare by source-offset identity
+                    // (works for matching a string literal against a string literal).
+                    let lit = pval(); adv()
+                    let arm_skip=nl()
+                    let lv=nv(); iremit(IR_CONST,lv,lit,0,0)
+                    let cmp=nv(); iremit(IR_EQ,cmp,disc,lv,0)
+                    iremit(IR_BR,0,cmp,arm_skip,0)
+                    mop(61*256+62)  // '=>'
+                    let arm_val=parse_expr()
+                    iremit(IR_MOV,res_vr,arm_val,0,0)
+                    iremit(IR_JMP,0,end,0,0)
+                    iremit(IR_LABEL,0,arm_skip,0,0)
+                } else {
+                    // Simple identifier binding - match any value and bind
+                    let bnm=pval(); let bnl=plen(); adv()
+                    let arm_skip=nl()
+                    let vr=nv(); iremit(IR_MOV,vr,disc,0,0)
+                    vadd(bnm,bnl,vr)
+                    // 0.0.69: optional GUARD -- `n if <cond> => expr`. The binder
+                    // is already in scope, so the condition may use it. If the
+                    // guard is false, skip this arm and fall through to the next.
+                    // Before 0.0.69 the `if` was not consumed here: mop('=>')
+                    // failed silently (returns 0 WITHOUT advancing), the arm's IR
+                    // came out malformed, and the whole match yielded 0 with no
+                    // diagnostic -- a silent wrong answer.
+                    if peek()==TT_KEY && ktext(pval(),plen())==3 {
+                        adv()                       // consume 'if'
+                        let gcond=parse_expr()      // guard condition
+                        iremit(IR_BR,0,gcond,arm_skip,0)   // false -> skip arm
+                    }
+                    mop(61*256+62)  // '=>'
+                    let arm_val=parse_expr()
+                    iremit(IR_MOV,res_vr,arm_val,0,0)
+                    iremit(IR_JMP,0,end,0,0)
+                    iremit(IR_LABEL,0,arm_skip,0,0)
+                }
+            }
+        } else if peek()==TT_PNCT && pval()==95 {  // '_' wildcard
+            adv()
+            let arm_skip=nl()
+            mop(61*256+62)  // '=>'
+            let arm_val=parse_expr()
+            iremit(IR_MOV,res_vr,arm_val,0,0)
+            iremit(IR_JMP,0,end,0,0)
+            iremit(IR_LABEL,0,arm_skip,0,0)
+        } else {
+            // Literal or other pattern - treat as equality check
+            let pat=parse_expr()
+            mop(61*256+62)  // '=>'
+            let arm_skip=nl()
+            let cmp=nv(); iremit(IR_EQ,cmp,pat,disc,0)
+            iremit(IR_BR,0,cmp,arm_skip,0)
+            let arm_val=parse_expr()
+            iremit(IR_MOV,res_vr,arm_val,0,0)
+            iremit(IR_JMP,0,end,0,0)
+            iremit(IR_LABEL,0,arm_skip,0,0)
+        }
+        if peek()==TT_PNCT&&pval()==44 { adv() }  // optional comma
+    }
+    iremit(IR_LABEL,0,end,0,0)
+    return res_vr
+}
+
+// === EXPRESSION PARSING ===
+fn parse_expr() { return parse_or() }
+
+fn parse_or() {
+    let l=parse_and()
+    // 0.0.70: accept BOTH `||` and the keyword `or` at this precedence level.
+    // Before 0.0.70 the keyword form was silently accepted by the tokenizer and
+    // then never consumed here, so `1==2 or 2==2` evaluated ONLY the first
+    // operand and discarded the rest -- returning 0 with no diagnostic.
+    while (peek()==TT_OP&&pval()==124*256+124) || (peek()==TT_KEY&&ktext(pval(),plen())==14) {
+        adv()
+        let vr=nv(); iremit(IR_MOV,vr,l,0,0)
+        let leval=nl(); let lend=nl()
+        iremit(IR_BR,0,vr,leval,0)   // if vr==0, need to eval RHS
+        iremit(IR_JMP,0,lend,0,0)    // vr!=0: short-circuit, keep truthy vr
+        iremit(IR_LABEL,0,leval,0,0)
+        let r=parse_and(); iremit(IR_MOV,vr,r,0,0)
+        iremit(IR_LABEL,0,lend,0,0)
+        l=vr
+    }
+    return l
+}
+fn parse_and() {
+    let l=parse_bor()
+    // 0.0.70: accept BOTH `&&` and the keyword `and` (see parse_or).
+    while (peek()==TT_OP&&pval()==38*256+38) || (peek()==TT_KEY&&ktext(pval(),plen())==13) {
+        adv()
+        let vr=nv(); iremit(IR_MOV,vr,l,0,0)
+        let lend=nl()
+        iremit(IR_BR,0,vr,lend,0)    // if vr==0: short-circuit, keep vr=0
+        let r=parse_bxor(); iremit(IR_MOV,vr,r,0,0)
+        iremit(IR_LABEL,0,lend,0,0)
+        l=vr
+    }
+    return l
+}
+fn parse_bor() {
+    let l=parse_bxor()
+    while peek()==TT_OP&&pval()==124 {
+        adv(); let r=parse_bxor(); let vr=nv()
+        if r64(vreg_is_big + l*8)==1 || r64(vreg_is_big + r*8)==1 {
+            // 0.0.117: big | big -> big_or (SIGN AWARE via two's-complement)
+            let cnm = big_nm(98,105,103,95,111,114,0,6)  // "big_or"
+            vr = big_binop_call(cnm, 6, l, r, 1)
+        } else { iremit(IR_BOR,vr,l,r,0) }
+        l=vr }
+    return l
+}
+fn parse_bxor() {
+    let l=parse_band()
+    while peek()==TT_OP&&pval()==94 {
+        adv(); let r=parse_band(); let vr=nv()
+        if r64(vreg_is_big + l*8)==1 || r64(vreg_is_big + r*8)==1 {
+            // 0.0.117: big ^ big -> big_xor
+            let cnm = big_nm(98,105,103,95,120,111,114,7)  // "big_xor"
+            vr = big_binop_call(cnm, 7, l, r, 1)
+        } else { iremit(IR_BXOR,vr,l,r,0) }
+        l=vr }
+    return l
+}
+fn parse_band() {
+    let l=parse_cmp()
+    while peek()==TT_OP&&pval()==38 {
+        // P6: '&' at the start of a NEW line is address-of of the next
+        // statement, not a bitwise-AND continuation (newlines are whitespace).
+        // Line number lives at TKS+16 (tokln/TKS+32 is the token LENGTH).
+        if tokp>0 && r64(toks + tokp*TKS + 16)!=r64(toks + (tokp-1)*TKS + 16) { break }
+        adv(); let r=parse_cmp(); let vr=nv()
+        if r64(vreg_is_big + l*8)==1 || r64(vreg_is_big + r*8)==1 {
+            // 0.0.117: big & big -> big_and
+            let cnm = big_nm(98,105,103,95,97,110,100,7)  // "big_and"
+            vr = big_binop_call(cnm, 7, l, r, 1)
+        } else { iremit(IR_BAND,vr,l,r,0) }
+        l=vr }
+    return l
+}
+
+fn parse_cmp() {
+    let l=parse_as()  // P6: 'as' cast binds tighter than comparison
+    while peek()==TT_OP {
+        let v=pval(); let rr=nv()
+        if v==61*256+61 { adv(); let r=parse_as()
+            let uo = user_binop(61*256+61, l, r)   // "=="
+            if uo >= 0 { l = uo }
+            else if r64(vreg_is_big + l*8)==1 || r64(vreg_is_big + r*8)==1 {
+                // 0.0.114: big == x -> big_eq (signed equality; result is int 0/1)
+                let cnm = big_nm(98,105,103,95,101,113,0,6)  // "big_eq"
+                l = big_binop_call(cnm, 6, l, r, 0)
+            }
+            else if r64(vreg_is_str + l*8)==1 && r64(vreg_is_str + r*8)==1 {
+                let cnm=srclen
+                w8(src+cnm,115); w8(src+cnm+1,116); w8(src+cnm+2,114); w8(src+cnm+3,95); w8(src+cnm+4,101); w8(src+cnm+5,113); w8(src+cnm+6,0)  // "str_eq\0"
+                srclen=cnm+7
+                let cavs=irc
+                let ca=nv(); iremit(IR_MOV,ca,l,0,0)
+                let cb=nv(); iremit(IR_MOV,cb,r,0,0)
+                let cr=nv(); iremit(IR_CALL,cr,cnm,2,cavs)
+                l=cr
+            } else { let fc = ft_cmp(61, l, r); if fc>=0 { l=fc } else { iremit(IR_EQ,rr,l,r,0); l=rr } }
+        }
+        else if v==33*256+61 { adv(); let r=parse_as()
+            let uo = user_binop(33*256+61, l, r)   // "!="
+            if uo >= 0 { l = uo }
+            else if r64(vreg_is_big + l*8)==1 || r64(vreg_is_big + r*8)==1 {
+                // 0.0.114: big != x -> !(big_eq) (result is int 0/1)
+                let cnm = big_nm(98,105,103,95,101,113,0,6)  // "big_eq"
+                let eq = big_binop_call(cnm, 6, l, r, 0)
+                iremit(IR_NOT, rr, eq, 0, 0); l = rr
+            }
+            else if r64(vreg_is_str + l*8)==1 && r64(vreg_is_str + r*8)==1 {
+                let cnm=srclen
+                w8(src+cnm,115); w8(src+cnm+1,116); w8(src+cnm+2,114); w8(src+cnm+3,95); w8(src+cnm+4,110); w8(src+cnm+5,101); w8(src+cnm+6,0)  // "str_ne\0"
+                srclen=cnm+7
+                let cavs=irc
+                let ca=nv(); iremit(IR_MOV,ca,l,0,0)
+                let cb=nv(); iremit(IR_MOV,cb,r,0,0)
+                let cr=nv(); iremit(IR_CALL,cr,cnm,2,cavs)
+                l=cr
+            } else { let fc = ft_cmp(33*256+61, l, r); if fc>=0 { l=fc } else { iremit(IR_NE,rr,l,r,0); l=rr } }
+        }
+        else if v==60 { let onm=pval(); let onl=plen(); adv(); let r=parse_as()
+            let uo = user_binop(60, l, r)
+            if uo>=0 { l=uo }
+            else if r64(vreg_is_big + l*8)==1 || r64(vreg_is_big + r*8)==1 {
+                // 0.0.117: big < x -> big_cmp(a,b) < 0  (SIGN AWARE; was compile_error(6))
+                let cnm = big_nm(98,105,103,95,99,109,112,7)  // "big_cmp"
+                let cr = big_binop_call(cnm, 7, l, r, 0)
+                let c0 = nv(); iremit(IR_CONST, c0, 0, 0, 0)
+                let rr2 = nv(); iremit(IR_LT, rr2, cr, c0, 0); l = rr2
+            }
+            else { let fc = ft_cmp(60, l, r); if fc>=0 { l=fc } else { iremit(IR_LT,rr,l,r,0); l=rr } } }
+        else if v==62 { let onm=pval(); let onl=plen(); adv(); let r=parse_as()
+            let uo = user_binop(62, l, r)
+            if uo>=0 { l=uo }
+            else if r64(vreg_is_big + l*8)==1 || r64(vreg_is_big + r*8)==1 {
+                // 0.0.117: big > x -> big_cmp(a,b) > 0
+                let cnm = big_nm(98,105,103,95,99,109,112,7)  // "big_cmp"
+                let cr = big_binop_call(cnm, 7, l, r, 0)
+                let c0 = nv(); iremit(IR_CONST, c0, 0, 0, 0)
+                let rr2 = nv(); iremit(IR_GT, rr2, cr, c0, 0); l = rr2
+            }
+            else { let fc = ft_cmp(62, l, r); if fc>=0 { l=fc } else { iremit(IR_GT,rr,l,r,0); l=rr } } }
+        else if v==60*256+61 { let onm=pval(); let onl=plen(); adv(); let r=parse_as()
+            let uo = user_binop(60*256+61, l, r)
+            if uo>=0 { l=uo }
+            else if r64(vreg_is_big + l*8)==1 || r64(vreg_is_big + r*8)==1 {
+                // 0.0.117: big <= x -> big_cmp(a,b) <= 0
+                let cnm = big_nm(98,105,103,95,99,109,112,7)  // "big_cmp"
+                let cr = big_binop_call(cnm, 7, l, r, 0)
+                let c0 = nv(); iremit(IR_CONST, c0, 0, 0, 0)
+                let rr2 = nv(); iremit(IR_LE, rr2, cr, c0, 0); l = rr2
+            }
+            else { let fc = ft_cmp(60*256+61, l, r); if fc>=0 { l=fc } else { iremit(IR_LE,rr,l,r,0); l=rr } } }
+        else if v==62*256+61 { let onm=pval(); let onl=plen(); adv(); let r=parse_as()
+            let uo = user_binop(62*256+61, l, r)
+            if uo>=0 { l=uo }
+            else if r64(vreg_is_big + l*8)==1 || r64(vreg_is_big + r*8)==1 {
+                // 0.0.117: big >= x -> big_cmp(a,b) >= 0
+                let cnm = big_nm(98,105,103,95,99,109,112,7)  // "big_cmp"
+                let cr = big_binop_call(cnm, 7, l, r, 0)
+                let c0 = nv(); iremit(IR_CONST, c0, 0, 0, 0)
+                let rr2 = nv(); iremit(IR_GE, rr2, cr, c0, 0); l = rr2
+            }
+            else { let fc = ft_cmp(62*256+61, l, r); if fc>=0 { l=fc } else { iremit(IR_GE,rr,l,r,0); l=rr } } }
+        else { break }
+    }
+    return l
+}
+
+fn parse_shift() {
+    let l=parse_add()
+    while peek()==TT_OP {
+        let v=pval(); let rr=nv()
+        if v==60*256+60 {
+            adv(); let r=parse_add()
+            if r64(vreg_is_big + l*8)==1 || r64(vreg_is_big + r*8)==1 {
+                // 0.0.117: big << n -> big_shl_signed(big_l, n)
+                rr = big_shift_call(0, l, r)
+            } else { iremit(IR_SHL,rr,l,r,0) }
+            l=rr
+        }
+        else if v==62*256+62 {
+            adv(); let r=parse_add()
+            if r64(vreg_is_big + l*8)==1 || r64(vreg_is_big + r*8)==1 {
+                // 0.0.117: big >> n -> big_shr_signed(big_l, n)
+                rr = big_shift_call(1, l, r)
+            } else { iremit(IR_SHR,rr,l,r,0) }
+            l=rr
+        }
+        else { break }
+    }
+    return l
+}
+
+// P6: parse 'as' cast operator (lower precedence than shift, higher than add)
+fn parse_as() {
+    let l=parse_shift()
+    while peek()==TT_AS {  // 'as' keyword token (TT_AS = 36, lexed from ktext 41)
+        adv()
+        // inline type parsing (like parse_let does)
+        let vtype = 0
+        if peek()==TT_KEY || (peek()==TT_ID && (ktext(pval(),plen())==67 || ktext(pval(),plen())==68 || ktext(pval(),plen())==69)) {
+            let hk = ktext(pval(), plen())
+            // ktext returns small keyword IDs: u8=44, u16=45, u32=46, u64=47, usize=48, bool=49, char=50, byte=51, mut=35
+            // 0.0.247: `as f32` / `as f16` / `as f64` -- a REAL cast now.
+            // The narrow direction emits the f64_to_f32/f64_to_f16 builtin (a
+            // rounded conversion); widening to f64 is free because an f32/f16
+            // payload is already exact in f64.
+            if hk==67 || hk==68 || hk==69 {
+                adv()  // consume the type name
+                let vr = nv()
+                if hk==69 { iremit(IR_MOV, vr, l, 0, 0); w64(vreg_ftype + vr*8, 0) }
+                else {
+                    // 0.0.248: ONE rounding. `as f16` used to be
+                    // ft_narrow(l, 1) followed by ft_narrow(nr, 2) -- an explicit
+                    // f64->f32 rounding and then an f32->f16 rounding, so the
+                    // value was rounded TWICE (and, before 0.0.248, three times,
+                    // since the f64->f16 builtin itself went through cvtsd2ss).
+                    // A cast is one rounding by definition: the target format is
+                    // the only precision the operation names.
+                    vr = ft_narrow(l, hk - 66)
+                }
+                w8(vfloat + vr, 1)
+                l = vr
+                continue
+            }
+            if hk==44 { vtype = 1 }
+            else if hk==45 { vtype = 2 }
+            else if hk==46 { vtype = 3 }
+            else if hk==47 { vtype = 4 }
+            else if hk==48 { vtype = 5 }
+            else if hk==49 { vtype = 6 }
+            else if hk==50 { vtype = 7 }
+            else if hk==51 { vtype = 8 }
+            else if hk==35 { vtype = 9 }  // mut
+            else if hk==55 { vtype = 0 }  // int -> signed default (vtype 0)
+            else if hk==62 { vtype = 12 } // 0.0.114: big -> VT_BIG (no truncation; big is a pointer type)
+            else { vtype = 0 }
+            adv()  // consume type keyword
+        }
+        let vr=nv()
+        // Tag the result vreg with the target width type (for downstream
+        // consistency / error checking). Truncation is emitted as a real
+        // IR_BAND with the width mask: a MOV+tag alone gets copy-propagated
+        // away (the cast vreg coalesces with its source), losing the mask.
+        // IR_BAND is a genuine operation so it survives copy-prop and actually
+        // truncates. Width types: 1=u8,7=char,8=byte -> 0xFF ; 2=u16 -> 0xFFFF ;
+        // 3=u32 -> 0xFFFFFFFF. Identity types (0/4/5/6) -> plain MOV.
+        w64(vreg_type + vr*8, vtype)
+        if vtype==1 || vtype==7 || vtype==8 {
+            let mc=nv(); iremit(IR_CONST, mc, 255, 0, 0); iremit(IR_BAND, vr, l, mc, 0)
+        } else if vtype==2 {
+            let mc=nv(); iremit(IR_CONST, mc, 65535, 0, 0); iremit(IR_BAND, vr, l, mc, 0)
+        } else if vtype==3 {
+            let mc=nv(); iremit(IR_CONST, mc, 4294967295, 0, 0); iremit(IR_BAND, vr, l, mc, 0)
+        } else {
+            iremit(IR_MOV, vr, l, 0, 0)
+        }
+        l=vr
+    }
+    return l
+}
+
+fn parse_add() {
+    let l=parse_mul()  // add binds looser than mul
+    while peek()==TT_OP {
+        let v=pval(); let rr=nv()
+        // P6: '-' at the start of a NEW line is a negation of the next
+        // statement, not a subtraction continuation (newlines are whitespace).
+        // Line number lives at TKS+16 (tokln/TKS+32 is the token LENGTH).
+        if v==45 && tokp>0 && r64(toks + tokp*TKS + 16)!=r64(toks + (tokp-1)*TKS + 16) { break }
+        // .. : string concatenation operator. Desugars to builtin str(a,b)
+        // (which mmaps a buffer and copies a then b). The builtin name "str"
+        // is injected past the end of src (srclen) once; tokenization is done,
+        // so this region is never re-scanned.
+        if v==46*256+46 {
+            adv()
+            let r=parse_mul()
+            let cnm = srclen
+            w8(src+cnm, 115); w8(src+cnm+1, 116); w8(src+cnm+2, 114); w8(src+cnm+3, 0)  // "str\0"
+            srclen = cnm + 4   // reserve the name slot so later literal writes don't clobber it
+            let cavs = irc
+            let ma = nv(); iremit(IR_MOV, ma, l, 0, 0)
+            let mb = nv(); iremit(IR_MOV, mb, r, 0, 0)
+            let cr = nv()
+            iremit(IR_CALL, cr, cnm, 2, cavs)
+            w64(vreg_is_str + cr*8, 1)   // str() returns a string -> tag it
+            l = cr
+        }
+        else if v==43 { adv(); let r=parse_mul()
+            let uo = user_binop(43, l, r)
+            if uo>=0 { l=uo }
+            else if r64(vreg_is_big + l*8)==1 || r64(vreg_is_big + r*8)==1 {
+                // 0.0.117: big + x -> big_add_signed (SIGN AWARE)
+                l = big_call_named(98,105,103,95,97,100,100,95,115,105,103,110,101,100, l, r)
+            }
+            else { let fa = ft_arith(0, l, r); if fa>=0 { l=fa } else { iremit(IR_ADD,rr,l,r,0); l=rr } } }
+        else if v==45 { adv(); let r=parse_mul()
+            let uo = user_binop(45, l, r)
+            if uo>=0 { l=uo }
+            else if r64(vreg_is_big + l*8)==1 || r64(vreg_is_big + r*8)==1 {
+                // 0.0.117: big - x -> big_sub_signed (SIGN AWARE)
+                l = big_call_named(98,105,103,95,115,117,98,95,115,105,103,110,101,100, l, r)
+            }
+            else { let fa = ft_arith(1, l, r); if fa>=0 { l=fa } else { iremit(IR_SUB,rr,l,r,0); l=rr } } }
+        else { break }
+    }
+    return l
+}
+
+fn parse_mul() {
+    let l=parse_unary()
+    while peek()==TT_OP {
+        let v=pval(); let rr=nv()
+        // P6: '*' at the start of a NEW line is a deref of the next statement,
+        // not a multiplication continuation (newlines are whitespace).
+        // Line number lives at TKS+16 (tokln/TKS+32 is the token LENGTH).
+        if v==42 && tokp>0 && r64(toks + tokp*TKS + 16)!=r64(toks + (tokp-1)*TKS + 16) { break }
+        if v==42 { adv(); let r=parse_unary()
+            let uo = user_binop(42, l, r)
+            if uo>=0 { l=uo }
+            else if r64(vreg_is_big + l*8)==1 || r64(vreg_is_big + r*8)==1 {
+                // 0.0.117: big * x -> big_mul_signed (SIGN AWARE)
+                l = big_call_named(98,105,103,95,109,117,108,95,115,105,103,110,101,100, l, r)
+            }
+            else { let fa = ft_arith(2, l, r); if fa>=0 { l=fa } else { iremit(IR_MUL,rr,l,r,0); l=rr } } }
+        else if v==47 { adv(); let r=parse_unary()
+            let uo = user_binop(47, l, r)
+            if uo>=0 { l=uo }
+            else if r64(vreg_is_big + l*8)==1 || r64(vreg_is_big + r*8)==1 {
+                // 0.0.114: big / x -> big_div
+                let cnm = big_nm(98,105,103,95,100,105,118,7)  // "big_div"
+                l = big_binop_call(cnm, 7, l, r, 1)
+            }
+            else { let fa = ft_arith(3, l, r); if fa>=0 { l=fa } else { iremit(IR_DIV,rr,l,r,0); l=rr } } }
+        else if v==37 { adv(); let r=parse_unary()
+            let uo = user_binop(37, l, r)
+            if uo>=0 { l=uo }
+            else if r64(vreg_is_big + l*8)==1 || r64(vreg_is_big + r*8)==1 {
+                // 0.0.114: big % x -> big_mod
+                let cnm = big_nm(98,105,103,95,109,111,100,7)  // "big_mod"
+                l = big_binop_call(cnm, 7, l, r, 1)
+            }
+            else { iremit(IR_MOD,rr,l,r,0); l=rr } }
+        else { break }
+    }
+    return l
+}
+
+fn parse_unary() {
+    // P6: raw pointer dereference: *p
+    if peek()==TT_OP&&pval()==42 {
+        adv()
+        let o=parse_unary()
+        let vr=nv()
+        // Check for mutable store: *p = v
+        if peek()==TT_OP && pval()==61 {
+            adv()
+            let val=parse_expr()
+            iremit(IR_DEREF_MUT, 0, o, val, 0)
+            return val  // return stored value for expression context
+        }
+        iremit(IR_DEREF, vr, o, 0, 0)
+        return vr
+    }
+    // P6: mutable raw pointer dereference: *p = v (handled above)
+    // P6: address-of: &p (for raw pointers)
+    //
+    // 0.0.259: `&GLOBAL` NOW PRODUCES THE GLOBAL'S STORAGE ADDRESS.
+    //
+    // Before this, &global was silently wrong. codegen's IR_PTR_CAST handler
+    // computed `lea rd, [rbp + spill_home(a0)]` -- the address of a0's HOME SLOT
+    // -- which is right for a local (a local's home slot IS its storage) and
+    // WRONG for a global, whose a0 vreg is an IR_LOADG temporary. So `&g` gave
+    // the address of a scratch frame slot holding a COPY of g. Measured
+    // consequences on 0.0.258, both silent:
+    //
+    //   * `atomic_add(&g, 1)` returned 0 forever and g was never modified, so a
+    //     work-stealing loop `i = atomic_add(&next, 1); while i < n {...}` never
+    //     terminated. This is the 931-of-2048-rows-wrong class.
+    //   * `&g` was not even stable: two uses in one function produced different
+    //     addresses (140450126102408 then 140450126102344), because each use
+    //     allocates a fresh temporary whose spill slot moves.
+    //
+    // THE FIX RECORDS THE FACT ONCE, IN THE PARSER, WHERE THE NAME IS KNOWN.
+    // The target is resolved here and its global index (g+1; 0 means "not a
+    // global") travels in the IR record's a1 field. It is NOT recovered later by
+    // scanning IR backwards for the defining IR_LOADG: that scan is exactly the
+    // "two divergent scans of one fact" defect this tree has paid for repeatedly,
+    // and it is unsound here as well, because the optimiser's dead-def pass
+    // rewrites an unread IR_LOADG into `MOV res,res` -- destroying the fact
+    // before codegen could look for it. Resolve once, record it, read it back.
+    // (a1 is unused for a2==1: it carries the target type tag only on the
+    // `x as T` cast path, a2==0.)
+    if peek()==TT_OP&&pval()==38 {
+        adv()
+        let gtag = 0
+        if peek()==TT_ID {
+            let g = gfind(pval(), plen())
+            if g >= 0 { gtag = g + 1 }
+        }
+        let o=parse_unary()
+        let vr=nv()
+        iremit(IR_PTR_CAST, vr, o, gtag, 1)  // a1 = global index+1 (0 = not a global), a2 = 1 = address-of
+        return vr
+    }
+    // 0.0.94: `move x` ? ownership-transfer prefix. Produces x's value (a plain
+    // copy, semantically identical today) and tags x's symbol as moved (3) so a
+    // later borrow-check pass (0.1.0) can reject a post-move use of x. The move
+    // is currently a no-op on codegen; it is recorded for the symbol table only.
+    if peek()==TT_MOVE {
+        adv()
+        let onm=pval(); let onl=plen()
+        let o=parse_unary()
+        // tag the source symbol moved if it resolves to a local binding
+        let src=vfind(onm,onl)
+        if src>=0 { set_vown(onm,onl,3) }
+        return o
+    }
+    if peek()==TT_OP {
+        let v=pval()
+        if v==45 { adv(); let o=parse_unary(); let vr=nv(); iremit(IR_NEG,vr,o,0,0); return vr }
+        if v==33 { adv(); let o=parse_unary(); let vr=nv(); iremit(IR_NOT,vr,o,0,0); return vr }
+        if v==126 { adv(); let o=parse_unary(); let vr=nv(); iremit(IR_BNOT,vr,o,0,0); return vr }
+    }
+    if peek()==TT_KEY&&ktext(pval(),plen())==15 {
+        adv(); let o=parse_unary(); let vr=nv(); iremit(IR_NOT,vr,o,0,0); return vr
+    }
+    // P6: volatile keyword prefix. `volatile` is lexed as TT_VOLATILE (34),
+    // NOT TT_KEY ? so we must match on the token type, not ktext (the old
+    // `peek()==TT_KEY && ktext==39` guard never matched, which silently dropped
+    // the whole `let v = volatile *p` binding and any following control flow).
+    if peek()==TT_VOLATILE {
+        adv()
+        // volatile *p = v  (store)
+        if peek()==TT_OP && pval()==42 {
+            adv()
+            let o=parse_unary()
+            if peek()==TT_OP && pval()==61 {
+                adv()
+                let val=parse_expr()
+                let vr=nv()
+                iremit(IR_VOLATILE_STORE, vr, o, val, 0)
+                return val
+            }
+            // volatile *p with no `=` following the deref: treat as load
+            let vr=nv()
+            iremit(IR_VOLATILE_LOAD, vr, o, 0, 0)
+            return vr
+        }
+        // volatile <expr>  (load)
+        let o=parse_unary()
+        let vr=nv()
+        iremit(IR_VOLATILE_LOAD, vr, o, 0, 0)
+        return vr
+    }
+    // Generic postfix: `.N` (numeric field) on any value vreg (inline tuple
+    // literal, fn result, etc). Name-bound `.field`/`.N` is still handled in
+    // parse_primary's TT_ID branch; this covers the value-not-yet-named case.
+    let v0 = parse_primary()
+    // P7: postfix `?` operator (try/unwrap) - binds tighter than `.field`
+    if peek()==TT_PNCT&&pval()==63 {  // '?'
+        adv()
+        // Tagged-union layout: [base+8]=tag (0=None/Err, 1=Some/Ok), [base+16]=payload.
+        // Emit IR_TRY: on tag==0 early-return the WHOLE value from the enclosing
+        // fn (rax holds the in-memory Option base); on tag==1 the result vreg =
+        // payload. The operand vreg (whole) must hold the base pointer.
+        let whole = v0
+        let pv=nv(); iremit(IR_TRY, pv, whole, 0, 0)
+        v0 = pv
+    }
+    while peek()==TT_PNCT&&pval()==46 {
+        adv()
+        if peek()==TT_NUM {
+            let fld=pval(); adv()
+            let fi=nv(); iremit(IR_CONST,fi,fld,0,0)
+            if peek()==TT_OP&&pval()==61 { adv(); let val=parse_expr(); iremit(IR_ISTORE,0,v0,fi,val); return v0 }
+            let vr=nv(); iremit(32,vr,v0,fi,0); v0=vr
+        } else { break }
+    }
+    return v0
+}
+
+
+
+// 0.0.96: try/catch exception handling.
+//   try { BODY } catch <name>? { HANDLER }
+// Emits: IR_TRY_PUSH(catch_lbl) ; BODY ; IR_TRY_END(catch_lbl) ; IR_JMP done_lbl ;
+//        <catch_lbl:> IR_CATCH(ev) ; HANDLER ; <done_lbl:>
+// The thrown value arrives in rax at the catch label (set by IR_THROW's unwinder);
+// if a binding name is given, ev is a fresh local vreg defined as rax (sdef in codegen).
+// NOTE: catch_lbl/done_lbl are bound via IR_LABEL (during ci_func), NOT a parse-time
+// lbladd() ? a parse-time lbladd() uses ip=0 and creates a stale entry that lblf()
+// matches first, making the IR_TRY_PUSH catch_ip patch resolve to 0 (-> throw jumps
+// to program entry -> infinite loop).
+fn parse_try() {
+    adv()   // consume 'try'
+    let catch_lbl = nl()
+    let done_lbl = nl()
+    iremit(IR_TRY_PUSH, 0, catch_lbl, 0, 0)
+    mpnct(123); parse_block(); mpnct(125)
+    // expect 'catch'
+    if peek()==TT_KEY && ktext(pval(),plen())==60 { adv() } else { /* tolerate missing catch */ }
+    // optional binding name
+    // A1b: the catch binding is scoped to the HANDLER block, not to the try's
+    // enclosing block. It used to be vadd'ed here, above the handler's own
+    // watermark, so `try {} catch e {}` left `e` resolvable for the rest of the
+    // enclosing function -- the same silent-rebind shape as an inner `let`.
+    let a1b_cwm = a1b_enter()
+    let ev = 0
+    if peek()==TT_ID { let nm=pval(); let nl2=plen(); adv(); ev = nv(); vadd(nm, nl2, ev) }
+    iremit(IR_TRY_END, 0, catch_lbl, 0, 0)
+    iremit(IR_JMP, 0, done_lbl, 0, 0)        // skip the catch handler on normal exit
+    iremit(IR_LABEL, 0, catch_lbl, 0, 0)     // bind during ci_func (real code offset)
+    iremit(IR_CATCH, ev, catch_lbl, 0, 0)
+    mpnct(123); parse_block(); mpnct(125)
+    a1b_leave(a1b_cwm)
+    iremit(IR_LABEL, 0, done_lbl, 0, 0)      // bind during ci_func
+}

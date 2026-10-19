@@ -160,7 +160,7 @@ no longer needs headroom that the programs it produces do not. The reclaim is
 enforced by a new gate row that forces exactly this cap:
 
 ```
-Stage 1.6n va-reclaim: the compiler SELF-COMPILES under a 1,572,864 KB
+Stage 1.6o va-reclaim: the compiler SELF-COMPILES under a 1,572,864 KB
 address-space cap and writes a binary.
 ```
 
@@ -207,8 +207,11 @@ the consistent, and the degenerate, answer.
 |---|---|
 | `-O` vs no-`O` on the tree | both `1e1edbe91f06e645483e8f965409ff61` — **`-O` remains byte-inert** |
 | 4-generation fixpoint | `1e1edbe9 x4`, distinct(g2,g3,g4) == 1 |
-| byte-identity, 249 rows | identical 249, differing 0, compile-fail 0 |
-| gate `run_tests.sh` | see the version's commit message / `WIP.md` |
+| byte-identity vs 0.0.258, 249 baseline rows | identical 248, differing 1 (`lfm2_threaded_pool_test.quanta`, the atomics row inherited from 0.0.260's base) |
+| instruction counts, 39 benchmark rows | identical 39, changed 0 (0 shrank, 0 grew) |
+| 0.0.260 seed chain from 0.0.259 golden | g1 == g2 == `d34ef3109a12bfc8b3057c541ed5d8df` == the committed binary |
+| gate `run_tests.sh` (`ulimit -c 0 -v 8000000`) | **36 GREEN, 0 RED, rc=0**; `functional 254/254 pass, 0 fail`; `OUTPUT-PATH GUARD: PASS` (12/12) |
+| `verify-release.sh 0.0.260 0.0.259` | **14 passed, 0 failed** (incl. `<VER>` bit-for-bit rebuild at `1e726928`, `<NEXT>` seed-chain lockstep, self-host fixed point) |
 
 ## 8. Growable arenas: priced, and why this version does not use them
 
@@ -313,6 +316,15 @@ not see this defect.
 ```
 0.0.258 / 0.0.259   9 PASS, 3 FAIL  -> OUTPUT-PATH GUARD: FAIL
 0.0.260            12 PASS, 0 FAIL  -> OUTPUT-PATH GUARD: PASS
+```
+
+In the gate the same three cases report, verbatim:
+
+```
+PASS unwritable dir (exited 1, 'qc: error: cannot open the output file for writing')
+PASS --emit-obj unwritable dir (exited 1, 'qc: error: cannot open the output file for writing')
+PASS missing parent (exited 1, 'qc: error: cannot open the output file for writing')
+OUTPUT-PATH GUARD: PASS
 ```
 
 The rest of that stage (the `qc SRC SRC` self-overwrite refusals) is untouched and

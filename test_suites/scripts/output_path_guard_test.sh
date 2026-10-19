@@ -113,6 +113,51 @@ refuse_case "--emit-obj SRC SRC" "$D/e.quanta" --emit-obj "$D/e.quanta" "$D/e.qu
 mkdir -p "$D/out"
 ok_case "qc SRC other-dir/OUT" "$D/d.quanta" "$D/out/d"
 
+# --- 9. an output path that cannot be CREATED must fail LOUDLY --------------
+# 0.0.260. `write_elf` discarded BOTH `file_open`'s and `file_write`'s return
+# values: a failed open left ofd negative, the `if ofd >= 0` guard skipped the
+# write, and the compiler exited 0 having produced nothing. This is the same
+# discarded-return class 0.0.257 opened one layer up (the --emit-qobj write), and
+# it is what made "oversized alloc died silently (exit 0, no binary)" possible to
+# mistake for success. Two independent unwritable shapes, because they fail for
+# different reasons and one of them (a missing parent) is NOT a permission test:
+#
+#   measured 0.0.258 / 0.0.259:  rc=0, no binary, nothing on stderr -- for both.
+#   measured 0.0.260:            rc=1, '"qc: error: cannot open the output file
+#                                for writing"'.
+unwritable_case() {
+    local label="$1"; shift
+    local out="$1"; shift
+    rm -f "$out"
+    local rc=0 msg
+    msg="$("$QC" "$@" 2>&1 >/dev/null)" || rc=$?
+    if [ "$rc" -eq 0 ]; then
+        echo "  FAIL $label: compiler exited 0 with no output at all -- a silent success (0.0.258/0.0.259 behaviour)"
+        FAIL=1
+        return
+    fi
+    if [ -e "$out" ]; then
+        echo "  FAIL $label: exited $rc but an output file exists anyway"
+        FAIL=1
+        return
+    fi
+    if [ -z "$msg" ]; then
+        echo "  FAIL $label: exited $rc but said NOTHING -- a failure a caller cannot attribute"
+        FAIL=1
+        return
+    fi
+    echo "  PASS $label (exited $rc, '$(echo "$msg" | head -1)')"
+}
+
+mk_src "$D/f.quanta"
+RO="$D/ro"
+mkdir -p "$RO"; chmod 555 "$RO"
+unwritable_case "unwritable dir" "$RO/f.bin" "$D/f.quanta" "$RO/f.bin"
+# the same shape in the other output mode, which shares write_elf
+unwritable_case "--emit-obj unwritable dir" "$RO/f.o" --emit-obj "$D/f.quanta" "$RO/f.o"
+chmod 755 "$RO"
+unwritable_case "missing parent" "$D/nodir/f.bin" "$D/f.quanta" "$D/nodir/f.bin"
+
 if [ "$FAIL" -eq 0 ]; then
     echo "  OUTPUT-PATH GUARD: PASS"
     exit 0

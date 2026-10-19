@@ -808,6 +808,73 @@ else
 fi
 rm -f "$CS1_OBJ"
 
+# --- Stage 1.6o: ADDRESS-SPACE RECLAIM GUARD (0.0.259/0.0.260) -----------------------
+# The compiler used to RESERVE 4.90 GB of address space to compile ANY input.
+# That was not memory: RSS stayed ~180 MB. It was a fixed set of up-front arenas
+# in globals.quanta, of which THREE 1 GiB reservations (`ir`, `lit_addr`,
+# `qir_mod`) plus a 512 MB `toks` and a 512 MB `code` were sized "big enough"
+# rather than from a measured high-water. The reservation, not memory, was what
+# the shipping ceiling (scripts/qcrun.sh COMPILER_MEM_MB=6144 = 6,291,456 KB)
+# constrained, and a compiler that runs out of address space dies SILENTLY:
+# exit 0, no binary, no diagnostic -- which is what made a codegen change worth
+# a few hundred bytes of arena classify as "the change broke the cache path".
+#
+# This row is the reclaim's own red-first guard, and it is a hard assertion, not
+# a ratio: force the address-space ceiling to VARG_LIMIT and require the
+# compiler to SELF-COMPILE inside it -- exit 0 AND a plausible binary on disk.
+# The "binary exists" half is load-bearing: the failure mode being guarded
+# against is rc=0 with nothing written, so a row that read the exit status alone
+# could not see it.
+#
+#   measured, bisected `ulimit -v` for the compiler's own source:
+#     0.0.258  4,903,320 KB   (RED under the cap below: rc=0, no binary)
+#     0.0.259 reclaim 1,006,640 KB   (GREEN, 56% margin)
+# VARG_LIMIT is 1,572,864 KB = 1536 MiB, the ceiling this version RECOMMENDS for
+# scripts/qcrun.sh's COMPILER_MEM_MB -- so the row asserts exactly the number the
+# project ships, rather than an arbitrary round figure.
+VARG_RC=0
+VARG_LIMIT=1572864
+VARG_W=/tmp/varg_stage
+rm -rf "$VARG_W"; mkdir -p "$VARG_W"
+VARG_SRC="compiler/$(cat "$REPO/VERSION")/src/x86/main.quanta"
+if [ ! -f "$VARG_SRC" ]; then
+  echo "  FAIL va-reclaim: $VARG_SRC missing (cannot self-compile the tree under test)"
+  VARG_RC=1
+else
+  ( cd "$REPO" || exit 1; ulimit -c 0; ulimit -v $VARG_LIMIT 2>/dev/null || true; \
+    timeout 900 "$QC" -O "$VARG_SRC" "$VARG_W/qc" >/dev/null 2>&1 )
+  varg_a=$?
+  varg_sz=$(stat -c%s "$VARG_W/qc" 2>/dev/null || echo 0)
+  if [ "$varg_a" -eq 0 ] && [ "$varg_sz" -gt 1000000 ]; then
+    echo "  PASS va-reclaim: the compiler self-compiles under a ${VARG_LIMIT} KB address-space cap (${varg_sz}-byte binary)"
+  else
+    echo "  FAIL va-reclaim: self-compile under a ${VARG_LIMIT} KB cap (rc=$varg_a, bytes=$varg_sz) -- either an oversized up-front arena reservation is back, or it died silently (rc=0 with no binary; 0.0.258 needs 4,903,320 KB)"
+    VARG_RC=1
+  fi
+fi
+rm -rf "$VARG_W"
+
+if [ ! -f "$CS1_SRC" ]; then
+  echo "  FAIL csave-guard: $CS1_SRC missing"
+  CS1_RC=1
+elif ! $QC --emit-obj "$CS1_SRC" "$CS1_OBJ" >/dev/null 2>&1; then
+  echo "  FAIL csave-guard: could not emit an object for the probe"
+  CS1_RC=1
+else
+  cs1_n=$(objdump -d "$CS1_OBJ" 2>/dev/null | awk '/<probe_fn>:/{f=1;next} /^$/{f=0} f' | grep -cE '^ +[0-9a-f]+:')
+  cs1_pp=$(objdump -d "$CS1_OBJ" 2>/dev/null | awk '/<probe_fn>:/{f=1;next} /^$/{f=0} f' | grep -cE 'push +%r(bx|12|13|14|15)|pop +%r(bx|12|13|14|15)')
+  if [ "${cs1_n:-0}" -le 0 ]; then
+    echo "  FAIL csave-guard: no probe_fn symbol in the emitted object (the probe must not fold away)"
+    CS1_RC=1
+  elif [ "$cs1_n" -gt "$CS1_MAX_INSTR" ]; then
+    echo "  FAIL csave-guard: probe_fn=$cs1_n instr (>$CS1_MAX_INSTR), callee-saved push/pop=$cs1_pp -- unused callee-saved registers are being saved again (see 0.0.258 CS1)"
+    CS1_RC=1
+  else
+    echo "  PASS csave-guard: probe_fn=$cs1_n instr (<=$CS1_MAX_INSTR), callee-saved push/pop=$cs1_pp"
+  fi
+fi
+rm -f "$CS1_OBJ"
+
 # --- Stage 1.5: EXTERN "C" FFI (object mode + gcc link) ----------------------
 # The main loop above compiles in EXEC mode only ($QC -O), where extern "C"
 # cannot resolve libc. This stage actually links a real libc FFI test so the
@@ -1395,6 +1462,7 @@ echo "  bare-metal    : $([ $BM_RC = 0 ] && echo GREEN || echo RED)  (ring-0 und
   constmul-guard : $([ "${F6C_RC:-1}" = 0 ] && echo GREEN || echo RED)  (0.0.255 F6: a constant multiplier uses the 3-operand imul, so the multiplicand copy is gone -- the emitted loop SHAPE, from the object bytes)
   immconst-guard : $([ "${F1I_RC:-1}" = 0 ] && echo GREEN || echo RED)  (0.0.256 V1: a single-use constant is folded into an immediate and never materialised -- the emitted loop SHAPE, from the object bytes)
   cache-precond-guard: $([ "${CAPG_RC:-1}" = 0 ] && echo GREEN || echo RED)  (0.0.257: the cache path fits the real compiler ceiling, a failed cache write is LOUD, and a truncated cache is refused -- raw rc/byte evidence, under a forced ulimit -v)
+  va-reclaim     : $([ "${VARG_RC:-1}" = 0 ] && echo GREEN || echo RED)  (0.0.259/0.0.260 VA: the compiler SELF-COMPILES under a 1,572,864 KB address-space cap and writes a binary -- raw rc + bytes, under a forced ulimit -v; the up-front arenas are sized from a measured high-water, not from "big enough")
   csave-guard    : $([ "${CS1_RC:-1}" = 0 ] && echo GREEN || echo RED)  (0.0.258 CS1: a callee-saved register the function never writes is neither pushed nor popped -- the emitted prologue/epilogue bytes, from the object bytes)"
 # Block promotion on a real functional/security/perf/valgrind/fuzz/diff/stdlib/mtu/qobj/verify-status
 # regression. Security KNOWN issues are surfaced by the script but do not turn
@@ -1421,7 +1489,7 @@ if [ $FUNCTIONAL_RC -ne 0 ] || [ $NATIVE_RC -ne 0 ] || [ $SECURITY_RC -ne 0 ] ||
    || [ $VALGRIND_RC -ne 0 ] || [ $FUZZ_RC -ne 0 ] || [ $DIFF_RC -ne 0 ] \
    || [ $GENERICS_RC -ne 0 ] || [ $STDLIB_RC -ne 0 ] || [ $MTU_RC -ne 0 ] \
    || [ $QOBJ_RC -ne 0 ] || [ $VERIFY_STATUS_RC -ne 0 ] || [ $OUTGUARD_RC -ne 0 ] || [ $NAKED_RC -ne 0 ] || [ $ASM_RC -ne 0 ] || [ $BM_RC -ne 0 ] \
-   || [ $GGUF_RC -ne 0 ] || [ $FPR_RC -ne 0 ] || [ $F16C_RC -ne 0 ] || [ $MARS_RC -ne 0 ] || [ "${F2D_RC:-1}" -ne 0 ] || [ "${F3T_RC:-1}" -ne 0 ] || [ "${A32_RC:-1}" -ne 0 ] || [ "${F6C_RC:-1}" -ne 0 ] || [ "${F1I_RC:-1}" -ne 0 ] || [ "${CAPG_RC:-1}" -ne 0 ] || [ "${CS1_RC:-1}" -ne 0 ]; then
+   || [ $GGUF_RC -ne 0 ] || [ $FPR_RC -ne 0 ] || [ $F16C_RC -ne 0 ] || [ $MARS_RC -ne 0 ] || [ "${F2D_RC:-1}" -ne 0 ] || [ "${F3T_RC:-1}" -ne 0 ] || [ "${A32_RC:-1}" -ne 0 ] || [ "${F6C_RC:-1}" -ne 0 ] || [ "${F1I_RC:-1}" -ne 0 ] || [ "${CAPG_RC:-1}" -ne 0 ] || [ "${CS1_RC:-1}" -ne 0 ] || [ "${VARG_RC:-1}" -ne 0 ]; then
   exit 1
 fi
 exit 0
