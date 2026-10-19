@@ -649,6 +649,62 @@ else
 fi
 rm -f "$F6C_OBJ" "$F6C_DIS"
 
+# --- Stage 1.6j: V1 SINGLE-USE-CONSTANT IMMEDIATE GUARD (0.0.256) --------------
+# 0.0.256 (V1) stops MATERIALISING a constant whose only reader has an immediate
+# encoding: no `mov $imm,%reg`, and no flush keeping its home current either. The
+# reader folds the literal into its own instruction (`imul rd,rsrc,imm32`,
+# `add/sub rd,imm32`, `cmp r,imm32`), which is why the loop body shrinks by the
+# number of single-use constants it contains.
+#
+# Same instrument as the guards above: the emitted object of
+# arith_immconst_probe.quanta, hot loop = the largest-span backward branch in
+# `main`. The probe's body holds EIGHT single-use constants.
+# MEASURED (loop-body instructions, --emit-obj + objdump):
+#   0.0.255 golden (pre-V1)  95  -> FAILS
+#   0.0.256 golden (V1)      85  -> PASSES
+# Threshold 90 sits between; counts are emitted bytes, load-independent.
+#
+# The probe ALSO has an EXPECTED.tsv row (rc 33) so it runs, and its comparison is
+# true for some iterations and false for others -- an inverted setcc would return
+# 75 and turn the row red. The byte count is the guard; the row is not allowed to
+# be a check that cannot fail.
+F1I_MAX_LOOP=90
+F1I_RC=0
+F1I_SRC="$TEST_SUITES/codes/arith_immconst_probe.quanta"
+F1I_OBJ="/tmp/f1i_probe.o"
+F1I_DIS="/tmp/f1i_probe.dis"
+if [ ! -f "$F1I_SRC" ]; then
+  echo "  FAIL immconst-guard: $F1I_SRC missing (the V1 red-first row)"
+  F1I_RC=1
+elif ! "$QC" --emit-obj "$F1I_SRC" "$F1I_OBJ" >/dev/null 2>&1; then
+  echo "  FAIL immconst-guard: probe failed to compile with --emit-obj"
+  F1I_RC=1
+else
+  objdump -d --no-show-raw-insn "$F1I_OBJ" > "$F1I_DIS" 2>/dev/null
+  read -r f1i_loop <<<"$(awk -v want=main "
+    /^[0-9a-f]+ <.*>:/ { name=\$2; gsub(/[<>:]/,\"\",name); infn=(name==want); next }
+    infn && /^[[:space:]]*[0-9a-f]+:/ {
+      n=split(\$0,a,\"\t\"); txt=(n>=2?a[2]:\$0)
+      addr=\$1; sub(/:\$/,\"\",addr); ia=strtonum(\"0x\" addr)
+      ord[ic]=ia; ic++
+      if (txt ~ /^j/) {
+        w=split(txt, b, /[[:space:]]+/)
+        if (w>=2 && b[2] ~ /^[0-9a-f]+\$/) { ta=strtonum(\"0x\" b[2]); if (ta < ia) { span=ia-ta; if (span>loopspan) { loopspan=span; lo=ta; hi=ia } } }
+      }
+    }
+    END { if (loopspan>0) for (k=0;k<ic;k++) if (ord[k]>=lo && ord[k]<=hi) loop++; printf \"%d\", loop+0 }" "$F1I_DIS")"
+  if [ "${f1i_loop:-0}" -le 0 ]; then
+    echo "  FAIL immconst-guard: no hot loop found in the probe (loop=$f1i_loop) -- the kernel must not fold"
+    F1I_RC=1
+  elif [ "$f1i_loop" -gt "$F1I_MAX_LOOP" ]; then
+    echo "  FAIL immconst-guard: loop body $f1i_loop > $F1I_MAX_LOOP (single-use constants are being materialised again; see 0.0.256 V1)"
+    F1I_RC=1
+  else
+    echo "  PASS immconst-guard: loop=$f1i_loop (<=$F1I_MAX_LOOP)"
+  fi
+fi
+rm -f "$F1I_OBJ" "$F1I_DIS"
+
 # --- Stage 1.5: EXTERN "C" FFI (object mode + gcc link) ----------------------
 # The main loop above compiles in EXEC mode only ($QC -O), where extern "C"
 # cannot resolve libc. This stage actually links a real libc FFI test so the
@@ -1233,7 +1289,8 @@ echo "  bare-metal    : $([ $BM_RC = 0 ] && echo GREEN || echo RED)  (ring-0 und
   deadstore-guard: $([ "${F2D_RC:-1}" = 0 ] && echo GREEN || echo RED)  (0.0.250 F2: the block-boundary flush stops storing dead temporaries -- the emitted loop SHAPE, from the object bytes)
   terminator-guard: $([ "${F3T_RC:-1}" = 0 ] && echo GREEN || echo RED)  (0.0.252 F3: a block terminator's operand is not stored-and-reloaded -- the emitted loop SHAPE, from the object bytes)
   spillframe-guard: $([ "${A32_RC:-1}" = 0 ] && echo GREEN || echo RED)  (0.0.253 A32: a float-using function RESERVES the float spill region in its frame -- the emitted prologue frame, from the object bytes)
-  constmul-guard : $([ "${F6C_RC:-1}" = 0 ] && echo GREEN || echo RED)  (0.0.255 F6: a constant multiplier uses the 3-operand imul, so the multiplicand copy is gone -- the emitted loop SHAPE, from the object bytes)"
+  constmul-guard : $([ "${F6C_RC:-1}" = 0 ] && echo GREEN || echo RED)  (0.0.255 F6: a constant multiplier uses the 3-operand imul, so the multiplicand copy is gone -- the emitted loop SHAPE, from the object bytes)
+  immconst-guard : $([ "${F1I_RC:-1}" = 0 ] && echo GREEN || echo RED)  (0.0.256 V1: a single-use constant is folded into an immediate and never materialised -- the emitted loop SHAPE, from the object bytes)"
 # Block promotion on a real functional/security/perf/valgrind/fuzz/diff/stdlib/mtu/qobj/verify-status
 # regression. Security KNOWN issues are surfaced by the script but do not turn
 # the gate red.
@@ -1259,7 +1316,7 @@ if [ $FUNCTIONAL_RC -ne 0 ] || [ $NATIVE_RC -ne 0 ] || [ $SECURITY_RC -ne 0 ] ||
    || [ $VALGRIND_RC -ne 0 ] || [ $FUZZ_RC -ne 0 ] || [ $DIFF_RC -ne 0 ] \
    || [ $GENERICS_RC -ne 0 ] || [ $STDLIB_RC -ne 0 ] || [ $MTU_RC -ne 0 ] \
    || [ $QOBJ_RC -ne 0 ] || [ $VERIFY_STATUS_RC -ne 0 ] || [ $OUTGUARD_RC -ne 0 ] || [ $NAKED_RC -ne 0 ] || [ $ASM_RC -ne 0 ] || [ $BM_RC -ne 0 ] \
-   || [ $GGUF_RC -ne 0 ] || [ $FPR_RC -ne 0 ] || [ $F16C_RC -ne 0 ] || [ $MARS_RC -ne 0 ] || [ "${F2D_RC:-1}" -ne 0 ] || [ "${F3T_RC:-1}" -ne 0 ] || [ "${A32_RC:-1}" -ne 0 ] || [ "${F6C_RC:-1}" -ne 0 ]; then
+   || [ $GGUF_RC -ne 0 ] || [ $FPR_RC -ne 0 ] || [ $F16C_RC -ne 0 ] || [ $MARS_RC -ne 0 ] || [ "${F2D_RC:-1}" -ne 0 ] || [ "${F3T_RC:-1}" -ne 0 ] || [ "${A32_RC:-1}" -ne 0 ] || [ "${F6C_RC:-1}" -ne 0 ] || [ "${F1I_RC:-1}" -ne 0 ]; then
   exit 1
 fi
 exit 0

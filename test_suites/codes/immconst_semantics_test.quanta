@@ -1,0 +1,68 @@
+// 0.0.256 (V1) semantics row -- a single-use constant folded into an IMMEDIATE.
+//
+// Every constant below has exactly ONE reader that has an immediate encoding, so
+// c1_analyze() elides its materialisation and the reader folds the literal into
+// its own instruction. This row pins the VALUES for all six comparisons with the
+// constant in BOTH operand slots (a0 == c needs the comparison inverted:
+// `c < x` is `x > c`), for add/sub/mul with the constant in either slot, and for
+// a constant divisor (whose strength-reduced path reads the literal from the IR
+// record rather than from a register).
+//
+// It also exercises the boundaries that must NOT take the immediate form:
+//   * 4294967296 (2^32) does not fit a sign-extended imm32;
+//   * a constant with TWO readers must stay materialised;
+//   * a constant compared against is still correct when the comparison is FALSE.
+//
+// Hand-derived: all twelve positive checks fire, so t == 12 -> exit 12.
+fn main() {
+    let a = 7
+
+    if a + 3 != 10 { exit(1) }
+    if 3 + a != 10 { exit(2) }
+    if a - 3 != 4 { exit(3) }
+    if 3 - a != 0 - 4 { exit(4) }
+    if a * 3 != 21 { exit(5) }
+    if 3 * a != 21 { exit(6) }
+    if a / 3 != 2 { exit(7) }
+    if a % 3 != 1 { exit(8) }
+
+    // int32 boundaries: both must stay exact.
+    let big = a + 4294967296
+    if big != 4294967303 { exit(9) }
+    let neg = a - 2147483648
+    if neg != 0 - 2147483641 { exit(10) }
+
+    // a constant with TWO readers must stay materialised and stay correct.
+    let k = 5
+    if a + k + k != 17 { exit(11) }
+
+    let t = 0
+    if a < 9 { t = t + 1 }
+    if 9 > a { t = t + 1 }
+    if a > 5 { t = t + 1 }
+    if 5 < a { t = t + 1 }
+    if a <= 7 { t = t + 1 }
+    if 7 >= a { t = t + 1 }
+    if a >= 7 { t = t + 1 }
+    if 7 <= a { t = t + 1 }
+    if a == 7 { t = t + 1 }
+    if 7 == a { t = t + 1 }
+    if a != 8 { t = t + 1 }
+    if 8 != a { t = t + 1 }
+
+    // the same twelve comparisons, FALSE -- an inverted setcc would take these.
+    if a < 5 { exit(20) }
+    if 5 > a { exit(21) }
+    if a > 9 { exit(22) }
+    if 9 < a { exit(23) }
+    if a <= 5 { exit(24) }
+    if 5 >= a { exit(25) }
+    if a >= 9 { exit(26) }
+    if 9 <= a { exit(27) }
+    if a == 8 { exit(28) }
+    if 8 == a { exit(29) }
+    if a != 7 { exit(30) }
+    if 7 != a { exit(31) }
+
+    exit(t)
+}

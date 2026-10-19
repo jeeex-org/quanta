@@ -1,0 +1,53 @@
+// 0.0.256 (V1) red-first row -- a single-use constant is consumed as an IMMEDIATE.
+//
+// Before this version every constant in this loop was MATERIALISED and kept
+// current in its home slot, because a constant is an ordinary vreg defined by an
+// earlier IR_CONST record:
+//
+//     mov  $0x7,%eax                 <- IR_CONST, one instruction
+//     mov  %rax,-0x98(%rbp,%riz,1)   <- the flush that keeps its home current
+//
+// and the operation then read it back out of a register. F6 (0.0.255) removed
+// only the COPY of the multiplicand; it did not touch either of those.
+//
+// This probe's body holds eight single-use constants, each read by an operation
+// that has an immediate encoding -- `i * 3` (imul rd,rsrc,imm32), `a + 5`
+// (add rd,imm32), `b - 2` (sub rd,imm32), `c / 7` and `d % 3` (whose
+// strength-reduced paths read the divisor from the IR RECORD, never from a
+// register), `e < 4` (cmp r,imm32) and `i + 1` -- plus the loop bound 8.
+//
+// The gate reads the loop body's instruction count out of the emitted object
+// (--emit-obj + objdump), which is exact emitted bytes and does not move with
+// load. MEASURED:
+//   0.0.255 golden (pre-V1)  95  -> FAILS
+//   0.0.256 golden (V1)      85  -> PASSES
+// Threshold 90 sits between. The count is not asserted to a single value: which
+// of the eight constants can be elided depends on the operand layout the reader
+// is allowed to use, and a future reader gaining an immediate form should be able
+// to lower this number, not fail the row.
+//
+// The return value is NOT what the guard reads (that is the loop-body byte
+// count), but it is asserted anyway so the probe also runs, and the comparison
+// is TRUE for some iterations and FALSE for others: `e >= 2` holds for
+// i = 4, 5 only, so an INVERTED setcc would return 75 instead of 33 and the
+// EXPECTED.tsv row would fail -- the guard is the byte count, but the row is not
+// allowed to be a test that cannot fail. (Both directions of all six comparisons,
+// each with the constant in BOTH operand slots, are pinned separately by
+// immconst_semantics_test.quanta.)
+//
+// Hand-derived: e = (floor((3i+3)/7)) % 3 = 0,0,1,1,2,2,0,0 for i=0..7, so the
+// condition holds at i=4,5 where c = 15, 18 -> s = 33.
+fn main() {
+    let s = 0
+    let i = 0
+    while i < 8 {
+        let a = i * 3
+        let b = a + 5
+        let c = b - 2
+        let d = c / 7
+        let e = d % 3
+        if e >= 2 { s = s + c }
+        i = i + 1
+    }
+    return s
+}
