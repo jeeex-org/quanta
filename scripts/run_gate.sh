@@ -4,7 +4,11 @@
 ulimit -c 0
 ulimit -v 68719476736
 ulimit -t 3000
-ulimit -f 1048576
+# The gguf-corrupt stage copies a 1.67 GB fixture 7 times; the guard stage
+# verifies the documented entry point's file-size limit permits that. The
+# bisected minimum VA for the compiler is 1,006,640 KB; the model is 1,674,455,072 B.
+# 8,388,608 blocks * 1024 = 8,589,934,592 B = 8 GiB (5.1x the largest fixture).
+ulimit -f 8388608
 REPO=$(cd "$(dirname "$(readlink -f "$0")")/.." && pwd)
 # Read VERSION rather than hardcoding a tree: a pinned old compiler makes a gate
 # report about a compiler nobody is shipping. Same bug as build_one.sh.

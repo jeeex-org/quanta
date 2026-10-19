@@ -1203,6 +1203,26 @@ else
   GGUF_RC=1
 fi
 
+# --- A41: GATE FILE-SIZE GUARD -----------------------------------------------
+# The documented entry point (scripts/run_gate.sh) sets ulimit -f. This stage
+# verifies that limit permits the largest gate fixture (the 1.67 GB gguf model)
+# to be copied byte-complete. On 0.0.260 the limit was 1 GiB (1048576 blocks),
+# which truncated the copy at exactly 1,073,741,824 bytes -- the gguf-corrupt
+# stage then failed 0/7 at generation time. This row is the red-first guard:
+# it was RED on the old limit, GREEN on the fixed limit.
+A41_RC=0
+if [ -f "$TEST_SUITES/scripts/gate_fsize_guard.sh" ]; then
+  # Inherits ulimit -f from run_gate.sh (the documented entry point).
+  if bash "$TEST_SUITES/scripts/gate_fsize_guard.sh"; then
+    A41_RC=0
+  else
+    A41_RC=1
+  fi
+else
+  echo "  FAIL: gate_fsize_guard.sh missing"
+  A41_RC=1
+fi
+
 if [ -f "$TEST_SUITES/scripts/qobj_gate.sh" ]; then
   if ! QC="$QC" bash "$TEST_SUITES/scripts/qobj_gate.sh"; then
     QOBJ_RC=1
@@ -1447,6 +1467,7 @@ echo "  generics      : $([ $GENERICS_RC = 0 ] && echo GREEN || echo RED)  (nega
 echo "  stdlib        : $([ $STDLIB_RC = 0 ] && echo GREEN || echo RED)  (lib/std/* via import, EXPECTED_STDLIB.tsv)"
 echo "  multi-tu      : $([ $MTU_RC = 0 ] && echo GREEN || echo RED)  (cross-TU call + global, --emit-obj + gcc link)"
 echo "  gguf-corrupt  : $([ $GGUF_RC = 0 ] && echo GREEN || echo RED)  (byte-level corrupt GGUF files must be rejected)"
+echo "  gate-fsize    : $([ $A41_RC = 0 ] && echo GREEN || echo RED)  (the documented run_gate.sh ulimit -f permits copying the largest gate fixture byte-complete)"
 echo "  verify-status : $([ $VERIFY_STATUS_RC = 0 ] && echo GREEN || echo RED)  (docs/status.json consistency)"
 echo "  qobj          : $([ $QOBJ_RC = 0 ] && echo GREEN || echo RED)  (module cache write/read/cache-only, G1+G3+G5+G4, plus G6 cache self-compile)"
 echo "  output-path   : $([ $OUTGUARD_RC = 0 ] && echo GREEN || echo RED)  (qc must refuse to overwrite its own input)"
@@ -1489,7 +1510,7 @@ if [ $FUNCTIONAL_RC -ne 0 ] || [ $NATIVE_RC -ne 0 ] || [ $SECURITY_RC -ne 0 ] ||
    || [ $VALGRIND_RC -ne 0 ] || [ $FUZZ_RC -ne 0 ] || [ $DIFF_RC -ne 0 ] \
    || [ $GENERICS_RC -ne 0 ] || [ $STDLIB_RC -ne 0 ] || [ $MTU_RC -ne 0 ] \
    || [ $QOBJ_RC -ne 0 ] || [ $VERIFY_STATUS_RC -ne 0 ] || [ $OUTGUARD_RC -ne 0 ] || [ $NAKED_RC -ne 0 ] || [ $ASM_RC -ne 0 ] || [ $BM_RC -ne 0 ] \
-   || [ $GGUF_RC -ne 0 ] || [ $FPR_RC -ne 0 ] || [ $F16C_RC -ne 0 ] || [ $MARS_RC -ne 0 ] || [ "${F2D_RC:-1}" -ne 0 ] || [ "${F3T_RC:-1}" -ne 0 ] || [ "${A32_RC:-1}" -ne 0 ] || [ "${F6C_RC:-1}" -ne 0 ] || [ "${F1I_RC:-1}" -ne 0 ] || [ "${CAPG_RC:-1}" -ne 0 ] || [ "${CS1_RC:-1}" -ne 0 ] || [ "${VARG_RC:-1}" -ne 0 ]; then
+   || [ $GGUF_RC -ne 0 ] || [ $FPR_RC -ne 0 ] || [ $F16C_RC -ne 0 ] || [ $MARS_RC -ne 0 ] || [ "$A41_RC" -ne 0 ] || [ "${F2D_RC:-1}" -ne 0 ] || [ "${F3T_RC:-1}" -ne 0 ] || [ "${A32_RC:-1}" -ne 0 ] || [ "${F6C_RC:-1}" -ne 0 ] || [ "${F1I_RC:-1}" -ne 0 ] || [ "${CAPG_RC:-1}" -ne 0 ] || [ "${CS1_RC:-1}" -ne 0 ] || [ "${VARG_RC:-1}" -ne 0 ]; then
   exit 1
 fi
 exit 0
