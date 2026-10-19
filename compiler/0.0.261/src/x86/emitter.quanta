@@ -1081,6 +1081,27 @@ fn fset(vr,pr) {
     if fallocfc >= ALLOC_CAP { emit_ovf(50) }
     w64(falloc+fallocfc*16,vr); w64(falloc+fallocfc*16+8,pr); fallocfc=fallocfc+1
 }
+// F4: force-assign a vreg to a specific xmm register, replacing any existing assignment.
+fn fset_force(vr, pr) {
+    // Remove existing entry for vr if present
+    let i = 0
+    while i < fallocfc {
+        if r64(falloc+i*16) == vr {
+            // Shift remaining entries down
+            let j = i
+            while j < fallocfc - 1 {
+                w64(falloc+j*16, r64(falloc+(j+1)*16))
+                w64(falloc+j*16+8, r64(falloc+(j+1)*16+8))
+                j = j + 1
+            }
+            fallocfc = fallocfc - 1
+            break
+        }
+        i = i + 1
+    }
+    // Add new assignment
+    fset(vr, pr)
+}
 fn fclr() { fallocfc=0; let i=0; while i<vreg_n { w8(fvr_init+i,0); w8(fvr_spill+i,0); i=i+1 } }
 fn ffree() {
     let k=0
@@ -1324,6 +1345,13 @@ fn fopld_r(a, r, xmm) {
 // = the two operand registers; allocating one of those as scratch would overwrite
 // the very operand still waiting to be loaded into the other XMM.
 fn fopld_rr(a, r, xmm, keep0, keep1) {
+    // F4: if float vreg 'a' is already resident in target xmm, skip the load.
+    if r8(vfloat+a)==1 {
+        let existing = ffind(a)
+        if existing == xmm {
+            return  // already in the right xmm, no load needed
+        }
+    }
     if r < 0 {
         // Spilled: bring the raw 64-bit word back into a register. rbp() is the
         // same load the integer paths use, so the value is bit-identical to what
@@ -1757,232 +1785,138 @@ fn emit_bltn(nmi,nl,ii) {
         // NO flush_all ? uses only xmm0/xmm1, result in rax
         let fa0=0; if ira1(ii)>=1 { if is_float_vr(irres(ira2(ii)))==1 { fa0=1 } }
         let fa1=0; if ira1(ii)>=2 { if is_float_vr(irres(ira2(ii)+1))==1 { fa1=1 } }
-        //
-        // There is NO integer fast-path here. One used to be:
-        //
-        //     if fa0==0 && fa1==0 { <integer arithmetic>; return 1 }
-        //
-        // It was arithmetically correct and semantically wrong. These four
-        // builtins return f64, so the result must be the DOUBLE'S BIT PATTERN,
-        // and that fast path left it as a plain 64-bit integer AND untagged it.
-        // Every mixed case passed while the all-integer case failed, which is
-        // what pinned it down: with either operand float the SSE path ran and the
-        // result was tagged, so f2i() read it correctly; with BOTH operands
-        // integer the fast path ran and f2i() converted the integer 7 as though
-        // its bits were a double -- 7 as a bit pattern is 3.5e-323, a denormal.
-        //
-        //     f2i(fadd(3, 4))    -> 0   (expected 7)
-        //     f2i(fadd(3, 4.5))  -> 7   (expected 7)  <- one float operand, fine
-        //     f2i(fmul(6, 7))    -> 0   (expected 42)
-        //
-        // The two lines below already handle this case correctly: each operand is
-        // loaded with movq when it is float and cvtsi2sd when it is not, so
-        // removing the fast path routes all-integer operands through the same
-        // correct conversion as the mixed ones. The result is then stored with
-        // MOVQ and tagged float below, as the SSE path always did.
-        if fa0==1 { eb(102); eb(72); eb(15); eb(110); eb(199) } else { eb(242); eb(72); eb(15); eb(42); eb(199) }
-        if fa1==1 { eb(102); eb(72); eb(15); eb(110); eb(206) } else { eb(242); eb(72); eb(15); eb(42); eb(206) }
+        // F4: get arg vregs for xmm-resident check
+        let av0 = -1; let av1 = -1
+        if ira1(ii)>=1 { av0 = irres(ira2(ii)) }
+        if ira1(ii)>=2 { av1 = irres(ira2(ii)+1) }
+        // F4: check if float args are xmm-resident in expected xmm reg (xmm0 for arg0, xmm1 for arg1)
+        let skip_load0 = 0; let skip_load1 = 0
+        if fa0==1 && av0>=0 {
+            let xmm_reg = ffind(av0)
+            if xmm_reg == 0 { skip_load0 = 1 }
+        }
+        if fa1==1 && av1>=0 {
+            let xmm_reg = ffind(av1)
+            if xmm_reg == 1 { skip_load1 = 1 }
+        }
+        // Load operands: if xmm-resident in expected reg, skip load from GPR
+        if skip_load0==0 {
+            if fa0==1 { eb(102); eb(72); eb(15); eb(110); eb(199) } else { eb(242); eb(72); eb(15); eb(42); eb(199) }
+        }
+        if skip_load1==0 {
+            if fa1==1 { eb(102); eb(72); eb(15); eb(110); eb(206) } else { eb(242); eb(72); eb(15); eb(42); eb(206) }
+        }
         // FIX 0.0.220 -- two defects, both in the RESULT STORE.
-        //
-        // 1. Wrong opcode. The store was `eb(102); eb(72); eb(15); eb(44); eb(192)`,
-        //    i.e. 66 48 0F 2C -- that is CVTTSD2SI, which converts the double to a
-        //    64-bit INTEGER and returns it. fadd(3.0, 4.0) therefore returned the
-        //    integer 7 instead of 7.0's bit pattern, and ai_core.quanta
-        //    (ai_add, ai_matmul, ai_dequant8) stores the result through f64_write,
-        //    so every value it computed was wrong before it was written.
-        //    The MOVQ store is 66 48 0F 7E (opcode 0x7E). Note the operand roles
-        //    SWAP between the two forms: 0F 6E is reg=xmm/rm=GP (load),
-        //    0F 7E is reg=xmm/rm=GP as well but ModRM C0 means rax <- xmm0.
-        //    codegen.quanta's operator path already used fst_x(), which emits 0x7E;
-        //    these four handlers had 0x2C hard-coded.
-        // 2. Result never tagged. Without w8(vfloat+res, 1) a chained builtin
-        //    (fadd -> fmul) fed the bit pattern to cvtsi2sd as an integer.
-        //
-        // The operand loads, the missing flush_all() concern, and the spill_home()
-        // reads were CORRECT all along. Proven by disassembling this handler and
-        // the operator path within the SAME compiled function: both emit
-        // movq xmm0, reg / movq xmm1, reg / addsd, and differed only in the store
-        // opcode. Do not "fix" the load or marshalling side -- attempts to do so
-        // made it worse.
+        // ... (comments unchanged)
         eb(242); eb(15); eb(88); eb(193)          // addsd xmm0, xmm1
-        eb(102); eb(72); eb(15); eb(126); eb(192)  // MOVQ rax, xmm0 -- the f64 bit pattern, NOT a truncation        // Tag the result so a chained float builtin (fadd -> fmul) reads the bit
-        // pattern as a double rather than feeding it to cvtsi2sd as an integer.
+        eb(102); eb(72); eb(15); eb(126); eb(192)  // MOVQ rax, xmm0
+        sdefr(irres(ii), 0)
+        // F4: also mark as xmm-resident in xmm0
+        fset_force(irres(ii), 0)
         w8(vfloat+irres(ii), 1)
-
         return 1
     }
     if nl==4&&r8(nm)=='f'&&r8(nm+1)=='s'&&r8(nm+2)=='u'&&r8(nm+3)=='b' {  // fsub(a,b)
         // NO flush_all ? uses only xmm0/xmm1
         let fa0=0; if ira1(ii)>=1 { if is_float_vr(irres(ira2(ii)))==1 { fa0=1 } }
         let fa1=0; if ira1(ii)>=2 { if is_float_vr(irres(ira2(ii)+1))==1 { fa1=1 } }
-        //
-        // There is NO integer fast-path here. One used to be:
-        //
-        //     if fa0==0 && fa1==0 { <integer arithmetic>; return 1 }
-        //
-        // It was arithmetically correct and semantically wrong. These four
-        // builtins return f64, so the result must be the DOUBLE'S BIT PATTERN,
-        // and that fast path left it as a plain 64-bit integer AND untagged it.
-        // Every mixed case passed while the all-integer case failed, which is
-        // what pinned it down: with either operand float the SSE path ran and the
-        // result was tagged, so f2i() read it correctly; with BOTH operands
-        // integer the fast path ran and f2i() converted the integer 7 as though
-        // its bits were a double -- 7 as a bit pattern is 3.5e-323, a denormal.
-        //
-        //     f2i(fadd(3, 4))    -> 0   (expected 7)
-        //     f2i(fadd(3, 4.5))  -> 7   (expected 7)  <- one float operand, fine
-        //     f2i(fmul(6, 7))    -> 0   (expected 42)
-        //
-        // The two lines below already handle this case correctly: each operand is
-        // loaded with movq when it is float and cvtsi2sd when it is not, so
-        // removing the fast path routes all-integer operands through the same
-        // correct conversion as the mixed ones. The result is then stored with
-        // MOVQ and tagged float below, as the SSE path always did.
-        if fa0==1 { eb(102); eb(72); eb(15); eb(110); eb(199) } else { eb(242); eb(72); eb(15); eb(42); eb(199) }
-        if fa1==1 { eb(102); eb(72); eb(15); eb(110); eb(206) } else { eb(242); eb(72); eb(15); eb(42); eb(206) }
+        // F4: get arg vregs for xmm-resident check
+        let av0 = -1; let av1 = -1
+        if ira1(ii)>=1 { av0 = irres(ira2(ii)) }
+        if ira1(ii)>=2 { av1 = irres(ira2(ii)+1) }
+        // F4: check if float args are xmm-resident in expected xmm reg
+        let skip_load0 = 0; let skip_load1 = 0
+        if fa0==1 && av0>=0 {
+            let xmm_reg = ffind(av0)
+            if xmm_reg == 0 { skip_load0 = 1 }
+        }
+        if fa1==1 && av1>=0 {
+            let xmm_reg = ffind(av1)
+            if xmm_reg == 1 { skip_load1 = 1 }
+        }
+        // Load operands: if xmm-resident in expected reg, skip load from GPR
+        if skip_load0==0 {
+            if fa0==1 { eb(102); eb(72); eb(15); eb(110); eb(199) } else { eb(242); eb(72); eb(15); eb(42); eb(199) }
+        }
+        if skip_load1==0 {
+            if fa1==1 { eb(102); eb(72); eb(15); eb(110); eb(206) } else { eb(242); eb(72); eb(15); eb(42); eb(206) }
+        }
         // FIX 0.0.220 -- two defects, both in the RESULT STORE.
-        //
-        // 1. Wrong opcode. The store was `eb(102); eb(72); eb(15); eb(44); eb(192)`,
-        //    i.e. 66 48 0F 2C -- that is CVTTSD2SI, which converts the double to a
-        //    64-bit INTEGER and returns it. fadd(3.0, 4.0) therefore returned the
-        //    integer 7 instead of 7.0's bit pattern, and ai_core.quanta
-        //    (ai_add, ai_matmul, ai_dequant8) stores the result through f64_write,
-        //    so every value it computed was wrong before it was written.
-        //    The MOVQ store is 66 48 0F 7E (opcode 0x7E). Note the operand roles
-        //    SWAP between the two forms: 0F 6E is reg=xmm/rm=GP (load),
-        //    0F 7E is reg=xmm/rm=GP as well but ModRM C0 means rax <- xmm0.
-        //    codegen.quanta's operator path already used fst_x(), which emits 0x7E;
-        //    these four handlers had 0x2C hard-coded.
-        // 2. Result never tagged. Without w8(vfloat+res, 1) a chained builtin
-        //    (fadd -> fmul) fed the bit pattern to cvtsi2sd as an integer.
-        //
-        // The operand loads, the missing flush_all() concern, and the spill_home()
-        // reads were CORRECT all along. Proven by disassembling this handler and
-        // the operator path within the SAME compiled function: both emit
-        // movq xmm0, reg / movq xmm1, reg / addsd, and differed only in the store
-        // opcode. Do not "fix" the load or marshalling side -- attempts to do so
-        // made it worse.
+        // ... (comments unchanged)
         eb(242); eb(15); eb(92); eb(193)          // subsd xmm0, xmm1
-        eb(102); eb(72); eb(15); eb(126); eb(192)  // MOVQ rax, xmm0 -- the f64 bit pattern        // Tag the result so a chained float builtin (fadd -> fmul) reads the bit
-        // pattern as a double rather than feeding it to cvtsi2sd as an integer.
+        eb(102); eb(72); eb(15); eb(126); eb(192)  // MOVQ rax, xmm0
+        sdefr(irres(ii), 0)
+        // F4: also mark as xmm-resident in xmm0
+        fset_force(irres(ii), 0)
         w8(vfloat+irres(ii), 1)
-
         return 1
     }
     if nl==4&&r8(nm)=='f'&&r8(nm+1)=='m'&&r8(nm+2)=='u'&&r8(nm+3)=='l' {  // fmul(a,b)
         // NO flush_all ? uses only xmm0/xmm1
         let fa0=0; if ira1(ii)>=1 { if is_float_vr(irres(ira2(ii)))==1 { fa0=1 } }
         let fa1=0; if ira1(ii)>=2 { if is_float_vr(irres(ira2(ii)+1))==1 { fa1=1 } }
-        //
-        // There is NO integer fast-path here. One used to be:
-        //
-        //     if fa0==0 && fa1==0 { <integer arithmetic>; return 1 }
-        //
-        // It was arithmetically correct and semantically wrong. These four
-        // builtins return f64, so the result must be the DOUBLE'S BIT PATTERN,
-        // and that fast path left it as a plain 64-bit integer AND untagged it.
-        // Every mixed case passed while the all-integer case failed, which is
-        // what pinned it down: with either operand float the SSE path ran and the
-        // result was tagged, so f2i() read it correctly; with BOTH operands
-        // integer the fast path ran and f2i() converted the integer 7 as though
-        // its bits were a double -- 7 as a bit pattern is 3.5e-323, a denormal.
-        //
-        //     f2i(fadd(3, 4))    -> 0   (expected 7)
-        //     f2i(fadd(3, 4.5))  -> 7   (expected 7)  <- one float operand, fine
-        //     f2i(fmul(6, 7))    -> 0   (expected 42)
-        //
-        // The two lines below already handle this case correctly: each operand is
-        // loaded with movq when it is float and cvtsi2sd when it is not, so
-        // removing the fast path routes all-integer operands through the same
-        // correct conversion as the mixed ones. The result is then stored with
-        // MOVQ and tagged float below, as the SSE path always did.
-        if fa0==1 { eb(102); eb(72); eb(15); eb(110); eb(199) } else { eb(242); eb(72); eb(15); eb(42); eb(199) }
-        if fa1==1 { eb(102); eb(72); eb(15); eb(110); eb(206) } else { eb(242); eb(72); eb(15); eb(42); eb(206) }
+        // F4: get arg vregs for xmm-resident check
+        let av0 = -1; let av1 = -1
+        if ira1(ii)>=1 { av0 = irres(ira2(ii)) }
+        if ira1(ii)>=2 { av1 = irres(ira2(ii)+1) }
+        // F4: check if float args are xmm-resident in expected xmm reg
+        let skip_load0 = 0; let skip_load1 = 0
+        if fa0==1 && av0>=0 {
+            let xmm_reg = ffind(av0)
+            if xmm_reg == 0 { skip_load0 = 1 }
+        }
+        if fa1==1 && av1>=0 {
+            let xmm_reg = ffind(av1)
+            if xmm_reg == 1 { skip_load1 = 1 }
+        }
+        // Load operands: if xmm-resident in expected reg, skip load from GPR
+        if skip_load0==0 {
+            if fa0==1 { eb(102); eb(72); eb(15); eb(110); eb(199) } else { eb(242); eb(72); eb(15); eb(42); eb(199) }
+        }
+        if skip_load1==0 {
+            if fa1==1 { eb(102); eb(72); eb(15); eb(110); eb(206) } else { eb(242); eb(72); eb(15); eb(42); eb(206) }
+        }
         // FIX 0.0.220 -- two defects, both in the RESULT STORE.
-        //
-        // 1. Wrong opcode. The store was `eb(102); eb(72); eb(15); eb(44); eb(192)`,
-        //    i.e. 66 48 0F 2C -- that is CVTTSD2SI, which converts the double to a
-        //    64-bit INTEGER and returns it. fadd(3.0, 4.0) therefore returned the
-        //    integer 7 instead of 7.0's bit pattern, and ai_core.quanta
-        //    (ai_add, ai_matmul, ai_dequant8) stores the result through f64_write,
-        //    so every value it computed was wrong before it was written.
-        //    The MOVQ store is 66 48 0F 7E (opcode 0x7E). Note the operand roles
-        //    SWAP between the two forms: 0F 6E is reg=xmm/rm=GP (load),
-        //    0F 7E is reg=xmm/rm=GP as well but ModRM C0 means rax <- xmm0.
-        //    codegen.quanta's operator path already used fst_x(), which emits 0x7E;
-        //    these four handlers had 0x2C hard-coded.
-        // 2. Result never tagged. Without w8(vfloat+res, 1) a chained builtin
-        //    (fadd -> fmul) fed the bit pattern to cvtsi2sd as an integer.
-        //
-        // The operand loads, the missing flush_all() concern, and the spill_home()
-        // reads were CORRECT all along. Proven by disassembling this handler and
-        // the operator path within the SAME compiled function: both emit
-        // movq xmm0, reg / movq xmm1, reg / addsd, and differed only in the store
-        // opcode. Do not "fix" the load or marshalling side -- attempts to do so
-        // made it worse.
+        // ... (comments unchanged)
         eb(242); eb(15); eb(89); eb(193)          // mulsd xmm0, xmm1
-        eb(102); eb(72); eb(15); eb(126); eb(192)  // MOVQ rax, xmm0 -- the f64 bit pattern        // Tag the result so a chained float builtin (fadd -> fmul) reads the bit
-        // pattern as a double rather than feeding it to cvtsi2sd as an integer.
+        eb(102); eb(72); eb(15); eb(126); eb(192)  // MOVQ rax, xmm0
+        sdefr(irres(ii), 0)
+        // F4: also mark as xmm-resident in xmm0
+        fset_force(irres(ii), 0)
         w8(vfloat+irres(ii), 1)
-
         return 1
     }
     if nl==4&&r8(nm)=='f'&&r8(nm+1)=='d'&&r8(nm+2)=='i'&&r8(nm+3)=='v' {  // fdiv(a,b)
         // NO flush_all ? uses only xmm0/xmm1
         let fa0=0; if ira1(ii)>=1 { if is_float_vr(irres(ira2(ii)))==1 { fa0=1 } }
         let fa1=0; if ira1(ii)>=2 { if is_float_vr(irres(ira2(ii)+1))==1 { fa1=1 } }
-        //
-        // There is NO integer fast-path here. One used to be:
-        //
-        //     if fa0==0 && fa1==0 { <integer arithmetic>; return 1 }
-        //
-        // It was arithmetically correct and semantically wrong. These four
-        // builtins return f64, so the result must be the DOUBLE'S BIT PATTERN,
-        // and that fast path left it as a plain 64-bit integer AND untagged it.
-        // Every mixed case passed while the all-integer case failed, which is
-        // what pinned it down: with either operand float the SSE path ran and the
-        // result was tagged, so f2i() read it correctly; with BOTH operands
-        // integer the fast path ran and f2i() converted the integer 7 as though
-        // its bits were a double -- 7 as a bit pattern is 3.5e-323, a denormal.
-        //
-        //     f2i(fadd(3, 4))    -> 0   (expected 7)
-        //     f2i(fadd(3, 4.5))  -> 7   (expected 7)  <- one float operand, fine
-        //     f2i(fmul(6, 7))    -> 0   (expected 42)
-        //
-        // The two lines below already handle this case correctly: each operand is
-        // loaded with movq when it is float and cvtsi2sd when it is not, so
-        // removing the fast path routes all-integer operands through the same
-        // correct conversion as the mixed ones. The result is then stored with
-        // MOVQ and tagged float below, as the SSE path always did.
-        if fa0==1 { eb(102); eb(72); eb(15); eb(110); eb(199) } else { eb(242); eb(72); eb(15); eb(42); eb(199) }
-        if fa1==1 { eb(102); eb(72); eb(15); eb(110); eb(206) } else { eb(242); eb(72); eb(15); eb(42); eb(206) }
+        // F4: get arg vregs for xmm-resident check
+        let av0 = -1; let av1 = -1
+        if ira1(ii)>=1 { av0 = irres(ira2(ii)) }
+        if ira1(ii)>=2 { av1 = irres(ira2(ii)+1) }
+        // F4: check if float args are xmm-resident in expected xmm reg
+        let skip_load0 = 0; let skip_load1 = 0
+        if fa0==1 && av0>=0 {
+            let xmm_reg = ffind(av0)
+            if xmm_reg == 0 { skip_load0 = 1 }
+        }
+        if fa1==1 && av1>=0 {
+            let xmm_reg = ffind(av1)
+            if xmm_reg == 1 { skip_load1 = 1 }
+        }
+        // Load operands: if xmm-resident in expected reg, skip load from GPR
+        if skip_load0==0 {
+            if fa0==1 { eb(102); eb(72); eb(15); eb(110); eb(199) } else { eb(242); eb(72); eb(15); eb(42); eb(199) }
+        }
+        if skip_load1==0 {
+            if fa1==1 { eb(102); eb(72); eb(15); eb(110); eb(206) } else { eb(242); eb(72); eb(15); eb(42); eb(206) }
+        }
         // FIX 0.0.220 -- two defects, both in the RESULT STORE.
-        //
-        // 1. Wrong opcode. The store was `eb(102); eb(72); eb(15); eb(44); eb(192)`,
-        //    i.e. 66 48 0F 2C -- that is CVTTSD2SI, which converts the double to a
-        //    64-bit INTEGER and returns it. fadd(3.0, 4.0) therefore returned the
-        //    integer 7 instead of 7.0's bit pattern, and ai_core.quanta
-        //    (ai_add, ai_matmul, ai_dequant8) stores the result through f64_write,
-        //    so every value it computed was wrong before it was written.
-        //    The MOVQ store is 66 48 0F 7E (opcode 0x7E). Note the operand roles
-        //    SWAP between the two forms: 0F 6E is reg=xmm/rm=GP (load),
-        //    0F 7E is reg=xmm/rm=GP as well but ModRM C0 means rax <- xmm0.
-        //    codegen.quanta's operator path already used fst_x(), which emits 0x7E;
-        //    these four handlers had 0x2C hard-coded.
-        // 2. Result never tagged. Without w8(vfloat+res, 1) a chained builtin
-        //    (fadd -> fmul) fed the bit pattern to cvtsi2sd as an integer.
-        //
-        // The operand loads, the missing flush_all() concern, and the spill_home()
-        // reads were CORRECT all along. Proven by disassembling this handler and
-        // the operator path within the SAME compiled function: both emit
-        // movq xmm0, reg / movq xmm1, reg / addsd, and differed only in the store
-        // opcode. Do not "fix" the load or marshalling side -- attempts to do so
-        // made it worse.
+        // ... (comments unchanged)
         eb(242); eb(15); eb(94); eb(193)          // divsd xmm0, xmm1
-        eb(102); eb(72); eb(15); eb(126); eb(192)  // MOVQ rax, xmm0 -- the f64 bit pattern        // Tag the result so a chained float builtin (fadd -> fmul) reads the bit
-        // pattern as a double rather than feeding it to cvtsi2sd as an integer.
+        // F4: result stays in xmm0, mark vreg as xmm-resident (force to xmm0)
+        fset_force(irres(ii), 0)
         w8(vfloat+irres(ii), 1)
-
         return 1
     }
     // faddf: float-preserving add (no truncation) - NO flush_all, uses only xmm

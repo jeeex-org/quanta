@@ -2143,12 +2143,21 @@ fn ci_func(fi, is_main) {
             // patterns (3.0 -> 1.0). An integer operand is converted with
             // cvtsi2sd by fopld; only if NEITHER is float is this integer add.
             if r8(vfloat+a0)==1 || r8(vfloat+a1)==1 {
-                let r1=aphys(a0); let r2=aphys(a1)
-            fopld_rr(a0, r1, 0, r1, r2); fopld_rr(a1, r2, 1, r1, r2)
-                    let rd=adistinct(res,r1,r2)
+                // F4 xmm-resident: check if float operands already in target xmm
+                let r1 = 0-1; let r2 = 0-1
+                if r8(vfloat+a0)==1 {
+                    let existing = ffind(a0)
+                    if existing != 0 { r1 = aphys(a0) }
+                } else { r1 = aphys(a0) }
+                if r8(vfloat+a1)==1 {
+                    let existing = ffind(a1)
+                    if existing != 1 { r2 = aphys(a1) }
+                } else { r2 = aphys(a1) }
+                if r1 != 0-1 { fopld_rr(a0, r1, 0, r1, r2) }
+                if r2 != 0-1 { fopld_rr(a1, r2, 1, r1, r2) }
                 eb(242); eb(15); eb(88); eb(193)      // addsd xmm0, xmm1 (inline)
-                fst_x(rd, 0)
-                sdef(res, rd); w8(vfloat+res, 1)
+                // F4: result stays in xmm0, mark vreg as xmm-resident (force to xmm0)
+                fset_force(res, 0); w8(vfloat+res, 1)
             } else {
             // 0.0.256 (V1): an ELIDED constant operand is added as an immediate.
             // `add r64, imm32` sets OF/ZF/SF/CF exactly as `add r64, r64` does,
@@ -2169,12 +2178,21 @@ fn ci_func(fi, is_main) {
         else if op==IR_SUB {
             // EITHER operand float, same as IR_ADD -- see the note there.
             if r8(vfloat+a0)==1 || r8(vfloat+a1)==1 {
-                let r1=aphys(a0); let r2=aphys(a1)
-                    fopld_rr(a0, r1, 0, r1, r2); fopld_rr(a1, r2, 1, r1, r2)
-                    let rd=adistinct(res,r1,r2)
+                // F4 xmm-resident: check if float operands already in target xmm
+                let r1 = 0-1; let r2 = 0-1
+                if r8(vfloat+a0)==1 {
+                    let existing = ffind(a0)
+                    if existing != 0 { r1 = aphys(a0) }
+                } else { r1 = aphys(a0) }
+                if r8(vfloat+a1)==1 {
+                    let existing = ffind(a1)
+                    if existing != 1 { r2 = aphys(a1) }
+                } else { r2 = aphys(a1) }
+                if r1 != 0-1 { fopld_rr(a0, r1, 0, r1, r2) }
+                if r2 != 0-1 { fopld_rr(a1, r2, 1, r1, r2) }
                 eb(242); eb(15); eb(92); eb(193)       // subsd xmm0, xmm1 (inline; fsub is reserved)
-                fst_x(rd, 0)
-                sdef(res, rd); w8(vfloat+res, 1)
+                // F4: result stays in xmm0, mark vreg as xmm-resident (force to xmm0)
+                fset_force(res, 0); w8(vfloat+res, 1)
             } else {
             // 0.0.256 (V1): an ELIDED constant in the SUBTRAHEND slot is `sub
             // rd, imm32`. Only slot 1: `c - x` cannot be an immediate subtract,
@@ -2198,12 +2216,21 @@ fn ci_func(fi, is_main) {
             // gguf_exp Taylor series (`term * r / i`) was dead. An integer operand
             // is converted with cvtsi2sd by fopld.
             if r8(vfloat+a0)==1 || r8(vfloat+a1)==1 {
-                let r1=aphys(a0); let r2=aphys(a1)
-                    fopld_rr(a0, r1, 0, r1, r2); fopld_rr(a1, r2, 1, r1, r2)
-                    let rd=adistinct(res,r1,r2)          // movq/cvtsi2sd into xmm0/xmm1
+                // F4 xmm-resident: check if float operands already in target xmm
+                let r1 = 0-1; let r2 = 0-1
+                if r8(vfloat+a0)==1 {
+                    let existing = ffind(a0)
+                    if existing != 0 { r1 = aphys(a0) }
+                } else { r1 = aphys(a0) }
+                if r8(vfloat+a1)==1 {
+                    let existing = ffind(a1)
+                    if existing != 1 { r2 = aphys(a1) }
+                } else { r2 = aphys(a1) }
+                if r1 != 0-1 { fopld_rr(a0, r1, 0, r1, r2) }
+                if r2 != 0-1 { fopld_rr(a1, r2, 1, r1, r2) }
                 eb(242); eb(15); eb(89); eb(193)      // mulsd xmm0, xmm1 (inline; fmul is reserved)
-                fst_x(rd, 0)                         // movq rd, xmm0 (raw float bits)
-                sdef(res, rd); w8(vfloat+res, 1)
+                // F4: result stays in xmm0, mark vreg as xmm-resident (force to xmm0)
+                fset_force(res, 0); w8(vfloat+res, 1)
             } else {
             // F6 (0.0.255): a CONSTANT multiplier (either operand) uses the
             // 3-operand imul form `imul rd, rsrc, imm32`: it reads the source
@@ -2544,12 +2571,21 @@ fn ci_func(fi, is_main) {
           // EITHER operand float -> SSE, same as IR_ADD/IR_MUL -- `1.0 / 2` used
           // to divide the raw bit-patterns on the integer idiv path and give 0.0.
           if r8(vfloat+a0)==1 || r8(vfloat+a1)==1 {
-            let r1=aphys(a0); let r2=aphys(a1)
-            fopld_rr(a0, r1, 0, r1, r2); fopld_rr(a1, r2, 1, r1, r2)          // movq/cvtsi2sd into xmm0/xmm1
-            let rd=adistinct(res,r1,r2)
+            // F4 xmm-resident: check if float operands already in target xmm
+            let r1 = 0-1; let r2 = 0-1
+            if r8(vfloat+a0)==1 {
+                let existing = ffind(a0)
+                if existing != 0 { r1 = aphys(a0) }
+            } else { r1 = aphys(a0) }
+            if r8(vfloat+a1)==1 {
+                let existing = ffind(a1)
+                if existing != 1 { r2 = aphys(a1) }
+            } else { r2 = aphys(a1) }
+            if r1 != 0-1 { fopld_rr(a0, r1, 0, r1, r2) }
+            if r2 != 0-1 { fopld_rr(a1, r2, 1, r1, r2) }
             eb(242); eb(15); eb(94); eb(193)      // divsd xmm0, xmm1 (inline; fdiv is reserved)
-            fst_x(rd, 0)                         // movq rd, xmm0 (raw float bits)
-            sdef(res, rd); w8(vfloat+res, 1)
+            // F4: result stays in xmm0, mark vreg as xmm-resident (force to xmm0)
+            fset_force(res, 0); w8(vfloat+res, 1)
           } else {
           // === 0.0.238: constant-divisor division by strength reduction ===
           //
@@ -3682,6 +3718,20 @@ fn ci_func(fi, is_main) {
             let is_ext_call=0
             if callee>=0 && r64(fn_extern + callee*8)==1 { is_ext_call=1 }
 
+            // F4: detect float builtins (fadd, fmul, fsub, fdiv) for xmm-resident arg passing
+            let is_fp_builtin = 0
+            if is_idx==0 {
+                if nl==4 {
+                    // fadd, fmul, fsub, fdiv
+                    if r8(src+nm)=='f' {
+                        let c1=r8(src+nm+1); let c2=r8(src+nm+2); let c3=r8(src+nm+3)
+                        if (c1=='a'&&c2=='d'&&c3=='d') || (c1=='m'&&c2=='u'&&c3=='l') || (c1=='s'&&c2=='u'&&c3=='b') || (c1=='d'&&c2=='i'&&c3=='v') {
+                            is_fp_builtin = 1
+                        }
+                    }
+                }
+            }
+
             // Spill args 6+ to the stack for NON-extern (internal) calls. Extern "C"
             // calls do their own spill AFTER the rsp-alignment push (in the extern
             // branch below), because pushing r11 for alignment must not land between
@@ -3715,7 +3765,24 @@ fn ci_func(fi, is_main) {
                         if arg_i==3 { preg=1 }
                         if arg_i==4 { preg=8 }
                         if arg_i==5 { preg=9 }
-                        rbp(preg, spill_home(av))
+                        // F4: for float builtins, if float arg is xmm-resident, move xmm->GPR instead of memory load
+                        let skip_mem_load = 0
+                        let xmm_reg = -1
+                        if is_fp_builtin==1 && (arg_i==0 || arg_i==1) && r8(vfloat+av)==1 {
+                            xmm_reg = ffind(av)
+                            if xmm_reg >= 0 {
+                                skip_mem_load = 1
+                            }
+                        }
+                        if skip_mem_load==0 {
+                            rbp(preg, spill_home(av))
+                        } else {
+                            // F4: movq preg, xmm_reg (any xmm register)
+                            // movq r64, xmm: 66 REX.W 0F 7E /r
+                            // ModRM = 0xC0 | (xmm_reg<<3) | preg
+                            let modrm = 192 + (xmm_reg*8) + preg
+                            eb(102); eb(72); eb(15); eb(126); eb(modrm)
+                        }
                         // P5: extern "C" ? skip the 8-byte Quanta length header on
                         // a string-valued arg so C receives a char* to the data.
                         if is_ext_call==1 {
