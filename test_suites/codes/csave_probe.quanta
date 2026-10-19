@@ -1,0 +1,24 @@
+// 0.0.258 (CS1) probe: probe_fn must write one of the ABI callee-saved registers
+// (RBX, R12-R15) or none. It writes NONE -- it uses only caller-saved temps,
+// which the allocator prefers and never evicts into a callee-saved home here.
+// So the prologue must not push RBX/R12-R15 and no epilogue may pop them.
+//
+// Counting probe_fn's instructions in the emitted object therefore measures the
+// elision directly: the fixed 5 pushes + 5 pops (25 = 5*2 bytes, 10
+// instructions, every one of them over 5 registers across 3 epilogues) are
+// either present or absent. The threshold in run_tests.sh sits between the two
+// measured values, so the row is RED before the lever and GREEN after it.
+fn probe_fn(a) {
+  let s = a
+  let i = 0
+  while i < 3 {
+    if i == 1 { s = s + 10 }
+    s = s + i
+    i = i + 1
+  }
+  return s
+}
+
+fn main() {
+  return probe_fn(1)
+}

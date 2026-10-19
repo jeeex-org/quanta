@@ -774,6 +774,40 @@ else
   fi
 fi
 
+# --- Stage 1.6m: CS1 CALLEE-SAVED ELISION GUARD (0.0.258) --------------------
+# 0.0.258 REMOVES the prologue push and every epilogue pop of an ABI callee-saved
+# register (RBX, R12-R15) that the function never writes, and widens the frame's
+# rsp adjustment by 8 per elided register (so the body's rsp is byte-for-byte
+# where it was). probe_fn writes NONE of the five.
+# Measured on the whole function, from --emit-obj + objdump:
+#   0.0.257: 86 instructions, 15 callee-saved push/pop   (> 80 -> RED)
+#   0.0.258: 74 instructions,  3 callee-saved push/pop   (<= 80 -> GREEN)
+CS1_MAX_INSTR=80
+CS1_RC=0
+CS1_SRC="$TEST_SUITES/codes/csave_probe.quanta"
+CS1_OBJ=/tmp/csave_probe.o
+rm -f "$CS1_OBJ"
+if [ ! -f "$CS1_SRC" ]; then
+  echo "  FAIL csave-guard: $CS1_SRC missing"
+  CS1_RC=1
+elif ! $QC --emit-obj "$CS1_SRC" "$CS1_OBJ" >/dev/null 2>&1; then
+  echo "  FAIL csave-guard: could not emit an object for the probe"
+  CS1_RC=1
+else
+  cs1_n=$(objdump -d "$CS1_OBJ" 2>/dev/null | awk '/<probe_fn>:/{f=1;next} /^$/{f=0} f' | grep -cE '^ +[0-9a-f]+:')
+  cs1_pp=$(objdump -d "$CS1_OBJ" 2>/dev/null | awk '/<probe_fn>:/{f=1;next} /^$/{f=0} f' | grep -cE 'push +%r(bx|12|13|14|15)|pop +%r(bx|12|13|14|15)')
+  if [ "${cs1_n:-0}" -le 0 ]; then
+    echo "  FAIL csave-guard: no probe_fn symbol in the emitted object (the probe must not fold away)"
+    CS1_RC=1
+  elif [ "$cs1_n" -gt "$CS1_MAX_INSTR" ]; then
+    echo "  FAIL csave-guard: probe_fn=$cs1_n instr (>$CS1_MAX_INSTR), callee-saved push/pop=$cs1_pp -- unused callee-saved registers are being saved again (see 0.0.258 CS1)"
+    CS1_RC=1
+  else
+    echo "  PASS csave-guard: probe_fn=$cs1_n instr (<=$CS1_MAX_INSTR), callee-saved push/pop=$cs1_pp"
+  fi
+fi
+rm -f "$CS1_OBJ"
+
 # --- Stage 1.5: EXTERN "C" FFI (object mode + gcc link) ----------------------
 # The main loop above compiles in EXEC mode only ($QC -O), where extern "C"
 # cannot resolve libc. This stage actually links a real libc FFI test so the
@@ -1360,7 +1394,8 @@ echo "  bare-metal    : $([ $BM_RC = 0 ] && echo GREEN || echo RED)  (ring-0 und
   spillframe-guard: $([ "${A32_RC:-1}" = 0 ] && echo GREEN || echo RED)  (0.0.253 A32: a float-using function RESERVES the float spill region in its frame -- the emitted prologue frame, from the object bytes)
   constmul-guard : $([ "${F6C_RC:-1}" = 0 ] && echo GREEN || echo RED)  (0.0.255 F6: a constant multiplier uses the 3-operand imul, so the multiplicand copy is gone -- the emitted loop SHAPE, from the object bytes)
   immconst-guard : $([ "${F1I_RC:-1}" = 0 ] && echo GREEN || echo RED)  (0.0.256 V1: a single-use constant is folded into an immediate and never materialised -- the emitted loop SHAPE, from the object bytes)
-  cache-precond-guard: $([ "${CAPG_RC:-1}" = 0 ] && echo GREEN || echo RED)  (0.0.257: the cache path fits the real compiler ceiling, a failed cache write is LOUD, and a truncated cache is refused -- raw rc/byte evidence, under a forced ulimit -v)"
+  cache-precond-guard: $([ "${CAPG_RC:-1}" = 0 ] && echo GREEN || echo RED)  (0.0.257: the cache path fits the real compiler ceiling, a failed cache write is LOUD, and a truncated cache is refused -- raw rc/byte evidence, under a forced ulimit -v)
+  csave-guard    : $([ "${CS1_RC:-1}" = 0 ] && echo GREEN || echo RED)  (0.0.258 CS1: a callee-saved register the function never writes is neither pushed nor popped -- the emitted prologue/epilogue bytes, from the object bytes)"
 # Block promotion on a real functional/security/perf/valgrind/fuzz/diff/stdlib/mtu/qobj/verify-status
 # regression. Security KNOWN issues are surfaced by the script but do not turn
 # the gate red.
@@ -1386,7 +1421,7 @@ if [ $FUNCTIONAL_RC -ne 0 ] || [ $NATIVE_RC -ne 0 ] || [ $SECURITY_RC -ne 0 ] ||
    || [ $VALGRIND_RC -ne 0 ] || [ $FUZZ_RC -ne 0 ] || [ $DIFF_RC -ne 0 ] \
    || [ $GENERICS_RC -ne 0 ] || [ $STDLIB_RC -ne 0 ] || [ $MTU_RC -ne 0 ] \
    || [ $QOBJ_RC -ne 0 ] || [ $VERIFY_STATUS_RC -ne 0 ] || [ $OUTGUARD_RC -ne 0 ] || [ $NAKED_RC -ne 0 ] || [ $ASM_RC -ne 0 ] || [ $BM_RC -ne 0 ] \
-   || [ $GGUF_RC -ne 0 ] || [ $FPR_RC -ne 0 ] || [ $F16C_RC -ne 0 ] || [ $MARS_RC -ne 0 ] || [ "${F2D_RC:-1}" -ne 0 ] || [ "${F3T_RC:-1}" -ne 0 ] || [ "${A32_RC:-1}" -ne 0 ] || [ "${F6C_RC:-1}" -ne 0 ] || [ "${F1I_RC:-1}" -ne 0 ] || [ "${CAPG_RC:-1}" -ne 0 ]; then
+   || [ $GGUF_RC -ne 0 ] || [ $FPR_RC -ne 0 ] || [ $F16C_RC -ne 0 ] || [ $MARS_RC -ne 0 ] || [ "${F2D_RC:-1}" -ne 0 ] || [ "${F3T_RC:-1}" -ne 0 ] || [ "${A32_RC:-1}" -ne 0 ] || [ "${F6C_RC:-1}" -ne 0 ] || [ "${F1I_RC:-1}" -ne 0 ] || [ "${CAPG_RC:-1}" -ne 0 ] || [ "${CS1_RC:-1}" -ne 0 ]; then
   exit 1
 fi
 exit 0
