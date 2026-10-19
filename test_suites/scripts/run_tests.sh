@@ -705,6 +705,75 @@ else
 fi
 rm -f "$F1I_OBJ" "$F1I_DIS"
 
+# --- Stage 1.6l: CACHE-PATH PRECONDITION GUARD (0.0.257) ---------------------
+# Three preconditions of the .qobj cache path that were measurably FALSE on
+# 0.0.256 (RED, verified) and are TRUE on 0.0.257 (GREEN). They are three
+# consequences of one address-space defect: `ir_unsafe` (globals.quanta) is a
+# ONE-BYTE-per-IR-record table that was sized against the WRONG IR_CAP, so it
+# allocated 1610612736 bytes = 1.57 GB for a 25.6 MB table. That waste left the
+# compiler 13 KB under scripts/qcrun.sh's COMPILER_MEM_MB=6144 ceiling
+# (6,291,456 KB), and the cache path additionally reported failure as success.
+#
+#   (a) cache-cap      -- under that ceiling, --emit-qobj must WRITE a cache.
+#                         0.0.256 fails the step (bare exit 1, no file at all).
+#   (b) cache-failloud -- a cache write that cannot succeed must exit NON-ZERO.
+#                         0.0.256 exits 0 having written nothing: a silent
+#                         success a caller cannot tell from a good cache.
+#   (c) cache-trunc    -- a truncated cache must be REFUSED, by name, not
+#                         consumed. 0.0.256 builds a binary from a 200-byte
+#                         cache -- a wrong answer instead of a diagnostic.
+CAPG_RC=0
+CAPG_LIMIT=6291456    # scripts/qcrun.sh COMPILER_MEM_MB (6144) * 1024
+CAPG_W=/tmp/capg_stage
+rm -rf "$CAPG_W"; mkdir -p "$CAPG_W/ro" "$CAPG_W/use"
+chmod 555 "$CAPG_W/ro"
+
+# (a) under the cap, the cache write must produce a file
+rm -f "$CAPG_W/cap.qobj"
+( cd "$REPO" || exit 1; ulimit -v $CAPG_LIMIT 2>/dev/null || true; \
+  timeout 300 "$QC" --emit-qobj benchmarks/benchmark_file_io.quanta "$CAPG_W/cap.qobj" >/dev/null 2>&1 )
+capg_a=$?
+capg_asz=$(stat -c%s "$CAPG_W/cap.qobj" 2>/dev/null || echo 0)
+if [ "$capg_a" -eq 0 ] && [ "$capg_asz" -gt 0 ]; then
+  echo "  PASS cache-cap: --emit-qobj wrote $capg_asz bytes under a ${CAPG_LIMIT} KB cap"
+else
+  echo "  FAIL cache-cap: --emit-qobj under a ${CAPG_LIMIT} KB cap (rc=$capg_a, bytes=$capg_asz) -- the compiler does not fit its own ceiling (see 0.0.257 ir_unsafe reclaim)"
+  CAPG_RC=1
+fi
+
+# (b) an impossible cache write must be loud
+( cd "$REPO" || exit 1; ulimit -v 8000000 2>/dev/null || true; \
+  timeout 300 "$QC" --emit-qobj benchmarks/benchmark_file_io.quanta "$CAPG_W/ro/x.qobj" >/dev/null 2>&1 )
+capg_b=$?
+if [ "$capg_b" -ne 0 ]; then
+  echo "  PASS cache-failloud: an unwritable cache path exits $capg_b"
+else
+  echo "  FAIL cache-failloud: an unwritable cache path exited 0 with no cache written -- a silent success (0.0.256 behaviour)"
+  CAPG_RC=1
+fi
+chmod 755 "$CAPG_W/ro"
+
+# (c) a truncated cache must be refused, naming the cache
+printf 'fn inc2(x) {\n  return x + 1\n}\nfn dbl2(x) {\n  return x * 2\n}\n' > "$CAPG_W/use/m.quanta"
+printf 'import m\nfn main() { return 7 }\n' > "$CAPG_W/use/use.quanta"
+rm -f "$CAPG_W/use/m.qobj"
+( cd "$CAPG_W/use" && timeout 300 "$QC" --emit-qobj m.quanta m.qobj >/dev/null 2>&1 )
+if [ ! -s "$CAPG_W/use/m.qobj" ]; then
+  echo "  FAIL cache-trunc: could not build the fixture cache"
+  CAPG_RC=1
+else
+  head -c 200 "$CAPG_W/use/m.qobj" > "$CAPG_W/use/t.qobj"
+  mv "$CAPG_W/use/t.qobj" "$CAPG_W/use/m.qobj"
+  capg_msg=$( ( cd "$CAPG_W/use" && timeout 300 "$QC" use.quanta out_trunc 2>&1 ) )
+  capg_c=$?
+  if [ "$capg_c" -ne 0 ] && [ -n "$capg_msg" ]; then
+    echo "  PASS cache-trunc: a 200-byte cache was refused (rc=$capg_c, '$(echo "$capg_msg" | head -1)')"
+  else
+    echo "  FAIL cache-trunc: a 200-byte cache was accepted (rc=$capg_c, artifact=$([ -f "$CAPG_W/use/out_trunc" ] && echo yes || echo no)) -- a partial module must not build a binary"
+    CAPG_RC=1
+  fi
+fi
+
 # --- Stage 1.5: EXTERN "C" FFI (object mode + gcc link) ----------------------
 # The main loop above compiles in EXEC mode only ($QC -O), where extern "C"
 # cannot resolve libc. This stage actually links a real libc FFI test so the
@@ -1290,7 +1359,8 @@ echo "  bare-metal    : $([ $BM_RC = 0 ] && echo GREEN || echo RED)  (ring-0 und
   terminator-guard: $([ "${F3T_RC:-1}" = 0 ] && echo GREEN || echo RED)  (0.0.252 F3: a block terminator's operand is not stored-and-reloaded -- the emitted loop SHAPE, from the object bytes)
   spillframe-guard: $([ "${A32_RC:-1}" = 0 ] && echo GREEN || echo RED)  (0.0.253 A32: a float-using function RESERVES the float spill region in its frame -- the emitted prologue frame, from the object bytes)
   constmul-guard : $([ "${F6C_RC:-1}" = 0 ] && echo GREEN || echo RED)  (0.0.255 F6: a constant multiplier uses the 3-operand imul, so the multiplicand copy is gone -- the emitted loop SHAPE, from the object bytes)
-  immconst-guard : $([ "${F1I_RC:-1}" = 0 ] && echo GREEN || echo RED)  (0.0.256 V1: a single-use constant is folded into an immediate and never materialised -- the emitted loop SHAPE, from the object bytes)"
+  immconst-guard : $([ "${F1I_RC:-1}" = 0 ] && echo GREEN || echo RED)  (0.0.256 V1: a single-use constant is folded into an immediate and never materialised -- the emitted loop SHAPE, from the object bytes)
+  cache-precond-guard: $([ "${CAPG_RC:-1}" = 0 ] && echo GREEN || echo RED)  (0.0.257: the cache path fits the real compiler ceiling, a failed cache write is LOUD, and a truncated cache is refused -- raw rc/byte evidence, under a forced ulimit -v)"
 # Block promotion on a real functional/security/perf/valgrind/fuzz/diff/stdlib/mtu/qobj/verify-status
 # regression. Security KNOWN issues are surfaced by the script but do not turn
 # the gate red.
@@ -1316,7 +1386,7 @@ if [ $FUNCTIONAL_RC -ne 0 ] || [ $NATIVE_RC -ne 0 ] || [ $SECURITY_RC -ne 0 ] ||
    || [ $VALGRIND_RC -ne 0 ] || [ $FUZZ_RC -ne 0 ] || [ $DIFF_RC -ne 0 ] \
    || [ $GENERICS_RC -ne 0 ] || [ $STDLIB_RC -ne 0 ] || [ $MTU_RC -ne 0 ] \
    || [ $QOBJ_RC -ne 0 ] || [ $VERIFY_STATUS_RC -ne 0 ] || [ $OUTGUARD_RC -ne 0 ] || [ $NAKED_RC -ne 0 ] || [ $ASM_RC -ne 0 ] || [ $BM_RC -ne 0 ] \
-   || [ $GGUF_RC -ne 0 ] || [ $FPR_RC -ne 0 ] || [ $F16C_RC -ne 0 ] || [ $MARS_RC -ne 0 ] || [ "${F2D_RC:-1}" -ne 0 ] || [ "${F3T_RC:-1}" -ne 0 ] || [ "${A32_RC:-1}" -ne 0 ] || [ "${F6C_RC:-1}" -ne 0 ] || [ "${F1I_RC:-1}" -ne 0 ]; then
+   || [ $GGUF_RC -ne 0 ] || [ $FPR_RC -ne 0 ] || [ $F16C_RC -ne 0 ] || [ $MARS_RC -ne 0 ] || [ "${F2D_RC:-1}" -ne 0 ] || [ "${F3T_RC:-1}" -ne 0 ] || [ "${A32_RC:-1}" -ne 0 ] || [ "${F6C_RC:-1}" -ne 0 ] || [ "${F1I_RC:-1}" -ne 0 ] || [ "${CAPG_RC:-1}" -ne 0 ]; then
   exit 1
 fi
 exit 0
