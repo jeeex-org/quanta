@@ -57,8 +57,13 @@ run_arm () {
   echo " arm $tag done, load_after=$l1"
 }
 
+# Restore the COMMITTED conf, not "whatever was there when this started": the
+# latter propagates a dirty value from a previous manual edit (it did exactly
+# that here -- an A/B left the bench conf at the last arm's flags for the next
+# reader). A driver must not leave the tree dirtier than it found it, and the
+# committed file is the only unambiguous definition of "clean".
 cp "$CONF" "$LOG/conf.before"
-trap 'cp "$LOG/conf.before" "$CONF"' EXIT
+trap 'git checkout -- "$CONF" 2>/dev/null || cp "$LOG/conf.before" "$CONF"' EXIT
 
 run_arm off1    0 0
 run_arm f64fma  1 0
