@@ -70,6 +70,169 @@ fn sweep(which, dtype, toff, rb, cols, x, xf32, argp) -> i64 {
     return clock() - t0
 }
 
+// ===================== PART 1b: the CHAIN kernel A/B ========================
+// which: 0 = f64 scalar chain (the existing tied-projection kernel),
+//        1 = f32 chain. r10 (the kernel's X) is the f64 pointer for arm 0 and
+// the f32 pointer for arm 1 -- the widths must agree with the kernel form.
+fn sweep_chain(which, toff, rb, cols, x, xf32, argp) -> i64 {
+    let t0 = clock()
+    let r = 0
+    while r < NROWS {
+        let raw = mm_map_base + toff + r * rb
+        mem_store(argp + 0, raw)
+        if which >= 1 { mem_store(argp + 8, xf32) } else { mem_store(argp + 8, x) }
+        mem_store(argp + 16, 0)
+        mem_store(argp + 24, cols / 256)
+        let v = 0
+        if which == 0 { v = jit_f_apply_chain(argp) } else { v = jit_f_apply_chain_f32(argp) }
+        mem_store(argp + 32, v)
+        r = r + 1
+    }
+    return clock() - t0
+}
+
+// ===================== PART 2b: the f32 CHAIN reference =====================
+// Written from the BLOCK FORMAT like ref_q6k_row, with ONE difference that is the
+// whole point: the accumulation is a strict left-to-right SCALAR chain
+//     acc = fadd32(acc, p)   for c = 0..ncols-1, ascending
+// exactly what `pl_run_embed_map`'s reference does (in f64 there), so a bit
+// comparison here proves the kernel reproduced the CHAIN ORDER and the exact f32
+// dequant, not just "a dot of the right magnitude". The kernel widens the f32
+// sum to f64 once, so the reference does the same.
+fn ref_q6k_chain_row(raw, cols, xf32) -> i64 {
+    let acc: f64 = 0.0
+    let nb = cols / 256
+    let bi = 0
+    while bi < nb {
+        let base = raw + bi * 210
+        let d32: f64 = ref_f16f32(base + 208)
+        let e = 0
+        while e < 256 {
+            let n = e / 128
+            let rr = e - n * 128
+            let s = rr / 32
+            let r2 = rr - s * 32
+            let h = r2 / 16
+            let off = r2 - h * 16
+            let g = off / 8
+            let k = off - g * 8
+            let s32 = (s - (s / 2) * 2) * 32
+            let qlb = mem_load8(base + n * 64 + s32 + h * 16 + g * 8 + k)
+            let qhb = mem_load8(base + 128 + n * 32 + h * 16 + g * 8 + k)
+            let lo = 0
+            if s >= 2 { lo = qlb / 16 } else { lo = qlb - (qlb / 16) * 16 }
+            let hi = 0
+            if s == 0 { hi = qhb - (qhb / 4) * 4 }
+            else if s == 1 { hi = qhb / 4 - ((qhb / 4) / 4) * 4 }
+            else if s == 2 { hi = qhb / 16 - ((qhb / 16) / 4) * 4 }
+            else { hi = qhb / 64 - ((qhb / 64) / 4) * 4 }
+            let q = lo + hi * 16 - 32
+            let scb = mem_load8(base + 192 + n * 8 + s * 2 + h)
+            let sc = scb
+            if scb > 127 { sc = scb - 256 }
+            // kernel order: q -> *sc -> *d -> *x, each ONE f32 op
+            let v1: f64 = fmul32(i2f(q), i2f(sc))
+            let v2: f64 = fmul32(v1, d32)
+            let xe = bi * 256 + e
+            let xv: f64 = f32bits_to_f64(mem_load32(xf32 + xe * 4))
+            let p: f64 = fmul32(v2, xv)
+            acc = fadd32(acc, p)        // SERIAL, ascending element order
+            e = e + 1
+        }
+        bi = bi + 1
+    }
+    return f64bits(f32bits_to_f64(f64_to_f32bits(acc)))
+}
+
+// Every timed chain row, f32 chain vs the f32 chain reference, raw f64 BITS.
+// ALSO: the f64 chain on the same row, to prove the two kernels are genuinely
+// DIFFERENT sequences -- if the f32 arm were silently the f64 kernel the bit
+// comparison below would still pass a *wrong* kernel only by accident, and a
+// `differ` count of 0 would expose that class directly.
+fn oracle_chain(toff, rb, cols, xf32, argp, stat) {
+    let bad = 0
+    let bothnan = 0
+    let onenan = 0
+    let differ = 0
+    let r = 0
+    while r < NROWS {
+        let raw = mm_map_base + toff + r * rb
+        mem_store(argp + 0, raw)
+        mem_store(argp + 8, xf32)
+        mem_store(argp + 16, 0)
+        mem_store(argp + 24, cols / 256)
+        let a = jit_f_apply_chain_f32(argp)
+        let e = ref_q6k_chain_row(raw, cols, xf32)
+        let c64 = jit_f_apply_chain(argp)
+        if a != e { bad = bad + 1 }
+        if c64 != a { differ = differ + 1 }
+        let na = isnan_bits(a)
+        let ne = isnan_bits(e)
+        if na != 0 && ne != 0 { bothnan = bothnan + 1 }
+        else if na != 0 || ne != 0 { onenan = onenan + 1 }
+        r = r + 1
+    }
+    prints("  rows="); print(NROWS)
+    prints(" chain_f32_vs_ref_bit_mismatch="); print(bad)
+    prints(" chain_f32_differs_from_f64_rows="); print(differ)
+    prints(" exactly_one_nan="); print(onenan)
+    prints(" both_nan="); print(bothnan)
+    newline()
+    return 0
+}
+
+fn bench_chain(label, idx, stat) {
+    let dtype = 14
+    let cols = gguf_tensor_dim(idx, 0)
+    if cols <= 0 { prints(label); prints("  SKIP: dim(0)="); print(cols); prints(" idx="); print(idx); newline(); return -1 }
+    let rows = gguf_tensor_nelements(idx) / cols
+    let rb = mm_row_bytes(dtype, cols)
+    let toff = gguf_tensor_offset(idx)
+    if rows < NROWS { prints(label); prints("  SKIP: rows="); print(rows); newline(); return -1 }
+    if rb <= 0 { prints(label); prints("  SKIP: row_bytes="); print(rb); newline(); return -1 }
+    if cols - (cols / 256) * 256 != 0 { prints(label); prints("  SKIP: cols%256!=0\n"); return -1 }
+
+    let x = mem_alloc(cols * 8)
+    let xf32 = mem_alloc(cols * 4)
+    let c = 0
+    while c < cols {
+        let u = i2f(c - (c / 128) * 128)
+        let v = (u - 63.5) * 0.001953125
+        mem_store(x + c * 8, v)
+        mem_store32(xf32 + c * 4, f64_to_f32bits(v))
+        c = c + 1
+    }
+    let argp = mem_alloc(64)
+
+    prints(label)
+    prints("  cols="); print(cols); prints(" rows="); print(NROWS)
+    prints(" dtype="); print(dtype); newline()
+    oracle_chain(toff, rb, cols, xf32, argp, stat)
+
+    let best0 = 0 - 1
+    let best1 = 0 - 1
+    let sum0 = 0
+    let sum1 = 0
+    let cyc = 0
+    while cyc < NCYC {
+        let t0 = sweep_chain(0, toff, rb, cols, x, xf32, argp)
+        let t1 = sweep_chain(1, toff, rb, cols, x, xf32, argp)
+        if best0 < 0 || t0 < best0 { best0 = t0 }
+        if best1 < 0 || t1 < best1 { best1 = t1 }
+        sum0 = sum0 + t0
+        sum1 = sum1 + t1
+        cyc = cyc + 1
+    }
+    prints("  best_ticks chain_f64="); print(best0)
+    prints(" chain_f32="); print(best1); newline()
+    if best1 > 0 { prints("  chain_f64_over_f32_min_x1000="); print(best0 * 1000 / best1) }
+    else { prints("  chain_f64_over_f32_min_x1000=NA") }
+    if sum1 > 0 { prints("  chain_f64_over_f32_sum_x1000="); print(sum0 * 1000 / sum1) }
+    else { prints("  chain_f64_over_f32_sum_x1000=NA") }
+    newline()
+    return 0
+}
+
 // ===================== PART 2: the f32 reference ============================
 // Written from the BLOCK FORMAT, not from the kernel: the 6-bit factor unpack is
 // q4k_sc/q4k_min, the nibble extraction is transcribed from ggml's layout, and
@@ -403,6 +566,8 @@ fn main() {
     if jit_f_setup_folded_fma() != 0 { prints("FAIL setup q4k fma\n"); return 35 }
     if jit_f_setup_folded_q6k() != 0 { prints("FAIL setup q6k\n"); return 36 }
     if jit_f_setup_folded_q6k_fma() != 0 { prints("FAIL setup q6k fma\n"); return 37 }
+    if jit_f_setup_chain() != 0 { prints("FAIL setup chain\n"); return 38 }
+    if jit_f_setup_chain_f32() != 0 { prints("FAIL setup chain f32\n"); return 39 }
 
     if gguf_load(Q4_PATH) != 0 { prints("FAIL gguf_load\n"); return 1 }
     if fc_read_config() != 0 { prints("FAIL fc_read_config\n"); return 1 }
@@ -425,6 +590,10 @@ fn main() {
     bench("Q4_K ffn_up.0   :", 12, lfm2_ffn_up(0), stat)
     bench("Q6_K ffn_down.3 :", 14, lfm2_ffn_down(3), stat)
     bench("Q6_K attn_v.2   :", 14, lfm2_attn_v(2), stat)
+
+    prints("--- PART 1b+2b: the CHAIN kernel (tied output projection), f64 vs f32 ---\n")
+    prints("(this is the 42.7%%-of-a-token term; token_embd.weight [2048,128000] Q6_K)\n")
+    bench_chain("Q6_K token_embd   :", lfm2_token_embd(), stat)
 
     prints("load at end: ")
     load_print()

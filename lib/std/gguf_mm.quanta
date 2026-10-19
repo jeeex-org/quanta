@@ -676,17 +676,36 @@ fn mm_get_fused_f32_drop() { return mm_fused_f32_drop }
 // region is refused.
 let mm_fused_chain = 0
 let mm_fused_chain_used = 0
+// The f32 chain: on exactly when the f64 chain route is on AND the f32 modifier
+// (mm_fused_f32) is on. It is a MODIFIER of mm_fused_chain, the same relation
+// mm_fused_f32 has to mm_fused_q4k / mm_fused_q6k -- it changes WHICH chain
+// kernel pl_run_embed_map dispatches, and the f64 chain kernel's bytes are not
+// touched. Fail-closed on TWO things, like the matvec f32 route: its RWX region
+// and the grow-only f32 x buffer (which must be refilled with the EMBED's x, a
+// different operand from any matvec's x, on the main thread before the pool is
+// woken). mm_fused_chain_f32_drop records WHY it fell back, so a silent
+// "no effect" arm can never be read as "the f32 chain is not faster":
+//   0 = not dropped, 1 = RWX region refused, 2 = the f32 x buffer failed.
+let mm_fused_chain_f32 = 0
+let mm_fused_chain_f32_used = 0
+let mm_fused_chain_f32_drop = 0
 
 fn mm_set_fused_chain(n) {
     if n < 0 { n = 0 }
     if n != 0 { n = 1 }
     mm_fused_chain = n
     mm_fused_chain_used = 0
+    mm_fused_chain_f32 = 0
+    mm_fused_chain_f32_used = 0
+    mm_fused_chain_f32_drop = 0
     return 0
 }
 
 fn mm_get_fused_chain() { return mm_fused_chain }
 fn mm_get_fused_chain_used() { return mm_fused_chain_used }
+fn mm_get_fused_chain_f32() { return mm_fused_chain_f32 }
+fn mm_get_fused_chain_f32_used() { return mm_fused_chain_f32_used }
+fn mm_get_fused_chain_f32_drop() { return mm_fused_chain_f32_drop }
 
 // ===========================================================================
 // PARALLEL GLU (silu(gate) * up) -- opt-in, DEFAULT OFF, ELEMENTWISE
@@ -1165,6 +1184,31 @@ fn mm_embed_logits_par(idx: u64, x: u64, v0: i64, vcount: i64, ncols: i64, y: u6
     // null code pointer on a box without executable anonymous memory.
     if mm_fused_chain != 0 {
         if jit_f_setup_chain() != 0 { mm_fused_chain = 0 }
+    }
+    // The f32 chain: a MODIFIER of the f64 chain, fail-closed in TWO independent
+    // steps, both on the main thread BEFORE any worker sees it.
+    //   1. the kernel's own RWX region -- a refusal keeps the f64 chain;
+    //   2. the grow-only f32 x buffer, REFILLED HERE with the EMBED's x. The
+    //      embed's x is a DIFFERENT operand from any matvec's x, so the buffer
+    //      cannot be left holding the last matvec's activations: the f32 chain
+    //      kernel reads x as f32 and being handed the f64 pointer would read the
+    //      wrong bytes and produce a plausible wrong number.
+    // Neither refusal clears mm_fused_chain, so this degrades to the f64 chain,
+    // never to the scalar reference. mm_fused_chain_f32_drop records WHICH step
+    // refused, so a silent "no effect" arm cannot be read as "not faster".
+    mm_fused_chain_f32 = 0
+    mm_fused_chain_f32_drop = 0
+    if mm_fused_chain != 0 && mm_fused_f32 != 0 {
+        if jit_f_setup_chain_f32() != 0 {
+            mm_fused_chain_f32_drop = 1
+        } else if mm_map_base != 0 && gguf_tensor_dtype(idx) == 14 && ncols - (ncols / 256) * 256 == 0 {
+            if pl_xf32_ensure(ncols) != 0 {
+                mm_fused_chain_f32_drop = 2
+            } else {
+                pl_xf32_fill(x, ncols)
+                mm_fused_chain_f32 = 1
+            }
+        }
     }
 
     // job descriptor for the shared pool worker (module-level; the driver fills
@@ -2511,6 +2555,14 @@ fn pl_run_embed_map(t: i64, cell) {
         cargs = mem_load(cell + 24)
         if cargs != 0 { fusedc = 1 }
     }
+    // The f32 chain MODIFIER: needs the f64 chain route, the f32 flag, its RWX
+    // region, and the f32 x buffer -- all validated on the main thread in
+    // mm_embed_logits_par before the pool was woken. `pl_xf32 != 0` is the second
+    // half of that guard and it is not optional: the kernel form and the operand
+    // width must agree, and handing the f32 kernel the f64 pointer would read the
+    // wrong bytes and produce a plausible wrong number.
+    let cf32 = 0
+    if fusedc != 0 && mm_fused_chain_f32 != 0 && pl_xf32 != 0 { cf32 = 1 }
     let v = lo
     while v < hi {
         let raw = mm_map_base + toff + (pl_v0 + v) * rb
@@ -2520,10 +2572,18 @@ fn pl_run_embed_map(t: i64, cell) {
             // exactly the cross-worker race the _s variants exist to avoid and
             // there are no atomics to fix it.
             mem_store(cargs + 0, raw)               // W: this row's quant bytes
-            mem_store(cargs + 8, pl_x)              // X: fixed for the whole matvec
+            // X: the f32 buffer when the f32 chain is active, else the f64 x.
+            if cf32 != 0 { mem_store(cargs + 8, pl_xf32) } else { mem_store(cargs + 8, pl_x) }
             mem_store(cargs + 16, 0)                // DMD: unused by the chain kernel
             mem_store(cargs + 24, pl_ncols / 256)   // nsuper
-            mem_store(pl_y + (pl_v0 + v) * 8, jit_f_apply_chain(cargs))
+            if cf32 != 0 {
+                mem_store(pl_y + (pl_v0 + v) * 8, jit_f_apply_chain_f32(cargs))
+                // Its own witness: without it an arm that never dispatched the
+                // f32 chain would report exactly what the f64 chain arm reports.
+                mm_fused_chain_f32_used = 1
+            } else {
+                mem_store(pl_y + (pl_v0 + v) * 8, jit_f_apply_chain(cargs))
+            }
             mm_fused_chain_used = 1
         } else {
             if mm_deq_row_raw(dtype, raw, pl_ncols, f64b) != 0 { return -1 }

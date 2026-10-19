@@ -1584,6 +1584,167 @@ fn jit_f_build_folded_f32(fma) -> i64 {
 }
 
 // ============================================================================
+// FOLDED *CHAIN* Q6_K f32 KERNEL -- the tied output projection, in f32
+// ============================================================================
+// WHY THIS IS A SEPARATE KERNEL FROM jit_f_build_folded_q6k_f32. The tied output
+// projection (token_embd.weight, [2048, 128000] Q6_K = 262,144,000 elements,
+// 9.72% of per-token matvec elements) is pool kind 5 (pl_run_embed_map), whose
+// reference dot is a strict LEFT-TO-RIGHT SCALAR CHAIN
+//     acc = acc + row[c]*x[c]     for c = 0..ncols-1
+// not mm_dot4_s's four lanes. The 8-lane f32 folded kernel's reduce order cannot
+// reproduce that, so this kernel keeps the chain and takes the f32 win the same
+// way the matvec family did: 8-element groups, ymm-wide dequant, and half the x
+// bytes.
+//
+// THE SHAPE. Byte-for-byte the SAME dequant as j_f32_q6_group (the ymm-wide Q6_K
+// body, already execution-verified). The ONLY difference is the fold: instead of
+// `vaddps ymm0, ymm0, ymm6` (lane k accumulates element k%8, reduced at the end),
+// the eight products of each group are folded into ONE scalar accumulator with
+// EIGHT SERIAL vaddss in element order:
+//     acc += p0 ; acc += p1 ; ... ; acc += p7
+// which is exactly `acc = acc + row[c]*x[c]` in order. Groups walk destination
+// element index n*128+s*32+h*16+g*8+k in ASCENDING order and r10 walks x 8 f32 at
+// a time, so the sequence is c = 0,1,2,...,ncols-1 with nothing reordered,
+// reassociated, or vectorised. Lane 0 of ymm0 (xmm0) is the accumulator and
+// `vaddss` never touches lanes 1-3.
+//
+// COST MODEL. The chain is LATENCY-bound: eight dependent vaddss (4 cycles each)
+// per 8 elements = ~4 cycles/element, the same per-element latency the f64 chain
+// pays with four vaddsd. The f32 win is therefore NOT in the chain itself but in
+// everything the out-of-order engine overlaps with it: the dequant, the two
+// factor multiplies and the x multiply are ALL ymm-wide over 8 elements where the
+// f64 chain is xmm-wide over 4, i.e. HALF the non-chain instructions per element,
+// and x is 4 bytes/element instead of 8.
+//
+// WHY NO FMA VARIANT. The f64 chain has none either, for the same reason in f32
+// form: the fold is already all adds, and the multiply that feeds it is shared
+// 8-wide. An FMA would have to become a SCALAR `vfmadd` per element (8 per group,
+// one rounding instead of two) plus the same lane extraction -- strictly more
+// work than the shared `vmulps` + eight `vaddss` it would replace -- and it would
+// move bits differently from a f32 reference chain. So this kernel is not a
+// modifier of mm_fused_fma and stays on this single form.
+//
+// REGISTER MAP: rdi=AS, r9=W cursor, r10=X(f32) cursor, rcx=nsuper;
+//   xmm0 lane0 = the scalar accumulator; ymm1 = broadcast d; ymm2 = broadcast sc;
+//   ymm3/4/5 = 8 dwords of -32 / 15 / 3; ymm6 = quant then the 8 products;
+//   ymm7 = qh scratch then [p4..p7]; xmm8 = the lane-extraction scratch.
+// No callee-saved register is touched: no prologue, no epilogue, no stack,
+// the same purity property every other kernel in this file has.
+
+// ---- the chain fold: EIGHT SERIAL vaddss in element order -------------------
+// Bytes GENERATED from tests/lfm2_f32_kernels.s (c_ext/c_pl*/c_add*/c_widen) by
+// tests/lfm2_f32_enc_gen.py and RUN with known operands by
+// tests/lfm2_f32_enc_verify.c, which asserts the imm8 selectors are lane-relative
+// AND that `vaddss` preserves lanes 1-3 (a `vaddps` here would reorder the
+// summation for free -- a silent wrong answer, not a crash).
+fn j_f32c_ext() -> i64 { return femit("c4e37d19f701", 6) }   // vextractf128 xmm7, ymm6, 1
+fn j_f32c_add0() -> i64 { return femit("c5fa58c6", 4) }      // vaddss xmm0, xmm0, xmm6  += p0
+fn j_f32c_pl1() -> i64 { return femit("c4637904c655", 6) }   // vpermilps xmm8, xmm6, 0x55
+fn j_f32c_pl2() -> i64 { return femit("c4637904c6aa", 6) }   // vpermilps xmm8, xmm6, 0xaa
+fn j_f32c_pl3() -> i64 { return femit("c4637904c6ff", 6) }   // vpermilps xmm8, xmm6, 0xff
+fn j_f32c_pl4() -> i64 { return femit("c4637904c700", 6) }   // vpermilps xmm8, xmm7, 0x00
+fn j_f32c_pl5() -> i64 { return femit("c4637904c755", 6) }   // vpermilps xmm8, xmm7, 0x55
+fn j_f32c_pl6() -> i64 { return femit("c4637904c7aa", 6) }   // vpermilps xmm8, xmm7, 0xaa
+fn j_f32c_pl7() -> i64 { return femit("c4637904c7ff", 6) }   // vpermilps xmm8, xmm7, 0xff
+fn j_f32c_addx() -> i64 { return femit("c4c17a58c0", 5) }    // vaddss xmm0, xmm0, xmm8
+fn j_f32c_widen() -> i64 { return femit("c5fa5ac0", 4) }     // vcvtss2sd xmm0, xmm0, xmm0
+
+// acc += p0,p1,...,p7, each its own dependent vaddss, strictly in element order.
+fn j_f32c_fold() -> i64 {
+    j_f32c_ext()
+    j_f32c_add0()
+    j_f32c_pl1()
+    j_f32c_addx()
+    j_f32c_pl2()
+    j_f32c_addx()
+    j_f32c_pl3()
+    j_f32c_addx()
+    j_f32c_pl4()
+    j_f32c_addx()
+    j_f32c_pl5()
+    j_f32c_addx()
+    j_f32c_pl6()
+    j_f32c_addx()
+    j_f32c_pl7()
+    j_f32c_addx()
+    return 0
+}
+
+// One 8-element group: the SAME dequant as j_f32_q6_group, the chain fold
+// instead of the 8-lane accumulate. ymm1 = d, ymm2 = sc, ymm3/4/5 = -32/15/3.
+fn j_f32c_q6_group(s, qlo, qho) -> i64 {
+    j_f32_ld_ql(qlo)
+    if s >= 2 { jbytes(5, "c5cd72d604") }        // vpsrld ymm6, ymm6, 4
+    else { jbytes(4, "c5cddbf4") }               // vpand ymm6, ymm6, ymm4
+    j_f32_ld_qh(qho)
+    if s > 0 { j_f32_qh_shr(s * 2) }
+    jbytes(4, "c5c5dbfd")                        // vpand ymm7, ymm7, ymm5
+    jbytes(5, "c5c572f704")                      // vpslld ymm7, ymm7, 4
+    jbytes(4, "c5cdebf7")                        // vpor ymm6, ymm6, ymm7
+    jbytes(4, "c5cdfef3")                        // vpaddd ymm6, ymm6, ymm3  (-32)
+    jbytes(4, "c5fc5bf6")                        // vcvtdq2ps ymm6, ymm6
+    jbytes(4, "c5cc59f2")                        // vmulps ymm6, ymm6, ymm2  (*sc)
+    jbytes(4, "c5cc59f1")                        // vmulps ymm6, ymm6, ymm1  (*d)
+    jbytes(5, "c4c14c5932")                      // vmulps ymm6, ymm6, [r10] (*x)
+    j_f32c_fold()                                // EIGHT SERIAL vaddss (the chain)
+    j_f_add_r10_32()                             // 8 f32 = 32 bytes
+    return 0
+}
+
+// Cadence is jit_f_build_folded_q6k_f32's exactly: n(0,1) -> s(0..3) -> h(0,1) ->
+// g(0,1), 8-element groups, ql = n*64 + (s%2)*32 + h*16 + g*8 (disp8),
+// qh = 128 + n*32 + h*16 + g*8 (disp32), sc at 192 + n*8 + s*2 + h, d at 208,
+// stride 210. NO reduce: the whole chain is already in xmm0 lane 0; a single
+// exact `vcvtss2sd` widens it to f64 because the calling contract is "the dot as
+// f64 bits in rax".
+fn jit_f_build_chain_q6k_f32() -> i64 {
+    let entry = ja_pos()
+    j_f_load_w()
+    j_f_load_x()
+    j_f_load_n()
+    j_f32_vxorps_y0()
+
+    let bodytop = ja_pos()
+
+    j_f32_d_load()
+    j_f32_q6_consts()
+
+    let n = 0
+    while n < 2 {
+        let s = 0
+        while s < 4 {
+            let h = 0
+            while h < 2 {
+                j_f32_sc_load(192 + n * 8 + s * 2 + h)
+                j_f32_sc_sext()
+                j_f32_sc_cvt()
+                j_f32_sc_bc()
+                let g = 0
+                while g < 2 {
+                    j_f32c_q6_group(s, n * 64 + (s - (s / 2) * 2) * 32 + h * 16 + g * 8, 128 + n * 32 + h * 16 + g * 8)
+                    g = g + 1
+                }
+                h = h + 1
+            }
+            s = s + 1
+        }
+        n = n + 1
+    }
+    jbytes(7, "4981c1d2000000")    // add r9, 210   (one Q6_K super-block)
+
+    jbytes(4, "4883e901")          // sub rcx,1
+    j_jne32()
+    let disp_at = ja_pos()
+    jbytes(4, "00000000")
+    if j_patch32(disp_at, bodytop) != 0 { return 0 - 1 }
+
+    j_f32c_widen()                 // f32 sum -> f64, ONE exact conversion
+    jbytes(5, "c4e1f97ec0")        // vmovq rax, xmm0   (f64 bits of the chain sum)
+    j_f_ret()
+    return entry
+}
+
+// ============================================================================
 // FOLDED Q6_K f32 KERNEL -- the twin of jit_f_build_folded_q6k
 // ============================================================================
 // The Q6_K block is 210 bytes: ql[128] at +0, qh[64] at +128, sc[16] i8 at
@@ -1787,3 +1948,21 @@ fn jit_f_setup_folded_q6k_f32_fma() -> i64 {
 }
 fn jit_f_ready_folded_q6k_f32_fma() { return jf_tbl_f32_q6k_fma }
 fn jit_f_apply_folded_q6k_f32_fma(as) -> i64 { return closure_call(jf_tbl_f32_q6k_fma, as, 0) }
+
+// ---- the f32 CHAIN kernel's own RWX region (tied output projection) ---------
+// Own region again, so neither the f64 chain kernel nor any matvec kernel moves.
+// Same argument area ([W, X, DMD, nsuper]) but [AS+8] must point at an f32 x
+// buffer (pl_xf32), NOT at the f64 pl_x the f64 chain kernel takes -- the operand
+// width and the kernel form must agree or the answer is a plausible wrong number.
+let jf_tbl_chain_f32 = 0
+
+fn jit_f_setup_chain_f32() -> i64 {
+    if jf_tbl_chain_f32 != 0 { return 0 }
+    if jit_f_alloc(65536) <= 0 { return -1 }
+    let t = jit_f_code(jit_f_build_chain_q6k_f32())
+    if t <= 0 { return -2 }
+    jf_tbl_chain_f32 = t
+    return 0
+}
+fn jit_f_ready_chain_f32() { return jf_tbl_chain_f32 }
+fn jit_f_apply_chain_f32(as) -> i64 { return closure_call(jf_tbl_chain_f32, as, 0) }

@@ -514,6 +514,91 @@ int main(void)
     runn((const char *[]){ "b_sc_ld", "b_sc_sext", "b_sc_cvt", "b_sc_bc", NULL });
     for (k = 0; k < 8; k++) CHK(getYf(2)[k] == -5.0f, "vbroadcastss ymm,xmm (sc) wrong");
 
+    /* ---------- f32 CHAIN kernel fold (the tied output projection) ---------- */
+    /* c_ext: vextractf128 xmm7, ymm6, 1 -- xmm7 must become the HIGH half. */
+    cur = "c_ext"; zeroctx();
+    setYf(6, (float[]){1,2,3,4,5,6,7,8});
+    runq("c_ext");
+    { float ex[4] = {5,6,7,8};
+      for (k = 0; k < 4; k++) CHK(getYf(7)[k] == ex[k],
+          "vextractf128 xmm7,ymm6,1 did not take the HIGH 128 bits"); }
+
+    /* the lane selectors: c_pl1..c_pl3 read xmm6, c_pl4..c_pl7 read xmm7 (after
+     * c_ext). imm8 is LANE-RELATIVE; this is the exact trap that cost a peer a
+     * day with vpermilpd, so every selector is asserted against a known vector. */
+    {
+        struct { const char *nm; int from_high; int lane; } pl[] = {
+            {"c_pl1", 0, 1}, {"c_pl2", 0, 2}, {"c_pl3", 0, 3},
+            {"c_pl4", 1, 0}, {"c_pl5", 1, 1}, {"c_pl6", 1, 2}, {"c_pl7", 1, 3},
+        };
+        float vals[8] = {10, 20, 30, 40, 50, 60, 70, 80};
+        for (i = 0; i < 7; i++) {
+            zeroctx();
+            setYf(6, vals);
+            if (pl[i].from_high) run2("c_ext", pl[i].nm);
+            else runq(pl[i].nm);
+            cur = pl[i].nm;
+            for (k = 0; k < 4; k++)
+                CHK(getYf(8)[k] == vals[(pl[i].from_high ? 4 : 0) + pl[i].lane],
+                    "vpermilps imm8 is not a lane-relative single-lane broadcast");
+        }
+    }
+
+    /* vaddss touches ONLY lane 0: a `vaddps` here would reorder the summation for
+     * free -- a silent wrong answer, not a crash. Asserted both ways. */
+    cur = "c_add0"; zeroctx();
+    setYf(0, (float[]){1.5f, 111, 222, 333});
+    setYf(6, (float[]){2.25f, 9, 9, 9});
+    runq("c_add0");
+    CHK(fb(getYf(0)[0]) == fb(1.5f + 2.25f), "vaddss xmm0,xmm0,xmm6 did not add lane 0");
+    CHK(getYf(0)[1] == 111.0f && getYf(0)[2] == 222.0f && getYf(0)[3] == 333.0f,
+        "vaddss clobbered lanes 1-3 -- this is a vaddps, not a vaddss");
+    cur = "c_add1"; zeroctx();
+    setYf(0, (float[]){1.5f, 111, 222, 333});
+    setYf(8, (float[]){-0.25f, 9, 9, 9});
+    runq("c_add1");
+    CHK(fb(getYf(0)[0]) == fb(1.5f - 0.25f), "vaddss xmm0,xmm0,xmm8 did not add lane 0");
+    CHK(getYf(0)[1] == 111.0f, "vaddss xmm0,xmm0,xmm8 clobbered lane 1");
+
+    /* the WHOLE fold as one block: EIGHT SERIAL vaddss in element order, every
+     * step f32. This is the bit-for-bit ORDER contract (not a magnitude check),
+     * the same shape as the 8-lane reduce-order test below. */
+    cur = "chain-fold-order"; {
+        int trials = 4000, bad = 0, t;
+        for (t = 0; t < trials; t++) {
+            float p[8], acc0, e;
+            for (k = 0; k < 8; k++) {
+                uint32_t u = (uint32_t)rand() ^ ((uint32_t)rand() << 16);
+                if (((u >> 23) & 0xFF) > 200) u = (u & 0x807FFFFF) | (100u << 23);
+                memcpy(&p[k], &u, 4);
+            }
+            acc0 = (float)((rand() % 2001) - 1000) * 0.001f;
+            zeroctx();
+            setYf(0, (float[]){acc0, 7, 8, 9});
+            setYf(6, p);
+            runn((const char *[]){ "c_ext","c_add0","c_pl1","c_add1","c_pl2","c_add2",
+                "c_pl3","c_add3","c_pl4","c_add4","c_pl5","c_add5","c_pl6","c_add6",
+                "c_pl7","c_add7", NULL });
+            e = acc0;
+            for (k = 0; k < 8; k++) e = e + p[k];   /* ((acc+p0)+p1)+... strictly in order */
+            if (fb(getYf(0)[0]) != fb(e)) bad++;
+            if (getYf(0)[1] != 7.0f || getYf(0)[2] != 8.0f || getYf(0)[3] != 9.0f) bad++;
+        }
+        CHK(bad == 0, "the f32 chain fold is not ((acc+p0)+p1)+...+p7 in f32 (or it clobbered a lane)");
+    }
+
+    /* c_widen: f32 -> f64, exact, lane 0 only; the upper 64 bits must be left. */
+    cur = "c_widen"; zeroctx();
+    { float v = 0.1f; double dv = (double)v;
+      memcpy(ctxbuf + Y(0), &v, 4);
+      *(uint64_t *)(ctxbuf + Y(0) + 8) = 0xDEADBEEFDEADBEEFULL;
+      runq("c_widen");
+      CHK(*(uint64_t *)(ctxbuf + Y(0)) == db(dv),
+          "vcvtss2sd xmm0,xmm0,xmm0 is not the exact f32->f64 widen of lane 0");
+      CHK(*(uint64_t *)(ctxbuf + Y(0) + 8) == 0xDEADBEEFDEADBEEFULL,
+          "vcvtss2sd clobbered the upper 64 bits (it must write lane 0 only)");
+    }
+
     /* ---------- the reduce chain ---------- */
     cur = "reduce-integers"; zeroctx();
     setYf(0, (float[]){1, 2, 3, 4, 5, 6, 7, 8});

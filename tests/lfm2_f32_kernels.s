@@ -293,3 +293,63 @@ b_c4:        vpsrld ymm4, ymm4, 28
 b_c5:        vpcmpeqd ymm5, ymm5, ymm5
 .globl b_c6
 b_c6:        vpsrld ymm5, ymm5, 30
+
+// ===================== f32 CHAIN kernel (tied output projection) ============
+// The chain is the reference's strict left-to-right scalar accumulation and a
+// lane-based kernel cannot reproduce it, so the fold is EIGHT SERIAL `vaddss`
+// in element order -- the f64 chain's shape in `ss` form, and it is the ONLY
+// new thing this kernel adds over the f32 matvec family's dequant (which is
+// reused verbatim and is already execution-verified above).
+//
+// ymm6 = [p0,p1,p2,p3,p4,p5,p6,p7] f32 products of ONE 8-element group.
+// The accumulator is xmm0 LANE 0 ONLY (`vaddss`, never `vaddps`): the harness
+// asserts lane 0 changes AND lanes 1-3 are preserved, which is the difference
+// between `ss` and `ps` and the reason a `ps` form here would be a silent wrong
+// answer (it would reorder the summation for free).
+//
+// NOTE the inline comments below use `#`: GNU as takes `#` as the inline comment
+// character on x86, while `//` is only recognised at the START of a line. An
+// instruction followed by `//` assembles the comment text as OPERANDS
+// ("spurious operands; 5 operands/instruction max").
+.globl c_ext
+c_ext:       vextractf128 xmm7, ymm6, 1     # xmm7 = [p4,p5,p6,p7]
+.globl c_add0
+c_add0:      vaddss xmm0, xmm0, xmm6        # acc += p0
+// The extractions are `vpermilps xmm,imm` -- imm8 selectors are LANE-RELATIVE
+// inside the 128-bit source, so 0x55/0xaa/0xff replay lane 1/2/3 into lane 0 of
+// the destination and `vaddss` then reads lane 0. Every selector is asserted
+// against a known vector in the harness; this is the same imm8 trap that cost a
+// peer a day with vpermilpd and it is NOT taken on faith here.
+.globl c_pl1
+c_pl1:       vpermilps xmm8, xmm6, 0x55     # [p1,p1,p1,p1]
+.globl c_add1
+c_add1:      vaddss xmm0, xmm0, xmm8        # acc += p1
+.globl c_pl2
+c_pl2:       vpermilps xmm8, xmm6, 0xaa
+.globl c_add2
+c_add2:      vaddss xmm0, xmm0, xmm8        # acc += p2
+.globl c_pl3
+c_pl3:       vpermilps xmm8, xmm6, 0xff
+.globl c_add3
+c_add3:      vaddss xmm0, xmm0, xmm8        # acc += p3
+.globl c_pl4
+c_pl4:       vpermilps xmm8, xmm7, 0x00
+.globl c_add4
+c_add4:      vaddss xmm0, xmm0, xmm8        # acc += p4
+.globl c_pl5
+c_pl5:       vpermilps xmm8, xmm7, 0x55
+.globl c_add5
+c_add5:      vaddss xmm0, xmm0, xmm8        # acc += p5
+.globl c_pl6
+c_pl6:       vpermilps xmm8, xmm7, 0xaa
+.globl c_add6
+c_add6:      vaddss xmm0, xmm0, xmm8        # acc += p6
+.globl c_pl7
+c_pl7:       vpermilps xmm8, xmm7, 0xff
+.globl c_add7
+c_add7:      vaddss xmm0, xmm0, xmm8        # acc += p7
+// The final widen: the calling contract is "the dot as f64 bits in rax", and
+// the f32 sum is widened ONCE (exact) exactly as the matvec family's reduce
+// does. This is the last instruction before `vmovq rax, xmm0`.
+.globl c_widen
+c_widen:     vcvtss2sd xmm0, xmm0, xmm0

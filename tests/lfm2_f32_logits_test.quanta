@@ -200,6 +200,8 @@ fn main() {
     let rr = mem_alloc(40)
     let w32 = mem_alloc(8 * NARM)
     let wfma = mem_alloc(8 * NARM)
+    let wch32 = mem_alloc(8 * NARM)
+    let wc32drop = mem_alloc(8 * NARM)
 
     mm_pool_begin()
 
@@ -227,16 +229,20 @@ fn main() {
         }
         mem_store(w32 + arm * 8, mm_get_fused_f32_used())
         mem_store(wfma + arm * 8, mm_get_fused_fma_used())
+        mem_store(wch32 + arm * 8, mm_get_fused_chain_f32_used())
+        mem_store(wc32drop + arm * 8, mm_get_fused_chain_f32_drop())
         arm = arm + 1
     }
     mm_pool_end()
 
-    prints("witnesses (per arm): f32_used / fma_used\n")
+    prints("witnesses (per arm): f32_used / fma_used / chain_f32_used (chain_f32_drop)\n")
     arm = 0
     while arm < NARM {
         prints("  arm "); print(arm)
         prints(": f32_used="); print(mem_load(w32 + arm * 8))
-        prints(" fma_used="); print(mem_load(wfma + arm * 8)); newline()
+        prints(" fma_used="); print(mem_load(wfma + arm * 8))
+        prints(" chain_f32_used="); print(mem_load(wch32 + arm * 8))
+        prints(" chain_f32_drop="); print(mem_load(wc32drop + arm * 8)); newline()
         arm = arm + 1
     }
     prints("f32_drop(reason, 0=none 1=no RWX 2=no f32 x buffer)=")
@@ -249,11 +255,19 @@ fn main() {
         excursion(L, L + arm * nv * 8, nv, rr)
         let refmax: f64 = f64of(mem_load(rr + 32))
         prints("arm"); print(arm); prints(" vs arm0: logit_mism="); print(mem_load(rr))
-        prints("  max_abs_diff_bits="); print(mem_load(rr + 8))
+        prints("  max_abs_diff_f64_bits="); print(mem_load(rr + 8))
         prints("  max_abs_diff="); print_f(f64of(mem_load(rr + 8)))
         prints("  max_ulp="); print(mem_load(rr + 16))
         prints("  sign_flips="); print(mem_load(rr + 24))
-        prints("  excursion_x1e18="); print(f2i(f64of(mem_load(rr + 8)) * 1000000000000000000.0))
+        // NOTE the scaling: a 19-DIGIT decimal literal does not evaluate to its
+        // own value on this tree, so `* 1000000000000000000.0` silently reports a
+        // bound 15.81x too small (measured: `f2i(1000000000000000000.0)` is
+        // 63251277506936832, and `f64bits(1000000000000000000.0)` is
+        // 4858283208366391296 against the true 4876203697187506176). The 1e9
+        // literal IS exact, so the product below is the exact 1e18 scale:
+        // `f2i(1000000000.0 * 1000000000.0) == 1000000000000000000`, verified.
+        // The RAW f64 BITS field above is the authoritative record either way.
+        prints("  excursion_x1e18="); print(f2i(f64of(mem_load(rr + 8)) * 1000000000.0 * 1000000000.0))
         prints("  over_maxlogit_x1e15="); print(f2i(f64of(mem_load(rr + 8)) / refmax * 1000000000000000.0))
         newline()
         prints("   ids: ")
@@ -302,6 +316,22 @@ fn main() {
     }
     if mem_load(w32 + 2 * 8) != 1 || mem_load(wfma + 2 * 8) != 0 {
         prints("FAIL: arm2 (f32 only) must dispatch the unfused f32 kernel\n"); return 47
+    }
+    // The f32 CHAIN (tied output projection) is a MODIFIER of mm_fused_chain, so
+    // it must be on in exactly the two f32 arms and off in the two f64 arms --
+    // and never dropped (a drop here would silently leave the f64 chain in place
+    // and make the f32 arm's excursion the matvec's alone).
+    arm = 0
+    while arm < NARM {
+        let want = 0
+        if arm >= 2 { want = 1 }
+        if mem_load(wch32 + arm * 8) != want {
+            prints("FAIL: f32 chain witness wrong for arm "); print(arm); newline(); return 48
+        }
+        if mem_load(wc32drop + arm * 8) != 0 {
+            prints("FAIL: the f32 chain was dropped on arm "); print(arm); newline(); return 49
+        }
+        arm = arm + 1
     }
     prints("PASS: every arm's first argmax is 597, all 25 per-step argmax and the\n")
     prints("      first 24 generated ids are IDENTICAL across all four arms, and the\n")
