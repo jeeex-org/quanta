@@ -420,7 +420,12 @@ all 128,000 logits. Every row `logit_mism=0 argmax_mism=0 max_abs_diff_bits=0`, 
 `fused_attn_used`, `fused_conv_used` = 1 on the passes that set them).
 
 **This is the proof that adding the f32 chain changed nothing for the flags that were
-already there.**
+already there.** Re-run under the **shipped `0.0.258`** (md5 `e7fc8cd4`): the same 9 rows,
+`logit_mism=0 argmax_mism=0 max_abs_diff_bits=0` on every one. **The bound and the gate are
+compiler-independent, as predicted**: the four bound runs (three under 0.0.256, one under
+0.0.258) are byte-identical to the digit — same `max_abs_diff_f64_bits`, same `max_ulp`, same
+`logit_mism`, same `excursion_x1e18`, same witnesses — while every TIMING figure had to be
+re-taken. That contrast is the reason the pin discipline distinguishes them.
 
 ---
 
