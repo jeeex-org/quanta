@@ -1532,3 +1532,113 @@ standing rules warn about. It is the next unit's item, with the reproducer above
 `ip` and the same residual — i.e. a fast integer-part extraction can be output-IDENTICAL over
 the range that terminates today, and only the `>= 2^53` branch is genuinely new behaviour.
 
+### A39 · **FIXED (0.0.259)** (compiler) · `&global` returned the address of a TEMPORARY — every atomic access through a global was a no-op on a private cell
+
+**The 931-of-2048-rows measurement was this, and it was a miscompile, not a race.**
+
+`codegen.quanta`'s `IR_PTR_CAST` address-of path emitted `lea rd, [rbp +
+spill_home(a0)]` for everything. For a LOCAL that is right, because a local's home slot IS
+its storage. For a GLOBAL the operand vreg is an `IR_LOADG` temporary, so the LEA took the
+address of a scratch frame slot holding a COPY. The compiler's own source recorded it as a
+limitation rather than a defect:
+
+```
+// vreg is an IR_LOADG temp, so &global is not yet supported ?
+```
+
+Measured on 0.0.258, all silent:
+
+* `&g` was not even STABLE: two uses in one function returned `140450126102408` then
+  `140450126102344`.
+* `mem_store(&g, 1234)` left `g` at its old value.
+* `atomic_add(&g, 1)` returned `0` on **every** call and left `g` at `0`, so the natural
+  work-stealing loop `i = atomic_add(&next,1); while i < n { ... }` re-processed row 0
+  forever and never terminated (rc 124 against the harness cap); with a step budget it
+  terminates with a WRONG answer instead — `atomic_ws_test` rc 11 on 0.0.258, rc 0 on
+  0.0.259.
+
+**Why the pool worked anyway, which is what hid it:** `lib/std/gguf_mm.quanta` reaches its
+protocol cells through *global variables holding heap pointers*
+(`atomic_store(pl_genp, 0)`), never `&global`. Those were always correct, so the loader's own
+atomic use was sound while the natural spelling of the same thing was not.
+
+**Fix.** The parser resolves the name (`gfind`) and records the global index (`g+1`) in the
+`IR_PTR_CAST` record's unused `a1`; codegen emits `lea rd, [rip+disp32]` and patches it
+exactly like an `IR_LOADG`. The fact is recorded once, at the point where the name is known,
+and is NOT recovered later by scanning IR backwards for the `IR_LOADG` — that scan is both
+the "two divergent scans of one fact" class AND unsound, because the optimiser's dead-def
+pass rewrites an unread `IR_LOADG` into `MOV res,res` before codegen could look for it.
+
+Row: `atomic_addrglobal_test.quanta` (rc 1 on 0.0.258, rc 0 on 0.0.259), single-threaded on
+purpose — the defect is in address computation, so it must be observable with no race.
+Record: `docs/research/atomics-0.0.259.md` §5.1.
+
+### A40 · **FIXED (0.0.259)** (compiler) · `atomic_store` claimed seq_cst and emitted a plain `mov` (release) — and NOTHING covered any of it
+
+Every comment and every call site called these builtins sequentially consistent. On x86-64 a
+plain `mov [rdi],rsi` is **release**, not seq_cst: the store-buffering outcome
+(`r1==0 && r2==0`) that a seq_cst store must forbid is architecturally permitted by a plain
+store, because a load may complete before an earlier store to a different address drains from
+the store buffer. objdump of the emitted code on 0.0.258: `48 89 37` and no locked or fence
+instruction anywhere in the program. (The 0.0.105 comment was right about LOADS — a seq_cst
+load is a plain mov under TSO — and that is exactly how the store's `mov` survived review.)
+
+0.0.259 adds the ordering model (`0 relaxed / 1 acquire / 2 release / 3 acq_rel / 4 seq_cst`,
+the trailing argument, defaulting to seq_cst) and makes the default true: a seq_cst store is
+`xchg [rdi],rsi` (implicitly locked), relaxed/release stay a plain `mov`.
+
+**The coverage hole is part of this bug.** `test_suites/codes/atomic_test.quanta` and
+`thread_concurrent_test.quanta` were in `codes/` and referenced by NO row — `atomic_test`
+only borrowed `thread_concurrent_test`'s `EXPECTED_STDLIB` slot indirectly, and the 0.0.105
+primitive test had been dead since it was written. `atomic_test` is now registered (rc 11,
+unchanged), and the ordering model plus the optimiser barrier are measured by
+`tests/atomic_guard.sh`, a byte scan of the emitted object: `xchg >= 1` (seq_cst store
+locked), `mov <= 2` (relaxed/release unlock), `lock xadd == 3` (no pass deleted or merged an
+atomic RMW). RED on 0.0.258 (`mov 3, xchg 0`), GREEN on 0.0.259 (`mov 2, xchg 1`).
+
+### A41 · **LIVE** (gate) · `run_gate.sh`'s `ulimit -f 1048576` truncates every gguf-corrupt fixture at exactly 1 GiB, so the official gate reports `gguf-corrupt: 0/7` for ANY compiler
+
+**Second instance this session of a resource sitting exactly at its limit** -- and found precisely
+because it was mistaken for a regression in a language lever that has nothing to do with GGUF.
+
+**The chain, measured, not inferred:**
+
+1. `scripts/run_gate.sh:4-7` sets `ulimit -c 0` / `-v 68719476736` / `-t 3000` / **`-f 1048576`**
+   (1,048,576 blocks = **1 GiB** maximum file size).
+2. `test_suites/scripts/run_tests.sh` never resets it -- it only sets `ulimit -c 0` (line 8) -- so
+   every stage it launches **inherits** the 1 GiB file cap.
+3. `run_tests.sh` runs the GGUF stage as a subprocess (`gguf_corrupt_gate.sh`, ~line 1129), which
+   builds each corrupt fixture by **copying the model** (`scripts/audit/gen_corrupt_gguf.py`,
+   `open(src,"rb")` -> `open(dst,"wb")` in chunks).
+4. The model is **1,673,562,112 bytes = 1.56 GiB**. Each fixture is therefore **exactly
+   1,073,741,824 bytes** on disk -- truncated by RLIMIT_FSIZE, with a Python traceback:
+   `FAIL (generate) gap: Traceback (most recent call last):`.
+5. A 1 GiB-truncated GGUF still has intact metadata and a lazy data extent, so the probe **loads
+   it and returns rc=0**, and the stage counts it as `corrupt file was ACCEPTED`.
+
+**Result: `gguf-corrupt: 0/7 rejected` / `FAILED (7)` / `GGUF_RC=1`**, which
+`run_tests.sh:1553` names in the exit decision, so the whole gate exits 1.
+
+**It is version-independent.** Measured with the **predecessor** `0.0.258` (golden `e7fc8cd4`):
+
+```
+ulimit -f 1048576  +  0.0.258  ->  FAIL (generate) x7, 0/7 rejected, rc=1
+no -f              +  0.0.258  ->  7/7 rejected, GREEN, rc=0
+no -f              +  0.0.259  ->  7/7 rejected, GREEN, rc=0
+```
+
+So the official gate has been RED at HEAD for anyone who runs it through `run_gate.sh`, and nobody
+hit it because everyone runs `run_tests.sh` directly (`run_gate.sh` is the wrapper). **The gate is
+green; the wrapper is broken.**
+
+**The fix is one of** (a) drop `-f` (or raise it above the model size, which is a moving target --
+the point of `-f` is to stop a runaway write, so a bound tied to a 1.56 GiB fixture is the wrong
+shape), or (b) have `gen_corrupt_gguf.py` build fixtures by writing only the *metadata region* plus
+a sparse/truncated data region rather than a full copy, so no fixture is ever model-sized. (b) is
+the better fix: it also makes the stage cost 1 GiB of disk per fixture instead of 1.56 GiB, and it
+removes the coupling between a gate threshold and the size of a model file that can be swapped.
+
+**Not fixed here** -- `scripts/run_gate.sh` is not this unit's path, and a gate-policy change
+silently folded into a language lever's commit is exactly the kind of thing that makes a gate's
+colour untrustworthy.
+

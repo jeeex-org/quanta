@@ -1,0 +1,21 @@
+// NEGATIVE FIXTURE (0.0.259): an atomic ordering argument that is NOT a
+// compile-time literal must be a COMPILE ERROR, not a silent demotion.
+//
+// An order is a property of the program text. If a runtime value were accepted,
+// the backend would have to either emit the strongest form and quietly ignore
+// what was asked, or branch per access; the first is a lie and the second is not
+// an atomic access. So this fails closed, naming the operation.
+//
+// The gate stage compiles this file and REQUIRES the compile to fail with the
+// ordering message. Compiling successfully is the failure.
+let NP = 0
+
+fn nst(o) -> i64 {
+    atomic_store(NP, 1, o)
+    return 0
+}
+
+fn main() -> i64 {
+    NP = mem_alloc(8)
+    return nst(2)
+}

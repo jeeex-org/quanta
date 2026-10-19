@@ -1,0 +1,83 @@
+// 0.0.259 ATOMICS: THE ORDERING MODEL.
+//
+// Every order 0..4 is exercised on every operation, and the DEFAULT (no order
+// argument) is checked separately -- because the default is the compatibility
+// surface: lib/std/gguf_mm.quanta's pool protocol and the 0.0.105 atomic_test
+// both call these builtins with no order argument and must not change meaning.
+//
+// The order is a COMPILE-TIME literal in the trailing argument position. The
+// values are read from lib/std/atomic.quanta, so this row also proves that the
+// named ordinals cross an import and are usable as the argument.
+//
+// rc: 0 = pass, otherwise the failing case number.
+import std/atomic
+
+let OP = 0
+
+fn main() -> i64 {
+    OP = mem_alloc(8)
+    mem_store(OP, 0)
+
+    // --- load: every order, same value, and the plain form ------------------
+    atomic_store(OP, 11)
+    if atomic_load(OP, ORD_RELAXED) != 11 { return 1 }
+    if atomic_load(OP, ORD_ACQUIRE) != 11 { return 2 }
+    if atomic_load(OP, ORD_SEQ_CST) != 11 { return 3 }
+    if atomic_load(OP) != 11 { return 4 }
+
+    // --- store: relaxed / release / seq_cst all store the value -------------
+    if atomic_store(OP, 21, ORD_RELAXED) != 21 { return 5 }
+    if atomic_load(OP) != 21 { return 6 }
+    if atomic_store(OP, 22, ORD_RELEASE) != 22 { return 7 }
+    if atomic_load(OP) != 22 { return 8 }
+    if atomic_store(OP, 23, ORD_SEQ_CST) != 23 { return 9 }
+    if atomic_load(OP) != 23 { return 10 }
+    if atomic_store(OP, 24) != 24 { return 11 }          // default = seq_cst
+    if atomic_load(OP) != 24 { return 12 }
+    if atomic_store(OP, 25, ORD_ACQUIRE) != 25 { return 13 }
+    if atomic_store(OP, 26, ORD_ACQ_REL) != 26 { return 14 }
+    if atomic_load(OP) != 26 { return 15 }
+
+    // --- add: returns the PREVIOUS value, every order ----------------------
+    atomic_store(OP, 100)
+    if atomic_add(OP, 1, ORD_RELAXED) != 100 { return 16 }
+    if atomic_add(OP, 2, ORD_ACQUIRE) != 101 { return 17 }
+    if atomic_add(OP, 4, ORD_RELEASE) != 103 { return 18 }
+    if atomic_add(OP, 8, ORD_ACQ_REL) != 107 { return 19 }
+    if atomic_add(OP, 16, ORD_SEQ_CST) != 115 { return 20 }
+    if atomic_add(OP, 32) != 131 { return 21 }            // default
+    if atomic_load(OP) != 163 { return 22 }
+
+    // --- swap: returns the previous value, every order ----------------------
+    if atomic_swap(OP, 200, ORD_RELAXED) != 163 { return 23 }
+    if atomic_swap(OP, 201, ORD_ACQ_REL) != 200 { return 24 }
+    if atomic_swap(OP, 202) != 201 { return 25 }
+    if atomic_load(OP) != 202 { return 26 }
+
+    // --- cmpxchg: success and failure, every order --------------------------
+    if atomic_cmpxchg(OP, 202, 300, ORD_RELAXED) != 202 { return 27 }
+    if atomic_load(OP) != 300 { return 28 }
+    if atomic_cmpxchg(OP, 300, 301, ORD_ACQ_REL) != 300 { return 29 }
+    if atomic_load(OP) != 301 { return 30 }
+    if atomic_cmpxchg(OP, 999, 1, ORD_SEQ_CST) != 301 { return 31 }   // no swap
+    if atomic_load(OP) != 301 { return 32 }
+    if atomic_cmpxchg(OP, 301, 302) != 301 { return 33 }             // default
+    if atomic_load(OP) != 302 { return 34 }
+
+    // --- a `let` binding of an ordinal resolves to its literal --------------
+    // The contract is "must resolve to a compile-time literal", and a let-bound
+    // literal does. A runtime value is a COMPILE ERROR -- pinned by the gate
+    // stage that compiles atomic_order_neg_test.quanta and requires it to fail.
+    let ord = ORD_RELEASE
+    atomic_store(OP, 400, ord)
+    if atomic_load(OP) != 400 { return 35 }
+
+    // --- the ORD_* values are the documented ones ---------------------------
+    if ORD_RELAXED != 0 { return 36 }
+    if ORD_ACQUIRE != 1 { return 37 }
+    if ORD_RELEASE != 2 { return 38 }
+    if ORD_ACQ_REL != 3 { return 39 }
+    if ORD_SEQ_CST != 4 { return 40 }
+
+    return 0
+}

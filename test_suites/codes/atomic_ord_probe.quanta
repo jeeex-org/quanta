@@ -1,0 +1,27 @@
+// The OBJDUMP TARGET for the atomics-guard gate stage (0.0.259).
+//
+// The stage reads the emitted object and counts, IN main:
+//   mov  %rsi,(%rdi)   >= 1   a RELAXED / RELEASE store is NOT locked
+//   xchg %rsi,(%rdi)   >= 1   a SEQ_CST store IS locked
+//   lock xadd          == 3   an atomic RMW survives the optimiser, three times
+//
+// Those three counts are the ORDERING MODEL and the BARRIER RULE, measured in
+// emitted bytes: exact, load-independent, no wall clock, no tolerance. On
+// 0.0.258 the xchg count is 0 (every atomic_store was a plain mov, whatever
+// order was asked for or claimed), so the stage is RED there and GREEN here.
+//
+// Deliberately tiny, and with no mem_store(), so the counts are unambiguous:
+// every store-to-a-pointer in this function is an atomic_store.
+let AP = 0
+
+fn main() -> i64 {
+    AP = mem_alloc(8)
+    atomic_store(AP, 0, 2)      // release  -> mov  [rdi],rsi
+    atomic_store(AP, 1, 2)      // release  -> mov  [rdi],rsi
+    atomic_store(AP, 2, 4)      // seq_cst  -> xchg [rdi],rsi
+    atomic_add(AP, 4, 0)        // relaxed RMW -> lock xadd
+    atomic_add(AP, 8, 4)        // seq_cst RMW -> lock xadd
+    atomic_add(AP, 16, 3)       // acq_rel RMW -> lock xadd
+    let v = atomic_load(AP, 1)  // acquire
+    return v                    // the three stores SET (2), the adds give 2+4+8+16 = 30
+}

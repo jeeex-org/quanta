@@ -1,0 +1,102 @@
+// 0.0.259 ATOMICS: `&GLOBAL` IS THE GLOBAL'S STORAGE ADDRESS.
+//
+// RED on 0.0.258. codegen's IR_PTR_CAST address-of handler emitted
+// `lea rd, [rbp + spill_home(a0)]` for everything, which is right for a local
+// (a local's home slot IS its storage) and WRONG for a global: the global's a0
+// vreg is an IR_LOADG TEMPORARY, so `&g` was the address of a scratch frame slot
+// holding a COPY of g. The compiler's own source carried the defect as a note:
+// "Globals: the a0 vreg is an IR_LOADG temp, so &global is not yet supported".
+//
+// DELIBERATELY SINGLE-THREADED. The defect is in ADDRESS COMPUTATION, not in the
+// atomic, so it must be observable with no concurrency at all. A row that needed
+// a race to fail would be a row that passes on a lucky scheduler.
+//
+// Measured on 0.0.258: `&AG` returned 140450126102408 then 140450126102344 (two
+// uses, two different addresses); mem_store(&AG, 1234) left AG at its old value;
+// atomic_add(&AG, 5) returned 0 forever and AG never moved.
+//
+// rc: 0 = pass, otherwise the failing case number.
+let AG = 0
+let AG2 = 0
+let AGP = 0
+
+fn ag_addr1() -> i64 { return &AG }
+fn ag_addr2() -> i64 { return &AG }
+
+fn main() -> i64 {
+    AG = 100
+
+    // --- case 1: &g is STABLE across uses, in one frame and across frames -----
+    let a1 = &AG
+    let a2 = &AG
+    if a1 != a2 { return 1 }
+    if ag_addr1() != ag_addr2() { return 2 }
+    if ag_addr1() != a1 { return 3 }
+
+    // --- case 2: the address is the GLOBAL's, not a copy ---------------------
+    if mem_load(&AG) != 100 { return 4 }
+    mem_store(&AG, 1234)
+    if AG != 1234 { return 5 }
+    if mem_load(&AG) != 1234 { return 6 }
+
+    // --- case 3: a write through it is visible to the next ordinary read -----
+    AG = 7
+    if mem_load(a1) != 7 { return 7 }
+
+    // --- case 4: atomic_add through &global actually advances the global -----
+    // On 0.0.258 the old value is 0 every time and AG never moves.
+    let o1 = atomic_add(&AG, 5)
+    if o1 != 7 { return 8 }
+    if AG != 12 { return 9 }
+    let o2 = atomic_add(&AG, 8)
+    if o2 != 12 { return 10 }
+    if AG != 20 { return 11 }
+
+    // --- case 5: swap / cmpxchg / store / load through &global ---------------
+    let o3 = atomic_swap(&AG, 50)
+    if o3 != 20 { return 12 }
+    if AG != 50 { return 13 }
+    let o4 = atomic_cmpxchg(&AG, 50, 60)
+    if o4 != 50 { return 14 }
+    if AG != 60 { return 15 }
+    let o5 = atomic_cmpxchg(&AG, 999, 1)    // wrong expectation: no swap
+    if o5 != 60 { return 16 }
+    if AG != 60 { return 17 }
+    atomic_store(&AG, 99, 2)                // release
+    if AG != 99 { return 18 }
+    atomic_store(&AG, 77)                   // default = seq_cst
+    if AG != 77 { return 19 }
+    if atomic_load(&AG) != 77 { return 20 }
+    if atomic_load(&AG, 1) != 77 { return 21 }
+
+    // --- case 6: a SECOND global gets a DIFFERENT address -------------------
+    AG2 = 5
+    if &AG2 == &AG { return 22 }
+    atomic_add(&AG2, 1)
+    if AG2 != 6 { return 23 }
+    if AG != 77 { return 24 }
+
+    // --- case 7: the local path is unchanged --------------------------------
+    // A local's home slot IS its storage, so &local must keep working exactly as
+    // it did; the global fix must not have moved it.
+    let lc = 41
+    let lp = &lc
+    mem_store(lp, 42)
+    if lc != 42 { return 25 }
+    if atomic_add(&lc, 8) != 42 { return 26 }
+    if lc != 50 { return 27 }
+
+    // --- case 8: a global whose value is itself a pointer -------------------
+    // &ptr_global is the address OF THE GLOBAL, not the address it points to.
+    // That distinction is the whole point, and it is why & was unusable for a
+    // work-stealing counter living in a global.
+    AGP = mem_alloc(8)
+    mem_store(AGP, 3)
+    let pbefore = AGP
+    atomic_add(&AGP, 1)                     // increments the GLOBAL holding the pointer
+    if AGP != pbefore + 1 { return 28 }
+    if mem_load(pbefore) != 3 { return 29 } // and did NOT touch the cell it points at
+    if mem_load(&AG) != 77 { return 30 }
+
+    return 0
+}

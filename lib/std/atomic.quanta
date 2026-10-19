@@ -1,0 +1,61 @@
+// std/atomic.quanta — the ATOMIC ORDERING ORDINALS (0.0.259).
+//
+// WHY THIS MODULE EXISTS. Since 0.0.259 every atomic access takes an optional
+// trailing COMPILE-TIME LITERAL argument selecting its ordering:
+//
+//     0 relaxed   1 acquire   2 release   3 acq_rel   4 seq_cst (the default)
+//
+// Those five numbers are a language-level fact, not an implementation detail,
+// and a lock-free algorithm written with bare `0`/`4` literals does not say
+// what it means. These five names are the whole API surface of the module --
+// there is deliberately no function in it, because the ordinal is consumed by
+// the COMPILER (at_ord(), emitter.quanta) at each call site, not by a runtime
+// routine. Import it and write the order you mean:
+//
+//     import std/atomic
+//     atomic_store(flagp, 1, ORD_RELEASE)
+//     let v = atomic_load(flagp, ORD_ACQUIRE)
+//
+// THEY ARE `const`, NOT `let`, AND THAT IS MEASURED, NOT STYLISTIC.
+// The order argument must resolve to a compile-time literal, and a `let` global
+// cannot: reading a global emits an IR_LOADG, so `let o = 2` at the top level
+// makes `atomic_store(p, 1, o)` a COMPILE ERROR. `const ORD_RELEASE = 2` is
+// evaluated by the front end (F7 parse_const) and spliced in as the literal at
+// every use site, so it is accepted. Written with `let`, this module would have
+// shipped five names the compiler refuses -- the exact defect class this whole
+// module is meant to prevent, and it was caught by compiling the test row rather
+// than by reasoning about it.
+//
+// THE ORDER IS A LITERAL, NOT A VALUE. `atomic_store(p, 1, ord)` where `ord` is
+// a runtime expression is a COMPILE ERROR, not a silent demotion -- an order is
+// a property of the program text. A LOCAL `let` bound to a literal resolves
+// through its copies and is accepted (this was found the hard way: the argument
+// records of an IR_CALL are IR_MOV copies, not value records, so the first build
+// of at_ord rejected a perfectly good literal); a parameter or a loaded value is
+// rejected.
+//
+// ON WHAT THE ORDERS COST, per operation, on x86-64 (see at_emit() in
+// emitter.quanta for the emission and why):
+//   * atomic_load  — every order emits the same `mov`: this ISA's ordinary load
+//                    is already at least acquire, and a seq_cst load is also a
+//                    plain mov under TSO.
+//   * atomic_store — relaxed/release emit `mov`; acquire/acq_rel/seq_cst emit
+//                    `xchg` (implicitly locked). seq_cst is the DEFAULT, so the
+//                    unqualified `atomic_store(p, v)` is a locked store.
+//   * atomic_add / atomic_swap / atomic_cmpxchg — every order emits the same
+//                    `lock`-prefixed instruction. x86-64 has no cheaper atomic
+//                    read-modify-write, and a locked RMW already provides
+//                    acq_rel, which is stronger than any order that can be
+//                    requested. The argument is still checked, so a typo cannot
+//                    pass silently.
+module std_atomic;
+
+const ORD_RELAXED = 0
+const ORD_ACQUIRE = 1
+const ORD_RELEASE = 2
+const ORD_ACQ_REL = 3
+const ORD_SEQ_CST = 4
+
+fn init() -> i64 {
+    return 0
+}
