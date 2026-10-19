@@ -1436,3 +1436,99 @@ comment documents the first: a body of `f2i(f64of(n) * 0.5)` was concluded "retu
 downstream integer operations took the float path and yielded bit patterns instead of values. Two
 instances, both *silent*, both requiring a bisect to find. **Inference by token scan is the defect
 class** — a marker list is a list of things someone remembered.
+
+---
+
+### A37 · **LIVE** (compiler, 0.0.256 and 0.0.258) · a 19-digit decimal float literal evaluates to ~1/15.81 of its value — silently, reproducibly, and it under-reported a measured bound
+
+```quanta
+import std/fs
+fn main() {
+    prints("bits_1e18 = "); print(f64bits(1000000000000000000.0)); newline()
+    prints("f2i_1e18  = "); print(f2i(1000000000000000000.0)); newline()
+    prints("f2i_prod  = "); print(f2i(1000000000.0 * 1000000000.0)); newline()
+    return 0
+}
+```
+
+Observed (identical on `0.0.256` md5 `21c868f4` and `0.0.258` md5 `e7fc8cd4`):
+
+```
+bits_1e18 = 4858283208366391296        true 1e18 bits = 4876203697187506176
+f2i_1e18  = 63251277506936832          ~6.325e16, i.e. 1e18 / 15.8106
+f2i_prod  = 1000000000000000000        the product form is EXACT
+```
+
+16-digit and shorter literals are exact (`f64bits(1000000000000000.0)` = 4831355200913801216,
+`f64bits(1000000000000.0)` = 4786511204640096256, both correct). So the limit is somewhere
+between 16 and 19 significant digits and the failure is not a 1-ULP rounding — it is a
+factor of **15.81**.
+
+**This is A30's family but a different severity.** A30 is "one 17-digit literal rounds 1 ULP
+low". This one is a factor of 15.81, so a literal built to scale a small quantity produces a
+plausible number that is wrong by an order of magnitude.
+
+**Site.** The float token packs the mantissa as `(val << 8) | fdigits`, and `val` is built by
+`compiler/<ver>/src/x86/lexer.quanta:286`:
+
+```quanta
+if val < 3602879701896397 {
+    val = val*10 + d
+    if fval < 36028797018963967 { fval = fval*10 + d }
+    fdigits = fdigits + 1
+}
+```
+
+The comment block above it (lines 225-285) documents **two earlier revisions of this same
+class**, one of which "sent the compiler into a hang". This is a third instance the guard does
+not cover.
+
+**Cost, measured.** `tests/lfm2_f32_logits_test.quanta` scaled a max |logit difference| by this
+literal to print it as an integer, so the f64+FMA bound recorded in
+`docs/research/f32-loader-kernels.md` as **2.921e-15** is really **4.618528e-14** — the raw
+f64-bits field was always correct and that is what the corrected figure comes from. The harness
+now multiplies by `1000000000.0 * 1000000000.0`. **Every harness that scales a float by a long
+decimal literal is affected**; the fix is one unit of work in the literal path (or a test that
+pins each decimal literal class against the host `strtod`).
+
+---
+
+### A38 · **LIVE** (lib/std, 0.0.256 and 0.0.258) · `print_f`'s integer part is O(|v|) and never terminates for |v| >= 2^53
+
+```quanta
+import std/fs
+fn main() { prints("v="); print_f(10000000000.0); prints(" END\n"); return 0 }
+```
+
+Observed: **no output, no return, within 12 s**, under both 0.0.256 and 0.0.258.
+`print_f(99999999.0)` returns instantly.
+
+**Site:** `lib/std/fs.quanta:237-241`:
+
+```quanta
+let ip = 0
+while m >= 1.0 {
+    m = m - 1.0
+    ip = ip + 1
+}
+```
+
+Two defects in one loop:
+
+1. **It is O(|v|) subtractions.** `print_f(1e10)` is ~1e10 iterations; `print_f(1e12)` did not
+   finish in 12 s. Every large float printed by any harness is silently slow.
+2. **It never terminates for `m >= 2^53`** (approximately 9.007e15), because `m - 1.0 == m`
+   once the ulp exceeds 1 — an INFINITE LOOP, not slowness.
+
+**Why it is filed rather than fixed here.** The range that currently works is fast enough for
+every number the f32 chain unit reports, and a fix that preserves the exact residual arithmetic
+for the mid-range (`1e8 .. 2^53`, which another harness could be printing today) while
+terminating above 2^53 is a proper decimal formatter with its own verification cycle. Doing that
+at the end of a kernel unit is exactly the "destabilise a shared formatter late" risk the
+standing rules warn about. It is the next unit's item, with the reproducer above.
+
+**Note for whoever takes it:** for `m < 2^53` the repeated subtraction of `1.0` is EXACT
+(every partial result is representable), so `ip = f2i(m)` and `m = m - i2f(ip)` give the same
+`ip` and the same residual — i.e. a fast integer-part extraction can be output-IDENTICAL over
+the range that terminates today, and only the `>= 2^53` branch is genuinely new behaviour.
+

@@ -22,10 +22,21 @@ VP="ulimit -c 0 -v 32000000;"
 echo "############ f32 re-measurement under a single pin ############"
 echo "compiler: $QC"
 md5sum "$QC"
-echo "expect md5 2fe5e2844b9c3a74cf7922152a69ea46"
+echo "NOTE the pin is whatever QC names; the GOLDEN for 0.0.256 is"
+echo "     21c868f418797c86d7db68728ed01917. Check the md5 against the version's"
+echo "     documented golden before trusting any figure -- a moving VERSION is why"
+echo "     the pin is explicit."
 echo "VERSION (NOT used as the pin): $(cat VERSION)"
 echo "load at start: $(cat /proc/loadavg)"
 date
+
+echo
+echo "############ EMITTED-CODE CHECKS (fast, no model; run after touching any hex) ############"
+python3 tests/lfm2_f32_enc_gen.py            # GNU as -> objdump -> table + prologue splice
+gcc -O1 -o /tmp/f32enc tests/lfm2_f32_enc_verify.c && /tmp/f32enc
+python3 tests/lfm2_f32_enc_negctl.py         # 5 negative controls: MUST all be caught
+python3 tests/lfm2_f32_hexcheck.py
+python3 tests/lfm2_jbytes_len_check.py
 
 echo
 echo "############ BUILD ############"
